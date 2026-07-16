@@ -1,0 +1,80 @@
+{
+  "target_schema": "leeds",
+  "page_size": 500,
+  "http_timeout_seconds": 30,
+  "http_retries": 4,
+  "layers": [
+    {
+      "key": "bus_stops",
+      "description": "West Yorkshire bus stops in and around Leeds; point and date-field example.",
+      "source_url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Transportation/MapServer/0",
+      "target_table": "bus_stops",
+      "where": "1=1",
+      "object_id_field": "OBJECTID",
+      "source_geometry_type": "esriGeometryPoint",
+      "target_geometry_type": "Point",
+      "expected_source_srid": 27700,
+      "minimum_source_count": 3000,
+      "columns": [
+        {"source": "BSSTOPID", "target": "stop_id", "type": "text"},
+        {"source": "BSDIR", "target": "direction", "type": "text"},
+        {"source": "BSTOWN", "target": "town", "type": "text"},
+        {"source": "BSNAME", "target": "stop_name", "type": "text"},
+        {"source": "BSSTAND", "target": "stand", "type": "text"},
+        {"source": "BSON", "target": "on_street", "type": "text"},
+        {"source": "BSTOWARD", "target": "towards", "type": "text"},
+        {"source": "BSCREATE", "target": "created_at", "type": "timestamptz"},
+        {"source": "BSUDATE", "target": "updated_at", "type": "timestamptz"},
+        {"source": "BSEDATE", "target": "ended_at", "type": "timestamptz"}
+      ]
+    },
+    {
+      "key": "definitive_paths",
+      "description": "Definitive public rights of way; polyline and floating-point-field example.",
+      "source_url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/PROW/MapServer/4",
+      "target_table": "definitive_paths",
+      "where": "1=1",
+      "object_id_field": "OBJECTID",
+      "source_geometry_type": "esriGeometryPolyline",
+      "target_geometry_type": "MultiLineString",
+      "expected_source_srid": 27700,
+      "minimum_source_count": 1800,
+      "columns": [
+        {"source": "PATHNAME", "target": "path_name", "type": "text"},
+        {"source": "SURFACE", "target": "surface", "type": "text"},
+        {"source": "LENGTH_MET", "target": "length_metres", "type": "double precision"},
+        {"source": "LENGTH_MIL", "target": "length_miles", "type": "double precision"},
+        {"source": "WIDTH_METR", "target": "width_metres", "type": "double precision"},
+        {"source": "WIDTH_FEET", "target": "width_feet", "type": "double precision"},
+        {"source": "PROW_STATU", "target": "prow_status", "type": "text"},
+        {"source": "LOCAL_AR_1", "target": "local_area", "type": "text"}
+      ]
+    },
+    {
+      "key": "planning_applications_recent",
+      "description": "The council's bounded 'valid last month' planning layer; polygon, integer, long text, double and date example.",
+      "source_url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1",
+      "target_table": "planning_applications_recent",
+      "where": "1=1",
+      "object_id_field": "OBJECTID_1",
+      "source_geometry_type": "esriGeometryPolygon",
+      "target_geometry_type": "MultiPolygon",
+      "expected_source_srid": 27700,
+      "minimum_source_count": 150,
+      "columns": [
+        {"source": "OBJECTID", "target": "application_object_id", "type": "integer"},
+        {"source": "KEYVAL", "target": "key_value", "type": "text"},
+        {"source": "REFVAL", "target": "reference", "type": "text"},
+        {"source": "PROPOSAL", "target": "proposal", "type": "text"},
+        {"source": "DATEDECISS", "target": "decision_at", "type": "timestamptz"},
+        {"source": "DATEAPVAL", "target": "validated_at", "type": "timestamptz"},
+        {"source": "DECSN", "target": "decision_code", "type": "text"},
+        {"source": "DCAPPTYP", "target": "application_type", "type": "text"},
+        {"source": "DCSTAT", "target": "status_code", "type": "text"},
+        {"source": "ADDRESS", "target": "address", "type": "text"},
+        {"source": "HOUSEDENS", "target": "housing_density", "type": "double precision"},
+        {"source": "CODETEXT", "target": "code_text", "type": "text"}
+      ]
+    }
+  ]
+}
