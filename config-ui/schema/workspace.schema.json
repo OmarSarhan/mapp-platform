@@ -1,0 +1,1633 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "workspace.schema.json",
+  "title": "GEOLYTIX XYZ v4.23.4 workspace",
+  "description": "Schema for the workspace surface used by this MAPP Explore instance. XYZ workspaces are extensible, so unknown framework/plugin properties are preserved.",
+  "type": "object",
+  "anyOf": [
+    {
+      "required": [
+        "locale"
+      ]
+    },
+    {
+      "required": [
+        "locales"
+      ]
+    }
+  ],
+  "properties": {
+    "key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable workspace identifier."
+    },
+    "dbs": {
+      "$ref": "#/$defs/databaseKey",
+      "description": "Default database connection. XYZ resolves this as the DBS_<value> environment variable."
+    },
+    "locale": {
+      "$ref": "#/$defs/locale",
+      "description": "Default locale and the locale used by this instance."
+    },
+    "locales": {
+      "type": "object",
+      "description": "Optional named locales. Each property name is a locale key.",
+      "additionalProperties": {
+        "$ref": "#/$defs/locale"
+      }
+    },
+    "templates": {
+      "type": "object",
+      "description": "Optional XYZ template definitions. Templates are deliberately open-ended.",
+      "additionalProperties": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "databaseKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]+$",
+      "examples": [
+        "MAPP"
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_$]*$"
+    },
+    "relation": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_$]*(\\.[A-Za-z_][A-Za-z0-9_$]*)?$",
+      "description": "An unquoted PostgreSQL table or schema.table name."
+    },
+    "color": {
+      "type": "string",
+      "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$",
+      "description": "CSS hexadecimal colour. XYZ/OpenLayers accepts short and alpha forms as well as six-digit colours."
+    },
+    "locale": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human-readable locale name."
+        },
+        "role": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "description": "Optional role restriction understood by XYZ.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "roles": {
+          "type": "object",
+          "description": "Role map used by XYZ's role-composition logic.",
+          "additionalProperties": true
+        },
+        "srid": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "pattern": "^[1-9][0-9]*$",
+          "minimum": 1,
+          "default": "3857",
+          "description": "Map projection SRID; defaults to 3857."
+        },
+        "extent": {
+          "$ref": "#/$defs/extent"
+        },
+        "view": {
+          "$ref": "#/$defs/view"
+        },
+        "minZoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "maxZoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "mapviewControls": {
+          "type": "array",
+          "description": "OpenLayers control constructor names. XYZ ignores names absent from ol.control.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "Attribution",
+              "FullScreen",
+              "MousePosition",
+              "OverviewMap",
+              "Rotate",
+              "ScaleLine",
+              "Zoom",
+              "ZoomSlider",
+              "ZoomToExtent"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "ScaleLine": {
+          "type": "string",
+          "enum": [
+            "metric",
+            "imperial"
+          ],
+          "description": "Scale-line units supported by XYZ v4.23.4."
+        },
+        "plugins": {
+          "type": [
+            "array",
+            "object"
+          ],
+          "description": "Plugins loaded for this locale."
+        },
+        "syncPlugins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Plugin keys loaded sequentially before map use."
+        },
+        "svgTemplates": {
+          "type": "object",
+          "description": "SVG template keys mapped to source URLs.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "queryparams": {
+          "type": "object",
+          "description": "Locale-level query parameters.",
+          "additionalProperties": true
+        },
+        "layers": {
+          "type": "object",
+          "description": "Map layers keyed by their stable layer key.",
+          "additionalProperties": {
+            "$ref": "#/$defs/layer"
+          }
+        },
+        "locales": {
+          "type": "array",
+          "description": "Keys of locale templates merged as nested locales.",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "extent": {
+      "type": "object",
+      "properties": {
+        "north": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "east": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "south": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "west": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "mask": {
+          "type": "boolean",
+          "default": false,
+          "description": "Mask the map outside the locale extent."
+        }
+      },
+      "additionalProperties": true
+    },
+    "view": {
+      "type": "object",
+      "properties": {
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "default": 0
+        },
+        "lng": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180,
+          "default": 0
+        },
+        "z": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30,
+          "description": "Initial zoom level."
+        },
+        "minZoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30
+        },
+        "maxZoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30
+        }
+      },
+      "additionalProperties": true
+    },
+    "layer": {
+      "type": "object",
+      "properties": {
+        "template": {
+          "type": "string",
+          "description": "Workspace template merged into this layer."
+        },
+        "templates": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          }
+        },
+        "src": {
+          "type": "string",
+          "description": "Remote/file template source consumed during workspace composition."
+        },
+        "include_props": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude_props": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "role": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "roles": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name; defaults to the layer key."
+        },
+        "display": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the layer is visible initially."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "cluster",
+            "googleMapTiles",
+            "mapboxStyle",
+            "maplibre",
+            "tiles",
+            "mvt",
+            "geojson",
+            "vector",
+            "wkt"
+          ],
+          "description": "Layer renderer/data format exported by XYZ v4.23.4."
+        },
+        "dbs": {
+          "$ref": "#/$defs/databaseKey",
+          "description": "Database override; otherwise workspace.dbs is inherited."
+        },
+        "table": {
+          "$ref": "#/$defs/relation"
+        },
+        "geom": {
+          "$ref": "#/$defs/identifier",
+          "description": "Geometry column."
+        },
+        "srid": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "pattern": "^[1-9][0-9]*$",
+          "minimum": 1,
+          "description": "Geometry SRID. MVT specifically requires 3857 in XYZ v4.23.4."
+        },
+        "qID": {
+          "$ref": "#/$defs/identifier",
+          "description": "Column uniquely identifying each feature."
+        },
+        "_dashboard": {
+          "type": "object",
+          "description": "Configuration-dashboard provenance hints ignored by XYZ.",
+          "properties": {
+            "generated": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "boolean"
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "URI": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Tile URL template, normally containing {z}, {x}, and {y}."
+        },
+        "source": {
+          "type": "string",
+          "default": "OSM",
+          "description": "OpenLayers tile-source constructor, commonly OSM or XYZ."
+        },
+        "projection": {
+          "type": "string",
+          "default": "EPSG:3857"
+        },
+        "params": {
+          "$ref": "#/$defs/layerParams"
+        },
+        "zIndex": {
+          "type": "number",
+          "description": "Layer drawing order."
+        },
+        "opacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "attribution": {
+          "type": "object",
+          "description": "Attribution label-to-link mapping.",
+          "additionalProperties": {
+            "type": "string",
+            "format": "uri-reference"
+          }
+        },
+        "infoj": {
+          "type": "array",
+          "description": "Feature-information fields, in display order.",
+          "items": {
+            "$ref": "#/$defs/infoEntry"
+          }
+        },
+        "style": {
+          "$ref": "#/$defs/layerStyle"
+        },
+        "tables": {
+          "type": "object",
+          "description": "Zoom-keyed PostgreSQL relations used instead of table.",
+          "patternProperties": {
+            "^[0-9]+$": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "geoms": {
+          "type": "object",
+          "description": "Zoom-keyed geometry columns used instead of geom.",
+          "patternProperties": {
+            "^[0-9]+$": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "z_field": {
+          "$ref": "#/$defs/identifier",
+          "description": "Optional column limiting MVT rows by zoom."
+        },
+        "transition": {
+          "type": "number",
+          "minimum": 0,
+          "description": "OpenLayers source transition duration in milliseconds."
+        },
+        "cacheSize": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "OpenLayers vector-tile cache size."
+        },
+        "vectorImage": {
+          "type": "boolean",
+          "description": "Use an OpenLayers VectorImage layer for vector formats."
+        },
+        "features": {
+          "type": "array",
+          "description": "Inline features passed directly to the selected featureFormat."
+        },
+        "featureFormat": {
+          "type": "string",
+          "description": "Feature response parser, normally geojson, wkt, cluster, wkth3, or wkt_properties."
+        },
+        "featureSet": {
+          "type": "array",
+          "description": "Feature IDs allowed to render."
+        },
+        "featureLookup": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Feature property lookup records used to restrict and style features."
+        },
+        "featureLookupId": {
+          "type": "string",
+          "default": "id"
+        },
+        "wkt_properties": {
+          "type": "boolean",
+          "description": "Load MVT properties separately using the WKT query."
+        },
+        "cluster": {
+          "$ref": "#/$defs/cluster"
+        },
+        "filter": {
+          "type": "object",
+          "description": "Layer filter configuration; XYZ creates filter.current when absent.",
+          "additionalProperties": true
+        },
+        "infoj_skip": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "number"
+            ]
+          },
+          "description": "Entry keys, fields, queries, types, or groups skipped from infoj."
+        },
+        "infoj_order": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          },
+          "description": "Order/filter for location information entries."
+        },
+        "fade": {
+          "type": "boolean"
+        },
+        "promoteDisplay": {
+          "type": "boolean",
+          "description": "Move the layer above other displayed layers when shown."
+        },
+        "zoomDisplay": {
+          "type": "boolean"
+        },
+        "accessToken": {
+          "type": "string",
+          "description": "Mapbox access token used by mapboxStyle or maplibre."
+        },
+        "apiKey": {
+          "type": "string",
+          "description": "Google Maps Tiles API key."
+        },
+        "preserveDrawingBuffer": {
+          "type": "boolean",
+          "description": "MapLibre canvas option required for screenshots."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "tiles"
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "URI"
+                ]
+              },
+              {
+                "required": [
+                  "template"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "mvt"
+                ]
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "template"
+                ]
+              },
+              {
+                "required": [
+                  "srid",
+                  "qID"
+                ],
+                "allOf": [
+                  {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "table"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "tables"
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "geom"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "geoms"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "cluster",
+                  "geojson",
+                  "vector",
+                  "wkt"
+                ]
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "template"
+                ]
+              },
+              {
+                "required": [
+                  "srid",
+                  "qID"
+                ],
+                "anyOf": [
+                  {
+                    "required": [
+                      "features"
+                    ]
+                  },
+                  {
+                    "allOf": [
+                      {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "table"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "tables"
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "geom"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "geoms"
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "mvt"
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "properties": {
+              "srid": {
+                "enum": [
+                  "3857",
+                  3857
+                ]
+              }
+            }
+          }
+        }
+        ,
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "mapboxStyle",
+                  "maplibre"
+                ]
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "required": [
+              "style"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "googleMapTiles"
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "required": [
+              "apiKey"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "layerParams": {
+      "type": "object",
+      "properties": {
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "default_fields": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "viewport": {
+          "type": "boolean",
+          "description": "Vector formats replace true with the current viewport."
+        },
+        "z": {
+          "type": "boolean",
+          "description": "Vector formats replace true with the current zoom."
+        },
+        "no_geom": {
+          "type": "boolean"
+        },
+        "template": {
+          "type": "string"
+        },
+        "layer_template": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "cluster": {
+      "type": "object",
+      "properties": {
+        "distance": {
+          "type": "number",
+          "minimum": 1,
+          "description": "Client-side cluster distance in pixels."
+        },
+        "resolution": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Database cluster resolution."
+        },
+        "hexgrid": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "distance"
+          ],
+          "not": {
+            "required": [
+              "resolution"
+            ]
+          }
+        },
+        {
+          "required": [
+            "resolution"
+          ],
+          "not": {
+            "required": [
+              "distance"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "infoEntry": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Optional stable entry key; XYZ otherwise derives one from array order."
+        },
+        "type": {
+          "type": "string",
+          "default": "text",
+          "enum": [
+            "boolean",
+            "dataview",
+            "date",
+            "datetime",
+            "defaults",
+            "documents",
+            "geometry",
+            "html",
+            "image",
+            "images",
+            "integer",
+            "json",
+            "key",
+            "layer",
+            "link",
+            "numeric",
+            "pills",
+            "pin",
+            "ping",
+            "query_button",
+            "report",
+            "tab",
+            "text",
+            "textarea",
+            "time",
+            "title"
+            ,
+            "mvt_clone",
+            "vector_layer"
+          ],
+          "description": "XYZ feature-information renderer. Omitted means text."
+        },
+        "title": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "field": {
+          "$ref": "#/$defs/identifier",
+          "description": "Unique result-field alias within this infoj array."
+        },
+        "fieldfx": {
+          "type": "string",
+          "minLength": 1,
+          "description": "PostgreSQL expression selected as field. It must be a single trusted expression."
+        },
+        "display": {
+          "type": "boolean",
+          "default": true
+        },
+        "inline": {
+          "type": "boolean",
+          "default": false
+        },
+        "query": {
+          "type": "string",
+          "description": "Optional XYZ query-template key."
+        },
+        "queryparams": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "edit": {
+          "type": [
+            "boolean",
+            "object"
+          ],
+          "description": "Optional edit configuration; not enabled by this read-only deployment."
+        },
+        "group": {
+          "type": "string"
+        },
+        "groupClassList": {
+          "type": [
+            "string",
+            "array"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "default": {
+          "description": "Fallback value when the query value is undefined."
+        },
+        "nullValue": {
+          "description": "Replacement value when the query result is null."
+        },
+        "skipFalsyValue": {
+          "type": "boolean"
+        },
+        "skipNullValue": {
+          "type": "boolean"
+        },
+        "skipUndefinedValue": {
+          "type": "boolean"
+        },
+        "jsonb_field": {
+          "type": "string"
+        },
+        "jsonb_key": {
+          "type": "string"
+        },
+        "json_field": {
+          "type": "string"
+        },
+        "json_key": {
+          "type": "string"
+        },
+        "objectAssignFromField": {
+          "type": "string"
+        },
+        "objectMergeFromField": {
+          "type": "string"
+        },
+        "formatterParams": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "suffix": {
+          "type": "string"
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "step": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "tooltip": {
+          "type": [
+            "string",
+            "object"
+          ]
+        },
+        "dependents": {
+          "type": "array"
+        },
+        "dependents_layers": {
+          "type": "array"
+        },
+        "dynamic": {
+          "type": "boolean"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "expanded": {
+          "type": "boolean"
+        },
+        "hideHelp": {
+          "type": "boolean"
+        },
+        "hideLayer": {
+          "type": "boolean"
+        },
+        "hideTabClose": {
+          "type": "boolean"
+        },
+        "disableTabClose": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "field"
+          ]
+        },
+        {
+          "required": [
+            "query"
+          ]
+        },
+        {
+          "required": [
+            "key"
+          ]
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "tab",
+                "title"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ],
+      "additionalProperties": true
+    },
+    "layerStyle": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/featureStyle"
+        },
+        "highlight": {
+          "$ref": "#/$defs/featureStyle"
+        },
+        "selected": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/featureStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cluster": {
+          "$ref": "#/$defs/featureStyle"
+        },
+        "theme": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/theme"
+            }
+          ]
+        },
+        "themes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/theme"
+          }
+        },
+        "hover": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/hover"
+            }
+          ]
+        },
+        "hovers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/hover"
+          }
+        },
+        "label": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/labelStyle"
+            }
+          ]
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/labelStyle"
+          }
+        },
+        "icon_scaling": {
+          "$ref": "#/$defs/iconScaling"
+        },
+        "cache": {
+          "type": "boolean",
+          "description": "Cache computed OpenLayers styles on features."
+        },
+        "drawer": {
+          "type": "string"
+        },
+        "zoomInScale": {
+          "type": "number"
+        },
+        "zoomOutScale": {
+          "type": "number"
+        },
+        "opacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1,
+          "description": "Opacity of the whole OpenLayers layer."
+        },
+        "contextFilter": {
+          "type": "string",
+          "description": "Canvas filter used by tile layers."
+        },
+        "URL": {
+          "type": "string",
+          "description": "Mapbox style URL used by mapboxStyle or maplibre."
+        },
+        "object": {
+          "type": "object",
+          "description": "Inline MapLibre style specification.",
+          "additionalProperties": true
+        },
+        "mapType": {
+          "type": "string",
+          "default": "roadmap",
+          "description": "Google Maps Tiles map type."
+        },
+        "layerTypes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Google Maps Tiles layer types."
+        }
+      },
+      "additionalProperties": true
+    },
+    "featureStyle": {
+      "type": "object",
+      "properties": {
+        "fillColor": {
+          "$ref": "#/$defs/color"
+        },
+        "fillOpacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "strokeColor": {
+          "$ref": "#/$defs/color"
+        },
+        "strokeOpacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "strokeWidth": {
+          "type": "number",
+          "minimum": 0
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 10,
+          "description": "Legacy/top-level point scale. XYZ styleParser moves this into icon.scale for default styles."
+        },
+        "highlightScale": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 10,
+          "description": "Scale multiplier applied by XYZ when this feature style is used as style.highlight."
+        },
+        "lineDash": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number",
+            "minimum": 0
+          },
+          "description": "OpenLayers stroke dash/gap sequence, for example [5, 4]."
+        },
+        "icon": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/iconStyle"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/iconStyle"
+              },
+              "minItems": 1
+            }
+          ]
+        },
+        "zIndex": {
+          "type": "number"
+        },
+        "clusterScale": {
+          "type": "number"
+        },
+        "zoomInScale": {
+          "type": "number"
+        },
+        "zoomOutScale": {
+          "type": "number"
+        },
+        "fieldScale": {
+          "type": "number"
+        },
+        "label": {
+          "$ref": "#/$defs/labelStyle"
+        }
+      },
+      "additionalProperties": true
+    },
+    "theme": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "basic",
+            "categorized",
+            "distributed",
+            "graduated"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "style": {
+          "$ref": "#/$defs/featureStyle"
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/themeCategory"
+          }
+        },
+        "other": {
+          "type": "boolean"
+        },
+        "graduated_breaks": {
+          "type": "string",
+          "enum": [
+            "greater_than",
+            "less_than"
+          ]
+        },
+        "distribution": {
+          "type": "string",
+          "enum": [
+            "count",
+            "jenks"
+          ]
+        },
+        "legend": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "skip": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "themeCategory": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "value": {},
+        "label": {
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "field": {
+          "type": "string"
+        },
+        "style": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/featureStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "icon": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/iconStyle"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/iconStyle"
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "hover": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "boolean"
+        },
+        "field": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "dynamic": {
+          "type": "boolean",
+          "description": "Disable XYZ hover response caching and query the value dynamically."
+        },
+        "hidden": {
+          "type": "boolean",
+          "description": "Hide the hover control from the XYZ layer style panel."
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "description": "XYZ query template used when the hover field is not already present on the feature."
+        }
+      },
+      "additionalProperties": true
+    },
+    "labelStyle": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "boolean"
+        },
+        "field": {
+          "type": "string"
+        },
+        "text": {
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "fillColor": {
+          "$ref": "#/$defs/color"
+        },
+        "strokeColor": {
+          "$ref": "#/$defs/color"
+        },
+        "strokeWidth": {
+          "type": "number",
+          "minimum": 0
+        },
+        "font": {
+          "type": "string"
+        },
+        "offsetX": {
+          "type": "number"
+        },
+        "offsetY": {
+          "type": "number"
+        },
+        "overflow": {
+          "type": "boolean"
+        },
+        "minZoom": {
+          "type": "number"
+        },
+        "maxZoom": {
+          "type": "number"
+        },
+        "count": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "iconScaling": {
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "icon": {
+          "type": "boolean"
+        },
+        "clusterScale": {
+          "type": "boolean"
+        },
+        "zoomInScale": {
+          "type": "boolean"
+        },
+        "zoomOutScale": {
+          "type": "boolean"
+        },
+        "fields": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "iconStyle": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "dot",
+            "target",
+            "triangle",
+            "square",
+            "diamond",
+            "semiCircle",
+            "markerLetter",
+            "markerColor",
+            "circle",
+            "template"
+          ],
+          "description": "Built-in SVG symbol exported by XYZ v4.23.4."
+        },
+        "fillColor": {
+          "$ref": "#/$defs/color",
+          "description": "Used by dot, target, triangle, square, diamond, and semiCircle."
+        },
+        "strokeColor": {
+          "$ref": "#/$defs/color",
+          "description": "Used by the built-in circle symbol; ignored by dot."
+        },
+        "strokeWidth": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Used by the built-in circle symbol."
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 10,
+          "description": "OpenLayers icon scale multiplier."
+        },
+        "color": {
+          "$ref": "#/$defs/color",
+          "description": "Marker colour used by markerLetter."
+        },
+        "letter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1,
+          "description": "Single character used by markerLetter."
+        },
+        "colorMarker": {
+          "$ref": "#/$defs/color",
+          "description": "Outer marker colour used by markerColor."
+        },
+        "colorDot": {
+          "$ref": "#/$defs/color",
+          "description": "Inner dot colour used by markerColor."
+        },
+        "anchor": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Custom SVG/image URL consumed directly by XYZ and OpenLayers. Dashboard-managed SVGs use /instance/svg/<filename>.svg."
+        },
+        "svg": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Legacy XYZ alias for icon.url. XYZ normalizes this property to url while loading the workspace."
+        },
+        "template": {
+          "type": "string",
+          "description": "Named SVG template used when type is template."
+        },
+        "substitute": {
+          "type": "object",
+          "description": "String substitutions applied to an SVG template.",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number"
+            ]
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "required": [
+            "url"
+          ]
+        },
+        {
+          "required": [
+            "svg"
+          ]
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "markerLetter"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "color",
+              "letter"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "markerColor"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "colorMarker",
+              "colorDot"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "template"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "template"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}
