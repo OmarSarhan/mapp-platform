@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r config-ui/requirements.txt
+          python -m pip install -e etl
+
+      - name: Test configuration service
+        run: PYTHONPATH=config-ui python -m unittest discover -s config-ui/tests -v
+
+      - name: Test ETL
+        run: PYTHONPATH=etl/src python -m unittest discover -s etl/tests -v
+
+      - name: Test deployment helpers
+        run: PYTHONPATH=. python -m unittest discover -s scripts/tests -v
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            config-ui/package-lock.json
+            browser-runner/package-lock.json
+
+      - name: Test cross-language workspace fingerprint
+        run: PYTHONPATH=. python -m unittest discover -s scripts/tests -p 'test_workspace_fingerprint.py' -v
+
+      - name: Build dashboard
+        working-directory: config-ui
+        run: |
+          npm ci
+          npm test
+          npm run build
+          npm audit --omit=dev
+
+      - name: Check browser runner
+        working-directory: browser-runner
+        run: |
+          npm ci --ignore-scripts
+          node --check server.mjs
+          npm audit --omit=dev
+
+      - name: Check XYZ supervisor wrapper
+        run: node --check docker/xyz/supervisor.mjs
+
+      - name: Validate shell and Compose configuration
+        run: |
+          bash -n bin/mapp scripts/verify.sh docker/postgis/healthcheck.sh docker/postgis/init/10-roles.sh
+          docker compose --env-file .env.example -f compose.yaml config --quiet
+          CONFIG_UID=1234 CONFIG_GID=2345 \
+            docker compose --env-file .env.example -f compose.yaml config --format json \
+            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="1234:2345"; assert all(services[name]["user"] == expected for name in ("xyz","config-ui","browser-runner"))'
+          docker compose --env-file .env.example -f compose.yaml -f compose.db-port.yaml config --quiet
+          export PRODUCTION_MAP_SITE=https://maps.company.co.uk
+          export PRODUCTION_CONFIG_SITE=https://config.company.co.uk
+          export PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui
+          export PRODUCTION_CADDY_EMAIL=operations@company.co.uk
+          export HTTPS_PORT=443
+          python scripts/validate_production_env.py --environment .env.example
+          docker compose --env-file .env.example -f compose.yaml -f compose.production.yaml config --quiet

@@ -1,0 +1,13 @@
+# Production hardening overlay:
+# MAPP_ENVIRONMENT=production ./bin/mapp serve
+services:
+  config-ui:
+    environment:
+      CONFIG_ALLOWED_HOSTS: ${PRODUCTION_CONFIG_ALLOWED_HOSTS:?Set PRODUCTION_CONFIG_ALLOWED_HOSTS to the configuration hostname}
+      CONFIG_SECURE_COOKIES: "true"
+
+  caddy:
+    environment:
+      MAP_SITE: ${PRODUCTION_MAP_SITE:?Set PRODUCTION_MAP_SITE to the public HTTPS map origin}
+      CONFIG_SITE: ${PRODUCTION_CONFIG_SITE:?Set PRODUCTION_CONFIG_SITE to the public HTTPS configuration origin}
+      CADDY_EMAIL: ${PRODUCTION_CADDY_EMAIL:?Set PRODUCTION_CADDY_EMAIL for certificate notifications}

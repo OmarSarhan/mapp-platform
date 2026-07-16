@@ -1,0 +1,11 @@
+.env
+backups/
+var/
+node_modules/
+dist/
+*.log
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/

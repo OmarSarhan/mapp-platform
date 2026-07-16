@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${MAPP_ENV_FILE:-${ROOT_DIR}/.env}"
+STATE_DIR="${ROOT_DIR}/var"
+WORKSPACE_DIR="${STATE_DIR}/workspace"
+CONTROL_DIR="${STATE_DIR}/control"
+RELOAD_DIR="${STATE_DIR}/reload"
+
+usage() {
+  printf '%s\n' \
+    "Usage: ./bin/mapp <command>" \
+    "" \
+    "  init         create a private .env from .env.example" \
+    "  up           build/start PostGIS, XYZ, config UI, and Caddy" \
+    "  serve        start PostGIS, XYZ, config UI, and Caddy without rerunning ETL" \
+    "  reload-xyz   request an XYZ process reload" \
+    "  config-ui    build/start the workspace configuration dashboard" \
+    "  config-ui-down stop and remove only the configuration dashboard" \
+    "  reset-config-password generate a new config UI administrator password" \
+    "  revoke-config-tokens revoke every remote CLI token" \
+    "  etl [layer]  run all ETL layers, or one configured layer" \
+    "  all          start the stack, run ETL, then verify it" \
+    "  test         run local unit and configuration tests" \
+    "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
+    "  verify       run end-to-end acceptance checks" \
+    "  config       validate the Compose configuration" \
+    "  build-xyz    rebuild the pinned XYZ image" \
+    "  ps           show service state" \
+    "  logs         follow service logs" \
+    "  db           open psql inside the database container" \
+    "  stop         stop services without deleting data" \
+    "  down         remove containers/networks, preserving data"
+  printf '%s\n' \
+    "" \
+    "Set MAPP_ENVIRONMENT=production to include compose.production.yaml and" \
+    "enforce production-only HTTPS host settings for every wrapper command."
+}
+
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf 'Docker is not installed in this shell. Rebuild the devcontainer or run from a Docker-enabled host.\n' >&2
+    exit 127
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    printf 'Docker Compose v2 is required.\n' >&2
+    exit 127
+  fi
+}
+
+environment_value() {
+  local key="$1"
+  local value
+  if [[ -v "${key}" ]]; then
+    printf '%s' "${!key}"
+    return
+  fi
+  value="$(
+    sed -n "s/^${key}=//p" "${ENV_FILE}" \
+      | tail -n 1
+  )"
+  value="${value%$'\r'}"
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "${value}"
+}
+
+state_owner_error() {
+  local expected_uid="$1"
+  local expected_gid="$2"
+  local path="${3:-${STATE_DIR}}"
+  printf 'Writable state ownership does not match CONFIG_UID=%s and CONFIG_GID=%s: %s\n' \
+    "${expected_uid}" "${expected_gid}" "${path}" >&2
+  printf 'Repair it deliberately, for example: sudo chown -R %s:%s %q\n' \
+    "${expected_uid}" "${expected_gid}" "${STATE_DIR}" >&2
+  exit 2
+}
+
+check_state_owner() {
+  local expected_uid expected_gid mismatch path
+  expected_uid="$(environment_value CONFIG_UID)"
+  expected_gid="$(environment_value CONFIG_GID)"
+  if [[ ! "${expected_uid}" =~ ^[0-9]+$ || ! "${expected_gid}" =~ ^[0-9]+$ ]]; then
+    printf 'CONFIG_UID and CONFIG_GID must be numeric.\n' >&2
+    exit 2
+  fi
+  if [[ -e "${STATE_DIR}" ]]; then
+    if [[ "$(stat -c %u "${STATE_DIR}")" != "${expected_uid}" \
+      || "$(stat -c %g "${STATE_DIR}")" != "${expected_gid}" ]]; then
+      state_owner_error "${expected_uid}" "${expected_gid}"
+    fi
+    mismatch="$(
+      find "${STATE_DIR}" -xdev \
+        \( ! -uid "${expected_uid}" -o ! -gid "${expected_gid}" \) \
+        -print -quit 2>/dev/null || true
+    )"
+    if [[ -n "${mismatch}" ]]; then
+      state_owner_error "${expected_uid}" "${expected_gid}" "${mismatch}"
+    fi
+  fi
+  if [[ "$(id -u)" != "${expected_uid}" || "$(id -g)" != "${expected_gid}" ]]; then
+    for path in \
+      "${STATE_DIR}" \
+      "${WORKSPACE_DIR}" \
+      "${CONTROL_DIR}" \
+      "${CONTROL_DIR}/artifacts" \
+      "${CONTROL_DIR}/proposals" \
+      "${RELOAD_DIR}"
+    do
+      if [[ ! -e "${path}" ]]; then
+        state_owner_error "${expected_uid}" "${expected_gid}" "${path}"
+      fi
+    done
+  fi
+}
+
+init_state() {
+  umask 077
+  mkdir -p \
+    "${WORKSPACE_DIR}" \
+    "${CONTROL_DIR}/artifacts" \
+    "${CONTROL_DIR}/proposals" \
+    "${RELOAD_DIR}"
+  chmod 700 \
+    "${STATE_DIR}" \
+    "${WORKSPACE_DIR}" \
+    "${CONTROL_DIR}" \
+    "${CONTROL_DIR}/artifacts" \
+    "${CONTROL_DIR}/proposals" \
+    "${RELOAD_DIR}"
+
+  if [[ ! -f "${WORKSPACE_DIR}/workspace.json" ]]; then
+    if [[ ! -f "${ROOT_DIR}/instance/workspace.seed.json" ]]; then
+      printf 'Missing workspace seed: %s/instance/workspace.seed.json\n' "${ROOT_DIR}" >&2
+      exit 2
+    fi
+    cp "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
+    chmod 644 "${WORKSPACE_DIR}/workspace.json"
+    printf 'Created live workspace from instance/workspace.seed.json.\n'
+  fi
+}
+
+init_env() {
+  init_state
+  if [[ ! -f "${CONTROL_DIR}/auth.json" ]]; then
+    command -v openssl >/dev/null 2>&1 || {
+      printf 'openssl is required to generate the configuration administrator password.\n' >&2
+      exit 127
+    }
+    admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+    printf '%s\n' "${admin_password}" \
+      | python3 "${ROOT_DIR}/config-ui/config_admin.py" init \
+          --root "${CONTROL_DIR}" \
+          --password-stdin
+  fi
+  if [[ -e "${ENV_FILE}" ]]; then
+    printf 'Initialization skipped: %s already exists and was left unchanged.\n' "${ENV_FILE}"
+    return
+  fi
+
+  if [[ ! -f "${ROOT_DIR}/.env.example" ]]; then
+    printf 'Missing initialization template: %s/.env.example\n' "${ROOT_DIR}" >&2
+    exit 2
+  fi
+
+  command -v openssl >/dev/null 2>&1 || {
+    printf 'openssl is required to generate local passwords.\n' >&2
+    exit 127
+  }
+
+  umask 077
+  sed \
+    -e "s/CHANGEME_POSTGRES/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_ETL/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/" \
+    -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
+    -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \
+    "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+  printf 'Created %s with URL-safe local passwords.\n' "${ENV_FILE}"
+}
+
+if [[ "${1:-}" == "init" ]]; then
+  init_env
+  exit 0
+fi
+
+if [[ "${1:-}" == "doctor" ]]; then
+  python3 "${ROOT_DIR}/scripts/check_env.py" \
+    --example "${ROOT_DIR}/.env.example" \
+    --environment "${ENV_FILE}" \
+    "${@:2}"
+  exit $?
+fi
+
+require_docker
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  printf 'Missing %s. Run ./bin/mapp init first.\n' "${ENV_FILE}" >&2
+  exit 2
+fi
+check_state_owner
+init_state
+check_state_owner
+if [[ ! -f "${CONTROL_DIR}/auth.json" ]]; then
+  printf 'Configuration authentication is not initialized. Run ./bin/mapp init.\n' >&2
+  exit 2
+fi
+
+compose=(
+  docker compose
+  --project-directory "${ROOT_DIR}"
+  --env-file "${ENV_FILE}"
+  --file "${ROOT_DIR}/compose.yaml"
+)
+case "${MAPP_ENVIRONMENT:-development}" in
+  development)
+    ;;
+  production)
+    python3 "${ROOT_DIR}/scripts/validate_production_env.py" \
+      --environment "${ENV_FILE}"
+    compose+=(--file "${ROOT_DIR}/compose.production.yaml")
+    ;;
+  *)
+    printf 'Unsupported MAPP_ENVIRONMENT: expected development or production.\n' >&2
+    exit 2
+    ;;
+esac
+
+case "${1:-}" in
+  up|serve)
+    "${compose[@]}" up --detach --build db xyz config-ui browser-runner caddy
+    ;;
+  config-ui)
+    "${compose[@]}" up --detach --build \
+      db xyz config-ui browser-runner caddy
+    ;;
+  config-ui-down)
+    "${compose[@]}" rm --stop --force config-ui
+    ;;
+  reload-xyz)
+    generation="$("${compose[@]}" exec -T config-ui python -c 'from control_api import request_reload; print(request_reload()["requestedGeneration"])')"
+    printf 'XYZ reload generation %s requested.\n' "${generation}"
+    ;;
+  etl)
+    if [[ -n "${2:-}" ]]; then
+      "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
+    else
+      "${compose[@]}" run --rm --build etl
+    fi
+    ;;
+  all)
+    "${compose[@]}" up --detach --build db xyz config-ui browser-runner caddy
+    "${compose[@]}" run --rm --build etl
+    "${ROOT_DIR}/scripts/verify.sh"
+    ;;
+  verify)
+    "${ROOT_DIR}/scripts/verify.sh"
+    ;;
+  test)
+    "${compose[@]}" build config-ui etl
+    docker run --rm \
+      --volume "${ROOT_DIR}:/workspace:ro" \
+      --env PYTHONPATH=/app \
+      mapp-config-ui:local \
+      python -m unittest discover -s /workspace/config-ui/tests -v
+    docker run --rm \
+      --volume "${ROOT_DIR}:/workspace:ro" \
+      --env PYTHONPATH=/app/src \
+      mapp-leeds-etl:local \
+      python -m unittest discover -s /workspace/etl/tests -v
+    PYTHONPATH="${ROOT_DIR}" \
+      python3 -m unittest discover -s "${ROOT_DIR}/scripts/tests" -v
+    docker run --rm \
+      --volume "${ROOT_DIR}:/source:ro" \
+      --workdir /tmp \
+      "${NODE_IMAGE:-node:22.23.1-bookworm-slim}" \
+      sh -c '
+        cp -a /source/config-ui /tmp/config-ui
+        cd /tmp/config-ui
+        npm ci
+        npm test
+        npm run build
+        npm audit --omit=dev
+        node --check /source/docker/xyz/supervisor.mjs
+        node --check /source/browser-runner/server.mjs
+      '
+    "${compose[@]}" config --quiet
+    printf 'Unit tests and Compose validation passed.\n'
+    ;;
+  config)
+    "${compose[@]}" config --quiet
+    printf 'Compose configuration is valid.\n'
+    ;;
+  build-xyz)
+    "${compose[@]}" build --pull xyz
+    ;;
+  ps)
+    "${compose[@]}" ps
+    ;;
+  logs)
+    "${compose[@]}" logs --follow --tail 200
+    ;;
+  db)
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    "${compose[@]}" exec db psql --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}"
+    ;;
+  reset-config-password)
+    "${compose[@]}" run --rm --no-deps config-ui \
+      python config_admin.py reset-password --root /control
+    ;;
+  revoke-config-tokens)
+    "${compose[@]}" run --rm --no-deps config-ui \
+      python config_admin.py revoke-tokens --root /control
+    ;;
+  stop)
+    "${compose[@]}" stop
+    ;;
+  down)
+    "${compose[@]}" down
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

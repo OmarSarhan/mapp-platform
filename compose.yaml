@@ -1,0 +1,228 @@
+name: ${COMPOSE_PROJECT_NAME:-mapp-explore}
+
+services:
+  db:
+    image: ${POSTGIS_IMAGE:-postgis/postgis:17-3.5}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+      ETL_DB_USER: ${ETL_DB_USER:?Set ETL_DB_USER in .env}
+      ETL_DB_PASSWORD: ${ETL_DB_PASSWORD:?Set ETL_DB_PASSWORD in .env}
+      XYZ_DB_USER: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
+      XYZ_DB_PASSWORD: ${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgis/init/10-roles.sh:/docker-entrypoint-initdb.d/90-mapp-roles.sh:ro
+      - ./docker/postgis/init/20-runtime-info.sql:/docker-entrypoint-initdb.d/95-mapp-runtime-info.sql:ro
+      - ./docker/postgis/healthcheck.sh:/usr/local/bin/mapp-db-healthcheck:ro
+    healthcheck:
+      test: [CMD, /usr/local/bin/mapp-db-healthcheck]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    shm_size: 256mb
+    stop_grace_period: 30s
+    networks:
+      - backend
+
+  xyz:
+    image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
+    build:
+      context: ./docker/xyz
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22.23.1-bookworm-slim}
+        XYZ_REF: ${XYZ_REF:-v4.23.4}
+        XYZ_COMMIT: ${XYZ_COMMIT:-a6f03c07dd7aaae2e9ab04087143ee0400e15cb9}
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    env_file:
+      - ./instance/xyz.env
+    environment:
+      DBS_MAPP: postgresql://${XYZ_DB_USER:?Set XYZ_DB_USER in .env}:${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+    expose:
+      - "3000"
+    volumes:
+      # XYZ receives only the live workspace, public instance assets, and its
+      # narrow reload mailbox. Authentication, proposals, audit logs, and
+      # browser artifacts are intentionally outside its filesystem view.
+      - ./var/workspace:/app/xyz/mapp-settings:ro
+      - ./instance/public:/app/xyz/public/instance:ro
+      - ./var/reload:/reload
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - edge
+      - backend
+
+  config-ui:
+    image: mapp-config-ui:local
+    build:
+      context: ./config-ui
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      DBS_MAPP: postgresql://${XYZ_DB_USER:?Set XYZ_DB_USER in .env}:${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      WORKSPACE_PATH: /workspace/workspace.json
+      SVG_DIR: /instance-public/svg
+      PORT: 8080
+      CONTROL_DIR: /control
+      WORKSPACE_SCHEMA_PATH: /app/schema/workspace.schema.json
+      RELOAD_DIR: /reload
+      XYZ_VERSION: ${XYZ_REF:-v4.23.4}
+      CONFIG_ALLOWED_HOSTS: ${CONFIG_ALLOWED_HOSTS:-localhost,127.0.0.1,config.localhost,config-ui}
+      CONFIG_SECURE_COOKIES: ${CONFIG_SECURE_COOKIES:-false}
+      BROWSER_RUNNER_URL: http://browser-runner:8080/run
+      BROWSER_XYZ_URL: http://caddy:8081
+    volumes:
+      # The workspace directory is writable so atomic rename remains possible.
+      # Public SVGs and the schema are read-only; sensitive control state is
+      # isolated from both XYZ and the public asset tree.
+      - ./var/workspace:/workspace
+      - ./instance/public:/instance-public:ro
+      - ./var/control:/control
+      - ./var/reload:/reload
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+      - edge
+      - automation
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.10.0-alpine}
+    restart: unless-stopped
+    ports:
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-3000}:80"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-3443}:443"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-3443}:443/udp"
+    environment:
+      MAP_SITE: ${MAP_SITE:-http://localhost}
+      CONFIG_SITE: ${CONFIG_SITE:-http://config.localhost}
+      CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.invalid}
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      xyz:
+        condition: service_healthy
+        restart: true
+      config-ui:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: [CMD, caddy, validate, --config, /etc/caddy/Caddyfile]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - edge
+      - automation
+
+  etl:
+    image: mapp-leeds-etl:local
+    build:
+      context: ./etl
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: postgresql://${ETL_DB_USER:?Set ETL_DB_USER in .env}:${ETL_DB_PASSWORD:?Set ETL_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      ETL_CONFIG: /config/layers.json
+      LOG_LEVEL: INFO
+    command:
+      - python
+      - -m
+      - leeds_arcgis_etl
+      - --config
+      - /config/layers.json
+    volumes:
+      - ./instance/etl:/config:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+
+  browser-runner:
+    image: mapp-browser-runner:local
+    build:
+      context: ./browser-runner
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    restart: unless-stopped
+    working_dir: /runner
+    environment:
+      PORT: 8080
+      ARTIFACT_DIR: /artifacts
+      ALLOWED_ORIGIN: http://caddy:8081
+      MAX_CONCURRENT_RUNS: ${BROWSER_MAX_CONCURRENT_RUNS:-1}
+    volumes:
+      - ./var/control/artifacts:/artifacts
+    expose:
+      - "8080"
+    healthcheck:
+      test: [CMD-SHELL, "curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - automation
+      # The runner needs outbound access for map CDN/basemap assets, but it
+      # does not join the database/backend or public edge networks. The
+      # automation network is shared only with config-ui and Caddy.
+      - browser-egress
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_postgres_data
+  caddy_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_caddy_data
+  caddy_config:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_caddy_config
+
+networks:
+  edge:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_edge
+  backend:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_backend
+  automation:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_automation
+    internal: true
+  browser-egress:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_browser-egress

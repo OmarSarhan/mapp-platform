@@ -1,0 +1,49 @@
+{
+	email {$CADDY_EMAIL:admin@example.invalid}
+	admin off
+}
+
+{$MAP_SITE:http://localhost} {
+	encode zstd gzip
+	@blocked path_regexp fileprovider (?i)^/(?:[^/]+/)*api/provider/file(?:/|$)
+	respond @blocked 404
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	reverse_proxy xyz:3000 {
+		health_uri /healthz
+		health_interval 10s
+	}
+}
+
+{$CONFIG_SITE:http://config.localhost} {
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Content-Security-Policy "default-src 'self'; style-src 'self' https://geolytix.com 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+		-Server
+	}
+	request_body {
+		max_size 5MB
+	}
+	reverse_proxy config-ui:8080 {
+		health_uri /healthz
+		health_interval 10s
+	}
+}
+
+# The automation hostname is intentionally unusable on the published HTTP
+# listener. Browser validation uses the separate, un-published :8081 site.
+http://caddy {
+	respond 404
+}
+
+http://caddy:8081 {
+	@blocked path_regexp fileprovider (?i)^/(?:[^/]+/)*api/provider/file(?:/|$)
+	respond @blocked 404
+	reverse_proxy xyz:3000
+}
