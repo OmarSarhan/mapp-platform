@@ -20,6 +20,43 @@ class ArcGISError(RuntimeError):
     pass
 
 
+def _format_service_error(url: str, error: Any) -> str:
+    code: int | str | None = None
+    descriptions: list[str] = []
+    if isinstance(error, dict):
+        raw_code = error.get("code")
+        if (
+            isinstance(raw_code, (int, str))
+            and not isinstance(raw_code, bool)
+            and str(raw_code).strip()
+        ):
+            code = raw_code
+
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            descriptions.append(message.strip())
+
+        details = error.get("details")
+        if isinstance(details, list):
+            useful_details = [
+                detail.strip()
+                for detail in details
+                if isinstance(detail, str) and detail.strip()
+            ]
+            if useful_details:
+                descriptions.append(f"Details: {'; '.join(useful_details)}")
+    elif isinstance(error, str) and error.strip():
+        descriptions.append(error.strip())
+
+    code_suffix = f" (code {code})" if code is not None else ""
+    description = (
+        " ".join(descriptions)
+        if descriptions
+        else "The service did not provide an error message."
+    )
+    return f"ArcGIS service error from {url}{code_suffix}: {description}"
+
+
 class ArcGISClient:
     def __init__(
         self,
@@ -52,7 +89,7 @@ class ArcGISClient:
                     )
                 if "error" in payload:
                     error = payload["error"]
-                    raise ArcGISError(f"ArcGIS error from {url}: {error}")
+                    raise ArcGISError(_format_service_error(url, error))
                 return payload
             except ArcGISError:
                 raise

@@ -182,17 +182,17 @@
           }
         }
       },
-      "Recent Planning Applications": {
-        "name": "Planning Applications Valid Last Month",
+      "Smoke Control Orders": {
+        "name": "Smoke Control Orders",
         "display": false,
         "format": "mvt",
         "dbs": "MAPP",
-        "table": "leeds.planning_applications_recent",
+        "table": "leeds.smoke_control_orders",
         "geom": "geom_3857",
         "srid": "3857",
         "qID": "object_id",
         "attribution": {
-          "Leeds City Council source": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1",
+          "Leeds City Council source": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/8",
           "Leeds data terms": "https://www.leeds.gov.uk/opendata/terms-and-licences"
         },
         "infoj": [
@@ -214,40 +214,45 @@
             "inline": true
           },
           {
-            "title": "Reference",
+            "title": "Locality",
+            "field": "locality",
+            "inline": true
+          },
+          {
+            "title": "Order reference",
             "field": "reference",
             "inline": true
           },
           {
-            "title": "Address",
-            "field": "address",
+            "title": "Council reference",
+            "field": "council_reference",
             "inline": true
           },
           {
-            "title": "Proposal",
-            "field": "proposal"
+            "title": "Description",
+            "field": "description"
           },
           {
-            "title": "Validated",
-            "field": "validated_at",
+            "title": "Order date",
+            "field": "order_date",
             "inline": true
           },
           {
-            "title": "Decision",
-            "field": "decision_code",
+            "title": "Legislation",
+            "field": "legislation",
             "inline": true
           },
           {
-            "title": "Housing density",
-            "field": "housing_density",
+            "title": "Area (m²)",
+            "field": "area_square_metres",
             "inline": true
           }
         ],
         "style": {
           "default": {
-            "fillColor": "#7048e8",
+            "fillColor": "#2f9e44",
             "fillOpacity": 0.28,
-            "strokeColor": "#5f3dc4",
+            "strokeColor": "#237a35",
             "strokeWidth": 1
           },
           "highlight": {

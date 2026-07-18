@@ -1,50 +1,59 @@
 # Leeds ArcGIS to PostGIS ETL
 
-This is a deliberately small, one-shot loader for three public Leeds layers. It
-does not mirror the whole `Public` folder. The runtime image contains the code
-and a baked example manifest; deployment uses `/config/layers.json`, mounted
-from `instance/etl/layers.json` on the host.
+This is a deliberately small, one-shot sample-data loader for three public
+Leeds layers. It is not required by the MAPP runtime and does not mirror the
+whole `Public` folder. The supported wrapper enables it only with
+`MAPP_DATABASE_MODE=bundled`; an external PostGIS deployment is expected to
+manage its own data. The runtime image contains the code and a baked example
+manifest; deployment uses `/config/layers.json`, mounted from
+`instance/etl/layers.json` on the host.
 
 ## Selected data
 
-Counts below were observed on 2026-07-15 and will change at the publisher.
+Counts below were observed on 2026-07-17 and will change at the publisher.
 
 | Target table | ArcGIS layer | Geometry | Observed rows | Representative fields |
 | --- | --- | --- | ---: | --- |
 | `leeds.bus_stops` | [`Transportation/MapServer/0`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Transportation/MapServer/0) — Leeds Bus Stops | Point | 4,233 | text, ArcGIS epoch dates |
 | `leeds.definitive_paths` | [`PROW/MapServer/4`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/PROW/MapServer/4) — Definitive Paths | line | 2,484 | text, double precision |
-| `leeds.planning_applications_recent` | [`Planning/MapServer/1`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1) — Planning Apps Valid Last Month | polygon | 275 | OID, integer, long text, double precision, dates |
+| `leeds.smoke_control_orders` | [`Planning/MapServer/8`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/8) — Smoke Control Orders | polygon | 200 | OID, integer, long text, double precision, dates |
 
 All three layer resources report source EPSG:27700, GeoJSON query support,
 ordered pagination, and a `maxRecordCount` of 1,000. The loader requests
-`outSR=4326`; Leeds ArcGIS Server performs the reprojection. The planning layer's
-name is publisher-supplied and is not a freshness guarantee; inspect its dates
-before treating it as current operational data.
+`outSR=4326`; Leeds ArcGIS Server performs the reprojection. These are public
+sample sources, not an operational-data freshness guarantee.
 
-## Current source status
+## Polygon-source selection
 
-On 2026-07-16, the configured
+The original sample used
 [`Planning/MapServer/1`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1)
-resource continued to return metadata, while both count and feature queries
-returned ArcGIS error 400, `Failed to execute query`. The opt-in live source
-test therefore fails for `planning_applications_recent`. The ETL treats this as
-a source failure: it exits non-zero, does not reconcile deletions, and leaves
-the existing 275 database rows available.
+(`Planning Apps Valid Last Month`). On 2026-07-17 it still returned metadata,
+but every tested count and feature query returned ArcGIS error 400. Planning
+layers 11 and 12 were rejected as fallbacks: they have different schemas and
+meanings and contained 65,642 and 363,050 records respectively.
 
-The same
-[`Planning` service](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer)
-currently exposes queryable layers 11 and 12, but their names, schemas, and
-record counts differ materially from the selected previous-month dataset.
-They are not safe drop-in replacements. Changing the source requires an owner
-decision plus a reviewed field mapping, retention policy, workspace update,
-and full ETL/XYZ/visual validation.
+The reviewed replacement is
+[`Planning/MapServer/8`](https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/8)
+(`Smoke Control Orders`). It is a bounded Leeds polygon dataset with 200
+queryable records and retains the sample's representative integer, long-text,
+date, and double-precision mappings. It uses a new
+`leeds.smoke_control_orders` table so source identities cannot mix with the
+retired planning dataset.
+
+The loader does not destructively remove tables that disappear from the
+manifest. An upgraded database can therefore retain the former
+`leeds.planning_applications_recent` snapshot, but it is no longer refreshed or
+referenced by the versioned workspace seed. After checking that no live
+workspace or downstream consumer still uses it, a database owner may archive
+or drop it separately.
 
 ## Runtime contract
 
 - Docker build context: `./etl`
 - Dockerfile: `./etl/Dockerfile`
 - Command: `python -m leeds_arcgis_etl`
-- Required environment: `DATABASE_URL`
+- Required container environment: `DATABASE_URL`, populated by Compose from
+  the operator-facing `.env` key `ETL_DATABASE_URL`
 - Optional environment: `ETL_CONFIG` (default `/config/layers.json`),
   `ETL_LAYER` (comma-separated keys), `LOG_LEVEL`
 - Optional CLI: `--layer KEY` (repeatable), `--check-source`, `--config PATH`
@@ -119,6 +128,11 @@ not that the entire prior snapshot is byte-for-byte unchanged. Page upserts
 make a retry safe and idempotent. A session-level PostgreSQL advisory lock
 serializes each target layer; a second overlapping invocation exits before it
 writes a run record or table row.
+
+Known ArcGIS service failures are reported as one concise error rather than a
+Python traceback. They still return non-zero so scheduling and monitoring do
+not mistake a failed refresh for success. Unexpected programming or database
+errors retain their traceback for diagnosis.
 
 ## Verification
 

@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from .arcgis import ArcGISClient
+from .arcgis import ArcGISClient, ArcGISError
 from .config import AppConfig, ConfigError, load_config
 from .core import prepare_feature, validate_metadata
 
@@ -149,6 +149,13 @@ def main() -> int:
         for layer in config.layers:
             try:
                 run_layer(layer, client, store)
+            except ArcGISError as exc:
+                failed = True
+                LOGGER.error(
+                    "%s failed safely: %s Stale-row reconciliation was skipped.",
+                    layer.key,
+                    exc,
+                )
             except Exception:
                 failed = True
                 LOGGER.exception("%s failed", layer.key)

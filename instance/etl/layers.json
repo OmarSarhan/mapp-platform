@@ -51,29 +51,30 @@
       ]
     },
     {
-      "key": "planning_applications_recent",
-      "description": "The council's bounded 'valid last month' planning layer; polygon, integer, long text, double and date example.",
-      "source_url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/1",
-      "target_table": "planning_applications_recent",
+      "key": "smoke_control_orders",
+      "description": "Leeds smoke control order areas; bounded polygon example with integer, long text, double and date fields.",
+      "source_url": "https://mapservices.leeds.gov.uk/arcgis/rest/services/Public/Planning/MapServer/8",
+      "target_table": "smoke_control_orders",
       "where": "1=1",
-      "object_id_field": "OBJECTID_1",
+      "object_id_field": "OBJECTID",
       "source_geometry_type": "esriGeometryPolygon",
       "target_geometry_type": "MultiPolygon",
       "expected_source_srid": 27700,
       "minimum_source_count": 150,
       "columns": [
-        {"source": "OBJECTID", "target": "application_object_id", "type": "integer"},
-        {"source": "KEYVAL", "target": "key_value", "type": "text"},
-        {"source": "REFVAL", "target": "reference", "type": "text"},
-        {"source": "PROPOSAL", "target": "proposal", "type": "text"},
-        {"source": "DATEDECISS", "target": "decision_at", "type": "timestamptz"},
-        {"source": "DATEAPVAL", "target": "validated_at", "type": "timestamptz"},
-        {"source": "DECSN", "target": "decision_code", "type": "text"},
-        {"source": "DCAPPTYP", "target": "application_type", "type": "text"},
-        {"source": "DCSTAT", "target": "status_code", "type": "text"},
-        {"source": "ADDRESS", "target": "address", "type": "text"},
-        {"source": "HOUSEDENS", "target": "housing_density", "type": "double precision"},
-        {"source": "CODETEXT", "target": "code_text", "type": "text"}
+        {"source": "INT_ID", "target": "source_id", "type": "integer"},
+        {"source": "INT_VERSION", "target": "version", "type": "integer"},
+        {"source": "TLC_CURRENT_FLAG", "target": "current_flag", "type": "text"},
+        {"source": "REGISTRATION_DATE", "target": "registered_at", "type": "timestamptz"},
+        {"source": "LC_REFERENCE", "target": "council_reference", "type": "text"},
+        {"source": "LEGISLATION", "target": "legislation", "type": "text"},
+        {"source": "REFERENCE", "target": "reference", "type": "text"},
+        {"source": "DESCRIPTION", "target": "description", "type": "text"},
+        {"source": "DATED", "target": "order_date", "type": "timestamptz"},
+        {"source": "LIVE", "target": "live_flag", "type": "text"},
+        {"source": "LV_NAME", "target": "name", "type": "text"},
+        {"source": "LOCALITY", "target": "locality", "type": "text"},
+        {"source": "SHAPE.AREA", "target": "area_square_metres", "type": "double precision"}
       ]
     }
   ]

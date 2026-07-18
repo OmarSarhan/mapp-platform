@@ -60,6 +60,12 @@ def sample_metadata() -> dict[str, object]:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_baked_and_deployed_manifests_match(self) -> None:
+        self.assertEqual(
+            (ROOT / "config" / "layers.json").read_bytes(),
+            (ROOT.parent / "instance" / "etl" / "layers.json").read_bytes(),
+        )
+
     def test_shipped_config_loads(self) -> None:
         config = load_config(ROOT / "config" / "layers.json")
         self.assertEqual(config.target_schema, "leeds")
@@ -68,11 +74,46 @@ class ConfigTests(unittest.TestCase):
             [
                 "bus_stops",
                 "definitive_paths",
-                "planning_applications_recent",
+                "smoke_control_orders",
             ],
         )
         self.assertTrue(
             all(layer.minimum_source_count > 0 for layer in config.layers)
+        )
+
+    def test_polygon_sample_uses_distinct_smoke_control_contract(self) -> None:
+        config = load_config(ROOT / "config" / "layers.json")
+        layer = next(
+            layer for layer in config.layers if layer.key == "smoke_control_orders"
+        )
+        self.assertEqual(
+            layer.source_url,
+            "https://mapservices.leeds.gov.uk/arcgis/rest/services/"
+            "Public/Planning/MapServer/8",
+        )
+        self.assertEqual(layer.target_table, "smoke_control_orders")
+        self.assertEqual(layer.object_id_field, "OBJECTID")
+        self.assertEqual(layer.minimum_source_count, 150)
+        self.assertEqual(
+            {
+                column.source: (column.target, column.postgres_type)
+                for column in layer.columns
+            },
+            {
+                "INT_ID": ("source_id", "integer"),
+                "INT_VERSION": ("version", "integer"),
+                "TLC_CURRENT_FLAG": ("current_flag", "text"),
+                "REGISTRATION_DATE": ("registered_at", "timestamptz"),
+                "LC_REFERENCE": ("council_reference", "text"),
+                "LEGISLATION": ("legislation", "text"),
+                "REFERENCE": ("reference", "text"),
+                "DESCRIPTION": ("description", "text"),
+                "DATED": ("order_date", "timestamptz"),
+                "LIVE": ("live_flag", "text"),
+                "LV_NAME": ("name", "text"),
+                "LOCALITY": ("locality", "text"),
+                "SHAPE.AREA": ("area_square_metres", "double precision"),
+            },
         )
 
     def test_minimum_source_count_must_be_non_negative(self) -> None:

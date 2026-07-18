@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
+from leeds_arcgis_etl.arcgis import ArcGISError
 from leeds_arcgis_etl.pipeline import ConsistencyError, run_layer
 from test_core import sample_layer, sample_metadata
 
@@ -38,6 +39,14 @@ class FakeClient:
         for page in self.raw_pages:
             yield offset, page
             offset += len(page)
+
+
+class CountErrorClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__([], [])
+
+    def count(self, _layer: Any) -> int:
+        raise ArcGISError("ArcGIS service error: source unavailable")
 
 
 class FakeStore:
@@ -112,6 +121,20 @@ class PipelineTests(unittest.TestCase):
             run_layer(
                 layer,
                 FakeClient([2], [[feature(1), feature(2)]]),  # type: ignore[arg-type]
+                store,  # type: ignore[arg-type]
+            )
+        self.assertEqual(store.upserted, [])
+        self.assertFalse(store.reconciled)
+        self.assertFalse(store.finished)
+        self.assertTrue(store.failed)
+        self.assertTrue(store.lock_released)
+
+    def test_source_error_records_failure_without_reconciliation(self) -> None:
+        store = FakeStore()
+        with self.assertRaisesRegex(ArcGISError, "source unavailable"):
+            run_layer(
+                sample_layer(),
+                CountErrorClient(),  # type: ignore[arg-type]
                 store,  # type: ignore[arg-type]
             )
         self.assertEqual(store.upserted, [])

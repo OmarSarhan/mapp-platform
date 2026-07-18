@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
+import json
 import unittest
 from typing import Any
+from unittest.mock import patch
 
-from leeds_arcgis_etl.arcgis import ArcGISClient
+from leeds_arcgis_etl.arcgis import ArcGISClient, ArcGISError
 from test_core import sample_layer
 
 
@@ -62,6 +65,39 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(
             len(list(client.pages(sample_layer(), {"maxRecordCount": 2}))), 1
         )
+
+
+class RequestErrorTests(unittest.TestCase):
+    def test_http_200_service_error_is_concise_and_not_retried(self) -> None:
+        response = io.BytesIO(
+            json.dumps(
+                {
+                    "error": {
+                        "code": 400,
+                        "extendedCode": -2147467261,
+                        "message": "Unable to complete operation.",
+                        "details": [],
+                    }
+                }
+            ).encode("utf-8")
+        )
+        client = ArcGISClient(retries=4)
+
+        with patch(
+            "leeds_arcgis_etl.arcgis.urlopen",
+            return_value=response,
+        ) as mocked_urlopen:
+            with self.assertRaises(ArcGISError) as raised:
+                client.count(sample_layer())
+
+        self.assertEqual(
+            str(raised.exception),
+            "ArcGIS service error from "
+            "https://example.test/MapServer/0/query (code 400): "
+            "Unable to complete operation.",
+        )
+        self.assertNotIn("extendedCode", str(raised.exception))
+        mocked_urlopen.assert_called_once()
 
 
 if __name__ == "__main__":
