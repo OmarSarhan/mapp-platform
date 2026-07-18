@@ -1,7 +1,7 @@
-# Optional override for host database tools:
-# docker compose -f compose.yaml -f compose.db-port.yaml up -d db
+# Optional override for host tools accessing the bundled sample database:
+# docker compose -f compose.yaml -f compose.bundled-db.yaml \
+#   -f compose.db-port.yaml up -d db
 services:
   db:
     ports:
       - "${DB_BIND_ADDRESS:-127.0.0.1}:${DB_PORT:-5432}:5432"
-

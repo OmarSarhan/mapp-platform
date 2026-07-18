@@ -40,6 +40,10 @@ FROM ${NODE_IMAGE} AS runtime
 ARG XYZ_REF=v4.23.4
 ARG XYZ_COMMIT=a6f03c07dd7aaae2e9ab04087143ee0400e15cb9
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 LABEL org.opencontainers.image.title="GEOLYTIX XYZ" \
       org.opencontainers.image.source="https://github.com/GEOLYTIX/xyz" \
       org.opencontainers.image.version="${XYZ_REF}" \

@@ -9,7 +9,11 @@ def production_values() -> dict[str, str]:
         "PRODUCTION_CONFIG_SITE": "https://config.company.co.uk",
         "PRODUCTION_CONFIG_ALLOWED_HOSTS": "config.company.co.uk,config-ui",
         "PRODUCTION_CADDY_EMAIL": "operations@company.co.uk",
+        "EDGE_BIND_ADDRESS": "0.0.0.0",
+        "HTTP_PORT": "80",
         "HTTPS_PORT": "443",
+        "CONFIG_UID": "1000",
+        "CONFIG_GID": "1000",
     }
 
 
@@ -51,6 +55,10 @@ class ProductionEnvironmentTests(unittest.TestCase):
             "https://10.0.0.2",
             "https://config",
             "https://maps.example.org",
+            "https://maps.internal",
+            "https://maps.local",
+            "https://maps.home.arpa",
+            "https://maps.onion",
         ):
             with self.subTest(origin=origin):
                 values = production_values()
@@ -90,6 +98,10 @@ class ProductionEnvironmentTests(unittest.TestCase):
             "https://[2001:4860:4860::8888]",
             "https://maps.company.co.uk:8443",
             "https://maps.company.co.uk.",
+            "https://maps.company.co.uk/",
+            "https://maps.company.co.uk?",
+            "https://maps.company.co.uk#",
+            "https://@maps.company.co.uk",
         ):
             with self.subTest(origin=origin):
                 values = production_values()
@@ -108,8 +120,30 @@ class ProductionEnvironmentTests(unittest.TestCase):
         self.assertTrue(any("trailing-dot" in error for error in validate(values)))
 
         values = production_values()
+        values["HTTP_PORT"] = "3000"
+        self.assertTrue(any("HTTP_PORT" in error for error in validate(values)))
+
+        values = production_values()
         values["HTTPS_PORT"] = "3443"
         self.assertTrue(any("HTTPS_PORT" in error for error in validate(values)))
+
+        values = production_values()
+        values["EDGE_BIND_ADDRESS"] = "127.0.0.1"
+        self.assertTrue(
+            any("EDGE_BIND_ADDRESS" in error for error in validate(values))
+        )
+
+    def test_rejects_root_or_malformed_runtime_ids(self):
+        for key, value in (
+            ("CONFIG_UID", "0"),
+            ("CONFIG_GID", "0"),
+            ("CONFIG_UID", "root"),
+            ("CONFIG_GID", "-1"),
+        ):
+            with self.subTest(key=key, value=value):
+                values = production_values()
+                values[key] = value
+                self.assertTrue(any(key in error for error in validate(values)))
 
 
 if __name__ == "__main__":

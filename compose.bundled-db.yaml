@@ -1,0 +1,88 @@
+# Bundled sample-data overlay. The supported wrapper includes this file only
+# when MAPP_DATABASE_MODE=bundled. External mode has no local database or ETL
+# service in its resolved Compose model.
+services:
+  db:
+    image: ${POSTGIS_IMAGE:-mapp-postgis-h3:17-3.5-4.2.3}
+    build:
+      context: ./docker/postgis
+      args:
+        H3_PG_REF: ${H3_PG_REF:-v4.2.3}
+        H3_PG_COMMIT: ${H3_PG_COMMIT:-a26630b8353d441e6bc8065c0a8dcaa3d89ef87b}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
+      ETL_DB_USER: ${ETL_DB_USER:?Set ETL_DB_USER in .env}
+      ETL_DB_PASSWORD: ${ETL_DB_PASSWORD:?Set ETL_DB_PASSWORD in .env}
+      XYZ_DB_USER: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
+      XYZ_DB_PASSWORD: ${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}
+      DERIVED_DB_USER: ${DERIVED_DB_USER:?Set DERIVED_DB_USER in .env}
+      DERIVED_DB_PASSWORD: ${DERIVED_DB_PASSWORD:?Set DERIVED_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgis/init/05-h3.sql:/docker-entrypoint-initdb.d/80-mapp-h3.sql:ro
+      - ./docker/postgis/init/10-roles.sh:/docker-entrypoint-initdb.d/90-mapp-roles.sh:ro
+      - ./docker/postgis/init/20-runtime-info.sql:/docker-entrypoint-initdb.d/95-mapp-runtime-info.sql:ro
+      - ./docker/postgis/healthcheck.sh:/usr/local/bin/mapp-db-healthcheck:ro
+      - ./docker/postgis/upgrade-derived.sh:/usr/local/bin/mapp-upgrade-derived:ro
+    healthcheck:
+      test: [CMD, /usr/local/bin/mapp-db-healthcheck]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    shm_size: 256mb
+    stop_grace_period: 30s
+    networks:
+      - backend
+
+  xyz:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  config-ui:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DERIVED_DATABASE_URL: ${DERIVED_DATABASE_URL:?Set DERIVED_DATABASE_URL in .env}
+      DERIVED_READER_ROLE: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
+
+  etl:
+    image: mapp-leeds-etl:local
+    build:
+      context: ./etl
+    profiles:
+      - tools
+    environment:
+      DATABASE_URL: ${ETL_DATABASE_URL:?Set ETL_DATABASE_URL in .env}
+      ETL_CONFIG: /config/layers.json
+      LOG_LEVEL: INFO
+    command:
+      - python
+      - -m
+      - leeds_arcgis_etl
+      - --config
+      - /config/layers.json
+    volumes:
+      - ./instance/etl:/config:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_postgres_data

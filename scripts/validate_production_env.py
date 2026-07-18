@@ -13,15 +13,25 @@ PRODUCTION_KEYS = (
     "PRODUCTION_CONFIG_SITE",
     "PRODUCTION_CONFIG_ALLOWED_HOSTS",
     "PRODUCTION_CADDY_EMAIL",
+    "EDGE_BIND_ADDRESS",
+    "HTTP_PORT",
+    "HTTPS_PORT",
+    "CONFIG_UID",
+    "CONFIG_GID",
 )
-ENV_OVERRIDE_KEYS = (*PRODUCTION_KEYS, "HTTPS_PORT")
+ENV_OVERRIDE_KEYS = PRODUCTION_KEYS
 RESERVED_SUFFIXES = (
+    "alt",
+    "arpa",
     "example",
     "example.com",
     "example.net",
     "example.org",
+    "internal",
     "invalid",
+    "local",
     "localhost",
+    "onion",
     "test",
 )
 DNS_LABEL = re.compile(
@@ -83,11 +93,13 @@ def validated_origin(value: str, key: str, errors: list[str]) -> str | None:
     if (
         parsed.scheme != "https"
         or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.path not in ("", "/")
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
         or parsed.query
         or parsed.fragment
+        or "?" in value
+        or "#" in value
     ):
         errors.append(f"{key} must be an HTTPS origin without credentials, path, query, or fragment.")
         return None
@@ -123,10 +135,30 @@ def validate(values: dict[str, str]) -> list[str]:
     if missing:
         errors.extend(f"{key} is required for production." for key in missing)
         return errors
-    if values.get("HTTPS_PORT", "443").strip() != "443":
+    if values["HTTP_PORT"].strip() != "80":
+        errors.append(
+            "HTTP_PORT must be 80 so Caddy can redirect HTTP and complete standard ACME challenges."
+        )
+    if values["HTTPS_PORT"].strip() != "443":
         errors.append(
             "HTTPS_PORT must be 443 for the direct production deployment."
         )
+    for key in ("CONFIG_UID", "CONFIG_GID"):
+        if re.fullmatch(r"[1-9][0-9]*", values[key].strip()) is None:
+            errors.append(
+                f"{key} must be a positive non-root numeric ID for production."
+            )
+
+    raw_bind_address = values["EDGE_BIND_ADDRESS"].strip()
+    try:
+        bind_address = ipaddress.ip_address(raw_bind_address.strip("[]"))
+    except ValueError:
+        errors.append("EDGE_BIND_ADDRESS must be a valid host interface address.")
+    else:
+        if bind_address.is_loopback:
+            errors.append(
+                "EDGE_BIND_ADDRESS must not be loopback for the direct production deployment."
+            )
 
     map_origin = validated_origin(
         values["PRODUCTION_MAP_SITE"].strip(),

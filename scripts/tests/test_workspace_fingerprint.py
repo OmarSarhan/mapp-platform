@@ -1,4 +1,5 @@
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -12,7 +13,6 @@ sys.path.insert(0, str(ROOT / "config-ui"))
 from control_api import workspace_fingerprint
 
 
-@unittest.skipUnless(shutil.which("node"), "Node is required for cross-language hashing")
 class WorkspaceFingerprintTests(unittest.TestCase):
     def test_python_and_node_hash_identical_saved_bytes(self):
         fixtures = (
@@ -29,10 +29,29 @@ class WorkspaceFingerprintTests(unittest.TestCase):
             "process.stdout.write(createHash('sha256')"
             ".update(Buffer.concat(chunks)).digest('hex'));"
         )
+        if shutil.which("node"):
+            command = ["node", "--input-type=module", "-e", script]
+        elif shutil.which("docker"):
+            command = [
+                "docker",
+                "run",
+                "--rm",
+                "--interactive",
+                "--network",
+                "none",
+                os.environ.get("NODE_IMAGE", "node:22.23.1-bookworm-slim"),
+                "node",
+                "--input-type=module",
+                "-e",
+                script,
+            ]
+        else:
+            self.fail("Node or Docker is required for cross-language hashing")
+
         for raw in fixtures:
             with self.subTest(raw=raw):
                 node_hash = subprocess.run(
-                    ["node", "--input-type=module", "-e", script],
+                    command,
                     input=raw,
                     check=True,
                     capture_output=True,

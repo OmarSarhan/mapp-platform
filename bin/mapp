@@ -7,34 +7,38 @@ STATE_DIR="${ROOT_DIR}/var"
 WORKSPACE_DIR="${STATE_DIR}/workspace"
 CONTROL_DIR="${STATE_DIR}/control"
 RELOAD_DIR="${STATE_DIR}/reload"
+PREVIEW_DIR="${STATE_DIR}/preview"
+PREVIEW_RELOAD_DIR="${STATE_DIR}/preview-reload"
 
 usage() {
   printf '%s\n' \
     "Usage: ./bin/mapp <command>" \
     "" \
     "  init         create a private .env from .env.example" \
-    "  up           build/start PostGIS, XYZ, config UI, and Caddy" \
-    "  serve        start PostGIS, XYZ, config UI, and Caddy without rerunning ETL" \
-    "  reload-xyz   request an XYZ process reload" \
+    "  up           build/start the configured database mode and platform services" \
+    "  serve        start platform services without running the sample ETL" \
+    "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
     "  config-ui    build/start the workspace configuration dashboard" \
     "  config-ui-down stop and remove only the configuration dashboard" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  run all ETL layers, or one configured layer" \
-    "  all          start the stack, run ETL, then verify it" \
+    "  etl [layer]  load sample data in bundled-database mode" \
+    "  upgrade-derived install H3 and derived-layer roles into an existing bundled database" \
+    "  all          start bundled mode, load sample data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
+    "  production-acceptance [options] collect redacted production readiness evidence" \
     "  verify       run end-to-end acceptance checks" \
     "  config       validate the Compose configuration" \
     "  build-xyz    rebuild the pinned XYZ image" \
     "  ps           show service state" \
     "  logs         follow service logs" \
-    "  db           open psql inside the database container" \
+    "  db           open psql inside the bundled sample database" \
     "  stop         stop services without deleting data" \
     "  down         remove containers/networks, preserving data"
   printf '%s\n' \
     "" \
-    "Set MAPP_ENVIRONMENT=production to include compose.production.yaml and" \
+    "Set MAPP_ENVIRONMENT=production in .env to include compose.production.yaml and" \
     "enforce production-only HTTPS host settings for every wrapper command."
 }
 
@@ -49,13 +53,9 @@ require_docker() {
   fi
 }
 
-environment_value() {
+dotenv_value() {
   local key="$1"
   local value
-  if [[ -v "${key}" ]]; then
-    printf '%s' "${!key}"
-    return
-  fi
   value="$(
     sed -n "s/^${key}=//p" "${ENV_FILE}" \
       | tail -n 1
@@ -67,6 +67,33 @@ environment_value() {
     value="${value:1:${#value}-2}"
   fi
   printf '%s' "${value}"
+}
+
+environment_value() {
+  local key="$1"
+  if [[ -v "${key}" ]]; then
+    printf '%s' "${!key}"
+  else
+    dotenv_value "${key}"
+  fi
+}
+
+reject_database_environment_overrides() {
+  local key configured
+  for key in \
+    DBS_MAPP ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
+    ETL_DB_USER ETL_DB_PASSWORD XYZ_DB_USER XYZ_DB_PASSWORD \
+    DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL
+  do
+    if [[ -v "${key}" ]]; then
+      configured="$(dotenv_value "${key}")"
+      if [[ "${!key}" != "${configured}" ]]; then
+        printf 'Exported %s conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
+          "${key}" "${ENV_FILE}" >&2
+        exit 2
+      fi
+    fi
+  done
 }
 
 state_owner_error() {
@@ -109,7 +136,9 @@ check_state_owner() {
       "${CONTROL_DIR}" \
       "${CONTROL_DIR}/artifacts" \
       "${CONTROL_DIR}/proposals" \
-      "${RELOAD_DIR}"
+      "${RELOAD_DIR}" \
+      "${PREVIEW_DIR}" \
+      "${PREVIEW_RELOAD_DIR}"
     do
       if [[ ! -e "${path}" ]]; then
         state_owner_error "${expected_uid}" "${expected_gid}" "${path}"
@@ -124,14 +153,18 @@ init_state() {
     "${WORKSPACE_DIR}" \
     "${CONTROL_DIR}/artifacts" \
     "${CONTROL_DIR}/proposals" \
-    "${RELOAD_DIR}"
+    "${RELOAD_DIR}" \
+    "${PREVIEW_DIR}" \
+    "${PREVIEW_RELOAD_DIR}"
   chmod 700 \
     "${STATE_DIR}" \
     "${WORKSPACE_DIR}" \
     "${CONTROL_DIR}" \
     "${CONTROL_DIR}/artifacts" \
     "${CONTROL_DIR}/proposals" \
-    "${RELOAD_DIR}"
+    "${RELOAD_DIR}" \
+    "${PREVIEW_DIR}" \
+    "${PREVIEW_RELOAD_DIR}"
 
   if [[ ! -f "${WORKSPACE_DIR}/workspace.json" ]]; then
     if [[ ! -f "${ROOT_DIR}/instance/workspace.seed.json" ]]; then
@@ -141,6 +174,10 @@ init_state() {
     cp "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
     chmod 644 "${WORKSPACE_DIR}/workspace.json"
     printf 'Created live workspace from instance/workspace.seed.json.\n'
+  fi
+  if [[ ! -f "${PREVIEW_DIR}/workspace.json" ]]; then
+    cp "${WORKSPACE_DIR}/workspace.json" "${PREVIEW_DIR}/workspace.json"
+    chmod 600 "${PREVIEW_DIR}/workspace.json"
   fi
 }
 
@@ -177,6 +214,7 @@ init_env() {
     -e "s/CHANGEME_POSTGRES/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_ETL/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_DERIVED/$(openssl rand -hex 24)/" \
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \
     "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
@@ -197,12 +235,20 @@ if [[ "${1:-}" == "doctor" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "production-acceptance" ]]; then
+  python3 "${ROOT_DIR}/scripts/production_acceptance.py" \
+    --environment "${ENV_FILE}" \
+    "${@:2}"
+  exit $?
+fi
+
 require_docker
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   printf 'Missing %s. Run ./bin/mapp init first.\n' "${ENV_FILE}" >&2
   exit 2
 fi
+reject_database_environment_overrides
 check_state_owner
 init_state
 check_state_owner
@@ -217,7 +263,32 @@ compose=(
   --env-file "${ENV_FILE}"
   --file "${ROOT_DIR}/compose.yaml"
 )
-case "${MAPP_ENVIRONMENT:-development}" in
+database_mode="$(dotenv_value MAPP_DATABASE_MODE)"
+if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]]; then
+  printf 'Exported MAPP_DATABASE_MODE conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
+    "${ENV_FILE}" >&2
+  exit 2
+fi
+case "${database_mode}" in
+  bundled)
+    compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
+    runtime_services=(db xyz xyz-preview config-ui browser-runner caddy)
+    ;;
+  external)
+    runtime_services=(xyz xyz-preview config-ui browser-runner caddy)
+    ;;
+  *)
+    printf 'MAPP_DATABASE_MODE must be bundled or external.\n' >&2
+    exit 2
+    ;;
+esac
+deployment_environment="$(dotenv_value MAPP_ENVIRONMENT)"
+if [[ -v MAPP_ENVIRONMENT && "${MAPP_ENVIRONMENT}" != "${deployment_environment}" ]]; then
+  printf 'Exported MAPP_ENVIRONMENT conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
+    "${ENV_FILE}" >&2
+  exit 2
+fi
+case "${deployment_environment}" in
   development)
     ;;
   production)
@@ -226,35 +297,59 @@ case "${MAPP_ENVIRONMENT:-development}" in
     compose+=(--file "${ROOT_DIR}/compose.production.yaml")
     ;;
   *)
-    printf 'Unsupported MAPP_ENVIRONMENT: expected development or production.\n' >&2
+    printf 'MAPP_ENVIRONMENT must be development or production.\n' >&2
     exit 2
     ;;
 esac
+if [[ "${database_mode}" == "external" ]]; then
+  resolved_dbs="$(
+    "${compose[@]}" config --format json \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["xyz"]["environment"]["DBS_MAPP"], end="")'
+  )"
+  printf '%s' "${resolved_dbs}" \
+    | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
+fi
 
 case "${1:-}" in
   up|serve)
-    "${compose[@]}" up --detach --build db xyz config-ui browser-runner caddy
+    "${compose[@]}" up --detach --build "${runtime_services[@]}"
     ;;
   config-ui)
-    "${compose[@]}" up --detach --build \
-      db xyz config-ui browser-runner caddy
+    "${compose[@]}" up --detach --build "${runtime_services[@]}"
     ;;
   config-ui-down)
     "${compose[@]}" rm --stop --force config-ui
     ;;
   reload-xyz)
-    generation="$("${compose[@]}" exec -T config-ui python -c 'from control_api import request_reload; print(request_reload()["requestedGeneration"])')"
-    printf 'XYZ reload generation %s requested.\n' "${generation}"
+    "${compose[@]}" exec -T config-ui python -c \
+      'from app import WORKSPACE; from control_api import request_reload, wait_reload, workspace_fingerprint; fingerprint = workspace_fingerprint(WORKSPACE.read_bytes()); result = request_reload(fingerprint); status = wait_reload(result["requestedGeneration"], fingerprint); completed = status["completed"]; print("XYZ reload generation {} {} for workspace {}.".format(result["requestedGeneration"], "completed" if completed else "did not complete", fingerprint)); raise SystemExit(0 if completed else 1)'
     ;;
   etl)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp etl is sample-data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
+      exit 2
+    fi
     if [[ -n "${2:-}" ]]; then
       "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
     else
       "${compose[@]}" run --rm --build etl
     fi
     ;;
+  upgrade-derived)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp upgrade-derived is available only for the bundled database; provision external roles and extensions with your database administrator.\n' >&2
+      exit 2
+    fi
+    "${compose[@]}" build db
+    "${compose[@]}" up --detach --no-deps db
+    "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
+    ;;
   all)
-    "${compose[@]}" up --detach --build db xyz config-ui browser-runner caddy
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp all includes the sample ETL and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
+      exit 2
+    fi
+    "${compose[@]}" up --detach --build "${runtime_services[@]}"
     "${compose[@]}" run --rm --build etl
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
@@ -262,7 +357,8 @@ case "${1:-}" in
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   test)
-    "${compose[@]}" build config-ui etl
+    "${compose[@]}" build config-ui
+    docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
     docker run --rm \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
@@ -290,7 +386,18 @@ case "${1:-}" in
         node --check /source/browser-runner/server.mjs
       '
     "${compose[@]}" config --quiet
-    printf 'Unit tests and Compose validation passed.\n'
+    docker compose \
+      --project-directory "${ROOT_DIR}" \
+      --env-file "${ROOT_DIR}/.env.example" \
+      --file "${ROOT_DIR}/compose.yaml" \
+      config --quiet
+    docker compose \
+      --project-directory "${ROOT_DIR}" \
+      --env-file "${ROOT_DIR}/.env.example" \
+      --file "${ROOT_DIR}/compose.yaml" \
+      --file "${ROOT_DIR}/compose.bundled-db.yaml" \
+      config --quiet
+    printf 'Unit tests and bundled/external Compose validation passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet
@@ -306,9 +413,13 @@ case "${1:-}" in
     "${compose[@]}" logs --follow --tail 200
     ;;
   db)
-    # shellcheck disable=SC1090
-    source "${ENV_FILE}"
-    "${compose[@]}" exec db psql --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}"
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp db is available only for the bundled sample database. Use an approved PostgreSQL client for the external service.\n' >&2
+      exit 2
+    fi
+    postgres_user="$(environment_value POSTGRES_USER)"
+    postgres_db="$(environment_value POSTGRES_DB)"
+    "${compose[@]}" exec db psql --username "${postgres_user}" --dbname "${postgres_db}"
     ;;
   reset-config-password)
     "${compose[@]}" run --rm --no-deps config-ui \

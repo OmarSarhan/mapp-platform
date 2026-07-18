@@ -1,5 +1,5 @@
 # Production hardening overlay:
-# MAPP_ENVIRONMENT=production ./bin/mapp serve
+# set MAPP_ENVIRONMENT=production in .env, then run ./bin/mapp serve
 services:
   config-ui:
     environment:

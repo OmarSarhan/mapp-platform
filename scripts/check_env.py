@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import tempfile
 from pathlib import Path
 
@@ -27,8 +28,12 @@ def missing_assignment_lines(example: Path, present: set[str]) -> list[str]:
             any(marker in key for marker in ("PASSWORD", "SECRET", "TOKEN"))
             and (not value or "CHANGEME" in value)
         )
-        if key not in present and not secret_placeholder:
-            output.append(line)
+        if key not in present:
+            output.append(
+                f"{key}={secrets.token_hex(24)}"
+                if secret_placeholder
+                else line
+            )
     return output
 
 
@@ -91,7 +96,10 @@ def main() -> int:
     if args.add_missing and missing:
         added = add_missing_defaults(args.example, args.environment, actual)
         if added:
-            print(f"Added {added} missing non-secret assignments from .env.example.")
+            print(
+                f"Added {added} missing assignments from .env.example; "
+                "secret placeholders were generated securely."
+            )
         actual = keys(args.environment)
         missing = sorted(expected - actual)
     if missing:

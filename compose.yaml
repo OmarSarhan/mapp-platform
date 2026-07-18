@@ -1,34 +1,6 @@
 name: ${COMPOSE_PROJECT_NAME:-mapp-explore}
 
 services:
-  db:
-    image: ${POSTGIS_IMAGE:-postgis/postgis:17-3.5}
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
-      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C.UTF-8
-      ETL_DB_USER: ${ETL_DB_USER:?Set ETL_DB_USER in .env}
-      ETL_DB_PASSWORD: ${ETL_DB_PASSWORD:?Set ETL_DB_PASSWORD in .env}
-      XYZ_DB_USER: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
-      XYZ_DB_PASSWORD: ${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgis/init/10-roles.sh:/docker-entrypoint-initdb.d/90-mapp-roles.sh:ro
-      - ./docker/postgis/init/20-runtime-info.sql:/docker-entrypoint-initdb.d/95-mapp-runtime-info.sql:ro
-      - ./docker/postgis/healthcheck.sh:/usr/local/bin/mapp-db-healthcheck:ro
-    healthcheck:
-      test: [CMD, /usr/local/bin/mapp-db-healthcheck]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 15s
-    shm_size: 256mb
-    stop_grace_period: 30s
-    networks:
-      - backend
-
   xyz:
     image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
     build:
@@ -44,7 +16,7 @@ services:
     env_file:
       - ./instance/xyz.env
     environment:
-      DBS_MAPP: postgresql://${XYZ_DB_USER:?Set XYZ_DB_USER in .env}:${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      DBS_MAPP: ${DBS_MAPP:?Set DBS_MAPP in .env}
     expose:
       - "3000"
     volumes:
@@ -54,9 +26,6 @@ services:
       - ./var/workspace:/app/xyz/mapp-settings:ro
       - ./instance/public:/app/xyz/public/instance:ro
       - ./var/reload:/reload
-    depends_on:
-      db:
-        condition: service_healthy
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -68,6 +37,34 @@ services:
       - edge
       - backend
 
+  xyz-preview:
+    image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    env_file:
+      - ./instance/xyz.env
+    environment:
+      DBS_MAPP: ${DBS_MAPP:?Set DBS_MAPP in .env}
+      WORKSPACE_FILE: /app/xyz/mapp-settings/workspace.json
+      RELOAD_DIR: /preview-reload
+    expose:
+      - "3000"
+    volumes:
+      - ./var/preview:/app/xyz/mapp-settings:ro
+      - ./instance/public:/app/xyz/public/instance:ro
+      - ./var/preview-reload:/preview-reload
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - backend
+      - automation
+
   config-ui:
     image: mapp-config-ui:local
     build:
@@ -76,7 +73,9 @@ services:
     init: true
     user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
     environment:
-      DBS_MAPP: postgresql://${XYZ_DB_USER:?Set XYZ_DB_USER in .env}:${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      DBS_MAPP: ${DBS_MAPP:?Set DBS_MAPP in .env}
+      DERIVED_DATABASE_URL: ${DERIVED_DATABASE_URL:-}
+      DERIVED_READER_ROLE: ${DERIVED_READER_ROLE:-}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
       PORT: 8080
@@ -88,6 +87,9 @@ services:
       CONFIG_SECURE_COOKIES: ${CONFIG_SECURE_COOKIES:-false}
       BROWSER_RUNNER_URL: http://browser-runner:8080/run
       BROWSER_XYZ_URL: http://caddy:8081
+      BROWSER_PREVIEW_XYZ_URL: http://xyz-preview:3000
+      PREVIEW_WORKSPACE_PATH: /preview/workspace.json
+      PREVIEW_RELOAD_DIR: /preview-reload
     volumes:
       # The workspace directory is writable so atomic rename remains possible.
       # Public SVGs and the schema are read-only; sensitive control state is
@@ -96,9 +98,8 @@ services:
       - ./instance/public:/instance-public:ro
       - ./var/control:/control
       - ./var/reload:/reload
-    depends_on:
-      db:
-        condition: service_healthy
+      - ./var/preview:/preview
+      - ./var/preview-reload:/preview-reload
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -145,37 +146,6 @@ services:
       - edge
       - automation
 
-  etl:
-    image: mapp-leeds-etl:local
-    build:
-      context: ./etl
-    profiles:
-      - tools
-    environment:
-      DATABASE_URL: postgresql://${ETL_DB_USER:?Set ETL_DB_USER in .env}:${ETL_DB_PASSWORD:?Set ETL_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
-      ETL_CONFIG: /config/layers.json
-      LOG_LEVEL: INFO
-    command:
-      - python
-      - -m
-      - leeds_arcgis_etl
-      - --config
-      - /config/layers.json
-    volumes:
-      - ./instance/etl:/config:ro
-    depends_on:
-      db:
-        condition: service_healthy
-    read_only: true
-    tmpfs:
-      - /tmp:size=128m,mode=1777
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    networks:
-      - backend
-
   browser-runner:
     image: mapp-browser-runner:local
     build:
@@ -188,6 +158,7 @@ services:
       PORT: 8080
       ARTIFACT_DIR: /artifacts
       ALLOWED_ORIGIN: http://caddy:8081
+      ALLOWED_ORIGINS: http://caddy:8081,http://xyz-preview:3000
       MAX_CONCURRENT_RUNS: ${BROWSER_MAX_CONCURRENT_RUNS:-1}
     volumes:
       - ./var/control/artifacts:/artifacts
@@ -209,8 +180,6 @@ services:
       - browser-egress
 
 volumes:
-  postgres_data:
-    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_postgres_data
   caddy_data:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_caddy_data
   caddy_config:
