@@ -29,5 +29,5 @@ disclosure. No response-time commitment is declared yet.
 ## Operational guidance
 
 See [`docs/security.md`](docs/security.md) for the threat model, filesystem and
-network boundaries, current full-scope token limitation, SQL/SVG controls, and
-the outstanding need for isolated proposal previews.
+network boundaries, legacy full and scoped device credentials, SQL/SVG
+controls, and the isolated proposal-preview boundary.

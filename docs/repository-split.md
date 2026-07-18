@@ -8,8 +8,9 @@ The parent workspace currently contains two repository-ready directories:
   validation, ETL, instance inputs, and operational documentation.
 - `mapp-config-cli` — standalone remote client and agent guidance.
 
-The parent directory has no `.git` metadata. The directory move is therefore a
-content split only; it is not evidence of a history-preserving migration.
+The parent directory is not a usable Git work tree. Each child is independently
+visible to source control, but this staged layout is still not evidence of a
+history-preserving migration from the canonical repository.
 
 ## Required history-preserving migration
 

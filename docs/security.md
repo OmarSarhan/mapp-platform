@@ -6,9 +6,17 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
 ## Trust boundaries
 
 - Caddy is the only intended public entry point.
-- PostgreSQL, XYZ, and the configuration service remain on private service
-  networks. The browser runner shares only the narrow automation network with
-  the configuration service and Caddy; it has no platform credential.
+- Live mode uses Caddy-managed HTTPS for all application traffic. Public port
+  80 exists only for automatic certificate handling and HTTPS redirects;
+  application containers are never published directly.
+- Both public routes send a one-year HSTS policy after HTTPS is established.
+  It intentionally omits `includeSubDomains` and preload until the owner has
+  validated every sibling hostname and accepted that broader commitment.
+- Bundled PostgreSQL, XYZ, and the configuration service remain on private
+  service networks. External PostGIS is reached only from the backend network
+  through the operator-approved route. The browser runner shares only the
+  narrow automation network with the configuration service and Caddy; it has
+  no platform credential.
 - The browser runner has a separate outbound network for external map assets;
   it does not join the database, backend, or public edge networks.
 - The map and configuration service use separate hostnames.
@@ -33,20 +41,24 @@ samples in the workspace or `instance/public`.
 
 ## Authentication and authorization
 
-Dashboard sessions use an HTTP-only, SameSite cookie and CSRF token.
+Dashboard sessions use an `HttpOnly`, SameSite cookie and CSRF token.
 Production must enable secure cookies and HTTPS.
 
-CLI tokens are shown once and stored as hashes by the platform. The current
-token model grants full configuration scope. It does not yet separate:
+CLI tokens are shown once and stored as hashes by the platform. For device
+authorization, approval stores no usable credential: the raw token is
+generated only during the first approved device poll, returned once, and only
+its hash is committed atomically with the consumed state. Legacy `full` tokens
+remain compatible. Device-authorized tokens separate:
 
 - read and catalog access;
 - proposal creation and visual evidence;
 - proposal application;
-- direct workspace saves and reloads.
+- reload access.
 
-Server-enforced scoped, expiring tokens are required before an autonomous
-agent can be considered limited to inspection and proposal creation. Written
-agent instructions are useful guardrails but are not an authorization control.
+Device authorization defaults to expiring `inspect + propose + visual` access;
+apply and reload are explicit additional grants. Direct workspace saves remain
+full-token/administrator operations. Scope checks are server-enforced; written
+agent instructions remain defence in depth rather than authorization.
 Dashboard password changes, token issuance/revocation, and audit access already
 require an administrator session and are not bearer-token capabilities.
 
@@ -93,9 +105,12 @@ require authentication for every non-public API. Its output can reveal map
 content and failed request URLs, so artifacts are authenticated and must be
 protected and expired.
 
-The current visual test renders the live workspace and does not preview a
-pending candidate. Candidate preview must not affect public users; a dedicated
-isolated process or namespace is still required.
+Proposal visual tests use a dedicated `xyz-preview` process, private workspace,
+and reload mailbox. Only pending, integrity-valid, non-superseded stored
+proposals can be rendered. Requests are serialized through browser completion
+to keep the candidate stable, and artifacts carry the proposal ID and candidate
+hash. The preview process is not public and cannot write or reload the live
+workspace.
 
 Automatic extent planning can be overridden with a bounded longitude,
 latitude, and zoom when outliers or unusual zoom rules produce a poor view.
@@ -107,6 +122,13 @@ artifact retention, storage quotas, or host-level resource controls.
 ## Secrets
 
 - Keep `.env` mode `0600` and out of version control and image contexts.
+- Treat `DBS_MAPP` and `ETL_DATABASE_URL` as credentials. Do not print Compose
+  renderings or diagnostics that expand them; XYZ and the configuration
+  service intentionally receive the same read-only runtime URI.
+- Treat `DERIVED_DATABASE_URL` as a separate privileged credential. Only the
+  configuration service receives it, and its role must own only
+  `derived_layers`. Creation, materialized refresh, and drop require the
+  `derive` scope and are audited.
 - Store administrator passwords and CLI tokens in an approved secret manager.
 - Never pass tokens in command arguments, logs, proposals, screenshots, or
   issue reports.
@@ -119,6 +141,9 @@ The application containers use read-only roots where practical,
 `no-new-privileges`, dropped capabilities, dedicated non-root users, bounded
 temporary filesystems, and internal networks. The configuration service and
 CLI do not require Docker socket access; do not add it.
+Initialize and operate production as a dedicated unprivileged host account.
+Production validation rejects `CONFIG_UID=0` or `CONFIG_GID=0` so a root-run
+initialization cannot silently make the application services run as root.
 
 Production hardening should also include immutable image digests, SBOMs,
 vulnerability scanning, host patching, firewall rules, backup encryption, log

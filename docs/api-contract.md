@@ -19,11 +19,23 @@ After bearer or dashboard-session authentication:
 - `GET /api/rules` returns validation and remediation rules, optionally by
   category.
 - `GET /api/examples` returns server-owned examples.
+- `GET /api/layers?locale=KEY` returns the server-composed effective layer map
+  and exact workspace revision. Omitting `locale` selects the top-level XYZ
+  default; the CLI does not reproduce XYZ merge rules locally. Clients must
+  require the advertised `layers effective` capability before using this
+  endpoint so they fail closed against an older independently released server.
 
-The current versions are `1.0`, but a formal compatibility policy is still
-required. The CLI should reject an unsupported major contract version and
-should not assume that a newer command exists merely because an older server
-used it.
+The current API and contract versions are `1.0`; the rules version is `1.1`.
+A formal compatibility policy is still required. The CLI should reject an
+unsupported major contract version and should not assume that a newer command
+exists merely because an older server used it.
+
+Schema, rules, and examples are also the CLI-facing source of truth for layer
+ordering. `group` is navigation-only; clients must use numeric `zIndex` values
+for stable drawing order (higher values render above lower values), or
+`promoteDisplay` for the dynamic “move above displayed layers when shown”
+behavior. The `setLayerDrawingOrder` example demonstrates revision-bound
+operations without requiring the CLI to encode XYZ semantics locally.
 
 Request bodies must be JSON objects of at most 5 MiB. Parsing is strict:
 `NaN`, `Infinity`, and `-Infinity` are not JSON values and are rejected.
@@ -34,7 +46,11 @@ Responses are also emitted as strict JSON.
 | Route | Purpose |
 | --- | --- |
 | `GET /api/workspace` | Workspace plus bytes-and-file-generation revision |
+| `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
 | `GET /api/catalog` | Database connections and renderable tables visible to XYZ |
+| `GET /api/derived-layers/capabilities` | Managed-view and H3 availability |
+| `GET /api/derived-layers` | Managed derived-layer definitions |
+| `GET /api/derived-layers/<name>` | One definition including its SQL |
 | `GET /api/icons` | Valid public SVG choices |
 | `GET /api/sql/capabilities` | Supported calculated-value expression model |
 | `GET /api/proposals` | Proposal summaries |
@@ -42,8 +58,31 @@ Responses are also emitted as strict JSON.
 | `GET /api/xyz/status` | Requested/applied reload generations and health |
 | `GET /api/artifacts/<path>` | Authenticated visual report or image |
 | `GET /api/auth/me` | Current actor and reported scopes; session list for administrators |
+| `GET /api/capabilities` | Stable action IDs, risks, routes, schemas, and operation kinds |
+| `GET /api/operations/<id>` | Durable authorized status/result for a long action |
 
 ## Mutations
+
+Managed derived-layer database actions are separate from workspace proposals:
+
+- `POST /api/derived-layers` creates a dependency-checked view or materialized
+  view with the `derive` scope.
+- `POST /api/derived-layers/<name>/refresh` refreshes a materialized view only
+  with `{"confirmed": true}`.
+- `POST /api/derived-layers/<name>/replace` atomically validates and swaps a
+  complete definition, including kind conversion, with explicit confirmation.
+  Results include `columnChanges`, `workspaceReferences`, `fieldReferences`,
+  and `requiresSecondOrderChanges`; blocked dependency errors also identify
+  `removedColumns` and `dependentColumns`. Dashboard and CLI clients should
+  show `userMessage` followed by `suggestedAction`; JSON paths, PostgreSQL
+  object descriptions, and `technicalDetail` are diagnostic fields and should
+  not be the primary user notification.
+- `POST /api/derived-layers/<name>/drop` removes a managed object only with
+  `{"confirmed": true}`. Replacement and drop report detected PostgreSQL
+  dependents; drop also reports live workspace references and refuses removal.
+
+Creating a derived relation never adds it to the workspace or reloads XYZ.
+That remains a separately reviewed, revision-bound workspace proposal.
 
 Managed changes use a list of operations:
 
@@ -71,17 +110,31 @@ Important routes include:
 | --- | --- |
 | `POST /api/validate` | Validate a complete candidate workspace |
 | `POST /api/mutate` | Validate operations; save only when explicitly requested |
+| `POST /api/proposals/check` | Preflight a revision-bound operation set without creating a proposal |
 | `POST /api/proposals` | Create a revision-bound proposal lifecycle record |
-| `POST /api/workspace` | Validate, save, and reload a complete workspace |
-| `POST /api/proposals/<id>/apply` | Apply a pending proposal and request reload |
+| `POST /api/workspace` | Validate and save a complete workspace, then wait for its fingerprint-matched reload |
+| `POST /api/proposals/<id>/apply` | Apply a pending proposal, then wait for its fingerprint-matched reload |
 | `POST /api/proposals/<id>/decline` | Record rejection and optional reason |
 | `POST /api/sql/test` | Probe one calculated information expression |
 | `POST /api/visual-plan` | Choose a data-aware view, with optional named `locale` and bounded `centre`/`zoom` override |
-| `POST /api/visual-test` | Run browser validation and create artifacts, with the same locale and view overrides |
-| `POST /api/xyz/reload` | Request a generation-based XYZ reload |
+| `POST /api/visual-test` | Run browser validation and create before/after artifacts, with the same locale and view overrides |
+| `POST /api/xyz/reload` | Request a generation-based XYZ reload and wait for TCP readiness with the current workspace fingerprint |
 
 Administrator-session routes create/revoke bearer tokens and change the
 administrator password.
+
+The managed write routes return HTTP 200 only after the XYZ supervisor reports
+child-process TCP readiness with the exact committed workspace fingerprint.
+`POST /api/xyz/reload` is the explicit operator/recovery endpoint; when no
+fingerprint is supplied, it derives and binds the current live workspace
+fingerprint before requesting the reload. A supplied fingerprint that is no
+longer current returns `409 workspace.fingerprint_conflict` without restarting
+XYZ. A successful normal workspace save or proposal apply does not need a
+second reload request.
+
+The optional request field is `workspaceFingerprint`, containing a lowercase
+64-character SHA-256 digest. The server validates it against the current live
+workspace while holding the save/reload lock.
 
 ## Revisions and proposals
 
@@ -104,6 +157,87 @@ from both the original revision and candidate, the proposal becomes
 `conflicted` and must not be silently rebased. Clients may therefore observe
 `pending`, `applying`, `applied`, `declined`, or `conflicted`; only the exact
 approved proposal is eligible for recovery.
+
+`POST /api/proposals/check` accepts the same `revision`, `operations`, and
+optional explanation as proposal creation. It runs the same candidate-building,
+workspace validation, and bounded SQL probes, but neither saves the workspace
+nor creates a proposal lifecycle record. A successful response contains a
+`check` object with `valid: true`, `proposalCreated: false`, original revision
+and hash, candidate hash, operations, focused diff, explanation, and warnings.
+It also returns `checkFingerprint`, a SHA-256 binding of the revision,
+candidate hash, and exact operations. Clients may send that fingerprint with
+the unchanged cached operation set to `POST /api/proposals`. The server
+recomputes it and rejects a mismatch with `proposal.check_fingerprint`.
+Proposal creation remains an independent authoritative validation and can
+still conflict if the live revision changes between requests.
+
+Candidate visual evidence is proposal-bound:
+
+| Endpoint | Behaviour |
+|---|---|
+| `POST /api/proposals/{id}/visual-plan` | Plan a candidate view, using the retained original only when the requested layer was deleted; advertised to clients as `proposals preview-plan` |
+| `POST /api/proposals/{id}/visual-test` | Render and test the candidate in isolated XYZ; advertised to clients as `proposals preview-test` |
+| `POST /api/proposals/{id}/screenshot` | Render a high-resolution original-versus-candidate comparison; advertised to clients as `proposals preview-screenshot` |
+
+Each response reports `source: "candidate"`, `proposalId`, and `candidateHash`.
+Visual-plan and visual-test browser evidence preserves that binding. A
+screenshot comparison additionally binds its nested before report to
+`source: "original"` and `originalHash`, while the after report remains bound
+to the candidate. Only a pending, integrity-valid proposal whose original
+revision is still current is eligible; declined, applied, conflicted, corrupt,
+or superseded proposals are rejected. The request accepts visual `layer`,
+`locale`, bounded centre/zoom overrides, and viewport fields. It never accepts
+an arbitrary workspace.
+
+Proposal screenshots default to a square 1080×1080 viewport at 1× device scale
+and capture only that viewport, producing an exact 1080×1080 page image.
+Request overrides are bounded to a 320–2560 pixel width, 240–1440 pixel height,
+and a 1×–3× device scale. The browser report's `capture` object records the
+effective viewport, scale, capture mode, and actual PNG dimensions so reviewers
+can verify the retained evidence resolution.
+
+For probeable database layers, visual planning focuses a representative
+feature near the layer extent centre and records an `interaction` plan for the
+browser runner. A proposal screenshot publishes the retained original and then
+the candidate to the same isolated preview process and renders both at the
+same view. Its `beforePage`/`beforeMap` artifacts therefore represent the
+original proposal revision, while `afterPage`/`afterMap` represent the
+candidate—not merely pre-click and post-click candidate states.
+
+When the focused diff changes the selected layer's `infoj` feature-information
+configuration, the runner selects the same representative feature in both
+renders, waits for XYZ's expanded `.location-view` panel to finish loading,
+and uses those selected states for the before/after page images. It also
+returns cropped `beforeInfoPanel` and `afterInfoPanel` artifacts. For other
+proposal changes the comparison remains unselected so a point highlight does
+not hide a symbol-style change. The separate visual-test endpoint continues
+to exercise the planned feature interaction.
+
+When a proposal adds, removes, or moves the requested layer in an XYZ `group`,
+the comparison isolates that layer: an addition is off before and alone after,
+a removal is alone before and off after, and a move keeps only the moved layer
+on in both renders. Other group members remain available in XYZ navigation but
+are not activated. Ordinary property edits that leave membership unchanged
+retain the active group as visual context. A deleted requested layer is planned
+from the original; its candidate side intentionally has no proposal layer
+active. The response plan reports `changeKind`, `groups`, candidate `layers`,
+`anchorLayer`, `requestedLayerDeleted`, and `viewSource`; nested browser reports
+record each side's actual activated layers and verify that its remaining group
+drawers are present.
+
+Candidate rendering uses a dedicated XYZ process, workspace path, and reload
+mailbox. Preview requests are serialized from candidate publication through
+browser completion, so one candidate cannot replace another mid-render. This
+process never writes, replaces, or reloads the live workspace or live XYZ
+process.
+
+For an `infoj[].fieldfx` operation, the service derives the effective locale,
+layer relation, information-field renderer, and expected result type from the
+workspace when these values are unambiguous. Validation errors may include that
+safe metadata so a client can construct a structured `sql.test` next action. It
+must not echo an SQL expression, database URL, credential, authorization header,
+or sensitive sample value in diagnostics or remediation data. If discovery is
+ambiguous, the preflight returns a diagnostic instead of guessing.
 
 ## Locale composition
 
@@ -134,14 +268,36 @@ geometry mappings are preserved and schema-validated. They are not forced
 through a concrete database-relation probe when no single relation represents
 their effective source.
 
-## Authentication limitation
+## Authentication and device authorization
 
-The current bearer-token records advertise only a full scope. The API does not
-yet enforce separate inspect, propose, visual, apply, direct-write, or reload
-permissions. Password changes, token administration, and audit access already
-require an administrator session. Scoped and expiring bearer credentials are
-required to make an AI-agent token meaningfully less privileged than an
-approval token.
+Legacy `full` bearer tokens remain compatible. Device credentials support
+`inspect`, `propose`, `visual`, `apply`, and `reload`, enforced server-side.
+The default agent request is `inspect + propose + visual`; apply and reload
+must be requested explicitly. Direct workspace writes and administrator routes
+remain full/administrator-only.
+
+`POST /api/auth/device` creates a rate-bounded ten-minute authorization and
+returns an opaque device ID plus user code. An administrator reviews the exact
+device name and scopes. `POST /api/auth/device/token` returns the thirty-day
+token once; subsequent polls return `consumed`. Raw device IDs and tokens are
+not written to audit records. Approval stores no raw credential; the token is
+created only on the first approved poll, and only its hash is persisted
+atomically with the consumed authorization state.
+
+## Response metadata and operations
+
+JSON responses include `meta.requestId` and `X-Request-ID`. Responses tied to
+a durable operation also include `meta.operationId` and an operation record.
+States are `running`, `succeeded`, `failed`, and `indeterminate`. Visual tests,
+proposal applies, and explicit reloads retain bounded mode-`0600` records;
+reading one requires its corresponding visual, apply, or reload scope.
+
+Indeterminate is not a retry instruction. Proposal apply retains the existing
+committed-state recovery rules, while reload recovery inspects XYZ generation
+and fingerprint state first. Unexpected reload/apply exceptions after an
+operation begins are recorded as `indeterminate`; any operation still
+`running` when the configuration service starts is also transitioned to
+`indeterminate` with `operation.interrupted`.
 
 ## Error handling
 
@@ -149,6 +305,41 @@ Clients should preserve the server's structured JSON error and use stable
 non-zero exit codes for usage, validation, revision conflict, connectivity,
 visual, and authentication failures. They must not print bearer tokens,
 authorization headers, database URLs, or sensitive SQL samples.
+
+Visual results include a structured diagnosis with independent HTTP, canvas,
+layer-binding, and page-error checks, the selected viewport/view, and a bounded
+failure class.
+
+HTTP `422` validation errors from preflight and proposal creation use a common
+diagnostic shape:
+
+```json
+{
+  "error": "Validation failed.",
+  "errors": [
+    {
+      "ruleId": "sql.result_type",
+      "pointer": "/locale/layers/Example/infoj/0/fieldfx",
+      "path": "locale.layers.Example.infoj[0].fieldfx",
+      "phase": "sql",
+      "severity": "error",
+      "message": "Expression returns text; bool is required.",
+      "expectedType": "bool",
+      "actualType": "text",
+      "locale": "locale",
+      "layer": "Example",
+      "field": "enabled"
+    }
+  ]
+}
+```
+
+`ruleId`, `pointer`, `phase`, `severity`, and `message` provide stable
+machine-readable context; type and SQL-discovery fields are included when
+relevant. Errors block proposal creation. Successful checks and proposals may
+contain review warnings; informational observations are non-blocking. Clients
+should render these categories separately and may derive `nextActions` with
+structured action IDs and arguments rather than shell command strings.
 
 Important status semantics are:
 

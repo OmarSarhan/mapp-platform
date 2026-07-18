@@ -13,19 +13,45 @@
 ```
 
 Use `./bin/mapp config` after Compose or environment changes. Use
-`./bin/mapp verify` for the complete runtime acceptance check.
+`./bin/mapp verify` for the mode-aware runtime checks. External deployments
+also require layer-specific visual acceptance for their own workspace.
+
+`MAPP_DATABASE_MODE=bundled` includes the local PostGIS service. With
+`MAPP_DATABASE_MODE=external`, `serve` starts only XYZ, the configuration
+service, browser runner, and Caddy; `DBS_MAPP` supplies their shared external
+connection. The external database lifecycle is not managed by this wrapper.
+Before switching an existing bundled deployment to external mode, take a
+backup and run `./bin/mapp down`; otherwise its already-running `db` container
+is outside the newly selected service set and remains untouched.
+
+Live deployments keep `MAPP_ENVIRONMENT=production` in `.env`. Caddy is their
+only published application endpoint: TCP 80 is redirect/ACME traffic and
+TCP/UDP 443 carries the map, dashboard, API, and remote CLI traffic over HTTPS.
+Do not publish XYZ or `config-ui` directly. Conflicting exported topology modes
+are rejected; use `MAPP_ENV_FILE` when deliberately selecting another complete
+environment.
 
 ## ETL
 
 ```sh
-./bin/mapp etl
 ./bin/mapp etl bus_stops
+./bin/mapp etl definitive_paths
+./bin/mapp etl smoke_control_orders
 ```
 
-The ETL is a one-shot tool, not a continuously running service. Schedule it
-with the host's approved scheduler if regular refreshes are required. Prevent
-overlapping invocations at the scheduler level even though each target layer
-also uses a PostgreSQL advisory lock.
+The ETL is optional sample-data provisioning for the bundled database, not a
+continuously running or required platform service. The wrapper disables it in
+external mode. If the sample stack needs regular refreshes, schedule it with
+the host's approved scheduler. Prevent overlapping invocations at the
+scheduler level even though each target layer also uses a PostgreSQL advisory
+lock.
+
+The unrestricted `./bin/mapp etl` loads all three configured sources. A known
+ArcGIS rejection is logged concisely and still returns non-zero; unexpected
+errors retain their traceback. In either case the failed run is recorded and
+deletion reconciliation is skipped. See the
+[ETL polygon-source note](../etl/README.md#polygon-source-selection) for the
+reviewed replacement of the former planning sample.
 
 Review ETL exit status and the `leeds._etl_runs` and `leeds._etl_layers`
 records. Source-count drift, duplicates, conversion errors, or incomplete
@@ -41,11 +67,14 @@ For an agent-driven change:
 
 1. Inspect identity, contract, revision, layer, schema, rules, and catalog.
 2. Create a revision-bound proposal.
-3. Review the explanation, focused diff, warnings, and baseline visual
-   evidence. Explicitly disclose that the pending candidate is not rendered
-   by the current visual test.
-4. Apply only after explicit approval.
-5. Check XYZ reload status and run a visual test on the changed layer.
+3. Review the explanation, focused diff, warnings, and visual evidence. Use
+   top-level visual commands for a live baseline and, when advertised by the
+   server contract, proposal preview commands for an isolated rendering bound
+   to the stored pending candidate.
+4. Apply only after explicit approval. The apply call automatically requests
+   and waits for an XYZ reload of the exact committed workspace fingerprint.
+5. Check the returned XYZ reload status and run a visual test on the changed
+   layer.
 
 If the live revision changed, discard and recreate the proposal. Do not
 silently rebase it.
@@ -62,13 +91,31 @@ a revision-bound `config-cli` proposal targeting the raw
 
 ## Reloads
 
-An applied proposal requests a reload generation. The XYZ supervisor restarts
-only its child application process and records the applied generation,
-workspace fingerprint, start time, and health in `var/reload`.
+Every successful dashboard workspace save and applied CLI proposal requests a
+reload generation. The caller waits for the supervisor to report the exact
+saved workspace fingerprint as healthy. The dashboard displays the restart
+while the save request is in flight and reports when connection readiness is
+confirmed. The XYZ supervisor restarts only its child application process and
+records the applied generation, workspace fingerprint, start time, and health
+in `var/reload`.
 
-Use the local `reload-xyz` command only for an intentional operator-requested
-reload. A healthy reload status is evidence that the expected workspace was
-loaded; it is not proof of cartographic quality.
+Use `./bin/mapp reload-xyz` only for an intentional local operator-requested
+reload. It fingerprints the current workspace, requests a generation, and
+waits for the supervisor to report TCP readiness with that fingerprint. This
+is evidence that the expected workspace file was loaded, not proof of HTTP,
+database-backed rendering, or cartographic quality.
+
+From a separate operator computer, the corresponding confirmed command is
+`config-cli reload-xyz --confirm` (also available as
+`config-cli xyz reload --confirm`). Both spellings call the authenticated
+`POST /api/xyz/reload` endpoint, which derives the current live workspace
+fingerprint and waits for the same readiness condition. These are
+recovery/operator actions, not an extra step after a normal save or proposal
+apply.
+
+Do not edit `var/workspace/workspace.json` directly. Filesystem changes are not
+watched because they would bypass validation, revision checks, proposals, and
+audit records.
 
 A save or proposal apply can commit before reload confirmation times out. An
 HTTP 504 carrying `saved: true`, or an `applied` proposal with an applied
@@ -82,9 +129,32 @@ map scale, then delegates to the internal browser runner. Reports and
 screenshots are stored in `var/control/artifacts` and served only through
 authenticated API routes.
 
-The current runner renders the live workspace. It is useful before a change as
-baseline evidence and after application as verification, but it is not a
-candidate preview.
+The live visual endpoints remain useful for baseline and post-application
+verification. Proposal visual endpoints render the stored pending candidate
+through the dedicated `xyz-preview` process. Candidate publication and browser
+completion are serialized, and the response and artifacts are bound to the
+proposal ID and candidate hash. Preview state lives in `var/preview` and
+`var/preview-reload`; it never replaces `var/workspace` or requests a live XYZ
+reload.
+
+Use the proposal `screenshot` endpoint for approval evidence. It defaults to a
+square 1080×1080 viewport at 1× device scale and viewport-only capture, producing
+an exact 1080×1080 page image. The response records actual PNG dimensions under
+`visual.capture`; authenticated artifact routes remain the only way to read the
+images. Width, height, and device scale are bounded to prevent unbounded browser
+resource use. The isolated renderer publishes the proposal's retained original
+first and its candidate second at the same view, so `before*` and `after*`
+artifacts show the configuration change rather than pre-click/post-click
+candidate states. For feature-information diffs, both renders select the same
+representative feature and wait for the expanded left information panel; the
+response also includes panel-only before/after artifacts.
+
+For add, remove, or move changes involving a grouped layer, the comparison
+switches on only the changed layer: additions appear only after, removals only
+before, and moves remain isolated on both sides. Other folder members stay off
+while remaining available in navigation. Ordinary style or configuration edits
+that keep the same membership retain the active group for context. A removed
+layer's candidate image intentionally contains no proposal layer.
 
 When browser validation does not pass, the API returns HTTP 422 while
 preserving the plan, failed report, and authenticated artifact paths. Review
@@ -118,16 +188,51 @@ monitoring policy remains to be implemented.
 
 ## Credentials
 
-Use dashboard administration to rotate the administrator password and revoke
-remote tokens. Changing `.env` passwords does not rotate roles in an existing
-PostgreSQL volume; perform database password rotation explicitly and update
-dependent services together.
+### Configuration dashboard password
+
+To replace a known or forgotten administrator password, run this from the
+platform checkout on the deployment host:
+
+```sh
+./bin/mapp reset-config-password
+```
+
+The command generates a new password and prints it once. Store it immediately
+in the approved password manager, then sign in to the dashboard again. The
+reset invalidates every existing dashboard session and takes effect without a
+service restart. It does not change or revoke remote CLI bearer tokens.
+
+The wrapper uses the deployment's selected `.env`. If the deployment
+deliberately uses another environment file, select the same file used to run
+the stack:
+
+```sh
+MAPP_ENV_FILE=/secure/path/production.env ./bin/mapp reset-config-password
+```
+
+To revoke all remote CLI tokens as a separate incident-response action, run:
+
+```sh
+./bin/mapp revoke-config-tokens
+```
+
+These commands affect configuration-service authentication only. They do not
+change PostgreSQL passwords. Changing `.env` passwords also does not rotate
+roles in an existing PostgreSQL volume; perform database password rotation
+explicitly and update dependent services together.
+
+XYZ and configuration discovery intentionally share the exact `DBS_MAPP`
+connection. For an external database, rotate that URI through the approved
+secret process and recreate both services together. Database administration,
+backups, and role changes remain the external operator's responsibility.
 
 ## Routine checks
 
 - Confirm all services are healthy.
-- Confirm recent ETL runs succeeded and expected row counts are plausible.
-- Check free space for PostgreSQL, Caddy, proposals, audit, and artifacts.
+- In bundled mode, confirm recent sample ETL runs succeeded and expected row
+  counts are plausible.
+- Check free space for bundled PostgreSQL when used, Caddy, proposals, audit,
+  and artifacts; monitor external PostGIS through its operator.
 - Review failed logins, token usage, and unexpected proposal activity.
 - Test backups and restores on a separate environment.
 - Verify TLS renewal and production cookie settings.

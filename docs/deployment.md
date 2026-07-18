@@ -3,13 +3,15 @@
 ## Prerequisites
 
 - A Linux host supported by Docker Engine.
+- A dedicated unprivileged deployment account; do not initialize or operate
+  the platform as root.
 - Docker Compose v2.
 - Python 3 and OpenSSL for the wrapper's initialization and validation helpers.
-- Sufficient persistent storage for PostgreSQL, Caddy data, audit/proposal
-  records, and browser artifacts.
+- Sufficient persistent storage for bundled PostgreSQL when selected, Caddy
+  data, audit/proposal records, and browser artifacts.
 - Two distinct public DNS hostnames: one for the map and one for the
   configuration service.
-- Direct public HTTPS on TCP port 443 to Caddy.
+- Direct public HTTP on TCP port 80 and HTTPS on TCP/UDP port 443 to Caddy.
 - A backup destination outside the deployment host.
 
 The platform test command runs Node/frontend and component checks in
@@ -20,22 +22,40 @@ The normal deployment does not publish PostgreSQL. The optional
 `compose.db-port.yaml` override is for deliberate, loopback-bound maintenance
 access.
 
-Production uses the hardening overlay:
+Production uses Caddy-managed HTTPS through the hardening overlay. Persist the
+mode in `.env`:
+
+```dotenv
+MAPP_ENVIRONMENT=production
+EDGE_BIND_ADDRESS=0.0.0.0
+HTTP_PORT=80
+HTTPS_PORT=443
+```
+
+Then validate and start it:
 
 ```sh
-export MAPP_ENVIRONMENT=production
 ./bin/mapp config
 ./bin/mapp serve
 ```
 
 The wrapper includes `compose.production.yaml` for every command, validates
 the production-only public settings, and forces secure dashboard cookies.
-Keep `MAPP_ENVIRONMENT=production` set for all production `mapp` commands;
-running the wrapper without it selects the development topology.
+Because `MAPP_ENVIRONMENT=production` is stored in `.env`, subsequent wrapper
+commands retain the HTTPS topology without needing a shell export. The wrapper
+treats `MAPP_ENVIRONMENT` and `MAPP_DATABASE_MODE` in the selected env file as
+authoritative and rejects conflicting same-name shell variables. Select a
+different reviewed file explicitly with `MAPP_ENV_FILE` rather than changing
+topology ambiently. Port 80 exists only for Caddy's redirect and
+automatic-certificate workflow; the application services remain unpublished
+behind it.
 
 ## Prepare the host
 
-1. Clone the platform repository into a release-specific directory.
+1. As the dedicated unprivileged deployment account, clone the platform
+   repository into a release-specific directory. Do not run `./bin/mapp init`
+   as root: it records the caller's UID/GID for the application containers,
+   and production validation rejects UID or GID `0`.
 2. Review `instance/workspace.seed.json`, `instance/xyz.env`,
    `instance/etl/layers.json`, and public SVGs through normal version control.
    Confirm whether the duplicate-looking `Definitive Paths 2` seed layer is
@@ -60,18 +80,55 @@ At minimum, set and review:
   origins using DNS hostnames and the standard port 443. IP literals,
   single-label/reserved names, trailing-dot names, and different ports on one
   hostname are rejected.
-- `HTTPS_PORT=443`: required by the direct production topology.
-- `EDGE_BIND_ADDRESS`: the intended host interface.
+- `HTTP_PORT=80` and `HTTPS_PORT=443`: required by the direct Caddy topology.
+- `EDGE_BIND_ADDRESS`: a non-loopback host interface, commonly `0.0.0.0`.
 - `PRODUCTION_CADDY_EMAIL`: a monitored, non-placeholder ACME contact.
 - `PRODUCTION_CONFIG_ALLOWED_HOSTS`: the deployed configuration hostname and
   only necessary internal names. Do not use a wildcard or trailing-dot name.
-- `CONFIG_SECURE_COOKIES=true`.
-- All PostgreSQL, ETL, and XYZ role passwords.
-- `CONFIG_UID` and `CONFIG_GID`: the owner of writable live state.
+- The resolved `CONFIG_SECURE_COOKIES=true`; the production overlay enforces
+  this even though the development value in `.env` remains `false`.
+- All PostgreSQL, ETL, and XYZ role passwords when using the bundled sample
+  database; the external `DBS_MAPP` credential otherwise.
+- `MAPP_DATABASE_MODE` and `DBS_MAPP`. For `external`, the URI must identify a
+  container-reachable PostGIS server and a least-privilege read role; the
+  wrapper will not start the bundled database or permit the sample ETL.
+- `CONFIG_UID` and `CONFIG_GID`: positive, non-root IDs for the dedicated owner
+  of writable live state.
 - The pinned XYZ tag, commit, and accepted image identifier.
 
 Do not put credentials in `instance`, the workspace, public SVGs, Compose
 arguments, screenshots, or documentation.
+
+The `DBS_MAPP` value is passed unchanged to both XYZ and the configuration
+service. Encode URI-reserved username/password characters and select an
+appropriate PostgreSQL `sslmode`. An external database must already have
+PostGIS, the mapped schemas and relations, and `CONNECT`/`USAGE`/`SELECT`
+grants. Changing the URI does not rewrite workspace table mappings; review the
+seed before first initialization or use an approved dashboard/CLI change for
+an existing live workspace.
+
+With `MAPP_DATABASE_MODE=external`, the resolved Compose model omits both `db`
+and `etl`, so their role variables are unused. Keep the full generated `.env`
+key set for consistent drift checks, or supply an externally managed env file
+containing the platform settings and `DBS_MAPP`. The wrapper rejects `db`,
+localhost names, and loopback addresses as external database hosts.
+
+For a publicly trusted server, use an explicit common trust path so Node `pg`
+and libpq/psycopg apply the same verification policy:
+
+```dotenv
+DBS_MAPP=postgresql://USER:PERCENT_ENCODED_PASSWORD@HOST:5432/DATABASE?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
+```
+
+Private CA roots or client certificates require reviewed read-only mounts at
+the same absolute paths in both `xyz` and `config-ui`, plus corresponding URI
+parameters. Never commit that material or downgrade TLS verification to
+compensate for a missing mount.
+
+When changing an existing deployment from `bundled` to `external`, back up the
+bundled database and run `./bin/mapp down` before editing the mode and URI.
+This removes the old containers and networks but preserves the named database
+volume; external mode does not destroy it or manage its retention.
 
 The shipped production overlay models Caddy as the direct HTTPS endpoint. A
 deployment behind another reverse proxy or on a non-standard public port is a
@@ -81,18 +138,26 @@ trusted headers, binding, TLS, and health checks; do not bypass the validator.
 ## Start and load
 
 ```sh
-export MAPP_ENVIRONMENT=production
+# Bundled sample database:
 ./bin/mapp serve
-./bin/mapp etl
+./bin/mapp etl bus_stops
+./bin/mapp etl definitive_paths
+./bin/mapp etl smoke_control_orders
+
+# Or, with MAPP_DATABASE_MODE=external:
+./bin/mapp serve
 ./bin/mapp verify
 ```
 
 `serve` starts the long-running services without changing database rows.
-`etl` loads or refreshes configured sources. `verify` requires a running,
-healthy stack with representative data and performs end-to-end checks.
+Bundled mode's `all` command loads the full sample ETL before verification.
+In external mode, `etl`, `all`, and the local `db` command are disabled;
+`verify` checks the external PostGIS connection and catalog plus the generic
+platform and gateway gates. Complete external acceptance with layer-specific
+visual tests for that workspace.
 
-Use `./bin/mapp ps` and `./bin/mapp logs` in the same exported production
-environment while bringing up the release. Confirm both public hostnames,
+Use `./bin/mapp ps` and `./bin/mapp logs` from the same repository with its
+production `.env` while bringing up the release. Confirm both public hostnames,
 authenticated dashboard access, the current workspace revision, XYZ reload
 health, and a visual test for representative point, line, and polygon layers.
 Also verify firewall exposure, certificate issuance/renewal, backup
@@ -100,18 +165,26 @@ restoration, and the browser runner's outbound asset policy. A reviewed egress
 allowlist or local asset mirror remains recommended before long-term
 production use.
 
+Collect the production-host and rehearsal results through the
+[production acceptance evidence workflow](production-acceptance.md). The
+generated report distinguishes observed passes from external or not-yet-run
+items; it does not treat a documented prerequisite as evidence that it exists.
+
 ## Remote client
 
 Install the standalone `mapp-config-cli` on the operator or agent computer.
-Create its bearer token in the dashboard, transfer the token through an
-approved secret channel, initialize the production profile over HTTPS, and
-delete any temporary token file after the credential has been stored securely.
+Create a short-lived bootstrap token in the dashboard, transfer it through an
+approved secret channel, and initialize the production profile over HTTPS.
+Then run `config-cli auth device` and approve the displayed code in the
+dashboard. The replacement credential expires after thirty days and defaults
+to the server-enforced `inspect + propose + visual` scopes; request `apply` or
+`reload` only when that computer genuinely needs them. Revoke the bootstrap
+token in the dashboard and delete any temporary token file after setup.
 
-Current bearer tokens have full workspace-configuration authority, including
-proposal application, direct save, and reload. Dashboard password, token, and
-audit administration remain admin-session-only. Until server-enforced
-workspace scopes are implemented, issuing a token to an autonomous agent
-grants more authority than the desired inspect-and-propose role.
+Legacy `full` tokens remain available for trusted operators and migration.
+Direct workspace saves require a full token or administrator session.
+Dashboard password, token, device approval, and audit administration remain
+administrator-session-only.
 
 ## Upgrade and rollback
 
@@ -124,6 +197,10 @@ grants more authority than the desired inspect-and-propose role.
    state.
 5. Run unit, Compose, integration, reload, and visual checks.
 6. Recreate application containers for production.
+
+Use the explicit upgrade and rollback rehearsal hooks described in
+[production acceptance evidence](production-acceptance.md) against an isolated
+restore before production promotion.
 
 Application rollback should restore the previous accepted images while
 preserving PostgreSQL and `var`. Database schema or PostgreSQL major-version

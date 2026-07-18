@@ -19,6 +19,118 @@ target. Comma-separated locale composition uses the same framework rules.
 Validators and clients must preserve those rules rather than inventing a
 generic deep merge.
 
+## Layer folders
+
+XYZ creates layer-list folders at runtime from the optional `group` property
+on each ordinary layer. Layers with the same exact, non-empty string are placed
+in the same drawer:
+
+```json
+{
+  "locale": {
+    "layers": {
+      "Bus Stops": {"group": "Transport"},
+      "Rail Stations": {"group": "Transport"}
+    }
+  }
+}
+```
+
+This is a flat layer map, not a nested folder structure. The dashboard exposes
+the value as **Layer folder** and groups its own navigation the same way.
+Clearing the field removes `group`. Advanced upstream properties
+`groupClassList` and `groupmeta` are preserved, but remain in Advanced layer
+JSON because they control CSS and trusted HTML respectively.
+
+Folder order is not map drawing order. A `group` only changes layer-list
+navigation; it does not create an OpenLayers group or a shared rendering
+stack. Set `zIndex` on each layer when relative rendering order matters.
+Higher values render above lower values, including across different folders:
+
+```json
+{
+  "locale": {
+    "layers": {
+      "Boundaries": {"group": "Planning", "zIndex": 10},
+      "Labels": {"group": "Reference", "zIndex": 20}
+    }
+  }
+}
+```
+
+Set `promoteDisplay: true` only when a layer should be moved above every
+currently displayed layer each time it is shown. Because that behavior is
+dynamic, explicit `zIndex` values are preferable for a stable, reviewable
+drawing order.
+
+## Interactive layer Styling panel
+
+XYZ treats `layer.style` as both feature-rendering configuration and the input
+to an optional interactive Styling drawer. `style.hidden: true` suppresses the
+drawer only; it does not disable `default`, `highlight`, `hover`, theme, label,
+or icon-scaling behavior.
+
+`style.elements` is an ordered allow-list of panel builder keys:
+
+```json
+{
+  "style": {
+    "hover": {"display": true, "field": "stop_id", "title": "Feature"},
+    "opacitySlider": true,
+    "elements": ["hover", "opacitySlider"]
+  }
+}
+```
+
+The pinned framework recognizes `labels`, `label`, `hovers`, `hover`, `themes`,
+`theme`, `icon_scaling`, and `opacitySlider`. Inclusion alone is insufficient:
+XYZ checks that the corresponding property exists, and selector controls may
+require multiple configured choices. Unknown element keys are valid extension
+points and must be preserved even though the dashboard cannot preview their
+plugin-provided renderers.
+
+## Interactive layer filters
+
+XYZ builds a layer's Filtering drawer from its `infoj` entries. An entry can
+declare `filter: true` for type inference, a built-in filter type string, or a
+filter object:
+
+```json
+{
+  "filter": {"viewport": true, "includeAll": false},
+  "infoj": [
+    {
+      "title": "Town",
+      "field": "town",
+      "type": "text",
+      "filter": {"type": "like", "leading_wildcard": true}
+    },
+    {
+      "title": "Object ID",
+      "field": "object_id",
+      "type": "integer",
+      "filter": true
+    }
+  ]
+}
+```
+
+Automatic inference maps `text` to `like`, `numeric` to `numeric`, `integer`
+to `integer`, `date` to `date`, `datetime` to `datetime`, and `boolean` to
+`boolean`. Built-in explicit types are `like`, `match`, `numeric`, `integer`,
+`in`, `ni`, `date`, `datetime`, `boolean`, and `null`.
+
+Layer-level `filter.include`, `exclude`, and `includeAll` control which
+compatible fields are offered. `filter.hidden` suppresses the drawer;
+`filter.viewport` scopes generated ranges, histograms, and counts to the
+current map view. `filter.default` is a fixed server-side restriction composed
+with interactive filters. Upstream also accepts trusted template SQL strings
+there, so changes require explicit query and data-access review.
+
+The dashboard exposes the safe common controls and preserves fixed ranges,
+value lists, dropdown/search presentation, histograms, drawer/dialog options,
+and custom extensions in Advanced layer JSON.
+
 When raw `workspace.locale` is absent, XYZ synthesizes
 `{"layers": {}}` as the default. No locale selection and the explicit name
 `locale` both resolve that synthetic default, even if exactly one named
@@ -90,7 +202,7 @@ workspace
 | `layer.source` | OpenLayers source name | Tile source; defaults to `OSM`. Use `XYZ` for ordinary URL-template tiles. |
 | `layer.projection` | projection string | Tile projection; defaults to `EPSG:3857`. |
 | `layer.dbs` | database key | Optional connection override; inherits workspace `dbs`. |
-| `layer.table` | `table` or `schema.table` | PostgreSQL relation used for feature queries. |
+| `layer.table` | `table` or `schema.table` | PostgreSQL relation used for feature queries; it may be a table, view, or materialized view. Managed multi-source results use `derived_layers.<name>`. |
 | `layer.geom` | SQL identifier | Geometry column. |
 | `layer.srid` | positive SRID | Must be `3857` for `mvt` in XYZ v4.23.4. |
 | `layer.qID` | SQL identifier | Unique feature ID column. |
@@ -124,17 +236,39 @@ workspace
 | `icon.type` | XYZ symbol name | `dot`, `target`, `triangle`, `square`, `diamond`, `semiCircle`, `circle`, `markerLetter`, `markerColor`, or `template`. |
 | `icon.fillColor` | hex colour | Effective for the filled built-in symbols; `dot` does not use `strokeColor`. |
 | `icon.strokeColor`, `strokeWidth` | colour and number | Effective for the built-in `circle` symbol. |
-| `icon.color`, `letter` | colour and one character | Required by `markerLetter`. |
+| `icon.color`, `letter` | colour and one character | Outer pin colour and centre text used by a layer `markerLetter`. These values must be inside the icon object. |
 | `icon.colorMarker`, `colorDot` | colours | Required by `markerColor`. |
 | `icon.url`, `svg` | non-empty string | Custom icon source supported by XYZ. `svg` is a legacy alias normalized to `url` at load time. Platform-managed files live in `instance/public/svg` and use `/instance/svg/<filename>.svg`. |
 | `icon` | object or object array | XYZ may render one icon or multiple icons. The dashboard preserves icon arrays but exposes them as read-only outside Advanced layer JSON. |
+
+XYZ also uses `markerLetter` internally for selected-location UI pins. That is
+not the same mapping as a layer's `style.<state>.icon`. XYZ clones
+`locale.locations.pinStyle`, then overwrites its `color` with the selected
+location style's `strokeColor` and its `letter` with the location record's
+`symbol`. A record-level `colour` first replaces the location style's stroke
+and fill colours. As a result, `locale.locations.pinStyle.color` and
+`locale.locations.pinStyle.letter` are not effective per-location controls,
+and changing only `locale.locations.style.fillColor` does not recolour the UI
+pin.
+
+The `locations` configuration and its records are open-ended XYZ UI extension
+state rather than the dashboard's validated layer-style surface. They are
+preserved through `additionalProperties`; their runtime-generated `colour` and
+`symbol` values should not be mistaken for required workspace-schema fields.
+This behavior is verified against XYZ v4.23.4's
+[`markerLetter` symbol](https://github.com/GEOLYTIX/xyz/blob/a6f03c07dd7aaae2e9ab04087143ee0400e15cb9/lib/utils/svgSymbols.mjs#L157-L167)
+and
+[`listview` pin construction](https://github.com/GEOLYTIX/xyz/blob/a6f03c07dd7aaae2e9ab04087143ee0400e15cb9/lib/ui/locations/listview.mjs#L267-L279).
 
 Extent and view objects may be absent or partial where XYZ composition supplies
 the remaining values. Validation checks only the numeric members that are
 present and checks cross-field ordering when both sides of a bound exist.
 
 The dashboard's ordinary catalog controls are intended for a concrete
-database-backed layer with one `table`, `geom`, and `qID`. External map styles,
+database-backed layer with one relation reference in `table`, plus `geom` and
+`qID`. The relation may be a managed view in `derived_layers`, so the workspace
+layer remains conventional even when its result derives from multiple source
+tables. External map styles,
 Google/tile sources, template-driven layers, inline `features`, zoom-keyed
 `tables`/`geoms`, icon arrays, and named style references are preserved but
 remain read-only in controls that would otherwise flatten or overwrite them.
