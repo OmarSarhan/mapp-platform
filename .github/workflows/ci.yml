@@ -25,6 +25,14 @@ jobs:
           python -m pip install -r config-ui/requirements.txt
           python -m pip install -e etl
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: |
+            config-ui/package-lock.json
+            browser-runner/package-lock.json
+
       - name: Test configuration service
         run: PYTHONPATH=config-ui python -m unittest discover -s config-ui/tests -v
 
@@ -33,17 +41,6 @@ jobs:
 
       - name: Test deployment helpers
         run: PYTHONPATH=. python -m unittest discover -s scripts/tests -v
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: |
-            config-ui/package-lock.json
-            browser-runner/package-lock.json
-
-      - name: Test cross-language workspace fingerprint
-        run: PYTHONPATH=. python -m unittest discover -s scripts/tests -p 'test_workspace_fingerprint.py' -v
 
       - name: Build dashboard
         working-directory: config-ui
@@ -67,14 +64,22 @@ jobs:
         run: |
           bash -n bin/mapp scripts/verify.sh docker/postgis/healthcheck.sh docker/postgis/init/10-roles.sh
           docker compose --env-file .env.example -f compose.yaml config --quiet
+          docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml config --quiet
           CONFIG_UID=1234 CONFIG_GID=2345 \
-            docker compose --env-file .env.example -f compose.yaml config --format json \
-            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="1234:2345"; assert all(services[name]["user"] == expected for name in ("xyz","config-ui","browser-runner"))'
-          docker compose --env-file .env.example -f compose.yaml -f compose.db-port.yaml config --quiet
+            docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml config --format json \
+            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="1234:2345"; assert all(services[name]["user"] == expected for name in ("xyz","config-ui","browser-runner")); assert services["xyz"]["environment"]["DBS_MAPP"] == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" in services["xyz"]["depends_on"] and "db" in services["config-ui"]["depends_on"]'
+          docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml -f compose.db-port.yaml config --quiet
+          DBS_MAPP='postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require' \
+            docker compose --env-file /dev/null -f compose.yaml config --format json \
+            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require"; assert services["xyz"]["environment"]["DBS_MAPP"] == expected == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" not in services and "etl" not in services; assert "depends_on" not in services["xyz"] and "depends_on" not in services["config-ui"]'
           export PRODUCTION_MAP_SITE=https://maps.company.co.uk
           export PRODUCTION_CONFIG_SITE=https://config.company.co.uk
           export PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui
           export PRODUCTION_CADDY_EMAIL=operations@company.co.uk
+          export EDGE_BIND_ADDRESS=0.0.0.0
+          export HTTP_PORT=80
           export HTTPS_PORT=443
           python scripts/validate_production_env.py --environment .env.example
-          docker compose --env-file .env.example -f compose.yaml -f compose.production.yaml config --quiet
+          docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml -f compose.production.yaml config --quiet
+          DBS_MAPP='postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt' \
+            docker compose --env-file /dev/null -f compose.yaml -f compose.production.yaml config --quiet

@@ -1,0 +1,39 @@
+{
+  "name": "MAPP Platform",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4.0.0": {}
+  },
+  "containerEnv": {
+    "EDGE_BIND_ADDRESS": "0.0.0.0"
+  },
+  "postCreateCommand": "python -m pip install --requirement config-ui/requirements.txt && npm --prefix config-ui ci",
+  "runArgs": [
+    "--publish",
+    "3000:3000"
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "MAPP gateway",
+      "onAutoForward": "ignore"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "openai.chatgpt",
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "terminal.integrated.cwd": "${workspaceFolder}",
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.terminal.useEnvFile": true
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}
