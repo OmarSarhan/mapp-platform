@@ -6,6 +6,22 @@ from infoj_types import info_value_error
 
 
 class ExpressionProbeContractTests(unittest.TestCase):
+    def test_validation_diagnostics_have_stable_machine_fields(self):
+        [diagnostic] = app.annotated([{
+            "path": "locale.layers.Boolean/info.infoj.0.fieldfx",
+            "pointer": "/locale/layers/Boolean~1info/infoj/0/fieldfx",
+            "message": "XYZ boolean entries require boolean; PostgreSQL returned text.",
+            "locale": "locale",
+            "layer": "Boolean/info",
+            "field": "calculated_value",
+        }])
+        self.assertEqual("sql.scalar_read_only", diagnostic["ruleId"])
+        self.assertEqual("/locale/layers/Boolean~1info/infoj/0/fieldfx", diagnostic["pointer"])
+        self.assertEqual("error", diagnostic["severity"])
+        self.assertEqual("boolean", diagnostic["expectedType"])
+        self.assertEqual("text", diagnostic["actualType"])
+        self.assertEqual("Boolean/info", diagnostic["layer"])
+
     def test_sample_payload_is_json_serializable(self):
         payload = {
             "valid": True,

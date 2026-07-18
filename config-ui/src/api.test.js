@@ -4,10 +4,13 @@ import test from 'node:test';
 import {
   ApiError,
   activeLocale,
+  confirmedWorkspaceReload,
   mergeLocale,
   renderedLocales,
   requestJson,
   savedWorkspaceFromError,
+  workspaceSaveFailurePhase,
+  workspaceSaveStatus,
 } from './api.js';
 
 test('requestJson retains a parsed error payload', async () => {
@@ -46,6 +49,88 @@ test('savedWorkspaceFromError rejects an ordinary failed save', () => {
     status: 422,
     payload: {saved: false, workspace: {key: 'demo'}, revision: 'rev-2'},
   })), null);
+});
+
+test('workspace save status distinguishes restart progress and readiness', () => {
+  assert.deepEqual(workspaceSaveStatus('restarting'), {
+    kind: 'pending',
+    message: 'Saving workspace and restarting XYZ…',
+  });
+  assert.deepEqual(workspaceSaveStatus('ready'), {
+    kind: 'success',
+    message: 'Workspace saved. XYZ restarted and is ready for connections with this workspace.',
+  });
+
+  const errors = [{path: 'server', message: 'Timed out waiting for XYZ.'}];
+  assert.deepEqual(workspaceSaveStatus('incomplete', errors), {
+    kind: 'error',
+    message: 'Workspace saved. XYZ is still restarting or its readiness could not be confirmed.',
+    errors,
+  });
+  assert.deepEqual(workspaceSaveStatus('failed', errors), {
+    kind: 'error',
+    message: 'Workspace was not saved.',
+    errors,
+  });
+  assert.deepEqual(workspaceSaveStatus('unknown', errors), {
+    kind: 'error',
+    message: 'Save outcome could not be confirmed. Reload the workspace before retrying.',
+    errors,
+  });
+});
+
+test('workspace save failure phase distinguishes definite and ambiguous outcomes', () => {
+  assert.equal(workspaceSaveFailurePhase(new ApiError('Validation failed.', {
+    status: 422,
+    payload: {errors: [{path: '/key', message: 'Required.'}]},
+  })), 'failed');
+  assert.equal(workspaceSaveFailurePhase(new ApiError('Reload timed out.', {
+    status: 504,
+    payload: {
+      saved: true,
+      workspace: {key: 'demo'},
+      revision: 'rev-2',
+    },
+  })), 'incomplete');
+  assert.equal(workspaceSaveFailurePhase(new TypeError('Network failed.')), 'unknown');
+  assert.equal(workspaceSaveFailurePhase(new ApiError('Gateway timeout.', {
+    status: 504,
+    payload: {},
+  })), 'unknown');
+});
+
+test('confirmedWorkspaceReload requires fingerprint-matched healthy readiness', () => {
+  const fingerprint = 'a'.repeat(64);
+  const payload = {
+    saved: true,
+    fingerprint,
+    reload: {
+      expectedWorkspaceFingerprint: fingerprint,
+      requestedGeneration: 4,
+      status: {
+        appliedGeneration: 4,
+        completed: true,
+        healthy: true,
+        workspaceFingerprint: fingerprint,
+      },
+    },
+  };
+  assert.equal(confirmedWorkspaceReload(payload), true);
+  assert.equal(confirmedWorkspaceReload({
+    ...payload,
+    reload: {
+      ...payload.reload,
+      status: {...payload.reload.status, workspaceFingerprint: 'b'.repeat(64)},
+    },
+  }), false);
+  assert.equal(confirmedWorkspaceReload({
+    ...payload,
+    reload: {
+      ...payload.reload,
+      status: {...payload.reload.status, completed: false},
+    },
+  }), false);
+  assert.equal(confirmedWorkspaceReload({saved: true}), false);
 });
 
 test('activeLocale identifies the locale currently rendered by the dashboard', () => {

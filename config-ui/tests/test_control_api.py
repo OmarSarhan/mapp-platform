@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from control_api import (
+    RULES,
     apply_operations,
     apply_visual_override,
+    capabilities,
     contract,
     deep_merge,
     effective_locales,
@@ -14,6 +16,7 @@ from control_api import (
     is_probeable_database_layer,
     pointer_get,
     proposal_create,
+    proposal_check,
     reload_status,
     reload_timeout,
     request_reload,
@@ -26,6 +29,68 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_capabilities_publish_stable_action_schemas_and_operation_contract(self):
+        payload = capabilities("instance")
+        actions = {item["id"]: item for item in payload["actions"]}
+        self.assertEqual("instance", payload["instanceId"])
+        self.assertEqual(
+            ["revision", "operations"],
+            actions["proposals.check"]["inputSchema"]["required"],
+        )
+        self.assertEqual("apply", actions["proposals.apply"]["risk"])
+        self.assertEqual(
+            "proposal.visual-test",
+            actions["proposals.visual-test"]["operationKind"],
+        )
+        self.assertEqual(
+            "proposal.screenshot",
+            actions["proposals.screenshot"]["operationKind"],
+        )
+        screenshot_properties = actions["proposals.screenshot"]["inputSchema"][
+            "properties"
+        ]
+        self.assertEqual(2560, screenshot_properties["viewport"]["properties"][
+            "width"
+        ]["maximum"])
+        self.assertEqual(
+            {"width": 1080, "height": 1080},
+            screenshot_properties["viewport"]["default"],
+        )
+        self.assertEqual(3, screenshot_properties["deviceScaleFactor"]["maximum"])
+        self.assertEqual(1, screenshot_properties["deviceScaleFactor"]["default"])
+        self.assertEqual(
+            "proposal.visual-test",
+            actions["proposals.preview-screenshot"]["operationKind"],
+        )
+        screenshot_schema = actions[
+            "proposals.preview-screenshot"
+        ]["inputSchema"]["properties"]
+        self.assertEqual(
+            2560,
+            screenshot_schema["viewport"]["properties"]["width"]["maximum"],
+        )
+        self.assertEqual(3, screenshot_schema["deviceScaleFactor"]["maximum"])
+        self.assertIn(
+            "workspaceFingerprint",
+            actions["xyz.reload"]["inputSchema"]["properties"],
+        )
+        self.assertNotIn(
+            "fingerprint",
+            actions["xyz.reload"]["inputSchema"]["properties"],
+        )
+        self.assertEqual("meta", payload["responseEnvelope"]["metadataField"])
+
+    def test_contract_advertises_scoped_device_authorization(self):
+        authentication = contract("instance")["authentication"]
+        self.assertEqual(
+            ["inspect", "propose", "visual"],
+            authentication["defaultDeviceScopes"],
+        )
+        self.assertEqual(
+            {"full", "inspect", "propose", "visual", "apply", "reload", "derive"},
+            set(authentication["scopes"]),
+        )
+
     def test_pointer_and_operations_preserve_unrelated_values(self):
         source = {"locale": {"layers": {"Bus Stops": {"style": {"default": {"icon": {"fillColor": "#0f0", "scale": 1}}}}}}, "plugin": {"x": 1}}
         candidate, diff = apply_operations(source, [{
@@ -108,22 +173,76 @@ class ControlApiTests(unittest.TestCase):
                 & 0o777,
             )
 
+    def test_proposal_check_returns_evidence_without_persisting(self):
+        original = {"key": "workspace", "locale": {"layers": {}}}
+        operations = [{"op": "set", "path": "/title", "value": "Candidate"}]
+        candidate, diff = apply_operations(original, operations)
+        checked = proposal_check(
+            original, "revision", candidate, operations, diff, "A focused edit.",
+        )
+        self.assertTrue(checked["valid"])
+        self.assertFalse(checked["proposalCreated"])
+        self.assertEqual("revision", checked["originalRevision"])
+        self.assertEqual(diff, checked["diff"])
+        self.assertRegex(checked["checkFingerprint"], r"^[0-9a-f]{64}$")
+        changed = proposal_check(
+            original, "revision-2", candidate, operations, diff, "A focused edit.",
+        )
+        self.assertNotEqual(
+            checked["checkFingerprint"], changed["checkFingerprint"]
+        )
+        changed_operations = [{"op": "set", "path": "/title", "value": "Other"}]
+        other_candidate, other_diff = apply_operations(original, changed_operations)
+        other = proposal_check(
+            original, "revision", other_candidate, changed_operations, other_diff,
+        )
+        self.assertNotEqual(checked["checkFingerprint"], other["checkFingerprint"])
+        self.assertNotIn("id", checked)
+        self.assertNotIn("status", checked)
+
     def test_contract_lists_only_implemented_proposal_commands(self):
-        commands = contract("instance")["commands"]
+        advertised = contract("instance")
+        commands = advertised["commands"]
+        self.assertIn("proposals check", commands)
         self.assertNotIn("proposals delete", commands)
         self.assertNotIn("completion-spec", commands)
+        self.assertIn("apply with managed reload", advertised["workflow"])
+        self.assertIn("check reload status", advertised["workflow"])
+        self.assertNotIn("reload", advertised["workflow"])
 
     def test_examples_preserve_revision_and_confirmation_guards(self):
-        workflow = examples()["workflow"]
+        advertised_examples = examples()
+        workflow = advertised_examples["workflow"]
+        proposal_check_command = next(
+            command for command in workflow if "proposals check" in command
+        )
         proposal_create_command = next(
             command for command in workflow if "proposals create" in command
         )
         proposal_apply_command = next(
             command for command in workflow if "proposals apply" in command
         )
-        self.assertIn("--base-revision", proposal_create_command)
+        self.assertIn("--base-revision", proposal_check_command)
+        self.assertIn("--from-check", proposal_create_command)
         self.assertIn("--confirm", proposal_apply_command)
-        self.assertNotIn("<", proposal_create_command + proposal_apply_command)
+        self.assertNotIn(
+            "<",
+            proposal_check_command + proposal_create_command + proposal_apply_command,
+        )
+        drawing_order = advertised_examples["setLayerDrawingOrder"]
+        self.assertEqual(
+            [10, 20],
+            [operation["value"] for operation in drawing_order["operations"]],
+        )
+        self.assertIn("navigation only", drawing_order["explanation"])
+
+    def test_layer_order_rule_distinguishes_navigation_from_rendering(self):
+        layer_order = next(
+            rule for rule in RULES if rule["id"] == "workspace.layer_order"
+        )
+        self.assertIn("navigation drawers only", layer_order["description"])
+        self.assertIn("higher values render above", layer_order["description"])
+        self.assertIn("promoteDisplay", layer_order["remediation"])
 
     def test_visual_override_is_bounded_and_preserves_base_evidence(self):
         plan = {
@@ -179,6 +298,35 @@ class ControlApiTests(unittest.TestCase):
             self.assertEqual(list(range(1, 13)), sorted(generations))
             self.assertEqual(12, reload_status()["requestedGeneration"])
             self.assertEqual([], list(Path(directory).glob("*.tmp")))
+
+    def test_reload_generation_advances_past_applied_when_requested_is_invalid_or_stale(self):
+        cases = (None, "corrupt\n", "-1\n", "3\n")
+        fingerprint = "a" * 64
+        for requested in cases:
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as directory, patch(
+                "control_api.RELOAD_DIR",
+                Path(directory),
+            ):
+                reload_dir = Path(directory)
+                if requested is not None:
+                    (reload_dir / "requested").write_text(requested)
+                (reload_dir / "applied").write_text("7\n")
+                (reload_dir / "healthy").write_text("true\n")
+                (reload_dir / "workspace-fingerprint").write_text(
+                    f"{fingerprint}\n"
+                )
+
+                result = request_reload(fingerprint)
+                status = reload_status()
+
+                self.assertEqual(8, result["requestedGeneration"])
+                self.assertEqual(8, status["requestedGeneration"])
+                self.assertEqual(7, status["appliedGeneration"])
+                self.assertTrue(status["healthy"])
+                self.assertFalse(
+                    status["appliedGeneration"] >= result["requestedGeneration"]
+                    and status["healthy"]
+                )
 
     def test_reload_input_is_validated_before_requesting(self):
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -237,6 +385,8 @@ class ControlApiTests(unittest.TestCase):
             {"locale", "en-GB", "cy-GB"},
             set(effective_locales(workspace)),
         )
+        with self.assertRaisesRegex(ValueError, "Unknown locale"):
+            select_locale(workspace, "")
 
     def test_locale_merge_matches_xyz_array_rules(self):
         merged = deep_merge(

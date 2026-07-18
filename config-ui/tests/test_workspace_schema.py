@@ -28,6 +28,61 @@ class WorkspaceValidationTests(unittest.TestCase):
     def test_accepts_supported_workspace_and_unknown_properties(self):
         self.assertEqual(validate_workspace(valid_workspace(), {"MAPP"}), [])
 
+    def test_accepts_non_empty_xyz_layer_group_and_rejects_empty_group(self):
+        data = valid_workspace()
+        data["locale"]["layers"]["Places"]["group"] = "Reference"
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+        data["locale"]["layers"]["Places"]["group"] = " "
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.group", paths)
+
+    def test_validates_style_panel_visibility_and_ordered_elements(self):
+        data = valid_workspace()
+        style = data["locale"]["layers"]["Places"].setdefault("style", {})
+        style.update({
+            "hidden": False,
+            "elements": ["hover", "opacitySlider", "customPluginControl"],
+            "opacitySlider": True,
+        })
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+        style["elements"] = ["hover", "hover"]
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.style.elements", paths)
+
+    def test_accepts_xyz_layer_and_infoj_filter_configuration(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["filter"] = {
+            "include": ["name"],
+            "exclude": ["id"],
+            "includeAll": False,
+            "viewport": True,
+            "hidden": False,
+            "default": {"active": {"boolean": True}},
+        }
+        layer["infoj"][0]["filter"] = {
+            "type": "like",
+            "leading_wildcard": True,
+        }
+        layer["infoj"].extend([
+            {
+                "title": "ID",
+                "field": "id",
+                "type": "integer",
+                "filter": True,
+            },
+        ])
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+    def test_rejects_invalid_filter_type_and_unknown_included_field(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["infoj"][0]["filter"] = {"type": "unsupported"}
+        layer["filter"] = {"include": ["missing_field"]}
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.infoj.0.filter.type", paths)
+        self.assertIn("locale.layers.Places.filter.include", paths)
+
     def test_rejects_unknown_database(self):
         data = valid_workspace()
         data["locale"]["layers"]["Places"]["dbs"] = "OTHER"

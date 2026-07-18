@@ -43,6 +43,68 @@ export function savedWorkspaceFromError(error) {
   };
 }
 
+export function confirmedWorkspaceReload(payload) {
+  const fingerprint = payload?.fingerprint;
+  const reload = payload?.reload;
+  const status = reload?.status;
+  return (
+    payload?.saved === true
+    && typeof fingerprint === 'string'
+    && /^[0-9a-f]{64}$/.test(fingerprint)
+    && reload?.expectedWorkspaceFingerprint === fingerprint
+    && Number.isInteger(reload?.requestedGeneration)
+    && reload.requestedGeneration >= 0
+    && status?.completed === true
+    && status.healthy === true
+    && Number.isInteger(status.appliedGeneration)
+    && status.appliedGeneration >= reload.requestedGeneration
+    && status.workspaceFingerprint === fingerprint
+  );
+}
+
+export function workspaceSaveStatus(phase, errors = []) {
+  const statuses = {
+    restarting: {
+      kind: 'pending',
+      message: 'Saving workspace and restarting XYZ…',
+    },
+    ready: {
+      kind: 'success',
+      message: 'Workspace saved. XYZ restarted and is ready for connections with this workspace.',
+    },
+    incomplete: {
+      kind: 'error',
+      message: 'Workspace saved. XYZ is still restarting or its readiness could not be confirmed.',
+    },
+    failed: {
+      kind: 'error',
+      message: 'Workspace was not saved.',
+    },
+    unknown: {
+      kind: 'error',
+      message: 'Save outcome could not be confirmed. Reload the workspace before retrying.',
+    },
+  };
+  return {...statuses[phase], ...(errors.length ? {errors} : {})};
+}
+
+export function workspaceSaveFailurePhase(error) {
+  if (savedWorkspaceFromError(error)) return 'incomplete';
+  const status = error?.status;
+  if (
+    error?.payload?.saved === false
+    || (
+      Number.isInteger(status)
+      && status >= 400
+      && status < 500
+      && status !== 408
+    )
+  ) {
+    return 'failed';
+  }
+  return 'unknown';
+}
+
 export function mergeLocale(base, override) {
   if (
     !base || typeof base !== 'object' || Array.isArray(base)

@@ -1,4 +1,5 @@
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,12 +74,50 @@ class ReloadTests(unittest.TestCase):
 
             workspace.write_text('{"key":"demo"}\n')
             with patch("app.WORKSPACE", workspace):
-                raw, _ = app.read_workspace()
+                _, _, current_revision = app.read_workspace()
                 with self.assertRaises(ValueError):
                     app.save_workspace(
                         {"key": "demo", "plugin": {"value": float("nan")}},
-                        app.revision(raw),
+                        current_revision,
                     )
+
+    def test_snapshot_cannot_pair_old_bytes_with_replacement_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace.json"
+            replacement = Path(directory) / "replacement.json"
+            old_raw = b'{"generation":"old"}\n'
+            new_raw = b'{"generation":"new"}\n'
+            workspace.write_bytes(old_raw)
+            replacement.write_bytes(new_raw)
+            old_modified_ns = 1_700_000_000_000_000_000
+            new_modified_ns = old_modified_ns + 1_000_000_000
+            os.utime(workspace, ns=(old_modified_ns, old_modified_ns))
+            os.utime(replacement, ns=(new_modified_ns, new_modified_ns))
+            old_modified_ns = workspace.stat().st_mtime_ns
+            new_modified_ns = replacement.stat().st_mtime_ns
+            real_fstat = os.fstat
+
+            def replace_before_fstat(descriptor):
+                os.replace(replacement, workspace)
+                return real_fstat(descriptor)
+
+            with (
+                patch("app.WORKSPACE", workspace),
+                patch("app.os.fstat", side_effect=replace_before_fstat),
+            ):
+                raw, data, current_revision = app.read_workspace()
+            self.assertEqual(new_raw, workspace.read_bytes())
+
+        self.assertEqual(old_raw, raw)
+        self.assertEqual("old", data["generation"])
+        self.assertEqual(
+            app.revision(old_raw, old_modified_ns),
+            current_revision,
+        )
+        self.assertNotEqual(
+            app.revision(old_raw, new_modified_ns),
+            current_revision,
+        )
 
     def _proposal_fixture(self, directory):
         workspace = Path(directory) / "workspace.json"
@@ -86,7 +125,7 @@ class ReloadTests(unittest.TestCase):
         store = ControlStore(Path(directory) / "control")
         store.initialize("correct horse battery staple", "instance")
         with patch("app.WORKSPACE", workspace):
-            raw, original = app.read_workspace()
+            _, original, original_revision = app.read_workspace()
             candidate = {
                 **original,
                 "title": "Approved candidate",
@@ -94,7 +133,7 @@ class ReloadTests(unittest.TestCase):
             proposal = proposal_create(
                 store,
                 original,
-                app.revision(raw),
+                original_revision,
                 candidate,
                 [{"op": "set", "path": "/title", "value": "Approved candidate"}],
                 [{

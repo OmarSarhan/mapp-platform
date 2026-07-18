@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
 
 API_VERSION = "1.0"
 CONTRACT_VERSION = "1.0"
-RULES_VERSION = "1.0"
+RULES_VERSION = "1.1"
 XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -43,15 +43,338 @@ PROPOSAL_LOCK = threading.RLock()
 
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect `config-cli schema` and correct the reported path."},
+    {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
     {"id": "workspace.catalog", "category": "catalog", "description": "Database-backed layers must use selectable relations and columns.", "remediation": "Use `config-cli catalog list` and select a reported table, geometry, and ID."},
     {"id": "workspace.feature_id", "category": "data", "description": "XYZ feature IDs must be non-null and unique.", "remediation": "Choose a primary or unique non-null column for qID."},
     {"id": "workspace.render", "category": "render", "description": "XYZ-equivalent bounded database reads must succeed.", "remediation": "Review the relation, SRID, expressions, and database permissions."},
     {"id": "sql.scalar_read_only", "category": "security", "description": "Calculated information values are one read-only scalar expression.", "remediation": "Remove statements, comments, subqueries, session functions, and system access."},
+    {"id": "derived_layer.select_only", "category": "security", "description": "Managed derived layers are one dependency-checked SELECT materialized only inside derived_layers.", "remediation": "Declare every schema-qualified source and remove statements, comments, undeclared relations, or unsafe operations."},
     {"id": "svg.safe", "category": "security", "description": "Dashboard SVGs must be bounded, parseable, and free of active content.", "remediation": "Use a safe SVG from `config-cli icons list`."},
     {"id": "proposal.revision", "category": "proposal", "description": "A proposal applies only to the revision from which it was created.", "remediation": "Create a new proposal against the current workspace."},
     {"id": "visual.data", "category": "visual", "description": "A database-backed visual test needs non-empty valid geometry.", "remediation": "Load data or provide an explicit centre and zoom."},
 ]
 DATABASE_LAYER_FORMATS = {"cluster", "geojson", "mvt", "vector", "wkt"}
+
+ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "derived-layers.create": {
+        "method": "POST",
+        "path": "/api/derived-layers",
+        "risk": "database-definition",
+        "scope": "derive",
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "name", "query", "sources", "idColumn", "geometryColumn"
+            ],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]{0,62}$",
+                },
+                "kind": {"enum": ["view", "materialized"]},
+                "query": {"type": "string", "minLength": 1},
+                "sources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"},
+                },
+                "idColumn": {"type": "string"},
+                "geometryColumn": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "derived-layers.refresh": {
+        "method": "POST",
+        "pathTemplate": "/api/derived-layers/{name}/refresh",
+        "risk": "database-refresh",
+        "scope": "derive",
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "derived-layers.replace": {
+        "method": "POST",
+        "pathTemplate": "/api/derived-layers/{name}/replace",
+        "risk": "database-definition",
+        "scope": "derive",
+        "presentation": {
+            "messageField": "derivedLayer.userMessage",
+            "nextActionField": "derivedLayer.suggestedAction",
+            "technicalFields": [
+                "workspaceReferences", "fieldReferences", "dependents",
+                "technicalDetail",
+            ],
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "confirmed", "name", "kind", "query", "sources",
+                "idColumn", "geometryColumn",
+            ],
+            "properties": {
+                "confirmed": {"const": True},
+                "name": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]{0,62}$",
+                },
+                "kind": {"enum": ["view", "materialized"]},
+                "query": {"type": "string", "minLength": 1},
+                "sources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"},
+                },
+                "idColumn": {"type": "string"},
+                "geometryColumn": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "derived-layers.drop": {
+        "method": "POST",
+        "pathTemplate": "/api/derived-layers/{name}/drop",
+        "risk": "database-definition",
+        "scope": "derive",
+        "presentation": {
+            "messageField": "userMessage",
+            "nextActionField": "suggestedAction",
+            "technicalFields": [
+                "workspaceReferences", "dependents", "technicalDetail",
+            ],
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "proposals.check": {
+        "method": "POST",
+        "path": "/api/proposals/check",
+        "risk": "read",
+        "scope": "propose",
+        "inputSchema": {
+            "type": "object",
+            "required": ["revision", "operations"],
+            "properties": {
+                "revision": {"type": "string", "minLength": 1},
+                "operations": {"type": "array", "minItems": 1},
+                "explanation": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "proposals.create": {
+        "method": "POST",
+        "path": "/api/proposals",
+        "risk": "propose",
+        "scope": "propose",
+        "inputSchema": {
+            "type": "object",
+            "required": ["revision", "operations"],
+            "properties": {
+                "revision": {"type": "string", "minLength": 1},
+                "operations": {"type": "array", "minItems": 1},
+                "explanation": {"type": "string"},
+                "checkFingerprint": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "proposals.apply": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/apply",
+        "risk": "apply",
+        "scope": "apply",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"approved": {"const": True}},
+            "required": ["approved"],
+            "additionalProperties": False,
+        },
+    },
+    "visual.test": {
+        "method": "POST",
+        "path": "/api/visual-test",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "visual.test",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {
+                    "type": "array",
+                    "prefixItems": [{"type": "number"}, {"type": "number"}],
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "proposals.visual-test": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/visual-test",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "proposal.visual-test",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {"type": "array", "minItems": 2, "maxItems": 2},
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "proposals.screenshot": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/screenshot",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "proposal.screenshot",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {"type": "array", "minItems": 2, "maxItems": 2},
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewport": {
+                    "type": "object",
+                    "default": {"width": 1080, "height": 1080},
+                    "properties": {
+                        "width": {
+                            "type": "number",
+                            "minimum": 320,
+                            "maximum": 2560,
+                        },
+                        "height": {
+                            "type": "number",
+                            "minimum": 240,
+                            "maximum": 1440,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                "deviceScaleFactor": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 1,
+                },
+            },
+            "additionalProperties": True,
+        },
+    },
+    "proposals.preview-plan": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/visual-plan",
+        "risk": "visual",
+        "scope": "visual",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {"type": "array", "minItems": 2, "maxItems": 2},
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewport": {"type": "object"},
+                "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "proposals.preview-test": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/visual-test",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "proposal.visual-test",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {"type": "array", "minItems": 2, "maxItems": 2},
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewport": {"type": "object"},
+                "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "proposals.preview-screenshot": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/screenshot",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "proposal.visual-test",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "centre": {"type": "array", "minItems": 2, "maxItems": 2},
+                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewport": {
+                    "type": "object",
+                    "properties": {
+                        "width": {
+                            "type": "integer",
+                            "minimum": 320,
+                            "maximum": 2560,
+                        },
+                        "height": {
+                            "type": "integer",
+                            "minimum": 240,
+                            "maximum": 1440,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+            },
+            "additionalProperties": True,
+        },
+    },
+    "xyz.reload": {
+        "method": "POST",
+        "path": "/api/xyz/reload",
+        "risk": "reload",
+        "scope": "reload",
+        "operationKind": "xyz.reload",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspaceFingerprint": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+                "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 120},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 def contract(instance_id: str) -> dict[str, Any]:
@@ -61,19 +384,68 @@ def contract(instance_id: str) -> dict[str, Any]:
         "rulesVersion": RULES_VERSION,
         "xyzVersion": XYZ_VERSION,
         "instanceId": instance_id,
-        "authentication": {"type": "bearer", "tokens": "issued by config UI", "scopes": ["full"]},
+        "authentication": {
+            "type": "bearer",
+            "tokens": "issued by config UI or approved device authorization",
+            "scopes": ["full", "inspect", "propose", "visual", "apply", "reload", "derive"],
+            "defaultDeviceScopes": ["inspect", "propose", "visual"],
+        },
         "commands": [
             "describe", "schema", "rules", "examples",
-            "workspace get", "layers list", "layers get", "catalog list", "icons list",
+            "capabilities list", "capabilities show",
+            "workspace get", "layers list", "layers get",
+            "layers style-elements", "layers filters", "layers effective",
+            "catalog list", "icons list",
+            "derived-layers capabilities", "derived-layers list",
+            "derived-layers show", "derived-layers create",
+            "derived-layers refresh", "derived-layers replace",
+            "derived-layers drop",
             "validate", "set", "unset", "amend", "sql capabilities", "sql test",
             "visual-plan", "visual-test", "screenshot",
-            "proposals create", "proposals show", "proposals list",
+            "proposals preview-plan", "proposals preview-test",
+            "proposals preview-screenshot",
+            "proposals check", "proposals create", "proposals show", "proposals list",
             "proposals apply", "proposals decline",
             "xyz status", "xyz reload",
-            "auth status",
+            "operations show", "operations wait",
+            "auth status", "auth device",
         ],
-        "workflow": ["inspect", "propose", "validate", "review evidence", "approve", "apply", "reload", "verify"],
+        "workflow": [
+            "inspect",
+            "propose",
+            "validate",
+            "review evidence",
+            "approve",
+            "apply with managed reload",
+            "check reload status",
+            "verify",
+        ],
         "exitCodes": {"success": 0, "usage": 2, "validation": 3, "conflict": 4, "connectivity": 5, "visual": 6, "authentication": 7},
+        "capabilities": {
+            "discovery": "/api/capabilities",
+            "operations": {
+                "statusTemplate": "/api/operations/{operationId}",
+                "terminalStatuses": ["succeeded", "failed", "indeterminate"],
+            },
+            "responseMetadata": "meta",
+        },
+    }
+
+
+def capabilities(instance_id: str) -> dict[str, Any]:
+    return {
+        "apiVersion": API_VERSION,
+        "contractVersion": CONTRACT_VERSION,
+        "instanceId": instance_id,
+        "actions": [
+            {"id": action_id, **copy.deepcopy(schema)}
+            for action_id, schema in sorted(ACTION_SCHEMAS.items())
+        ],
+        "responseEnvelope": {
+            "metadataField": "meta",
+            "requestIdField": "requestId",
+            "operationIdField": "operationId",
+        },
     }
 
 
@@ -244,10 +616,26 @@ def examples() -> dict:
             }],
             "explanation": "Changes only the Bus Stops default point-symbol fill colour.",
         },
+        "setLayerDrawingOrder": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Boundaries/zIndex",
+                    "value": 10,
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Labels/zIndex",
+                    "value": 20,
+                },
+            ],
+            "explanation": "Draws Labels above Boundaries. Layer group values affect navigation only.",
+        },
         "workflow": [
             "config-cli describe",
             "config-cli layers get 'Bus Stops'",
-            "config-cli proposals create --base-revision WORKSPACE_REVISION --set '/locale/layers/Bus Stops/style/default/icon/fillColor=\"#2563eb\"' --explanation 'Changes only the default Bus Stops fill colour.'",
+            "config-cli proposals check --base-revision WORKSPACE_REVISION --set '/locale/layers/Bus Stops/style/default/icon/fillColor=\"#2563eb\"' --explanation 'Changes only the default Bus Stops fill colour.'",
+            "config-cli proposals create --from-check CHECK_FINGERPRINT",
             "config-cli proposals apply PROPOSAL_ID --confirm",
             "config-cli xyz status",
             "config-cli visual-test --layer 'Bus Stops'",
@@ -273,9 +661,7 @@ def proposal_create(store, original: dict, original_revision: str, candidate: di
         "explanation": explanation or explain_diff(diff),
         "original": original,
         "candidate": candidate,
-        "warnings": [
-            "Visual tests render the live workspace; they do not preview this candidate before application."
-        ],
+        "warnings": [],
     }
     path = store.proposals / proposal_id
     path.mkdir(mode=0o700)
@@ -291,6 +677,31 @@ def proposal_create(store, original: dict, original_revision: str, candidate: di
     )
     store.audit("proposal.created", actor=actor, details={"id": proposal_id, "candidateHash": proposal["candidateHash"]})
     return proposal
+
+
+def proposal_check(original: dict, original_revision: str, candidate: dict,
+                   operations: list, diff: list,
+                   explanation: str | None = None) -> dict:
+    """Return proposal evidence without allocating or persisting a proposal."""
+    candidate_hash = workspace_hash(candidate)
+    fingerprint = hashlib.sha256(json.dumps({
+        "revision": original_revision,
+        "candidateHash": candidate_hash,
+        "operations": operations,
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+       allow_nan=False).encode()).hexdigest()
+    return {
+        "valid": True,
+        "proposalCreated": False,
+        "originalRevision": original_revision,
+        "originalHash": workspace_hash(original),
+        "candidateHash": candidate_hash,
+        "checkFingerprint": fingerprint,
+        "operations": operations,
+        "diff": diff,
+        "explanation": explanation or explain_diff(diff),
+        "warnings": [],
+    }
 
 
 def explain_diff(diff: list[dict]) -> str:
@@ -329,6 +740,14 @@ def proposal_list(store) -> list[dict]:
     return output
 
 
+def _reload_generation(path: Path) -> int | None:
+    try:
+        generation = int(path.read_text().strip())
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        return None
+    return generation if generation >= 0 else None
+
+
 def request_reload(expected_fingerprint: str | None = None) -> dict:
     if expected_fingerprint is not None and (
         not isinstance(expected_fingerprint, str)
@@ -348,11 +767,12 @@ def request_reload(expected_fingerprint: str | None = None) -> dict:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             request_path = RELOAD_DIR / "requested"
-            try:
-                current = int(request_path.read_text().strip() or "0")
-            except (FileNotFoundError, OSError, ValueError):
-                current = 0
-            generation = current + 1
+            requested = _reload_generation(request_path)
+            applied = _reload_generation(RELOAD_DIR / "applied")
+            generation = max(
+                requested if requested is not None else 0,
+                applied if applied is not None else 0,
+            ) + 1
             _atomic_text(
                 RELOAD_DIR / "expected-workspace",
                 (expected_fingerprint or "") + "\n",
@@ -375,10 +795,8 @@ def reload_status() -> dict:
             return default
 
     def generation(name: str) -> int:
-        try:
-            return int(read(name))
-        except ValueError:
-            return 0
+        value = _reload_generation(RELOAD_DIR / name)
+        return value if value is not None else 0
 
     return {
         "requestedGeneration": generation("requested"),
@@ -553,7 +971,7 @@ def select_locale(
     requested: str | None = None,
 ) -> tuple[str, dict]:
     locales = effective_locales(workspace)
-    if requested:
+    if requested is not None:
         locale = locales.get(requested)
         if not isinstance(locale, dict):
             raise ValueError(f"Unknown locale: {requested}")
@@ -643,37 +1061,83 @@ def visual_plan(
     if not count or None in (west, south, east, north):
         raise ValueError("Layer has no non-null renderable geometry.")
     centre_x, centre_y = (west + east) / 2, (south + north) / 2
-    width = max(east - west, 10.0)
-    height = max(north - south, 10.0)
-    resolution = max(width / (1280 * .7), height / (720 * .7))
-    zoom = max(0, min(22, math.log2(156543.03392804097 / resolution)))
-    upper_geometry = (geometry_type or "").upper()
-    if "POINT" in upper_geometry:
-        zoom = max(14, zoom)
-    elif "LINE" in upper_geometry:
-        zoom = max(13, zoom)
-    elif "POLYGON" in upper_geometry:
-        zoom = max(14, zoom)
+    sample_query = sql.SQL("""
+      WITH candidate AS (
+        SELECT {qid} AS feature_id,
+               {geom} AS geom
+        FROM {relation}
+        WHERE {geom} IS NOT NULL
+        ORDER BY ST_Transform({geom}, 3857) <-> ST_SetSRID(ST_MakePoint(%s, %s), 3857)
+        LIMIT 1
+      ), prepared AS (
+        SELECT feature_id,
+               GeometryType(geom) AS geometry_type,
+               ST_Extent(ST_Transform(geom, 3857)) AS extent,
+               ST_Transform(ST_PointOnSurface(geom), 4326) AS target
+        FROM candidate
+        GROUP BY feature_id, GeometryType(geom), ST_Transform(ST_PointOnSurface(geom), 4326)
+      )
+      SELECT feature_id,
+             geometry_type,
+             ST_XMin(extent), ST_YMin(extent), ST_XMax(extent), ST_YMax(extent),
+             ST_X(target), ST_Y(target)
+      FROM prepared
+    """).format(
+        geom=geom,
+        qid=sql.Identifier(layer["qID"]),
+        relation=relation_sql,
+    )
     with psycopg.connect(database_url, connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SET statement_timeout = '5000ms'")
-            cur.execute(
-                "SELECT ST_X(point), ST_Y(point) FROM (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),3857),4326) point) q",
-                (centre_x, centre_y),
-            )
-            lng, lat = cur.fetchone()
+            cur.execute(sample_query, (centre_x, centre_y))
+            sample = cur.fetchone()
+    (
+        feature_id,
+        sample_geometry_type,
+        sample_west,
+        sample_south,
+        sample_east,
+        sample_north,
+        target_lng,
+        target_lat,
+    ) = sample
+    focus_west = sample_west if sample_west is not None else west
+    focus_south = sample_south if sample_south is not None else south
+    focus_east = sample_east if sample_east is not None else east
+    focus_north = sample_north if sample_north is not None else north
+    width = max(focus_east - focus_west, 25.0)
+    height = max(focus_north - focus_south, 25.0)
+    resolution = max(width / (1920 * .45), height / (1080 * .45))
+    zoom = max(0, min(22, math.log2(156543.03392804097 / resolution)))
+    geometry_type = sample_geometry_type or geometry_type
+    upper_geometry = (geometry_type or "").upper()
+    if "POINT" in upper_geometry:
+        zoom = max(16, zoom)
+    elif "LINE" in upper_geometry:
+        zoom = max(16, zoom)
+    elif "POLYGON" in upper_geometry:
+        zoom = max(14, zoom)
     return {
         "layer": layer_key,
         "locale": selected_locale,
-        "source": "postgis-extent",
+        "source": "postgis-feature",
         "database": db_name,
         "table": layer["table"],
         "geometry": layer["geom"],
+        "featureIdField": layer["qID"],
+        "featureId": feature_id,
         "geometryType": geometry_type,
         "featureCount": count,
         "bounds3857": [west, south, east, north],
-        "centre": [lng, lat],
+        "focusBounds3857": [focus_west, focus_south, focus_east, focus_north],
+        "centre": [target_lng, target_lat],
         "zoom": round(zoom, 2),
-        "warnings": ["Large or outlier-heavy datasets may benefit from an explicit centre and zoom."],
+        "interaction": {
+            "type": "click-centre-feature",
+            "expectedLayer": layer_key,
+            "expectedFeatureId": feature_id,
+        },
+        "warnings": ["The visual check is focused on one representative feature."],
     }

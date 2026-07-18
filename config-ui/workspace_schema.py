@@ -26,6 +26,10 @@ ICON_TYPES = {
     "dot", "target", "triangle", "square", "diamond", "semiCircle",
     "circle", "markerLetter", "markerColor", "template",
 }
+FILTER_TYPES = {
+    "like", "match", "numeric", "integer", "in", "ni", "date",
+    "datetime", "boolean", "null",
+}
 UNSAFE_EXPRESSION = re.compile(
     r"\b(?:select|insert|update|delete|merge|drop|alter|create|truncate|grant|"
     r"revoke|copy|call|do|execute|prepare|deallocate|vacuum|analyze|refresh|"
@@ -326,6 +330,10 @@ def _validate_layer(key, layer, path, errors, available_dbs):
         _error(errors, f"{path}.format", f"Must be one of: {', '.join(sorted(SUPPORTED_FORMATS))}.")
     if "display" in layer and not isinstance(layer["display"], bool):
         _error(errors, f"{path}.display", "Must be true or false.")
+    if "group" in layer and (
+        not isinstance(layer["group"], str) or not layer["group"].strip()
+    ):
+        _error(errors, f"{path}.group", "Must be a non-empty string when set.")
     if fmt is None and has_template:
         _validate_style(layer.get("style"), f"{path}.style", errors)
         return
@@ -428,12 +436,12 @@ def _validate_layer(key, layer, path, errors, available_dbs):
             _error(errors, f"{path}.srid", "Must be a positive EPSG/SRID integer.")
         elif valid_srid and fmt == "mvt" and int(srid) != 3857:
             _error(errors, f"{path}.srid", "XYZ v4.23.4 requires SRID 3857 for MVT layers.")
+        fields: set[str] = set()
         infoj = layer.get("infoj")
         if infoj is not None:
             if not isinstance(infoj, list):
                 _error(errors, f"{path}.infoj", "Must be an array.")
             else:
-                fields: set[str] = set()
                 for index, entry in enumerate(infoj):
                     entry_path = f"{path}.infoj.{index}"
                     if not isinstance(entry, dict):
@@ -457,6 +465,11 @@ def _validate_layer(key, layer, path, errors, available_dbs):
                         _error(errors, f"{entry_path}.display", "Must be true or false.")
                     if "inline" in entry and not isinstance(entry["inline"], bool):
                         _error(errors, f"{entry_path}.inline", "Must be true or false.")
+                    _validate_info_filter(
+                        entry.get("filter"),
+                        f"{entry_path}.filter",
+                        errors,
+                    )
                     expression = entry.get("fieldfx")
                     if expression is not None and (not isinstance(expression, str) or not expression.strip()):
                         _error(errors, f"{entry_path}.fieldfx", "Must be a non-empty PostgreSQL expression.")
@@ -464,7 +477,89 @@ def _validate_layer(key, layer, path, errors, available_dbs):
                         error = expression_error(expression)
                         if error:
                             _error(errors, f"{entry_path}.fieldfx", error)
+        _validate_layer_filter(
+            layer.get("filter"),
+            f"{path}.filter",
+            errors,
+            fields,
+        )
         _validate_style(layer.get("style"), f"{path}.style", errors)
+
+
+def _validate_info_filter(value, path, errors):
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        if value not in FILTER_TYPES:
+            _error(errors, path, f"Must be one of: {', '.join(sorted(FILTER_TYPES))}.")
+        return
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be true, false, a filter type, or an object.")
+        return
+    filter_type = value.get("type")
+    if filter_type not in FILTER_TYPES:
+        _error(errors, f"{path}.type", f"Must be one of: {', '.join(sorted(FILTER_TYPES))}.")
+    field = value.get("field")
+    if field is not None and (
+        not isinstance(field, str) or not IDENTIFIER.fullmatch(field)
+    ):
+        _error(errors, f"{path}.field", "Must be an unquoted result-field identifier.")
+    for key in (
+        "leading_wildcard", "dropdown", "dropdown_pills", "dropdown_search",
+        "searchbox",
+    ):
+        if key in value and not isinstance(value[key], bool):
+            _error(errors, f"{path}.{key}", "Must be true or false.")
+    for key in ("min", "max", "step"):
+        if key in value and not _number(value[key]):
+            _error(errors, f"{path}.{key}", "Must be a number.")
+    if _number(value.get("step")) and value["step"] <= 0:
+        _error(errors, f"{path}.step", "Must be greater than zero.")
+    if (
+        _number(value.get("min"))
+        and _number(value.get("max"))
+        and value["min"] > value["max"]
+    ):
+        _error(errors, path, "min must not be greater than max.")
+    for key in ("in", "ni"):
+        if key in value and not isinstance(value[key], list):
+            _error(errors, f"{path}.{key}", "Must be an array.")
+
+
+def _validate_layer_filter(value, path, errors, fields):
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be an object.")
+        return
+    for key in ("hidden", "viewport", "includeAll"):
+        if key in value and not isinstance(value[key], bool):
+            _error(errors, f"{path}.{key}", "Must be true or false.")
+    for key in ("include", "exclude"):
+        selected = value.get(key)
+        if selected is None:
+            continue
+        if not (
+            isinstance(selected, list)
+            and all(
+                isinstance(item, str) and IDENTIFIER.fullmatch(item)
+                for item in selected
+            )
+            and len(selected) == len(set(selected))
+        ):
+            _error(
+                errors,
+                f"{path}.{key}",
+                "Must be an array of unique result-field identifiers.",
+            )
+            continue
+        for field in selected:
+            if field not in fields:
+                _error(
+                    errors,
+                    f"{path}.{key}",
+                    f"Unknown infoj field: {field}.",
+                )
 
 
 def _validate_style(style, path, errors):
@@ -473,6 +568,19 @@ def _validate_style(style, path, errors):
     if not isinstance(style, dict):
         _error(errors, path, "Must be an object.")
         return
+    if "hidden" in style and not isinstance(style["hidden"], bool):
+        _error(errors, f"{path}.hidden", "Must be true or false.")
+    elements = style.get("elements")
+    if elements is not None and not (
+        isinstance(elements, list)
+        and all(isinstance(item, str) and item.strip() for item in elements)
+        and len(elements) == len(set(elements))
+    ):
+        _error(
+            errors,
+            f"{path}.elements",
+            "Must be an array of unique, non-empty style element keys.",
+        )
     hover = style.get("hover")
     if hover is not None:
         if not isinstance(hover, (dict, str)):

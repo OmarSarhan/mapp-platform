@@ -4,7 +4,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from control_plane import ControlStore, iso, now
+from control_plane import ControlStore, iso, now, token_hash
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -91,3 +91,137 @@ class ControlPlaneTests(unittest.TestCase):
             )
             records = {item["id"]: item for item in store.list_tokens()}
             self.assertIsNotNone(records[first["id"]]["revoked"])
+
+    def test_scoped_device_authorization_is_expiring_and_one_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            started = store.start_device_authorization(
+                "codex",
+                ["inspect", "propose", "visual"],
+                "127.0.0.1",
+            )
+            self.assertEqual("pending", store.poll_device_authorization(started["deviceId"])["status"])
+            self.assertTrue(store.approve_device_authorization(started["userCode"]))
+            approved_state = store._state()
+            self.assertEqual([], approved_state["tokens"])
+            self.assertEqual(
+                "approved",
+                approved_state["deviceAuthorizations"][0]["status"],
+            )
+            self.assertNotIn(
+                "mapp_",
+                (Path(directory) / "auth.json").read_text(),
+            )
+            authorized = store.poll_device_authorization(started["deviceId"])
+            self.assertEqual("authorized", authorized["status"])
+            self.assertEqual(
+                ["inspect", "propose", "visual"],
+                authorized["record"]["scopes"],
+            )
+            self.assertIsNotNone(authorized["record"]["expires"])
+            self.assertNotIn(
+                authorized["token"],
+                (Path(directory) / "audit.jsonl").read_text(),
+            )
+            persisted = (Path(directory) / "auth.json").read_text()
+            self.assertNotIn(authorized["token"], persisted)
+            self.assertNotIn('"token":', persisted)
+            self.assertEqual(
+                token_hash(authorized["token"]),
+                store._state()["tokens"][0]["hash"],
+            )
+            self.assertEqual(
+                "consumed",
+                store.poll_device_authorization(started["deviceId"])["status"],
+            )
+
+    def test_legacy_raw_device_credentials_are_purged_and_revoked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ControlStore(root)
+            store.initialize("correct horse battery staple", "instance")
+            started = store.start_device_authorization(
+                "legacy-agent",
+                ["inspect"],
+                "127.0.0.1",
+            )
+            raw, record = store.create_token(
+                "Device: legacy-agent",
+                iso(now() + timedelta(days=30)),
+                ["inspect"],
+            )
+            state = store._state()
+            authorization = state["deviceAuthorizations"][0]
+            authorization.update({
+                "status": "approved",
+                "token": raw,
+                "tokenRecord": record,
+            })
+            store._write(state)
+
+            migrated = ControlStore(root)
+            migrated_state = migrated._state()
+            migrated_authorization = migrated_state["deviceAuthorizations"][0]
+            migrated_token = next(
+                item
+                for item in migrated_state["tokens"]
+                if item["id"] == record["id"]
+            )
+
+            self.assertNotIn("token", migrated_authorization)
+            self.assertNotIn("tokenRecord", migrated_authorization)
+            self.assertIsNotNone(
+                migrated_authorization["legacyCredentialPurged"],
+            )
+            self.assertIsNotNone(migrated_token["revoked"])
+            self.assertIsNone(
+                migrated.authenticate_token(raw, "127.0.0.1"),
+            )
+            self.assertNotIn(raw, (root / "auth.json").read_text())
+            self.assertEqual(
+                "authorized",
+                migrated.poll_device_authorization(started["deviceId"])["status"],
+            )
+
+    def test_operation_records_are_private_and_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "visual.test",
+                "token:test",
+                {"layer": "Bus Stops"},
+            )
+            self.assertEqual("running", operation["status"])
+            terminal = store.finish_operation(
+                operation["id"],
+                status="failed",
+                error={"code": "visual.failed", "message": "No canvas."},
+            )
+            self.assertEqual("failed", store.read_operation(operation["id"])["status"])
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE(
+                    (store.operations / f"{terminal['id']}.json").stat().st_mode
+                ),
+            )
+
+    def test_running_operations_become_indeterminate_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ControlStore(root)
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "proposal.apply",
+                "token:test",
+                {"proposalId": "proposal-1"},
+            )
+
+            restarted = ControlStore(root)
+            restarted.recover_interrupted_operations()
+            recovered = restarted.read_operation(operation["id"])
+
+            self.assertEqual("indeterminate", recovered["status"])
+            self.assertEqual("operation.interrupted", recovered["error"]["code"])
+            self.assertIsNone(recovered["result"])

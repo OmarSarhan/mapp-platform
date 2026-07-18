@@ -3,7 +3,19 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "scripts": {"build": "vite build", "test": "node --test src/*.test.js"},
-  "dependencies": {"vite": "8.1.4", "react": "19.2.7", "react-dom": "19.2.7"},
-  "devDependencies": {}
+  "scripts": {
+    "build": "vite build",
+    "test": "node --test src/api.test.js && vitest run"
+  },
+  "dependencies": {
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "vite": "8.1.4"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.2",
+    "jsdom": "29.1.1",
+    "vitest": "4.1.10"
+  }
 }

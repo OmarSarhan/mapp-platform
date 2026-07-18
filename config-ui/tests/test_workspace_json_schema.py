@@ -16,6 +16,23 @@ class WorkspaceJsonSchemaTests(unittest.TestCase):
         bus_style = workspace["locale"]["layers"]["Bus Stops"]["style"]
         self.assertEqual(bus_style["default"]["icon"]["url"], "/instance/svg/bus.svg")
         self.assertEqual(bus_style["hover"]["field"], "stop_name")
+        smoke = workspace["locale"]["layers"]["Smoke Control Orders"]
+        self.assertEqual(smoke["table"], "leeds.smoke_control_orders")
+        self.assertEqual(
+            smoke["attribution"]["Leeds City Council source"],
+            "https://mapservices.leeds.gov.uk/arcgis/rest/services/"
+            "Public/Planning/MapServer/8",
+        )
+        self.assertTrue(
+            {
+                "locality",
+                "council_reference",
+                "description",
+                "order_date",
+                "area_square_metres",
+            }
+            <= {entry.get("field") for entry in smoke["infoj"]}
+        )
 
     def test_schema_covers_dashboard_xyz_symbols(self):
         schema = json.loads(

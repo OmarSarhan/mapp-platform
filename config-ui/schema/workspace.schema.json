@@ -306,6 +306,19 @@
           "default": false,
           "description": "Whether the layer is visible initially."
         },
+        "group": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional layer-list folder. XYZ groups layers that share this exact value for navigation only; group or folder order does not control map drawing order."
+        },
+        "groupClassList": {
+          "type": "string",
+          "description": "Optional CSS classes applied to the XYZ layer-group drawer."
+        },
+        "groupmeta": {
+          "type": "string",
+          "description": "Optional trusted HTML metadata shown for the group. The last grouped layer declaring it wins."
+        },
         "format": {
           "type": "string",
           "enum": [
@@ -377,7 +390,7 @@
         },
         "zIndex": {
           "type": "number",
-          "description": "Layer drawing order."
+          "description": "Layer drawing order, independent of layer-list groups. Higher values render above lower values."
         },
         "opacity": {
           "type": "number",
@@ -477,9 +490,7 @@
           "$ref": "#/$defs/cluster"
         },
         "filter": {
-          "type": "object",
-          "description": "Layer filter configuration; XYZ creates filter.current when absent.",
-          "additionalProperties": true
+          "$ref": "#/$defs/layerFilter"
         },
         "infoj_skip": {
           "type": "array",
@@ -506,7 +517,7 @@
         },
         "promoteDisplay": {
           "type": "boolean",
-          "description": "Move the layer above other displayed layers when shown."
+          "description": "When shown, assign the layer a z-index above every currently displayed layer."
         },
         "zoomDisplay": {
           "type": "boolean"
@@ -908,6 +919,32 @@
           ],
           "description": "Optional edit configuration; not enabled by this read-only deployment."
         },
+        "filter": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "like",
+                "match",
+                "numeric",
+                "integer",
+                "in",
+                "ni",
+                "date",
+                "datetime",
+                "boolean",
+                "null"
+              ]
+            },
+            {
+              "$ref": "#/$defs/infoFilter"
+            }
+          ],
+          "description": "Interactive layer-filter definition. True asks XYZ to infer a compatible filter from the info type."
+        },
         "group": {
           "type": "string"
         },
@@ -1045,6 +1082,65 @@
       ],
       "additionalProperties": true
     },
+    "layerFilter": {
+      "type": "object",
+      "properties": {
+        "hidden": {"type": "boolean"},
+        "viewport": {"type": "boolean"},
+        "includeAll": {"type": "boolean"},
+        "include": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "exclude": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "default": {
+          "description": "Fixed server-side filter composed with interactive filters. XYZ accepts a filter object, OR-array, or trusted template string."
+        },
+        "drawer": {"type": ["string", "boolean"]},
+        "dialog": {"type": ["boolean", "object"]},
+        "popout": {"type": ["boolean", "object"]},
+        "classList": {"type": "string"},
+        "count_meta": {"type": "string"},
+        "viewport_description": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "infoFilter": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["like", "match", "numeric", "integer", "in", "ni", "date", "datetime", "boolean", "null"]
+        },
+        "field": {"$ref": "#/$defs/identifier"},
+        "title": {"type": "string"},
+        "meta": {"type": "string"},
+        "min": {"type": "number"},
+        "max": {"type": "number"},
+        "step": {"type": "number", "exclusiveMinimum": 0},
+        "prefix": {"type": "string"},
+        "suffix": {"type": "string"},
+        "label_a": {"type": "string"},
+        "label_b": {"type": "string"},
+        "leading_wildcard": {"type": "boolean"},
+        "in": {"type": "array"},
+        "ni": {"type": "array"},
+        "dropdown": {"type": "boolean"},
+        "dropdown_pills": {"type": "boolean"},
+        "dropdown_search": {"type": "boolean"},
+        "searchbox": {"type": "boolean"},
+        "placeholder": {"type": "string"},
+        "histogram": {"type": ["boolean", "object"]},
+        "minmax_query": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
     "layerStyle": {
       "type": "object",
       "properties": {
@@ -1122,8 +1218,27 @@
           "type": "boolean",
           "description": "Cache computed OpenLayers styles on features."
         },
+        "hidden": {
+          "type": "boolean",
+          "description": "Suppress the interactive Styling panel without disabling feature rendering."
+        },
+        "elements": {
+          "type": "array",
+          "description": "Ordered XYZ layer-style UI element keys. An element renders only when its corresponding style property exists.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "opacitySlider": {
+          "description": "Presence enables the opacitySlider style-panel element when that key is included in elements."
+        },
         "drawer": {
-          "type": "string"
+          "type": [
+            "string",
+            "boolean"
+          ]
         },
         "zoomInScale": {
           "type": "number"

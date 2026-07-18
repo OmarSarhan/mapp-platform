@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --requirement requirements.txt
 
-COPY app.py workspace_schema.py svg_icons.py static_files.py infoj_types.py control_plane.py control_api.py config_admin.py ./
+COPY app.py workspace_schema.py svg_icons.py static_files.py infoj_types.py control_plane.py control_api.py config_admin.py derived_layers.py ./
 COPY schema ./schema
 COPY --from=web /web/dist ./static
 

@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import secrets
 import tempfile
 import threading
 import time
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,14 +21,19 @@ import psycopg
 from psycopg.rows import dict_row
 
 from infoj_types import info_value_error
+from derived_layers import (
+    DerivedLayerDependencyError,
+    DerivedLayerError,
+    DerivedLayerStore,
+)
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from workspace_schema import expression_function_names, validate_workspace
 from control_plane import ControlStore
 from control_api import (
-    PROPOSAL_LOCK, RULES, apply_operations, apply_visual_override, contract, examples,
+    PROPOSAL_LOCK, RULES, apply_operations, apply_visual_override, capabilities, contract, examples,
     effective_locales, is_probeable_database_layer,
-    pointer_get, proposal_create, proposal_list, proposal_read, proposal_write,
+    pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
     reload_status, reload_timeout, request_reload,
     schema as contract_schema, select_locale, visual_plan,
     strict_json_loads, wait_reload, workspace_fingerprint, workspace_hash,
@@ -50,8 +57,30 @@ PORT = int(os.environ.get("PORT", "8080"))
 MAX_BODY = 5 * 1024 * 1024
 SAVE_LOCK = threading.Lock()
 SAVE_RELOAD_LOCK = threading.Lock()
+PREVIEW_LOCK = threading.RLock()
+PREVIEW_WORKSPACE = Path(
+    os.environ.get(
+        "PREVIEW_WORKSPACE_PATH",
+        str(LOCAL_RUNTIME / "preview/workspace.json"),
+    )
+)
+PREVIEW_RELOAD_DIR = Path(
+    os.environ.get(
+        "PREVIEW_RELOAD_DIR",
+        str(LOCAL_RUNTIME / "preview-reload"),
+    )
+)
 CONTROL = ControlStore(
     Path(os.environ.get("CONTROL_DIR", str(LOCAL_RUNTIME / "control")))
+)
+CONTROL.recover_interrupted_operations()
+DERIVED = (
+    DerivedLayerStore(
+        os.environ["DERIVED_DATABASE_URL"],
+        os.environ["DERIVED_READER_ROLE"],
+    )
+    if os.environ.get("DERIVED_DATABASE_URL")
+    else None
 )
 
 
@@ -77,16 +106,92 @@ LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LOGIN_LOCK = threading.Lock()
 
 
-def revision(raw: bytes) -> str:
+def revision(raw: bytes, modified_ns: int) -> str:
     # Include the file generation so an identical intervening save is still
     # detected as a stale browser revision.
-    generation = str(WORKSPACE.stat().st_mtime_ns).encode()
+    generation = str(modified_ns).encode()
     return hashlib.sha256(raw + b":" + generation).hexdigest()
 
 
-def read_workspace() -> tuple[bytes, dict]:
-    raw = WORKSPACE.read_bytes()
-    return raw, strict_json_loads(raw)
+def read_workspace() -> tuple[bytes, dict, str]:
+    with WORKSPACE.open("rb") as stream:
+        raw = stream.read()
+        modified_ns = os.fstat(stream.fileno()).st_mtime_ns
+    return raw, strict_json_loads(raw), revision(raw, modified_ns)
+
+
+def derived_workspace_references(name: str) -> list[str]:
+    _, workspace, _ = read_workspace()
+    relation = f"derived_layers.{name}"
+    references = []
+    for locale_key, locale in effective_locales(workspace).items():
+        locale_path = "locale" if locale_key == "locale" else f"locales.{locale_key}"
+        if not isinstance(locale, dict):
+            continue
+        for layer_key, layer in (locale.get("layers") or {}).items():
+            if isinstance(layer, dict) and layer.get("table") == relation:
+                references.append(f"{locale_path}.layers.{layer_key}")
+    return references
+
+
+def derived_workspace_impact(name: str, affected_columns: list[str]) -> dict:
+    _, workspace, _ = read_workspace()
+    relation, affected = f"derived_layers.{name}", set(affected_columns)
+    references, field_references, consumer_labels = [], [], []
+    for locale_key, locale in effective_locales(workspace).items():
+        locale_path = "locale" if locale_key == "locale" else f"locales.{locale_key}"
+        if not isinstance(locale, dict):
+            continue
+        for layer_key, layer in (locale.get("layers") or {}).items():
+            if not isinstance(layer, dict) or layer.get("table") != relation:
+                continue
+            layer_path = f"{locale_path}.layers.{layer_key}"
+            references.append(layer_path)
+            locale_label = (
+                "default map"
+                if locale_key == "locale"
+                else str(locale.get("name") or locale_key)
+            )
+            layer_label = str(layer.get("name") or layer_key)
+            consumer_labels.append(f"{layer_label} ({locale_label})")
+            hover = (layer.get("style") or {}).get("hover")
+            candidates = [
+                ("qID", "feature ID", layer.get("qID")),
+                ("geom", "map geometry", layer.get("geom")),
+            ]
+            if isinstance(hover, dict):
+                candidates.append((
+                    "style.hover.field", "hover text", hover.get("field")
+                ))
+            for index, entry in enumerate(layer.get("infoj") or []):
+                if isinstance(entry, dict):
+                    label = str(
+                        entry.get("title") or entry.get("label")
+                        or f"information field {index + 1}"
+                    )
+                    candidates.append((
+                        f"infoj.{index}.field", f'information value “{label}”',
+                        entry.get("field"),
+                    ))
+            field_references.extend(
+                {
+                    "path": f"{layer_path}.{path}",
+                    "column": value,
+                    "consumer": f"{layer_label} ({locale_label})",
+                    "usage": usage,
+                    "label": (
+                        f'{layer_label} ({locale_label}) uses “{value}” '
+                        f"for its {usage}"
+                    ),
+                }
+                for path, usage, value in candidates if value in affected
+            )
+    return {
+        "workspaceReferences": references,
+        "consumerLabels": consumer_labels,
+        "fieldReferences": field_references,
+        "requiresSecondOrderChanges": bool(field_references),
+    }
 
 
 def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
@@ -99,8 +204,8 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
         ) + "\n"
     ).encode()
     with SAVE_LOCK:
-        current, _ = read_workspace()
-        if not isinstance(expected, str) or expected != revision(current):
+        _, _, current_revision = read_workspace()
+        if not isinstance(expected, str) or expected != current_revision:
             raise FileExistsError("Workspace changed on disk. Reload before saving.")
         backup = WORKSPACE.with_suffix(WORKSPACE.suffix + ".bak")
         shutil.copyfile(WORKSPACE, backup)
@@ -111,6 +216,10 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
                 stream.flush()
                 os.fsync(stream.fileno())
                 os.fchmod(stream.fileno(), 0o644)
+                next_revision = revision(
+                    encoded,
+                    os.fstat(stream.fileno()).st_mtime_ns,
+                )
             os.replace(temporary, WORKSPACE)
             directory = os.open(
                 WORKSPACE.parent,
@@ -123,7 +232,7 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-    return encoded, revision(encoded)
+    return encoded, next_revision
 
 
 def save_and_reload(
@@ -159,6 +268,316 @@ def reload_completed(reload_result: dict) -> bool:
     return isinstance(status, dict) and status.get("completed") is True
 
 
+def _atomic_preview_text(path: Path, value: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def prepare_workspace_preview(
+    workspace: dict,
+    expected_hash: str,
+    *,
+    source: str,
+    timeout: float = 30,
+) -> dict:
+    """Publish one integrity-checked workspace to the isolated preview XYZ."""
+    actual_hash = workspace_hash(workspace)
+    if actual_hash != expected_hash:
+        raise RuntimeError(f"Stored proposal {source} failed its integrity check.")
+    encoded = json.dumps(
+        workspace, indent=2, ensure_ascii=False, allow_nan=False
+    ) + "\n"
+    fingerprint = workspace_fingerprint(encoded.encode())
+    with PREVIEW_LOCK:
+        _atomic_preview_text(PREVIEW_WORKSPACE, encoded, 0o600)
+        PREVIEW_RELOAD_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            current = int(
+                (PREVIEW_RELOAD_DIR / "requested").read_text().strip() or "0"
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            current = 0
+        generation = current + 1
+        _atomic_preview_text(
+            PREVIEW_RELOAD_DIR / "expected-workspace", fingerprint + "\n"
+        )
+        _atomic_preview_text(
+            PREVIEW_RELOAD_DIR / "requested", f"{generation}\n"
+        )
+        deadline = time.monotonic() + timeout
+        status = {}
+        while time.monotonic() < deadline:
+            def read(name: str, default: str = "") -> str:
+                try:
+                    return (PREVIEW_RELOAD_DIR / name).read_text().strip()
+                except (FileNotFoundError, OSError, UnicodeError):
+                    return default
+            status = {
+                "appliedGeneration": read("applied", "0"),
+                "workspaceFingerprint": read("workspace-fingerprint"),
+                "healthy": read("healthy", "false") == "true",
+            }
+            if (
+                status["appliedGeneration"] == str(generation)
+                and status["workspaceFingerprint"] == fingerprint
+                and status["healthy"]
+            ):
+                return {
+                    "source": source,
+                    "generation": generation,
+                    "workspaceFingerprint": fingerprint,
+                    "workspaceHash": actual_hash,
+                }
+            time.sleep(0.1)
+    raise TimeoutError("Candidate preview process did not become ready.")
+
+
+def prepare_candidate_preview(proposal: dict, timeout: float = 30) -> dict:
+    """Publish a proposal candidate only to the isolated preview XYZ process."""
+    return prepare_workspace_preview(
+        proposal.get("candidate"),
+        proposal.get("candidateHash"),
+        source="candidate",
+        timeout=timeout,
+    )
+
+
+def prepare_original_preview(proposal: dict, timeout: float = 30) -> dict:
+    """Publish the proposal's integrity-checked original to preview XYZ."""
+    return prepare_workspace_preview(
+        proposal.get("original"),
+        proposal.get("originalHash"),
+        source="original",
+        timeout=timeout,
+    )
+
+
+def proposal_changes_feature_info(
+    proposal: dict,
+    layer_key: str,
+    locale_key: str,
+) -> bool:
+    """Whether this proposal changes feature information for the rendered layer."""
+    resolved_layers = False
+    try:
+        _, original_locale = select_locale(proposal.get("original"), locale_key)
+        _, candidate_locale = select_locale(proposal.get("candidate"), locale_key)
+        original_layer = (original_locale.get("layers") or {}).get(layer_key)
+        candidate_layer = (candidate_locale.get("layers") or {}).get(layer_key)
+        resolved_layers = True
+        if (
+            isinstance(original_layer, dict)
+            and isinstance(candidate_layer, dict)
+            and original_layer.get("infoj") != candidate_layer.get("infoj")
+        ):
+            return True
+    except (AttributeError, TypeError, ValueError):
+        # Retain path-based detection for an older or incomplete proposal
+        # record; preview integrity checks still gate rendering separately.
+        pass
+    if resolved_layers:
+        return False
+    prefixes = [["locale", "layers", layer_key, "infoj"]]
+    if locale_key != "locale":
+        prefixes.append(["locales", locale_key, "layers", layer_key, "infoj"])
+    for item in proposal.get("diff") or []:
+        try:
+            parts = pointer_parts(item.get("path"))
+        except (TypeError, ValueError):
+            continue
+        if any(parts[:len(prefix)] == prefix for prefix in prefixes):
+            return True
+    return False
+
+
+def proposal_group_preview(
+    proposal: dict,
+    requested_layer: str,
+    locale_key: str | None,
+) -> dict:
+    """Resolve original/candidate group membership for proposal rendering."""
+    selected_locale, candidate_locale = select_locale(
+        proposal["candidate"],
+        locale_key,
+    )
+    _, original_locale = select_locale(
+        proposal["original"],
+        selected_locale,
+    )
+
+    def layer_map(locale: dict) -> dict:
+        layers = locale.get("layers") or {}
+        return layers if isinstance(layers, dict) else {}
+
+    original_layers = layer_map(original_locale)
+    candidate_layers = layer_map(candidate_locale)
+    original_layer = original_layers.get(requested_layer)
+    candidate_layer = candidate_layers.get(requested_layer)
+    original_present = isinstance(original_layer, dict)
+    candidate_present = isinstance(candidate_layer, dict)
+    original_group = (
+        original_layer.get("group") if original_present else None
+    )
+    candidate_group = (
+        candidate_layer.get("group") if candidate_present else None
+    )
+    change_kind = (
+        "added"
+        if not original_present and candidate_present
+        else "removed"
+        if original_present and not candidate_present
+        else "moved"
+        if original_present
+        and candidate_present
+        and original_group != candidate_group
+        else "edited"
+    )
+    groups = []
+    for layer in (original_layer, candidate_layer):
+        group = layer.get("group") if isinstance(layer, dict) else None
+        if isinstance(group, str) and group and group not in groups:
+            groups.append(group)
+
+    def side_selection(layers: dict) -> dict:
+        requested_present = isinstance(layers.get(requested_layer), dict)
+        selected = (
+            [requested_layer] if requested_present else []
+        ) if change_kind in {"added", "removed", "moved"} else [
+                key
+                for key, layer in layers.items()
+                if (
+                    isinstance(key, str)
+                    and isinstance(layer, dict)
+                    and layer.get("group") in groups
+                )
+            ]
+        if not groups and requested_present and requested_layer not in selected:
+            selected.append(requested_layer)
+        anchor_candidates = [
+            key
+            for key in selected
+            if is_probeable_database_layer(layers[key])
+        ] or selected
+        if not anchor_candidates:
+            anchor_candidates = [
+                key
+                for key in ("OpenStreetMap", *layers)
+                if key in layers and isinstance(layers[key], dict)
+            ]
+        if not anchor_candidates:
+            raise ValueError(
+                "The proposal workspace has no layer available for visual planning."
+            )
+        return {
+            "anchorLayer": (
+                requested_layer
+                if requested_layer in anchor_candidates
+                else anchor_candidates[0]
+            ),
+            "renderLayer": (
+                requested_layer
+                if requested_layer in selected
+                else None
+            ),
+            "layers": selected,
+            "groups": [
+                group
+                for group in groups
+                if any(
+                    isinstance(layer, dict)
+                    and layer.get("group") == group
+                    for layer in layers.values()
+                )
+            ],
+            "requestedLayerPresent": requested_present,
+        }
+
+    return {
+        "locale": selected_locale,
+        "requestedLayer": requested_layer,
+        "changeKind": change_kind,
+        "groups": groups,
+        "original": side_selection(original_layers),
+        "candidate": side_selection(candidate_layers),
+    }
+
+
+def preview_proposal(proposal_id: str) -> dict:
+    proposal = proposal_read(CONTROL, proposal_id)
+    if proposal.get("status") != "pending":
+        raise ValueError(f"Proposal is {proposal.get('status')}.")
+    candidate = proposal.get("candidate")
+    if not isinstance(candidate, dict) or workspace_hash(candidate) != proposal.get(
+        "candidateHash"
+    ):
+        raise RuntimeError("Stored proposal candidate failed its integrity check.")
+    _, _, current_revision = read_workspace()
+    if current_revision != proposal.get("originalRevision"):
+        raise FileExistsError(
+            "Proposal has been superseded by a newer workspace revision."
+        )
+    return proposal
+
+
+def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
+                       target_url: str) -> tuple[int, dict]:
+    runner_payload = json.dumps(
+        {
+            "url": target_url,
+            "layer": layer_key,
+            "layers": plan.get("layers", [layer_key]),
+            "plan": plan,
+            "viewport": payload.get("viewport", {"width": 1920, "height": 1080}),
+            "deviceScaleFactor": payload.get("deviceScaleFactor", 2),
+            "fullPage": payload.get("fullPage", True),
+            "metadata": payload.get("metadata"),
+        },
+        allow_nan=False,
+    ).encode()
+    try:
+        with urlopen(Request(
+            os.environ.get(
+                "BROWSER_RUNNER_URL", "http://browser-runner:8080/run"
+            ),
+            data=runner_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        ), timeout=60) as response:
+            return HTTPStatus.OK, json.load(response)
+    except HTTPError as exc:
+        try:
+            result = strict_json_loads(exc.read())
+        except (OSError, UnicodeError, ValueError):
+            result = None
+        if exc.code == HTTPStatus.UNPROCESSABLE_ENTITY and isinstance(result, dict):
+            return HTTPStatus.UNPROCESSABLE_ENTITY, result
+        if exc.code == HTTPStatus.TOO_MANY_REQUESTS:
+            return HTTPStatus.TOO_MANY_REQUESTS, {
+                "error": (
+                    result.get("error") if isinstance(result, dict) else None
+                ) or "Visual runner is busy. Retry later."
+            }
+        return HTTPStatus.BAD_GATEWAY, {
+            "error": f"Browser validation service returned HTTP {exc.code}."
+        }
+    except Exception as exc:
+        return HTTPStatus.BAD_GATEWAY, {
+            "error": f"Browser validation failed: {exc}"
+        }
+
+
 def apply_proposal_and_reload(
     store: ControlStore,
     proposal: dict,
@@ -174,8 +593,7 @@ def apply_proposal_and_reload(
     candidate hash, finish the proposal record, and request XYZ reload again.
     """
     with SAVE_RELOAD_LOCK:
-        raw, current_workspace = read_workspace()
-        current_revision = revision(raw)
+        raw, current_workspace, current_revision = read_workspace()
         candidate = proposal["candidate"]
         candidate_hash = proposal["candidateHash"]
         recovered = False
@@ -221,8 +639,7 @@ def apply_proposal_and_reload(
                     proposal["originalRevision"],
                 )
             except FileExistsError:
-                raw, current_workspace = read_workspace()
-                current_revision = revision(raw)
+                raw, current_workspace, current_revision = read_workspace()
                 if workspace_hash(current_workspace) == candidate_hash:
                     encoded = raw
                     next_revision = current_revision
@@ -309,17 +726,20 @@ def discover_connection(db_name: str, database_url: str) -> list[dict]:
     query = """
       SELECT n.nspname AS schema, c.relname AS table, a.attname AS column,
              format_type(a.atttypid, a.atttypmod) AS data_type,
-             COALESCE(gc.type, '') AS geometry_type,
-             gc.srid,
+             CASE WHEN a.atttypid = 'geometry'::regtype
+               THEN postgis_typmod_type(a.atttypmod)
+               ELSE ''
+             END AS geometry_type,
+             CASE WHEN a.atttypid = 'geometry'::regtype
+               THEN postgis_typmod_srid(a.atttypmod)
+               ELSE NULL
+             END AS srid,
              NOT a.attnotnull AS nullable,
              COALESCE(ix.is_primary, false) AS primary_key,
              COALESCE(ix.is_unique, false) AS unique_key
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-      LEFT JOIN geometry_columns gc
-        ON gc.f_table_schema = n.nspname AND gc.f_table_name = c.relname
-       AND gc.f_geometry_column = a.attname
       LEFT JOIN (
         SELECT i.indrelid, unnest(i.indkey) AS attnum,
                bool_or(i.indisprimary) AS is_primary,
@@ -527,9 +947,19 @@ def validate_renderable(data: dict, tables: list[dict]) -> list[dict[str, str]]:
                             if sample:
                                 message = info_value_error(entry.get("type", "text"), sample[0], sample[1])
                                 if message:
+                                    locale_pointer = (
+                                        "/locale" if locale_path == "locale"
+                                        else "/locales/" + locale_path.removeprefix("locales.").replace("~", "~0").replace("/", "~1")
+                                    )
                                     errors.append({
                                         "path": f"{path}.infoj.{index_number}.{'fieldfx' if entry.get('fieldfx') else 'field'}",
+                                        "pointer": f"{locale_pointer}/layers/{key.replace('~', '~0').replace('/', '~1')}/infoj/{index_number}/{'fieldfx' if entry.get('fieldfx') else 'field'}",
                                         "message": message,
+                                        "locale": locale_path.removeprefix("locales."),
+                                        "layer": key,
+                                        "field": entry.get("field"),
+                                        "expectedType": entry.get("type", "text"),
+                                        "actualType": sample[0],
                                     })
                         if layer.get("format") == "mvt":
                             if str(layer.get("srid")) != "3857":
@@ -549,12 +979,26 @@ def validate_renderable(data: dict, tables: list[dict]) -> list[dict[str, str]]:
                         cur.execute("SET LOCAL search_path = pg_catalog, public")
                         match = re.match(r"infoj\.(\d+)\.fieldfx: (.*)", str(exc))
                         if match:
+                            locale_pointer = (
+                                "/locale" if locale_path == "locale"
+                                else "/locales/" + locale_path.removeprefix("locales.").replace("~", "~0").replace("/", "~1")
+                            )
                             errors.append({
                                 "path": f"{path}.infoj.{match.group(1)}.fieldfx",
+                                "pointer": f"{locale_pointer}/layers/{key.replace('~', '~0').replace('/', '~1')}/infoj/{match.group(1)}/fieldfx",
                                 "message": match.group(2),
+                                "locale": locale_path.removeprefix("locales."),
+                                "layer": key,
+                                "field": (layer.get("infoj") or [])[int(match.group(1))].get("field"),
                             })
                         else:
-                            errors.append({"path": path, "message": f"XYZ database render probe failed: {exc}"})
+                            # Database exceptions can include query fragments or
+                            # connection details. Keep proposal diagnostics safe
+                            # for terminals and automation logs.
+                            errors.append({
+                                "path": path,
+                                "message": "XYZ database render probe failed during the bounded read.",
+                            })
     return errors
 
 
@@ -667,7 +1111,26 @@ def annotated(errors):
             rule, phase = "workspace.catalog", "catalog"
         else:
             rule, phase = "workspace.structure", "schema"
-        output.append({**error, "ruleId": rule, "phase": phase})
+        pointer = error.get("pointer") or "/" + "/".join(
+            part.replace("~", "~0").replace("/", "~1")
+            for part in path.split(".")
+        ) if path else ""
+        diagnostic = {
+            **error,
+            "pointer": pointer,
+            "ruleId": rule,
+            "phase": phase,
+            "severity": "error",
+        }
+        type_match = re.search(
+            r"XYZ ([A-Za-z]+) entries require (?:a )?([^;]+); PostgreSQL returned ([^.]+)\.?$",
+            message,
+        )
+        if type_match and "expectedType" not in diagnostic:
+            diagnostic["expectedType"] = type_match.group(2).strip()
+        if type_match and "actualType" not in diagnostic:
+            diagnostic["actualType"] = type_match.group(3).strip()
+        output.append(diagnostic)
     return output
 
 
@@ -681,12 +1144,30 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"{self.client_address[0]} {fmt % args}")
 
-    def _json(self, status, payload):
+    def _json(self, status, payload, *, headers=None):
+        payload = dict(payload)
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["requestId"] = getattr(self, "_request_id", secrets.token_hex(16))
+        operation = payload.get("operation")
+        if isinstance(operation, dict) and isinstance(operation.get("id"), str):
+            meta["operationId"] = operation["id"]
+        payload["meta"] = meta
+
+        def json_default(value):
+            if isinstance(value, (date, datetime)):
+                return value.isoformat()
+            raise TypeError(
+                f"Object of type {type(value).__name__} is not JSON serializable"
+            )
+
         body = json.dumps(
             payload,
             separators=(",", ":"),
             ensure_ascii=False,
             allow_nan=False,
+            default=json_default,
         ).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -695,6 +1176,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Request-ID", meta["requestId"])
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -732,12 +1216,49 @@ class Handler(SimpleHTTPRequestHandler):
             return "admin"
         return None
 
-    def _authorized(self, *, state_change=False):
+    def _authorized(self, *, state_change=False, required_scope: str | None = None):
         actor = self._actor(state_change=state_change)
         if not actor:
             self._json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required."})
             return None
+        required_scope = required_scope or getattr(self, "_authorization_scope", None)
+        scopes = set((self._authentication or {}).get("scopes") or [])
+        if (
+            required_scope
+            and actor != "admin"
+            and "full" not in scopes
+            and required_scope not in scopes
+        ):
+            self._json(HTTPStatus.FORBIDDEN, {
+                "error": "The credential does not grant the required scope.",
+                "code": "auth.scope_required",
+                "requiredScope": required_scope,
+                "grantedScopes": sorted(scopes),
+            })
+            return None
         return actor
+
+    @staticmethod
+    def _required_scope(path: str, method: str) -> str | None:
+        if method == "GET":
+            if path.startswith("/api/operations/"):
+                return None
+            if path.startswith("/api/artifacts/"):
+                return "visual"
+            return "inspect"
+        if path in {"/api/visual-plan", "/api/visual-test"} or re.fullmatch(
+            r"/api/proposals/[^/]+/(visual-plan|visual-test|screenshot)", path
+        ):
+            return "visual"
+        if path.endswith("/apply"):
+            return "apply"
+        if path == "/api/xyz/reload":
+            return "reload"
+        if path == "/api/derived-layers" or path.startswith("/api/derived-layers/"):
+            return "derive" if method != "GET" else "inspect"
+        if path in {"/api/proposals", "/api/proposals/check"} or path.endswith("/decline"):
+            return "propose"
+        return "full"
 
     def _payload(self):
         size = int(self.headers.get("Content-Length", "0"))
@@ -753,12 +1274,14 @@ class Handler(SimpleHTTPRequestHandler):
         return not ALLOWED_HOSTS or host in ALLOWED_HOSTS
 
     def do_OPTIONS(self):
+        self._request_id = secrets.token_hex(16)
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
     def do_GET(self):
+        self._request_id = secrets.token_hex(16)
         path = urlparse(self.path).path
         if not self._host_allowed():
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Unrecognized Host header."})
@@ -771,7 +1294,12 @@ class Handler(SimpleHTTPRequestHandler):
                 "xyzVersion": os.environ.get("XYZ_VERSION", "v4.23.4"),
             })
             return
-        if path.startswith("/api/") and path != "/api/auth/login":
+        if path.startswith("/api/") and path not in {
+            "/api/auth/login",
+            "/api/auth/device",
+            "/api/auth/device/token",
+        }:
+            self._authorization_scope = self._required_scope(path, "GET")
             actor = self._authorized()
             if not actor:
                 return
@@ -785,8 +1313,32 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         elif path == "/api/workspace":
             try:
-                raw, data = read_workspace()
-                self._json(HTTPStatus.OK, {"workspace": data, "revision": revision(raw)})
+                _, data, current_revision = read_workspace()
+                self._json(
+                    HTTPStatus.OK,
+                    {"workspace": data, "revision": current_revision},
+                )
+            except Exception as exc:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        elif path == "/api/layers":
+            requested_locale = parse_qs(
+                urlparse(self.path).query,
+                keep_blank_values=True,
+            ).get("locale", [None])[0]
+            try:
+                _, data, current_revision = read_workspace()
+                locale_key, locale = select_locale(data, requested_locale)
+                layers = locale.get("layers")
+                self._json(HTTPStatus.OK, {
+                    "revision": current_revision,
+                    "locale": locale_key,
+                    "layers": layers if isinstance(layers, dict) else {},
+                })
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": str(exc),
+                    "code": "locale.not_found",
+                })
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif path == "/api/catalog":
@@ -794,10 +1346,50 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"databases": sorted(DB_CONNECTIONS), "tables": discover()})
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
+        elif path == "/api/derived-layers/capabilities":
+            try:
+                result = (
+                    DERIVED.capabilities()
+                    if DERIVED
+                    else {
+                        "configured": False,
+                        "schema": "derived_layers",
+                        "kinds": ["view", "materialized"],
+                        "h3Available": False,
+                    }
+                )
+                self._json(HTTPStatus.OK, result)
+            except (DerivedLayerError, psycopg.Error) as exc:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+        elif path == "/api/derived-layers":
+            try:
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                self._json(HTTPStatus.OK, {"derivedLayers": DERIVED.list()})
+            except (DerivedLayerError, psycopg.Error) as exc:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+        elif path.startswith("/api/derived-layers/"):
+            try:
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                name = path.removeprefix("/api/derived-layers/")
+                if "/" in name:
+                    raise FileNotFoundError(name)
+                self._json(HTTPStatus.OK, {"derivedLayer": DERIVED.get(name)})
+            except FileNotFoundError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            except (DerivedLayerError, psycopg.Error) as exc:
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
         elif path == "/api/icons":
             self._json(HTTPStatus.OK, {"icons": discover_icons()})
         elif path == "/api/contract":
             self._json(HTTPStatus.OK, contract(CONTROL.instance_id()))
+        elif path == "/api/capabilities":
+            self._json(HTTPStatus.OK, capabilities(CONTROL.instance_id()))
         elif path == "/api/schema":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -826,6 +1418,11 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
             else:
                 self._json(HTTPStatus.OK, {"tokens": CONTROL.list_tokens()})
+        elif path == "/api/admin/device-authorizations":
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+            else:
+                self._json(HTTPStatus.OK, {"authorizations": CONTROL.list_device_authorizations()})
         elif path == "/api/admin/audit":
             if actor != "admin":
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
@@ -840,6 +1437,26 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         elif path == "/api/xyz/status":
             self._json(HTTPStatus.OK, reload_status())
+        elif path.startswith("/api/operations/"):
+            try:
+                operation = CONTROL.read_operation(path.rsplit("/", 1)[1])
+                required_scope = {
+                    "visual.test": "visual",
+                    "proposal.visual-test": "visual",
+                    "xyz.reload": "reload",
+                    "proposal.apply": "apply",
+                }.get(operation.get("kind"), "full")
+                scopes = set((self._authentication or {}).get("scopes") or [])
+                if actor != "admin" and "full" not in scopes and required_scope not in scopes:
+                    self._json(HTTPStatus.FORBIDDEN, {
+                        "error": "The credential cannot inspect this operation.",
+                        "code": "auth.scope_required",
+                        "requiredScope": required_scope,
+                    })
+                    return
+                self._json(HTTPStatus.OK, {"operation": operation})
+            except FileNotFoundError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(exc), "code": "operation.not_found"})
         elif path.startswith("/api/artifacts/"):
             relative = path.removeprefix("/api/artifacts/")
             artifact = (CONTROL.root / "artifacts" / relative).resolve()
@@ -871,9 +1488,31 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        self._request_id = secrets.token_hex(16)
         request_path = urlparse(self.path).path
         if not self._host_allowed():
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Unrecognized Host header."})
+            return
+        if request_path == "/api/auth/device":
+            try:
+                payload = self._payload()
+                result = CONTROL.start_device_authorization(
+                    payload.get("deviceName", ""),
+                    payload.get("scopes", ["inspect", "propose", "visual"]),
+                    self._remote(),
+                )
+                result["verificationUri"] = "/"
+                self._json(HTTPStatus.CREATED, result)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "device.invalid_request"})
+            return
+        if request_path == "/api/auth/device/token":
+            try:
+                result = CONTROL.poll_device_authorization(self._payload().get("deviceId", ""))
+                status = HTTPStatus.OK if result["status"] == "authorized" else HTTPStatus.ACCEPTED
+                self._json(status, result)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "device.invalid_request"})
             return
         if request_path == "/api/auth/login":
             try:
@@ -891,35 +1530,169 @@ class Handler(SimpleHTTPRequestHandler):
                 session, csrf = result
                 with LOGIN_LOCK:
                     LOGIN_ATTEMPTS.pop(self._remote(), None)
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/json")
                 secure = "; Secure" if SECURE_COOKIES else ""
-                self.send_header("Set-Cookie", f"mapp_session={session}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=43200")
-                body = json.dumps(
+                self._json(
+                    HTTPStatus.OK,
                     {"authenticated": True, "csrfToken": csrf},
-                    allow_nan=False,
-                ).encode()
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                    headers={
+                        "Set-Cookie": (
+                            f"mapp_session={session}; Path=/; HttpOnly; "
+                            f"SameSite=Strict{secure}; Max-Age=43200"
+                        )
+                    },
+                )
             except (ValueError, json.JSONDecodeError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
+        self._authorization_scope = self._required_scope(request_path, "POST")
         actor = self._authorized(state_change=True)
         if not actor:
             return
         allowed = {
             "/api/workspace", "/api/validate", "/api/expression-test", "/api/mutate",
-            "/api/proposals", "/api/xyz/reload", "/api/visual-plan",
+            "/api/proposals", "/api/proposals/check", "/api/xyz/reload", "/api/visual-plan",
             "/api/visual-test",
             "/api/admin/tokens", "/api/admin/password", "/api/auth/logout",
+            "/api/admin/device-authorizations/approve",
             "/api/sql/test",
+            "/api/derived-layers",
         }
-        if request_path not in allowed and not request_path.endswith(("/apply", "/decline", "/revoke")):
+        derived_action_path = re.fullmatch(
+            r"/api/derived-layers/([a-z][a-z0-9_]{0,62})/(refresh|replace|drop)",
+            request_path,
+        )
+        proposal_visual_path = re.fullmatch(
+            r"/api/proposals/([A-Za-z0-9._-]+)/(visual-plan|visual-test|screenshot)",
+            request_path,
+        )
+        if (
+            request_path not in allowed
+            and not request_path.endswith(("/apply", "/decline", "/revoke"))
+            and not proposal_visual_path
+            and not derived_action_path
+        ):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:
             payload = self._payload()
+            if request_path == "/api/derived-layers":
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                result = DERIVED.create(payload, actor)
+                CONTROL.audit(
+                    "derived_layer.created",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        "name": result["name"],
+                        "kind": result["kind"],
+                        "sources": result["sources"],
+                    },
+                )
+                self._json(HTTPStatus.CREATED, {"derivedLayer": result})
+                return
+            if derived_action_path:
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                name, action = derived_action_path.groups()
+                if payload.get("confirmed") is not True:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": (
+                            "Please confirm this derived-layer change before "
+                            "it is applied."
+                        ),
+                        "code": "derived_layer.confirmation_required",
+                        "suggestedAction": (
+                            "Review the change, then retry with confirmation."
+                        ),
+                    })
+                    return
+                if action == "refresh":
+                    result = DERIVED.refresh(name)
+                    event = "derived_layer.refreshed"
+                elif action == "replace":
+                    replacement = {**payload}
+                    replacement.pop("confirmed", None)
+                    result = DERIVED.replace(name, replacement, actor)
+                    changes = result.get("columnChanges", {})
+                    result.update(derived_workspace_impact(
+                        name,
+                        changes.get("removed", []) + changes.get("changed", []),
+                    ))
+                    if result["requiresSecondOrderChanges"]:
+                        affected = "; ".join(
+                            item["label"] for item in result["fieldReferences"]
+                        )
+                        result["userMessage"] = (
+                            f'The derived layer “{name}” was saved, but these '
+                            f"map settings now need attention: {affected}."
+                        )
+                        result["suggestedAction"] = (
+                            "Update those map settings before publishing. In "
+                            "the CLI, you can include the follow-on changes in "
+                            "the same proposal."
+                        )
+                    elif result["consumerLabels"]:
+                        result["userMessage"] = (
+                            f'The derived layer “{name}” was saved. It is used '
+                            "by: " + ", ".join(result["consumerLabels"]) + "."
+                        )
+                        result["suggestedAction"] = (
+                            "Review those map layers before publishing."
+                        )
+                    else:
+                        result["userMessage"] = (
+                            f'The derived layer “{name}” was saved successfully.'
+                        )
+                    event = "derived_layer.replaced"
+                else:
+                    workspace_impact = derived_workspace_impact(name, [])
+                    workspace_references = workspace_impact["workspaceReferences"]
+                    dependents = DERIVED.dependents(name)
+                    if workspace_references or dependents:
+                        reasons = []
+                        if workspace_references:
+                            reasons.append("workspace_references")
+                        if dependents:
+                            reasons.append("postgresql_dependents")
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": (
+                                f'The derived layer “{name}” cannot be deleted '
+                                "because it is still in use."
+                            ),
+                            "userMessage": (
+                                f'The derived layer “{name}” cannot be deleted '
+                                "because it is still in use. Nothing was changed."
+                            ),
+                            "suggestedAction": (
+                                "Remove it from the listed map layers and "
+                                "database views, then try again."
+                            ),
+                            "code": "derived_layer.in_use",
+                            "operation": "drop",
+                            "blocked": True,
+                            "reasons": reasons,
+                            "name": name,
+                            "dependents": dependents,
+                            "workspaceReferences": workspace_references,
+                            "consumerLabels": workspace_impact["consumerLabels"],
+                            "dropped": False,
+                        })
+                        return
+                    result = DERIVED.drop(name)
+                    event = "derived_layer.dropped"
+                CONTROL.audit(
+                    event,
+                    actor=actor,
+                    remote=self._remote(),
+                    details={"name": name, "kind": result["kind"]},
+                )
+                self._json(HTTPStatus.OK, {"derivedLayer": result})
+                return
             if request_path == "/api/auth/logout":
                 CONTROL.logout(self._cookies().get("mapp_session"))
                 self._json(HTTPStatus.OK, {"authenticated": False})
@@ -928,8 +1701,22 @@ class Handler(SimpleHTTPRequestHandler):
                 if actor != "admin":
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
                     return
-                raw, token = CONTROL.create_token(payload.get("name", "CLI token"), payload.get("expires"))
+                raw, token = CONTROL.create_token(
+                    payload.get("name", "CLI token"),
+                    payload.get("expires"),
+                    payload.get("scopes"),
+                )
                 self._json(HTTPStatus.CREATED, {"token": raw, "record": token, "warning": "Copy this token now; it will not be shown again."})
+                return
+            if request_path == "/api/admin/device-authorizations/approve":
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                approved = CONTROL.approve_device_authorization(payload.get("userCode", ""))
+                self._json(
+                    HTTPStatus.OK if approved else HTTPStatus.NOT_FOUND,
+                    {"approved": approved},
+                )
                 return
             if request_path == "/api/admin/password":
                 if actor != "admin" or not CONTROL.change_password(payload.get("current", ""), payload.get("replacement", "")):
@@ -944,23 +1731,467 @@ class Handler(SimpleHTTPRequestHandler):
                 token_id = request_path.split("/")[-2]
                 self._json(HTTPStatus.OK if CONTROL.revoke_token(token_id) else HTTPStatus.NOT_FOUND, {"revoked": token_id})
                 return
-            if request_path == "/api/xyz/reload":
-                fingerprint = payload.get("workspaceFingerprint")
-                timeout = reload_timeout(payload.get("timeout", 30))
-                result = request_reload(fingerprint)
-                result["status"] = wait_reload(
-                    result["requestedGeneration"],
-                    fingerprint,
-                    timeout,
+            if proposal_visual_path:
+                proposal_id, action = proposal_visual_path.groups()
+                try:
+                    proposal = preview_proposal(proposal_id)
+                except FileNotFoundError as exc:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                    return
+                except FileExistsError as exc:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": str(exc),
+                        "ruleId": "proposal.revision",
+                    })
+                    return
+                except ValueError as exc:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": str(exc),
+                        "ruleId": "proposal.preview_status",
+                    })
+                    return
+                except RuntimeError as exc:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": str(exc),
+                        "ruleId": "proposal.integrity",
+                    })
+                    return
+                layer_key = payload.get("layer")
+                if not isinstance(layer_key, str) or not layer_key.strip():
+                    raise ValueError("Visual requests require a layer key.")
+                group_preview = proposal_group_preview(
+                    proposal,
+                    layer_key,
+                    payload.get("locale"),
                 )
-                CONTROL.audit("xyz.reload_requested", actor=actor, remote=self._remote(), details=result)
-                self._json(HTTPStatus.OK if result["status"]["completed"] else HTTPStatus.GATEWAY_TIMEOUT, result)
+                plan_source = (
+                    "candidate"
+                    if group_preview["candidate"]["requestedLayerPresent"]
+                    else "original"
+                )
+                plan_selection = group_preview[plan_source]
+                plan = apply_visual_override(
+                    visual_plan(
+                        proposal[plan_source],
+                        plan_selection["anchorLayer"],
+                        DB_CONNECTIONS,
+                        group_preview["locale"],
+                    ),
+                    payload,
+                )
+                plan.update({
+                    "layer": layer_key,
+                    "anchorLayer": group_preview["candidate"]["anchorLayer"],
+                    "layers": group_preview["candidate"]["layers"],
+                    "groups": group_preview["groups"],
+                    "activeGroups": group_preview["candidate"]["groups"],
+                    "changeKind": group_preview["changeKind"],
+                    "requestedLayerDeleted": not group_preview[
+                        "candidate"
+                    ]["requestedLayerPresent"],
+                    "viewSource": plan_source,
+                })
+                binding = {
+                    "source": "candidate",
+                    "proposalId": proposal_id,
+                    "candidateHash": proposal["candidateHash"],
+                }
+                if action == "visual-plan":
+                    self._json(HTTPStatus.OK, {**binding, "plan": plan})
+                    return
+                feature_info_comparison = (
+                    action == "screenshot"
+                    and proposal_changes_feature_info(
+                        proposal,
+                        layer_key,
+                        plan.get("locale", "locale"),
+                    )
+                )
+                render_plan = dict(plan)
+                original_render_plan = {
+                    **render_plan,
+                    "anchorLayer": group_preview["original"]["anchorLayer"],
+                    "layers": group_preview["original"]["layers"],
+                    "activeGroups": group_preview["original"]["groups"],
+                }
+                candidate_render_plan = {
+                    **render_plan,
+                    "anchorLayer": group_preview["candidate"]["anchorLayer"],
+                    "layers": group_preview["candidate"]["layers"],
+                    "activeGroups": group_preview["candidate"]["groups"],
+                }
+                if group_preview["changeKind"] != "edited":
+                    original_render_plan.pop("interaction", None)
+                    candidate_render_plan.pop("interaction", None)
+                render_payload = dict(payload)
+                if action == "screenshot":
+                    render_payload.setdefault(
+                        "viewport",
+                        {"width": 1080, "height": 1080},
+                    )
+                    render_payload.setdefault("deviceScaleFactor", 1)
+                    # Keep approval images at the requested viewport dimensions
+                    # instead of extending them to the document's full height.
+                    render_payload["fullPage"] = False
+                    if feature_info_comparison:
+                        interaction = {
+                            **(render_plan.get("interaction") or {}),
+                            "requireInfoPanel": True,
+                        }
+                        original_render_plan["interaction"] = interaction
+                        candidate_render_plan["interaction"] = interaction
+                    else:
+                        # A proposal screenshot compares configuration states.
+                        # Selection would obscure point-style changes, so it is
+                        # reserved for feature-information comparisons.
+                        original_render_plan.pop("interaction", None)
+                        candidate_render_plan.pop("interaction", None)
+                operation = CONTROL.create_operation(
+                    (
+                        "proposal.screenshot"
+                        if action == "screenshot"
+                        else "proposal.visual-test"
+                    ),
+                    actor,
+                    {
+                        **binding,
+                        "layer": layer_key,
+                        "groups": group_preview["groups"],
+                        "originalLayers": group_preview["original"]["layers"],
+                        "candidateLayers": group_preview["candidate"]["layers"],
+                        "featureInfoComparison": feature_info_comparison,
+                    },
+                )
+                comparison_binding_valid = True
+                try:
+                    # Keep the isolated workspace pinned throughout the
+                    # original/candidate comparison so another proposal cannot
+                    # replace either side while Chromium is rendering it.
+                    with PREVIEW_LOCK:
+                        original_status = None
+                        original_result = None
+                        original_preview = None
+                        target_url = os.environ.get(
+                            "BROWSER_PREVIEW_XYZ_URL",
+                            "http://xyz-preview:3000",
+                        )
+                        if action == "screenshot":
+                            original_binding = {
+                                "source": "original",
+                                "proposalId": proposal_id,
+                                "originalHash": proposal["originalHash"],
+                            }
+                            original_preview = prepare_original_preview(proposal)
+                            original_status, original_result = run_browser_visual(
+                                group_preview["original"]["renderLayer"],
+                                original_render_plan,
+                                {
+                                    **render_payload,
+                                    "metadata": original_binding,
+                                },
+                                target_url=target_url,
+                            )
+                        candidate_preview = prepare_candidate_preview(proposal)
+                        status, candidate_result = run_browser_visual(
+                            group_preview["candidate"]["renderLayer"],
+                            candidate_render_plan,
+                            {
+                                **render_payload,
+                                "metadata": binding,
+                            },
+                            target_url=target_url,
+                        )
+                    if action == "screenshot":
+                        if (
+                            not isinstance(original_result, dict)
+                            or not isinstance(candidate_result, dict)
+                        ):
+                            result = None
+                        else:
+                            comparison_binding_valid = (
+                                original_result.get("metadata")
+                                == original_binding
+                                and candidate_result.get("metadata") == binding
+                            )
+                            original_artifacts = original_result.get("artifacts") or {}
+                            candidate_artifacts = candidate_result.get("artifacts") or {}
+                            page_key = (
+                                "afterPage"
+                                if feature_info_comparison
+                                else "beforePage"
+                            )
+                            map_key = (
+                                "afterMap"
+                                if feature_info_comparison
+                                else "beforeMap"
+                            )
+                            comparison_artifacts = {
+                                "beforePage": original_artifacts.get(page_key),
+                                "beforeMap": original_artifacts.get(map_key),
+                                "afterPage": candidate_artifacts.get(page_key),
+                                "afterMap": candidate_artifacts.get(map_key),
+                                "beforeReport": original_artifacts.get("report"),
+                                "afterReport": candidate_artifacts.get("report"),
+                            }
+                            if feature_info_comparison:
+                                comparison_artifacts.update({
+                                    "beforeInfoPanel": original_artifacts.get(
+                                        "infoPanel"
+                                    ),
+                                    "afterInfoPanel": candidate_artifacts.get(
+                                        "infoPanel"
+                                    ),
+                                })
+                            statuses = {original_status, status}
+                            status = (
+                                HTTPStatus.OK
+                                if statuses == {HTTPStatus.OK}
+                                else HTTPStatus.UNPROCESSABLE_ENTITY
+                                if HTTPStatus.UNPROCESSABLE_ENTITY in statuses
+                                else next(
+                                    (
+                                        item for item in statuses
+                                        if item != HTTPStatus.OK
+                                    ),
+                                    HTTPStatus.BAD_GATEWAY,
+                                )
+                            )
+                            result = {
+                                "runId": candidate_result.get("runId"),
+                                "passed": status == HTTPStatus.OK,
+                                "metadata": binding,
+                                "comparison": {
+                                    "before": "original",
+                                    "after": "candidate",
+                                    "featureInfoPanel": feature_info_comparison,
+                                    "original": original_result,
+                                    "candidate": candidate_result,
+                                },
+                                "artifacts": comparison_artifacts,
+                                "capture": {
+                                    "original": original_result.get("capture"),
+                                    "candidate": candidate_result.get("capture"),
+                                },
+                                "diagnosis": {
+                                    "outcome": (
+                                        "passed"
+                                        if status == HTTPStatus.OK
+                                        else "failed"
+                                    ),
+                                    "original": original_result.get("diagnosis"),
+                                    "candidate": candidate_result.get("diagnosis"),
+                                },
+                            }
+                        preview = {
+                            "original": original_preview,
+                            "candidate": candidate_preview,
+                        }
+                    else:
+                        result = candidate_result
+                        preview = candidate_preview
+                except TimeoutError as exc:
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="failed",
+                        error={"code": "visual.preview_timeout", "message": str(exc)},
+                    )
+                    self._json(HTTPStatus.GATEWAY_TIMEOUT, {
+                        **binding,
+                        "error": str(exc),
+                        "operation": operation,
+                    })
+                    return
+                except Exception as exc:
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="indeterminate",
+                        error={
+                            "code": "visual.preview_interrupted",
+                            "message": (
+                                "Proposal visual validation did not record a "
+                                f"terminal result: {exc}"
+                            ),
+                        },
+                    )
+                    self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                        **binding,
+                        "error": (
+                            "Proposal visual validation did not record a "
+                            "terminal result."
+                        ),
+                        "operation": operation,
+                    })
+                    return
+                if not isinstance(result, dict):
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="failed",
+                        error={
+                            "code": "visual.invalid_response",
+                            "message": (
+                                "Browser validation returned an invalid response."
+                            ),
+                        },
+                    )
+                    self._json(HTTPStatus.BAD_GATEWAY, {
+                        **binding,
+                        "error": "Browser validation returned an invalid response.",
+                        "operation": operation,
+                    })
+                    return
+                result_binding = result.get("metadata")
+                if (
+                    (result.get("runId") or result.get("artifacts"))
+                    and (
+                        result_binding != binding
+                        or not comparison_binding_valid
+                    )
+                ):
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="failed",
+                        error={
+                            "code": "visual.binding_mismatch",
+                            "message": "Browser artifact binding was not preserved.",
+                        },
+                    )
+                    self._json(HTTPStatus.BAD_GATEWAY, {
+                        **binding,
+                        "error": "Browser artifact binding was not preserved.",
+                        "operation": operation,
+                    })
+                    return
+                response = {
+                    **binding,
+                    "plan": plan,
+                    "preview": preview,
+                    "visual": result,
+                }
+                if status == HTTPStatus.UNPROCESSABLE_ENTITY:
+                    response["error"] = "Browser validation did not pass."
+                elif status != HTTPStatus.OK:
+                    response["error"] = result.get("error", "Browser validation failed.")
+                operation = CONTROL.finish_operation(
+                    operation["id"],
+                    status="succeeded" if status == HTTPStatus.OK else "failed",
+                    result=response if status == HTTPStatus.OK else None,
+                    error=(
+                        None
+                        if status == HTTPStatus.OK
+                        else {
+                            "code": "visual.failed",
+                            "message": response["error"],
+                            "diagnosis": result.get("diagnosis"),
+                        }
+                    ),
+                )
+                CONTROL.audit(
+                    (
+                        "proposal.screenshot_completed"
+                        if action == "screenshot"
+                        else "proposal.visual_completed"
+                    ),
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        **binding,
+                        "action": action,
+                        "layer": layer_key,
+                        "runId": result.get("runId"),
+                        "passed": result.get("passed"),
+                    },
+                )
+                # The durable operation stores `response` as its result. Build
+                # a separate outer envelope instead of inserting the operation
+                # back into that same object, which would create
+                # response -> operation -> result -> response.
+                self._json(status, {**response, "operation": operation})
+                return
+            if request_path == "/api/xyz/reload":
+                timeout = reload_timeout(payload.get("timeout", 30))
+                with SAVE_RELOAD_LOCK:
+                    supplied_fingerprint = payload.get("workspaceFingerprint")
+                    if supplied_fingerprint is not None and (
+                        not isinstance(supplied_fingerprint, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", supplied_fingerprint)
+                    ):
+                        raise ValueError(
+                            "Workspace fingerprint must be a lowercase SHA-256 digest."
+                        )
+                    raw, _, _ = read_workspace()
+                    fingerprint = workspace_fingerprint(raw)
+                    if (
+                        supplied_fingerprint is not None
+                        and supplied_fingerprint != fingerprint
+                    ):
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": "Workspace fingerprint is stale.",
+                            "code": "workspace.fingerprint_conflict",
+                            "currentWorkspaceFingerprint": fingerprint,
+                        })
+                        return
+                    operation = CONTROL.create_operation(
+                        "xyz.reload",
+                        actor,
+                        {"workspaceFingerprint": fingerprint},
+                    )
+                    try:
+                        result = request_reload(fingerprint)
+                        result["status"] = wait_reload(
+                            result["requestedGeneration"],
+                            fingerprint,
+                            timeout,
+                        )
+                    except Exception as exc:
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="indeterminate",
+                            error={
+                                "code": "xyz.reload_interrupted",
+                                "message": (
+                                    "Reload did not record a terminal result: "
+                                    f"{exc}"
+                                ),
+                            },
+                        )
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                            "error": (
+                                "XYZ reload did not record a terminal result. "
+                                "Inspect XYZ status before retrying."
+                            ),
+                            "operation": operation,
+                        })
+                        return
+                completed = result["status"]["completed"]
+                operation = CONTROL.finish_operation(
+                    operation["id"],
+                    status="succeeded" if completed else "indeterminate",
+                    result=result if completed else None,
+                    error=(
+                        None
+                        if completed
+                        else {
+                            "code": "xyz.reload_timeout",
+                            "message": "Reload completion was not observed before timeout.",
+                        }
+                    ),
+                )
+                CONTROL.audit(
+                    "xyz.reload_requested",
+                    actor=actor,
+                    remote=self._remote(),
+                    details=result,
+                )
+                self._json(
+                    HTTPStatus.OK if completed else HTTPStatus.GATEWAY_TIMEOUT,
+                    {**result, "operation": operation},
+                )
                 return
             if request_path == "/api/visual-plan":
                 layer_key = payload.get("layer")
                 if not isinstance(layer_key, str) or not layer_key.strip():
                     raise ValueError("Visual requests require a layer key.")
-                _, current_workspace = read_workspace()
+                _, current_workspace, _ = read_workspace()
                 plan = visual_plan(
                     payload.get("workspace", current_workspace),
                     layer_key,
@@ -976,7 +2207,7 @@ class Handler(SimpleHTTPRequestHandler):
                 layer_key = payload.get("layer")
                 if not isinstance(layer_key, str) or not layer_key.strip():
                     raise ValueError("Visual requests require a layer key.")
-                _, current_workspace = read_workspace()
+                _, current_workspace, _ = read_workspace()
                 plan = apply_visual_override(
                     visual_plan(
                         payload.get("workspace", current_workspace),
@@ -996,11 +2227,17 @@ class Handler(SimpleHTTPRequestHandler):
                         "plan": plan,
                         "viewport": payload.get(
                             "viewport",
-                            {"width": 1280, "height": 720},
+                            {"width": 1920, "height": 1080},
                         ),
+                        "deviceScaleFactor": payload.get("deviceScaleFactor"),
                     },
                     allow_nan=False,
                 ).encode()
+                operation = CONTROL.create_operation(
+                    "visual.test",
+                    actor,
+                    {"layer": layer_key, "locale": plan.get("locale")},
+                )
                 try:
                     with urlopen(Request(
                         os.environ.get("BROWSER_RUNNER_URL", "http://browser-runner:8080/run"),
@@ -1010,7 +2247,13 @@ class Handler(SimpleHTTPRequestHandler):
                     ), timeout=60) as response:
                         result = json.load(response)
                     CONTROL.audit("visual.completed", actor=actor, remote=self._remote(), details={"layer": layer_key, "runId": result.get("runId"), "passed": result.get("passed")})
-                    self._json(HTTPStatus.OK, {"plan": plan, "visual": result})
+                    response_payload = {"plan": plan, "visual": result}
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="succeeded",
+                        result=response_payload,
+                    )
+                    self._json(HTTPStatus.OK, {**response_payload, "operation": operation})
                 except HTTPError as exc:
                     try:
                         result = strict_json_loads(exc.read())
@@ -1027,15 +2270,30 @@ class Handler(SimpleHTTPRequestHandler):
                                 "passed": False,
                             },
                         )
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            error={
+                                "code": "visual.failed",
+                                "message": "Browser validation did not pass.",
+                                "diagnosis": result.get("diagnosis"),
+                            },
+                        )
                         self._json(
                             HTTPStatus.UNPROCESSABLE_ENTITY,
                             {
                                 "error": "Browser validation did not pass.",
                                 "plan": plan,
                                 "visual": result,
+                                "operation": operation,
                             },
                         )
                     elif exc.code == HTTPStatus.TOO_MANY_REQUESTS:
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            error={"code": "visual.busy", "message": "Visual runner is busy."},
+                        )
                         self._json(
                             HTTPStatus.TOO_MANY_REQUESTS,
                             {
@@ -1045,9 +2303,18 @@ class Handler(SimpleHTTPRequestHandler):
                                     else None
                                 ) or "Visual runner is busy. Retry later.",
                                 "plan": plan,
+                                "operation": operation,
                             },
                         )
                     else:
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            error={
+                                "code": "visual.upstream",
+                                "message": f"Browser runner returned HTTP {exc.code}.",
+                            },
+                        )
                         self._json(
                             HTTPStatus.BAD_GATEWAY,
                             {
@@ -1056,13 +2323,26 @@ class Handler(SimpleHTTPRequestHandler):
                                     f"HTTP {exc.code}."
                                 ),
                                 "plan": plan,
+                                "operation": operation,
                             },
                         )
                 except Exception as exc:
-                    self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Browser validation failed: {exc}", "plan": plan})
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="failed",
+                        error={
+                            "code": "visual.upstream",
+                            "message": f"Browser validation failed: {exc}",
+                        },
+                    )
+                    self._json(HTTPStatus.BAD_GATEWAY, {
+                        "error": f"Browser validation failed: {exc}",
+                        "plan": plan,
+                        "operation": operation,
+                    })
                 return
             if request_path == "/api/sql/test":
-                raw, candidate = read_workspace()
+                _, candidate, _ = read_workspace()
                 locale_key, locale = select_locale(
                     candidate,
                     payload.get("locale"),
@@ -1085,10 +2365,10 @@ class Handler(SimpleHTTPRequestHandler):
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Expression test failed.", "errors": annotated([{"path": "fieldfx", "message": str(exc)}])})
                 return
-            if request_path in {"/api/mutate", "/api/proposals"}:
-                raw, current_workspace = read_workspace()
-                expected = payload.get("revision") or revision(raw)
-                if expected != revision(raw):
+            if request_path in {"/api/mutate", "/api/proposals", "/api/proposals/check"}:
+                _, current_workspace, current_revision = read_workspace()
+                expected = payload.get("revision") or current_revision
+                if expected != current_revision:
                     self._json(HTTPStatus.CONFLICT, {"error": "Workspace changed on disk. Reload before continuing."})
                     return
                 candidate, diff = apply_operations(current_workspace, payload.get("operations") or [])
@@ -1096,7 +2376,31 @@ class Handler(SimpleHTTPRequestHandler):
                 if errors:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Validation failed.", "errors": annotated(errors)})
                     return
-                if request_path == "/api/proposals":
+                supplied_check = payload.get("checkFingerprint")
+                if request_path == "/api/proposals" and supplied_check is not None:
+                    checked = proposal_check(
+                        current_workspace, expected, candidate,
+                        payload.get("operations") or [], diff,
+                        payload.get("explanation"),
+                    )
+                    if (
+                        not isinstance(supplied_check, str)
+                        or supplied_check != checked["checkFingerprint"]
+                    ):
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": "Checked operations no longer match this proposal request.",
+                            "ruleId": "proposal.check_fingerprint",
+                            "remediation": "Run proposals check again and create from the new check fingerprint.",
+                        })
+                        return
+                if request_path == "/api/proposals/check":
+                    checked = proposal_check(
+                        current_workspace, expected, candidate,
+                        payload.get("operations") or [], diff,
+                        payload.get("explanation"),
+                    )
+                    self._json(HTTPStatus.OK, {"check": checked})
+                elif request_path == "/api/proposals":
                     proposal = proposal_create(CONTROL, current_workspace, expected, candidate, payload.get("operations") or [], diff, actor, payload.get("explanation"))
                     self._json(HTTPStatus.CREATED, {"proposal": proposal})
                 elif payload.get("save"):
@@ -1106,10 +2410,10 @@ class Handler(SimpleHTTPRequestHandler):
                             expected,
                         )
                     except FileExistsError as exc:
-                        raw, _ = read_workspace()
+                        _, _, current_revision = read_workspace()
                         self._json(HTTPStatus.CONFLICT, {
                             "error": str(exc),
-                            "currentRevision": revision(raw),
+                            "currentRevision": current_revision,
                         })
                         return
                     completed = reload_completed(reload_result)
@@ -1145,6 +2449,12 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.OK, {"workspace": candidate, "revision": expected, "fingerprint": workspace_hash(candidate), "diff": diff, "saved": False})
                 return
             if request_path.endswith("/apply"):
+                if payload.get("approved") is not True:
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "Proposal application requires explicit approval.",
+                        "code": "proposal.approval_required",
+                    })
+                    return
                 with PROPOSAL_LOCK:
                     proposal = proposal_read(CONTROL, request_path.split("/")[-2])
                     if proposal["status"] not in {"pending", "applying"}:
@@ -1161,13 +2471,13 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     validate_before_apply = True
                     if proposal["status"] == "applying":
-                        current_raw, current_workspace = read_workspace()
+                        _, current_workspace, current_revision = read_workspace()
                         current_matches_candidate = (
                             workspace_hash(current_workspace)
                             == proposal["candidateHash"]
                         )
                         current_matches_original_revision = (
-                            revision(current_raw)
+                            current_revision
                             == proposal["originalRevision"]
                         )
                         # A committed candidate must be reconciled even if
@@ -1188,22 +2498,74 @@ class Handler(SimpleHTTPRequestHandler):
                                 "ruleId": "proposal.validation",
                             })
                             return
+                    operation = CONTROL.create_operation(
+                        "proposal.apply",
+                        actor,
+                        {
+                            "proposalId": proposal["id"],
+                            "candidateHash": proposal["candidateHash"],
+                        },
+                    )
                     try:
                         proposal, reload_result = apply_proposal_and_reload(
                             CONTROL,
                             proposal,
                             actor=actor,
                         )
+                        completed = reload_completed(reload_result)
                     except FileExistsError as exc:
-                        raw, _ = read_workspace()
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            error={"code": "proposal.revision", "message": str(exc)},
+                        )
+                        _, _, current_revision = read_workspace()
                         self._json(HTTPStatus.CONFLICT, {
                             "error": str(exc),
                             "ruleId": "proposal.revision",
-                            "currentRevision": revision(raw),
+                            "currentRevision": current_revision,
                             "remediation": "Create a new proposal from the current workspace revision.",
+                            "operation": operation,
                         })
                         return
-                completed = reload_completed(reload_result)
+                    except Exception as exc:
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="indeterminate",
+                            error={
+                                "code": "proposal.apply_interrupted",
+                                "message": (
+                                    "Proposal apply did not record a terminal "
+                                    f"result: {exc}"
+                                ),
+                            },
+                        )
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                            "error": (
+                                "Proposal apply did not record a terminal result. "
+                                "Inspect the proposal, workspace revision, and XYZ "
+                                "status before retrying."
+                            ),
+                            "operation": operation,
+                        })
+                        return
+                operation = CONTROL.finish_operation(
+                    operation["id"],
+                    status="succeeded" if completed else "indeterminate",
+                    result=(
+                        {"proposal": proposal, "reload": reload_result}
+                        if completed
+                        else None
+                    ),
+                    error=(
+                        None
+                        if completed
+                        else {
+                            "code": "proposal.apply_reload_timeout",
+                            "message": "Proposal committed but reload completion was not observed.",
+                        }
+                    ),
+                )
                 CONTROL.audit(
                     "proposal.applied",
                     actor=actor,
@@ -1222,6 +2584,7 @@ class Handler(SimpleHTTPRequestHandler):
                         ),
                         "proposal": proposal,
                         "reload": reload_result,
+                        "operation": operation,
                     },
                 )
                 return
@@ -1295,8 +2658,71 @@ class Handler(SimpleHTTPRequestHandler):
             )
         except json.JSONDecodeError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Request body is not valid JSON."})
-        except ValueError as exc:
+        except DerivedLayerDependencyError as exc:
+            operation = (
+                "replace"
+                if derived_action_path and derived_action_path.group(2) == "replace"
+                else "drop"
+            )
+            action = "edited" if operation == "replace" else "deleted"
+            columns = sorted(set(exc.removed_columns) & set(exc.dependent_columns))
+            column_message = (
+                " The database uses these affected fields: "
+                + ", ".join(f"“{column}”" for column in columns) + "."
+                if columns else ""
+            )
+            message = (
+                f'The derived layer “{exc.name}” cannot be {action} because '
+                f"other database views or objects use it.{column_message} "
+                "Nothing was changed."
+            )
+            self._json(HTTPStatus.CONFLICT, {
+                "error": message,
+                "userMessage": message,
+                "suggestedAction": (
+                    "Update or remove the dependent database views first, "
+                    "then try again."
+                ),
+                "code": "derived_layer.in_use",
+                "operation": operation,
+                "blocked": True,
+                "reasons": ["postgresql_dependents"],
+                "name": exc.name,
+                "dependents": exc.dependents,
+                "removedColumns": exc.removed_columns,
+                "dependentColumns": exc.dependent_columns,
+                "workspaceReferences": derived_workspace_references(exc.name),
+                "requiresSecondOrderChanges": bool(
+                    exc.removed_columns or exc.dependent_columns
+                ),
+                "dropped": False,
+            })
+        except (DerivedLayerError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except FileExistsError as exc:
+            if request_path == "/api/derived-layers":
+                self._json(HTTPStatus.CONFLICT, {
+                    "error": (
+                        f'A derived layer named “{exc}” already exists. '
+                        "Choose a different name or edit the existing layer."
+                    ),
+                    "code": "derived_layer.already_exists",
+                })
+            else:
+                self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+        except psycopg.Error as exc:
+            self._json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                {
+                    "error": (
+                        "The database could not apply this derived-layer "
+                        "change. Check the query, source tables, and selected "
+                        "ID and geometry fields, then try again."
+                    ),
+                    "code": "derived_layer.database_error",
+                    "technicalDetail": str(exc),
+                },
+            )
         except Exception as exc:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 

@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -19,6 +20,8 @@ UTC = dt.timezone.utc
 PBKDF2_ROUNDS = 310_000
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_MAX_SECONDS = 12 * 60 * 60
+DEVICE_AUTH_SECONDS = 10 * 60
+DEVICE_TOKEN_SECONDS = 30 * 24 * 60 * 60
 MIN_PASSWORD_LENGTH = 12
 AUDIT_MAX_BYTES = 10 * 1024 * 1024
 AUDIT_RETAIN_BYTES = 5 * 1024 * 1024
@@ -141,6 +144,9 @@ class ControlStore:
         self.proposals = root / "proposals"
         self.proposals.mkdir(exist_ok=True, mode=0o700)
         os.chmod(self.proposals, 0o700)
+        self.operations = root / "operations"
+        self.operations.mkdir(exist_ok=True, mode=0o700)
+        os.chmod(self.operations, 0o700)
         self.lock = threading.RLock()
         self._process_lock_depth = 0
         self._process_lock_fd = os.open(
@@ -151,6 +157,7 @@ class ControlStore:
         os.chmod(self.process_lock_path, 0o600)
         self._last_failed_token_audit = 0.0
         self._secure_existing_state()
+        self._purge_legacy_device_credentials()
 
     @contextlib.contextmanager
     def _locked(self):
@@ -180,11 +187,84 @@ class ControlStore:
             proposal_path = proposal_dir / "proposal.json"
             if proposal_path.is_file() and not proposal_path.is_symlink():
                 os.chmod(proposal_path, 0o600)
+        for operation_path in self.operations.glob("*.json"):
+            if operation_path.is_file() and not operation_path.is_symlink():
+                os.chmod(operation_path, 0o600)
+
+    def _purge_legacy_device_credentials(self) -> None:
+        """Remove raw device tokens persisted by the earlier staged format."""
+        if not self.state_path.exists():
+            return
+        changed = False
+        with self._locked():
+            state = self._state()
+            current = iso()
+            tokens = state.get("tokens")
+            if not isinstance(tokens, list):
+                tokens = []
+            for item in state["deviceAuthorizations"]:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.pop("token", None)
+                public_record = item.pop("tokenRecord", None)
+                if raw is None and public_record is None:
+                    continue
+                changed = True
+                token_id = (
+                    public_record.get("id")
+                    if isinstance(public_record, dict)
+                    else None
+                )
+                raw_hash = token_hash(raw) if isinstance(raw, str) else None
+                for token in tokens:
+                    if not isinstance(token, dict) or token.get("revoked"):
+                        continue
+                    if (
+                        (token_id and token.get("id") == token_id)
+                        or (raw_hash and token.get("hash") == raw_hash)
+                    ):
+                        token["revoked"] = current
+                item["legacyCredentialPurged"] = current
+            if changed:
+                self._write(state)
+        if changed:
+            self.audit(
+                "device.legacy_credential_purged",
+                actor="system",
+            )
+
+    def recover_interrupted_operations(self) -> None:
+        """Fail closed for work abandoned by a previous service process."""
+        with self._locked():
+            for operation_path in self.operations.glob("*.json"):
+                if not operation_path.is_file() or operation_path.is_symlink():
+                    continue
+                try:
+                    operation = _strict_json(operation_path.read_text())
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                if not isinstance(operation, dict) or operation.get("status") != "running":
+                    continue
+                operation.update({
+                    "status": "indeterminate",
+                    "updated": iso(),
+                    "result": None,
+                    "error": {
+                        "code": "operation.interrupted",
+                        "message": (
+                            "The service restarted before this operation recorded "
+                            "a terminal result. Reconcile target state before retrying."
+                        ),
+                    },
+                })
+                _atomic_json(operation_path, operation)
 
     def _state(self) -> dict[str, Any]:
         if not self.state_path.exists():
             raise RuntimeError("Control-plane authentication is not initialized. Run ./bin/mapp init.")
-        return _strict_json(self.state_path.read_text())
+        state = _strict_json(self.state_path.read_text())
+        state.setdefault("deviceAuthorizations", [])
+        return state
 
     def _write(self, state: dict[str, Any]) -> None:
         _atomic_json(self.state_path, state)
@@ -200,6 +280,7 @@ class ControlStore:
                 "adminPassword": password_hash(password),
                 "sessions": [],
                 "tokens": [],
+                "deviceAuthorizations": [],
             })
             self.audit("auth.initialized", actor="local-admin")
             return True
@@ -335,7 +416,12 @@ class ControlStore:
             self.audit("auth.password_changed", actor="admin")
             return True
 
-    def create_token(self, name: str, expires: str | None = None) -> tuple[str, dict]:
+    def create_token(
+        self,
+        name: str,
+        expires: str | None = None,
+        scopes: list[str] | None = None,
+    ) -> tuple[str, dict]:
         if not isinstance(name, str) or not name.strip() or len(name) > 100:
             raise ValueError("Token names must contain 1 to 100 characters.")
         normalized_expiry = None
@@ -347,6 +433,20 @@ class ControlStore:
                 raise ValueError("Token expiry must be a future ISO-8601 timestamp.")
             normalized_expiry = iso(expiry)
         raw = "mapp_" + secrets.token_urlsafe(32)
+        normalized_scopes = scopes or ["full"]
+        allowed_scopes = {"full", "inspect", "propose", "visual", "apply", "reload", "derive"}
+        if (
+            not isinstance(normalized_scopes, list)
+            or not normalized_scopes
+            or any(
+                not isinstance(scope, str) or scope not in allowed_scopes
+                for scope in normalized_scopes
+            )
+        ):
+            raise ValueError("Token scopes are invalid.")
+        normalized_scopes = list(dict.fromkeys(normalized_scopes))
+        if "full" in normalized_scopes and len(normalized_scopes) != 1:
+            raise ValueError("The full scope cannot be combined with narrower scopes.")
         record = {
             "id": secrets.token_hex(8),
             "name": name.strip(),
@@ -355,7 +455,7 @@ class ControlStore:
             "expires": normalized_expiry,
             "lastUsed": None,
             "revoked": None,
-            "scopes": ["full"],
+            "scopes": normalized_scopes,
         }
         with self._locked():
             state = self._state()
@@ -363,6 +463,215 @@ class ControlStore:
             self._write(state)
         self.audit("token.created", actor="admin", details={"id": record["id"], "name": name})
         return raw, self.public_token(record)
+
+    def start_device_authorization(
+        self,
+        device_name: str,
+        scopes: list[str],
+        remote: str,
+    ) -> dict:
+        if not isinstance(device_name, str) or not device_name.strip() or len(device_name) > 100:
+            raise ValueError("Device names must contain 1 to 100 characters.")
+        allowed = {"inspect", "propose", "visual", "apply", "reload", "derive"}
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or any(not isinstance(scope, str) or scope not in allowed for scope in scopes)
+        ):
+            raise ValueError("Requested device scopes are invalid.")
+        current = now()
+        device_id = secrets.token_urlsafe(24)
+        user_code = f"{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
+        record = {
+            "idHash": token_hash(device_id),
+            "userCode": user_code,
+            "deviceName": device_name.strip(),
+            "scopes": list(dict.fromkeys(scopes)),
+            "created": iso(current),
+            "expires": iso(current + dt.timedelta(seconds=DEVICE_AUTH_SECONDS)),
+            "remote": remote,
+            "status": "pending",
+        }
+        with self._locked():
+            state = self._state()
+            active = [
+                item for item in state["deviceAuthorizations"]
+                if parse_time(item.get("expires")) and parse_time(item["expires"]) > current
+            ]
+            if sum(
+                item.get("remote") == remote and item.get("status") == "pending"
+                for item in active
+            ) >= 3:
+                raise ValueError("Too many pending device authorizations from this client.")
+            if len(active) >= 20:
+                raise ValueError("The device authorization queue is full.")
+            state["deviceAuthorizations"] = [*active, record]
+            self._write(state)
+        self.audit("device.started", actor="anonymous", remote=remote, details={"userCode": user_code})
+        return {
+            "deviceId": device_id,
+            "userCode": user_code,
+            "expiresIn": DEVICE_AUTH_SECONDS,
+            "interval": 3,
+            "scopes": record["scopes"],
+        }
+
+    def list_device_authorizations(self) -> list[dict]:
+        with self._locked():
+            current = now()
+            return [
+                {
+                    key: item.get(key)
+                    for key in ("userCode", "deviceName", "scopes", "created", "expires", "remote", "status")
+                }
+                for item in self._state()["deviceAuthorizations"]
+                if parse_time(item.get("expires")) and parse_time(item["expires"]) > current
+            ]
+
+    def approve_device_authorization(self, user_code: str) -> bool:
+        approved = False
+        with self._locked():
+            state = self._state()
+            current = now()
+            for item in state["deviceAuthorizations"]:
+                if (
+                    item.get("userCode") == user_code
+                    and item.get("status") == "pending"
+                    and parse_time(item.get("expires"))
+                    and parse_time(item["expires"]) > current
+                ):
+                    item.update({
+                        "status": "approved",
+                        "approved": iso(current),
+                    })
+                    self._write(state)
+                    approved = True
+                    break
+        if approved:
+            self.audit(
+                "device.approved",
+                actor="admin",
+                details={"userCode": user_code},
+            )
+        return approved
+
+    def poll_device_authorization(self, device_id: str) -> dict:
+        digest = token_hash(device_id)
+        issued: tuple[str, dict, str] | None = None
+        with self._locked():
+            state = self._state()
+            current = now()
+            for item in state["deviceAuthorizations"]:
+                if not hmac.compare_digest(str(item.get("idHash", "")), digest):
+                    continue
+                expiry = parse_time(item.get("expires"))
+                if not expiry or expiry <= current:
+                    return {"status": "expired"}
+                status = item.get("status")
+                if status == "pending":
+                    return {"status": "pending"}
+                if status == "consumed":
+                    return {"status": "consumed"}
+                if status != "approved":
+                    return {"status": "invalid"}
+
+                scopes = item.get("scopes")
+                allowed = {"inspect", "propose", "visual", "apply", "reload", "derive"}
+                if (
+                    not isinstance(scopes, list)
+                    or not scopes
+                    or any(
+                        not isinstance(scope, str) or scope not in allowed
+                        for scope in scopes
+                    )
+                ):
+                    return {"status": "invalid"}
+                raw = "mapp_" + secrets.token_urlsafe(32)
+                record = {
+                    "id": secrets.token_hex(8),
+                    "name": f"Device: {item['deviceName']}",
+                    "hash": token_hash(raw),
+                    "created": iso(current),
+                    "expires": iso(
+                        current + dt.timedelta(seconds=DEVICE_TOKEN_SECONDS)
+                    ),
+                    "lastUsed": None,
+                    "revoked": None,
+                    "scopes": list(dict.fromkeys(scopes)),
+                }
+                state["tokens"].append(record)
+                item.update({
+                    "status": "consumed",
+                    "consumed": iso(current),
+                    "tokenId": record["id"],
+                })
+                self._write(state)
+                issued = (raw, self.public_token(record), str(item.get("remote", "")))
+                break
+        if issued:
+            raw, record, remote = issued
+            self.audit(
+                "device.token_issued",
+                actor=f"token:{record['id']}",
+                remote=remote,
+                details={"id": record["id"], "scopes": record["scopes"]},
+            )
+            return {"status": "authorized", "token": raw, "record": record}
+        return {"status": "invalid"}
+
+    def create_operation(self, kind: str, actor: str, target: dict | None = None) -> dict:
+        operation = {
+            "id": secrets.token_hex(16),
+            "kind": kind,
+            "status": "running",
+            "actor": actor,
+            "target": target or {},
+            "created": iso(),
+            "updated": iso(),
+            "result": None,
+            "error": None,
+        }
+        with self._locked():
+            existing = sorted(
+                (
+                    path for path in self.operations.glob("*.json")
+                    if path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: path.stat().st_mtime_ns,
+            )
+            for stale in existing[:-499]:
+                stale.unlink()
+            _atomic_json(self.operations / f"{operation['id']}.json", operation)
+        return operation
+
+    def finish_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        result: dict | None = None,
+        error: dict | None = None,
+    ) -> dict:
+        if status not in {"succeeded", "failed", "indeterminate"}:
+            raise ValueError("Invalid terminal operation status.")
+        with self._locked():
+            operation = self.read_operation(operation_id)
+            operation.update({
+                "status": status,
+                "updated": iso(),
+                "result": result,
+                "error": error,
+            })
+            _atomic_json(self.operations / f"{operation_id}.json", operation)
+            return operation
+
+    def read_operation(self, operation_id: str) -> dict:
+        if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+            raise FileNotFoundError("Operation not found.")
+        path = self.operations / f"{operation_id}.json"
+        if not path.is_file():
+            raise FileNotFoundError("Operation not found.")
+        return _strict_json(path.read_text())
 
     @staticmethod
     def public_token(record: dict) -> dict:
