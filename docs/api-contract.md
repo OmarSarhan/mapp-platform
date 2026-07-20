@@ -113,6 +113,12 @@ Important routes include:
 | `POST /api/proposals/check` | Preflight a revision-bound operation set without creating a proposal |
 | `POST /api/proposals` | Create a revision-bound proposal lifecycle record |
 | `POST /api/workspace` | Validate and save a complete workspace, then wait for its fingerprint-matched reload |
+
+Proposal visual requests accept `viewMode` as `focus` (the default) or
+`default`. Focus mode activates the requested layer and relevant group context
+through XYZ's `layers` query parameter. Default mode omits that parameter for
+both original and candidate renders so initial `layer.display` changes can be
+verified without the preview overriding them.
 | `POST /api/proposals/<id>/apply` | Apply a pending proposal, then wait for its fingerprint-matched reload |
 | `POST /api/proposals/<id>/decline` | Record rejection and optional reason |
 | `POST /api/sql/test` | Probe one calculated information expression |
