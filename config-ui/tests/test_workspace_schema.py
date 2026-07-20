@@ -273,6 +273,53 @@ class WorkspaceValidationTests(unittest.TestCase):
         paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
         self.assertIn("locale.layers.Places.style.default.icon.type", paths)
 
+    def test_validates_optional_viewport_count_text(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["filter"] = {
+            "viewport": True,
+            "count_meta": "features currently visible",
+            "viewport_description": "Counted in the current map view.",
+        }
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+        layer["filter"]["count_meta"] = " "
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.filter.count_meta", paths)
+
+    def test_validates_optional_layer_heading_viewport_count(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["plugins"] = ["/instance/plugins/viewport-layer-count.mjs"]
+        layer["viewport_layer_count"] = {"debounce": 300}
+        layer["filter"] = {"viewport": True}
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+        layer["viewport_layer_count"]["debounce"] = -1
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn(
+            "locale.layers.Places.viewport_layer_count.debounce",
+            paths,
+        )
+
+    def test_validates_optional_geometry_info_symbol_metadata(self):
+        data = valid_workspace()
+        entry = data["locale"]["layers"]["Places"]["infoj"][0]
+        entry.update({
+            "type": "geometry",
+            "style": {
+                "fillColor": None,
+                "strokeColor": "#ff007b",
+                "strokeWidth": 3,
+            },
+            "_dashboard": {"styleFromLayerDefault": True},
+        })
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+        entry["_dashboard"]["styleFromLayerDefault"] = "yes"
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn(
+            "locale.layers.Places.infoj.0._dashboard.styleFromLayerDefault",
+            paths,
+        )
+
     def test_rejects_non_3857_mvt_and_unsupported_scale_units(self):
         data = valid_workspace()
         data["locale"]["ScaleLine"] = "nautical"

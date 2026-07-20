@@ -96,6 +96,8 @@ class WorkspaceJsonSchemaTests(unittest.TestCase):
         } <= style_fields)
         hover_fields = set(defs["hover"]["properties"])
         self.assertTrue({"display", "field", "title", "dynamic", "hidden", "query"} <= hover_fields)
+        info_fields = set(defs["infoEntry"]["properties"])
+        self.assertTrue({"style", "_dashboard"} <= info_fields)
 
 
 if __name__ == "__main__":

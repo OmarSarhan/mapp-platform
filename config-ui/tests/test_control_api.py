@@ -244,6 +244,45 @@ class ControlApiTests(unittest.TestCase):
         self.assertIn("higher values render above", layer_order["description"])
         self.assertIn("promoteDisplay", layer_order["remediation"])
 
+    def test_examples_publish_optional_legend_and_viewport_count_operations(self):
+        advertised = examples()
+        legend = advertised["showLayerLegend"]
+        categorized = advertised["setCategorizedSymbology"]
+        viewport = advertised["countLayerInViewport"]
+        viewport_heading = advertised["showViewportCountBesideLayer"]
+        info_symbol = advertised["showSymbolInFeatureInformation"]
+        self.assertEqual("basic", legend["operations"][0]["value"]["type"])
+        self.assertEqual(["theme"], legend["operations"][1]["value"])
+        self.assertEqual(
+            "categorized",
+            categorized["operations"][0]["value"]["type"],
+        )
+        self.assertEqual(
+            "town",
+            categorized["operations"][0]["value"]["field"],
+        )
+        self.assertEqual(
+            ["theme"],
+            categorized["operations"][1]["value"],
+        )
+        self.assertTrue(viewport["operations"][0]["value"]["viewport"])
+        self.assertTrue(viewport["operations"][1]["value"])
+        self.assertEqual(
+            ["/instance/plugins/viewport-layer-count.mjs"],
+            viewport_heading["operations"][0]["value"],
+        )
+        self.assertEqual({}, viewport_heading["operations"][1]["value"])
+        self.assertTrue(viewport_heading["operations"][2]["value"])
+        self.assertIsNone(info_symbol["operations"][0]["value"]["fillColor"])
+        self.assertTrue(
+            info_symbol["operations"][1]["value"]["styleFromLayerDefault"]
+        )
+        rule_ids = {rule["id"] for rule in RULES}
+        self.assertIn("workspace.layer_legend", rule_ids)
+        self.assertIn("workspace.categorized_symbology", rule_ids)
+        self.assertIn("workspace.infoj_geometry_symbol", rule_ids)
+        self.assertIn("workspace.viewport_count", rule_ids)
+
     def test_visual_override_is_bounded_and_preserves_base_evidence(self):
         plan = {
             "source": "postgis-extent",

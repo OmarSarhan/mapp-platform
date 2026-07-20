@@ -25,7 +25,7 @@ After bearer or dashboard-session authentication:
   require the advertised `layers effective` capability before using this
   endpoint so they fail closed against an older independently released server.
 
-The current API and contract versions are `1.0`; the rules version is `1.1`.
+The current API and contract versions are `1.0`; the rules version is `1.3`.
 A formal compatibility policy is still required. The CLI should reject an
 unsupported major contract version and should not assume that a newer command
 exists merely because an older server used it.
@@ -36,10 +36,113 @@ for stable drawing order (higher values render above lower values), or
 `promoteDisplay` for the dynamic “move above displayed layers when shown”
 behavior. The `setLayerDrawingOrder` example demonstrates revision-bound
 operations without requiring the CLI to encode XYZ semantics locally.
+The `showLayerLegend`, `setCategorizedSymbology`,
+`showSymbolInFeatureInformation`,
+`countLayerInViewport`, and `showViewportCountBesideLayer` examples publish
+the optional operations for a basic layer legend, a clicked-feature geometry
+swatch/icon, a Filtering-panel count, and a bracketed layer-heading count.
 
 Request bodies must be JSON objects of at most 5 MiB. Parsing is strict:
 `NaN`, `Infinity`, and `-Infinity` are not JSON values and are rejected.
 Responses are also emitted as strict JSON.
+
+## CLI operations for symbology, information swatches, and viewport counts
+
+The standalone CLI continues to use revision-bound proposal operations; this
+repository does not contain a second CLI implementation. Inspect the effective
+layer and current revision before constructing either optional change:
+
+```sh
+config-cli workspace get
+config-cli layers get 'Bus Stops'
+```
+
+Create and review a basic legend proposal:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"basic","label":"Bus stop","style":{"icon":{"url":"/instance/svg/bus.svg","scale":1}}}' \
+  --set '/locale/layers/Bus Stops/style/elements=["theme"]' \
+  --explanation 'Shows the existing Bus Stops symbol in the optional XYZ Styling-panel legend.'
+```
+
+Create and review categorized, data-driven symbology. Category `value` entries
+must exactly match the stored field values. When `style.elements` already
+exists, inspect it and retain unrelated enabled controls rather than copying
+this intentionally minimal example:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"categorized","title":"Bus stops by town","field":"town","categories":[{"value":"Leeds","label":"Leeds","style":{"icon":{"type":"dot","fillColor":"#176b4d","scale":1}}},{"value":"Wetherby","label":"Wetherby","style":{"icon":{"type":"dot","fillColor":"#277da1","scale":1}}}]}' \
+  --set '/locale/layers/Bus Stops/style/elements=["theme"]' \
+  --explanation 'Uses exact town values for the Bus Stops symbols and XYZ legend.'
+```
+
+The dashboard’s richer feature-information preview is a review surface, not a
+separate workspace property. CLI clients configure the same backend
+`style.theme` object and should use a bounded `visual-test` after application
+to verify the rendered categories and legend.
+
+Create and review a viewport-count proposal. The `infoj` array index must come
+from the inspected revision; this example's `2` is the Object ID entry in the
+seed workspace:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/filter={"viewport":true,"includeAll":false,"count_meta":"features currently visible"}' \
+  --set '/locale/layers/Bus Stops/infoj/2/filter=true' \
+  --explanation 'Adds an optional Filtering-panel count scoped to the current viewport.'
+```
+
+To show the viewport count directly beside the layer name, preserve any
+existing entries in `plugins` when constructing the inspected revision's new
+array:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/plugins=["/instance/plugins/viewport-layer-count.mjs"]' \
+  --set '/locale/layers/Bus Stops/viewport_layer_count={}' \
+  --set '/locale/layers/Bus Stops/filter/viewport=true' \
+  --explanation 'Shows the current viewport count in brackets beside the Bus Stops layer name.'
+```
+
+This heading badge does not require an interactive `infoj` filter. It respects
+one when present, only queries while the layer is visible, and is removed by
+deleting `viewport_layer_count` and the corresponding plugin URL. Do not remove
+unrelated URLs from an existing `plugins` array.
+
+`filter.viewport_description` is deliberately absent from these guided
+examples. Pinned XYZ v4.23.4 preserves the value but leaves its generated
+element hidden, so the dashboard and CLI contract do not advertise it as a
+visible effect.
+
+Create and review a clicked-feature symbol proposal. The null fill and stroke
+values prevent XYZ's selected-location palette from adding another swatch
+behind a point icon:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/infoj/0/style={"fillColor":null,"strokeColor":null,"icon":{"url":"/instance/svg/bus.svg","scale":1}}' \
+  --set '/locale/layers/Bus Stops/infoj/0/_dashboard={"styleFromLayerDefault":true}' \
+  --explanation 'Shows the existing Bus Stops icon in clicked-feature information and marks it for dashboard synchronization.'
+```
+
+Use the returned focused diff and evidence in the normal `proposals create`,
+explicit approval, `proposals apply --confirm`, reload-status, and visual-test
+workflow. To remove either optional feature, create a new revision-bound
+proposal using `--unset` for `style.theme` (and remove only its `theme` element
+when appropriate), or for `filter.viewport`, custom count text, and the entry
+filter. Remove the bracketed layer-heading count by unsetting
+`viewport_layer_count` and removing only
+`/instance/plugins/viewport-layer-count.mjs` from the inspected layer's plugin
+array. Remove a dashboard-managed feature-information symbol by unsetting the
+geometry entry's `style` and ownership marker. Do not apply the original
+request as approval.
 
 ## Core reads
 

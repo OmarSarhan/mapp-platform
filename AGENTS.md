@@ -33,6 +33,21 @@ mount behavior when explicitly requested. Preserve unknown XYZ extension
 properties and update the API contract and documentation with compatible
 behavior changes.
 
+## Feature-information symbology
+
+XYZ geometry `infoj` entries may use an optional `style` to render both the
+selected geometry overlay and its swatch or icon in clicked-feature
+information. Preserve unmarked custom entry styles. The dashboard may set
+`infoj[]._dashboard.styleFromLayerDefault: true` only when it owns a copy of
+`layer.style.default`; only marked styles may be automatically synchronized or
+removed by that managed control.
+
+When a derived relation replacement adds or removes output columns, the
+dashboard may reconcile direct consumer-layer `infoj`, filter, and hover
+configuration only as unsaved local workspace state. Preserve calculated
+`fieldfx` entries and named-locale override boundaries. The confirmed database
+replacement is not approval to save or apply the follow-on workspace change.
+
 ## XYZ framework invariant
 
 Do not vendor, fork, or patch the GEOLYTIX XYZ source in this repository. The

@@ -306,6 +306,25 @@
           "default": false,
           "description": "Whether the layer is visible initially."
         },
+        "plugins": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "description": "Optional plugin modules loaded for this layer."
+        },
+        "viewport_layer_count": {
+          "type": "object",
+          "properties": {
+            "debounce": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 5000,
+              "description": "Additional delay in milliseconds before refreshing the layer-heading viewport count."
+            }
+          },
+          "additionalProperties": true,
+          "description": "Enables the instance viewport-count badge beside this queryable layer's name."
+        },
         "group": {
           "type": "string",
           "minLength": 1,
@@ -945,6 +964,23 @@
           ],
           "description": "Interactive layer-filter definition. True asks XYZ to infer a compatible filter from the info type."
         },
+        "style": {
+          "oneOf": [
+            {"$ref": "#/$defs/featureStyle"},
+            {"type": "null"}
+          ],
+          "description": "Optional geometry-entry style. XYZ uses it for the selected geometry and renders the same style as a swatch or icon in feature information."
+        },
+        "_dashboard": {
+          "type": "object",
+          "properties": {
+            "styleFromLayerDefault": {
+              "type": "boolean",
+              "description": "Dashboard ownership marker for a geometry-entry style synchronized from layer.style.default."
+            }
+          },
+          "additionalProperties": true
+        },
         "group": {
           "type": "string"
         },
@@ -1105,8 +1141,16 @@
         "dialog": {"type": ["boolean", "object"]},
         "popout": {"type": ["boolean", "object"]},
         "classList": {"type": "string"},
-        "count_meta": {"type": "string"},
-        "viewport_description": {"type": "string"}
+        "count_meta": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional text displayed after the XYZ Filtering-panel feature count."
+        },
+        "viewport_description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "XYZ v4.23.4 workspace value preserved for compatibility; the pinned renderer constructs this note but leaves it hidden."
+        }
       },
       "additionalProperties": true
     },
@@ -1377,6 +1421,10 @@
         },
         "title": {
           "type": "string"
+        },
+        "label": {
+          "type": "string",
+          "description": "Label displayed beside a basic theme symbol in the XYZ legend."
         },
         "field": {
           "type": "string"

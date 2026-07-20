@@ -330,6 +330,27 @@ def _validate_layer(key, layer, path, errors, available_dbs):
         _error(errors, f"{path}.format", f"Must be one of: {', '.join(sorted(SUPPORTED_FORMATS))}.")
     if "display" in layer and not isinstance(layer["display"], bool):
         _error(errors, f"{path}.display", "Must be true or false.")
+    plugins = layer.get("plugins")
+    if plugins is not None and not (
+        isinstance(plugins, list)
+        and all(isinstance(item, str) and item.strip() for item in plugins)
+        and len(plugins) == len(set(plugins))
+    ):
+        _error(errors, f"{path}.plugins", "Must be an array of unique, non-empty plugin URLs.")
+    viewport_count = layer.get("viewport_layer_count")
+    if viewport_count is not None:
+        if not isinstance(viewport_count, dict):
+            _error(errors, f"{path}.viewport_layer_count", "Must be an object.")
+        else:
+            debounce = viewport_count.get("debounce")
+            if debounce is not None and (
+                not _number(debounce) or debounce < 0 or debounce > 5000
+            ):
+                _error(
+                    errors,
+                    f"{path}.viewport_layer_count.debounce",
+                    "Must be a number from 0 to 5000.",
+                )
     if "group" in layer and (
         not isinstance(layer["group"], str) or not layer["group"].strip()
     ):
@@ -465,6 +486,13 @@ def _validate_layer(key, layer, path, errors, available_dbs):
                         _error(errors, f"{entry_path}.display", "Must be true or false.")
                     if "inline" in entry and not isinstance(entry["inline"], bool):
                         _error(errors, f"{entry_path}.inline", "Must be true or false.")
+                    if "style" in entry and entry["style"] is not None and not isinstance(entry["style"], dict):
+                        _error(errors, f"{entry_path}.style", "Must be an XYZ feature-style object or null.")
+                    dashboard = entry.get("_dashboard")
+                    if dashboard is not None and not isinstance(dashboard, dict):
+                        _error(errors, f"{entry_path}._dashboard", "Must be an object.")
+                    elif isinstance(dashboard, dict) and "styleFromLayerDefault" in dashboard and not isinstance(dashboard["styleFromLayerDefault"], bool):
+                        _error(errors, f"{entry_path}._dashboard.styleFromLayerDefault", "Must be true or false.")
                     _validate_info_filter(
                         entry.get("filter"),
                         f"{entry_path}.filter",
@@ -535,6 +563,11 @@ def _validate_layer_filter(value, path, errors, fields):
     for key in ("hidden", "viewport", "includeAll"):
         if key in value and not isinstance(value[key], bool):
             _error(errors, f"{path}.{key}", "Must be true or false.")
+    for key in ("count_meta", "viewport_description"):
+        if key in value and (
+            not isinstance(value[key], str) or not value[key].strip()
+        ):
+            _error(errors, f"{path}.{key}", "Must be a non-empty string.")
     for key in ("include", "exclude"):
         selected = value.get(key)
         if selected is None:

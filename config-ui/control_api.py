@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
 
 API_VERSION = "1.0"
 CONTRACT_VERSION = "1.0"
-RULES_VERSION = "1.1"
+RULES_VERSION = "1.3"
 XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -44,6 +44,10 @@ PROPOSAL_LOCK = threading.RLock()
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect `config-cli schema` and correct the reported path."},
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
+    {"id": "workspace.layer_legend", "category": "schema", "description": "An optional basic theme exposes the layer symbology as a legend in XYZ's Styling panel.", "remediation": "Set style.theme to a basic theme whose style matches style.default, and include theme in style.elements when an explicit element list is present."},
+    {"id": "workspace.categorized_symbology", "category": "schema", "description": "A categorized theme maps exact values from a feature field to labelled styles in XYZ's data-driven legend.", "remediation": "Set style.theme to a categorized theme with a valid field and category value/style entries; preserve unrelated style.elements and include theme when that array is explicit."},
+    {"id": "workspace.infoj_geometry_symbol", "category": "schema", "description": "An optional geometry infoj style renders the same swatch or icon beside its checkbox and on the selected geometry.", "remediation": "Set the geometry infoj entry style to the effective layer symbol; use the dashboard ownership marker only when the dashboard should keep it synchronized with style.default."},
+    {"id": "workspace.viewport_count", "category": "schema", "description": "An optional layer filter with viewport enabled scopes XYZ's feature count to the current map view.", "remediation": "Set filter.viewport to true and configure at least one compatible infoj entry as an interactive filter so XYZ creates the Filtering panel."},
     {"id": "workspace.catalog", "category": "catalog", "description": "Database-backed layers must use selectable relations and columns.", "remediation": "Use `config-cli catalog list` and select a reported table, geometry, and ID."},
     {"id": "workspace.feature_id", "category": "data", "description": "XYZ feature IDs must be non-null and unique.", "remediation": "Choose a primary or unique non-null column for qID."},
     {"id": "workspace.render", "category": "render", "description": "XYZ-equivalent bounded database reads must succeed.", "remediation": "Review the relation, SRID, expressions, and database permissions."},
@@ -655,6 +659,134 @@ def examples() -> dict:
                 },
             ],
             "explanation": "Draws Labels above Boundaries. Layer group values affect navigation only.",
+        },
+        "showLayerLegend": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/theme",
+                    "value": {
+                        "type": "basic",
+                        "label": "Bus stop",
+                        "style": {
+                            "icon": {
+                                "url": "/instance/svg/bus.svg",
+                                "scale": 1,
+                            },
+                        },
+                    },
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/elements",
+                    "value": ["theme"],
+                },
+            ],
+            "explanation": "Optionally shows the Bus Stops map symbol as a basic legend in the XYZ layer Styling panel.",
+        },
+        "setCategorizedSymbology": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/theme",
+                    "value": {
+                        "type": "categorized",
+                        "title": "Bus stops by town",
+                        "field": "town",
+                        "categories": [
+                            {
+                                "value": "Leeds",
+                                "label": "Leeds",
+                                "style": {
+                                    "icon": {
+                                        "type": "dot",
+                                        "fillColor": "#176b4d",
+                                        "scale": 1,
+                                    },
+                                },
+                            },
+                            {
+                                "value": "Wetherby",
+                                "label": "Wetherby",
+                                "style": {
+                                    "icon": {
+                                        "type": "dot",
+                                        "fillColor": "#277da1",
+                                        "scale": 1,
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/elements",
+                    "value": ["theme"],
+                },
+            ],
+            "explanation": "Uses exact town values to drive Bus Stops symbols and the XYZ theme legend; preserve unrelated style element keys from the inspected revision.",
+        },
+        "countLayerInViewport": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/filter",
+                    "value": {
+                        "viewport": True,
+                        "includeAll": False,
+                        "count_meta": "features currently visible",
+                    },
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/infoj/2/filter",
+                    "value": True,
+                },
+            ],
+            "explanation": "Optionally creates the Filtering panel and scopes its feature count to the current viewport.",
+        },
+        "showViewportCountBesideLayer": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/plugins",
+                    "value": ["/instance/plugins/viewport-layer-count.mjs"],
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/viewport_layer_count",
+                    "value": {},
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/filter/viewport",
+                    "value": True,
+                },
+            ],
+            "explanation": "Optionally shows the visible feature count in brackets beside the Bus Stops layer name.",
+        },
+        "showSymbolInFeatureInformation": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/infoj/0/style",
+                    "value": {
+                        "fillColor": None,
+                        "strokeColor": None,
+                        "icon": {
+                            "url": "/instance/svg/bus.svg",
+                            "scale": 1,
+                        },
+                    },
+                },
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/infoj/0/_dashboard",
+                    "value": {"styleFromLayerDefault": True},
+                },
+            ],
+            "explanation": "Optionally shows the Bus Stops map icon beside its geometry control in clicked-feature information.",
         },
         "workflow": [
             "config-cli describe",
