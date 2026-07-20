@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from svg_icons import safe_svg
@@ -40,6 +41,14 @@ class SvgIconTests(unittest.TestCase):
             )
             self.assertFalse(safe_svg(text))
             self.assertFalse(safe_svg(large))
+
+    def test_public_icons_declare_intrinsic_dimensions_for_map_rendering(self):
+        icon_dir = Path(__file__).parents[2] / "instance" / "public" / "svg"
+        for path in icon_dir.glob("*.svg"):
+            with self.subTest(icon=path.name):
+                root = ET.parse(path).getroot()
+                self.assertTrue(root.get("width"))
+                self.assertTrue(root.get("height"))
 
 
 if __name__ == "__main__":
