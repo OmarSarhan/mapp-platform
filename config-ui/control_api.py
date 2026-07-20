@@ -237,6 +237,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewMode": {
+                    "type": "string",
+                    "enum": ["focus", "default"],
+                    "default": "focus",
+                },
             },
             "additionalProperties": True,
         },
@@ -255,6 +260,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewMode": {
+                    "type": "string",
+                    "enum": ["focus", "default"],
+                    "default": "focus",
+                },
                 "viewport": {
                     "type": "object",
                     "default": {"width": 1080, "height": 1080},
@@ -295,6 +305,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewMode": {
+                    "type": "string",
+                    "enum": ["focus", "default"],
+                    "default": "focus",
+                },
                 "viewport": {"type": "object"},
                 "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
             },
@@ -315,6 +330,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewMode": {
+                    "type": "string",
+                    "enum": ["focus", "default"],
+                    "default": "focus",
+                },
                 "viewport": {"type": "object"},
                 "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
             },
@@ -335,6 +355,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "viewMode": {
+                    "type": "string",
+                    "enum": ["focus", "default"],
+                    "default": "focus",
+                },
                 "viewport": {
                     "type": "object",
                     "properties": {

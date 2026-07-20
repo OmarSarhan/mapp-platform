@@ -420,6 +420,24 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual({"width": 1920, "height": 1080}, payload["viewport"])
         self.assertEqual(2, payload["deviceScaleFactor"])
         self.assertEqual(["Stops", "Rail Stations"], payload["layers"])
+        self.assertEqual("focus", payload["viewMode"])
+
+    def test_browser_request_propagates_default_view_mode(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
+        with patch.object(app, "urlopen", return_value=response) as urlopen:
+            status, result = app.run_browser_visual(
+                "Stops",
+                {"centre": [1, 2], "layers": ["Stops"]},
+                {"viewMode": "default"},
+                target_url="http://xyz-preview:3000",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = app.json.loads(request.data)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(result["passed"])
+        self.assertEqual("default", payload["viewMode"])
 
     def test_group_preview_isolates_added_and_deleted_layers(self):
         existing = {"group": "Transport", "format": "mvt"}

@@ -542,6 +542,7 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             "viewport": payload.get("viewport", {"width": 1920, "height": 1080}),
             "deviceScaleFactor": payload.get("deviceScaleFactor", 2),
             "fullPage": payload.get("fullPage", True),
+            "viewMode": payload.get("viewMode", "focus"),
             "metadata": payload.get("metadata"),
         },
         allow_nan=False,
@@ -1764,6 +1765,11 @@ class Handler(SimpleHTTPRequestHandler):
                     layer_key,
                     payload.get("locale"),
                 )
+                view_mode = payload.get("viewMode", "focus")
+                if view_mode not in {"focus", "default"}:
+                    raise ValueError(
+                        "Visual viewMode must be 'focus' or 'default'."
+                    )
                 plan_source = (
                     "candidate"
                     if group_preview["candidate"]["requestedLayerPresent"]
@@ -1790,6 +1796,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "candidate"
                     ]["requestedLayerPresent"],
                     "viewSource": plan_source,
+                    "viewMode": view_mode,
                 })
                 binding = {
                     "source": "candidate",
@@ -1824,6 +1831,7 @@ class Handler(SimpleHTTPRequestHandler):
                     original_render_plan.pop("interaction", None)
                     candidate_render_plan.pop("interaction", None)
                 render_payload = dict(payload)
+                render_payload["viewMode"] = view_mode
                 if action == "screenshot":
                     render_payload.setdefault(
                         "viewport",

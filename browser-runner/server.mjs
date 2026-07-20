@@ -141,6 +141,7 @@ async function runVisual(input) {
   if (input.plan?.locale) {
     target.searchParams.set("locale", input.plan.locale);
   }
+  const viewMode = input.viewMode === "default" ? "default" : "focus";
   const requestedLayers = Array.isArray(input.layers)
     ? input.layers.filter(value => typeof value === "string" && value)
     : input.layer
@@ -150,7 +151,7 @@ async function runVisual(input) {
     "OpenStreetMap",
     ...requestedLayers.filter(value => value !== "OpenStreetMap"),
   ];
-  if (activeLayers.length) {
+  if (viewMode === "focus" && activeLayers.length) {
     target.searchParams.set("layers", activeLayers.join(","));
   }
 
@@ -169,6 +170,7 @@ async function runVisual(input) {
     runId,
     layer: input.layer,
     layers: requestedLayers,
+    viewMode,
     groups: Array.isArray(input.plan?.activeGroups)
       ? input.plan.activeGroups
       : [],
@@ -199,7 +201,9 @@ async function runVisual(input) {
     });
     report.httpStatus = response?.status();
     report.canvasCount = await page.locator("canvas").count();
-    report.layerTextFound = input.layer
+    report.layerTextFound = viewMode === "default"
+      ? true
+      : input.layer
       ? await page.getByText(input.layer, {exact: false}).count() > 0
       : true;
     report.groupTextFound = (
