@@ -89,11 +89,108 @@ require multiple configured choices. Unknown element keys are valid extension
 points and must be preserved even though the dashboard cannot preview their
 plugin-provided renderers.
 
+### Optional layer-symbol legend
+
+XYZ renders a layer legend from `style.theme`; it does not automatically turn
+`style.default` into a legend. A single-symbol layer can use an optional
+`basic` theme whose style matches its default map symbol:
+
+```json
+{
+  "style": {
+    "default": {"strokeColor": "#ff007b", "strokeWidth": 3},
+    "theme": {
+      "type": "basic",
+      "label": "Definitive public right of way",
+      "style": {"strokeColor": "#ff007b", "strokeWidth": 3}
+    },
+    "elements": ["theme"]
+  }
+}
+```
+
+The dashboard's **Show symbol legend** control creates this theme from the
+current default symbol and keeps both styles synchronized when the default
+symbol is edited there. It preserves existing named, categorized, distributed,
+and graduated themes for Advanced layer JSON. Omitting `style.theme` retains
+the map symbol without showing a legend.
+
+The dashboard labels a layer as **Static symbology** when the default style,
+optionally with a basic theme, supplies its one symbol. Categorized,
+distributed, and graduated themes are labelled **Data-driven symbology**. For
+those themes the dashboard shows the driving field(s), number of legend
+classes, and previews up to eight configured category symbols. The separately
+labelled default/fallback editor remains available, but is not presented as
+the complete data-driven legend. Named themes are resolved from `style.themes`
+for the same inspection; a missing named definition is shown as a warning.
+
+To create a categorized theme in the dashboard:
+
+1. Select the layer and find **Symbology mode**.
+2. Choose **Data-driven categorized**.
+3. Select the **Category field** whose values drive the symbols.
+4. Use **Add legend category** for each expected value, then provide its exact
+   value, user-facing legend label, and symbol colour.
+5. Review the map/fallback preview and the richer **Feature information
+   preview**, then save and reload XYZ.
+
+The editor writes `style.theme.type: "categorized"`, its `field`, and
+`categories`, and ensures the theme legend is included when an explicit
+`style.elements` list exists. Switching back to **Static** explicitly removes
+the active managed theme. Existing graduated, distributed, and named themes
+are labelled as advanced and remain preserved unless the operator deliberately
+chooses a different mode.
+
+The Feature information preview includes the selected-geometry swatch,
+its synchronization status, representative attribute values, and the complete
+configured categorized legend. This makes the fallback swatch and the
+data-driven legend visibly distinct before a workspace change is saved.
+
+### Optional symbol in clicked-feature information
+
+An `infoj` entry with `type: "geometry"` uses its optional `style` both for the
+selected geometry overlay and for the swatch or icon beside its checkbox:
+
+```json
+{
+  "type": "geometry",
+  "label": "Public right of way",
+  "display": true,
+  "field": "geom_3857",
+  "fieldfx": "ST_AsGeoJSON(geom_3857)",
+  "style": {
+    "fillColor": null,
+    "strokeColor": "#ff007b",
+    "strokeWidth": 3
+  }
+}
+```
+
+Point entries may instead use the same `icon` object as a feature style. The
+dashboard's **Feature-information symbol** control copies
+`layer.style.default` into the geometry entry and records
+`_dashboard.styleFromLayerDefault: true`. Subsequent default-symbol edits then
+update only marked entries. An unmarked custom `infoj[].style` is preserved
+until an operator explicitly chooses to replace it. Disabling the control
+removes only a marked, dashboard-managed style.
+
+The dashboard presents this as the explicit **Keep information symbol
+synchronized** checkbox. This avoids silently overwriting custom information
+styles and prevents a managed swatch drifting when the static default/fallback
+symbology changes. A geometry information swatch is one static style: for a
+data-driven theme it represents the fallback, while the theme legend represents
+the individual data-driven classes.
+
 ## Interactive layer filters
 
 XYZ builds a layer's Filtering drawer from its `infoj` entries. An entry can
 declare `filter: true` for type inference, a built-in filter type string, or a
 filter object:
+
+The dashboard limits interactive filter choices to the entry's information
+type. Text, numeric, integer, date, datetime, and boolean entries receive their
+matching XYZ control and compatible exact, inclusion, exclusion, or null
+choices. Types that XYZ cannot infer as filters are shown as unavailable.
 
 ```json
 {
@@ -127,6 +224,42 @@ current map view. `filter.default` is a fixed server-side restriction composed
 with interactive filters. Upstream also accepts trusted template SQL strings
 there, so changes require explicit query and data-access review.
 
+XYZ only creates the Filtering drawer, including its count, when at least one
+compatible `infoj` entry is offered by `filter.includeAll`, `filter.include`,
+or the entry's own `filter` property. `filter.count_meta` optionally replaces
+the text after the number. Omitting `filter.viewport` preserves the ordinary
+non-viewport count.
+
+Pinned XYZ v4.23.4 accepts `filter.viewport_description` and constructs an
+element for it, but leaves that element hidden. The dashboard therefore
+preserves an existing value in Advanced layer JSON but does not advertise an
+editable control that has no visible framework effect.
+
+### Optional count beside the layer name
+
+A queryable database layer can show its current viewport count in brackets
+directly beside its name in the layer list:
+
+```json
+{
+  "plugins": ["/instance/plugins/viewport-layer-count.mjs"],
+  "viewport_layer_count": {},
+  "filter": {"viewport": true}
+}
+```
+
+The dashboard's **Show viewport count beside layer name** switch manages these
+properties together. The badge uses XYZ's `location_count` query, refreshes
+after map movement, respects the layer's active filters, and queries only while
+the layer is visible and has a table at the current zoom. It shows an ellipsis
+while loading and an en dash if the count is unavailable. A custom
+`viewport_layer_count.debounce` from 0 to 5000 milliseconds may be supplied in
+Advanced layer JSON; the default is 250 milliseconds in addition to XYZ's
+map-change debounce.
+
+Omitting `viewport_layer_count` leaves the layer heading unchanged. Tile and
+other non-queryable layers do not support this badge.
+
 The dashboard exposes the safe common controls and preserves fixed ranges,
 value lists, dropdown/search presentation, histograms, drawer/dialog options,
 and custom extensions in Advanced layer JSON.
@@ -144,6 +277,19 @@ server API and CLI. Editing an effective object could otherwise copy inherited
 content into the raw override, and deleting an inherited layer would not
 remove it from the default. Use focused API/CLI JSON Pointer operations against
 the raw `locales.<name>` override instead.
+
+## Dashboard layer editor structure
+
+The editable default-locale layer page is divided into task-based collapsible
+sections: **Identity and display**, **Data source**, **Appearance and legend**,
+**Interaction**, **Feature information**, and **Advanced layer JSON**.
+Database controls appear only for supported single-relation database layers;
+tile layers show their URI instead; open-ended external/template sources
+retain their complete JSON without presenting inapplicable database fields.
+Styling controls are disabled until the Styling panel is enabled, and
+Filtering-panel options are disabled or hidden until that panel is enabled.
+Advanced JSON remains available so this organization never discards unknown
+XYZ extension properties.
 
 ## Hierarchy
 
@@ -220,6 +366,8 @@ workspace
 | `infoj[].title`, `label` | string | User-facing text. |
 | `infoj[].display` | boolean | Whether the entry is displayed; defaults to true. |
 | `infoj[].inline` | boolean | Places title and value on one line. |
+| `infoj[].style` | feature style or null | For a geometry entry, styles the selected geometry and renders the matching swatch/icon beside its information-panel checkbox. |
+| `infoj[]._dashboard.styleFromLayerDefault` | boolean | Dashboard ownership marker enabling synchronization from `layer.style.default`; omit for custom entry styles. |
 | `style.default` | feature style | Normal feature symbol. |
 | `style.highlight` | feature style | Selected/hovered feature override. |
 | `style.selected`, `style.cluster` | feature styles | Overrides for selected locations and clustered points. |

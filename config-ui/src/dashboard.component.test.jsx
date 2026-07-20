@@ -13,6 +13,7 @@ import {
   DerivedLayers,
   Root,
   derivedLayerFormDefinition,
+  reconcileDerivedWorkspace,
 } from './main.jsx';
 
 const workspace = {
@@ -82,6 +83,56 @@ afterEach(() => {
 });
 
 describe('Dashboard managed save lifecycle', () => {
+  test('reconciles added and removed derived columns into workspace info fields', () => {
+    const source = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Summary: {
+            table: 'derived_layers.summary',
+            qID: 'id',
+            infoj: [
+              {type: 'geometry', field: 'geom', fieldfx: 'ST_AsGeoJSON(geom)'},
+              {title: 'Old name', field: 'old_name', type: 'text'},
+              {title: 'Calculated', field: 'old_name', fieldfx: 'upper(name)'},
+              {title: 'Kept', field: 'kept', type: 'text'},
+            ],
+            filter: {include: ['old_name', 'kept']},
+            style: {hover: {field: 'old_name', display: true}},
+          },
+        },
+      },
+    };
+    const tables = [{
+      schema: 'derived_layers',
+      table: 'summary',
+      columns: [
+        {name: 'id', type: 'bigint'},
+        {name: 'geom', type: 'geometry', geometryType: 'POINT', srid: 3857},
+        {name: 'kept', type: 'text'},
+        {name: 'new_count', type: 'integer'},
+      ],
+    }];
+    const result = reconcileDerivedWorkspace(source, {
+      name: 'summary',
+      columnChanges: {added: ['new_count'], removed: ['old_name'], changed: []},
+    }, tables);
+    const layer = result.workspace.locale.layers.Summary;
+    expect(layer.infoj.map(entry => entry.title)).toEqual([
+      undefined, 'Calculated', 'Kept', 'New Count',
+    ]);
+    expect(layer.infoj.at(-1)).toMatchObject({
+      field: 'new_count',
+      type: 'integer',
+      _dashboard: {catalogField: true},
+    });
+    expect(layer.filter.include).toEqual(['kept']);
+    expect(layer.style.hover).toBeUndefined();
+    expect(result.summary).toEqual({layers: 1, added: 1, removed: 1});
+    expect(source.locale.layers.Summary.infoj).toHaveLength(4);
+  });
+
   test('refreshes the derived-layer form after converting its kind', async () => {
     const materialized = {
       name: 'hex_summary',
@@ -238,7 +289,7 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/icons') return response({icons: []});
       throw new Error(`Unexpected request: GET ${path}`);
     }));
-    render(<Dashboard openSecurity={() => {}}/>);
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
 
     expect(await screen.findByRole('heading', {name: 'Transport'})).toBeTruthy();
     fireEvent.click(screen.getByRole('button', {name: 'Bus Stops'}));
@@ -267,13 +318,368 @@ describe('Dashboard managed save lifecycle', () => {
     expect(hoverToggle.checked).toBe(true);
     expect(labelToggle.disabled).toBe(true);
     fireEvent.click(hoverToggle);
-    expect(screen.getByText(/Order:/).textContent)
+    expect(screen.getByText(/Control order:/).textContent)
       .not.toMatch(/(?:^|→ )hover(?: →|$)/);
     const filterSelect = screen.getByRole('combobox', {
       name: /Interactive filter/,
     });
     fireEvent.change(filterSelect, {target: {value: 'Automatic'}});
     expect(filterSelect.value).toBe('Automatic');
+  });
+
+  test('limits interactive filters to choices compatible with each information type', async () => {
+    const filteredWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Measurements: {
+            name: 'Measurements',
+            format: 'mvt',
+            style: {default: {icon: {type: 'dot'}}},
+            infoj: [
+              {title: 'Name', field: 'name', type: 'text'},
+              {title: 'Count', field: 'count', type: 'integer'},
+              {title: 'Measured', field: 'measured_at', type: 'datetime'},
+              {title: 'Photo', field: 'photo', type: 'image'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: filteredWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Measurements'}));
+    const filters = screen.getAllByRole('combobox', {name: /Interactive filter/});
+    const choices = select => [...select.options].map(option => option.textContent);
+
+    expect(choices(filters[0])).toContain('Text prefix');
+    expect(choices(filters[0])).not.toContain('Numeric range');
+    expect(choices(filters[1])).toContain('Integer range');
+    expect(choices(filters[1])).not.toContain('Text prefix');
+    expect(choices(filters[2])).toContain('Date/time range');
+    expect(choices(filters[2])).not.toContain('Date range');
+    expect(filters[3].disabled).toBe(true);
+    expect(choices(filters[3])).toEqual(['None']);
+  });
+
+  test('optionally configures a viewport count beside the layer name', async () => {
+    const countedWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Places: {
+            name: 'Places',
+            format: 'mvt',
+            table: 'public.places',
+            geom: 'geom_3857',
+            qID: 'id',
+            style: {default: {icon: {type: 'dot'}}},
+            infoj: [{title: 'Name', field: 'name', type: 'text'}],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: countedWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
+    const toggle = screen.getByRole('checkbox', {
+      name: /Show viewport count beside layer name/,
+    });
+    fireEvent.click(toggle);
+
+    let managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    expect(managed.plugins).toContain(
+      '/instance/plugins/viewport-layer-count.mjs',
+    );
+    expect(managed.viewport_layer_count).toEqual({});
+    expect(managed.filter.viewport).toBe(true);
+
+    fireEvent.click(toggle);
+    managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    expect(managed.viewport_layer_count).toBeUndefined();
+    expect(managed.plugins).toBeUndefined();
+    expect(managed.filter.viewport).toBe(true);
+  });
+
+  test('structures layer tasks and gates controls behind their requirements', async () => {
+    const configuredWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Places: {
+            name: 'Places',
+            format: 'mvt',
+            table: 'public.places',
+            geom: 'geom_3857',
+            qID: 'id',
+            style: {default: {icon: {type: 'dot'}}, hidden: true},
+            filter: {hidden: true, viewport: true},
+            infoj: [{title: 'Name', field: 'name', type: 'text'}],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: configuredWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
+    const sections = [...container.querySelectorAll('.layer-section>summary span')]
+      .map(element => element.textContent);
+    expect(sections).toEqual([
+      'Identity and display',
+      'Data source',
+      'Appearance and legend',
+      'Interaction',
+      'Feature information',
+      'Advanced layer JSON',
+    ]);
+
+    fireEvent.click(screen.getByText('Interaction').closest('summary'));
+    expect(screen.getByRole('checkbox', {name: /Opacity slider/}).disabled).toBe(true);
+    expect(screen.getByRole('checkbox', {
+      name: /Offer all compatible fields/,
+    }).disabled).toBe(true);
+    expect(screen.queryByRole('textbox', {name: /Count label/})).toBeNull();
+
+    fireEvent.click(screen.getByRole('checkbox', {name: /Show Filtering panel/}));
+    expect(screen.getByRole('checkbox', {
+      name: /Offer all compatible fields/,
+    }).disabled).toBe(false);
+    expect(screen.getByRole('textbox', {name: /Count label/})).toBeTruthy();
+  });
+
+  test('optionally manages a geometry info symbol from the layer default style', async () => {
+    const symbolWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Paths: {
+            name: 'Paths',
+            format: 'mvt',
+            style: {
+              default: {strokeColor: '#ff007b', strokeWidth: 3},
+            },
+            infoj: [{
+              type: 'geometry',
+              label: 'Path geometry',
+              field: 'geom_3857',
+              fieldfx: 'ST_AsGeoJSON(geom_3857)',
+              display: true,
+            }],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: symbolWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Paths'}));
+    const toggle = screen.getByRole('checkbox', {
+      name: /Keep information symbol synchronized: Path geometry/,
+    });
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+
+    const advanced = container.querySelector('.advanced textarea');
+    const managed = JSON.parse(advanced.value);
+    expect(managed.infoj[0].style).toEqual({
+      fillColor: null,
+      strokeColor: '#ff007b',
+      strokeWidth: 3,
+    });
+    expect(managed.infoj[0]._dashboard.styleFromLayerDefault).toBe(true);
+
+    fireEvent.click(toggle);
+    const removed = JSON.parse(advanced.value);
+    expect(removed.infoj[0].style).toBeUndefined();
+    expect(removed.infoj[0]._dashboard).toBeUndefined();
+  });
+
+  test('identifies and previews data-driven symbology without treating it as static', async () => {
+    const themedWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Status: {
+            name: 'Status',
+            format: 'mvt',
+            style: {
+              default: {icon: {type: 'dot', fillColor: '#777777'}},
+              theme: {
+                type: 'categorized',
+                field: 'status',
+                categories: [
+                  {value: 'Open', label: 'Open', style: {
+                    icon: {type: 'dot', fillColor: '#00aa44'},
+                  }},
+                  {value: 'Closed', label: 'Closed', style: {
+                    icon: {type: 'square', fillColor: '#cc2233'},
+                  }},
+                ],
+              },
+            },
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {title: 'Status', field: 'status', type: 'text'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: themedWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Status'}));
+    expect(screen.getByText(/Data-driven categorized symbology/).closest('p').textContent)
+      .toContain('field status · 2 legend classes');
+    expect(screen.getByText('Default / fallback symbology')).toBeTruthy();
+    expect(screen.getAllByText('Open')
+      .some(element => element.closest('.symbol-state'))).toBe(true);
+    expect(screen.getAllByText('Closed')
+      .some(element => element.closest('.symbol-state'))).toBe(true);
+    expect(screen.getByText('Selected geometry')).toBeTruthy();
+    const informationLegend = screen.getByText('Legend')
+      .closest('.info-legend-preview');
+    expect(informationLegend.textContent).toContain('Open');
+    expect(informationLegend.textContent).toContain('Closed');
+  });
+
+  test('creates categorized symbology through guided dashboard controls', async () => {
+    const staticWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Places: {
+            name: 'Places',
+            format: 'mvt',
+            style: {default: {icon: {type: 'dot', fillColor: '#777777'}}},
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {title: 'Status', field: 'status', type: 'text'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: staticWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
+    fireEvent.change(screen.getByRole('combobox', {name: /Symbology mode/}), {
+      target: {value: 'Data-driven categorized'},
+    });
+    expect(screen.getByRole('combobox', {name: /Category field/}).value)
+      .toBe('status');
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+    fireEvent.change(screen.getByRole('textbox', {name: /Value/}), {
+      target: {value: 'Open'},
+    });
+    fireEvent.change(screen.getByRole('textbox', {name: /Legend label/}), {
+      target: {value: 'Open places'},
+    });
+
+    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    expect(managed.style.theme).toMatchObject({
+      type: 'categorized',
+      field: 'status',
+      categories: [{value: 'Open', label: 'Open places'}],
+    });
+  });
+
+  test('previews the effective highlighted style with inherited opacity', async () => {
+    const styledWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Orders: {
+            name: 'Smoke Control Orders',
+            format: 'mvt',
+            style: {
+              default: {
+                fillColor: '#13fbaa',
+                fillOpacity: 0.3,
+                strokeColor: '#0b1913',
+                strokeWidth: 2,
+              },
+              highlight: {
+                fillColor: '#4513fb',
+                strokeColor: '#0e0d0b',
+                strokeWidth: 3,
+              },
+            },
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: styledWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Orders'}));
+    const defaultPreview = screen.getAllByText('Default')
+      .find(element => element.closest('.symbol-state'))
+      .closest('.symbol-state');
+    const highlightPreview = screen.getByText('Highlighted').closest('.symbol-state');
+    expect(defaultPreview.querySelector('path').getAttribute('fill')).toBe('#13fbaa');
+    expect(highlightPreview.querySelector('path').getAttribute('fill')).toBe('#4513fb');
+    expect(highlightPreview.querySelector('path').getAttribute('fill-opacity')).toBe('0.3');
   });
 
   test('provides a visible logout action', async () => {

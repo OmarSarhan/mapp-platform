@@ -36,6 +36,23 @@ same impact and ask whether the necessary second-order workspace operations
 should be included in that same revision-bound proposal. Those operations
 still require focused-diff review and explicit approval.
 
+After a successful replacement in the workspace dashboard, its catalog is
+refreshed immediately and raw workspace layers that directly reference the
+derived relation are reconciled in memory:
+
+- added non-geometry, non-ID columns become generated `infoj` entries;
+- direct-column `infoj` entries for removed columns are removed;
+- calculated `fieldfx` entries are preserved because their result field is an
+  alias rather than necessarily being the removed source column;
+- removed columns are pruned from filter include/exclude lists and invalid
+  hover-field selections are cleared.
+
+The resulting workspace is deliberately marked unsaved. The operator must
+review the updated fields and use **Save & reload XYZ** separately. Replacing a
+derived relation is not approval to publish a workspace change. Named-locale
+effective views remain read-only and inherit reconciled default-layer fields;
+focused raw named overrides still require API/CLI proposals.
+
 API results and errors provide `userMessage` and, where action is needed,
 `suggestedAction`. These are the user-facing dashboard and CLI messages.
 Machine-oriented paths, database object descriptions, reason codes, and
