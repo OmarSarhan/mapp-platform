@@ -8,7 +8,12 @@ import {
   waitFor,
 } from '@testing-library/react';
 
-import {Dashboard, Root} from './main.jsx';
+import {
+  Dashboard,
+  DerivedLayers,
+  Root,
+  derivedLayerFormDefinition,
+} from './main.jsx';
 
 const workspace = {
   key: 'demo',
@@ -77,6 +82,131 @@ afterEach(() => {
 });
 
 describe('Dashboard managed save lifecycle', () => {
+  test('refreshes the derived-layer form after converting its kind', async () => {
+    const materialized = {
+      name: 'hex_summary',
+      kind: 'materialized',
+      sources: ['leeds.bus_stops'],
+      idColumn: 'id',
+      geometryColumn: 'geom',
+      description: 'Summary',
+      query: 'SELECT id, geom FROM leeds.bus_stops',
+      createdAt: '2026-07-19T12:00:00Z',
+      createdBy: 'admin',
+      refreshedAt: '2026-07-19T12:01:00Z',
+    };
+    const converted = {
+      ...materialized,
+      kind: 'view',
+      refreshedAt: null,
+      userMessage: 'Saved successfully.',
+    };
+    let listKind = 'materialized';
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: [{...materialized, kind: listKind}]});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers/hex_summary' && !options.method) {
+        return response({derivedLayer: materialized});
+      }
+      if (
+        path === '/api/derived-layers/hex_summary/replace'
+        && options.method === 'POST'
+      ) {
+        listKind = 'view';
+        return response({derivedLayer: converted});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    const actions = await screen.findByRole('combobox', {
+      name: 'Edit or delete derived_layers.hex_summary',
+    });
+    fireEvent.change(actions, {target: {value: 'convert'}});
+
+    await screen.findByRole('heading', {
+      name: 'Edit derived_layers.hex_summary',
+    });
+    expect(screen.getByDisplayValue('view')).toBeTruthy();
+    expect(screen.getByText(/view · leeds\.bus_stops/)).toBeTruthy();
+  });
+
+  test('removes server metadata from editable derived-layer definitions', () => {
+    expect(derivedLayerFormDefinition({
+      name: 'hex_summary',
+      kind: 'materialized',
+      sources: ['leeds.bus_stops'],
+      idColumn: 'id',
+      geometryColumn: 'geom',
+      description: null,
+      query: 'SELECT id, geom FROM leeds.bus_stops',
+      createdAt: '2026-07-19T12:00:00Z',
+      createdBy: 'admin',
+      refreshedAt: '2026-07-19T12:01:00Z',
+    })).toEqual({
+      name: 'hex_summary',
+      kind: 'materialized',
+      sources: 'leeds.bus_stops',
+      idColumn: 'id',
+      geometryColumn: 'geom',
+      description: '',
+      query: 'SELECT id, geom FROM leeds.bus_stops',
+    });
+  });
+
+  test('keeps the derived-layer menu interactive after loading its options', async () => {
+    let resolveDerivedLayers;
+    const derivedLayers = new Promise(resolve => {
+      resolveDerivedLayers = resolve;
+    });
+    let derivedLayerRequests = 0;
+    const openDerivedLayers = vi.fn();
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      if (path === '/api/derived-layers') {
+        derivedLayerRequests += 1;
+        return derivedLayers;
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(
+      <Dashboard
+        openSecurity={() => {}}
+        openDerivedLayers={openDerivedLayers}
+      />,
+    );
+
+    const menu = await screen.findByRole('combobox', {
+      name: 'Create or edit a derived layer',
+    });
+    await waitFor(() => expect(derivedLayerRequests).toBe(1));
+    expect(menu.disabled).toBe(true);
+
+    resolveDerivedLayers(response({
+      derivedLayers: [{name: 'hex_summary'}],
+    }));
+    await waitFor(() => expect(menu.disabled).toBe(false));
+
+    fireEvent.focus(menu);
+    expect(menu.disabled).toBe(false);
+    expect(derivedLayerRequests).toBe(1);
+
+    fireEvent.change(menu, {target: {value: 'edit:hex_summary'}});
+    expect(openDerivedLayers).toHaveBeenCalledWith({
+      action: 'edit',
+      name: 'hex_summary',
+    });
+  });
+
   test('groups layer navigation and edits folder membership as layer.group', async () => {
     const groupedWorkspace = {
       ...workspace,
