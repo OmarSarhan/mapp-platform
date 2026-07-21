@@ -498,6 +498,16 @@ def _validate_layer(key, layer, path, errors, available_dbs):
                         f"{entry_path}.filter",
                         errors,
                     )
+                    if entry.get("fieldfx") and entry.get("filter") not in (None, False):
+                        _error(
+                            errors,
+                            f"{entry_path}.filter",
+                            (
+                                "XYZ interactive filters must use real layer "
+                                "columns; calculated fieldfx entries are only "
+                                "safe for feature information."
+                            ),
+                        )
                     expression = entry.get("fieldfx")
                     if expression is not None and (not isinstance(expression, str) or not expression.strip()):
                         _error(errors, f"{entry_path}.fieldfx", "Must be a non-empty PostgreSQL expression.")

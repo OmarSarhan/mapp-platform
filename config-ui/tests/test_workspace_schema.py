@@ -83,6 +83,16 @@ class WorkspaceValidationTests(unittest.TestCase):
         self.assertIn("locale.layers.Places.infoj.0.filter.type", paths)
         self.assertIn("locale.layers.Places.filter.include", paths)
 
+    def test_rejects_interactive_filters_on_calculated_info_fields(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["infoj"][0]["fieldfx"] = "upper(name)"
+        layer["infoj"][0]["filter"] = {"type": "like"}
+
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+
+        self.assertIn("locale.layers.Places.infoj.0.filter", paths)
+
     def test_rejects_unknown_database(self):
         data = valid_workspace()
         data["locale"]["layers"]["Places"]["dbs"] = "OTHER"

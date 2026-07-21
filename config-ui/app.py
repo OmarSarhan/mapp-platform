@@ -1071,8 +1071,27 @@ def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
                             "message": "Must select a column from this table.",
                         })
             for index_number, entry in enumerate(layer.get("infoj") or []):
-                if isinstance(entry, dict) and not entry.get("fieldfx") and entry.get("field") not in columns:
+                if not isinstance(entry, dict):
+                    continue
+                field = entry.get("field")
+                if not entry.get("fieldfx") and field not in columns:
                     errors.append({"path": f"{path}.infoj.{index_number}.field", "message": "Must select a column from this table or provide a trusted SQL expression."})
+                filter_enabled = entry.get("filter") not in (None, False)
+                auto_filtered = (
+                    (layer.get("filter") or {}).get("includeAll") is True
+                    and entry.get("type") in {"numeric", "integer", "text", "date", "datetime", "boolean"}
+                    and field not in set((layer.get("filter") or {}).get("exclude") or [])
+                )
+                included = field in set((layer.get("filter") or {}).get("include") or [])
+                if (filter_enabled or auto_filtered or included) and field not in columns:
+                    errors.append({
+                        "path": f"{path}.infoj.{index_number}.filter",
+                        "message": (
+                            "XYZ Filtering panel entries must use a real table "
+                            "column. Calculated fieldfx aliases are not safe "
+                            "for filter SQL or min/max statistics."
+                        ),
+                    })
     return errors
 
 

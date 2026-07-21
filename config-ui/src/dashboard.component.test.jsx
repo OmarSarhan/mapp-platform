@@ -367,6 +367,12 @@ describe('Dashboard managed save lifecycle', () => {
               {title: 'Count', field: 'count', type: 'integer'},
               {title: 'Measured', field: 'measured_at', type: 'datetime'},
               {title: 'Photo', field: 'photo', type: 'image'},
+              {
+                title: 'Calculated score',
+                field: 'score_rounded',
+                fieldfx: 'round(score)::bigint',
+                type: 'integer',
+              },
             ],
           },
         },
@@ -394,6 +400,9 @@ describe('Dashboard managed save lifecycle', () => {
     expect(choices(filters[2])).not.toContain('Date range');
     expect(filters[3].disabled).toBe(true);
     expect(choices(filters[3])).toEqual(['None']);
+    expect(filters[4].disabled).toBe(true);
+    expect(choices(filters[4])).toEqual(['None']);
+    expect(screen.getByText(/XYZ filters need a real table column/)).toBeTruthy();
   });
 
   test('optionally configures a viewport count beside the layer name', async () => {

@@ -83,6 +83,40 @@ class CatalogSymbologyValidationTests(unittest.TestCase):
             paths,
         )
 
+    def test_rejects_filtering_panel_entries_without_real_table_columns(self):
+        workspace = {"dbs": "MAPP", "locale": {"layers": {"Places": {
+            "format": "mvt",
+            "dbs": "MAPP",
+            "table": "derived_layers.places",
+            "geom": "geom",
+            "srid": 3857,
+            "qID": "id",
+            "filter": {"includeAll": True},
+            "infoj": [
+                {
+                    "type": "numeric",
+                    "title": "Calculated score",
+                    "field": "score_rounded",
+                    "fieldfx": "round(score)::bigint",
+                }
+            ],
+            "style": {"default": {"fillColor": "#eeeeee"}},
+        }}}}
+        tables = [{
+            "dbs": "MAPP",
+            "schema": "derived_layers",
+            "table": "places",
+            "columns": [
+                {"name": "id", "geometryType": "", "srid": None},
+                {"name": "score", "geometryType": "", "srid": None},
+                {"name": "geom", "geometryType": "POLYGON", "srid": 3857},
+            ],
+        }]
+
+        paths = {error["path"] for error in app.validate_catalog(workspace, tables)}
+
+        self.assertIn("locale.layers.Places.infoj.0.filter", paths)
+
 
 class JsonResponseTests(unittest.TestCase):
     def test_derived_layer_timestamps_are_serialized_as_iso_8601(self):

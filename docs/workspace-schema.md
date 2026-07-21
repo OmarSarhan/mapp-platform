@@ -259,6 +259,13 @@ or the entry's own `filter` property. `filter.count_meta` optionally replaces
 the text after the number. Omitting `filter.viewport` preserves the ordinary
 non-viewport count.
 
+Interactive filters must target real output columns from the layer relation.
+Calculated `infoj[].fieldfx` entries are safe for clicked feature information,
+but XYZ v4.23.4's Filtering drawer builds SQL and numeric min/max statistics
+from the literal `field` name and does not expand `fieldfx`. To filter a
+calculated value, expose it as an actual source or derived-layer column first;
+do not rely on an `infoj` alias such as `resurface_cost_rounded`.
+
 Pinned XYZ v4.23.4 accepts `filter.viewport_description` and constructs an
 element for it, but leaves that element hidden. The dashboard therefore
 preserves an existing value in Advanced layer JSON but does not advertise an
