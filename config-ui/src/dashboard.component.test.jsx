@@ -554,6 +554,48 @@ describe('Dashboard managed save lifecycle', () => {
     expect(removed.infoj[0]._dashboard).toBeUndefined();
   });
 
+  test('edits label-backed information fields without adding a title', async () => {
+    const infoWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Places: {
+            name: 'Places',
+            format: 'mvt',
+            style: {default: {icon: {type: 'dot'}}},
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {type: 'pin', label: 'Location', field: 'pin', fieldfx: 'ARRAY[0,0]'},
+              {title: 'Name', field: 'name', type: 'text'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: infoWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
+    fireEvent.change(screen.getByDisplayValue('Location'), {
+      target: {value: 'Map location'},
+    });
+
+    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    expect(managed.infoj[1]).toMatchObject({
+      type: 'pin',
+      label: 'Map location',
+    });
+    expect(managed.infoj[1]).not.toHaveProperty('title');
+  });
+
   test('identifies and previews data-driven symbology without treating it as static', async () => {
     const themedWorkspace = {
       ...workspace,
@@ -663,6 +705,62 @@ describe('Dashboard managed save lifecycle', () => {
       field: 'priority',
       categories: [{value: 10, label: 'Open places'}],
     });
+  });
+
+  test('configures multi-field categorized point icons without a top-level field', async () => {
+    const staticWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Places: {
+            name: 'Places',
+            format: 'mvt',
+            style: {default: {icon: {type: 'dot', fillColor: '#777777'}}},
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {title: 'Status', field: 'status', type: 'text'},
+              {title: 'Priority', field: 'priority', type: 'integer'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: staticWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
+    fireEvent.change(screen.getByRole('combobox', {name: /Symbology mode/}), {
+      target: {value: 'Data-driven categorized'},
+    });
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /Compose icons from multiple fields/,
+    }));
+    expect(screen.queryByRole('combobox', {name: /Category field/}))
+      .toBeNull();
+    fireEvent.click(screen.getByRole('checkbox', {name: 'priority'}));
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+    fireEvent.change(screen.getByRole('combobox', {name: /Category field/}), {
+      target: {value: 'priority'},
+    });
+    fireEvent.change(screen.getByRole('spinbutton', {name: /Exact value/}), {
+      target: {value: '10'},
+    });
+
+    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    expect(managed.style.theme).toMatchObject({
+      type: 'categorized',
+      fields: ['status', 'priority'],
+      categories: [{field: 'priority', value: 10}],
+    });
+    expect(managed.style.theme).not.toHaveProperty('field');
   });
 
   test('uses display names in navigation and assigns line category stroke colours without catalog metadata', async () => {

@@ -148,6 +148,13 @@ For categorized, graduated, and distributed modes:
 6. Review the map/fallback preview and the richer **Feature information
    preview**, then save and reload XYZ.
 
+For multi-field categorized point icons, enable **Compose icons from multiple
+fields**, choose the contributing **Category fields**, then set each legend
+category's own **Category field** and exact value. The dashboard writes
+`style.theme.fields` and category-level `field` values, and deliberately hides
+the single `style.theme.field` control because XYZ accepts either `field` or
+`fields`, not both.
+
 The editor writes the selected `style.theme.type` and its mode-specific fields
 and categories, and ensures the theme legend is included when an explicit
 `style.elements` list exists. Switching a configured theme to another mode
