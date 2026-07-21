@@ -60,6 +60,119 @@ async function captureMap(page, directory, label, fullPage = true) {
   };
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function requestedPanels(input) {
+  const raw = Array.isArray(input.panels)
+    ? input.panels
+    : typeof input.panel === "string"
+      ? [input.panel]
+      : [];
+  return [...new Set(raw.filter(value => (
+    value === "filtering" || value === "styling"
+  )))];
+}
+
+async function clickVisibleText(page, text, {exact = false} = {}) {
+  if (!text) return false;
+  const locator = exact
+    ? page.getByText(text, {exact: true})
+    : page.getByText(new RegExp(escapeRegExp(text), "i"));
+  const count = await locator.count().catch(() => 0);
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const item = locator.nth(index);
+    if (!await item.isVisible().catch(() => false)) continue;
+    await item.click({timeout: 1_500}).catch(() => null);
+    return true;
+  }
+  return false;
+}
+
+async function expandRequestedLayer(page, input) {
+  const groups = Array.isArray(input.plan?.activeGroups)
+    ? input.plan.activeGroups
+    : [];
+  const openedGroups = [];
+  for (const group of groups) {
+    if (await clickVisibleText(page, group, {exact: true})) {
+      openedGroups.push(group);
+      await page.waitForTimeout(250);
+    }
+  }
+  const layerOpened = await clickVisibleText(page, input.layer, {exact: false});
+  if (layerOpened) await page.waitForTimeout(500);
+  return {openedGroups, layerOpened};
+}
+
+async function openPanel(page, panel, input, directory) {
+  const label = panel === "filtering" ? "Filtering" : "Styling";
+  const artifactKey = panel === "filtering" ? "filteringPanel" : "stylingPanel";
+  const filename = panel === "filtering" ? "filtering-panel.png" : "styling-panel.png";
+  const attempted = await clickVisibleText(page, label, {exact: false});
+  await page.waitForTimeout(750);
+  const bodyText = await interactionText(page);
+  const handle = await page.evaluateHandle(({panelLabel}) => {
+    const visible = element => {
+      const style = getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+      return (
+        style.visibility !== "hidden"
+        && style.display !== "none"
+        && box.width >= 120
+        && box.height >= 40
+      );
+    };
+    const score = element => {
+      const text = element.innerText || "";
+      const box = element.getBoundingClientRect();
+      let value = 0;
+      if (new RegExp(panelLabel, "i").test(text)) value += 20;
+      if (/panel|drawer|view|layer|control|filter|style/i.test(String(element.className || ""))) {
+        value += 10;
+      }
+      if (box.width >= 180 && box.width <= 700) value += 5;
+      if (box.height >= 80 && box.height <= 1200) value += 5;
+      value -= Math.abs(text.length - 800) / 1000;
+      return value;
+    };
+    const candidates = [...document.querySelectorAll("body *")]
+      .filter(element => visible(element) && new RegExp(panelLabel, "i").test(element.innerText || ""))
+      .sort((left, right) => score(right) - score(left));
+    return candidates[0] || null;
+  }, {panelLabel: label});
+  const element = handle.asElement();
+  const box = element ? await element.boundingBox().catch(() => null) : null;
+  const opened = Boolean(box);
+  let image = null;
+  if (opened) {
+    const buffer = await element.screenshot({path: `${directory}/${filename}`});
+    image = pngSize(buffer);
+  }
+  const expectedText = Array.isArray(input.expectedPanelText)
+    ? input.expectedPanelText.filter(value => typeof value === "string" && value)
+    : [];
+  const expectedTextFound = Object.fromEntries(
+    expectedText.map(value => [
+      value,
+      bodyText.toLowerCase().includes(value.toLowerCase()),
+    ]),
+  );
+  return {
+    panel,
+    label,
+    artifactKey,
+    attempted,
+    opened,
+    image,
+    textLength: bodyText.length,
+    textSample: bodyText.slice(0, 2000),
+    expectedTextFound,
+    passed: opened && Object.values(expectedTextFound).every(Boolean),
+  };
+}
+
 async function interactionText(page) {
   return (await page.locator("body").innerText({timeout: 2_000}))
     .replace(/\s+/g, " ")
@@ -166,6 +279,7 @@ async function runVisual(input) {
   );
   const fullPage = input.fullPage !== false;
   const timeout = Math.min(60_000, Math.max(5_000, Number(input.timeout) || 45_000));
+  const panels = requestedPanels(input);
   const report = {
     runId,
     layer: input.layer,
@@ -174,6 +288,7 @@ async function runVisual(input) {
     groups: Array.isArray(input.plan?.activeGroups)
       ? input.plan.activeGroups
       : [],
+    panels,
     plan: input.plan,
     metadata: input.metadata,
     url: target.toString(),
@@ -267,6 +382,13 @@ async function runVisual(input) {
         afterTextSample: afterText.slice(0, 2000),
       };
     }
+    report.panelNavigation = panels.length
+      ? await expandRequestedLayer(page, input)
+      : null;
+    report.panels = {};
+    for (const panel of panels) {
+      report.panels[panel] = await openPanel(page, panel, input, directory);
+    }
     const afterCapture = await captureMap(page, directory, "after", fullPage);
     const pageImage = await page.screenshot({
       path: `${directory}/page.png`,
@@ -299,12 +421,14 @@ async function runVisual(input) {
         )
       )
       : true;
+    const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
     report.passed = Boolean(
       response?.ok()
       && report.canvasCount
       && report.layerTextFound
       && report.groupTextFound
       && interactionPassed
+      && panelsPassed
       && !report.pageErrors.length
     );
   } catch (error) {
@@ -359,6 +483,11 @@ async function runVisual(input) {
           : true,
         observed: report.interaction,
       },
+      ...panels.map(panel => ({
+        id: `visual.panel.${panel}`,
+        passed: report.panels?.[panel]?.passed === true,
+        observed: report.panels?.[panel] ?? null,
+      })),
     ],
     viewport,
     deviceScaleFactor,
@@ -382,6 +511,8 @@ async function runVisual(input) {
                 : report.interaction
                   && !report.interaction.textChanged
                   ? "feature"
+                  : panels.some(panel => !report.panels?.[panel]?.passed)
+                    ? "panel"
                   : report.pageErrors.length
                     ? "page"
                     : "unknown",
@@ -401,6 +532,12 @@ async function runVisual(input) {
       afterMap: `${runId}/after-map.png`,
       infoPanel: report.interaction?.infoPanelExpanded
         ? `${runId}/info-panel.png`
+        : null,
+      filteringPanel: report.panels?.filtering?.opened
+        ? `${runId}/filtering-panel.png`
+        : null,
+      stylingPanel: report.panels?.styling?.opened
+        ? `${runId}/styling-panel.png`
         : null,
     },
   };

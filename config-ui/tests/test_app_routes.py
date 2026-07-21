@@ -638,6 +638,27 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual("default", payload["viewMode"])
 
+    def test_browser_request_propagates_panel_capture_options(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
+        with patch.object(app, "urlopen", return_value=response) as urlopen:
+            status, result = app.run_browser_visual(
+                "Stops",
+                {"centre": [1, 2], "layers": ["Stops"]},
+                {
+                    "panel": "filtering",
+                    "expectedPanelText": ["Cost", "Length"],
+                },
+                target_url="http://xyz-preview:3000",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = app.json.loads(request.data)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(result["passed"])
+        self.assertEqual(["filtering"], payload["panels"])
+        self.assertEqual(["Cost", "Length"], payload["expectedPanelText"])
+
     def test_group_preview_isolates_added_and_deleted_layers(self):
         existing = {"group": "Transport", "format": "mvt"}
         added = {"group": "Transport", "format": "mvt"}
@@ -915,7 +936,12 @@ class CandidatePreviewRouteTests(unittest.TestCase):
 
     def test_screenshot_preserves_high_resolution_capture_metadata(self) -> None:
         handler, responses = self.handler(
-            "/api/proposals/proposal-1/screenshot", {"layer": "Stops"}
+            "/api/proposals/proposal-1/screenshot",
+            {
+                "layer": "Stops",
+                "panels": ["filtering", "styling"],
+                "expectedPanelText": ["Cost"],
+            },
         )
         proposal = self.proposal()
         binding = {
@@ -964,6 +990,10 @@ class CandidatePreviewRouteTests(unittest.TestCase):
                             "artifacts": {
                                 "beforePage": "run-original/before-page.png",
                                 "beforeMap": "run-original/before-map.png",
+                                "filteringPanel": (
+                                    "run-original/filtering-panel.png"
+                                ),
+                                "stylingPanel": "run-original/styling-panel.png",
                             },
                             "capture": {
                                 "viewport": {"width": 1080, "height": 1080},
@@ -980,6 +1010,10 @@ class CandidatePreviewRouteTests(unittest.TestCase):
                             "artifacts": {
                                 "beforePage": "run-candidate/before-page.png",
                                 "beforeMap": "run-candidate/before-map.png",
+                                "filteringPanel": (
+                                    "run-candidate/filtering-panel.png"
+                                ),
+                                "stylingPanel": "run-candidate/styling-panel.png",
                             },
                             "capture": {
                                 "viewport": {"width": 1080, "height": 1080},
@@ -1015,6 +1049,29 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             )
             self.assertEqual(1, call.args[2]["deviceScaleFactor"])
             self.assertFalse(call.args[2]["fullPage"])
+            self.assertEqual(["filtering", "styling"], call.args[2]["panels"])
+            self.assertEqual(["Cost"], call.args[2]["expectedPanelText"])
+        self.assertEqual(
+            ["filtering", "styling"],
+            create_operation.call_args.args[2]["panels"],
+        )
+        artifacts = responses[0][1]["visual"]["artifacts"]
+        self.assertEqual(
+            "run-original/filtering-panel.png",
+            artifacts["beforeFilteringPanel"],
+        )
+        self.assertEqual(
+            "run-candidate/filtering-panel.png",
+            artifacts["afterFilteringPanel"],
+        )
+        self.assertEqual(
+            "run-original/styling-panel.png",
+            artifacts["beforeStylingPanel"],
+        )
+        self.assertEqual(
+            "run-candidate/styling-panel.png",
+            artifacts["afterStylingPanel"],
+        )
         self.assertEqual(
             {"width": 1080, "height": 1080},
             responses[0][1]["visual"]["capture"]["candidate"]["images"]["page"],

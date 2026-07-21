@@ -705,6 +705,7 @@ def preview_proposal(proposal_id: str) -> dict:
 
 def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
                        target_url: str) -> tuple[int, dict]:
+    panels = visual_panels(payload)
     runner_payload = json.dumps(
         {
             "url": target_url,
@@ -715,6 +716,8 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             "deviceScaleFactor": payload.get("deviceScaleFactor", 2),
             "fullPage": payload.get("fullPage", True),
             "viewMode": payload.get("viewMode", "focus"),
+            "panels": panels,
+            "expectedPanelText": payload.get("expectedPanelText", []),
             "metadata": payload.get("metadata"),
         },
         allow_nan=False,
@@ -749,6 +752,25 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
         return HTTPStatus.BAD_GATEWAY, {
             "error": f"Browser validation failed: {exc}"
         }
+
+
+def visual_panels(payload: dict) -> list[str]:
+    raw = payload.get("panels")
+    if raw is None:
+        raw = payload.get("panel")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("Visual panels must be 'filtering', 'styling', or a list.")
+    panels: list[str] = []
+    for item in raw:
+        if item not in {"filtering", "styling"}:
+            raise ValueError("Visual panels must be 'filtering' or 'styling'.")
+        if item not in panels:
+            panels.append(item)
+    return panels
 
 
 def apply_proposal_and_reload(
@@ -2086,6 +2108,7 @@ class Handler(SimpleHTTPRequestHandler):
                         plan.get("locale", "locale"),
                     )
                 )
+                panels = visual_panels(payload) if action == "screenshot" else []
                 render_plan = dict(plan)
                 original_render_plan = {
                     **render_plan,
@@ -2140,6 +2163,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "originalLayers": group_preview["original"]["layers"],
                         "candidateLayers": group_preview["candidate"]["layers"],
                         "featureInfoComparison": feature_info_comparison,
+                        "panels": panels,
                     },
                 )
                 comparison_binding_valid = True
@@ -2220,6 +2244,25 @@ class Handler(SimpleHTTPRequestHandler):
                                     ),
                                     "afterInfoPanel": candidate_artifacts.get(
                                         "infoPanel"
+                                    ),
+                                })
+                            for panel in panels:
+                                key = (
+                                    "filteringPanel"
+                                    if panel == "filtering"
+                                    else "stylingPanel"
+                                )
+                                artifact_name = (
+                                    "FilteringPanel"
+                                    if panel == "filtering"
+                                    else "StylingPanel"
+                                )
+                                comparison_artifacts.update({
+                                    f"before{artifact_name}": (
+                                        original_artifacts.get(key)
+                                    ),
+                                    f"after{artifact_name}": (
+                                        candidate_artifacts.get(key)
                                     ),
                                 })
                             statuses = {original_status, status}

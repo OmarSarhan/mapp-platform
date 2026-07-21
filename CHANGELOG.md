@@ -29,6 +29,9 @@ first release.
   pre-click/post-click images as before/after. Feature-information changes now
   select the same feature on both sides, wait for the expanded information
   panel, and retain full-page and panel-only comparison artifacts.
+- Extended proposal screenshots with optional Filtering and Styling panel
+  capture, including dedicated before/after panel artifacts and text-presence
+  evidence checks.
 - Made proposal preview plans and screenshots group-aware: layer additions,
   moves, and removals are isolated from other folder members, while ordinary
   edits that keep membership unchanged retain their group as visual context.

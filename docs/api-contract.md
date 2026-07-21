@@ -80,6 +80,18 @@ config-cli proposals check \
   --explanation 'Uses exact town values for the Bus Stops symbols and XYZ legend.'
 ```
 
+For point layers, XYZ can compose an icon array from multiple categorized
+fields. In that shape, use `style.theme.fields` and give each category a
+category-level `field`. Do not also set `style.theme.field`:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"categorized","title":"Bus stop status markers","fields":["status","priority"],"categories":[{"field":"status","value":"open","label":"Open","style":{"icon":{"type":"dot","fillColor":"#176b4d"}}},{"field":"priority","value":"high","label":"High priority","style":{"icon":{"type":"triangle","fillColor":"#f8961e"}}}]}' \
+  --set '/locale/layers/Bus Stops/style/elements=["theme"]' \
+  --explanation 'Composes point icons from status and priority categories without setting a top-level theme field.'
+```
+
 The dashboard’s richer feature-information preview is a review surface, not a
 separate workspace property. CLI clients configure the same backend
 `style.theme` object and should use a bounded `visual-test` after application
@@ -337,6 +349,16 @@ Request overrides are bounded to a 320–2560 pixel width, 240–1440 pixel heig
 and a 1×–3× device scale. The browser report's `capture` object records the
 effective viewport, scale, capture mode, and actual PNG dimensions so reviewers
 can verify the retained evidence resolution.
+
+Screenshot requests may also ask the browser runner to open XYZ layer drawers:
+`panel: "filtering"` for one panel, or `panels: ["filtering", "styling"]` for
+multiple panels. The runner expands the relevant group/layer labels before
+opening the drawer and returns cropped comparison artifacts such as
+`beforeFilteringPanel`, `afterFilteringPanel`, `beforeStylingPanel`, and
+`afterStylingPanel`. Optional `expectedPanelText` values make the runner fail
+with a panel evidence diagnosis when a requested filter, bound label, legend
+class, or other control text is absent. Existing page, map, report, and
+feature-information artifacts are preserved.
 
 For probeable database layers, visual planning focuses a representative
 feature near the layer extent centre and records an `interaction` plan for the

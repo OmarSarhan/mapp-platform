@@ -293,6 +293,22 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "maximum": 3,
                     "default": 1,
                 },
+                "panel": {
+                    "type": "string",
+                    "enum": ["filtering", "styling"],
+                },
+                "panels": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["filtering", "styling"],
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedPanelText": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
             },
             "additionalProperties": True,
         },
@@ -382,6 +398,22 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "additionalProperties": False,
                 },
                 "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+                "panel": {
+                    "type": "string",
+                    "enum": ["filtering", "styling"],
+                },
+                "panels": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["filtering", "styling"],
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedPanelText": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
             },
             "additionalProperties": True,
         },
