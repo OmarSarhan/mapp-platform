@@ -177,6 +177,20 @@ ETL_DATABASE_URL=postgresql://${ETL_DB_USER}:${ETL_DB_PASSWORD}@db:5432/${POSTGR
 ```
 
 Use `./bin/mapp all` to load and verify every configured bundled sample source.
+
+To remove the complete bundled PostgreSQL volume and rebuild it with only the
+configured ETL sources, run:
+
+```sh
+./bin/mapp reset-data --confirm
+```
+
+This deletes derived layers and every other non-ETL database object. It
+replaces the live and preview workspaces with `instance/workspace.seed.json`,
+clearing layer configuration that depended on deleted data. Dashboard
+authentication, audit, proposal, artifact, and public-asset state is preserved.
+The command is unavailable in external-database mode and requires the explicit
+`--confirm` guard.
 Source availability can change independently; treat a non-zero ETL exit as a
 failed refresh and inspect the recorded run before retrying.
 

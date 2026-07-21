@@ -371,19 +371,22 @@ for locale_key, locale in effective_locales(workspace).items():
     if selected:
         break
 
-if not selected:
-    raise SystemExit("The current workspace has no database-backed MVT layer to verify.")
-print(urlencode(selected), end="")
+if selected:
+    print(urlencode(selected), end="")
 PY
   )"
-  mvt_file="$(mktemp)"
-  trap 'rm -f "${mvt_file}"' EXIT
-  curl --fail --silent --show-error "${map_headers[@]}" \
-    "${map_url}/api/query?${mvt_query}" \
-    --output "${mvt_file}"
-  if [[ ! -s "${mvt_file}" ]]; then
-    printf 'XYZ returned an empty MVT response for a current workspace layer.\n' >&2
-    exit 1
+  if [[ -n "${mvt_query}" ]]; then
+    mvt_file="$(mktemp)"
+    trap 'rm -f "${mvt_file}"' EXIT
+    curl --fail --silent --show-error "${map_headers[@]}" \
+      "${map_url}/api/query?${mvt_query}" \
+      --output "${mvt_file}"
+    if [[ ! -s "${mvt_file}" ]]; then
+      printf 'XYZ returned an empty MVT response for a current workspace layer.\n' >&2
+      exit 1
+    fi
+  else
+    printf 'Workspace has no database-backed MVT layer; skipped the live MVT render probe.\n'
   fi
 fi
 

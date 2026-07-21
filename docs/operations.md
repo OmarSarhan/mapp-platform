@@ -39,6 +39,20 @@ environment.
 ./bin/mapp etl smoke_control_orders
 ```
 
+To rebuild the bundled database from its initialization scripts and leave only
+the configured ETL datasets, use the explicitly destructive command:
+
+```sh
+./bin/mapp reset-data --confirm
+```
+
+It stops the stack, removes only the named bundled PostgreSQL volume, replaces
+the live and preview workspaces with `instance/workspace.seed.json`, starts a
+fresh database, and runs the unrestricted ETL. This clears workspace layers
+which depended on deleted derived or custom relations. Dashboard authentication,
+audit records, proposals, artifacts, and public assets are not reset. External-
+database mode rejects this command.
+
 The ETL is optional sample-data provisioning for the bundled database, not a
 continuously running or required platform service. The wrapper disables it in
 external mode. If the sample stack needs regular refreshes, schedule it with

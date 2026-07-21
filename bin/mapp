@@ -23,6 +23,7 @@ usage() {
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
     "  etl [layer]  load sample data in bundled-database mode" \
+    "  reset-data --confirm remove the bundled database and reload only configured ETL data" \
     "  upgrade-derived install H3 and derived-layer roles into an existing bundled database" \
     "  all          start bundled mode, load sample data, then verify it" \
     "  test         run local unit and configuration tests" \
@@ -334,6 +335,38 @@ case "${1:-}" in
     else
       "${compose[@]}" run --rm --build etl
     fi
+    ;;
+  reset-data)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+      exit 2
+    fi
+    if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
+      printf '%s\n' \
+        'This permanently removes the bundled PostgreSQL database, including derived layers and any non-ETL tables.' \
+        'The live workspace is replaced by instance/workspace.seed.json; dashboard authentication, audit records, proposals, and public assets are preserved.' \
+        'Run ./bin/mapp reset-data --confirm to continue.' >&2
+      exit 2
+    fi
+    database_volume="$(
+      "${compose[@]}" config --format json \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["volumes"]["postgres_data"]["name"], end="")'
+    )"
+    printf 'Stopping the platform before removing bundled database volume %s.\n' "${database_volume}"
+    "${compose[@]}" down
+    if docker volume inspect "${database_volume}" >/dev/null 2>&1; then
+      docker volume rm "${database_volume}"
+    else
+      printf 'Bundled database volume did not exist; a new one will be initialized.\n'
+    fi
+    install -m 0644 "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
+    install -m 0600 "${ROOT_DIR}/instance/workspace.seed.json" "${PREVIEW_DIR}/workspace.json"
+    printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
+    "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    "${compose[@]}" run --rm --build etl
+    "${ROOT_DIR}/scripts/verify.sh"
+    printf '%s\n' \
+      'Bundled database reset completed, all configured ETL sources were loaded, and the seed workspace was restored.'
     ;;
   upgrade-derived)
     if [[ "${database_mode}" != "bundled" ]]; then
