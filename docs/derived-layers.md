@@ -46,12 +46,28 @@ derived relation are reconciled in memory:
   alias rather than necessarily being the removed source column;
 - removed columns are pruned from filter include/exclude lists and invalid
   hover-field selections are cleared.
+- removed or type-changed fields used by direct, named, multi-field, or
+  category-level symbology are retained for deliberate correction and marked
+  **Derived-layer symbology needs inspection** in the layer editor.
 
 The resulting workspace is deliberately marked unsaved. The operator must
 review the updated fields and use **Save & reload XYZ** separately. Replacing a
 derived relation is not approval to publish a workspace change. Named-locale
 effective views remain read-only and inherit reconciled default-layer fields;
 focused raw named overrides still require API/CLI proposals.
+
+The replacement API includes those symbology uses in `fieldReferences`, with
+precise workspace paths, consumer labels, and `requiresSecondOrderChanges`.
+CLI clients must offer an explicit correction path—select a replacement field,
+change symbology mode, refresh/reinspect the derived relation, or abandon the
+workspace proposal. They must not infer a replacement merely because a new
+column has a similar name or type.
+
+Ordinary views follow source data immediately. Materialized views do not:
+their list entry displays the last refresh time and offers **Refresh data**.
+Refreshing data does not reconcile schema references; replacing a definition
+does. After either action, inspect the returned timestamps/column changes and
+reload the catalog before proposing dependent workspace edits.
 
 API results and errors provide `userMessage` and, where action is needed,
 `suggestedAction`. These are the user-facing dashboard and CLI messages.
@@ -104,6 +120,20 @@ The server requires:
 - a typed PostGIS geometry with a positive SRID;
 - a non-null, unique feature ID and at least one non-null geometry;
 - completion within bounded statement and lock timeouts.
+
+The dashboard submits create, replace/convert, and materialized refresh work
+with `"background": true`. The API responds with `202 Accepted`, an operation
+record, and a `statusUrl`; the dashboard polls that durable operation until the
+database transaction has committed and the output checks have passed or a
+terminal error is recorded. Closing the browser or an HTTP proxy timing out
+does not cancel the PostgreSQL work. A service restart cannot preserve an
+in-flight database connection: startup recovery marks such an operation
+indeterminate, while PostgreSQL rolls its uncommitted transaction back.
+
+For compatibility, callers that omit `background` retain the synchronous
+response. Create, replace, and refresh work remains bounded by a 30-minute
+database statement timeout; operations which swap relations also retain a
+5-second lock timeout.
 
 DDL, DML, session changes, notifications, copying, and dependencies on another
 managed derived layer are rejected. This remains trusted administrative SQL:
@@ -164,9 +194,9 @@ materialized view when repeated H3 generation is too expensive.
 | `GET /api/derived-layers/capabilities` | `inspect` | Modes and PostGIS/H3 versions |
 | `GET /api/derived-layers` | `inspect` | Definitions without SQL |
 | `GET /api/derived-layers/{name}` | `inspect` | One definition including SQL |
-| `POST /api/derived-layers` | `derive` | Create a view or materialized view |
-| `POST /api/derived-layers/{name}/refresh` | `derive` | Confirmed materialized refresh |
-| `POST /api/derived-layers/{name}/replace` | `derive` | Confirmed atomic replacement or kind conversion |
+| `POST /api/derived-layers` | `derive` | Create a view or materialized view; accepts optional `background` |
+| `POST /api/derived-layers/{name}/refresh` | `derive` | Confirmed materialized refresh; accepts optional `background` |
+| `POST /api/derived-layers/{name}/replace` | `derive` | Confirmed atomic replacement or kind conversion; accepts optional `background` |
 | `POST /api/derived-layers/{name}/drop` | `derive` | Confirmed dependency-safe removal |
 | `POST /api/derived-layers/{name}/drop` | `derive` | Confirmed removal |
 

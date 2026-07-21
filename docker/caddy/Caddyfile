@@ -13,10 +13,11 @@
 		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}
-	reverse_proxy xyz:3000 {
-		health_uri /healthz
-		health_interval 10s
-	}
+	# Do not actively probe XYZ over HTTP. XYZ applies its application rate
+	# limit to this path, so a busy map can otherwise make Caddy eject its only
+	# upstream and turn a recoverable 429 into a site-wide 503. Docker performs
+	# the independent container health check and gates Caddy startup on it.
+	reverse_proxy xyz:3000
 }
 
 {$CONFIG_SITE:http://config.localhost} {

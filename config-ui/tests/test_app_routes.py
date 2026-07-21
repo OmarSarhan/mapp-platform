@@ -10,6 +10,77 @@ from unittest.mock import MagicMock, Mock, patch
 import app
 
 
+class CatalogSymbologyValidationTests(unittest.TestCase):
+    def test_mixed_case_point_typmod_requires_an_icon(self):
+        workspace = {"dbs": "MAPP", "locale": {"layers": {"Stops": {
+            "format": "mvt", "table": "leeds.bus_stops", "geom": "geom_3857",
+            "srid": 3857, "qID": "id", "style": {"default": {"fillColor": "#fff"}},
+        }}}}
+        tables = [{"dbs": "MAPP", "schema": "leeds", "table": "bus_stops", "columns": [
+            {"name": "id", "geometryType": "", "srid": None},
+            {"name": "geom", "geometryType": "Point", "srid": 4326},
+            {"name": "geom_3857", "geometryType": "Geometry", "srid": 3857},
+        ]}]
+        paths = {error["path"] for error in app.validate_catalog(workspace, tables)}
+        self.assertIn("locale.layers.Stops.style.default.icon", paths)
+
+    def test_reports_removed_theme_and_category_fields_at_precise_paths(self):
+        workspace = {
+            "dbs": "MAPP",
+            "locale": {
+                "layers": {
+                    "Places": {
+                        "format": "mvt",
+                        "dbs": "MAPP",
+                        "table": "derived_layers.places",
+                        "geom": "geom",
+                        "srid": 3857,
+                        "qID": "id",
+                        "style": {
+                            "default": {"fillColor": "#eeeeee"},
+                            "theme": {
+                                "type": "graduated",
+                                "field": "removed_score",
+                                "graduated_breaks": "less_than",
+                                "categories": [{"value": 10, "style": {}}],
+                            },
+                            "themes": {
+                                "multi": {
+                                    "type": "categorized",
+                                    "fields": ["kind", "removed_status"],
+                                    "categories": [
+                                        {
+                                            "field": "removed_category_field",
+                                            "value": "open",
+                                            "style": {"icon": {"type": "dot"}},
+                                        }
+                                    ],
+                                }
+                            },
+                        },
+                    }
+                }
+            },
+        }
+        tables = [{
+            "dbs": "MAPP",
+            "schema": "derived_layers",
+            "table": "places",
+            "columns": [
+                {"name": "id", "geometryType": "", "srid": None},
+                {"name": "kind", "geometryType": "", "srid": None},
+                {"name": "geom", "geometryType": "POLYGON", "srid": 3857},
+            ],
+        }]
+        paths = {error["path"] for error in app.validate_catalog(workspace, tables)}
+        self.assertIn("locale.layers.Places.style.theme.field", paths)
+        self.assertIn("locale.layers.Places.style.themes.multi.fields.1", paths)
+        self.assertIn(
+            "locale.layers.Places.style.themes.multi.categories.0.field",
+            paths,
+        )
+
+
 class JsonResponseTests(unittest.TestCase):
     def test_derived_layer_timestamps_are_serialized_as_iso_8601(self):
         handler = object.__new__(app.Handler)
@@ -79,6 +150,15 @@ class LayersRouteTests(unittest.TestCase):
                 "qID": "path_id",
                 "geom": "geom_3857",
                 "infoj": [{"field": "status"}],
+                "style": {
+                    "theme": {
+                        "type": "categorized",
+                        "fields": ["status", "class"],
+                        "categories": [
+                            {"field": "class", "value": "A", "style": {}},
+                        ],
+                    },
+                },
             }}},
         }
         with patch.object(
@@ -90,13 +170,20 @@ class LayersRouteTests(unittest.TestCase):
         self.assertTrue(impact["requiresSecondOrderChanges"])
         self.assertEqual(
             [item["column"] for item in impact["fieldReferences"]],
-            ["path_id", "status"],
+            ["path_id", "status", "status"],
         )
         self.assertEqual(impact["consumerLabels"], ["Paths (default map)"])
         self.assertEqual(
             impact["fieldReferences"][0]["label"],
             "Paths (default map) uses “path_id” for its feature ID",
         )
+        symbology = [
+            item for item in impact["fieldReferences"]
+            if "symbology" in item["usage"]
+        ]
+        self.assertEqual(symbology[0]["path"], (
+            "locale.layers.Paths.style.theme.fields.0"
+        ))
 
     def test_layers_route_returns_server_composed_locale(self) -> None:
         workspace = {
@@ -148,6 +235,18 @@ class LayersRouteTests(unittest.TestCase):
 
 
 class CatalogDiscoveryTests(unittest.TestCase):
+    def test_server_catalog_omits_public_schema_without_hiding_it_from_validation(self):
+        discovered = [
+            {"dbs": "MAPP", "schema": "public", "table": "old_places"},
+            {"dbs": "MAPP", "schema": "etl", "table": "places"},
+        ]
+
+        with patch.object(app, "discover", return_value=discovered):
+            self.assertEqual([discovered[1]], app.discover_catalog())
+
+        # Full discovery remains available to workspace validation.
+        self.assertEqual("public", discovered[0]["schema"])
+
     def test_materialized_geometry_uses_relation_typmod_metadata(self):
         connection = MagicMock()
         cursor = MagicMock()
@@ -163,6 +262,55 @@ class CatalogDiscoveryTests(unittest.TestCase):
         self.assertIn("c.relkind IN ('r', 'p', 'v', 'm')", discovery_query)
         self.assertIn("postgis_typmod_type(a.atttypmod)", discovery_query)
         self.assertNotIn("JOIN geometry_columns", discovery_query)
+
+
+class DerivedBackgroundOperationTests(unittest.TestCase):
+    def test_create_records_success_only_after_store_returns(self):
+        derived = Mock()
+        derived.create.return_value = {
+            "name": "slow_places",
+            "kind": "materialized",
+            "sources": ["etl.places"],
+        }
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(app, "CONTROL", control):
+            app.run_derived_background(
+                "a" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        derived.create.assert_called_once_with({"name": "slow_places"}, "admin")
+        control.finish_operation.assert_called_once_with(
+            "a" * 32,
+            status="succeeded",
+            result={"derivedLayer": derived.create.return_value},
+        )
+
+    def test_database_failure_is_available_to_status_polling(self):
+        derived = Mock()
+        derived.refresh.side_effect = RuntimeError("statement timed out")
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(app, "CONTROL", control):
+            app.run_derived_background(
+                "b" * 32,
+                "refresh",
+                {},
+                "admin",
+                "127.0.0.1",
+                "slow_places",
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("failed", call.kwargs["status"])
+        self.assertEqual(
+            "statement timed out",
+            call.kwargs["error"]["message"],
+        )
 
 
 class ReloadRouteTests(unittest.TestCase):
@@ -484,6 +632,22 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual("removed", deleted_preview["changeKind"])
         self.assertFalse(
             deleted_preview["candidate"]["requestedLayerPresent"],
+        )
+
+    def test_group_preview_retains_configured_tile_background_key(self):
+        osm = {"format": "tiles", "display": True}
+        proposal = {
+            "original": {"locale": {"layers": {"Open_Street_Map": osm}}},
+            "candidate": {"locale": {"layers": {"Open_Street_Map": osm}}},
+        }
+
+        preview = app.proposal_group_preview(
+            proposal, "Open_Street_Map", None
+        )
+
+        self.assertEqual(
+            ["Open_Street_Map"],
+            preview["candidate"]["backgroundLayers"],
         )
 
     def test_group_move_isolates_moved_layer_across_affected_groups(self):
@@ -992,6 +1156,25 @@ class CandidatePreviewRouteTests(unittest.TestCase):
 
     def test_preview_lock_is_reentrant_for_publish_and_render_scope(self) -> None:
         self.assertIsInstance(app.PREVIEW_LOCK, type(threading.RLock()))
+
+    def test_live_preview_sync_publishes_exact_committed_workspace(self) -> None:
+        encoded = b'{"key":"demo","locale":{"layers":{}}}\n'
+        workspace = app.json.loads(encoded)
+        with patch.object(
+            app,
+            "prepare_workspace_preview",
+            return_value={"source": "live"},
+        ) as prepare:
+            result = app.sync_live_preview(encoded)
+
+        self.assertEqual({"source": "live"}, result)
+        prepare.assert_called_once_with(
+            workspace,
+            app.workspace_hash(workspace),
+            source="live",
+            timeout=30,
+            wait=False,
+        )
 
 
 class AuthorizationScopeTests(unittest.TestCase):

@@ -58,6 +58,11 @@ MAX_BODY = 5 * 1024 * 1024
 SAVE_LOCK = threading.Lock()
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
+PREVIEW_SYNC_LOCK = threading.Lock()
+PREVIEW_SYNC_STATE: dict[str, object] = {
+    "pending": None,
+    "running": False,
+}
 PREVIEW_WORKSPACE = Path(
     os.environ.get(
         "PREVIEW_WORKSPACE_PATH",
@@ -155,6 +160,13 @@ def derived_workspace_impact(name: str, affected_columns: list[str]) -> dict:
             layer_label = str(layer.get("name") or layer_key)
             consumer_labels.append(f"{layer_label} ({locale_label})")
             hover = (layer.get("style") or {}).get("hover")
+            style = layer.get("style") or {}
+            theme_key = style.get("theme")
+            theme_path = "style.theme"
+            theme = theme_key
+            if isinstance(theme_key, str):
+                theme = (style.get("themes") or {}).get(theme_key)
+                theme_path = f"style.themes.{theme_key}"
             candidates = [
                 ("qID", "feature ID", layer.get("qID")),
                 ("geom", "map geometry", layer.get("geom")),
@@ -163,6 +175,22 @@ def derived_workspace_impact(name: str, affected_columns: list[str]) -> dict:
                 candidates.append((
                     "style.hover.field", "hover text", hover.get("field")
                 ))
+            if isinstance(theme, dict):
+                candidates.append((
+                    f"{theme_path}.field", "symbology field",
+                    theme.get("field"),
+                ))
+                for index, field in enumerate(theme.get("fields") or []):
+                    candidates.append((
+                        f"{theme_path}.fields.{index}",
+                        "multi-field symbology", field,
+                    ))
+                for index, category in enumerate(theme.get("categories") or []):
+                    if isinstance(category, dict):
+                        candidates.append((
+                            f"{theme_path}.categories.{index}.field",
+                            "symbology category field", category.get("field"),
+                        ))
             for index, entry in enumerate(layer.get("infoj") or []):
                 if isinstance(entry, dict):
                     label = str(
@@ -192,6 +220,82 @@ def derived_workspace_impact(name: str, affected_columns: list[str]) -> dict:
         "fieldReferences": field_references,
         "requiresSecondOrderChanges": bool(field_references),
     }
+
+
+def run_derived_background(
+    operation_id: str,
+    action: str,
+    payload: dict,
+    actor: str,
+    remote: str,
+    name: str | None = None,
+) -> None:
+    """Complete a derived-layer database operation after HTTP has returned."""
+    try:
+        if not DERIVED:
+            raise DerivedLayerError(
+                "Derived-layer database management is not configured."
+            )
+        if action == "create":
+            result = DERIVED.create(payload, actor)
+        elif action == "replace" and name:
+            result = DERIVED.replace(name, payload, actor)
+            changes = result.get("columnChanges", {})
+            result.update(derived_workspace_impact(
+                name,
+                changes.get("removed", []) + changes.get("changed", []),
+            ))
+        elif action == "refresh" and name:
+            result = DERIVED.refresh(name)
+        else:
+            raise DerivedLayerError("Unsupported background operation.")
+        CONTROL.audit(
+            f"derived_layer.{action}d" if action != "refresh" else "derived_layer.refreshed",
+            actor=actor,
+            remote=remote,
+            details={
+                "name": result["name"],
+                "kind": result["kind"],
+                "sources": result["sources"],
+                "operationId": operation_id,
+            },
+        )
+        CONTROL.finish_operation(
+            operation_id,
+            status="succeeded",
+            result={"derivedLayer": result},
+        )
+    except Exception as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                "code": "derived_layer.background_failed",
+                "message": str(exc),
+                "type": type(exc).__name__,
+            },
+        )
+
+
+def start_derived_background(
+    action: str,
+    payload: dict,
+    actor: str,
+    remote: str,
+    name: str | None = None,
+) -> dict:
+    operation = CONTROL.create_operation(
+        f"derived-layer.{action}",
+        actor,
+        {"name": name or payload.get("name"), "action": action},
+    )
+    threading.Thread(
+        target=run_derived_background,
+        args=(operation["id"], action, payload, actor, remote, name),
+        name=f"derived-{action}-{operation['id'][:8]}",
+        daemon=True,
+    ).start()
+    return operation
 
 
 def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
@@ -291,6 +395,7 @@ def prepare_workspace_preview(
     *,
     source: str,
     timeout: float = 30,
+    wait: bool = True,
 ) -> dict:
     """Publish one integrity-checked workspace to the isolated preview XYZ."""
     actual_hash = workspace_hash(workspace)
@@ -316,6 +421,14 @@ def prepare_workspace_preview(
         _atomic_preview_text(
             PREVIEW_RELOAD_DIR / "requested", f"{generation}\n"
         )
+        if not wait:
+            return {
+                "source": source,
+                "generation": generation,
+                "workspaceFingerprint": fingerprint,
+                "workspaceHash": actual_hash,
+                "queued": True,
+            }
         deadline = time.monotonic() + timeout
         status = {}
         while time.monotonic() < deadline:
@@ -362,6 +475,55 @@ def prepare_original_preview(proposal: dict, timeout: float = 30) -> dict:
         source="original",
         timeout=timeout,
     )
+
+
+def sync_live_preview(encoded: bytes | None = None, timeout: float = 30) -> dict:
+    """Publish the current committed workspace as the preview baseline."""
+    if encoded is None:
+        encoded, workspace, _ = read_workspace()
+    else:
+        workspace = strict_json_loads(encoded)
+    return prepare_workspace_preview(
+        workspace,
+        workspace_hash(workspace),
+        source="live",
+        timeout=timeout,
+        wait=False,
+    )
+
+
+def _live_preview_sync_worker() -> None:
+    while True:
+        with PREVIEW_SYNC_LOCK:
+            encoded = PREVIEW_SYNC_STATE["pending"]
+            PREVIEW_SYNC_STATE["pending"] = None
+            if encoded is None:
+                PREVIEW_SYNC_STATE["running"] = False
+                return
+        try:
+            sync_live_preview(encoded)
+        except Exception as exc:
+            CONTROL.audit(
+                "preview.sync_failed",
+                actor="system",
+                details={"error": type(exc).__name__},
+            )
+
+
+def schedule_live_preview_sync(encoded: bytes | None = None) -> None:
+    """Coalesce preview refreshes so the newest committed workspace wins."""
+    if encoded is None:
+        encoded, _, _ = read_workspace()
+    with PREVIEW_SYNC_LOCK:
+        PREVIEW_SYNC_STATE["pending"] = bytes(encoded)
+        if PREVIEW_SYNC_STATE["running"]:
+            return
+        PREVIEW_SYNC_STATE["running"] = True
+    threading.Thread(
+        target=_live_preview_sync_worker,
+        name="live-preview-sync",
+        daemon=True,
+    ).start()
 
 
 def proposal_changes_feature_info(
@@ -492,6 +654,16 @@ def proposal_group_preview(
                 else None
             ),
             "layers": selected,
+            "backgroundLayers": [
+                key
+                for key, layer in layers.items()
+                if (
+                    isinstance(key, str)
+                    and isinstance(layer, dict)
+                    and layer.get("format") == "tiles"
+                    and layer.get("display") is True
+                )
+            ],
             "groups": [
                 group
                 for group in groups
@@ -682,6 +854,7 @@ def apply_proposal_and_reload(
                 "requestedGeneration"
             ]
         proposal_write(store, proposal)
+        schedule_live_preview_sync(encoded)
 
         generation = reload_result.get("requestedGeneration")
         if isinstance(generation, int):
@@ -779,6 +952,16 @@ def discover() -> list[dict]:
     return tables
 
 
+def discover_catalog() -> list[dict]:
+    """Return tables offered for layer discovery in the dashboard/API.
+
+    Keep ``discover()`` complete because workspace validation must continue to
+    recognise an explicitly configured legacy ``public.*`` layer.  The public
+    schema is omitted only from the server catalog used to add new layers.
+    """
+    return [table for table in discover() if table.get("schema") != "public"]
+
+
 def layer_db(data: dict, layer: dict) -> str | None:
     return layer.get("dbs") or data.get("dbs")
 
@@ -814,13 +997,15 @@ def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
             elif str(geom["srid"]) != str(layer.get("srid")):
                 errors.append({"path": f"{path}.srid", "message": f'Must match the geometry column SRID ({geom["srid"]}).'})
             else:
-                geometry_type = geom["geometryType"]
-                if geometry_type == "GEOMETRY":
+                geometry_type = str(geom["geometryType"])
+                if geometry_type.upper() == "GEOMETRY":
                     geometry_type = next(
                         (column["geometryType"] for column in table["columns"]
-                         if column["geometryType"] not in ("", "GEOMETRY")),
+                         if column["geometryType"]
+                         and str(column["geometryType"]).upper() != "GEOMETRY"),
                         geometry_type,
                     )
+                geometry_type = str(geometry_type).upper()
                 default_style = (layer.get("style") or {}).get("default") or {}
                 if "POINT" in geometry_type and not default_style.get("icon"):
                     errors.append({"path": f"{path}.style.default.icon", "message": "Point layers require an XYZ icon style."})
@@ -831,6 +1016,38 @@ def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
             hover = (layer.get("style") or {}).get("hover")
             if isinstance(hover, dict) and hover.get("field") not in columns:
                 errors.append({"path": f"{path}.style.hover.field", "message": "Must select a column from this table."})
+            style = layer.get("style") or {}
+            themes = []
+            if isinstance(style.get("theme"), dict):
+                themes.append((f"{path}.style.theme", style["theme"]))
+            if isinstance(style.get("themes"), dict):
+                themes.extend(
+                    (f"{path}.style.themes.{name}", theme)
+                    for name, theme in style["themes"].items()
+                    if isinstance(theme, dict)
+                )
+            for theme_path, theme in themes:
+                if theme.get("field") is not None and theme["field"] not in columns:
+                    errors.append({
+                        "path": f"{theme_path}.field",
+                        "message": "Must select a column from this table.",
+                    })
+                for field_index, field in enumerate(theme.get("fields") or []):
+                    if field not in columns:
+                        errors.append({
+                            "path": f"{theme_path}.fields.{field_index}",
+                            "message": "Must select a column from this table.",
+                        })
+                for category_index, category in enumerate(theme.get("categories") or []):
+                    if (
+                        isinstance(category, dict)
+                        and category.get("field") is not None
+                        and category["field"] not in columns
+                    ):
+                        errors.append({
+                            "path": f"{theme_path}.categories.{category_index}.field",
+                            "message": "Must select a column from this table.",
+                        })
             for index_number, entry in enumerate(layer.get("infoj") or []):
                 if isinstance(entry, dict) and not entry.get("fieldfx") and entry.get("field") not in columns:
                     errors.append({"path": f"{path}.infoj.{index_number}.field", "message": "Must select a column from this table or provide a trusted SQL expression."})
@@ -1344,7 +1561,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif path == "/api/catalog":
             try:
-                self._json(HTTPStatus.OK, {"databases": sorted(DB_CONNECTIONS), "tables": discover()})
+                self._json(HTTPStatus.OK, {
+                    "databases": sorted(DB_CONNECTIONS),
+                    "tables": discover_catalog(),
+                })
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
         elif path == "/api/derived-layers/capabilities":
@@ -1446,6 +1666,9 @@ class Handler(SimpleHTTPRequestHandler):
                     "proposal.visual-test": "visual",
                     "xyz.reload": "reload",
                     "proposal.apply": "apply",
+                    "derived-layer.create": "derive",
+                    "derived-layer.replace": "derive",
+                    "derived-layer.refresh": "derive",
                 }.get(operation.get("kind"), "full")
                 scopes = set((self._authentication or {}).get("scopes") or [])
                 if actor != "admin" and "full" not in scopes and required_scope not in scopes:
@@ -1581,6 +1804,16 @@ class Handler(SimpleHTTPRequestHandler):
                     raise DerivedLayerError(
                         "Derived-layer database management is not configured."
                     )
+                background = payload.pop("background", False)
+                if background is True:
+                    operation = start_derived_background(
+                        "create", payload, actor, self._remote()
+                    )
+                    self._json(HTTPStatus.ACCEPTED, {
+                        "operation": operation,
+                        "statusUrl": f"/api/operations/{operation['id']}",
+                    })
+                    return
                 result = DERIVED.create(payload, actor)
                 CONTROL.audit(
                     "derived_layer.created",
@@ -1612,6 +1845,22 @@ class Handler(SimpleHTTPRequestHandler):
                         ),
                     })
                     return
+                background = payload.pop("background", False)
+                if background is True and action in {"refresh", "replace"}:
+                    replacement = {**payload}
+                    replacement.pop("confirmed", None)
+                    operation = start_derived_background(
+                        action,
+                        replacement if action == "replace" else {},
+                        actor,
+                        self._remote(),
+                        name,
+                    )
+                    self._json(HTTPStatus.ACCEPTED, {
+                        "operation": operation,
+                        "statusUrl": f"/api/operations/{operation['id']}",
+                    })
+                    return
                 if action == "refresh":
                     result = DERIVED.refresh(name)
                     event = "derived_layer.refreshed"
@@ -1628,6 +1877,10 @@ class Handler(SimpleHTTPRequestHandler):
                         affected = "; ".join(
                             item["label"] for item in result["fieldReferences"]
                         )
+                        symbology_affected = any(
+                            "symbology" in item["usage"]
+                            for item in result["fieldReferences"]
+                        )
                         result["userMessage"] = (
                             f'The derived layer “{name}” was saved, but these '
                             f"map settings now need attention: {affected}."
@@ -1637,6 +1890,25 @@ class Handler(SimpleHTTPRequestHandler):
                             "the CLI, you can include the follow-on changes in "
                             "the same proposal."
                         )
+                        if symbology_affected:
+                            result["correctionOptions"] = [
+                                {
+                                    "id": "select_replacement_field",
+                                    "label": "Select a valid replacement symbology field",
+                                },
+                                {
+                                    "id": "change_symbology_mode",
+                                    "label": "Choose another symbology mode and rebuild its legend",
+                                },
+                                {
+                                    "id": "restore_derived_output",
+                                    "label": "Edit the derived query to restore the required output field",
+                                },
+                                {
+                                    "id": "abandon_workspace_change",
+                                    "label": "Leave the workspace unchanged",
+                                },
+                            ]
                     elif result["consumerLabels"]:
                         result["userMessage"] = (
                             f'The derived layer “{name}” was saved. It is used '
@@ -2640,6 +2912,7 @@ class Handler(SimpleHTTPRequestHandler):
             except FileExistsError as exc:
                 self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
+            schedule_live_preview_sync(encoded)
             completed = reload_completed(reload_result)
             CONTROL.audit(
                 "workspace.saved",
@@ -2736,4 +3009,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    schedule_live_preview_sync()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

@@ -85,6 +85,34 @@ separate workspace property. CLI clients configure the same backend
 `style.theme` object and should use a bounded `visual-test` after application
 to verify the rendered categories and legend.
 
+Graduated themes require an actual numeric field and ordered unique numeric
+breaks. For `less_than`, breaks ascend; for `greater_than`, they descend:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"graduated","title":"Bus stops by score","field":"score","graduated_breaks":"less_than","categories":[{"value":10,"label":"Up to 10","style":{"icon":{"type":"dot","fillColor":"#a8d5ec"}}},{"value":50,"label":"Up to 50","style":{"icon":{"type":"dot","fillColor":"#277da1"}}}]}' \
+  --explanation 'Uses ordered numeric score breaks for Bus Stops symbology.'
+```
+
+Distributed themes require a stable identity field and at least one usable
+style. XYZ reuses the palette and attempts to avoid equal styles on
+intersecting features:
+
+```sh
+config-cli proposals check \
+  --base-revision WORKSPACE_REVISION \
+  --set '/locale/layers/Bus Stops/style/theme={"type":"distributed","title":"Distributed bus stop palette","field":"object_id","categories":[{"label":"Green","style":{"icon":{"type":"dot","fillColor":"#176b4d"}}},{"label":"Blue","style":{"icon":{"type":"dot","fillColor":"#277da1"}}}]}' \
+  --explanation 'Distributes a two-symbol palette using the stable Bus Stops feature ID.'
+```
+
+The API’s `fieldReferences` response includes direct theme fields, indexed
+multi-field theme entries, and category-level fields. If a derived relation
+replacement removes or changes any of them, CLI clients should present the
+returned `userMessage` and `suggestedAction`, ask whether to replace the field,
+change mode, refresh/reinspect the derived relation, or abandon the follow-on
+proposal, and never choose a correction silently.
+
 Create and review a viewport-count proposal. The `infoj` array index must come
 from the inspected revision; this example's `2` is the Object ID entry in the
 seed workspace:
@@ -150,7 +178,7 @@ request as approval.
 | --- | --- |
 | `GET /api/workspace` | Workspace plus bytes-and-file-generation revision |
 | `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
-| `GET /api/catalog` | Database connections and renderable tables visible to XYZ |
+| `GET /api/catalog` | Database connections and renderable tables offered for new layers; omits the PostgreSQL `public` schema |
 | `GET /api/derived-layers/capabilities` | Managed-view and H3 availability |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
 | `GET /api/derived-layers/<name>` | One definition including its SQL |
@@ -163,6 +191,11 @@ request as approval.
 | `GET /api/auth/me` | Current actor and reported scopes; session list for administrators |
 | `GET /api/capabilities` | Stable action IDs, risks, routes, schemas, and operation kinds |
 | `GET /api/operations/<id>` | Durable authorized status/result for a long action |
+
+Derived-layer create, replace, and refresh requests accept an optional
+`"background": true`. They return `202 Accepted` with `operation` and
+`statusUrl`; poll that URL until `status` is `succeeded`, `failed`, or
+`indeterminate`. Omitting the flag preserves the synchronous API behaviour.
 
 ## Mutations
 
@@ -333,6 +366,11 @@ active. The response plan reports `changeKind`, `groups`, candidate `layers`,
 `anchorLayer`, `requestedLayerDeleted`, and `viewSource`; nested browser reports
 record each side's actual activated layers and verify that its remaining group
 drawers are present.
+
+Focused previews derive `backgroundLayers` from visible `format: "tiles"`
+layers in the effective locale. They never assume a particular OSM object key;
+when there is no explicit focus or background layer, the runner omits the
+`layers` URL parameter so XYZ can honour configured initial visibility.
 
 Candidate rendering uses a dedicated XYZ process, workspace path, and reload
 mailbox. Preview requests are serialized from candidate publication through

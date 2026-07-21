@@ -147,10 +147,10 @@ async function runVisual(input) {
     : input.layer
       ? [input.layer]
       : [];
-  const activeLayers = [
-    "OpenStreetMap",
-    ...requestedLayers.filter(value => value !== "OpenStreetMap"),
-  ];
+  const backgroundLayers = Array.isArray(input.plan?.backgroundLayers)
+    ? input.plan.backgroundLayers.filter(value => typeof value === "string" && value)
+    : [];
+  const activeLayers = [...new Set([...backgroundLayers, ...requestedLayers])];
   if (viewMode === "focus" && activeLayers.length) {
     target.searchParams.set("layers", activeLayers.join(","));
   }

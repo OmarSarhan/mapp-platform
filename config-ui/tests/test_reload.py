@@ -162,6 +162,7 @@ class ReloadTests(unittest.TestCase):
                     return_value={"requestedGeneration": 4},
                 ),
                 patch("app.wait_reload", side_effect=observe_applied),
+                patch("app.schedule_live_preview_sync") as preview_sync,
             ):
                 applied, reload_result = app.apply_proposal_and_reload(
                     store,
@@ -176,6 +177,8 @@ class ReloadTests(unittest.TestCase):
                 app.strict_json_loads(workspace.read_bytes()),
             )
             self.assertEqual("Approved candidate", saved["title"])
+            preview_sync.assert_called_once()
+            self.assertEqual(workspace.read_bytes(), preview_sync.call_args.args[0])
 
     def test_interrupted_proposal_recovers_an_exact_committed_candidate(self):
         with tempfile.TemporaryDirectory() as directory:

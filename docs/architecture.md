@@ -1,5 +1,15 @@
 # Architecture
 
+![MAPP platform, configuration API, CLI and dashboard relationship](images/mapp-api-cli-dashboard.svg)
+
+The environment section distinguishes the private deployment `.env`, which
+the `mapp` wrapper passes to Docker Compose for runtime substitution, from
+`instance/xyz.env`, which Compose supplies to XYZ as its reviewed framework
+settings. Values such as `DBS_MAPP` are resolved from the private `.env` and
+injected explicitly into XYZ and the configuration service. The dashboard and
+CLI do not inject environment variables; they change the workspace through the
+configuration API.
+
 ## Scope
 
 MAPP Platform owns the live server and its configuration API. The standalone
@@ -106,6 +116,11 @@ pretending that one database relation represents them.
 
 Proposal preview publishes an integrity-checked stored candidate to a dedicated
 `xyz-preview` process with separate workspace and reload state. The live
+workspace is also republished to that isolated process after each committed
+dashboard save or proposal apply and when the configuration service starts,
+so it is the preview baseline between proposal captures. Publications are
+serialized with captures, and rapid saves are coalesced so the newest committed
+workspace wins without a preview failure blocking the live save. The live
 workspace and live XYZ generation are never changed. A process-wide lock pins
 one proposal candidate through browser completion, and artifact metadata binds
 the result to its proposal ID and candidate hash.

@@ -338,7 +338,10 @@ class DerivedLayerStore:
     def create(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         definition = validate_definition(payload)
         with self._connect() as connection, connection.cursor() as cur:
-            cur.execute("SET LOCAL statement_timeout = '30s'")
+            # Materialization and output validation can legitimately outlive an
+            # HTTP request. The dashboard submits these as durable background
+            # operations; retain a finite database-side safety bound.
+            cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._initialize(cur)
@@ -418,7 +421,7 @@ class DerivedLayerStore:
         if definition["kind"] != "materialized":
             raise DerivedLayerError("Only materialized views can be refreshed.")
         with self._connect() as connection, connection.cursor() as cur:
-            cur.execute("SET LOCAL statement_timeout = '5min'")
+            cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute(
                 sql.SQL("REFRESH MATERIALIZED VIEW {}").format(
                     sql.Identifier(SCHEMA, name)
@@ -436,7 +439,7 @@ class DerivedLayerStore:
         if definition["name"] != name:
             raise DerivedLayerError("Replacement name must match the existing relation.")
         with self._connect() as connection, connection.cursor() as cur:
-            cur.execute("SET LOCAL statement_timeout = '5min'")
+            cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._initialize(cur)

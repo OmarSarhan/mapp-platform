@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img" aria-labelledby="title desc">
+  <title id="title">MAPP platform, API, CLI, and dashboard relationship</title>
+  <desc id="desc">The dashboard and standalone CLI both communicate with the configuration API. The API validates and writes the live workspace, then requests an XYZ reload. XYZ reads the workspace and serves the public map. Docker Compose reads the private platform environment file and injects runtime values into services, while XYZ also receives reviewed framework settings from instance slash xyz dot env.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#315f51"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#173e4d" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .title{font:700 34px system-ui,sans-serif;fill:#173e4d}.subtitle{font:400 17px system-ui,sans-serif;fill:#526b65}
+      .box-title{font:700 23px system-ui,sans-serif;fill:#173e4d}.body{font:400 16px system-ui,sans-serif;fill:#315f51}
+      .small{font:600 14px system-ui,sans-serif;fill:#526b65}.line{stroke:#315f51;stroke-width:3;fill:none;marker-end:url(#arrow)}
+      .dash{stroke-dasharray:8 8}.client{fill:#eef8fc;stroke:#277da1}.service{fill:#eff8f3;stroke:#176b4d}
+      .state{fill:#fff7dc;stroke:#c18b16}.map{fill:#f4effb;stroke:#7251a3}.box{stroke-width:2.5;rx:16;filter:url(#shadow)}
+    </style>
+  </defs>
+
+  <rect width="1200" height="900" fill="#ffffff"/>
+  <text x="600" y="55" text-anchor="middle" class="title">How MAPP, the API, CLI and dashboard relate</text>
+  <text x="600" y="86" text-anchor="middle" class="subtitle">One configuration API; two operator interfaces; one authoritative live workspace</text>
+
+  <rect class="box client" x="70" y="155" width="280" height="145"/>
+  <text x="210" y="198" text-anchor="middle" class="box-title">Configuration dashboard</text>
+  <text x="210" y="232" text-anchor="middle" class="body">Browser interface for people</text>
+  <text x="210" y="260" text-anchor="middle" class="small">Session cookie + CSRF</text>
+
+  <rect class="box client" x="70" y="420" width="280" height="145"/>
+  <text x="210" y="463" text-anchor="middle" class="box-title">Standalone CLI</text>
+  <text x="210" y="497" text-anchor="middle" class="body">Remote operator or agent</text>
+  <text x="210" y="525" text-anchor="middle" class="small">Scoped bearer token</text>
+
+  <rect class="box service" x="460" y="275" width="300" height="180"/>
+  <text x="610" y="320" text-anchor="middle" class="box-title">MAPP configuration API</text>
+  <text x="610" y="354" text-anchor="middle" class="body">Authentication and authorization</text>
+  <text x="610" y="382" text-anchor="middle" class="body">Validation, proposals and audit</text>
+  <text x="610" y="410" text-anchor="middle" class="body">Atomic save and reload coordination</text>
+
+  <rect class="box state" x="875" y="155" width="260" height="145"/>
+  <text x="1005" y="198" text-anchor="middle" class="box-title">Live workspace</text>
+  <text x="1005" y="232" text-anchor="middle" class="body">workspace.json</text>
+  <text x="1005" y="260" text-anchor="middle" class="small">Authoritative map configuration</text>
+
+  <rect class="box map" x="875" y="420" width="260" height="145"/>
+  <text x="1005" y="463" text-anchor="middle" class="box-title">XYZ map</text>
+  <text x="1005" y="497" text-anchor="middle" class="body">Reads the live workspace</text>
+  <text x="1005" y="525" text-anchor="middle" class="small">Serves the public map</text>
+
+  <path class="line" d="M350 225 C410 225 410 320 460 335"/>
+  <text x="395" y="232" text-anchor="middle" class="small">HTTPS API</text>
+
+  <path class="line" d="M350 492 C410 492 410 415 460 395"/>
+  <text x="395" y="498" text-anchor="middle" class="small">HTTPS API</text>
+
+  <path class="line" d="M760 335 C815 320 815 240 875 230"/>
+  <text x="818" y="291" text-anchor="middle" class="small">validate + save</text>
+
+  <path class="line" d="M1005 300 L1005 420"/>
+  <text x="1022" y="365" class="small">read</text>
+
+  <path class="line dash" d="M760 405 C815 420 815 490 875 492"/>
+  <text x="816" y="461" text-anchor="middle" class="small">reload request</text>
+
+  <text x="600" y="615" text-anchor="middle" class="box-title">Environment injection</text>
+
+  <rect class="box state" x="70" y="645" width="250" height="105"/>
+  <text x="195" y="685" text-anchor="middle" class="box-title">Private .env</text>
+  <text x="195" y="716" text-anchor="middle" class="small">URLs, passwords, mode and hosts</text>
+
+  <rect class="box service" x="465" y="645" width="270" height="105"/>
+  <text x="600" y="685" text-anchor="middle" class="box-title">Docker Compose</text>
+  <text x="600" y="716" text-anchor="middle" class="small">Resolves and injects service values</text>
+
+  <rect class="box state" x="880" y="645" width="250" height="105"/>
+  <text x="1005" y="685" text-anchor="middle" class="box-title">instance/xyz.env</text>
+  <text x="1005" y="716" text-anchor="middle" class="small">Reviewed XYZ framework settings</text>
+
+  <path class="line" d="M320 698 L465 698"/>
+  <text x="392" y="688" text-anchor="middle" class="small">read by wrapper</text>
+  <path class="line dash" d="M550 645 C520 585 590 520 590 455"/>
+  <text x="520" y="558" text-anchor="middle" class="small">API runtime env</text>
+  <path class="line dash" d="M690 645 C770 590 835 545 875 520"/>
+  <text x="776" y="589" text-anchor="middle" class="small">DBS_MAPP etc.</text>
+  <path class="line" d="M1005 645 L1005 565"/>
+  <text x="1022" y="610" class="small">env_file</text>
+
+  <rect x="375" y="800" width="450" height="64" rx="14" fill="#ffffff" stroke="#cbd8d3" stroke-width="2"/>
+  <text x="600" y="827" text-anchor="middle" class="small">Dashboard and CLI never inject XYZ environment values.</text>
+  <text x="600" y="850" text-anchor="middle" class="body">They configure the workspace through the API.</text>
+</svg>
