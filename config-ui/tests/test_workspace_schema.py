@@ -273,6 +273,125 @@ class WorkspaceValidationTests(unittest.TestCase):
         paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
         self.assertIn("locale.layers.Places.style.default.icon.type", paths)
 
+    def test_accepts_all_xyz_theme_modes_and_named_theme_reference(self):
+        data = valid_workspace()
+        data["locale"]["layers"]["Places"]["style"] = {
+            "default": {"fillColor": "#eeeeee", "strokeColor": "#111111"},
+            "theme": "category",
+            "themes": {
+                "category": {
+                    "type": "categorized",
+                    "field": "kind",
+                    "categories": [
+                        {"value": "park", "label": "Park", "style": {"fillColor": "#00aa00"}},
+                        {"value": "water", "label": "Water", "icon": {"type": "dot", "fillColor": "#0000ff"}},
+                    ],
+                    "futureThemeOption": True,
+                },
+                "multi": {
+                    "type": "categorized",
+                    "fields": ["kind", "status"],
+                    "categories": [
+                        {"field": "kind", "value": "park", "style": {"icon": {"type": "dot"}}},
+                        {"field": "status", "value": "open", "style": {"icon": [{"type": "circle"}]}},
+                    ],
+                },
+                "breaks": {
+                    "type": "graduated",
+                    "field": "score",
+                    "graduated_breaks": "less_than",
+                    "categories": [
+                        {"value": 10, "label": "Low", "style": {"fillColor": "#eeeeee"}},
+                        {"value": 20, "label": "High", "style": {"fillColor": "#111111"}},
+                    ],
+                },
+                "palette": {
+                    "type": "distributed",
+                    "categories": [
+                        {"style": {"fillColor": "#ff0000"}},
+                        {"style": {"icon": {"url": "/instance/svg/bus.svg"}}},
+                    ],
+                },
+                "one": {
+                    "type": "basic",
+                    "label": "Places",
+                    "style": {"strokeColor": "#123456"},
+                },
+            },
+        }
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+    def test_rejects_missing_duplicate_and_invalid_categorized_values(self):
+        data = valid_workspace()
+        data["locale"]["layers"]["Places"]["style"] = {
+            "theme": {
+                "type": "categorized",
+                "field": "kind",
+                "fields": ["kind"],
+                "categories": [
+                    {"value": "park", "label": " ", "style": {"fillColor": "#00aa00"}},
+                    {"value": "park", "style": {"fillColor": "#00bb00"}},
+                    {"value": ["not", "scalar"], "style": {}},
+                    {"style": {}},
+                ],
+            }
+        }
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.style.theme.field", paths)
+        self.assertIn("locale.layers.Places.style.theme.categories.0.label", paths)
+        self.assertIn("locale.layers.Places.style.theme.categories.1.value", paths)
+        self.assertIn("locale.layers.Places.style.theme.categories.2.value", paths)
+        self.assertIn("locale.layers.Places.style.theme.categories.3.value", paths)
+
+    def test_rejects_unordered_or_duplicate_graduated_breaks(self):
+        data = valid_workspace()
+        theme = {
+            "type": "graduated",
+            "field": "score",
+            "graduated_breaks": "less_than",
+            "categories": [
+                {"value": 20, "style": {}},
+                {"value": 10, "style": {}},
+                {"value": 10, "style": {}},
+            ],
+        }
+        data["locale"]["layers"]["Places"]["style"] = {
+            "default": {"fillColor": "#eeeeee"},
+            "theme": theme,
+        }
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.style.theme.categories", paths)
+        self.assertIn("locale.layers.Places.style.theme.categories.2.value", paths)
+        theme["graduated_breaks"] = "near"
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.style.theme.graduated_breaks", paths)
+
+    def test_rejects_invalid_multi_field_distributed_and_named_themes(self):
+        data = valid_workspace()
+        data["locale"]["layers"]["Places"]["style"] = {
+            "theme": "missing",
+            "themes": {
+                "multi": {
+                    "type": "categorized",
+                    "fields": ["kind", "kind"],
+                    "categories": [
+                        {"field": "other", "value": "park", "style": {"fillColor": "#00aa00"}},
+                    ],
+                },
+                "distributed": {
+                    "type": "distributed",
+                    "field": "bad field",
+                    "categories": [{}, {"style": None}],
+                },
+            },
+        }
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.style.theme", paths)
+        self.assertIn("locale.layers.Places.style.themes.multi.fields", paths)
+        self.assertIn("locale.layers.Places.style.themes.multi.categories.0.style.icon", paths)
+        self.assertIn("locale.layers.Places.style.themes.distributed.field", paths)
+        self.assertIn("locale.layers.Places.style.themes.distributed.categories.0.style", paths)
+
     def test_validates_optional_viewport_count_text(self):
         data = valid_workspace()
         layer = data["locale"]["layers"]["Places"]

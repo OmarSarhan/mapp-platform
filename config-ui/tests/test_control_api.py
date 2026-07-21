@@ -248,6 +248,8 @@ class ControlApiTests(unittest.TestCase):
         advertised = examples()
         legend = advertised["showLayerLegend"]
         categorized = advertised["setCategorizedSymbology"]
+        graduated = advertised["setGraduatedSymbology"]
+        distributed = advertised["setDistributedSymbology"]
         viewport = advertised["countLayerInViewport"]
         viewport_heading = advertised["showViewportCountBesideLayer"]
         info_symbol = advertised["showSymbolInFeatureInformation"]
@@ -265,6 +267,14 @@ class ControlApiTests(unittest.TestCase):
             ["theme"],
             categorized["operations"][1]["value"],
         )
+        self.assertEqual(
+            "less_than",
+            graduated["operations"][0]["value"]["graduated_breaks"],
+        )
+        self.assertEqual(
+            "distributed",
+            distributed["operations"][0]["value"]["type"],
+        )
         self.assertTrue(viewport["operations"][0]["value"]["viewport"])
         self.assertTrue(viewport["operations"][1]["value"])
         self.assertEqual(
@@ -280,6 +290,7 @@ class ControlApiTests(unittest.TestCase):
         rule_ids = {rule["id"] for rule in RULES}
         self.assertIn("workspace.layer_legend", rule_ids)
         self.assertIn("workspace.categorized_symbology", rule_ids)
+        self.assertIn("workspace.theme_semantics", rule_ids)
         self.assertIn("workspace.infoj_geometry_symbol", rule_ids)
         self.assertIn("workspace.viewport_count", rule_ids)
 
@@ -499,3 +510,20 @@ class ControlApiTests(unittest.TestCase):
                 {"template": "OSM"}
             )
         )
+
+    def test_visual_plan_uses_configured_visible_tile_key_as_background(self):
+        workspace = {
+            "locale": {
+                "layers": {
+                    "Open_Street_Map": {
+                        "format": "tiles",
+                        "display": True,
+                        "URI": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                    }
+                }
+            }
+        }
+
+        plan = visual_plan(workspace, "Open_Street_Map", {})
+
+        self.assertEqual(["Open_Street_Map"], plan["backgroundLayers"])

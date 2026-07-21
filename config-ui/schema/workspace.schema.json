@@ -1427,12 +1427,16 @@
           "description": "Label displayed beside a basic theme symbol in the XYZ legend."
         },
         "field": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_$]*$"
         },
         "fields": {
           "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_$]*$"
           }
         },
         "style": {
@@ -1440,6 +1444,7 @@
         },
         "categories": {
           "type": "array",
+          "minItems": 1,
           "items": {
             "$ref": "#/$defs/themeCategory"
           }
@@ -1469,6 +1474,59 @@
           "type": "boolean"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "basic"}
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["label", "style"],
+            "properties": {
+              "label": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {"enum": ["graduated", "distributed"]}
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["categories"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "graduated"}
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["field", "graduated_breaks"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "categorized"}
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["categories"],
+            "oneOf": [
+              {"required": ["field"], "not": {"required": ["fields"]}},
+              {"required": ["fields"], "not": {"required": ["field"]}}
+            ]
+          }
+        }
+      ],
       "additionalProperties": true
     },
     "themeCategory": {
@@ -1488,7 +1546,8 @@
           ]
         },
         "field": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_$]*$"
         },
         "style": {
           "oneOf": [
@@ -1509,7 +1568,8 @@
               "type": "array",
               "items": {
                 "$ref": "#/$defs/iconStyle"
-              }
+              },
+              "minItems": 1
             }
           ]
         }

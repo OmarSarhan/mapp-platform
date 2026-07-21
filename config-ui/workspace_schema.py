@@ -627,50 +627,193 @@ def _validate_style(style, path, errors):
             for key in ("title", "label", "query"):
                 if key in hover and (not isinstance(hover[key], str) or not hover[key].strip()):
                     _error(errors, f"{path}.hover.{key}", "Must be a non-empty string.")
-    for state in ("default", "highlight"):
+    themes = style.get("themes")
+    if themes is not None:
+        if not isinstance(themes, dict) or not themes:
+            _error(errors, f"{path}.themes", "Must be a non-empty object keyed by theme name.")
+        else:
+            for key, theme in themes.items():
+                if not isinstance(key, str) or not key.strip():
+                    _error(errors, f"{path}.themes", "Theme names must be non-empty strings.")
+                    continue
+                _validate_theme(
+                    theme,
+                    f"{path}.themes.{key}",
+                    errors,
+                    style.get("default"),
+                )
+    theme = style.get("theme")
+    if isinstance(theme, str):
+        if not theme.strip():
+            _error(errors, f"{path}.theme", "Must name a configured style.themes entry.")
+        elif not isinstance(themes, dict) or theme not in themes:
+            _error(errors, f"{path}.theme", f"Unknown named theme: {theme}.")
+    elif theme is not None:
+        _validate_theme(theme, f"{path}.theme", errors, style.get("default"))
+
+    for state in ("default", "highlight", "selected", "cluster"):
         value = style.get(state)
         if value is None:
             continue
-        if not isinstance(value, dict):
-            _error(errors, f"{path}.{state}", "Must be an object.")
-            continue
-        for key in ("fillColor", "strokeColor"):
-            if key in value and (not isinstance(value[key], str) or not COLOR.fullmatch(value[key])):
-                _error(errors, f"{path}.{state}.{key}", "Must be a six- or eight-digit hex color.")
-        for key, low, high in (("fillOpacity", 0, 1), ("strokeOpacity", 0, 1), ("strokeWidth", 0, 20), ("scale", 0.1, 10)):
-            if key in value and (not _number(value[key]) or not low <= value[key] <= high):
-                _error(errors, f"{path}.{state}.{key}", f"Must be a number from {low} to {high}.")
-        if "lineDash" in value and not (
-            isinstance(value["lineDash"], list)
-            and value["lineDash"]
-            and all(_number(item) and item >= 0 for item in value["lineDash"])
+        _validate_feature_style(value, f"{path}.{state}", errors)
+
+
+def _validate_theme(theme, path, errors, default_style=None):
+    if not isinstance(theme, dict):
+        _error(errors, path, "Must be an XYZ theme object.")
+        return
+    theme_type = theme.get("type")
+    if theme_type not in {"basic", "categorized", "graduated", "distributed"}:
+        _error(errors, f"{path}.type", "Must be basic, categorized, graduated, or distributed.")
+        return
+    for key in ("title", "label"):
+        if key in theme and (not isinstance(theme[key], str) or not theme[key].strip()):
+            _error(errors, f"{path}.{key}", "Must be a non-empty string.")
+
+    if theme_type == "basic":
+        if not isinstance(theme.get("style"), dict):
+            _error(errors, f"{path}.style", "A basic theme requires a feature-style object.")
+        else:
+            _validate_feature_style(theme["style"], f"{path}.style", errors)
+        if not isinstance(theme.get("label"), str) or not theme["label"].strip():
+            _error(errors, f"{path}.label", "A basic theme requires a non-empty legend label.")
+        return
+
+    field = theme.get("field")
+    fields = theme.get("fields")
+    if theme_type == "categorized" and fields is not None:
+        usable_fields = (
+            fields
+            if isinstance(fields, list)
+            and fields
+            and all(isinstance(item, str) and IDENTIFIER.fullmatch(item) for item in fields)
+            else None
+        )
+        if not (
+            usable_fields is not None and len(fields) == len(set(fields))
         ):
-            _error(errors, f"{path}.{state}.lineDash", "Must be a non-empty array of non-negative numbers.")
-        icon = value.get("icon")
-        if icon is not None:
-            icons = icon if isinstance(icon, list) else [icon]
-            if not icons or not all(isinstance(item, dict) for item in icons):
+            _error(errors, f"{path}.fields", "Must contain unique database field identifiers.")
+        fields = usable_fields
+        if field is not None:
+            _error(errors, f"{path}.field", "Use either field or fields for a categorized theme, not both.")
+    elif not isinstance(field, str) or not IDENTIFIER.fullmatch(field):
+        if theme_type == "distributed" and field is None:
+            pass  # XYZ deliberately defaults distributed themes to the stable id field.
+        else:
+            _error(errors, f"{path}.field", "Must select a database field identifier.")
+
+    categories = theme.get("categories")
+    if not isinstance(categories, list) or not categories:
+        _error(errors, f"{path}.categories", "Must contain at least one category.")
+        return
+
+    seen = set()
+    graduated_values = []
+    for index, category in enumerate(categories):
+        category_path = f"{path}.categories.{index}"
+        if not isinstance(category, dict):
+            _error(errors, category_path, "Must be a category object.")
+            continue
+        if "label" in category and not (
+            isinstance(category["label"], (str, int, float))
+            and not isinstance(category["label"], bool)
+            and (not isinstance(category["label"], str) or category["label"].strip())
+        ):
+            _error(errors, f"{category_path}.label", "Must be a non-empty string or number.")
+        if theme_type in {"categorized", "graduated"} and "value" not in category:
+            _error(errors, f"{category_path}.value", "A category requires an exact value.")
+        elif "value" in category and isinstance(category["value"], (dict, list)):
+            _error(errors, f"{category_path}.value", "Must be a scalar feature value.")
+
+        category_field = category.get("field")
+        if fields is not None:
+            if category_field not in fields:
+                _error(errors, f"{category_path}.field", "Must match one of the theme fields.")
+        elif category_field is not None and (
+            not isinstance(category_field, str) or not IDENTIFIER.fullmatch(category_field)
+        ):
+            _error(errors, f"{category_path}.field", "Must be a database field identifier.")
+
+        value = category.get("value")
+        duplicate_key = (category_field if fields is not None else None, type(value).__name__, repr(value))
+        if "value" in category and duplicate_key in seen:
+            _error(errors, f"{category_path}.value", "Duplicate category value for this field.")
+        seen.add(duplicate_key)
+
+        category_style = category.get("style")
+        if category_style is None and "icon" in category:
+            category_style = {"icon": category["icon"]}
+        if category_style is not None:
+            _validate_feature_style(category_style, f"{category_path}.style", errors)
+
+        if fields is not None and (
+            not isinstance(category_style, dict) or "icon" not in category_style
+        ):
+            _error(errors, f"{category_path}.style.icon", "Multi-field categories require an icon style.")
+        elif theme_type == "distributed" and not isinstance(category_style, dict):
+            _error(errors, f"{category_path}.style", "Distributed categories require a feature style.")
+        elif (
+            category_style is None
+            and "style" not in category
+            and "icon" not in category
+            and not isinstance(default_style, dict)
+        ):
+            _error(errors, f"{category_path}.style", "Provide a category style or a layer default style.")
+
+        if theme_type == "graduated":
+            if not _number(value):
+                _error(errors, f"{category_path}.value", "Graduated category breaks must be numbers.")
+            else:
+                graduated_values.append(value)
+
+    if theme_type == "graduated":
+        breaks = theme.get("graduated_breaks")
+        if breaks not in {"less_than", "greater_than"}:
+            _error(errors, f"{path}.graduated_breaks", "Must be less_than or greater_than.")
+        if len(graduated_values) == len(categories):
+            expected = sorted(graduated_values, reverse=breaks == "greater_than")
+            if graduated_values != expected or len(graduated_values) != len(set(graduated_values)):
                 _error(
                     errors,
-                    f"{path}.{state}.icon",
-                    "Must be one XYZ icon object or a non-empty icon array.",
+                    f"{path}.categories",
+                    f"Break values must be unique and ordered for {breaks}.",
                 )
-                continue
-            for index, item in enumerate(icons):
-                icon_path = (
-                    f"{path}.{state}.icon.{index}"
-                    if isinstance(icon, list)
-                    else f"{path}.{state}.icon"
-                )
-                if item.get("type") not in ICON_TYPES and not item.get("url"):
-                    _error(errors, f"{icon_path}.type", f"Must be an XYZ v4.23.4 symbol: {', '.join(sorted(ICON_TYPES))}.")
-                for key in ("fillColor", "strokeColor", "color", "colorMarker", "colorDot"):
-                    if key in item and (not isinstance(item[key], str) or not COLOR.fullmatch(item[key])):
-                        _error(errors, f"{icon_path}.{key}", "Must be a six- or eight-digit hex color.")
-                for key, low, high in (("strokeWidth", 0, 20), ("scale", 0.1, 10)):
-                    if key in item and (not _number(item[key]) or not low <= item[key] <= high):
-                        _error(errors, f"{icon_path}.{key}", f"Must be a number from {low} to {high}.")
-                if item.get("type") == "markerLetter" and (
-                    not isinstance(item.get("letter"), str) or len(item["letter"]) != 1
-                ):
-                    _error(errors, f"{icon_path}.letter", "Must be exactly one character.")
+
+
+def _validate_feature_style(value, path, errors):
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be an object.")
+        return
+    for key in ("fillColor", "strokeColor"):
+        if key in value and (not isinstance(value[key], str) or not COLOR.fullmatch(value[key])):
+            _error(errors, f"{path}.{key}", "Must be a three-, four-, six-, or eight-digit hex color.")
+    for key, low, high in (("fillOpacity", 0, 1), ("strokeOpacity", 0, 1), ("strokeWidth", 0, 20), ("scale", 0.1, 10)):
+        if key in value and (not _number(value[key]) or not low <= value[key] <= high):
+            _error(errors, f"{path}.{key}", f"Must be a number from {low} to {high}.")
+    if "lineDash" in value and not (
+        isinstance(value["lineDash"], list)
+        and value["lineDash"]
+        and all(_number(item) and item >= 0 for item in value["lineDash"])
+    ):
+        _error(errors, f"{path}.lineDash", "Must be a non-empty array of non-negative numbers.")
+    icon = value.get("icon")
+    if icon is None:
+        return
+    icons = icon if isinstance(icon, list) else [icon]
+    if not icons or not all(isinstance(item, dict) for item in icons):
+        _error(errors, f"{path}.icon", "Must be one XYZ icon object or a non-empty icon array.")
+        return
+    for index, item in enumerate(icons):
+        icon_path = f"{path}.icon.{index}" if isinstance(icon, list) else f"{path}.icon"
+        if item.get("type") not in ICON_TYPES and not item.get("url"):
+            _error(errors, f"{icon_path}.type", f"Must be an XYZ v4.23.4 symbol: {', '.join(sorted(ICON_TYPES))}.")
+        for key in ("fillColor", "strokeColor", "color", "colorMarker", "colorDot"):
+            if key in item and (not isinstance(item[key], str) or not COLOR.fullmatch(item[key])):
+                _error(errors, f"{icon_path}.{key}", "Must be a three-, four-, six-, or eight-digit hex color.")
+        for key, low, high in (("strokeWidth", 0, 20), ("scale", 0.1, 10)):
+            if key in item and (not _number(item[key]) or not low <= item[key] <= high):
+                _error(errors, f"{icon_path}.{key}", f"Must be a number from {low} to {high}.")
+        if item.get("type") == "markerLetter" and (
+            not isinstance(item.get("letter"), str) or len(item["letter"]) != 1
+        ):
+            _error(errors, f"{icon_path}.letter", "Must be exactly one character.")

@@ -24,7 +24,7 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
 
 API_VERSION = "1.0"
 CONTRACT_VERSION = "1.0"
-RULES_VERSION = "1.3"
+RULES_VERSION = "1.4"
 XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -46,6 +46,7 @@ RULES = [
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
     {"id": "workspace.layer_legend", "category": "schema", "description": "An optional basic theme exposes the layer symbology as a legend in XYZ's Styling panel.", "remediation": "Set style.theme to a basic theme whose style matches style.default, and include theme in style.elements when an explicit element list is present."},
     {"id": "workspace.categorized_symbology", "category": "schema", "description": "A categorized theme maps exact values from a feature field to labelled styles in XYZ's data-driven legend.", "remediation": "Set style.theme to a categorized theme with a valid field and category value/style entries; preserve unrelated style.elements and include theme when that array is explicit."},
+    {"id": "workspace.theme_semantics", "category": "schema", "description": "Graduated themes require ordered unique numeric breaks; distributed themes require a stable identity field and a non-empty style palette; named and multi-field themes must resolve every referenced field.", "remediation": "Inspect the current layer fields and theme before choosing a corrective mode. Replace invalid references, reorder graduated breaks for the selected comparison, or refresh/reconcile the derived source before proposing the workspace change."},
     {"id": "workspace.infoj_geometry_symbol", "category": "schema", "description": "An optional geometry infoj style renders the same swatch or icon beside its checkbox and on the selected geometry.", "remediation": "Set the geometry infoj entry style to the effective layer symbol; use the dashboard ownership marker only when the dashboard should keep it synchronized with style.default."},
     {"id": "workspace.viewport_count", "category": "schema", "description": "An optional layer filter with viewport enabled scopes XYZ's feature count to the current map view.", "remediation": "Set filter.viewport to true and configure at least one compatible infoj entry as an interactive filter so XYZ creates the Filtering panel."},
     {"id": "workspace.catalog", "category": "catalog", "description": "Database-backed layers must use selectable relations and columns.", "remediation": "Use `config-cli catalog list` and select a reported table, geometry, and ID."},
@@ -727,6 +728,43 @@ def examples() -> dict:
             ],
             "explanation": "Uses exact town values to drive Bus Stops symbols and the XYZ theme legend; preserve unrelated style element keys from the inspected revision.",
         },
+        "setGraduatedSymbology": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/theme",
+                    "value": {
+                        "type": "graduated",
+                        "title": "Bus stops by score",
+                        "field": "score",
+                        "graduated_breaks": "less_than",
+                        "categories": [
+                            {"value": 10, "label": "Up to 10", "style": {"icon": {"type": "dot", "fillColor": "#a8d5ec"}}},
+                            {"value": 50, "label": "Up to 50", "style": {"icon": {"type": "dot", "fillColor": "#277da1"}}},
+                        ],
+                    },
+                },
+            ],
+            "explanation": "Uses ordered numeric less-than breaks; verify that score is numeric and preserve the inspected layer's unrelated style configuration.",
+        },
+        "setDistributedSymbology": {
+            "operations": [
+                {
+                    "op": "set",
+                    "path": "/locale/layers/Bus Stops/style/theme",
+                    "value": {
+                        "type": "distributed",
+                        "title": "Distributed bus stop palette",
+                        "field": "object_id",
+                        "categories": [
+                            {"label": "Green", "style": {"icon": {"type": "dot", "fillColor": "#176b4d"}}},
+                            {"label": "Blue", "style": {"icon": {"type": "dot", "fillColor": "#277da1"}}},
+                        ],
+                    },
+                },
+            ],
+            "explanation": "Lets XYZ distribute a reusable palette by stable feature identity while avoiding repeated styles on intersecting features where possible.",
+        },
         "countLayerInViewport": {
             "operations": [
                 {
@@ -1151,6 +1189,16 @@ def visual_plan(
     locale_key: str | None = None,
 ) -> dict:
     selected_locale, locale = select_locale(workspace, locale_key)
+    background_layers = [
+        key
+        for key, candidate in (locale.get("layers") or {}).items()
+        if (
+            isinstance(key, str)
+            and isinstance(candidate, dict)
+            and candidate.get("format") == "tiles"
+            and candidate.get("display") is True
+        )
+    ]
     layer = (locale.get("layers") or {}).get(layer_key)
     if not isinstance(layer, dict):
         raise ValueError(
@@ -1162,6 +1210,7 @@ def visual_plan(
             "layer": layer_key,
             "locale": selected_locale,
             "source": "workspace-view",
+            "backgroundLayers": background_layers,
             "warnings": [
                 "This layer uses an external or advanced XYZ source, so the "
                 "visual check uses the configured workspace view."
@@ -1280,6 +1329,7 @@ def visual_plan(
         "layer": layer_key,
         "locale": selected_locale,
         "source": "postgis-feature",
+        "backgroundLayers": background_layers,
         "database": db_name,
         "table": layer["table"],
         "geometry": layer["geom"],

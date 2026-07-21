@@ -109,11 +109,10 @@ XYZ renders a layer legend from `style.theme`; it does not automatically turn
 }
 ```
 
-The dashboard's **Show symbol legend** control creates this theme from the
-current default symbol and keeps both styles synchronized when the default
-symbol is edited there. It preserves existing named, categorized, distributed,
-and graduated themes for Advanced layer JSON. Omitting `style.theme` retains
-the map symbol without showing a legend.
+The dashboard's **Basic legend** mode creates this theme from the current
+default symbol and keeps both styles synchronized when the default symbol is
+edited there. Omitting `style.theme` retains the map symbol without showing a
+legend.
 
 The dashboard labels a layer as **Static symbology** when the default style,
 optionally with a basic theme, supplies its one symbol. Categorized,
@@ -124,22 +123,45 @@ labelled default/fallback editor remains available, but is not presented as
 the complete data-driven legend. Named themes are resolved from `style.themes`
 for the same inspection; a missing named definition is shown as a warning.
 
-To create a categorized theme in the dashboard:
+The **Symbology mode** selector exposes the four XYZ theme implementations:
+
+- **Basic legend** applies one theme style.
+- **Data-driven categorized** matches exact values from one field, or composes
+  point icons from categories attached to multiple declared fields.
+- **Data-driven graduated** compares an ordered list of unique numeric breaks
+  using `less_than` or `greater_than`. XYZ uses the final stored category when
+  no break matches, so its label must describe the remaining range rather than
+  only the final numeric break.
+- **Data-driven distributed** reuses a configured style palette by stable
+  feature identity and attempts not to repeat a style on intersecting
+  features.
+
+For categorized, graduated, and distributed modes:
 
 1. Select the layer and find **Symbology mode**.
-2. Choose **Data-driven categorized**.
-3. Select the **Category field** whose values drive the symbols.
-4. Use **Add legend category** for each expected value, then provide its exact
-   value, user-facing legend label, and symbol colour.
-5. Review the map/fallback preview and the richer **Feature information
+2. Choose the required data-driven mode.
+3. Select the required category, numeric, or stable-identity field.
+4. Use **Add legend category** for each exact value, numeric break, or palette
+   entry, then provide its user-facing label.
+5. Expand **Edit symbol or icon** to configure the complete point icon,
+   line, or polygon style for that class.
+6. Review the map/fallback preview and the richer **Feature information
    preview**, then save and reload XYZ.
 
-The editor writes `style.theme.type: "categorized"`, its `field`, and
-`categories`, and ensures the theme legend is included when an explicit
-`style.elements` list exists. Switching back to **Static** explicitly removes
-the active managed theme. Existing graduated, distributed, and named themes
-are labelled as advanced and remain preserved unless the operator deliberately
-chooses a different mode.
+The editor writes the selected `style.theme.type` and its mode-specific fields
+and categories, and ensures the theme legend is included when an explicit
+`style.elements` list exists. Switching a configured theme to another mode
+shows a destructive-change warning because its fields, values, labels, breaks,
+and styles will be replaced. Cancelling leaves the existing theme untouched.
+Named theme references are resolved from `style.themes`; selecting another
+existing named theme is supported without flattening its definition.
+
+XYZ’s OpenLayers style conversion makes symbol compatibility geometry-specific:
+points require `icon`; lines use `strokeColor`, `strokeWidth`, and `lineDash`;
+polygons use `fillColor` and may also use the stroke properties. Multi-field
+categorized themes compose an array of icons and are therefore intended for
+point layers. These rules apply equally to the default fallback, basic theme
+style, and every categorized, graduated, or distributed category style.
 
 The Feature information preview includes the selected-geometry swatch,
 its synchronization status, representative attribute values, and the complete
@@ -286,6 +308,9 @@ sections: **Identity and display**, **Data source**, **Appearance and legend**,
 Database controls appear only for supported single-relation database layers;
 tile layers show their URI instead; open-ended external/template sources
 retain their complete JSON without presenting inapplicable database fields.
+The server catalog omits tables in PostgreSQL's `public` schema when offering
+new layers. Existing workspace layers that explicitly reference `public.*`
+remain supported and are still checked by validation.
 Styling controls are disabled until the Styling panel is enabled, and
 Filtering-panel options are disabled or hidden until that panel is enabled.
 Advanced JSON remains available so this organization never discards unknown
@@ -340,6 +365,12 @@ workspace
 | `locale.ScaleLine` | `metric`, `imperial` | Scale-line units in XYZ v4.23.4. |
 | `locale.layers.<key>` | object | Layer key used in URLs, hooks, and queries. |
 | `layer.name` | string | Display label; defaults to the layer key. |
+
+When the dashboard creates a layer or a display-name edit loses focus, it
+derives the internal layer key from `layer.name`: spaces become underscores,
+special characters are removed, and collisions receive `_1`, `_2`, and later
+suffixes. The display label itself retains its spaces and punctuation. Matching
+named-locale overrides are moved with a renamed default-locale layer.
 | `layer.display` | boolean | Initial visibility. |
 | `layer.format` | XYZ format key | `cluster`, `geojson`, `googleMapTiles`, `mapboxStyle`, `maplibre`, `mvt`, `tiles`, `vector`, or `wkt`. The dashboard currently creates the database and tile formats used by this deployment. |
 | `layer.template` | string | Workspace template merged into the layer; may supply the source properties otherwise required by a concrete layer. |

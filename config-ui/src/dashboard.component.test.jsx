@@ -13,6 +13,7 @@ import {
   DerivedLayers,
   Root,
   derivedLayerFormDefinition,
+  geometryKind,
   reconcileDerivedWorkspace,
 } from './main.jsx';
 
@@ -36,6 +37,16 @@ const response = (payload, status = 200) => ({
   status,
   statusText: status >= 200 && status < 300 ? 'OK' : 'Request failed',
   json: async () => payload,
+});
+
+test('recognizes mixed-case PostGIS geometry metadata', () => {
+  const columns = type => ({columns: [
+    {name: 'geom_3857', geometryType: 'Geometry'},
+    {name: 'geom', geometryType: type},
+  ]});
+  expect(geometryKind({geom: 'geom_3857'}, columns('Point'))).toBe('point');
+  expect(geometryKind({geom: 'geom_3857'}, columns('MultiLineString'))).toBe('line');
+  expect(geometryKind({geom: 'geom_3857'}, columns('MultiPolygon'))).toBe('polygon');
 });
 
 function standardFetch(workspaceRequest) {
@@ -99,7 +110,16 @@ describe('Dashboard managed save lifecycle', () => {
               {title: 'Kept', field: 'kept', type: 'text'},
             ],
             filter: {include: ['old_name', 'kept']},
-            style: {hover: {field: 'old_name', display: true}},
+            style: {
+              hover: {field: 'old_name', display: true},
+              theme: {
+                type: 'categorized',
+                field: 'old_name',
+                categories: [{value: 'A', label: 'A', style: {
+                  icon: {type: 'dot', fillColor: '#176b4d'},
+                }}],
+              },
+            },
           },
         },
       },
@@ -129,6 +149,11 @@ describe('Dashboard managed save lifecycle', () => {
     });
     expect(layer.filter.include).toEqual(['kept']);
     expect(layer.style.hover).toBeUndefined();
+    expect(layer._dashboard.symbologyInspection).toEqual({
+      fields: ['old_name'],
+      reason: 'derived_schema_changed',
+      relation: 'derived_layers.summary',
+    });
     expect(result.summary).toEqual({layers: 1, added: 1, removed: 1});
     expect(source.locale.layers.Summary.infoj).toHaveLength(4);
   });
@@ -599,6 +624,7 @@ describe('Dashboard managed save lifecycle', () => {
             infoj: [
               {type: 'geometry', field: 'geom'},
               {title: 'Status', field: 'status', type: 'text'},
+              {title: 'Priority', field: 'priority', type: 'integer'},
             ],
           },
         },
@@ -620,9 +646,12 @@ describe('Dashboard managed save lifecycle', () => {
     });
     expect(screen.getByRole('combobox', {name: /Category field/}).value)
       .toBe('status');
+    fireEvent.change(screen.getByRole('combobox', {name: /Category field/}), {
+      target: {value: 'priority'},
+    });
     fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
-    fireEvent.change(screen.getByRole('textbox', {name: /Value/}), {
-      target: {value: 'Open'},
+    fireEvent.change(screen.getByRole('spinbutton', {name: /Exact value/}), {
+      target: {value: '10'},
     });
     fireEvent.change(screen.getByRole('textbox', {name: /Legend label/}), {
       target: {value: 'Open places'},
@@ -631,9 +660,145 @@ describe('Dashboard managed save lifecycle', () => {
     const managed = JSON.parse(container.querySelector('.advanced textarea').value);
     expect(managed.style.theme).toMatchObject({
       type: 'categorized',
-      field: 'status',
-      categories: [{value: 'Open', label: 'Open places'}],
+      field: 'priority',
+      categories: [{value: 10, label: 'Open places'}],
     });
+  });
+
+  test('uses display names in navigation and assigns line category stroke colours without catalog metadata', async () => {
+    const lineWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          internal_routes_key: {
+            name: 'Walking routes',
+            format: 'mvt',
+            geom: 'geom',
+            style: {
+              default: {strokeColor: '#008000', strokeWidth: 3},
+            },
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {title: 'Length metres', field: 'length_metres', type: 'numeric'},
+            ],
+          },
+          Walking_routes: {
+            name: 'Reserved route key',
+            format: 'mvt',
+            style: {default: {strokeColor: '#333333'}},
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: lineWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    expect(await screen.findByRole('button', {name: 'Walking routes'})).toBeTruthy();
+    expect(screen.queryByRole('button', {name: 'internal_routes_key'})).toBeNull();
+    fireEvent.click(screen.getByRole('button', {name: 'Walking routes'}));
+    const displayName = screen.getByRole('textbox', {name: /Display name/});
+    fireEvent.change(displayName, {target: {value: 'Walking routes!'}});
+    fireEvent.blur(displayName);
+    expect(screen.getByRole('button', {name: 'Walking routes!'}).title)
+      .toBe('Layer key: Walking_routes_1');
+    expect(screen.getByText(/Line features use stroke colour/)).toBeTruthy();
+    fireEvent.change(screen.getByRole('combobox', {name: /Symbology mode/}), {
+      target: {value: 'Data-driven graduated'},
+    });
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+
+    const managed = JSON.parse(
+      container.querySelector('[aria-label="Advanced layer JSON"]').value,
+    );
+    expect(managed.style.theme.categories.map(category => category.style.strokeColor))
+      .toEqual(['#176b4d', '#277da1']);
+    expect(managed.style.theme.categories.every(category => (
+      category.style.fillColor === undefined
+    ))).toBe(true);
+  });
+
+  test('warns before replacing a configured theme and guides graduated and distributed modes', async () => {
+    const modeWorkspace = {
+      ...workspace,
+      locale: {
+        ...workspace.locale,
+        layers: {
+          Measures: {
+            name: 'Measures',
+            format: 'mvt',
+            qID: 'id',
+            style: {
+              default: {icon: {type: 'dot', fillColor: '#777777'}},
+              theme: {
+                type: 'categorized',
+                field: 'status',
+                categories: [{value: 'Open', label: 'Open', style: {
+                  icon: {type: 'dot', fillColor: '#00aa44'},
+                }}],
+              },
+            },
+            infoj: [
+              {type: 'geometry', field: 'geom'},
+              {title: 'Status', field: 'status', type: 'text'},
+              {title: 'Score', field: 'score', type: 'numeric'},
+            ],
+          },
+        },
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: modeWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false)
+      .mockReturnValue(true);
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Measures'}));
+    const mode = screen.getByRole('combobox', {name: /Symbology mode/});
+    fireEvent.change(mode, {target: {value: 'Data-driven graduated'}});
+    expect(JSON.parse(container.querySelector('[aria-label="Advanced layer JSON"]').value)
+      .style.theme.type).toBe('categorized');
+
+    fireEvent.change(mode, {target: {value: 'Data-driven graduated'}});
+    let managed = JSON.parse(
+      container.querySelector('[aria-label="Advanced layer JSON"]').value,
+    );
+    expect(managed.style.theme).toMatchObject({
+      type: 'graduated',
+      field: 'score',
+      graduated_breaks: 'less_than',
+      categories: [],
+    });
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+    expect(screen.getByRole('spinbutton', {name: /Numeric break/})).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'Add legend category'}));
+    expect(screen.getByText('XYZ effective range: ≤ 10')).toBeTruthy();
+    expect(screen.getByText('XYZ effective range: > 10')).toBeTruthy();
+
+    fireEvent.change(mode, {target: {value: 'Data-driven distributed'}});
+    managed = JSON.parse(
+      container.querySelector('[aria-label="Advanced layer JSON"]').value,
+    );
+    expect(managed.style.theme).toMatchObject({
+      type: 'distributed',
+      field: 'id',
+      categories: [],
+    });
+    expect(confirm).toHaveBeenCalledTimes(3);
   });
 
   test('previews the effective highlighted style with inherited opacity', async () => {
@@ -672,7 +837,7 @@ describe('Dashboard managed save lifecycle', () => {
     }));
     render(<Dashboard openSecurity={() => {}}/>);
 
-    fireEvent.click(await screen.findByRole('button', {name: 'Orders'}));
+    fireEvent.click(await screen.findByRole('button', {name: 'Smoke Control Orders'}));
     const defaultPreview = screen.getAllByText('Default')
       .find(element => element.closest('.symbol-state'))
       .closest('.symbol-state');
