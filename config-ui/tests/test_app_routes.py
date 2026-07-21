@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import io
-import unittest
 import threading
+import tempfile
+import unittest
 from datetime import datetime, timezone
 from http import HTTPStatus
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import app
+from control_plane import ControlStore
 
 
 class CatalogSymbologyValidationTests(unittest.TestCase):
@@ -311,6 +314,54 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             "statement timed out",
             call.kwargs["error"]["message"],
         )
+
+    def test_background_create_with_datetime_metadata_records_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            operation = control.create_operation(
+                "derived-layer.create",
+                "admin",
+                {"name": "definitive_paths_h3_r9"},
+            )
+            derived = Mock()
+            derived.create.return_value = {
+                "name": "definitive_paths_h3_r9",
+                "kind": "materialized",
+                "sources": ["leeds.definitive_paths"],
+                "createdAt": datetime(
+                    2026, 7, 21, 11, 11, 52, 489807,
+                    tzinfo=timezone.utc,
+                ),
+                "refreshedAt": datetime(
+                    2026, 7, 21, 11, 11, 52, 489807,
+                    tzinfo=timezone.utc,
+                ),
+            }
+
+            with patch.object(app, "DERIVED", derived), patch.object(
+                app, "CONTROL", control
+            ), patch.object(control, "audit"):
+                app.run_derived_background(
+                    operation["id"],
+                    "create",
+                    {"name": "definitive_paths_h3_r9"},
+                    "admin",
+                    "127.0.0.1",
+                )
+
+            stored = control.read_operation(operation["id"])
+            self.assertEqual("succeeded", stored["status"])
+            self.assertIsNone(stored["error"])
+            layer = stored["result"]["derivedLayer"]
+            self.assertEqual(
+                "2026-07-21T11:11:52.489807+00:00",
+                layer["createdAt"],
+            )
+            self.assertEqual(
+                "2026-07-21T11:11:52.489807+00:00",
+                layer["refreshedAt"],
+            )
 
 
 class ReloadRouteTests(unittest.TestCase):

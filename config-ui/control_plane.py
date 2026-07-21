@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import datetime as dt
+import decimal
 import fcntl
 import hashlib
 import hmac
@@ -12,6 +13,7 @@ import re
 import secrets
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +71,18 @@ def _strict_json(raw: str) -> Any:
     return json.loads(raw, parse_constant=_reject_json_constant)
 
 
+def json_default(value: Any) -> str:
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    if isinstance(value, (decimal.Decimal, uuid.UUID)):
+        return str(value)
+    raise TypeError(
+        f"Object of type {type(value).__name__} is not JSON serializable"
+    )
+
+
 def _atomic_bytes(path: Path, encoded: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -100,6 +114,7 @@ def _atomic_json(path: Path, value: Any) -> None:
                 indent=2,
                 ensure_ascii=False,
                 allow_nan=False,
+                default=json_default,
             ) + "\n"
         ).encode("utf-8"),
     )
@@ -319,6 +334,7 @@ class ControlStore:
                 separators=(",", ":"),
                 ensure_ascii=False,
                 allow_nan=False,
+                default=json_default,
             ) + "\n"
         ).encode("utf-8")
         if len(encoded) > AUDIT_RECORD_MAX_BYTES:
@@ -332,6 +348,7 @@ class ControlStore:
                     separators=(",", ":"),
                     ensure_ascii=False,
                     allow_nan=False,
+                    default=json_default,
                 ) + "\n"
             ).encode("utf-8")
         with self._locked():

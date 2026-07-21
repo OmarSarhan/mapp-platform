@@ -1,7 +1,9 @@
 import stat
 import tempfile
 import unittest
-from datetime import timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from control_plane import ControlStore, iso, now, token_hash
@@ -206,6 +208,41 @@ class ControlPlaneTests(unittest.TestCase):
                     (store.operations / f"{terminal['id']}.json").stat().st_mode
                 ),
             )
+
+    def test_operation_results_normalize_database_native_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "derived-layer.create",
+                "token:test",
+                {"name": "places"},
+            )
+            identifier = uuid.UUID("12345678-1234-5678-1234-567812345678")
+            terminal = store.finish_operation(
+                operation["id"],
+                status="succeeded",
+                result={
+                    "derivedLayer": {
+                        "name": "places",
+                        "createdAt": datetime(
+                            2026, 7, 21, 11, 11, 52, 489807,
+                            tzinfo=timezone.utc,
+                        ),
+                        "businessDate": date(2026, 7, 21),
+                        "rowCount": Decimal("2941"),
+                        "requestId": identifier,
+                    }
+                },
+            )
+
+            self.assertEqual("succeeded", terminal["status"])
+            stored = store.read_operation(operation["id"])
+            layer = stored["result"]["derivedLayer"]
+            self.assertEqual("2026-07-21T11:11:52.489807+00:00", layer["createdAt"])
+            self.assertEqual("2026-07-21", layer["businessDate"])
+            self.assertEqual("2941", layer["rowCount"])
+            self.assertEqual(str(identifier), layer["requestId"])
 
     def test_running_operations_become_indeterminate_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
