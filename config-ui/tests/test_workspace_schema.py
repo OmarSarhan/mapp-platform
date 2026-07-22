@@ -17,7 +17,6 @@ def valid_workspace():
                     "table": "public.places", "geom": "geom_3857",
                     "srid": "3857", "qID": "id",
                     "infoj": [{"title": "Name", "field": "name", "inline": True}],
-                    "futureXYZProperty": {"is": "preserved"},
                 }
             },
         },
@@ -25,8 +24,73 @@ def valid_workspace():
 
 
 class WorkspaceValidationTests(unittest.TestCase):
-    def test_accepts_supported_workspace_and_unknown_properties(self):
+    def test_accepts_supported_workspace(self):
         self.assertEqual(validate_workspace(valid_workspace(), {"MAPP"}), [])
+
+    def test_accepts_native_templates_gazetteer_and_plugins(self):
+        data = valid_workspace()
+        data["templates"] = {
+            "summary": {
+                "template": "SELECT count(*) FROM places",
+                "dbs": "MAPP",
+                "value_only": True,
+                "statement_timeout": 5000,
+            },
+            "remote_layer": {"src": "file:/instance/layer.json"},
+        }
+        data["locale"].update({
+            "templates": ["base_locale", {"src": "file:/instance/extra.json"}],
+            "syncPlugins": ["zoomBtn", "zoomToArea"],
+            "keyvalue_dictionary": [{"key": "name", "value": "Places", "default": "Locations"}],
+        })
+        data["locale"]["layers"]["Places"]["gazetteer"] = {
+            "datasets": [{"layer": "Places", "qterm": "name", "limit": 10}]
+        }
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+    def test_rejects_unknown_properties_at_contract_boundaries(self):
+        data = valid_workspace()
+        data["futureRoot"] = True
+        data["locale"]["measure_distance"] = {}
+        data["locale"]["layers"]["Places"]["futureXYZProperty"] = {}
+        data["locale"]["feature_info"] = {"features": True, "futureOption": True}
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertEqual(paths, {
+            "futureRoot",
+            "locale.measure_distance",
+            "locale.layers.Places.futureXYZProperty",
+            "locale.feature_info.futureOption",
+        })
+
+    def test_rejects_invalid_template_and_gazetteer_descriptors(self):
+        data = valid_workspace()
+        data["templates"] = {"bad": {"statement_timeout": -1, "module": "yes"}}
+        data["locale"]["layers"]["Places"]["gazetteer"] = {
+            "datasets": [{"layer": "Places", "qterm": "bad-name"}]
+        }
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("templates.bad.statement_timeout", paths)
+        self.assertIn("templates.bad.module", paths)
+        self.assertIn("locale.layers.Places.gazetteer.datasets.0.qterm", paths)
+
+    def test_validates_only_bundled_plugin_contracts(self):
+        data = valid_workspace()
+        data["locale"].update({
+            "consent": {"text": "Allow required storage?", "title": "Consent"},
+            "custom_theme": {"primary": "#123456"},
+            "feature_info": {"features": True, "css": "max-width: 20rem"},
+            "layer_order": ["Places"],
+            "link_button": {"href": "/help", "icon_name": "help"},
+            "test": {"quiet": True, "showSummary": False},
+            "zoomBtn": {},
+        })
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+        data["locale"]["consent"] = {}
+        data["locale"]["link_button"] = {"href": "/help"}
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.consent.text", paths)
+        self.assertIn("locale.link_button.icon_name", paths)
 
     def test_accepts_non_empty_xyz_layer_group_and_rejects_empty_group(self):
         data = valid_workspace()

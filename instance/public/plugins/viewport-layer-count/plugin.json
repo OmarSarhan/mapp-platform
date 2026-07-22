@@ -1,0 +1,42 @@
+{
+  "id": "viewport-layer-count",
+  "name": "Viewport layer count",
+  "version": "1.0.0",
+  "xyzVersion": ">=4.23.0 <5.0.0",
+  "entry": "index.mjs",
+  "registrationKey": "viewport_layer_count",
+  "scope": ["layer"],
+  "dispatch": ["layer"],
+  "configurationKey": "viewport_layer_count",
+  "configurationSchema": {
+    "type": "object",
+    "properties": {
+      "debounce": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 5000,
+        "description": "Delay in milliseconds before refreshing the viewport count."
+      }
+    },
+    "additionalProperties": false
+  },
+  "summary": "Shows a queryable layer's feature count beside its name for the current map viewport.",
+  "prerequisites": [
+    "Queryable database layer",
+    "Stable qID",
+    "filter.viewport enabled"
+  ],
+  "dependencies": [],
+  "aliases": ["/instance/plugins/viewport-layer-count.mjs"],
+  "previewAssertions": [
+    {"type": "registration"},
+    {"type": "layer-dispatch"},
+    {"type": "selector-visible", "selector": "[data-id=\"viewport-layer-count\"]"},
+    {"type": "no-plugin-console-errors"}
+  ],
+  "documentation": {
+    "configuration": "Set layer.viewport_layer_count and add the entry URL to layer.plugins.",
+    "behavior": "Adds a debounced badge to the layer header and refreshes it after map movement.",
+    "security": "Runs as trusted same-origin browser JavaScript and performs XYZ count requests."
+  }
+}
