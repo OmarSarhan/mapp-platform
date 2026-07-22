@@ -14,14 +14,21 @@ first release.
 
 ### Changed
 
+- Added a manifest-backed external XYZ plugin registry with hashed discovery,
+  strict dynamic schemas, proposal and preview bindings, declarative browser
+  evidence, dashboard/CLI discovery, and cross-service mount verification.
+- Restricted the advertised workspace schema to capabilities verified in the
+  pinned XYZ v4.23.4 source, with typed native templates, layer gazetteer,
+  dictionaries, SVG templates, roles, and the exact bundled plugin registry;
+  properties outside the audited contract are rejected with their exact path
+  rather than preserved or silently removed.
 - Added atomic, validated derived-layer replacement and kind conversion, with
   structured blocking feedback for PostgreSQL dependents and dashboard
   workspace references.
 - Added first-class XYZ layer-folder support through validated per-layer
   `group` values, grouped dashboard navigation, and a layer-folder editor.
 - Added first-class controls for XYZ's interactive layer Styling panel,
-  including panel visibility and ordered `style.elements`, while preserving
-  custom extension keys.
+  including panel visibility and ordered audited `style.elements` keys.
 - Added schema validation and dashboard controls for XYZ layer Filtering
   panels, layer-level behavior, and per-information-field filters.
 - Made proposal screenshots render a high-resolution, isolated

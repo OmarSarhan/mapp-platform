@@ -549,6 +549,7 @@ class ApplyRouteTests(unittest.TestCase):
             "originalRevision": "revision-1",
             "candidate": candidate,
             "candidateHash": app.workspace_hash(candidate),
+            "pluginCatalogueFingerprint": app.plugin_catalogue()["fingerprint"],
         }
 
     def test_apply_requires_explicit_approval_before_operation_creation(self):
@@ -629,6 +630,7 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "originalHash": app.workspace_hash(original),
             "candidate": candidate,
             "candidateHash": app.workspace_hash(candidate),
+            "pluginCatalogueFingerprint": app.plugin_catalogue()["fingerprint"],
             "diff": [],
         }
 
@@ -1289,6 +1291,16 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         declined["status"] = "declined"
         with patch.object(app, "proposal_read", return_value=declined):
             with self.assertRaisesRegex(ValueError, "declined"):
+                app.preview_proposal("proposal-1")
+
+    def test_preview_rejects_a_changed_plugin_catalogue(self) -> None:
+        proposal = self.proposal()
+        proposal["pluginCatalogueFingerprint"] = "stale"
+        with (
+            patch.object(app, "proposal_read", return_value=proposal),
+            patch.object(app, "read_workspace", return_value=(b"{}", {}, "revision-1")),
+        ):
+            with self.assertRaisesRegex(FileExistsError, "plugin catalogue changed"):
                 app.preview_proposal("proposal-1")
         corrupt = self.proposal()
         corrupt["candidateHash"] = "0" * 64

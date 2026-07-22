@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
+
 try:
     import psycopg
     from psycopg import sql
@@ -55,10 +57,64 @@ RULES = [
     {"id": "sql.scalar_read_only", "category": "security", "description": "Calculated information values are one read-only scalar expression.", "remediation": "Remove statements, comments, subqueries, session functions, and system access."},
     {"id": "derived_layer.select_only", "category": "security", "description": "Managed derived layers are one dependency-checked SELECT materialized only inside derived_layers.", "remediation": "Declare every schema-qualified source and remove statements, comments, undeclared relations, or unsafe operations."},
     {"id": "svg.safe", "category": "security", "description": "Dashboard SVGs must be bounded, parseable, and free of active content.", "remediation": "Use a safe SVG from `config-cli icons list`."},
+    {"id": "plugin.catalogue", "category": "security", "description": "External XYZ plugins must be source-controlled, manifest-backed, compatible, contained, and schema-closed.", "remediation": "Run `config-cli plugins validate` and correct the deployment plugin package."},
+    {"id": "proposal.plugin_catalogue", "category": "proposal", "description": "A proposal and its preview evidence apply only to the plugin catalogue fingerprint against which they were created.", "remediation": "Create and preview a new proposal after any plugin deployment change."},
     {"id": "proposal.revision", "category": "proposal", "description": "A proposal applies only to the revision from which it was created.", "remediation": "Create a new proposal against the current workspace."},
     {"id": "visual.data", "category": "visual", "description": "A database-backed visual test needs non-empty valid geometry.", "remediation": "Load data or provide an explicit centre and zoom."},
 ]
 DATABASE_LAYER_FORMATS = {"cluster", "geojson", "mvt", "vector", "wkt"}
+
+PLUGIN_MANIFEST: list[dict[str, Any]] = [
+    {"key": "admin", "configuration": "object", "execution": "locale", "purpose": "Administrator navigation for authenticated administrators.", "prerequisites": ["standard map button column", "authenticated administrator"]},
+    {"key": "consent", "configuration": "object requiring text", "execution": "locale", "purpose": "Persisted user-consent confirmation.", "prerequisites": ["authenticated user", "user IndexedDB"]},
+    {"key": "custom_theme", "configuration": "CSS colour string map", "execution": "locale", "purpose": "Apply locale CSS colour variables.", "prerequisites": ["XYZ cssColour utility"]},
+    {"key": "dark_mode", "configuration": "object", "execution": "locale", "purpose": "Persisted light/dark mode toggle.", "prerequisites": ["standard map button column", "user IndexedDB for persistence"]},
+    {"key": "feature_info", "configuration": "true or object with features/css", "execution": "locale", "purpose": "Raw clicked-feature popup interaction.", "prerequisites": ["standard map button column"]},
+    {"key": "fullscreen", "configuration": "object", "execution": "locale", "purpose": "Fullscreen layout toggle and map resize.", "prerequisites": ["standard map button column"]},
+    {"key": "layer_order", "configuration": "array of layer keys", "execution": "locale", "purpose": "Sort the decorated locale layer array.", "prerequisites": []},
+    {"key": "link_button", "configuration": "link object or array", "execution": "locale", "purpose": "Add configured navigation links.", "prerequisites": ["standard map button column", "href and icon_name"]},
+    {"key": "locator", "configuration": "object", "execution": "locale", "purpose": "Browser-geolocation button.", "prerequisites": ["standard map button column", "browser geolocation permission"]},
+    {"key": "login", "configuration": "object", "execution": "locale", "purpose": "Login or logout navigation.", "prerequisites": ["standard map button column", "page login advertisement"]},
+    {"key": "svg_templates", "configuration": "object mapping names to URLs", "execution": "locale-sync", "purpose": "Legacy SVG template loader; svgTemplates is preferred.", "prerequisites": ["fetchable SVG sources"]},
+    {"key": "test", "configuration": "object with quiet/showSummary", "execution": "locale", "purpose": "Run requested core or integrity browser tests.", "prerequisites": ["test URL hook", "test framework import"]},
+    {"key": "userIDB", "configuration": "object", "execution": "locale", "purpose": "Developer user-record JSON editor.", "prerequisites": ["standard map button column", "JSON editor"]},
+    {"key": "userLayer", "configuration": "object", "execution": "locale", "purpose": "Developer unsaved-layer JSON editor.", "prerequisites": ["layer JSON editor UI"]},
+    {"key": "userLocale", "configuration": "object", "execution": "locale", "purpose": "Store and remove personal composed locales.", "prerequisites": ["authenticated user", "standard map button column"]},
+    {"key": "zoomBtn", "configuration": "object", "execution": "locale", "purpose": "Zoom buttons respecting effective view limits.", "prerequisites": ["standard map button column"]},
+    {"key": "zoomToArea", "configuration": "object", "execution": "locale", "purpose": "Drag-box zoom interaction.", "prerequisites": ["standard map button column"]},
+]
+
+
+def plugin_manifest() -> dict[str, Any]:
+    external = external_plugin_catalogue()
+    return {
+        "xyzVersion": XYZ_VERSION,
+        "xyzCommit": external["xyzCommit"],
+        "fingerprint": external["fingerprint"],
+        "registrySource": "GEOLYTIX XYZ lib/plugins/_plugins.mjs",
+        "loading": {
+            "sources": "locale.plugins plus every layer.plugins array",
+            "extensions": [".js", ".mjs"],
+            "relativeResolution": "current document origin",
+            "deduplication": "exact source string, first occurrence after layer sources are prepended",
+            "failure": "dynamic import failures are logged and loading continues via Promise.allSettled",
+            "registration": "imported modules must register functions on global mapp.plugins; exports are not automatically registered",
+        },
+        "dispatch": {
+            "sync": "locale.syncPlugins keys execute sequentially and are awaited after dynamic imports",
+            "async": "other locale keys matching mapp.plugins functions are invoked together and awaited with Promise.all",
+            "layer": "during layer decoration, every layer property key matching mapp.plugins is invoked with the complete layer object and is not awaited",
+            "missingKeys": "unknown sync keys and locale/layer properties without registered functions are ignored",
+        },
+        "security": [
+            "Plugin modules execute arbitrary browser JavaScript in the XYZ origin.",
+            "A schema-valid plugin URL is not proof that the module loads or registers the expected key.",
+            "Plugin changes require source review, proposal review, reload confirmation, and focused browser evidence.",
+        ],
+        "bundled": copy.deepcopy(PLUGIN_MANIFEST),
+        "external": external["external"],
+        "valid": external["valid"],
+    }
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
     "derived-layers.create": {
@@ -454,6 +510,7 @@ def contract(instance_id: str) -> dict[str, Any]:
         },
         "commands": [
             "describe", "schema", "rules", "examples",
+            "plugins list", "plugins show", "plugins validate", "plugins usage",
             "capabilities list", "capabilities show",
             "workspace get", "layers list", "layers get",
             "layers style-elements", "layers filters", "layers effective",
@@ -664,7 +721,7 @@ def apply_operations(document: dict, operations: list[dict]) -> tuple[dict, list
 
 
 def schema(pointer: str | None = None) -> Any:
-    data = strict_json_loads(SCHEMA_PATH.read_text())
+    data = composed_schema(strict_json_loads(SCHEMA_PATH.read_text()))
     return pointer_get(data, pointer) if pointer else data
 
 
@@ -883,6 +940,7 @@ def proposal_create(store, original: dict, original_revision: str, candidate: di
         "originalRevision": original_revision,
         "originalHash": workspace_hash(original),
         "candidateHash": workspace_hash(candidate),
+        "pluginCatalogueFingerprint": external_plugin_catalogue()["fingerprint"],
         "operations": operations,
         "diff": diff,
         "explanation": explanation or explain_diff(diff),
@@ -911,10 +969,12 @@ def proposal_check(original: dict, original_revision: str, candidate: dict,
                    explanation: str | None = None) -> dict:
     """Return proposal evidence without allocating or persisting a proposal."""
     candidate_hash = workspace_hash(candidate)
+    plugin_fingerprint = external_plugin_catalogue()["fingerprint"]
     fingerprint = hashlib.sha256(json.dumps({
         "revision": original_revision,
         "candidateHash": candidate_hash,
         "operations": operations,
+        "pluginCatalogueFingerprint": plugin_fingerprint,
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
        allow_nan=False).encode()).hexdigest()
     return {
@@ -923,6 +983,7 @@ def proposal_check(original: dict, original_revision: str, candidate: dict,
         "originalRevision": original_revision,
         "originalHash": workspace_hash(original),
         "candidateHash": candidate_hash,
+        "pluginCatalogueFingerprint": plugin_fingerprint,
         "checkFingerprint": fingerprint,
         "operations": operations,
         "diff": diff,
@@ -963,7 +1024,7 @@ def proposal_list(store) -> list[dict]:
     output = []
     for path in sorted(store.proposals.glob("*/proposal.json"), reverse=True):
         item = strict_json_loads(path.read_text())
-        output.append({key: item.get(key) for key in ("id", "status", "created", "actor", "explanation", "originalRevision", "candidateHash")})
+        output.append({key: item.get(key) for key in ("id", "status", "created", "actor", "explanation", "originalRevision", "candidateHash", "pluginCatalogueFingerprint")})
     return output
 
 

@@ -29,9 +29,10 @@ from derived_layers import (
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from workspace_schema import expression_function_names, validate_workspace
+from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore
 from control_api import (
-    PROPOSAL_LOCK, RULES, apply_operations, apply_visual_override, capabilities, contract, examples,
+    PROPOSAL_LOCK, RULES, apply_operations, apply_visual_override, capabilities, contract, examples, plugin_manifest,
     effective_locales, is_probeable_database_layer,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
     reload_status, reload_timeout, request_reload,
@@ -700,7 +701,35 @@ def preview_proposal(proposal_id: str) -> dict:
         raise FileExistsError(
             "Proposal has been superseded by a newer workspace revision."
         )
+    if proposal.get("pluginCatalogueFingerprint") != plugin_catalogue()["fingerprint"]:
+        raise FileExistsError(
+            "Proposal plugin catalogue changed; create and preview a new proposal."
+        )
     return proposal
+
+
+def plugin_preview_checks(workspace: dict, locale_key: str, layers: list[str]) -> list[dict]:
+    catalogue = plugin_catalogue()
+    by_id = {entry["id"]: entry for entry in catalogue["external"] if entry.get("available")}
+    usage = plugin_usage(workspace)
+    selected_paths = {
+        f"{locale_key}.layers.{layer}" for layer in layers
+    } | {locale_key}
+    checks = []
+    for item in usage:
+        if item["path"] not in selected_paths:
+            continue
+        plugin = by_id[item["pluginId"]]
+        checks.append({
+            "id": plugin["id"],
+            "registrationKey": plugin["registrationKey"],
+            "entryUrl": plugin["entryUrl"],
+            "entryHash": plugin["files"][0]["sha256"] if plugin.get("files") else None,
+            "scope": item["scope"],
+            "path": item["path"],
+            "assertions": plugin["previewAssertions"],
+        })
+    return checks
 
 
 def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
@@ -719,6 +748,7 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             "panels": panels,
             "expectedPanelText": payload.get("expectedPanelText", []),
             "metadata": payload.get("metadata"),
+            "pluginChecks": plan.get("pluginChecks", []),
         },
         allow_nan=False,
     ).encode()
@@ -1362,6 +1392,8 @@ def annotated(errors):
         message = error.get("message", "")
         if "fieldfx" in path:
             rule, phase = "sql.scalar_read_only", "security"
+        elif ".plugins" in path or "Plugin" in message or "plugin" in message:
+            rule, phase = "plugin.catalogue", "plugin"
         elif path.endswith(".qID") and ("null" in message or "unique" in message or "duplicate" in message):
             rule, phase = "workspace.feature_id", "data"
         elif "render probe" in message:
@@ -1658,6 +1690,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"schema": contract_schema(query.get("pointer", [None])[0])})
             except (KeyError, IndexError, ValueError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        elif path == "/api/plugins":
+            _, workspace, _ = read_workspace()
+            manifest = plugin_manifest()
+            manifest["usage"] = plugin_usage(workspace)
+            manifest["workspaceErrors"] = validate_workspace_plugins(workspace)
+            self._json(HTTPStatus.OK, {"plugins": manifest})
         elif path == "/api/rules":
             category = parse_qs(urlparse(self.path).query).get("category", [None])[0]
             self._json(HTTPStatus.OK, {"rules": [rule for rule in RULES if not category or rule["category"] == category]})
@@ -2110,6 +2148,7 @@ class Handler(SimpleHTTPRequestHandler):
                     ]["requestedLayerPresent"],
                     "viewSource": plan_source,
                     "viewMode": view_mode,
+                    "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                 })
                 binding = {
                     "source": "candidate",
@@ -2134,12 +2173,22 @@ class Handler(SimpleHTTPRequestHandler):
                     "anchorLayer": group_preview["original"]["anchorLayer"],
                     "layers": group_preview["original"]["layers"],
                     "activeGroups": group_preview["original"]["groups"],
+                    "pluginChecks": plugin_preview_checks(
+                        proposal["original"],
+                        group_preview["locale"],
+                        group_preview["original"]["layers"],
+                    ),
                 }
                 candidate_render_plan = {
                     **render_plan,
                     "anchorLayer": group_preview["candidate"]["anchorLayer"],
                     "layers": group_preview["candidate"]["layers"],
                     "activeGroups": group_preview["candidate"]["groups"],
+                    "pluginChecks": plugin_preview_checks(
+                        proposal["candidate"],
+                        group_preview["locale"],
+                        group_preview["candidate"]["layers"],
+                    ),
                 }
                 if group_preview["changeKind"] != "edited":
                     original_render_plan.pop("interaction", None)
@@ -2183,6 +2232,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "candidateLayers": group_preview["candidate"]["layers"],
                         "featureInfoComparison": feature_info_comparison,
                         "panels": panels,
+                        "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                     },
                 )
                 comparison_binding_valid = True
@@ -2223,6 +2273,10 @@ class Handler(SimpleHTTPRequestHandler):
                                 "metadata": binding,
                             },
                             target_url=target_url,
+                        )
+                    if proposal["pluginCatalogueFingerprint"] != plugin_catalogue()["fingerprint"]:
+                        raise FileExistsError(
+                            "Plugin catalogue changed during preview; run a new proposal preview."
                         )
                     if action == "screenshot":
                         if (
@@ -2331,6 +2385,18 @@ class Handler(SimpleHTTPRequestHandler):
                     else:
                         result = candidate_result
                         preview = candidate_preview
+                except FileExistsError as exc:
+                    operation = CONTROL.finish_operation(
+                        operation["id"],
+                        status="failed",
+                        error={"code": "visual.plugin_catalogue_stale", "message": str(exc)},
+                    )
+                    self._json(HTTPStatus.CONFLICT, {
+                        **binding,
+                        "error": str(exc),
+                        "operation": operation,
+                    })
+                    return
                 except TimeoutError as exc:
                     operation = CONTROL.finish_operation(
                         operation["id"],
@@ -2540,6 +2606,13 @@ class Handler(SimpleHTTPRequestHandler):
                     DB_CONNECTIONS,
                     payload.get("locale"),
                 )
+                workspace_for_plan = payload.get("workspace", current_workspace)
+                plan["pluginChecks"] = plugin_preview_checks(
+                    workspace_for_plan,
+                    plan.get("locale", "locale"),
+                    plan.get("layers", [layer_key]),
+                )
+                plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
                 self._json(
                     HTTPStatus.OK,
                     {"plan": apply_visual_override(plan, payload)},
@@ -2559,6 +2632,13 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                     payload,
                 )
+                workspace_for_plan = payload.get("workspace", current_workspace)
+                plan["pluginChecks"] = plugin_preview_checks(
+                    workspace_for_plan,
+                    plan.get("locale", "locale"),
+                    plan.get("layers", [layer_key]),
+                )
+                plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
                 runner_payload = json.dumps(
                     {
                         "url": os.environ.get(
@@ -2809,6 +2889,15 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json(HTTPStatus.CONFLICT, {
                             "error": "Stored proposal candidate failed its integrity check.",
                             "ruleId": "proposal.integrity",
+                        })
+                        return
+                    current_plugin_fingerprint = plugin_catalogue()["fingerprint"]
+                    if proposal.get("pluginCatalogueFingerprint") != current_plugin_fingerprint:
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": "Plugin catalogue changed; create and preview a new proposal.",
+                            "ruleId": "proposal.plugin_catalogue",
+                            "expectedPluginCatalogueFingerprint": proposal.get("pluginCatalogueFingerprint"),
+                            "actualPluginCatalogueFingerprint": current_plugin_fingerprint,
                         })
                         return
                     validate_before_apply = True

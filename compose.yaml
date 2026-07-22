@@ -78,11 +78,13 @@ services:
       DERIVED_READER_ROLE: ${DERIVED_READER_ROLE:-}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
+      PLUGIN_DIR: /instance-public/plugins
       PORT: 8080
       CONTROL_DIR: /control
       WORKSPACE_SCHEMA_PATH: /app/schema/workspace.schema.json
       RELOAD_DIR: /reload
       XYZ_VERSION: ${XYZ_REF:-v4.23.4}
+      XYZ_COMMIT: ${XYZ_COMMIT:-a6f03c07dd7aaae2e9ab04087143ee0400e15cb9}
       CONFIG_ALLOWED_HOSTS: ${CONFIG_ALLOWED_HOSTS:-localhost,127.0.0.1,config.localhost,config-ui}
       CONFIG_SECURE_COOKIES: ${CONFIG_SECURE_COOKIES:-false}
       BROWSER_RUNNER_URL: http://browser-runner:8080/run

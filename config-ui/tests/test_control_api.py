@@ -15,6 +15,7 @@ from control_api import (
     examples,
     is_probeable_database_layer,
     pointer_get,
+    plugin_manifest,
     proposal_create,
     proposal_check,
     reload_status,
@@ -29,6 +30,26 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_plugin_manifest_describes_loader_dispatch_and_exact_registry(self):
+        payload = plugin_manifest()
+        keys = {item["key"] for item in payload["bundled"]}
+        self.assertEqual("v4.23.4", payload["xyzVersion"])
+        self.assertEqual(64, len(payload["fingerprint"]))
+        external = {item["id"]: item for item in payload["external"]}
+        self.assertTrue(external["viewport-layer-count"]["available"])
+        self.assertEqual(
+            "/instance/plugins/viewport-layer-count/index.mjs",
+            external["viewport-layer-count"]["entryUrl"],
+        )
+        self.assertIn("allSettled", payload["loading"]["failure"])
+        self.assertIn("not awaited", payload["dispatch"]["layer"])
+        self.assertEqual({
+            "admin", "consent", "custom_theme", "dark_mode", "feature_info",
+            "fullscreen", "layer_order", "link_button", "locator", "login",
+            "svg_templates", "test", "userIDB", "userLayer", "userLocale",
+            "zoomBtn", "zoomToArea",
+        }, keys)
+
     def test_capabilities_publish_stable_action_schemas_and_operation_contract(self):
         payload = capabilities("instance")
         actions = {item["id"]: item for item in payload["actions"]}

@@ -35,7 +35,9 @@ instance/                         versioned deployment inputs
 ├── workspace.seed.json          initial workspace only
 ├── xyz.env                      non-secret XYZ runtime settings
 ├── etl/layers.json              ETL source and field manifest
-└── public/svg/                  public custom map icons
+└── public/
+    ├── svg/                     public custom map icons
+    └── plugins/                 trusted manifest-backed XYZ plugins
 
 var/                              ignored mutable runtime state
 ├── workspace/

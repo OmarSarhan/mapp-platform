@@ -97,6 +97,9 @@ case "${deployment_environment}" in
 esac
 
 "${compose[@]}" config --quiet
+PLUGIN_DIR="${ROOT_DIR}/instance/public/plugins" \
+  PYTHONPATH="${ROOT_DIR}/config-ui" \
+  python3 -c 'from plugin_registry import catalogue; import sys; result = catalogue(); print("Plugin catalogue fingerprint: " + result["fingerprint"]); sys.exit(0 if result["valid"] else 1)'
 resolved_dbs="$(
   "${compose[@]}" config --format json \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["xyz"]["environment"]["DBS_MAPP"], end="")'
@@ -143,6 +146,24 @@ for service in xyz config-ui; do
     exit 1
   fi
 done
+
+plugin_hashes() {
+  local service="$1" root="$2"
+  "${compose[@]}" exec -T "${service}" sh -c \
+    "cd '${root}' && find . -type f -not -type l -print0 | sort -z | xargs -0 sha256sum"
+}
+if ! diff -u \
+  <(plugin_hashes xyz /app/xyz/public/instance/plugins) \
+  <(plugin_hashes config-ui /instance-public/plugins); then
+  printf 'Live XYZ and configuration service plugin mounts differ.\n' >&2
+  exit 1
+fi
+if ! diff -u \
+  <(plugin_hashes xyz /app/xyz/public/instance/plugins) \
+  <(plugin_hashes xyz-preview /app/xyz/public/instance/plugins); then
+  printf 'Live and preview XYZ plugin mounts differ.\n' >&2
+  exit 1
+fi
 
 if ! "${compose[@]}" exec -T browser-runner \
   curl --fail --silent --show-error http://xyz-preview:3000/ >/dev/null; then

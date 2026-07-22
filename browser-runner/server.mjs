@@ -179,6 +179,59 @@ async function interactionText(page) {
     .trim();
 }
 
+async function evaluatePluginChecks(page, requested, report) {
+  const checks = [];
+  for (const plugin of Array.isArray(requested) ? requested : []) {
+    const registration = await page.evaluate(
+      key => typeof globalThis.mapp?.plugins?.[key] === "function",
+      plugin.registrationKey,
+    ).catch(() => false);
+    const assertions = [];
+    for (const assertion of Array.isArray(plugin.assertions) ? plugin.assertions : []) {
+      let passed = false;
+      let observed = null;
+      if (assertion.type === "registration") {
+        passed = registration;
+        observed = registration;
+      } else if (assertion.type === "selector-exists" || assertion.type === "selector-visible") {
+        const locator = page.locator(assertion.selector).first();
+        const count = await locator.count().catch(() => 0);
+        observed = assertion.type === "selector-visible"
+          ? await locator.isVisible().catch(() => false)
+          : count > 0;
+        passed = Boolean(observed);
+      } else if (assertion.type === "layer-dispatch" || assertion.type === "locale-dispatch") {
+        // Dispatch has no generic XYZ completion hook. Registration plus any
+        // declared observable selector is the bounded platform-owned evidence.
+        const selectors = plugin.assertions.filter(item => item.type?.startsWith("selector-"));
+        passed = registration && selectors.length > 0;
+        observed = {registered: registration, observableAssertions: selectors.length};
+      } else if (assertion.type === "no-plugin-console-errors") {
+        const tokens = [plugin.id, plugin.registrationKey, plugin.entryUrl].filter(Boolean);
+        const messages = [
+          ...report.console.filter(item => item.type === "error").map(item => item.text),
+          ...report.pageErrors,
+          ...report.failedRequests.map(item => `${item.url} ${item.error || ""}`),
+        ];
+        const matched = messages.filter(message => tokens.some(token => message.includes(token)));
+        passed = matched.length === 0;
+        observed = matched;
+      }
+      assertions.push({type: assertion.type, passed, observed});
+    }
+    checks.push({
+      id: plugin.id,
+      entryUrl: plugin.entryUrl,
+      entryHash: plugin.entryHash,
+      registrationKey: plugin.registrationKey,
+      registered: registration,
+      assertions,
+      passed: registration && assertions.every(assertion => assertion.passed),
+    });
+  }
+  return checks;
+}
+
 async function secureArtifactTree() {
   await mkdir(root, {recursive: true, mode: 0o700});
   await chmod(root, 0o700);
@@ -328,6 +381,10 @@ async function runVisual(input) {
         ),
       )
     ).every(count => count > 0);
+    if (Array.isArray(input.pluginChecks) && input.pluginChecks.length) {
+      report.pluginNavigation = await expandRequestedLayer(page, input);
+    }
+    report.plugins = await evaluatePluginChecks(page, input.pluginChecks, report);
     const beforeCapture = await captureMap(page, directory, "before", fullPage);
     report.interaction = null;
     if (input.plan?.interaction?.type === "click-centre-feature") {
@@ -422,6 +479,7 @@ async function runVisual(input) {
       )
       : true;
     const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
+    const pluginsPassed = report.plugins.every(plugin => plugin.passed);
     report.passed = Boolean(
       response?.ok()
       && report.canvasCount
@@ -429,6 +487,7 @@ async function runVisual(input) {
       && report.groupTextFound
       && interactionPassed
       && panelsPassed
+      && pluginsPassed
       && !report.pageErrors.length
     );
   } catch (error) {
@@ -488,6 +547,11 @@ async function runVisual(input) {
         passed: report.panels?.[panel]?.passed === true,
         observed: report.panels?.[panel] ?? null,
       })),
+      ...(report.plugins || []).map(plugin => ({
+        id: `visual.plugin.${plugin.id}`,
+        passed: plugin.passed,
+        observed: plugin,
+      })),
     ],
     viewport,
     deviceScaleFactor,
@@ -513,6 +577,8 @@ async function runVisual(input) {
                   ? "feature"
                   : panels.some(panel => !report.panels?.[panel]?.passed)
                     ? "panel"
+                  : (report.plugins || []).some(plugin => !plugin.passed)
+                    ? "plugin"
                   : report.pageErrors.length
                     ? "page"
                     : "unknown",
