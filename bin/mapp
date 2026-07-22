@@ -233,6 +233,9 @@ if [[ "${1:-}" == "doctor" ]]; then
     --example "${ROOT_DIR}/.env.example" \
     --environment "${ENV_FILE}" \
     "${@:2}"
+  PLUGIN_DIR="${ROOT_DIR}/instance/public/plugins" \
+    PYTHONPATH="${ROOT_DIR}/config-ui" \
+    python3 -c 'from plugin_registry import catalogue; import sys; result = catalogue(); print("Plugin catalogue {}: {} external plugin(s).".format(result["fingerprint"][:12], len(result["external"]))); sys.exit(0 if result["valid"] else 1)'
   exit $?
 fi
 

@@ -261,6 +261,8 @@ Important routes include:
 | `POST /api/proposals/check` | Preflight a revision-bound operation set without creating a proposal |
 | `POST /api/proposals` | Create a revision-bound proposal lifecycle record |
 | `POST /api/workspace` | Validate and save a complete workspace, then wait for its fingerprint-matched reload |
+| `GET /api/schema` | Return the typed pinned-XYZ contract, including native template, gazetteer, dictionary, SVG, and bundled-plugin fields; `pointer` may focus the response for CLI use. Unknown contract properties are rejected with an exact path. |
+| `GET /api/plugins` | Return the pinned registry and external manifest catalogue, including schemas, hashes, compatibility, usage, diagnostics, preview checks, and the catalogue fingerprint used by all `config-cli plugins` commands. |
 
 Proposal visual requests accept `viewMode` as `focus` (the default) or
 `default`. Focus mode activates the requested layer and relevant group context

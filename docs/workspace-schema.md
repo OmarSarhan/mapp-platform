@@ -5,9 +5,10 @@ The machine-readable schema is
 It describes the workspace surface used by this project against the pinned
 GEOLYTIX XYZ v4.23.4 commit.
 
-XYZ workspace objects are extension points for templates, plugins, roles,
-filters, themes, and custom UI. The schema therefore validates known values but
-keeps `additionalProperties: true` at extensible object levels.
+The contract is closed at workspace, locale, layer, gazetteer, and bundled
+plugin boundaries. Unadvertised properties are rejected with their JSON path
+and are never silently discarded. Maps remain open only where arbitrary names
+are intrinsic to an audited feature, such as layer IDs and role names.
 
 The top-level `locale` is XYZ's default rendered locale, including when
 `locales` exists. XYZ pre-composes the default into each named locale except a
@@ -345,12 +346,19 @@ workspace
 │   │   └── lat / lng / z / minZoom / maxZoom
 │   ├── mapviewControls[]
 │   ├── ScaleLine
+│   ├── template / templates[]
+│   ├── plugins[] / syncPlugins[]
+│   ├── keyvalue_dictionary
+│   ├── svgTemplates / svg_templates
+│   ├── built-in plugin configuration (zoomBtn, locator, login, test, zoomToArea)
+│   ├── plugin-owned extension objects
 │   └── layers
 │       └── <layer key>
 │           ├── name / display / format
 │           ├── attribution
 │           ├── tiles: URI / source / projection / params
 │           ├── data: dbs / table / geom / srid / qID
+│           ├── gazetteer             optional native layer search panel
 │           ├── infoj[]
 │           │   └── type / title / label / field / fieldfx /
 │           │       display / inline
@@ -360,7 +368,7 @@ workspace
 │               └── opacity
 ├── locales                        optional named composed locales
 │   └── <locale key>               override composed with default by XYZ rules
-└── templates                      optional open-ended XYZ templates
+└── templates                      query, locale, layer and module templates
 ```
 
 ## Keys and options
@@ -377,8 +385,87 @@ workspace
 | `locale.view.z` | number, `0..30` | Initial zoom. |
 | `locale.mapviewControls[]` | OpenLayers control names | This file uses `Zoom`; unknown names are ignored by XYZ. |
 | `locale.ScaleLine` | `metric`, `imperial` | Scale-line units in XYZ v4.23.4. |
+| `templates.<key>` | object | Native XYZ template. Supported metadata includes `src`, inline `template`, `dbs`, `module`, `nonblocking`, `statement_timeout`, `value_only`, `reduce`, roles, and query access flags. |
+| `locale/layer.template` | key or object | One template composed into the object. |
+| `locale/layer.templates[]` | keys or objects | Templates composed in order. These are composition references, not a generic array of `{src, dbs}` includes. |
+| `layer.gazetteer` | object | Native layer-panel location search. A direct `qterm` searches the owning layer; `datasets[]` add searches and require `qterm`, with optional layer/table/query/limit/label/no-result overrides. Latitude/longitude input works without a dataset. A named `provider` requires separately loaded code because the pinned utility registry supplies no external provider. |
+| `locale.keyvalue_dictionary`, `layer.keyvalue_dictionary` | array | Native recursive value substitutions keyed by property name and current value, with `default` and language keys. |
+| `locale.svgTemplates` / `svg_templates` | object | SVG source map; the underscored spelling is the supported legacy alias. |
+| `locale.plugins[]`, `syncPlugins[]` | string arrays | Plugin modules to load, and plugin keys that must execute sequentially. |
 | `locale.layers.<key>` | object | Layer key used in URLs, hooks, and queries. |
 | `layer.name` | string | Display label; defaults to the layer key. |
+
+### Pinned plugin capabilities
+
+Pinned XYZ v4.23.4 dispatches a locale property to a same-named plugin. The
+schema advertises only the plugins present in this commit's bundled registry:
+
+| Locale property | Pinned behavior |
+| --- | --- |
+| `admin` | Adds the XYZ administrator link, but only for an authenticated administrator and a standard map button column. Its configuration object is otherwise unused. |
+| `consent` | Shows `text` in a confirmation dialog for a logged-in user and persists an affirmative response in user IndexedDB; optional `title` overrides the dialog heading. |
+| `custom_theme` | Passes the configured CSS colour-variable map to XYZ's colour-theme utility. |
+| `dark_mode` | Adds a light/dark toggle. The chosen state comes from and is persisted to the authenticated user record; the configuration object is unused. |
+| `feature_info` | Adds a click-identification mode and popup of raw feature properties. `features` expands cluster members and `css` styles the popup. `true` is also accepted upstream. |
+| `fullscreen` | Toggles XYZ's fullscreen body class and resizes OpenLayers and Mapbox-backed layers. |
+| `layer_order` | Sorts the decorated locale layer array using the listed layer keys. Unlisted keys sort above listed entries under the pinned comparator. This is runtime ordering, separate from `zIndex`. |
+| `link_button` | Adds one or more links. Each requires `href` and `icon_name`; optional fields include `title`, `target`, CSS class/style, and `locale` query-string propagation. |
+| `locator` | Adds browser geolocation and uses `locale.maxZoom` after a position is found. |
+| `login` | Adds login/logout navigation only when the rendered page advertises login support. |
+| `svg_templates` | Legacy plugin spelling for loading named SVG source URLs. `svgTemplates` is the preferred native property and is loaded before synchronous rendering. |
+| `test` | Runs the requested `core` or `integrity` browser suite from the URL test hook; supports `quiet` and `showSummary`. |
+| `userIDB` | Developer-facing JSON editor for the authenticated or anonymous user IndexedDB record. |
+| `userLayer` | Developer-facing JSON editor that decorates an unsaved client-side layer; it requires XYZ's layer JSON editor UI. |
+| `userLocale` | Allows an authenticated user to save and remove composed personal locales. |
+| `zoomBtn` | Adds zoom buttons bounded by the effective view's minimum and maximum zoom. |
+| `zoomToArea` | Adds a drag-box zoom interaction and restores pointer highlighting when finished. |
+
+`measure_distance`, `query_features`, `posthog`, `googleMaps`, `userSettings`,
+`info_panel`, `screenshot`, `coordinates`, `streetview`, and similarly named
+objects are not in the pinned registry or otherwise read by this commit. They
+are therefore not advertised by the schema. Unknown properties remain
+round-trip-preserved so an inspection or unrelated edit does not destroy
+custom data, but preservation must never be presented as feature support.
+
+### Plugin loading and dispatch
+
+`locale.plugins` supplies dynamic module URLs. XYZ prepends every
+`layer.plugins` array, removes duplicate source strings, and considers only
+values ending exactly in `.js` or `.mjs`. Relative values resolve against the
+page origin; values beginning with `http` pass directly to dynamic `import()`.
+Import failures are logged, but `Promise.allSettled` allows map creation to
+continue.
+
+The loader ignores module exports. A dynamic module must register its callable
+as a side effect on global `mapp.plugins` under its configuration key. It runs
+arbitrary browser JavaScript in the XYZ origin.
+
+After loading, `locale.syncPlugins` keys execute sequentially as
+`mapp.plugins[key](locale[key], mapview)` and each result is awaited. Other
+locale keys matching registered functions execute together and are awaited
+with `Promise.all`. Missing keys are silently skipped. During layer decoration,
+every layer property whose name matches a registered plugin invokes that
+function with the complete layer object; this layer hook is not awaited.
+
+Use `/api/plugins` or `config-cli plugins list/show/validate/usage` for the
+connected server's exact built-in and external registry. External manifest
+schemas are composed into `/api/schema`; proposals and preview evidence bind
+to the catalogue fingerprint. See [External XYZ plugins](external-plugins.md).
+
+The dashboard exposes top-level templates and advanced locale/layer values as JSON object
+editors. The configuration API and standalone CLI expose the same values
+through the workspace document, JSON Pointer mutations, and `/api/schema`.
+Properties outside the connected closed contract are rejected.
+
+`src` supports `file:`, `cloudfront:`, HTTPS, loopback-only HTTP, and providers
+created by configured `SIGN_*` environment entries. HTTPS responses ending in
+`.json` are parsed as JSON; other HTTP responses are text. Templates are
+fetched by XYZ when first resolved and cached for that XYZ workspace
+generation (module templates are the exception). A saved workspace
+reload therefore starts a fresh generation and causes live sources to be read
+again on first use. Validation checks the descriptor, but deliberately does not
+execute remote template code or SQL; post-reload and visual tests remain
+necessary evidence for live-template changes.
 
 When the dashboard creates a layer or a display-name edit loses focus, it
 derives the internal layer key from `layer.name`: spaces become underscores,

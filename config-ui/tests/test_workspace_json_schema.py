@@ -59,6 +59,39 @@ class WorkspaceJsonSchemaTests(unittest.TestCase):
         } <= layer_fields)
         self.assertIn("_dashboard", layer_fields)
 
+    def test_schema_covers_templates_gazetteer_and_only_bundled_plugins(self):
+        schema = json.loads(
+            (ROOT / "config-ui/schema/workspace.schema.json").read_text()
+        )
+        defs = schema["$defs"]
+        template_fields = set(defs["templateDefinition"]["properties"])
+        self.assertTrue({
+            "src", "template", "dbs", "module", "nonblocking",
+            "statement_timeout", "value_only", "reduce",
+        } <= template_fields)
+        locale_fields = set(defs["locale"]["properties"])
+        self.assertTrue({
+            "template", "templates", "keyvalue_dictionary",
+            "svgTemplates", "svg_templates", "admin", "consent",
+            "custom_theme", "dark_mode", "feature_info", "fullscreen",
+            "layer_order", "link_button", "locator", "login", "test",
+            "userIDB", "userLayer", "userLocale", "zoomBtn", "zoomToArea",
+        } <= locale_fields)
+        self.assertFalse({
+            "googleMaps", "measure_distance", "query_features", "posthog",
+            "userSettings", "info_panel", "screenshot", "coordinates",
+            "streetview",
+        } & locale_fields)
+        self.assertIn("gazetteer", defs["layer"]["properties"])
+        self.assertIs(schema["additionalProperties"], False)
+        self.assertIs(defs["locale"]["additionalProperties"], False)
+        self.assertIs(defs["layer"]["additionalProperties"], False)
+        self.assertIs(
+            defs["layer"]["properties"]["gazetteer"]["additionalProperties"],
+            False,
+        )
+        self.assertIs(defs["gazetteerDataset"]["additionalProperties"], False)
+
     def test_schema_covers_xyz_infoj_and_style_registries(self):
         schema = json.loads(
             (ROOT / "config-ui/schema/workspace.schema.json").read_text()

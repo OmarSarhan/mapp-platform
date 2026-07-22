@@ -63,6 +63,9 @@ function standardFetch(workspaceRequest) {
     if (path === '/api/icons') {
       return response({icons: []});
     }
+    if (path === '/api/plugins') {
+      return response({plugins: {external: [], fingerprint: 'catalogue'}});
+    }
     throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
   });
 }
@@ -439,7 +442,7 @@ describe('Dashboard managed save lifecycle', () => {
     });
     fireEvent.click(toggle);
 
-    let managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    let managed = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
     expect(managed.plugins).toContain(
       '/instance/plugins/viewport-layer-count.mjs',
     );
@@ -447,7 +450,7 @@ describe('Dashboard managed save lifecycle', () => {
     expect(managed.filter.viewport).toBe(true);
 
     fireEvent.click(toggle);
-    managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    managed = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
     expect(managed.viewport_layer_count).toBeUndefined();
     expect(managed.plugins).toBeUndefined();
     expect(managed.filter.viewport).toBe(true);
@@ -484,7 +487,7 @@ describe('Dashboard managed save lifecycle', () => {
 
     fireEvent.click(await screen.findByRole('button', {name: 'Places'}));
     const sections = [...container.querySelectorAll('.layer-section>summary span')]
-      .map(element => element.textContent);
+      .map(element => element.textContent).slice(-6);
     expect(sections).toEqual([
       'Identity and display',
       'Data source',
@@ -548,7 +551,7 @@ describe('Dashboard managed save lifecycle', () => {
     expect(toggle.checked).toBe(false);
     fireEvent.click(toggle);
 
-    const advanced = container.querySelector('.advanced textarea');
+    const advanced = screen.getByLabelText('Advanced layer JSON');
     const managed = JSON.parse(advanced.value);
     expect(managed.infoj[0].style).toEqual({
       fillColor: null,
@@ -597,7 +600,7 @@ describe('Dashboard managed save lifecycle', () => {
       target: {value: 'Map location'},
     });
 
-    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    const managed = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
     expect(managed.infoj[1]).toMatchObject({
       type: 'pin',
       label: 'Map location',
@@ -708,7 +711,7 @@ describe('Dashboard managed save lifecycle', () => {
       target: {value: 'Open places'},
     });
 
-    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    const managed = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
     expect(managed.style.theme).toMatchObject({
       type: 'categorized',
       field: 'priority',
@@ -763,7 +766,7 @@ describe('Dashboard managed save lifecycle', () => {
       target: {value: '10'},
     });
 
-    const managed = JSON.parse(container.querySelector('.advanced textarea').value);
+    const managed = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
     expect(managed.style.theme).toMatchObject({
       type: 'categorized',
       fields: ['status', 'priority'],

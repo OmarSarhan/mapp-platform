@@ -29,9 +29,10 @@ The original request is not approval to apply a proposal. If the revision
 changed, create a new proposal; never silently rebase it.
 
 Platform development may change validation, schema, API, initialization, or
-mount behavior when explicitly requested. Preserve unknown XYZ extension
-properties and update the API contract and documentation with compatible
-behavior changes.
+mount behavior when explicitly requested. Reject properties outside the
+audited pinned-XYZ contract; do not silently remove them. Arbitrary keys remain
+valid only in schema-declared maps. Update the API contract and documentation
+with compatible behavior changes.
 
 ## Feature-information symbology
 
@@ -53,6 +54,11 @@ replacement is not approval to save or apply the follow-on workspace change.
 Do not vendor, fork, or patch the GEOLYTIX XYZ source in this repository. The
 image must continue to clone a declared upstream reference, verify its full
 commit, and layer only deployment mappings and the supervisor around it.
+
+External browser plugins are trusted, source-controlled deployment inputs under
+`instance/public/plugins`. Each requires a closed manifest contract and
+isolated candidate-preview evidence. Never import plugin code during discovery
+or offer executable-code upload through the dashboard.
 
 ## Filesystem safety
 

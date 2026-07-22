@@ -1,15 +1,20 @@
 """Validation rules for the supported GEOLYTIX XYZ workspace surface.
 
 XYZ deliberately accepts extensible workspace objects and does not publish a
-closed JSON schema. This validator is therefore strict for fields the editor
-understands and preserves unknown properties for forward compatibility.
+closed JSON schema. This validator exposes only the audited surface of the
+pinned framework and rejects unadvertised properties instead of stripping or
+silently preserving them.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import re
+from pathlib import Path
 from typing import Any
+
+from plugin_registry import available_plugins, validate_workspace_plugins
 
 DB_KEY = re.compile(r"^[A-Za-z0-9-]+$")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -30,6 +35,12 @@ FILTER_TYPES = {
     "like", "match", "numeric", "integer", "in", "ni", "date",
     "datetime", "boolean", "null",
 }
+_CONTRACT = json.loads(
+    (Path(__file__).parent / "schema/workspace.schema.json").read_text(encoding="utf-8")
+)
+TOP_LEVEL_KEYS = frozenset(_CONTRACT["properties"])
+LOCALE_KEYS = frozenset(_CONTRACT["$defs"]["locale"]["properties"])
+LAYER_KEYS = frozenset(_CONTRACT["$defs"]["layer"]["properties"])
 UNSAFE_EXPRESSION = re.compile(
     r"\b(?:select|insert|update|delete|merge|drop|alter|create|truncate|grant|"
     r"revoke|copy|call|do|execute|prepare|deallocate|vacuum|analyze|refresh|"
@@ -157,6 +168,16 @@ def _error(errors: list[dict[str, str]], path: str, message: str) -> None:
     errors.append({"path": path, "message": message})
 
 
+def _reject_unknown(value: dict, allowed: frozenset[str], path: str, errors) -> None:
+    for key in value:
+        if key not in allowed:
+            _error(
+                errors,
+                f"{path}.{key}" if path else key,
+                "Property is not supported by the pinned XYZ workspace contract.",
+            )
+
+
 def _merge(base: Any, override: Any) -> Any:
     if not isinstance(base, dict) or not isinstance(override, dict):
         return copy.deepcopy(override)
@@ -207,11 +228,26 @@ def validate_workspace(data: Any, available_dbs: set[str] | None = None) -> list
     errors: list[dict[str, str]] = []
     if not isinstance(data, dict):
         return [{"path": "$", "message": "Workspace must be a JSON object."}]
+    _reject_unknown(data, TOP_LEVEL_KEYS, "", errors)
 
     if "key" in data and (not isinstance(data["key"], str) or not data["key"].strip()):
         _error(errors, "key", "Must be a non-empty string.")
 
     _validate_dbs(data.get("dbs"), "dbs", errors, available_dbs, required=False)
+    if "roles" in data:
+        _validate_roles(data["roles"], "roles", errors)
+    templates = data.get("templates")
+    if templates is not None:
+        if not isinstance(templates, dict):
+            _error(errors, "templates", "Must be an object keyed by template name.")
+        else:
+            for key, template in templates.items():
+                template_path = f"templates.{key}"
+                if not isinstance(key, str) or not key.strip():
+                    _error(errors, "templates", "Template keys must be non-empty strings.")
+                _validate_template_definition(
+                    template, template_path, errors, available_dbs
+                )
 
     locale = data.get("locale")
     locales = data.get("locales")
@@ -250,6 +286,7 @@ def validate_workspace(data: Any, available_dbs: set[str] | None = None) -> list
 
     if locale is None and locales is None:
         _error(errors, "locale", "Define locale or locales; the editor requires an explicit locale.")
+    errors.extend(validate_workspace_plugins(data))
     return errors
 
 
@@ -264,12 +301,64 @@ def _validate_dbs(value, path, errors, available_dbs, *, required):
         _error(errors, path, f"No DBS_{value} connection is configured.")
 
 
+def _validate_template_definition(value, path, errors, available_dbs):
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be a template object.")
+        return
+    for key in ("src", "template"):
+        if key in value and not isinstance(value[key], str):
+            _error(errors, f"{path}.{key}", "Must be a string.")
+    if "src" in value and not value["src"].strip():
+        _error(errors, f"{path}.src", "Must be non-empty when set.")
+    _validate_dbs(
+        value.get("dbs"), f"{path}.dbs", errors, available_dbs, required=False
+    )
+    for key in ("module", "nonblocking", "value_only", "reduce", "admin", "layer"):
+        if key in value and not isinstance(value[key], bool):
+            _error(errors, f"{path}.{key}", "Must be true or false.")
+    timeout = value.get("statement_timeout")
+    if timeout is not None and (
+        not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0
+    ):
+        _error(errors, f"{path}.statement_timeout", "Must be a non-negative integer in milliseconds.")
+    if "roles" in value:
+        _validate_roles(value["roles"], f"{path}.roles", errors)
+
+
+def _validate_template_reference(value, path, errors, available_dbs):
+    if isinstance(value, str) and value.strip():
+        return
+    if isinstance(value, dict):
+        _validate_template_definition(value, path, errors, available_dbs)
+        return
+    _error(errors, path, "Must be a non-empty template key or template object.")
+
+
+def _validate_roles(value, path, errors):
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be an object keyed by role name.")
+        return
+    for role, override in value.items():
+        if not isinstance(role, str) or not role:
+            _error(errors, path, "Role names must be non-empty strings.")
+        if override is not None and not isinstance(override, (bool, dict)):
+            _error(errors, f"{path}.{role}", "Must be true, false, null, or an object override.")
+
+
 def _validate_locale(locale, path, errors, available_dbs):
     if not isinstance(locale, dict):
         _error(errors, path, "Must be an object.")
         return
+    plugin_keys = {
+        plugin["configurationKey"]
+        for plugin in available_plugins()
+        if "locale" in plugin["scope"]
+    }
+    _reject_unknown(locale, LOCALE_KEYS | plugin_keys, path, errors)
     if "name" in locale and not isinstance(locale["name"], str):
         _error(errors, f"{path}.name", "Must be a string.")
+    if "roles" in locale:
+        _validate_roles(locale["roles"], f"{path}.roles", errors)
     extent = locale.get("extent")
     if extent is not None:
         if not isinstance(extent, dict):
@@ -308,6 +397,31 @@ def _validate_locale(locale, path, errors, available_dbs):
         _error(errors, f"{path}.mapviewControls", "Must be an array of strings.")
     if "ScaleLine" in locale and locale["ScaleLine"] not in SCALE_UNITS:
         _error(errors, f"{path}.ScaleLine", f"Must be one of: {', '.join(sorted(SCALE_UNITS))}.")
+    if "template" in locale:
+        _validate_template_reference(
+            locale["template"], f"{path}.template", errors, available_dbs
+        )
+    if "templates" in locale:
+        if not isinstance(locale["templates"], list):
+            _error(errors, f"{path}.templates", "Must be an array of template references.")
+        else:
+            for index, reference in enumerate(locale["templates"]):
+                _validate_template_reference(
+                    reference, f"{path}.templates.{index}", errors, available_dbs
+                )
+    for key in ("plugins", "syncPlugins"):
+        value = locale.get(key)
+        if value is not None and not (
+            isinstance(value, list)
+            and all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            _error(errors, f"{path}.{key}", "Must be an array of non-empty strings.")
+    if isinstance(locale.get("plugins"), list) and len(locale["plugins"]) != len(set(locale["plugins"])):
+        _error(errors, f"{path}.plugins", "Must not contain duplicate module references.")
+    _validate_bundled_plugins(locale, path, errors)
+    dictionary = locale.get("keyvalue_dictionary")
+    if dictionary is not None:
+        _validate_keyvalue_dictionary(dictionary, f"{path}.keyvalue_dictionary", errors)
     layers = locale.get("layers")
     if layers is None:
         return
@@ -318,13 +432,115 @@ def _validate_locale(locale, path, errors, available_dbs):
         _validate_layer(key, layer, f"{path}.layers.{key}", errors, available_dbs)
 
 
+def _validate_bundled_plugins(locale, path, errors):
+    object_plugins = {
+        "admin", "dark_mode", "fullscreen", "locator", "login", "userIDB",
+        "userLayer", "userLocale", "zoomBtn", "zoomToArea",
+    }
+    for key in object_plugins:
+        if key in locale:
+            if not isinstance(locale[key], dict):
+                _error(errors, f"{path}.{key}", "Must be an object.")
+            else:
+                allowed = frozenset({"title"}) if key == "userIDB" else frozenset()
+                _reject_unknown(locale[key], allowed, f"{path}.{key}", errors)
+    consent = locale.get("consent")
+    if consent is not None and (
+        not isinstance(consent, dict)
+        or not isinstance(consent.get("text"), str)
+        or not consent["text"].strip()
+    ):
+        _error(errors, f"{path}.consent.text", "Consent requires non-empty text.")
+    if isinstance(consent, dict):
+        _reject_unknown(consent, frozenset({"text", "title"}), f"{path}.consent", errors)
+    theme = locale.get("custom_theme")
+    if theme is not None and (
+        not isinstance(theme, dict)
+        or not all(isinstance(value, str) for value in theme.values())
+    ):
+        _error(errors, f"{path}.custom_theme", "Must map CSS colour keys to strings.")
+    feature_info = locale.get("feature_info")
+    if feature_info is not None and feature_info is not True and not isinstance(feature_info, dict):
+        _error(errors, f"{path}.feature_info", "Must be true or an object.")
+    elif isinstance(feature_info, dict):
+        _reject_unknown(feature_info, frozenset({"features", "css"}), f"{path}.feature_info", errors)
+        if "features" in feature_info and not isinstance(feature_info["features"], bool):
+            _error(errors, f"{path}.feature_info.features", "Must be true or false.")
+        if "css" in feature_info and not isinstance(feature_info["css"], str):
+            _error(errors, f"{path}.feature_info.css", "Must be a string.")
+    layer_order = locale.get("layer_order")
+    if layer_order is not None and not (
+        isinstance(layer_order, list)
+        and all(isinstance(item, str) for item in layer_order)
+        and len(layer_order) == len(set(layer_order))
+    ):
+        _error(errors, f"{path}.layer_order", "Must be an array of unique layer keys.")
+    links = locale.get("link_button")
+    if links is not None:
+        entries = links if isinstance(links, list) else [links]
+        if not isinstance(links, (dict, list)) or not entries:
+            _error(errors, f"{path}.link_button", "Must be a link object or non-empty array.")
+        else:
+            for index, link in enumerate(entries):
+                link_path = f"{path}.link_button" + (f".{index}" if isinstance(links, list) else "")
+                if not isinstance(link, dict):
+                    _error(errors, link_path, "Must be an object.")
+                    continue
+                _reject_unknown(
+                    link,
+                    frozenset({"href", "icon_name", "title", "target", "css_class", "css_style", "locale"}),
+                    link_path,
+                    errors,
+                )
+                for key in ("href", "icon_name"):
+                    if not isinstance(link.get(key), str) or not link[key].strip():
+                        _error(errors, f"{link_path}.{key}", "Must be a non-empty string.")
+    test = locale.get("test")
+    if test is not None:
+        if not isinstance(test, dict):
+            _error(errors, f"{path}.test", "Must be an object.")
+        else:
+            _reject_unknown(test, frozenset({"quiet", "showSummary"}), f"{path}.test", errors)
+            for key in ("quiet", "showSummary"):
+                if key in test and not isinstance(test[key], bool):
+                    _error(errors, f"{path}.test.{key}", "Must be true or false.")
+
+
 def _validate_layer(key, layer, path, errors, available_dbs):
     if not isinstance(key, str) or not key.strip():
         _error(errors, path, "Layer key must be a non-empty string.")
     if not isinstance(layer, dict):
         _error(errors, path, "Layer must be an object.")
         return
-    has_template = isinstance(layer.get("template"), str)
+    plugin_keys = {
+        plugin["configurationKey"]
+        for plugin in available_plugins()
+        if "layer" in plugin["scope"]
+    }
+    _reject_unknown(layer, LAYER_KEYS | plugin_keys, path, errors)
+    if "roles" in layer:
+        _validate_roles(layer["roles"], f"{path}.roles", errors)
+    has_template = (
+        isinstance(layer.get("template"), str) and bool(layer["template"].strip())
+    ) or isinstance(layer.get("template"), dict)
+    if "template" in layer:
+        _validate_template_reference(
+            layer["template"], f"{path}.template", errors, available_dbs
+        )
+    if "templates" in layer:
+        if not isinstance(layer["templates"], list):
+            _error(errors, f"{path}.templates", "Must be an array of template references.")
+        else:
+            for index, reference in enumerate(layer["templates"]):
+                _validate_template_reference(
+                    reference, f"{path}.templates.{index}", errors, available_dbs
+                )
+    if "keyvalue_dictionary" in layer:
+        _validate_keyvalue_dictionary(
+            layer["keyvalue_dictionary"], f"{path}.keyvalue_dictionary", errors
+        )
+    if "gazetteer" in layer:
+        _validate_gazetteer(layer["gazetteer"], f"{path}.gazetteer", errors)
     fmt = layer.get("format")
     if fmt not in SUPPORTED_FORMATS and not (fmt is None and has_template):
         _error(errors, f"{path}.format", f"Must be one of: {', '.join(sorted(SUPPORTED_FORMATS))}.")
@@ -360,10 +576,6 @@ def _validate_layer(key, layer, path, errors, available_dbs):
         return
     if fmt == "tiles":
         has_uri = isinstance(layer.get("URI"), str) and layer["URI"].strip()
-        has_template = (
-            isinstance(layer.get("template"), str)
-            and layer["template"].strip()
-        )
         if not has_uri and not has_template:
             _error(
                 errors,
@@ -522,6 +734,65 @@ def _validate_layer(key, layer, path, errors, available_dbs):
             fields,
         )
         _validate_style(layer.get("style"), f"{path}.style", errors)
+
+
+def _validate_keyvalue_dictionary(value, path, errors):
+    if not isinstance(value, list):
+        _error(errors, path, "Must be an array.")
+        return
+    for index, entry in enumerate(value):
+        entry_path = f"{path}.{index}"
+        if not isinstance(entry, dict):
+            _error(errors, entry_path, "Must be an object.")
+            continue
+        for key in ("key", "value"):
+            if not isinstance(entry.get(key), str) or (key == "key" and not entry[key]):
+                _error(errors, f"{entry_path}.{key}", "Must be a non-empty string." if key == "key" else "Must be a string.")
+        for key, item in entry.items():
+            if not isinstance(item, str):
+                _error(errors, f"{entry_path}.{key}", "Dictionary values must be strings.")
+
+
+def _validate_gazetteer(value, path, errors):
+    if not isinstance(value, dict):
+        _error(errors, path, "Must be an object.")
+        return
+    _reject_unknown(
+        value,
+        frozenset({"provider", "maxZoom", "placeholder", "table", "qterm", "limit", "no_result", "datasets"}),
+        path,
+        errors,
+    )
+    datasets = value.get("datasets")
+    if datasets is not None and not isinstance(datasets, list):
+        _error(errors, f"{path}.datasets", "Must be an array.")
+        return
+    for index, dataset in enumerate(datasets or []):
+        item_path = f"{path}.datasets.{index}"
+        if not isinstance(dataset, dict):
+            _error(errors, item_path, "Must be an object.")
+            continue
+        _reject_unknown(
+            dataset,
+            frozenset({"layer", "table", "qterm", "limit", "no_result", "title", "label", "query", "leading_wildcard"}),
+            item_path,
+            errors,
+        )
+        if "layer" in dataset and (
+            not isinstance(dataset["layer"], str) or not dataset["layer"].strip()
+        ):
+            _error(errors, f"{item_path}.layer", "Must name a configured layer.")
+        qterm = dataset.get("qterm")
+        if not isinstance(qterm, str) or not IDENTIFIER.fullmatch(qterm):
+            _error(errors, f"{item_path}.qterm", "Must be an unquoted column identifier.")
+        table = dataset.get("table")
+        if table is not None and (not isinstance(table, str) or not RELATION.fullmatch(table)):
+            _error(errors, f"{item_path}.table", "Use table or schema.table.")
+        limit = dataset.get("limit")
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+        ):
+            _error(errors, f"{item_path}.limit", "Must be a positive integer.")
 
 
 def _validate_info_filter(value, path, errors):

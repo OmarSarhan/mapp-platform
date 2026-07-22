@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "workspace.schema.json",
   "title": "GEOLYTIX XYZ v4.23.4 workspace",
-  "description": "Schema for the workspace surface used by this MAPP Explore instance. XYZ workspaces are extensible, so unknown framework/plugin properties are preserved.",
+  "description": "Closed capability contract for the audited workspace surface of the pinned GEOLYTIX XYZ framework. Unsupported properties are rejected, not silently removed.",
   "type": "object",
   "anyOf": [
     {
@@ -26,6 +26,10 @@
       "$ref": "#/$defs/databaseKey",
       "description": "Default database connection. XYZ resolves this as the DBS_<value> environment variable."
     },
+    "roles": {
+      "$ref": "#/$defs/roleMap",
+      "description": "Workspace role declarations returned by XYZ's workspace roles endpoint."
+    },
     "locale": {
       "$ref": "#/$defs/locale",
       "description": "Default locale and the locale used by this instance."
@@ -39,13 +43,13 @@
     },
     "templates": {
       "type": "object",
-      "description": "Optional XYZ template definitions. Templates are deliberately open-ended.",
+      "description": "XYZ query, locale, layer, view, message, or module templates keyed by their lookup name.",
       "additionalProperties": {
-        "type": "object"
+        "$ref": "#/$defs/templateDefinition"
       }
     }
   },
-  "additionalProperties": true,
+  "additionalProperties": false,
   "$defs": {
     "databaseKey": {
       "type": "string",
@@ -53,6 +57,53 @@
       "examples": [
         "MAPP"
       ]
+    },
+    "templateDefinition": {
+      "type": "object",
+      "properties": {
+        "src": {"type": "string", "minLength": 1, "description": "Provider-qualified source loaded lazily by XYZ, for example file: or URL provider syntax supported by the deployment."},
+        "template": {"type": "string", "description": "Inline SQL, HTML, message, or other template text."},
+        "dbs": {"$ref": "#/$defs/databaseKey"},
+        "module": {"type": "boolean", "description": "Treat a fetched string as an ECMAScript module."},
+        "nonblocking": {"type": "boolean", "description": "Return HTTP 202 without awaiting completion of a query template."},
+        "statement_timeout": {"type": "integer", "minimum": 0, "description": "PostgreSQL statement timeout in milliseconds."},
+        "value_only": {"type": "boolean", "description": "Return the first value from the first query row."},
+        "reduce": {"type": "boolean", "description": "Reduce query rows to a flat values array."},
+        "roles": {"$ref": "#/$defs/roleMap"},
+        "admin": {"type": "boolean"},
+        "layer": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "templateReference": {
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"$ref": "#/$defs/templateDefinition"}
+      ]
+    },
+    "roleMap": {
+      "type": "object",
+      "description": "Role names, including wildcard * and negated !role names, mapped to an access flag or object merged for that role.",
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "boolean"},
+          {"type": "null"},
+          {"type": "object", "additionalProperties": true}
+        ]
+      }
+    },
+    "keyValueDictionary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "value"],
+        "properties": {
+          "key": {"type": "string", "minLength": 1},
+          "value": {"type": "string"},
+          "default": {"type": "string"}
+        },
+        "additionalProperties": {"type": "string"}
+      }
     },
     "identifier": {
       "type": "string",
@@ -86,9 +137,8 @@
           }
         },
         "roles": {
-          "type": "object",
-          "description": "Role map used by XYZ's role-composition logic.",
-          "additionalProperties": true
+          "$ref": "#/$defs/roleMap",
+          "description": "Role map used by XYZ's access and role-specific composition logic."
         },
         "srid": {
           "type": [
@@ -144,11 +194,10 @@
           "description": "Scale-line units supported by XYZ v4.23.4."
         },
         "plugins": {
-          "type": [
-            "array",
-            "object"
-          ],
-          "description": "Plugins loaded for this locale."
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true,
+          "description": "Plugin module references dynamically loaded for this locale."
         },
         "syncPlugins": {
           "type": "array",
@@ -157,6 +206,11 @@
           },
           "description": "Plugin keys loaded sequentially before map use."
         },
+        "template": {"$ref": "#/$defs/templateReference"},
+        "templates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/templateReference"}
+        },
         "svgTemplates": {
           "type": "object",
           "description": "SVG template keys mapped to source URLs.",
@@ -164,6 +218,51 @@
             "type": "string"
           }
         },
+        "svg_templates": {
+          "type": "object",
+          "description": "Legacy alias for svgTemplates retained by XYZ v4.23.4.",
+          "additionalProperties": {"type": "string"}
+        },
+        "keyvalue_dictionary": {"$ref": "#/$defs/keyValueDictionary"},
+        "admin": {"type": "object", "description": "Bundled plugin adding an administrator link for an authenticated XYZ administrator.", "additionalProperties": false},
+        "consent": {
+          "type": "object",
+          "description": "Bundled plugin requesting and persisting consent for an authenticated user.",
+          "properties": {"text": {"type": "string", "minLength": 1}, "title": {"type": "string"}},
+          "required": ["text"],
+          "additionalProperties": false
+        },
+        "custom_theme": {"type": "object", "description": "Bundled plugin applying locale CSS colour variables.", "additionalProperties": {"type": "string"}},
+        "dark_mode": {"type": "object", "description": "Bundled plugin adding a persisted light/dark colour-mode toggle.", "additionalProperties": false},
+        "feature_info": {
+          "description": "Bundled plugin adding a map feature-identification interaction.",
+          "oneOf": [
+            {"const": true},
+            {"type": "object", "properties": {"features": {"type": "boolean"}, "css": {"type": "string"}}, "additionalProperties": false}
+          ]
+        },
+        "fullscreen": {"type": "object", "description": "Bundled plugin adding the XYZ fullscreen-layout toggle.", "additionalProperties": false},
+        "layer_order": {"type": "array", "description": "Bundled plugin ordering decorated layers by layer key.", "items": {"type": "string"}, "uniqueItems": true},
+        "link_button": {
+          "description": "Bundled plugin adding one or more configured links to the map button column.",
+          "oneOf": [
+            {"$ref": "#/$defs/linkButton"},
+            {"type": "array", "items": {"$ref": "#/$defs/linkButton"}}
+          ]
+        },
+        "zoomBtn": {"type": "object", "description": "Bundled plugin adding zoom-in/out buttons bounded by the effective view zoom limits.", "additionalProperties": false},
+        "login": {"type": "object", "description": "Bundled plugin adding login/logout navigation when login support is advertised by the page.", "additionalProperties": false},
+        "locator": {"type": "object", "description": "Bundled plugin adding browser-geolocation control.", "additionalProperties": false},
+        "zoomToArea": {"type": "object", "description": "Bundled plugin adding a drag-box zoom interaction.", "additionalProperties": false},
+        "test": {
+          "type": "object",
+          "description": "Bundled plugin running requested core or integrity browser tests.",
+          "properties": {"quiet": {"type": "boolean"}, "showSummary": {"type": "boolean"}},
+          "additionalProperties": false
+        },
+        "userIDB": {"type": "object", "description": "Bundled developer plugin for editing the current user's IndexedDB record.", "properties": {"title": {"type": "string"}}, "additionalProperties": false},
+        "userLayer": {"type": "object", "description": "Bundled developer plugin for adding an unsaved layer through XYZ's JSON editor.", "additionalProperties": false},
+        "userLocale": {"type": "object", "description": "Bundled authenticated-user plugin for storing composed personal locales.", "additionalProperties": false},
         "queryparams": {
           "type": "object",
           "description": "Locale-level query parameters.",
@@ -185,7 +284,7 @@
           "uniqueItems": true
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "extent": {
       "type": "object",
@@ -216,7 +315,37 @@
           "description": "Mask the map outside the locale extent."
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
+    },
+    "gazetteerDataset": {
+      "type": "object",
+      "required": ["qterm"],
+      "properties": {
+        "layer": {"type": "string", "minLength": 1},
+        "table": {"$ref": "#/$defs/relation"},
+        "qterm": {"$ref": "#/$defs/identifier"},
+        "limit": {"type": "integer", "minimum": 1},
+        "no_result": {"type": ["string", "null"]},
+        "title": {"type": "string"},
+        "label": {"type": "string"},
+        "query": {"type": "string"},
+        "leading_wildcard": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "linkButton": {
+      "type": "object",
+      "required": ["href", "icon_name"],
+      "properties": {
+        "href": {"type": "string", "minLength": 1},
+        "icon_name": {"type": "string", "minLength": 1},
+        "title": {"type": "string"},
+        "target": {"type": "string"},
+        "css_class": {"type": "string"},
+        "css_style": {"type": "string"},
+        "locale": {"type": "boolean"}
+      },
+      "additionalProperties": false
     },
     "view": {
       "type": "object",
@@ -256,16 +385,13 @@
       "type": "object",
       "properties": {
         "template": {
-          "type": "string",
+          "$ref": "#/$defs/templateReference",
           "description": "Workspace template merged into this layer."
         },
         "templates": {
           "type": "array",
           "items": {
-            "type": [
-              "string",
-              "object"
-            ]
+            "$ref": "#/$defs/templateReference"
           }
         },
         "src": {
@@ -294,8 +420,23 @@
           }
         },
         "roles": {
+          "$ref": "#/$defs/roleMap"
+        },
+        "keyvalue_dictionary": {"$ref": "#/$defs/keyValueDictionary"},
+        "gazetteer": {
           "type": "object",
-          "additionalProperties": true
+          "description": "Pinned XYZ layer-panel location search configuration.",
+          "properties": {
+            "provider": {"type": "string", "description": "Name of a gazetteer utility supplied by additionally loaded code; pinned core only supplies database datasets."},
+            "maxZoom": {"type": "number", "minimum": 0, "maximum": 30},
+            "placeholder": {"type": "string"},
+            "table": {"$ref": "#/$defs/relation"},
+            "qterm": {"$ref": "#/$defs/identifier"},
+            "limit": {"type": "integer", "minimum": 1},
+            "no_result": {"type": ["string", "null"]},
+            "datasets": {"type": "array", "items": {"$ref": "#/$defs/gazetteerDataset"}}
+          },
+          "additionalProperties": false
         },
         "name": {
           "type": "string",
@@ -311,19 +452,6 @@
           "items": {"type": "string", "minLength": 1},
           "uniqueItems": true,
           "description": "Optional plugin modules loaded for this layer."
-        },
-        "viewport_layer_count": {
-          "type": "object",
-          "properties": {
-            "debounce": {
-              "type": "number",
-              "minimum": 0,
-              "maximum": 5000,
-              "description": "Additional delay in milliseconds before refreshing the layer-heading viewport count."
-            }
-          },
-          "additionalProperties": true,
-          "description": "Enables the instance viewport-count badge beside this queryable layer's name."
         },
         "group": {
           "type": "string",
@@ -772,7 +900,7 @@
           }
         }
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "layerParams": {
       "type": "object",
@@ -855,7 +983,7 @@
           }
         }
       ],
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "infoEntry": {
       "type": "object",
