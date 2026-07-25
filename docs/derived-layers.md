@@ -98,6 +98,13 @@ published result, but not on the private `_definitions` registry. Leaving
 `DERIVED_DATABASE_URL` empty
 disables mutation and reports `configured: false`.
 
+For a complete administrator-facing checklist and parameterized grant
+examples, use the
+[external PostgreSQL administrator handoff](external-postgresql.md). In
+particular, ordinary views use invoker permissions: both the derived owner and
+the runtime reader need direct `SELECT` access to every approved source
+relation used by an ordinary derived view.
+
 ## Definition checks
 
 ```json

@@ -394,6 +394,7 @@ acceptance result.
 
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/deployment.md)
+- [External PostgreSQL administrator handoff](docs/external-postgresql.md)
 - [Operations](docs/operations.md)
 - [Security](docs/security.md)
 - [Backup and restore](docs/backup-restore.md)

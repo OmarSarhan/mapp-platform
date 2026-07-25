@@ -107,6 +107,14 @@ grants. Changing the URI does not rewrite workspace table mappings; review the
 seed before first initialization or use an approved dashboard/CLI change for
 an existing live workspace.
 
+Give the remote database administrator the
+[external PostgreSQL administrator handoff](external-postgresql.md) before
+requesting credentials. It defines the prerequisites, separate runtime and
+derived roles, least-privilege SQL templates, TLS settings, verification
+queries, and ongoing responsibilities. The derived role is optional; do not
+reuse a source owner or database administrator account for either application
+connection.
+
 With `MAPP_DATABASE_MODE=external`, the resolved Compose model omits both `db`
 and `etl`, so their role variables are unused. Keep the full generated `.env`
 key set for consistent drift checks, or supply an externally managed env file
