@@ -177,7 +177,7 @@ class SupplyChainWorkflowTests(unittest.TestCase):
             "IMAGE_DIGEST: ${{ steps.build.outputs.digest }}",
             "image-ref=%s@%s",
             "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-            "subject-${{ matrix.image }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            "subject-${{ matrix.image }}-${{ github.sha }}-${{ github.run_id }}",
             "provenance: mode=max",
             "sbom: generator=docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68",
             "DOCKER_BUILD_RECORD_RETENTION_DAYS: 30",
@@ -197,6 +197,17 @@ class SupplyChainWorkflowTests(unittest.TestCase):
         )
         for fragment in required_fragments:
             self.assertIn(fragment, self.workflow)
+
+        artifact_names = re.findall(
+            r"^          name: (?:subject|evidence|signatures)-.*$",
+            self.workflow,
+            re.MULTILINE,
+        )
+        self.assertTrue(artifact_names)
+        self.assertTrue(
+            all("run_attempt" not in name for name in artifact_names)
+        )
+        self.assertGreaterEqual(self.workflow.count("overwrite: true"), 3)
 
     def test_private_personal_repository_does_not_use_enterprise_attestations(self) -> None:
         self.assertNotRegex(

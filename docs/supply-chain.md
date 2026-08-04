@@ -57,7 +57,9 @@ request an OIDC identity. The scan job gets only `packages: read`, does not
 check out source, and removes its read-only registry credential after use. Only
 the signing job gets `packages: write` and `id-token: write`; it contains no
 scanner action. The immutable image name and digest cross these boundaries in
-a 30-day subject artifact, and signing starts only after the complete scan
+a 30-day subject artifact keyed by the stable workflow run ID. Stable handoff
+names let a failed-job retry reuse successful upstream artifacts; a full rerun
+replaces those exact artifacts. Signing starts only after the complete scan
 matrix succeeds. Evidence blobs are signed, verified, and retained before the
 image is signed, so an evidence failure cannot leave a release-looking image
 signature behind.
