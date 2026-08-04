@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -17,6 +18,10 @@ EXPECTED_BASES = {
     "browser-runner/Dockerfile": (
         "mcr.microsoft.com/playwright:v1.61.1-noble@sha256:"
         "5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48",
+    ),
+    "docker/caddy/Dockerfile": (
+        "caddy:2.10.0-alpine@sha256:"
+        "ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c",
     ),
     "config-ui/Dockerfile": (
         "node:22.23.1-bookworm-slim@sha256:"
@@ -85,6 +90,27 @@ class SupplyChainWorkflowTests(unittest.TestCase):
         cls.workflow = (
             REPOSITORY_ROOT / ".github/workflows/supply-chain.yml"
         ).read_text(encoding="utf-8")
+        matrix_match = re.search(
+            r"          MATRIX_JSON: >-\n"
+            r"(?P<body>(?:            .*\n)+)"
+            r"        run:",
+            cls.workflow,
+        )
+        if matrix_match is None:
+            raise AssertionError("supply-chain matrix JSON is missing")
+        cls.matrix = json.loads(
+            " ".join(line.strip() for line in matrix_match.group("body").splitlines())
+        )
+        jobs_text = cls.workflow.split("\njobs:\n", maxsplit=1)[1]
+        matches = list(re.finditer(r"^  ([a-z][a-z0-9-]*):\n", jobs_text, re.MULTILINE))
+        cls.jobs = {
+            match.group(1): jobs_text[
+                match.start() : matches[index + 1].start()
+                if index + 1 < len(matches)
+                else len(jobs_text)
+            ]
+            for index, match in enumerate(matches)
+        }
 
     def test_actions_are_full_commit_sha_pinned(self) -> None:
         uses = re.findall(r"^\s*uses:\s*([^@\s]+)@([^\s#]+)", self.workflow, re.MULTILINE)
@@ -93,11 +119,49 @@ class SupplyChainWorkflowTests(unittest.TestCase):
             self.assertRegex(revision, r"^[0-9a-f]{40}$", action)
 
     def test_every_final_image_is_built(self) -> None:
-        dockerfiles = set(
-            re.findall(r"^\s+dockerfile:\s+(\S+)$", self.workflow, re.MULTILINE)
-        )
+        dockerfiles = [entry["dockerfile"] for entry in self.matrix["include"]]
         expected = set(EXPECTED_BASES) - {".devcontainer/Dockerfile"}
-        self.assertEqual(dockerfiles, expected)
+        self.assertEqual(set(dockerfiles), expected)
+        self.assertEqual(len(dockerfiles), len(expected))
+
+    def test_scanners_have_no_publish_or_oidc_authority(self) -> None:
+        self.assertEqual(set(self.jobs), {"plan", "build", "scan", "sign"})
+
+        build = self.jobs["build"]
+        self.assertIn("packages: write", build)
+        self.assertNotIn("id-token: write", build)
+        self.assertNotIn("anchore/sbom-action", build)
+        self.assertNotIn("aquasecurity/trivy-action", build)
+        self.assertNotIn("sigstore/cosign-installer", build)
+
+        scan = self.jobs["scan"]
+        self.assertIn("packages: read", scan)
+        self.assertNotIn("packages: write", scan)
+        self.assertNotIn("id-token: write", scan)
+        self.assertIn("anchore/sbom-action", scan)
+        self.assertIn("aquasecurity/trivy-action", scan)
+        self.assertNotIn("sigstore/cosign-installer", scan)
+
+        sign = self.jobs["sign"]
+        self.assertIn("packages: write", sign)
+        self.assertIn("id-token: write", sign)
+        self.assertNotIn("anchore/sbom-action", sign)
+        self.assertNotIn("aquasecurity/trivy-action", sign)
+        self.assertIn("needs: [plan, scan]", sign)
+        self.assertLess(sign.index("cosign sign-blob"), sign.index("Retain signature bundles"))
+        self.assertLess(sign.index("Retain signature bundles"), sign.index("Sign the image last"))
+
+    def test_compose_deploys_the_reviewed_caddy_wrapper(self) -> None:
+        compose = (REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8")
+        example_env = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("image: mapp-caddy:2.10.0", compose)
+        self.assertRegex(
+            compose,
+            r"(?ms)^  caddy:\n.*?^    build:\n"
+            r"      context: \./docker/caddy\n"
+            r"      dockerfile: Dockerfile$",
+        )
+        self.assertNotIn("CADDY_IMAGE=", example_env)
 
     def test_release_requires_oidc_and_never_reads_a_signing_key(self) -> None:
         self.assertIn("id-token: write", self.workflow)
@@ -110,7 +174,10 @@ class SupplyChainWorkflowTests(unittest.TestCase):
 
     def test_digest_bound_evidence_and_policy_are_retained(self) -> None:
         required_fragments = (
-            "@${{ steps.build.outputs.digest }}",
+            "IMAGE_DIGEST: ${{ steps.build.outputs.digest }}",
+            "image-ref=%s@%s",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "subject-${{ matrix.image }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
             "provenance: mode=max",
             "sbom: generator=docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68",
             "DOCKER_BUILD_RECORD_RETENTION_DAYS: 30",

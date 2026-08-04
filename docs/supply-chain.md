@@ -18,6 +18,7 @@ machine-readable allowlist and must change in the same review as a Dockerfile.
 | `python:3.12.13-slim-bookworm` | `sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b` | config UI, semantic service, and ETL |
 | `postgis/postgis:17-3.5` | `sha256:45f2a608397fa67d236b012c14a9e3ea31e9fe813edbeb5c1c0d1acbf0d48ea9` | bundled PostgreSQL/PostGIS/H3 image |
 | `mcr.microsoft.com/playwright:v1.61.1-noble` | `sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48` | browser runner |
+| `caddy:2.10.0-alpine` | `sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c` | Caddy edge wrapper |
 | `ubuntu/squid:6.6-24.04_edge` | `sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c` | allowlisting egress proxy |
 | `mcr.microsoft.com/devcontainers/python:1-3.12-bookworm` | `sha256:7876580dc67fd460fd962f004cbeb480027e9bbc0657096f1087db11f9eaff39` | development container only |
 
@@ -28,13 +29,16 @@ Canonical publishes `ubuntu/squid` as a Verified Publisher image. The selected
 Squid 6.6 / Ubuntu 24.04 line is supported through May 2029. Its configuration
 is mounted read-only at `/etc/squid/squid.conf`, it listens on port 3128, and
 its optional log/cache paths are `/var/log/squid` and `/var/spool/squid`.
+Caddy's wrapper adds nothing to the reviewed upstream image; Compose continues
+to mount the same Caddyfile and retains the upstream entrypoint and command.
 
 ## Publication workflow
 
 `.github/workflows/supply-chain.yml` runs only for `main` (including manual
-runs selected on `main`). It publishes one `linux/amd64` GHCR image per final
-Dockerfile under a unique source/run tag. Deployment and verification must use
-the emitted image digest rather than that tag.
+runs selected on `main`). It publishes one `linux/amd64` GHCR image for each of
+the eight final Dockerfiles, including the Caddy wrapper, under a unique
+source/run tag. Deployment and verification must use the emitted image digest
+rather than that tag.
 
 For every image digest the workflow:
 
@@ -47,21 +51,31 @@ For every image digest the workflow:
    Cosign 3.0.6; and
 5. verifies the Cosign certificate identity and OIDC issuer before completion.
 
-All actions use full commit SHAs. Signing has `id-token: write` and uses the
-GitHub Actions OIDC identity; there is no repository signing key or Cosign
-password. GHCR login uses only the workflow-scoped `GITHUB_TOKEN`. The release
-builder is also fixed to Buildx 0.34.1 and the multi-platform BuildKit 0.30.0
-index digest
+All actions use full commit SHAs. The build, scan, and signing phases run as
+separate jobs. The build job can read source and publish packages but cannot
+request an OIDC identity. The scan job gets only `packages: read`, does not
+check out source, and removes its read-only registry credential after use. Only
+the signing job gets `packages: write` and `id-token: write`; it contains no
+scanner action. The immutable image name and digest cross these boundaries in
+a 30-day subject artifact, and signing starts only after the complete scan
+matrix succeeds. Evidence blobs are signed, verified, and retained before the
+image is signed, so an evidence failure cannot leave a release-looking image
+signature behind.
+
+Signing uses the GitHub Actions OIDC identity; there is no repository signing
+key or Cosign password. Registry login uses only the job-scoped
+`GITHUB_TOKEN`. The release builder is also fixed to Buildx 0.34.1 and the
+multi-platform BuildKit 0.30.0 index digest
 `sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f`.
 BuildKit's `docker/buildkit-syft-scanner:stable-1` generator is fixed to index
 digest
 `sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68`.
 
 The BuildKit OCI attestations and Cosign image signature remain attached to the
-image in GHCR. The workflow also uploads the scan, both SBOMs, extracted SLSA
-provenance, their Sigstore bundles, and the BuildKit build record for 30 days.
-A failed scan therefore still leaves the SBOM, provenance, and scan evidence
-available for review.
+image in GHCR. Separate subject, scan-evidence, and signature-bundle artifacts,
+plus the BuildKit build record, are retained for 30 days. A failed scan still
+leaves the SBOM, provenance, and scan evidence available for review, but no
+signing job starts unless every final-image scan succeeds.
 
 For an image named `IMAGE` and digest `DIGEST`, consumers should verify both
 identities before deployment:
@@ -81,6 +95,26 @@ Do not loosen the certificate identity to accept arbitrary branches or
 workflows. A release/deployment policy should also require the expected GitHub
 repository and `main` workflow identity, not merely the presence of any valid
 signature.
+
+Promotion must require both a successful supply-chain workflow conclusion and
+the expected image signature. A signature alone is not a release marker: an
+external failure while verifying the final signature could still make the job
+fail after the registry accepted it.
+
+To deploy the published Caddy wrapper instead of building it locally, use a
+deployment-owned Compose override with the verified digest; do not restore the
+old `CADDY_IMAGE` variable because a digest cannot also be a build output tag:
+
+```yaml
+services:
+  caddy:
+    image: ghcr.io/OWNER/REPOSITORY-caddy@sha256:DIGEST
+    build: !reset null
+```
+
+Apply that file after the repository Compose files, pull the digest, and start
+with `--no-build`. Keep the override outside source control if it contains
+environment-specific release selection.
 
 Registry-native attestations require the candidate image to be pushed before
 the scan. A rejected candidate therefore remains under its unique run tag but
@@ -128,12 +162,14 @@ notices as triggers for an immediate refresh.
 
 - Docker: [pin base images to digests](https://docs.docker.com/build/building/best-practices/#pin-base-image-versions),
   [add SBOM/provenance attestations](https://docs.docker.com/build/ci/github-actions/attestations/),
-  and [inspect SLSA provenance](https://docs.docker.com/build/metadata/attestations/slsa-provenance/#inspecting-provenance).
+  [inspect SLSA provenance](https://docs.docker.com/build/metadata/attestations/slsa-provenance/#inspecting-provenance),
+  and [reset an inherited Compose value](https://docs.docker.com/reference/compose-file/merge/#reset-value).
 - GitHub: [pin actions to full commit SHAs](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/manage-custom-actions#using-release-management-for-actions)
-  and [attest container images](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations#generating-build-provenance-for-container-images).
+  and [set least-privilege `GITHUB_TOKEN` permissions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token).
 - Anchore: [generate SPDX and CycloneDX SBOMs with Syft](https://github.com/anchore/syft#readme).
 - Sigstore: [keyless CI signing with Cosign](https://docs.sigstore.dev/quickstart/quickstart-ci/)
   and [identity-bound verification](https://docs.sigstore.dev/cosign/verifying/verify/).
 - OCI: [Image and Distribution 1.1 referrers](https://opencontainers.org/posts/blog/2024-03-13-image-and-distribution-1-1/)
   for signatures, SBOMs, and provenance attached to an image digest.
 - Canonical: [the maintained `ubuntu/squid` image](https://hub.docker.com/r/ubuntu/squid).
+- Docker Official Images: [the maintained Caddy image](https://hub.docker.com/_/caddy).
