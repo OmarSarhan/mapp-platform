@@ -26,15 +26,15 @@ secured independently.
                          │          │
                          ▼          ▼
                         XYZ     config dashboard/API
-                         │       │       │
-                         └──┬────┘       └── browser runner
+                         │       │       ├── browser runner
+                         └──┬────┘       └── semantic service ──> SQLite
                             ▼
               bundled or external PostgreSQL/PostGIS
                             ▲
                             │ bundled sample mode only
                     optional one-shot ETL
-                            ▲
-                     Leeds ArcGIS REST
+                         ▲        ▲
+              Leeds ArcGIS   ONS/Nomis Census
 
 external config-cli ── HTTPS/bearer token ──> config API
 ```
@@ -42,24 +42,28 @@ external config-cli ── HTTPS/bearer token ──> config API
 Caddy is the only platform service intended to publish host ports. Bundled
 PostgreSQL, XYZ, the configuration service, and the browser runner communicate
 over private Compose networks; external PostGIS traffic leaves the backend
-network for the operator-managed endpoint. The browser runner additionally
-joins a dedicated egress
-network so the rendered map can fetch external framework, icon, and basemap
-assets. It shares the narrow automation network with the configuration
-service and Caddy, but does not join the database/backend or public edge
-networks and holds no platform credential. Browser navigation uses a guarded,
+network for the operator-managed endpoint. The browser runner shares only the
+internal automation network with the configuration service, Caddy, and an
+allowlisting Squid proxy. Only that unprivileged proxy joins the dedicated
+external network, so Chromium can fetch reviewed basemap assets without a
+direct route to arbitrary destinations. The runner does not join the
+database/backend or public edge networks and holds no platform credential.
+Browser navigation uses a guarded,
 un-published Caddy listener on port 8081; the `caddy` hostname is denied on the
-published HTTP listener.
+published HTTP listener. The semantic service is on a separate internal
+network shared only with the configuration service. It has neither a public
+route nor a database credential.
 
 ## Components
 
 | Component | Responsibility | Persistent inputs/state |
 | --- | --- | --- |
 | PostgreSQL/PostGIS | Application data and spatial indexes; either bundled sample data or an externally managed server | Named PostgreSQL volume in bundled mode; external operator in external mode |
-| ETL | Optional sample-data provisioning through bounded ArcGIS reads and idempotent PostGIS loading | `instance/etl/layers.json`; bundled mode through the wrapper |
+| ETL | Optional Leeds sample and reviewed England Census 2021 provisioning through bounded, validated source reads | `instance/etl/layers.json`, `instance/etl/census.json`; bundled mode through the wrapper |
 | XYZ | Map UI, MVT and feature queries | `var/workspace/workspace.json`, `instance/xyz.env`, public assets |
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
-| Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
+| Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
+| Semantic service | Durable generated facts, curated annotations, per-asset proposals, history, and archive tombstones | `var/semantic/semantic.sqlite3` |
 | Browser runner | Authenticated visual validation with bounded map origin and isolated outbound asset access | `var/control/artifacts` |
 | Caddy | TLS, host routing, response headers, upstream file-provider guard | Caddy named volumes |
 | Standalone CLI | Remote inspection, proposals, application and verification | State on the separate client computer |
@@ -71,6 +75,8 @@ The versioned `instance` tree contains reviewed deployment inputs:
 - `workspace.seed.json` initializes a missing live workspace.
 - `xyz.env` contains non-secret XYZ settings.
 - `etl/layers.json` selects optional sample ETL sources and fields.
+- `etl/census.json` pins the England Census topic archives and the deterministic
+  full Output Area source hash and geometry contract.
 - `public/svg` contains public custom icons.
 
 The ignored `var` tree contains live state:
@@ -82,14 +88,62 @@ The ignored `var` tree contains live state:
   visual artifacts.
 - `preview` contains the private candidate workspace used only by
   `xyz-preview`.
+- `semantic` contains the generated and curated semantic catalog, proposal
+  records, source-event receipts, and asset history.
 - `reload` is a narrow generation/fingerprint channel between the
   configuration service and XYZ supervisor.
 - `preview-reload` is a separate generation/fingerprint channel between the
   configuration service and the preview XYZ supervisor.
 
 The control tree contains authentication material and sensitive operational
-records. It must not be mounted into XYZ or served as a public static
-resource.
+records. The semantic tree is also mutable operational state. Neither may be
+mounted into XYZ or served as a public static resource.
+
+## Semantic metadata flow
+
+The semantic store is intentionally outside PostgreSQL and outside XYZ. It
+describes assets without becoming another client route to their rows. The
+configuration service alone may perform the separately scoped, bounded
+sample/statistics read used by an explicitly opted-in Gemini generation
+request; it sends that context to the provider without storing it in the
+semantic service or returning it to the browser/CLI:
+
+1. A managed derived-layer transaction commits the relation definition, a
+   stable semantic asset ID, its next generation, and an outbox event together.
+2. The configuration service delivers the retained event to the private
+   semantic service. Startup and background drains recover interrupted
+   delivery.
+3. The semantic service updates source-owned generated facts and history,
+   retaining field IDs while their source names remain present.
+4. Dashboard and CLI users inspect the catalog through the authenticated
+   configuration API, including immutable per-asset history. Curated meaning
+   changes through a checked, revision-bound per-asset proposal.
+5. A new workspace reference to a derived relation is publishable only after
+   the matching semantic generation is ready.
+
+The derived-layer PostgreSQL outbox is the atomic bridge; SQLite does not
+participate in the PostgreSQL transaction. Stable event IDs make delivery
+idempotent. Workers atomically take expiring PostgreSQL claims with
+`SKIP LOCKED`; only the matching claimant can commit delivery, retry, or repair
+state, while lease expiry recovers abandoned work. Event envelopes, payload
+hashes, and acknowledgements are validated, and events are delivered in order
+per asset and managed derived name. Delivery remains safely at-least-once.
+Failed automatic delivery becomes an explicit `repair_required` blocker
+instead of discarding the source change or guessing. The confirmed
+administrator action only requeues the same retained event and payload; it
+cannot correct a deterministic conflict by itself.
+
+Bundled database reset owns a fenced maintenance gate. It first uses automatic
+delivery to reach a completely ready, blocker-free preflight state, then
+archives and verifies every current asset before volume removal. A handled
+interruption can compensate only its own gate. Recovery gives each definition
+left in reset archival state a new semantic asset ID and registers it from
+generation 1 with the archived asset as a validated predecessor. Curated
+metadata, orphans, and matching field IDs carry into the audited successor; the
+accepted predecessor remains an immutable tombstone. Startup never
+force-recovers a retained gate. After confirming that no reset process remains,
+an operator must use `./bin/mapp recover-reset-data --confirm`. See [Semantic
+metadata control plane](semantic-layer.md).
 
 ## Configuration flow
 

@@ -39,6 +39,14 @@ absence of plugin-related browser errors. Manifest-provided test code is never
 executed by the configuration service. A post-apply visual test separately
 confirms behavior against live XYZ.
 
-Use `config-cli plugins list`, `show`, `validate`, and `usage`. `./bin/mapp
-doctor` validates source manifests; `./bin/mapp verify` additionally compares
-mounted plugin hashes across services.
+Authenticated callers with `inspect` can read `GET /api/plugins`. The response
+contains the pinned built-in registry, source-controlled external manifests,
+workspace usage and diagnostics, declarative preview checks, and the catalogue
+fingerprint. The standalone client exposes that same server-owned response
+through `config-cli plugins list`, `show`, `validate`, and `usage`; these are
+inspection commands and never install, upload, import, or mutate a plugin.
+Treat an absent advertised plugin command as unavailable rather than calling a
+similar route directly.
+
+`./bin/mapp doctor` validates source manifests; `./bin/mapp verify`
+additionally compares mounted plugin hashes across services.

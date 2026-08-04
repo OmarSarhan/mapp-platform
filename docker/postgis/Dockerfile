@@ -1,11 +1,13 @@
-FROM postgis/postgis:17-3.5
+FROM postgis/postgis:17-3.5@sha256:45f2a608397fa67d236b012c14a9e3ea31e9fe813edbeb5c1c0d1acbf0d48ea9
 
 ARG H3_PG_REF=v4.2.3
 ARG H3_PG_COMMIT=a26630b8353d441e6bc8065c0a8dcaa3d89ef87b
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    sed -i 's|http://deb.debian.org/debian-security|https://security.debian.org/debian-security|g' /etc/apt/sources.list; \
+    sed -i 's|http://deb.debian.org/debian|https://ftp.debian.org/debian|g' /etc/apt/sources.list; \
+    apt-get -o Acquire::Retries=10 update; \
+    apt-get -o Acquire::Retries=10 install -y --no-install-recommends \
       build-essential \
       ca-certificates \
       cmake \

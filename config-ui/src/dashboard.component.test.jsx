@@ -12,6 +12,9 @@ import {
   Dashboard,
   DerivedLayers,
   Root,
+  Security,
+  TOKEN_ACCESS_PRESETS,
+  TOKEN_SCOPE_OPTIONS,
   derivedLayerFormDefinition,
   geometryKind,
   reconcileDerivedWorkspace,
@@ -37,6 +40,232 @@ const response = (payload, status = 200) => ({
   status,
   statusText: status >= 200 && status < 300 ? 'OK' : 'Request failed',
   json: async () => payload,
+});
+
+describe('Scoped token administration', () => {
+  test('offers semantic privilege tiers and provisions the selected scopes', async () => {
+    const created = [];
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (options.method === 'POST' && path === '/api/admin/tokens') {
+        created.push(JSON.parse(options.body));
+        return response({token: 'mapp_one_time', record: {id: 'token-1'}}, 201);
+      }
+      if (path === '/api/admin/tokens') {
+        return response({tokens: []});
+      }
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: []});
+      }
+      if (path === '/api/admin/audit') {
+        return response({events: []});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    const access = await screen.findByLabelText('Token access level');
+    expect(access.value).toBe('full');
+    for (const scope of TOKEN_SCOPE_OPTIONS) {
+      expect(screen.getByRole('checkbox', {name: new RegExp(scope.label)}).checked)
+        .toBe(true);
+    }
+    expect(screen.getByText(
+      'Selected scopes: full (all bearer-token workspace and semantic scopes)',
+    )).toBeTruthy();
+    fireEvent.change(access, {target: {value: 'semantic-administrator'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Create scoped CLI token'}));
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0]).toMatchObject({
+      name: 'CLI operator',
+      scopes: [
+        'semantic:inspect',
+        'semantic:source',
+        'semantic:generate',
+        'semantic:data',
+        'semantic:propose',
+        'semantic:apply',
+        'semantic:admin',
+      ],
+    });
+    expect(new Date(created[0].expires).getTime()).toBeGreaterThan(Date.now());
+    expect(await screen.findByText('mapp_one_time')).toBeTruthy();
+    expect(Object.fromEntries(TOKEN_ACCESS_PRESETS.map(item => [
+      item.id,
+      item.scopes,
+    ]))).toEqual({
+      'semantic-reader': ['semantic:inspect'],
+      'semantic-proposer': ['semantic:inspect', 'semantic:propose'],
+      'semantic-ai-author': [
+        'semantic:inspect',
+        'semantic:source',
+        'semantic:generate',
+        'semantic:data',
+        'semantic:propose',
+      ],
+      'semantic-curator': [
+        'semantic:inspect',
+        'semantic:propose',
+        'semantic:apply',
+      ],
+      'semantic-operator': ['semantic:inspect', 'semantic:admin'],
+      'semantic-administrator': [
+        'semantic:inspect',
+        'semantic:source',
+        'semantic:generate',
+        'semantic:data',
+        'semantic:propose',
+        'semantic:apply',
+        'semantic:admin',
+      ],
+      full: ['full'],
+    });
+    expect(TOKEN_ACCESS_PRESETS.find(item => item.id === 'full')).toMatchObject({
+      label: 'Full platform operator',
+      help: expect.stringContaining('dashboard-session-only'),
+    });
+    expect(TOKEN_SCOPE_OPTIONS.map(item => item.id)).toEqual([
+      'inspect',
+      'propose',
+      'visual',
+      'apply',
+      'reload',
+      'derive',
+      'semantic:inspect',
+      'semantic:source',
+      'semantic:generate',
+      'semantic:data',
+      'semantic:propose',
+      'semantic:apply',
+      'semantic:admin',
+    ]);
+  });
+
+  test('provisions every named access level without expanding its scopes', async () => {
+    const created = [];
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (options.method === 'POST' && path === '/api/admin/tokens') {
+        created.push(JSON.parse(options.body));
+        return response({
+          token: `mapp_${created.length}`,
+          record: {id: `token-${created.length}`},
+        }, 201);
+      }
+      if (path === '/api/admin/tokens') {
+        return response({tokens: []});
+      }
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: []});
+      }
+      if (path === '/api/admin/audit') {
+        return response({events: []});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    const access = await screen.findByLabelText('Token access level');
+    const create = screen.getByRole('button', {
+      name: 'Create scoped CLI token',
+    });
+    fireEvent.change(screen.getByLabelText('Token expiry'), {
+      target: {value: 'never'},
+    });
+    expect(create.disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText('Confirm extended token lifetime'));
+    expect(create.disabled).toBe(false);
+
+    for (const preset of TOKEN_ACCESS_PRESETS) {
+      fireEvent.change(access, {target: {value: preset.id}});
+      await waitFor(() => expect(access.value).toBe(preset.id));
+      fireEvent.click(create);
+      await waitFor(() => expect(created).toHaveLength(
+        TOKEN_ACCESS_PRESETS.indexOf(preset) + 1,
+      ));
+      expect(created.at(-1)).toEqual({
+        name: 'CLI operator',
+        scopes: preset.scopes,
+        expires: null,
+        extendedExpiryConfirmed: true,
+      });
+      await waitFor(() => expect(create.disabled).toBe(false));
+    }
+  });
+
+  test('narrows full access before custom selection and confirms no expiry', async () => {
+    const created = [];
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (options.method === 'POST' && path === '/api/admin/tokens') {
+        created.push(JSON.parse(options.body));
+        return response({token: 'mapp_custom', record: {id: 'token-2'}}, 201);
+      }
+      if (path === '/api/admin/tokens') {
+        return response({tokens: []});
+      }
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: []});
+      }
+      if (path === '/api/admin/audit') {
+        return response({events: []});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    const access = await screen.findByLabelText('Token access level');
+    const create = screen.getByRole('button', {name: 'Create scoped CLI token'});
+    expect(access.value).toBe('full');
+    expect(screen.getByText(
+      'Selected scopes: full (all bearer-token workspace and semantic scopes)',
+    )).toBeTruthy();
+
+    const semanticInspect = screen.getByRole('checkbox', {
+      name: /Inspect semantic catalog/,
+    });
+    fireEvent.click(semanticInspect);
+    expect(access.value).toBe('custom');
+    expect(screen.getByText(new RegExp(
+      TOKEN_SCOPE_OPTIONS
+        .filter(scope => scope.id !== 'semantic:inspect')
+        .map(scope => scope.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join(', '),
+    ))).toBeTruthy();
+    expect(create.disabled).toBe(false);
+    fireEvent.change(access, {target: {value: 'custom'}});
+    expect(screen.getByText(/inspect, propose, visual/)).toBeTruthy();
+
+    fireEvent.click(semanticInspect);
+    for (const scope of TOKEN_SCOPE_OPTIONS) {
+      expect(screen.getByRole('checkbox', {name: new RegExp(scope.label)}).checked)
+        .toBe(true);
+    }
+    expect(screen.getAllByText(/semantic:inspect/).length).toBeGreaterThan(1);
+    expect(create.disabled).toBe(false);
+
+    for (const scope of TOKEN_SCOPE_OPTIONS) {
+      const checkbox = screen.getByRole('checkbox', {name: new RegExp(scope.label)});
+      if (checkbox.checked) fireEvent.click(checkbox);
+    }
+    expect(screen.getByText('Selected scopes: none')).toBeTruthy();
+    expect(create.disabled).toBe(true);
+
+    fireEvent.click(semanticInspect);
+    fireEvent.change(screen.getByLabelText('Token expiry'), {
+      target: {value: 'never'},
+    });
+    expect(create.disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText('Confirm extended token lifetime'));
+    fireEvent.click(create);
+
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect(created[0]).toEqual({
+      name: 'CLI operator',
+      scopes: ['semantic:inspect'],
+      expires: null,
+      extendedExpiryConfirmed: true,
+    });
+    expect(await screen.findByText('mapp_custom')).toBeTruthy();
+  });
 });
 
 test('recognizes mixed-case PostGIS geometry metadata', () => {
@@ -97,6 +326,50 @@ afterEach(() => {
 });
 
 describe('Dashboard managed save lifecycle', () => {
+  test('requires an explicit action to add a selected catalog table as a layer', async () => {
+    const catalogTable = {
+      dbs: 'MAPP',
+      schema: 'leeds',
+      table: 'bus_stops',
+      columns: [
+        {name: 'id', type: 'integer', primaryKey: true, nullable: false},
+        {name: 'geom', geometryType: 'Point', srid: 3857},
+      ],
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') return response({workspace, revision: 'rev-1'});
+      if (path === '/api/catalog') return response({tables: [catalogTable], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      if (path === '/api/plugins') return response({plugins: {external: [], fingerprint: 'catalogue'}});
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    const catalogRow = await screen.findByRole('button', {name: /leeds\.bus_stops/});
+    fireEvent.click(catalogRow);
+
+    expect(catalogRow.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByRole('button', {name: 'Bus Stops'})).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', {name: 'Add selected table as layer'}));
+    expect(await screen.findByRole('button', {name: 'Bus Stops'})).toBeTruthy();
+  });
+
+  test('explains that advanced configuration is optional and links to its guide', async () => {
+    vi.stubGlobal('fetch', standardFetch(() => response({})));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByText('Templates and advanced locale JSON'));
+
+    const guide = screen.getByRole('link', {
+      name: 'Open the advanced-configuration guide',
+    });
+    expect(guide.getAttribute('href')).toBe('/advanced-configuration.html');
+    expect(guide.closest('p').textContent).toContain(
+      'Gazetteer setup belongs to an individual layer.',
+    );
+  });
+
   test('reconciles added and removed derived columns into workspace info fields', () => {
     const source = {
       ...workspace,
@@ -162,6 +435,7 @@ describe('Dashboard managed save lifecycle', () => {
   });
 
   test('refreshes the derived-layer form after converting its kind', async () => {
+    let replacementPayload;
     const materialized = {
       name: 'hex_summary',
       kind: 'materialized',
@@ -173,6 +447,7 @@ describe('Dashboard managed save lifecycle', () => {
       createdAt: '2026-07-19T12:00:00Z',
       createdBy: 'admin',
       refreshedAt: '2026-07-19T12:01:00Z',
+      spatialScope: {type: 'workspace-map-extent', locale: 'Leeds'},
     };
     const converted = {
       ...materialized,
@@ -196,6 +471,7 @@ describe('Dashboard managed save lifecycle', () => {
         path === '/api/derived-layers/hex_summary/replace'
         && options.method === 'POST'
       ) {
+        replacementPayload = JSON.parse(options.body);
         listKind = 'view';
         return response({derivedLayer: converted});
       }
@@ -213,6 +489,10 @@ describe('Dashboard managed save lifecycle', () => {
     });
     expect(screen.getByDisplayValue('view')).toBeTruthy();
     expect(screen.getByText(/view · leeds\.bus_stops/)).toBeTruthy();
+    expect(replacementPayload.spatialScope).toEqual({
+      type: 'workspace-map-extent',
+      locale: 'Leeds',
+    });
   });
 
   test('removes server metadata from editable derived-layer definitions', () => {
@@ -227,6 +507,7 @@ describe('Dashboard managed save lifecycle', () => {
       createdAt: '2026-07-19T12:00:00Z',
       createdBy: 'admin',
       refreshedAt: '2026-07-19T12:01:00Z',
+      spatialScope: {type: 'workspace-map-extent', locale: 'Leeds'},
     })).toEqual({
       name: 'hex_summary',
       kind: 'materialized',
@@ -235,7 +516,309 @@ describe('Dashboard managed save lifecycle', () => {
       geometryColumn: 'geom',
       description: '',
       query: 'SELECT id, geom FROM leeds.bus_stops',
+      spatialScope: {type: 'workspace-map-extent', locale: 'Leeds'},
     });
+  });
+
+  test('scopes create requests and reports the successful materialization estimate', async () => {
+    let createPayload;
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: []});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers' && options.method === 'POST') {
+        createPayload = JSON.parse(options.body);
+        return response({derivedLayer: {
+          ...createPayload,
+          queryPlanProbe: {
+            estimatedFinalRows: 100000,
+            maxIntermediateRows: 250000,
+            maxIntermediateBytes: 128 * 1024 * 1024,
+          },
+          materializationProbe: {
+            estimatedBytes: 512 * 1024 * 1024,
+            actualBytes: 480 * 1024 * 1024,
+            maxEstimatedBytes: 1024 ** 3,
+          },
+        }}, 201);
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    fireEvent.change(await screen.findByLabelText('Name'), {target: {value: 'large_places'}});
+    fireEvent.change(screen.getByLabelText('Kind'), {target: {value: 'materialized'}});
+    fireEvent.change(screen.getByLabelText('ID column'), {target: {value: 'id'}});
+    fireEvent.change(screen.getByLabelText('Geometry column'), {target: {value: 'geom'}});
+    fireEvent.change(screen.getByLabelText('Source relations'), {target: {value: 'leeds.places'}});
+    fireEvent.change(screen.getByLabelText('One read-only SELECT'), {target: {value: 'SELECT id, geom FROM leeds.places'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Create derived relation'}));
+
+    expect(await screen.findByText(/Planner-estimated materialized size: 512 MiB \(limit 1.0 GiB\)/)).toBeTruthy();
+    expect(screen.getByText(/Actual stored materialized size: 480 MiB \(limit 1.0 GiB\)/)).toBeTruthy();
+    expect(screen.getByText(/Planner-estimated query: 100,000 output rows · largest intermediate 250,000 rows · 128 MiB intermediate data/)).toBeTruthy();
+    expect(createPayload.spatialScope).toEqual({type: 'workspace-map-extent'});
+    expect(screen.getByText(/workspace map area at one zoom level out \(z−1\)/)).toBeTruthy();
+  });
+
+  test('offers to switch an oversized background materialization to a view without resubmitting', async () => {
+    let createRequests = 0;
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: []});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers' && options.method === 'POST') {
+        createRequests += 1;
+        return response({operation: {
+          id: 'operation-1',
+          status: 'failed',
+          error: {
+            status: 409,
+            code: 'derived_layer.materialization_too_large',
+            userMessage: 'The materialized result is too large.',
+            suggestedAction: 'Create an ordinary view instead.',
+            blocked: true,
+            recommendedKind: 'view',
+            probe: {estimatedBytes: 2 * 1024 ** 3, maxEstimatedBytes: 1024 ** 3},
+          },
+        }}, 202);
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    const kind = await screen.findByLabelText('Kind');
+    fireEvent.change(kind, {target: {value: 'materialized'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Create derived relation'}));
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/Switch this form to an ordinary view/)));
+    expect(kind.value).toBe('view');
+    expect(createRequests).toBe(1);
+  });
+
+  test('does not switch or resubmit a query that exceeds the compute guard', async () => {
+    let createRequests = 0;
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: []});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers' && options.method === 'POST') {
+        createRequests += 1;
+        return response({operation: {
+          id: 'operation-2',
+          status: 'failed',
+          error: {
+            status: 409,
+            code: 'derived_layer.query_too_expensive',
+            userMessage: 'The query plan exceeds the compute guard.',
+            suggestedAction: 'Rewrite the query or reduce its H3 expansion.',
+            blocked: true,
+            reasons: [{
+              code: 'h3_scope_cells',
+              message: 'Too many H3 cells.',
+              suggestedAction: 'Use a coarser H3 resolution.',
+            }],
+            probe: {
+              estimatedTotalCost: 20000000,
+              h3Expansion: {resolutions: [12], estimatedScopeCells: 20000000},
+            },
+            technicalDetail: 'raw planner diagnostic',
+          },
+        }, meta: {requestId: 'req-compute'}}, 202);
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    const kind = await screen.findByLabelText('Kind');
+    fireEvent.change(kind, {target: {value: 'materialized'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Create derived relation'}));
+
+    expect(await screen.findByText(/Rewrite the query or reduce its H3 expansion/)).toBeTruthy();
+    expect(screen.getByText('Too many H3 cells.')).toBeTruthy();
+    expect(screen.getByText('Use a coarser H3 resolution.')).toBeTruthy();
+    expect(screen.getByText(/No derived layer was created/)).toBeTruthy();
+    const details = screen.getByText('Technical details').closest('details');
+    expect(details.open).toBe(false);
+    expect(details.textContent).toContain('derived_layer.query_too_expensive');
+    expect(details.textContent).toContain('req-compute');
+    expect(screen.getByText('raw planner diagnostic').closest('details')).toBe(details);
+    expect(kind.value).toBe('materialized');
+    expect(confirm).not.toHaveBeenCalled();
+    expect(createRequests).toBe(1);
+  });
+
+  test('explains a query policy rejection without misclassifying it as H3 cost', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: []});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers' && options.method === 'POST') {
+        const message = 'The derived-layer query for “places” uses SQL that is not allowed. Relation places must be schema-qualified.';
+        return response({
+          error: message,
+          userMessage: message,
+          code: 'derived_layer.query_not_allowed',
+          category: 'policy',
+          blocked: true,
+          stateUnchanged: true,
+          safeState: 'No derived layer was created.',
+          reasons: [{
+            code: 'unqualified_relation',
+            message: 'Relation places must be schema-qualified.',
+            suggestedAction: 'Change it to a permitted relation such as leeds.places.',
+          }],
+          meta: {requestId: 'req-policy'},
+        }, 422);
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Create derived relation'}));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.querySelector('strong').textContent)
+      .toBe('The derived-layer query for “places” uses SQL that is not allowed.');
+    expect(screen.getByText('Relation places must be schema-qualified.')).toBeTruthy();
+    expect(screen.getByText(/Change it to a permitted relation/)).toBeTruthy();
+    expect(screen.getByText(/No derived layer was created/)).toBeTruthy();
+    expect(screen.queryByText(/lower the H3 resolution/i)).toBeNull();
+    const details = screen.getByText('Technical details').closest('details');
+    expect(details.textContent).toContain('derived_layer.query_not_allowed');
+    expect(details.textContent).toContain('req-policy');
+  });
+
+  test('does not claim an unchanged database state for an indeterminate operation', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: []});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (path === '/api/derived-layers' && options.method === 'POST') {
+        return response({operation: {
+          id: 'operation-indeterminate',
+          status: 'indeterminate',
+          error: {
+            status: 500,
+            code: 'derived_layer.operation_failed',
+            userMessage: 'The derived-layer operation ended without a confirmed result.',
+            suggestedAction: 'Inspect the authoritative derived-layer catalog before retrying.',
+            blocked: true,
+            indeterminate: true,
+          },
+        }}, 202);
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Create derived relation'}));
+
+    expect(await screen.findByText(/ended without a confirmed result/)).toBeTruthy();
+    expect(screen.getByText(/Inspect the authoritative derived-layer catalog/)).toBeTruthy();
+    expect(screen.queryByText(/Database state:/)).toBeNull();
+    expect(screen.queryByText(/No derived layer was created/)).toBeNull();
+    expect(screen.getByText('Technical details').closest('details').textContent)
+      .toContain('Indeterminate');
+  });
+
+  test('loads the exact oversized refresh as a view draft without converting it', async () => {
+    const materialized = {
+      name: 'hex_summary',
+      kind: 'materialized',
+      sources: ['leeds.bus_stops'],
+      idColumn: 'id',
+      geometryColumn: 'geom',
+      description: 'Summary',
+      query: 'SELECT id, geom FROM leeds.bus_stops',
+      spatialScope: {type: 'workspace-map-extent', locale: 'Leeds'},
+    };
+    let refreshRequests = 0;
+    let showRequests = 0;
+    let replaceRequests = 0;
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/derived-layers' && !options.method) {
+        return response({derivedLayers: [materialized]});
+      }
+      if (path === '/api/derived-layers/capabilities') {
+        return response({extensions: {postgis: '3.5'}, h3Available: true});
+      }
+      if (
+        path === '/api/derived-layers/hex_summary/refresh'
+        && options.method === 'POST'
+      ) {
+        refreshRequests += 1;
+        return response({operation: {
+          id: 'operation-refresh',
+          status: 'failed',
+          error: {
+            status: 409,
+            code: 'derived_layer.materialization_too_large',
+            userMessage: 'The refreshed materialized result would be too large.',
+            suggestedAction: 'Convert this layer to an ordinary view or reduce its output.',
+            blocked: true,
+            stateUnchanged: true,
+            safeState: 'The existing materialized data remains active and unchanged.',
+            recommendedKind: 'view',
+            probeStage: 'estimate',
+            probe: {
+              estimatedBytes: 2 * 1024 ** 3,
+              maxEstimatedBytes: 1024 ** 3,
+            },
+          },
+        }}, 202);
+      }
+      if (path === '/api/derived-layers/hex_summary' && !options.method) {
+        showRequests += 1;
+        return response({derivedLayer: materialized});
+      }
+      if (
+        path === '/api/derived-layers/hex_summary/replace'
+        && options.method === 'POST'
+      ) {
+        replaceRequests += 1;
+        return response({derivedLayer: {...materialized, kind: 'view'}});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+    render(<DerivedLayers close={() => {}}/>);
+
+    const actions = await screen.findByRole('combobox', {
+      name: 'Edit or delete derived_layers.hex_summary',
+    });
+    fireEvent.change(actions, {target: {value: 'refresh'}});
+
+    await screen.findByRole('heading', {name: 'Edit derived_layers.hex_summary'});
+    expect(screen.getByLabelText('Kind').value).toBe('view');
+    expect(screen.getByLabelText('One read-only SELECT').value).toBe(materialized.query);
+    expect(screen.getByText(/Review it and select Save derived layer to convert it/)).toBeTruthy();
+    expect(screen.getByText(/existing materialized data remains active and unchanged/i)).toBeTruthy();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(confirm.mock.calls[1][0]).toMatch(/will not change until you explicitly save/);
+    expect(refreshRequests).toBe(1);
+    expect(showRequests).toBe(1);
+    expect(replaceRequests).toBe(0);
   });
 
   test('keeps the derived-layer menu interactive after loading its options', async () => {

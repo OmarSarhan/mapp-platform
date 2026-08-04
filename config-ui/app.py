@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -9,12 +10,13 @@ import secrets
 import tempfile
 import threading
 import time
-from datetime import date, datetime
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -22,22 +24,59 @@ from psycopg.rows import dict_row
 
 from infoj_types import info_value_error
 from derived_layers import (
+    SCHEMA as DERIVED_SCHEMA,
     DerivedLayerDependencyError,
     DerivedLayerError,
+    DerivedLayerMaterializationTooLarge,
+    DerivedLayerMaintenanceError,
+    DerivedLayerQueryTooExpensive,
+    DerivedLayerResetOwnershipError,
+    DerivedLayerSourceMismatchError,
     DerivedLayerStore,
+    validate_definition,
+    validate_spatial_scope,
 )
 from static_files import safe_static_path
 from svg_icons import safe_svg
+from semantic_client import SemanticClient, SemanticClientError
+from semantic_sources import (
+    DEFAULT_ALLOWLIST as DEFAULT_SEMANTIC_SOURCE_ALLOWLIST,
+    GENERATION_SAMPLE_MAX_BYTES,
+    GENERATION_SAMPLE_MAX_COLUMNS,
+    GENERATION_SAMPLE_MAX_ROWS,
+    GENERATION_SAMPLE_PERCENT,
+    GENERATION_SAMPLE_VALUE_MAX_CHARS,
+    GENERATION_STATISTICS_MAX_ROWS,
+    PostgresSemanticSources,
+    SemanticSourceError,
+    parse_allowlist as parse_semantic_source_allowlist,
+    parse_exclusions as parse_semantic_source_exclusions,
+    postgres_generation_context,
+    source_asset_id,
+    source_generated,
+    validate_source_selector,
+)
+from gemini_client import (
+    DEFAULT_MODEL as DEFAULT_GEMINI_MODEL,
+    GeminiClientError,
+    GeminiSemanticClient,
+)
 from workspace_schema import expression_function_names, validate_workspace
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
-from control_plane import ControlStore
+from control_plane import ControlStore, parse_time
 from control_api import (
-    PROPOSAL_LOCK, RULES, apply_operations, apply_visual_override, capabilities, contract, examples, plugin_manifest,
-    effective_locales, is_probeable_database_layer,
+    CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
+    CollectionPaginationError, VisualPlanningDatabaseError,
+    apply_operations, capabilities, contract, examples, plugin_manifest,
+    decode_position_cursor,
+    effective_locales, enforce_collection_payload, is_probeable_database_layer,
+    legacy_collection, paginate_collection, paginate_keyset_page,
+    pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
-    reload_status, reload_timeout, request_reload,
+    reload_status, reload_timeout, request_reload, visual_hover_plan,
     schema as contract_schema, select_locale, visual_plan,
     strict_json_loads, wait_reload, workspace_fingerprint, workspace_hash,
+    workspace_map_extent,
 )
 
 ROOT = Path(__file__).parent
@@ -54,11 +93,71 @@ DB_CONNECTIONS = {
     for key, value in os.environ.items()
     if key.startswith("DBS_") and value
 }
+SEMANTIC_SOURCE_ALLOWLIST = parse_semantic_source_allowlist(
+    os.environ.get(
+        "SEMANTIC_SOURCE_ALLOWLIST",
+        DEFAULT_SEMANTIC_SOURCE_ALLOWLIST,
+    )
+)
+SEMANTIC_SOURCE_EXCLUSIONS = parse_semantic_source_exclusions(
+    os.environ.get("SEMANTIC_SOURCE_EXCLUSIONS", "")
+)
+SEMANTIC_SOURCES = PostgresSemanticSources(
+    DB_CONNECTIONS,
+    SEMANTIC_SOURCE_ALLOWLIST,
+    SEMANTIC_SOURCE_EXCLUSIONS,
+)
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_BODY = 5 * 1024 * 1024
+DEFAULT_TOKEN_LIFETIME = timedelta(days=30)
+_MISSING = object()
+
+
+def requested_token_expiry(
+    payload: dict,
+    *,
+    current_time: datetime | None = None,
+) -> str | None:
+    """Apply the dashboard token lifetime policy before token creation."""
+    confirmed = payload.get("extendedExpiryConfirmed", False)
+    if not isinstance(confirmed, bool):
+        raise ValueError("Extended token expiry confirmation must be a boolean.")
+
+    current_time = current_time or datetime.now(timezone.utc)
+    if "expires" not in payload:
+        return (current_time + DEFAULT_TOKEN_LIFETIME).isoformat()
+
+    requested = payload["expires"]
+    if requested is None:
+        if not confirmed:
+            raise ValueError(
+                "Non-expiring tokens require explicit extended-expiry confirmation."
+            )
+        return None
+
+    expiry = parse_time(requested)
+    if expiry is None:
+        raise ValueError("Token expiry must be an ISO-8601 timestamp.")
+    if expiry > current_time + DEFAULT_TOKEN_LIFETIME and not confirmed:
+        raise ValueError(
+            "Token lifetimes longer than 30 days require explicit confirmation."
+        )
+    return requested
+try:
+    DERIVED_MAX_BACKGROUND_JOBS = int(
+        os.environ.get("DERIVED_MAX_BACKGROUND_JOBS", "1")
+    )
+except ValueError:
+    raise RuntimeError(
+        "DERIVED_MAX_BACKGROUND_JOBS must be an integer between 1 and 4."
+    ) from None
+if not 1 <= DERIVED_MAX_BACKGROUND_JOBS <= 4:
+    raise RuntimeError("DERIVED_MAX_BACKGROUND_JOBS must be between 1 and 4.")
 SAVE_LOCK = threading.Lock()
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
+DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
+DERIVED_BACKGROUND_ACTIVE_JOBS = 0
 PREVIEW_SYNC_LOCK = threading.Lock()
 PREVIEW_SYNC_STATE: dict[str, object] = {
     "pending": None,
@@ -88,6 +187,1024 @@ DERIVED = (
     if os.environ.get("DERIVED_DATABASE_URL")
     else None
 )
+
+
+class DerivedLayerBackgroundCapacityError(DerivedLayerError):
+    def __init__(self, active_jobs: int, max_active_jobs: int):
+        self.active_jobs = active_jobs
+        self.max_active_jobs = max_active_jobs
+        super().__init__(
+            "The derived-layer background worker is busy. Wait for the active "
+            "operation to finish before retrying."
+        )
+SEMANTIC = (
+    SemanticClient(
+        os.environ["SEMANTIC_SERVICE_URL"],
+        os.environ["SEMANTIC_INTERNAL_TOKEN"],
+    )
+    if (
+        os.environ.get("SEMANTIC_SERVICE_URL")
+        and os.environ.get("SEMANTIC_INTERNAL_TOKEN")
+    )
+    else None
+)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+try:
+    GEMINI = (
+        GeminiSemanticClient(
+            os.environ["GEMINI_APIKEY"],
+            model=GEMINI_MODEL,
+        )
+        if os.environ.get("GEMINI_APIKEY")
+        else None
+    )
+    GEMINI_CONFIGURATION_ERROR = None
+except GeminiClientError as exc:
+    GEMINI = None
+    GEMINI_CONFIGURATION_ERROR = exc
+SEMANTIC_OUTBOX_LOCK = threading.Lock()
+SEMANTIC_OUTBOX_WAKE = threading.Event()
+SEMANTIC_MAX_ATTEMPTS = 8
+SEMANTIC_SOURCE_LOCK = threading.Lock()
+
+
+def semantic_generation_capability() -> dict:
+    return {
+        "available": GEMINI is not None,
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+        "targets": ["table", "field"],
+        "metadataOnly": True,
+        "contextOptions": {
+            "sampleRows": {
+                "available": True,
+                "percent": GENERATION_SAMPLE_PERCENT,
+                "maxRows": GENERATION_SAMPLE_MAX_ROWS,
+                "maxBytes": GENERATION_SAMPLE_MAX_BYTES,
+                "maxColumns": GENERATION_SAMPLE_MAX_COLUMNS,
+                "maxValueCharacters": GENERATION_SAMPLE_VALUE_MAX_CHARS,
+                "requiredScope": "semantic:data",
+            },
+            "statistics": {
+                "available": True,
+                "fieldSamplePercent": GENERATION_SAMPLE_PERCENT,
+                "fieldMaxSampledRows": GENERATION_STATISTICS_MAX_ROWS,
+                "requiredScope": "semantic:data",
+            },
+        },
+    }
+
+
+def _semantic_generation_request(
+    payload: dict,
+) -> tuple[str, dict, dict[str, bool]]:
+    if (
+        not isinstance(payload, dict)
+        or not {"assetId", "target"} <= set(payload)
+        or not set(payload) <= {"assetId", "target", "contextOptions"}
+    ):
+        raise GeminiClientError(
+            "Semantic generation requires assetId, target, and optional "
+            "contextOptions.",
+            status=HTTPStatus.BAD_REQUEST,
+            code="semantic.generation_invalid_request",
+        )
+    asset_id = payload.get("assetId")
+    target = payload.get("target")
+    if (
+        not isinstance(asset_id, str)
+        or not asset_id.strip()
+        or len(asset_id) > 200
+        or not isinstance(target, dict)
+    ):
+        raise GeminiClientError(
+            "Semantic generation request is invalid.",
+            status=HTTPStatus.BAD_REQUEST,
+            code="semantic.generation_invalid_request",
+        )
+    raw_options = payload.get("contextOptions", {})
+    if (
+        not isinstance(raw_options, dict)
+        or not set(raw_options) <= {"sampleRows", "statistics"}
+        or any(
+            key in raw_options and not isinstance(raw_options[key], bool)
+            for key in ("sampleRows", "statistics")
+        )
+    ):
+        raise GeminiClientError(
+            "contextOptions accepts only boolean sampleRows and statistics.",
+            status=HTTPStatus.BAD_REQUEST,
+            code="semantic.generation_invalid_request",
+        )
+    context_options = {
+        "sampleRows": raw_options.get("sampleRows", False),
+        "statistics": raw_options.get("statistics", False),
+    }
+    kind = target.get("kind")
+    if kind == "table" and set(target) == {"kind"}:
+        return asset_id, {"kind": "table"}, context_options
+    if kind == "field" and set(target) == {"kind", "fieldId"}:
+        field_id = target.get("fieldId")
+        if (
+            isinstance(field_id, str)
+            and field_id.strip()
+            and len(field_id) <= 200
+        ):
+            return (
+                asset_id,
+                {"kind": "field", "fieldId": field_id},
+                context_options,
+            )
+    raise GeminiClientError(
+        "target must select a table or one stable fieldId.",
+        status=HTTPStatus.BAD_REQUEST,
+        code="semantic.generation_invalid_request",
+    )
+
+
+def _generated_table_identity(generated: dict) -> dict:
+    identity = {}
+    for key in (
+        "name",
+        "kind",
+        "description",
+        "idColumn",
+        "geometryColumn",
+        "geometryType",
+        "srid",
+    ):
+        value = generated.get(key)
+        if key in generated and (
+            value is None or isinstance(value, (str, int, float, bool))
+        ):
+            identity[key] = value
+    binding = generated.get("binding")
+    if isinstance(binding, dict):
+        filtered_binding = {
+            key: binding[key]
+            for key in ("adapter", "alias", "schema", "relation")
+            if isinstance(binding.get(key), str)
+        }
+        if filtered_binding:
+            identity["binding"] = filtered_binding
+    spatial_scope = generated.get("spatialScope")
+    if spatial_scope is not None:
+        try:
+            identity["spatialScope"] = validate_spatial_scope(spatial_scope)
+        except DerivedLayerError:
+            pass
+    return identity
+
+
+def _semantic_annotation(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in ("displayName", "description", "tags", "caveats")
+        if key in value
+    }
+
+
+def _generated_field(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in (
+            "name",
+            "type",
+            "nullable",
+            "description",
+            "geometryType",
+            "srid",
+        )
+        if key in value
+        and (
+            value.get(key) is None
+            or isinstance(value.get(key), (str, int, float, bool))
+        )
+    }
+
+
+def semantic_generation_context(
+    asset: dict,
+    target: dict,
+) -> tuple[dict, str | None]:
+    generated = asset.get("generated")
+    curated = asset.get("curated")
+    if not isinstance(generated, dict):
+        raise GeminiClientError(
+            "Semantic asset generated metadata is invalid.",
+            status=HTTPStatus.BAD_GATEWAY,
+            code="semantic.generation_context_invalid",
+        )
+    if not isinstance(curated, dict):
+        raise GeminiClientError(
+            "Semantic asset curated metadata is invalid.",
+            status=HTTPStatus.BAD_GATEWAY,
+            code="semantic.generation_context_invalid",
+        )
+    identity = _generated_table_identity(generated)
+    if target["kind"] == "table":
+        fields = generated.get("fields")
+        fields = fields if isinstance(fields, list) else []
+        return {
+            "target": {"kind": "table"},
+            "table": {
+                **identity,
+                "fields": [
+                    field
+                    for raw in fields
+                    if (field := _generated_field(raw))
+                ],
+            },
+            "currentAnnotation": _semantic_annotation(curated),
+        }, None
+
+    fields = generated.get("fields")
+    fields = fields if isinstance(fields, list) else []
+    matches = [
+        field
+        for field in fields
+        if isinstance(field, dict) and field.get("id") == target["fieldId"]
+    ]
+    if len(matches) != 1:
+        raise GeminiClientError(
+            "The selected semantic field was not found.",
+            status=HTTPStatus.NOT_FOUND,
+            code="semantic.field_not_found",
+        )
+    curated_fields = curated.get("fields")
+    if "fields" in curated and not isinstance(curated_fields, dict):
+        raise GeminiClientError(
+            "Semantic field annotations are not an object.",
+            status=HTTPStatus.BAD_GATEWAY,
+            code="semantic.generation_context_invalid",
+        )
+    current_annotation = (
+        curated_fields.get(target["fieldId"])
+        if isinstance(curated_fields, dict)
+        else None
+    )
+    return {
+        "target": {"kind": "field"},
+        "table": identity,
+        "field": _generated_field(matches[0]),
+        "currentAnnotation": _semantic_annotation(current_annotation),
+    }, str(matches[0].get("name") or "")
+
+
+def _semantic_generation_sample_seed(asset: dict) -> float:
+    identity = (
+        f"{asset.get('id', '')}:{asset.get('version', '')}"
+    ).encode("utf-8")
+    number = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big")
+    return (number / ((1 << 64) - 1)) * 2 - 1
+
+
+def semantic_generation_optional_context(
+    asset: dict,
+    target: dict,
+    context_options: dict[str, bool],
+) -> dict:
+    if not any(context_options.values()):
+        return {}
+    generated = asset.get("generated")
+    if not isinstance(generated, dict):
+        raise GeminiClientError(
+            "Semantic asset generated metadata is invalid.",
+            status=HTTPStatus.BAD_GATEWAY,
+            code="semantic.generation_context_invalid",
+        )
+    binding = generated.get("binding")
+    fields = generated.get("fields")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("adapter") != "postgresql"
+        or not isinstance(fields, list)
+    ):
+        raise GeminiClientError(
+            "Optional data context is unavailable for this semantic asset.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            code="semantic.generation_context_unavailable",
+        )
+    schema = binding.get("schema")
+    relation = binding.get("relation")
+    if not isinstance(schema, str) or not isinstance(relation, str):
+        raise GeminiClientError(
+            "Optional data context is unavailable for this semantic asset.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            code="semantic.generation_context_unavailable",
+        )
+    field_name = None
+    if target["kind"] == "field":
+        matches = [
+            field
+            for field in fields
+            if (
+                isinstance(field, dict)
+                and field.get("id") == target["fieldId"]
+            )
+        ]
+        if len(matches) != 1 or not isinstance(
+            matches[0].get("name"), str
+        ):
+            raise GeminiClientError(
+                "The selected semantic field was not found.",
+                status=HTTPStatus.NOT_FOUND,
+                code="semantic.field_not_found",
+            )
+        field_name = matches[0]["name"]
+    arguments = {
+        "schema": schema,
+        "relation": relation,
+        "fields": fields,
+        "target_kind": target["kind"],
+        "field_name": field_name,
+        "sample_rows": context_options["sampleRows"],
+        "statistics": context_options["statistics"],
+        "sample_seed": _semantic_generation_sample_seed(asset),
+    }
+    try:
+        alias = binding.get("alias")
+        if isinstance(alias, str):
+            if asset.get("id") != source_asset_id(alias, schema, relation):
+                raise GeminiClientError(
+                    "Semantic source binding does not match the asset.",
+                    status=HTTPStatus.CONFLICT,
+                    code="semantic.generation_context_invalid",
+                )
+            return SEMANTIC_SOURCES.generation_context(
+                alias,
+                **arguments,
+            )
+        if (
+            schema != DERIVED_SCHEMA
+            or generated.get("name") != relation
+            or DERIVED is None
+        ):
+            raise GeminiClientError(
+                "Optional data context is unavailable for this semantic asset.",
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+                code="semantic.generation_context_unavailable",
+            )
+        definition = DERIVED.get(relation, include_query=False)
+        profile = definition.get("semanticProfile")
+        asset_generation = asset.get("generation")
+        if (
+            not isinstance(profile, dict)
+            or profile.get("assetId") != asset.get("id")
+            or profile.get("status") != "ready"
+            or isinstance(asset_generation, bool)
+            or not isinstance(asset_generation, int)
+            or asset_generation < 1
+            or isinstance(profile.get("generation"), bool)
+            or profile.get("generation") != asset_generation
+        ):
+            raise GeminiClientError(
+                "Derived-layer semantic profile is not current, ready, or "
+                "matched to the semantic asset.",
+                status=HTTPStatus.CONFLICT,
+                code="semantic.generation_context_invalid",
+            )
+        return postgres_generation_context(
+            DB_CONNECTIONS["MAPP"],
+            **arguments,
+        )
+    except GeminiClientError:
+        raise
+    except SemanticSourceError as exc:
+        raise GeminiClientError(
+            str(exc),
+            status=exc.status,
+            code=exc.code,
+        ) from exc
+    except (DerivedLayerError, FileNotFoundError, psycopg.Error) as exc:
+        raise GeminiClientError(
+            "Optional data context is unavailable for this semantic asset.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            code="semantic.generation_context_unavailable",
+        ) from exc
+
+
+def _json_pointer_part(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def semantic_generation_operations(
+    target: dict,
+    profile: dict,
+    current_annotation: dict | None = None,
+) -> list[dict]:
+    prefix = "/curated"
+    if target["kind"] == "field":
+        prefix += f"/fields/{_json_pointer_part(target['fieldId'])}"
+    current_annotation = (
+        current_annotation
+        if isinstance(current_annotation, dict)
+        else {}
+    )
+    operations = [
+        {
+            "op": "set",
+            "path": f"{prefix}/{key}",
+            "value": profile[key],
+        }
+        for key in ("displayName", "description", "tags", "caveats")
+        if current_annotation.get(key, _MISSING) != profile[key]
+    ]
+    if not operations:
+        raise GeminiClientError(
+            "Gemini returned the semantic annotation already stored.",
+            status=HTTPStatus.CONFLICT,
+            code="semantic.generation_no_change",
+        )
+    return operations
+
+
+def semantic_proxy_path(path: str, query: str = "") -> str | None:
+    static = {
+        "/api/semantic/status": "/v1/status",
+        "/api/semantic/catalog": "/v1/catalog",
+        "/api/semantic/catalog/search": "/v1/search",
+        "/api/semantic/proposals": "/v1/proposals",
+        "/api/semantic/proposals/check": "/v1/proposals/check",
+    }
+    target = static.get(path)
+    patterns = (
+        (
+            r"/api/semantic/catalog/objects/([^/]+)/history",
+            "/v1/assets/{}/history",
+        ),
+        (
+            r"/api/semantic/catalog/objects/([^/]+)",
+            "/v1/assets/{}",
+        ),
+        (
+            r"/api/semantic/proposals/([A-Za-z0-9._-]+)",
+            "/v1/proposals/{}",
+        ),
+        (
+            r"/api/semantic/proposals/([A-Za-z0-9._-]+)/(apply|decline)",
+            "/v1/proposals/{}/{}",
+        ),
+    )
+    if target is None:
+        for pattern, template in patterns:
+            match = re.fullmatch(pattern, path)
+            if match:
+                target = template.format(*match.groups())
+                break
+    if target is None:
+        return None
+    return target + (f"?{query}" if query else "")
+
+
+def paginated_collection_payload(
+    key: str,
+    items: list,
+    query: dict[str, list[str]],
+    *,
+    scope: str,
+) -> dict:
+    if not query:
+        return {key: items}
+    limit, cursor = pagination_parameters(query)
+    page_items, pagination = paginate_collection(
+        items,
+        limit=limit,
+        cursor=cursor,
+        scope=scope,
+    )
+    return {key: page_items, "pagination": pagination}
+
+
+def derived_semantic_profiles(
+    *,
+    include_delivery_diagnostics: bool = False,
+    delivery_blockers: list[dict] | None = None,
+    name: str | None = None,
+    after_name: str | None = None,
+    fetch_limit: int | None = None,
+) -> list[dict]:
+    if not DERIVED:
+        raise DerivedLayerError(
+            "Derived-layer database management is not configured."
+        )
+    if name is not None:
+        definitions = [DERIVED.get(name, include_query=False)]
+    elif fetch_limit is not None:
+        definitions = DERIVED.list_page(
+            after_name=after_name,
+            fetch_limit=fetch_limit,
+        )
+    else:
+        definitions = DERIVED.list()
+    profiles = [
+        {
+            "name": item["name"],
+            "relation": f"derived_layers.{item['name']}",
+            "kind": item["kind"],
+            **item["semanticProfile"],
+        }
+        for item in definitions
+    ]
+    if not include_delivery_diagnostics:
+        return profiles
+    blockers = (
+        delivery_blockers
+        if delivery_blockers is not None
+        else DERIVED.semantic_outbox_blockers()
+    )
+    add_semantic_delivery_diagnostics(profiles, blockers)
+    return profiles
+
+
+def add_semantic_delivery_diagnostics(
+    profiles: list[dict],
+    blockers: list[dict],
+) -> None:
+    blockers_by_name = {}
+    for blocker in blockers:
+        name = blocker.get("name")
+        if isinstance(name, str) and name and name not in blockers_by_name:
+            blockers_by_name[name] = blocker
+    for profile in profiles:
+        blocker = blockers_by_name.get(profile["name"])
+        if not blocker:
+            continue
+        error = blocker.get("lastError")
+        profile["delivery"] = {
+            "eventId": blocker["eventId"],
+            "operation": blocker["type"],
+            "generation": blocker["generation"],
+            "status": blocker["status"],
+            "attempts": blocker.get("attempts", 0),
+            "lastError": (
+                " ".join(str(error).split())[:1000]
+                if error
+                else None
+            ),
+        }
+
+
+def semantic_delivery_blocker_page(
+    profile_names: list[str],
+    *,
+    include_unmatched: bool,
+) -> tuple[list[dict], list[dict], bool]:
+    matched = (
+        DERIVED.semantic_outbox_blockers(
+            profile_names=profile_names,
+            include_unmatched=False,
+            one_per_profile=True,
+            fetch_limit=len(profile_names),
+        )
+        if profile_names
+        else []
+    )
+    if not include_unmatched:
+        return matched, [], False
+    unmatched = DERIVED.semantic_outbox_blockers(
+        unmatched_only=True,
+        fetch_limit=MAX_PAGE_LIMIT + 1,
+    )
+    return matched, unmatched[:MAX_PAGE_LIMIT], len(unmatched) > MAX_PAGE_LIMIT
+
+
+def unmatched_semantic_delivery_blockers(
+    profiles: list[dict],
+    blockers: list[dict],
+) -> list[dict]:
+    current_names = {profile["name"] for profile in profiles}
+    output = []
+    for blocker in blockers:
+        name = blocker.get("name")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,62}", name) is None
+            or name in current_names
+        ):
+            continue
+        error = blocker.get("lastError")
+        output.append({
+            "name": name,
+            "relation": f"derived_layers.{name}",
+            "assetId": blocker["assetId"],
+            "eventId": blocker["eventId"],
+            "operation": blocker["type"],
+            "generation": blocker["generation"],
+            "status": blocker["status"],
+            "attempts": blocker.get("attempts", 0),
+            "lastError": (
+                " ".join(str(error).split())[:1000]
+                if error
+                else None
+            ),
+        })
+    return output
+
+
+def observed_semantic_revision(profiles: list[dict]) -> int:
+    revisions = [
+        int(profile["revision"])
+        for profile in profiles
+        if str(profile.get("revision") or "").isdigit()
+    ]
+    return max(revisions, default=0)
+
+
+def current_semantic_revision(actor: str) -> int:
+    if not SEMANTIC:
+        raise SemanticClientError(
+            "Semantic service is not configured.",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            payload={"code": "semantic.unavailable"},
+        )
+    status = SEMANTIC.request(
+        "/v1/status",
+        actor=actor,
+        scopes=["semantic:inspect"],
+    )
+    revision = status.get("catalogRevision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+    ):
+        raise SemanticClientError(
+            "Semantic service returned an invalid catalog revision.",
+            status=HTTPStatus.BAD_GATEWAY,
+            payload={"code": "semantic.invalid_response"},
+        )
+    return revision
+
+
+def semantic_event_payload_hash(payload: dict) -> str:
+    canonical = {
+        key: value
+        for key, value in payload.items()
+        if key != "payloadHash"
+    }
+    return hashlib.sha256(json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()).hexdigest()
+
+
+def validate_semantic_outbox_event(event: dict) -> dict:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        raise SemanticClientError(
+            "Stored semantic event payload is invalid.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            payload={"code": "semantic.outbox_corrupt"},
+        )
+    exact_fields = {
+        "eventId": event.get("eventId"),
+        "assetId": event.get("assetId"),
+        "type": event.get("type"),
+        "generation": event.get("generation"),
+    }
+    if (
+        any(payload.get(key) != value for key, value in exact_fields.items())
+        or not isinstance(event.get("eventId"), str)
+        or not event["eventId"]
+        or not isinstance(event.get("assetId"), str)
+        or not event["assetId"]
+        or event.get("type") not in {
+            "register", "replace", "refresh", "archive"
+        }
+        or isinstance(event.get("generation"), bool)
+        or not isinstance(event.get("generation"), int)
+        or event["generation"] < 1
+        or isinstance(payload.get("generation"), bool)
+        or not isinstance(payload.get("generation"), int)
+        or payload["generation"] < 1
+    ):
+        raise SemanticClientError(
+            "Stored semantic event does not match its outbox envelope.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            payload={"code": "semantic.outbox_corrupt"},
+        )
+    supplied_hash = payload.get("payloadHash")
+    if (
+        not isinstance(supplied_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", supplied_hash)
+        or supplied_hash != semantic_event_payload_hash(payload)
+    ):
+        raise SemanticClientError(
+            "Stored semantic event payload hash is invalid.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            payload={"code": "semantic.outbox_corrupt"},
+        )
+    return dict(payload)
+
+
+def validate_semantic_event_ack(
+    event: dict,
+    payload: dict,
+    response: dict,
+) -> int:
+    revision = response.get("catalogRevision")
+    acknowledged = response.get("event")
+    asset = response.get("asset")
+    expected_status = (
+        "archived" if event["type"] == "archive" else "ready"
+    )
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or not isinstance(acknowledged, dict)
+        or acknowledged.get("eventId") != event["eventId"]
+        or acknowledged.get("payloadHash") != payload["payloadHash"]
+        or not isinstance(acknowledged.get("idempotent"), bool)
+        or not isinstance(asset, dict)
+        or asset.get("id") != event["assetId"]
+        or isinstance(asset.get("generation"), bool)
+        or not isinstance(asset.get("generation"), int)
+        or asset.get("generation") != event["generation"]
+        or asset.get("status") != expected_status
+        or isinstance(asset.get("catalogRevision"), bool)
+        or not isinstance(asset.get("catalogRevision"), int)
+        or asset.get("catalogRevision") != revision
+    ):
+        raise SemanticClientError(
+            "Semantic service returned a mismatched event acknowledgement.",
+            status=HTTPStatus.BAD_GATEWAY,
+            payload={"code": "semantic.invalid_event_ack"},
+        )
+    return revision
+
+
+def drain_semantic_outbox(limit: int = 50) -> dict:
+    result = {"delivered": 0, "retried": 0, "repairRequired": 0}
+    if not DERIVED or not SEMANTIC:
+        return result
+    if not SEMANTIC_OUTBOX_LOCK.acquire(blocking=False):
+        return result
+    try:
+        for _ in range(limit):
+            claimed = DERIVED.claim_semantic_events(1)
+            if not claimed:
+                break
+            event = claimed[0]
+            try:
+                payload = validate_semantic_outbox_event(event)
+                response = SEMANTIC.request(
+                    "/v1/events",
+                    method="POST",
+                    payload=payload,
+                    actor=str(payload.get("actor") or "system"),
+                    scopes=["semantic:admin"],
+                )
+                revision = validate_semantic_event_ack(
+                    event,
+                    payload,
+                    response,
+                )
+                if DERIVED.mark_semantic_delivered(
+                    event["eventId"],
+                    event["claimId"],
+                    revision,
+                ):
+                    result["delivered"] += 1
+            except Exception as exc:
+                attempts = int(event.get("attempts") or 0) + 1
+                permanent = (
+                    isinstance(exc, SemanticClientError)
+                    and exc.status is not None
+                    and 400 <= exc.status < 500
+                )
+                if permanent or attempts >= SEMANTIC_MAX_ATTEMPTS:
+                    if DERIVED.mark_semantic_repair(
+                        event["eventId"],
+                        event["claimId"],
+                        str(exc),
+                    ):
+                        result["repairRequired"] += 1
+                else:
+                    delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
+                    if DERIVED.mark_semantic_retry(
+                        event["eventId"],
+                        event["claimId"],
+                        str(exc),
+                        datetime.now(timezone.utc) + timedelta(seconds=delay),
+                    ):
+                        result["retried"] += 1
+        return result
+    finally:
+        SEMANTIC_OUTBOX_LOCK.release()
+
+
+def schedule_semantic_outbox() -> None:
+    SEMANTIC_OUTBOX_WAKE.set()
+
+
+def run_semantic_outbox() -> None:
+    while True:
+        try:
+            drain_semantic_outbox()
+        except Exception:
+            # Event-specific errors are persisted by the drain. A connection
+            # failure before events can be read is retried on the next wake.
+            pass
+        SEMANTIC_OUTBOX_WAKE.wait(10)
+        SEMANTIC_OUTBOX_WAKE.clear()
+
+
+def archive_derived_semantics_before_reset(
+    reset_owner: str,
+    timeout_seconds: int = 120,
+) -> dict:
+    if not DERIVED or not SEMANTIC:
+        raise RuntimeError(
+            "Derived-layer and semantic services must be configured before reset."
+        )
+    DERIVED.begin_semantic_reset("system:reset-data", reset_owner)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        drain_semantic_outbox()
+        profiles = derived_semantic_profiles()
+        blockers = DERIVED.semantic_outbox_blockers()
+        repairs = [
+            str(blocker.get("name") or blocker["assetId"])
+            for blocker in blockers
+            if blocker["status"] == "repair_required"
+        ]
+        if repairs:
+            raise RuntimeError(
+                "Semantic reset preflight found repair_required events for: "
+                + ", ".join(repairs)
+            )
+        nonready = [
+            profile for profile in profiles
+            if profile["status"] != "ready"
+        ]
+        if not blockers and not nonready:
+            break
+        if time.monotonic() >= deadline:
+            pending_items = [
+                f'{profile["name"]} ({profile["status"]})'
+                for profile in nonready
+            ] + [
+                f'{blocker.get("name") or blocker["assetId"]} '
+                f'({blocker["type"]}:{blocker["status"]})'
+                for blocker in blockers
+            ]
+            raise TimeoutError(
+                "Timed out during semantic reset preflight: "
+                + ", ".join(dict.fromkeys(pending_items))
+            )
+        time.sleep(1)
+    DERIVED.queue_semantic_archives("system:reset-data")
+    while True:
+        drain_semantic_outbox()
+        profiles = derived_semantic_profiles()
+        blockers = DERIVED.semantic_outbox_blockers()
+        incomplete = [
+            profile for profile in profiles
+            if profile["status"] != "archived"
+        ]
+        if not incomplete and not blockers:
+            return {
+                "archived": len(profiles),
+                "catalogRevision": observed_semantic_revision(profiles),
+                "profiles": profiles,
+            }
+        repairs = [
+            str(blocker.get("name") or blocker["assetId"])
+            for blocker in blockers
+            if blocker["status"] == "repair_required"
+        ]
+        if repairs:
+            raise RuntimeError(
+                "Semantic archive has repair_required events for: "
+                + ", ".join(repairs)
+            )
+        if time.monotonic() >= deadline:
+            pending_items = [
+                f'{profile["name"]} ({profile["status"]})'
+                for profile in incomplete
+            ] + [
+                f'{blocker.get("name") or blocker["assetId"]} '
+                f'({blocker["type"]}:{blocker["status"]})'
+                for blocker in blockers
+            ]
+            raise TimeoutError(
+                "Timed out before semantic archive completed: "
+                + ", ".join(dict.fromkeys(pending_items))
+            )
+        time.sleep(1)
+
+
+def recover_interrupted_reset_semantics(
+    *,
+    reset_owner: str | None = None,
+    force: bool = False,
+    wait_for_ready: bool = False,
+    timeout_seconds: int = 120,
+) -> dict:
+    if not DERIVED:
+        return {"recovered": 0, "profiles": []}
+    if reset_owner is None and not force:
+        raise RuntimeError(
+            "Reset recovery requires the owning operation UUID or explicit "
+            "force confirmation."
+        )
+    try:
+        recovered_result = DERIVED.recover_reset_semantic_profiles(
+            "system:reset-recovery",
+            reset_owner,
+        )
+    except DerivedLayerResetOwnershipError:
+        return {
+            "recovered": 0,
+            "profiles": [],
+            "gateOwned": False,
+            "reason": "foreign_gate",
+        }
+    gate_owned = recovered_result is not None
+    gate_owner = (
+        recovered_result["resetOwner"]
+        if recovered_result is not None
+        else None
+    )
+    recovered = (
+        recovered_result["profiles"]
+        if recovered_result is not None
+        else []
+    )
+    if not wait_for_ready:
+        if recovered:
+            schedule_semantic_outbox()
+        return {
+            "recovered": len(recovered),
+            "profiles": recovered,
+            "gateOwned": gate_owned,
+        }
+    if not SEMANTIC:
+        raise RuntimeError(
+            "Semantic service must be configured to complete reset recovery."
+        )
+    recovered_names = {
+        item["name"] for item in recovered
+    } or set(DERIVED.reset_recovery_names())
+    if not recovered_names:
+        if gate_owner is not None:
+            DERIVED.complete_reset_semantic_recovery(gate_owner)
+        return {
+            "recovered": 0,
+            "profiles": [],
+            "gateOwned": gate_owned,
+        }
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        drain_semantic_outbox()
+        profiles = [
+            item
+            for item in derived_semantic_profiles()
+            if item["name"] in recovered_names
+        ]
+        blockers = [
+            item
+            for item in DERIVED.semantic_outbox_blockers()
+            if item.get("name") in recovered_names
+        ]
+        repairs = [
+            str(item.get("name") or item["assetId"])
+            for item in blockers
+            if item["status"] == "repair_required"
+        ]
+        if repairs:
+            raise RuntimeError(
+                "Semantic reset recovery has repair_required events for: "
+                + ", ".join(repairs)
+            )
+        if not blockers and len(profiles) == len(recovered_names) and all(
+            item["status"] == "ready" for item in profiles
+        ):
+            if gate_owner is not None:
+                DERIVED.complete_reset_semantic_recovery(gate_owner)
+            return {
+                "recovered": len(profiles),
+                "profiles": profiles,
+                "gateOwned": gate_owned,
+            }
+        if time.monotonic() >= deadline:
+            states = ", ".join(
+                f'{item["name"]} ({item["status"]})' for item in profiles
+            )
+            raise TimeoutError(
+                "Timed out before semantic reset recovery completed: "
+                + (states or "profiles unavailable")
+            )
+        time.sleep(1)
 
 
 def normalized_host(value: str) -> str | None:
@@ -247,9 +1364,10 @@ def run_derived_background(
                 changes.get("removed", []) + changes.get("changed", []),
             ))
         elif action == "refresh" and name:
-            result = DERIVED.refresh(name)
+            result = DERIVED.refresh(name, actor)
         else:
             raise DerivedLayerError("Unsupported background operation.")
+        schedule_semantic_outbox()
         CONTROL.audit(
             f"derived_layer.{action}d" if action != "refresh" else "derived_layer.refreshed",
             actor=actor,
@@ -258,6 +1376,7 @@ def run_derived_background(
                 "name": result["name"],
                 "kind": result["kind"],
                 "sources": result["sources"],
+                "spatialScope": result.get("spatialScope"),
                 "operationId": operation_id,
             },
         )
@@ -266,16 +1385,807 @@ def run_derived_background(
             status="succeeded",
             result={"derivedLayer": result},
         )
-    except Exception as exc:
+    except DerivedLayerQueryTooExpensive as exc:
+        status = derived_query_error_status(exc)
         CONTROL.finish_operation(
             operation_id,
             status="failed",
             error={
-                "code": "derived_layer.background_failed",
-                "message": str(exc),
+                **derived_query_too_expensive_error(exc, action),
+                "status": int(status),
                 "type": type(exc).__name__,
             },
         )
+    except DerivedLayerMaterializationTooLarge as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_materialization_too_large_error(exc, action),
+                "status": int(HTTPStatus.CONFLICT),
+                "type": type(exc).__name__,
+            },
+        )
+    except DerivedLayerDependencyError as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_dependency_error(exc, action),
+                "status": int(HTTPStatus.CONFLICT),
+                "type": type(exc).__name__,
+            },
+        )
+    except DerivedLayerSourceMismatchError as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_source_mismatch_error(exc, action),
+                "status": int(HTTPStatus.UNPROCESSABLE_ENTITY),
+                "type": type(exc).__name__,
+            },
+        )
+    except DerivedLayerMaintenanceError as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_maintenance_error(exc, action),
+                "status": int(HTTPStatus.CONFLICT),
+                "type": type(exc).__name__,
+            },
+        )
+    except FileExistsError as exc:
+        layer_name = str(exc)
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_already_exists_error(layer_name),
+                "status": int(HTTPStatus.CONFLICT),
+                "type": type(exc).__name__,
+            },
+        )
+    except FileNotFoundError as exc:
+        layer_name = str(exc) or str(name or "")
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_not_found_error(layer_name, action),
+                "status": int(HTTPStatus.NOT_FOUND),
+                "type": type(exc).__name__,
+            },
+        )
+    except DerivedLayerError as exc:
+        response = derived_validation_error(exc, action)
+        status = derived_validation_error_status(response)
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **response,
+                "status": int(status),
+                "type": type(exc).__name__,
+            },
+        )
+    except psycopg.Error as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="failed",
+            error={
+                **derived_database_error(exc, action),
+                "status": int(HTTPStatus.UNPROCESSABLE_ENTITY),
+                "type": type(exc).__name__,
+            },
+        )
+    except Exception as exc:
+        CONTROL.finish_operation(
+            operation_id,
+            status="indeterminate",
+            error={
+                **derived_operation_failed_error(action),
+                "status": int(HTTPStatus.INTERNAL_SERVER_ERROR),
+                "type": type(exc).__name__,
+            },
+        )
+
+
+def derived_background_capacity() -> dict:
+    with DERIVED_BACKGROUND_JOB_LOCK:
+        return {
+            "activeJobs": DERIVED_BACKGROUND_ACTIVE_JOBS,
+            "maxActiveJobs": DERIVED_MAX_BACKGROUND_JOBS,
+        }
+
+
+def reserve_derived_background_job() -> None:
+    global DERIVED_BACKGROUND_ACTIVE_JOBS
+    with DERIVED_BACKGROUND_JOB_LOCK:
+        if DERIVED_BACKGROUND_ACTIVE_JOBS >= DERIVED_MAX_BACKGROUND_JOBS:
+            raise DerivedLayerBackgroundCapacityError(
+                DERIVED_BACKGROUND_ACTIVE_JOBS,
+                DERIVED_MAX_BACKGROUND_JOBS,
+            )
+        DERIVED_BACKGROUND_ACTIVE_JOBS += 1
+
+
+def release_derived_background_job() -> None:
+    global DERIVED_BACKGROUND_ACTIVE_JOBS
+    with DERIVED_BACKGROUND_JOB_LOCK:
+        if DERIVED_BACKGROUND_ACTIVE_JOBS <= 0:
+            raise RuntimeError("No derived-layer background job is reserved.")
+        DERIVED_BACKGROUND_ACTIVE_JOBS -= 1
+
+
+def run_reserved_derived_background(*args) -> None:
+    try:
+        run_derived_background(*args)
+    finally:
+        release_derived_background_job()
+
+
+INVALID_QUERY_REASON_CODES = frozenset({
+    "invalid_sql", "multiple_statements", "not_select",
+})
+COMPUTE_QUERY_REASON_CODES = frozenset({
+    "cartesian_join",
+    "final_rows",
+    "h3_composed_expansion",
+    "h3_scope_expansion",
+    "intermediate_bytes",
+    "intermediate_rows",
+    "join_expansion",
+    "plan_depth",
+    "plan_nodes",
+    "planned_workers",
+    "recursive_plan",
+    "too_many_ctes",
+    "too_many_grouping_sets",
+    "too_many_joins",
+    "too_many_set_operations",
+    "total_cost",
+    "unbounded_aggregate_state",
+    "unbounded_geometry_expansion",
+    "unbounded_row_generator",
+    "unbounded_scalar_output",
+    "unbounded_set_function",
+})
+
+
+def derived_operation_safe_state(operation: str | None) -> str:
+    return {
+        "create": "No derived layer was created.",
+        "replace": "The existing derived layer remains active and unchanged.",
+        "refresh": "The existing materialized data remains unchanged.",
+        "drop": "Nothing was deleted.",
+    }.get(operation, "No derived-layer change was applied.")
+
+
+def derived_request_operation(request_path: str, derived_action_path) -> str | None:
+    if request_path == "/api/derived-layers":
+        return "create"
+    if derived_action_path:
+        return derived_action_path.group(2)
+    return None
+
+
+def derived_blocked_error(
+    *,
+    code: str,
+    message: str,
+    suggested_action: str,
+    operation: str | None,
+    **fields,
+) -> dict:
+    return {
+        "error": message,
+        "message": message,
+        "userMessage": message,
+        "suggestedAction": suggested_action,
+        "code": code,
+        "operation": operation,
+        "blocked": True,
+        "stateUnchanged": True,
+        "safeState": derived_operation_safe_state(operation),
+        **fields,
+    }
+
+
+def derived_materialization_too_large_error(
+    exc: DerivedLayerMaterializationTooLarge,
+    operation: str | None = None,
+) -> dict:
+    actual = "actualBytes" in exc.probe
+    if operation == "refresh":
+        suggested_action = (
+            "Convert this materialized layer to an ordinary view, or reduce "
+            "its output before refreshing again."
+        )
+    elif operation == "replace":
+        suggested_action = (
+            "Replace it with an ordinary view, or reduce the replacement "
+            "query output."
+        )
+    else:
+        suggested_action = (
+            "Create this derived layer as an ordinary view, or reduce its "
+            "output before trying again."
+        )
+    message = str(exc)
+    response = derived_blocked_error(
+        code="derived_layer.materialization_too_large",
+        message=message,
+        suggested_action=suggested_action,
+        operation=operation,
+        recommendedKind="view",
+        name=exc.name,
+        probe=exc.probe,
+        probeStage="actual" if actual else "estimate",
+    )
+    if actual:
+        response["rolledBack"] = True
+    return response
+
+
+def derived_query_classification(
+    exc: DerivedLayerQueryTooExpensive,
+) -> tuple[str, str, HTTPStatus]:
+    codes = {
+        reason.get("code")
+        for reason in exc.reasons
+        if isinstance(reason, dict)
+    }
+    if codes & INVALID_QUERY_REASON_CODES:
+        return "invalid", "derived_layer.query_invalid", HTTPStatus.BAD_REQUEST
+    if codes and codes <= COMPUTE_QUERY_REASON_CODES:
+        return (
+            "compute",
+            "derived_layer.query_too_expensive",
+            HTTPStatus.CONFLICT,
+        )
+    return (
+        "policy",
+        "derived_layer.query_not_allowed",
+        HTTPStatus.UNPROCESSABLE_ENTITY,
+    )
+
+
+def derived_query_reason_action(code: str) -> str:
+    if code in INVALID_QUERY_REASON_CODES:
+        return "Submit exactly one PostgreSQL SELECT statement with valid syntax."
+    if code in {"unqualified_relation", "unapproved_relation_schema"}:
+        return (
+            "Use only declared, permitted source relations and qualify each "
+            "one as schema.table."
+        )
+    if code in {"h3_unscoped_polygon_expansion", "h3_scope_binding"}:
+        return (
+            "Generate H3 cells directly from _mapp_h3_scope.geom_4326 in the "
+            "query scope."
+        )
+    if code == "h3_missing_scope":
+        return "Resolve a workspace map extent before using H3 polygon expansion."
+    if code in {"h3_dynamic_resolution", "h3_dynamic_grid_distance"}:
+        return "Use the literal H3 resolution or grid-distance bounds in the reason."
+    if code in {"h3_scope_expansion", "h3_composed_expansion"}:
+        return "Use a coarser H3 resolution or a smaller literal traversal distance."
+    if code in {"h3_unbounded_expansion", "h3_unbounded_child_expansion"}:
+        return "Replace the H3 expansion with a server-bounded supported H3 operation."
+    if code in {
+        "unbounded_aggregate_state", "unapproved_aggregate",
+        "unapproved_window_routine",
+    }:
+        return "Use a fixed-state aggregate such as count, sum, avg, min, or max."
+    if code in {
+        "unbounded_geometry_expansion", "unbounded_row_generator",
+        "unbounded_scalar_output", "unbounded_set_function",
+    }:
+        return "Remove the unbounded expansion or replace it with a provably bounded input."
+    if code == "cartesian_join":
+        return "Add an explicit bounded join predicate and split OR alternatives."
+    if code in {
+        "hazardous_function", "dangerous_catalog_function",
+        "security_definer_routine", "configured_routine", "volatile_routine",
+    } or code.startswith("unapproved_"):
+        return (
+            "Remove the routine, operator, type, or cast and use only approved "
+            "pg_catalog, PostGIS, or H3 functionality."
+        )
+    if code in {
+        "modifying_cte", "recursive_cte", "row_locking", "select_into",
+    }:
+        return "Rewrite the query as a read-only, non-recursive SELECT."
+    if code in {
+        "h3_scope_shadowed", "reserved_alias", "reserved_cte",
+        "reserved_relation",
+    }:
+        return "Rename the reserved query alias, CTE, or relation."
+    if code == "natural_join":
+        return "Replace NATURAL JOIN with an explicit bounded join condition."
+    return (
+        "Reduce output rows, joins, generated rows, and intermediate work; "
+        "add selective predicates or source indexes where appropriate."
+    )
+
+
+def derived_query_too_expensive_error(
+    exc: DerivedLayerQueryTooExpensive,
+    operation: str | None = None,
+) -> dict:
+    category, code, _ = derived_query_classification(exc)
+    reasons = []
+    for reason in exc.reasons:
+        item = dict(reason)
+        item["suggestedAction"] = derived_query_reason_action(
+            str(item.get("code", ""))
+        )
+        reasons.append(item)
+    details = "; ".join(
+        str(reason.get("message", "")) for reason in reasons
+    )
+    if category == "invalid":
+        lead = f'The derived-layer query for “{exc.name}” is invalid.'
+        suggested_action = (
+            "Correct the SQL described below, then submit exactly one SELECT."
+        )
+    elif category == "policy":
+        lead = (
+            f'The derived-layer query for “{exc.name}” uses SQL that is not '
+            "allowed."
+        )
+        suggested_action = (
+            reasons[0]["suggestedAction"]
+            if reasons
+            else "Remove the prohibited SQL and try again."
+        )
+    else:
+        lead = (
+            f'The derived-layer query for “{exc.name}” exceeds the server '
+            "compute budget."
+        )
+        suggested_action = (
+            "Address each compute-limit reason below. Changing to an ordinary "
+            "view does not bypass this guard."
+        )
+    message = lead + (" " + details if details else "")
+    return derived_blocked_error(
+        code=code,
+        message=message,
+        suggested_action=suggested_action,
+        operation=operation,
+        category=category,
+        name=exc.name,
+        probe=exc.probe,
+        reasons=reasons,
+    )
+
+
+def derived_query_error_status(
+    exc: DerivedLayerQueryTooExpensive,
+) -> HTTPStatus:
+    return derived_query_classification(exc)[2]
+
+
+def derived_source_mismatch_error(
+    exc: DerivedLayerSourceMismatchError,
+    operation: str | None,
+) -> dict:
+    message = (
+        "The declared source list does not match the relations PostgreSQL "
+        "resolved from the query."
+    )
+    return derived_blocked_error(
+        code="derived_layer.source_mismatch",
+        message=message,
+        suggested_action=(
+            "Add every relation used by the query to sources and remove any "
+            "declared source the query does not use."
+        ),
+        operation=operation,
+        declaredSources=exc.declared_sources,
+        resolvedSources=exc.resolved_sources,
+        missingSources=exc.missing_sources,
+        extraSources=exc.extra_sources,
+    )
+
+
+def derived_in_use_reasons(
+    *,
+    has_workspace_references: bool,
+    has_postgresql_dependents: bool,
+) -> list[dict[str, str]]:
+    reasons = []
+    if has_workspace_references:
+        reasons.append({
+            "code": "workspace_references",
+            "message": (
+                "One or more workspace map layers still reference this "
+                "derived layer."
+            ),
+            "suggestedAction": (
+                "Remove or replace the listed workspace references first."
+            ),
+        })
+    if has_postgresql_dependents:
+        reasons.append({
+            "code": "postgresql_dependents",
+            "message": (
+                "One or more PostgreSQL views or objects depend on this "
+                "derived layer."
+            ),
+            "suggestedAction": (
+                "Update or remove the listed PostgreSQL dependents first."
+            ),
+        })
+    return reasons
+
+
+def derived_dependency_error(
+    exc: DerivedLayerDependencyError,
+    operation: str,
+) -> dict:
+    action = "edited" if operation == "replace" else "deleted"
+    columns = sorted(
+        set(exc.removed_columns) & set(exc.dependent_columns)
+    )
+    column_message = (
+        " The database uses these affected fields: "
+        + ", ".join(f"“{column}”" for column in columns) + "."
+        if columns else ""
+    )
+    message = (
+        f'The derived layer “{exc.name}” cannot be {action} because other '
+        f"database views or objects use it.{column_message}"
+    )
+    return derived_blocked_error(
+        code="derived_layer.in_use",
+        message=message,
+        suggested_action=(
+            "Update or remove the dependent database views first, then try "
+            "again."
+        ),
+        operation=operation,
+        reasons=derived_in_use_reasons(
+            has_workspace_references=False,
+            has_postgresql_dependents=True,
+        ),
+        name=exc.name,
+        dependents=exc.dependents,
+        removedColumns=exc.removed_columns,
+        dependentColumns=exc.dependent_columns,
+        workspaceReferences=derived_workspace_references(exc.name),
+        requiresSecondOrderChanges=bool(
+            exc.removed_columns or exc.dependent_columns
+        ),
+        dropped=False,
+    )
+
+
+def derived_validation_error(exc: Exception, operation: str | None) -> dict:
+    message = str(exc)
+    invalid_query = (
+        message == "A SELECT query is required."
+        or message == "Derived-layer SQL must be one SELECT query."
+        or message.startswith("Derived-layer SQL is limited to ")
+        or message == "SQL terminators and comments are not allowed."
+    )
+    policy_query = (
+        message.startswith("SQL keyword ")
+        or message == (
+            "A managed derived layer cannot depend on another derived layer."
+        )
+    )
+    if invalid_query or policy_query:
+        category = "invalid" if invalid_query else "policy"
+        code = (
+            "derived_layer.query_invalid"
+            if invalid_query
+            else "derived_layer.query_not_allowed"
+        )
+        suggested_action = (
+            "Submit exactly one PostgreSQL SELECT statement with valid syntax."
+            if invalid_query
+            else "Remove the prohibited SQL or managed-source dependency."
+        )
+        return derived_blocked_error(
+            code=code,
+            message=message,
+            suggested_action=suggested_action,
+            operation=operation,
+            category=category,
+            reasons=[{
+                "code": "invalid_sql" if invalid_query else "prohibited_sql",
+                "message": message,
+                "suggestedAction": suggested_action,
+            }],
+        )
+    if "ready semantic profiles" in message:
+        code = "derived_layer.source_profile_required"
+        suggested_action = (
+            "Synchronize every listed source with `semantic source sync`, "
+            "then retry the derived-layer request."
+        )
+    elif "spatialScope" in message or "map extent" in message.lower():
+        code = "derived_layer.spatial_scope_invalid"
+        suggested_action = (
+            "Select a valid workspace locale and let the server resolve its "
+            "map extent."
+        )
+    else:
+        code = "derived_layer.invalid_request"
+        suggested_action = "Correct the derived-layer request described above and retry."
+    return derived_blocked_error(
+        code=code,
+        message=message,
+        suggested_action=suggested_action,
+        operation=operation,
+    )
+
+
+def derived_validation_error_status(response: dict) -> HTTPStatus:
+    if response.get("code") == "derived_layer.query_not_allowed":
+        return HTTPStatus.UNPROCESSABLE_ENTITY
+    return HTTPStatus.BAD_REQUEST
+
+
+def derived_maintenance_error(
+    exc: DerivedLayerMaintenanceError,
+    operation: str | None,
+) -> dict:
+    message = str(exc)
+    return derived_blocked_error(
+        code="derived_layer.maintenance",
+        message=message,
+        suggested_action=(
+            "Wait for reset-data maintenance to finish, then retry the same "
+            "request."
+        ),
+        operation=operation,
+        retryable=True,
+    )
+
+
+def derived_not_found_error(name: str, operation: str | None) -> dict:
+    message = (
+        f'The derived layer “{name}” does not exist.'
+    )
+    return derived_blocked_error(
+        code="derived_layer.not_found",
+        message=message,
+        suggested_action=(
+            "List derived layers and retry with an existing layer name."
+        ),
+        operation=operation,
+        name=name,
+    )
+
+
+def derived_already_exists_error(name: str) -> dict:
+    message = (
+        f'A derived layer named “{name}” already exists.'
+    )
+    return derived_blocked_error(
+        code="derived_layer.already_exists",
+        message=message,
+        suggested_action=(
+            "Choose a different name or replace the existing derived layer."
+        ),
+        operation="create",
+        name=name,
+    )
+
+
+def sanitized_postgres_detail(exc: psycopg.Error) -> dict:
+    technical_detail = {}
+    sqlstate = getattr(exc, "sqlstate", None)
+    if isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
+        technical_detail["sqlstate"] = sqlstate
+    diagnostics = getattr(exc, "diag", None)
+    primary = getattr(diagnostics, "message_primary", None)
+    if isinstance(primary, str) and primary.strip():
+        technical_detail["message"] = primary.strip()[:500]
+    return technical_detail
+
+
+def derived_database_error(
+    exc: psycopg.Error,
+    operation: str | None,
+) -> dict:
+    message = "The database could not apply this derived-layer change."
+    response = {
+        "error": message,
+        "message": message,
+        "userMessage": message,
+        "suggestedAction": (
+            "Check the query, declared source tables, and selected ID and "
+            "geometry fields. If the request ran in the background, inspect "
+            "the authoritative layer before retrying."
+        ),
+        "code": "derived_layer.database_error",
+        "operation": operation,
+        "blocked": True,
+    }
+    technical_detail = sanitized_postgres_detail(exc)
+    if technical_detail:
+        response["technicalDetail"] = technical_detail
+    return response
+
+
+def derived_read_error(
+    *,
+    code: str,
+    message: str,
+    suggested_action: str,
+    exc: Exception,
+) -> dict:
+    response = {
+        "error": message,
+        "message": message,
+        "userMessage": message,
+        "suggestedAction": suggested_action,
+        "code": code,
+    }
+    if isinstance(exc, psycopg.Error):
+        technical_detail = sanitized_postgres_detail(exc)
+        if technical_detail:
+            response["technicalDetail"] = technical_detail
+    return response
+
+
+def derived_operation_failed_error(operation: str | None) -> dict:
+    message = (
+        "The derived-layer operation ended without a confirmed result."
+    )
+    return {
+        "error": message,
+        "message": message,
+        "userMessage": message,
+        "suggestedAction": (
+            "Inspect the authoritative derived-layer catalog before retrying; "
+            "the requested change may or may not have completed."
+        ),
+        "code": "derived_layer.operation_failed",
+        "operation": operation,
+        "blocked": True,
+        "indeterminate": True,
+    }
+
+
+def require_semantic_derived_sources(
+    payload: dict,
+    catalog: dict,
+) -> None:
+    """Require every declared relation source to have a ready semantic profile."""
+    definition = validate_definition(payload)
+    assets = catalog.get("assets")
+    if not isinstance(assets, list):
+        raise DerivedLayerError("Semantic catalog returned invalid source profiles.")
+    profiled_sources = set()
+    for asset in assets:
+        if not isinstance(asset, dict) or asset.get("status") != "ready":
+            continue
+        generated = asset.get("generated")
+        if not isinstance(generated, dict):
+            continue
+        binding = generated.get("binding")
+        if not isinstance(binding, dict) or binding.get("adapter") != "postgresql":
+            continue
+        schema = binding.get("schema")
+        relation = binding.get("relation")
+        if isinstance(schema, str) and isinstance(relation, str):
+            profiled_sources.add(f"{schema}.{relation}")
+    missing = sorted(set(definition["sources"]) - profiled_sources)
+    if missing:
+        raise DerivedLayerError(
+            "Derived-layer sources need ready semantic profiles: "
+            + ", ".join(missing)
+            + ". Synchronize each source with `semantic source sync` before "
+            "creating or replacing a derived layer."
+        )
+
+
+def resolve_derived_spatial_scope(payload: dict) -> dict:
+    resolved = {**payload}
+    requested = resolved.get(
+        "spatialScope",
+        {"type": "workspace-map-extent"},
+    )
+    if not isinstance(requested, dict):
+        raise DerivedLayerError(
+            "spatialScope must be an object with type workspace-map-extent."
+        )
+    unknown = sorted(set(requested) - {"type", "locale"})
+    if unknown:
+        raise DerivedLayerError(
+            "Unknown spatialScope properties: " + ", ".join(unknown)
+        )
+    if requested.get("type") != "workspace-map-extent":
+        raise DerivedLayerError(
+            "spatialScope.type must be workspace-map-extent."
+        )
+    locale_key = requested.get("locale")
+    if locale_key is not None and (
+        not isinstance(locale_key, str) or not locale_key
+    ):
+        raise DerivedLayerError(
+            "spatialScope.locale must be a non-empty locale key."
+        )
+    _, workspace, _ = read_workspace()
+    try:
+        resolved["spatialScope"] = workspace_map_extent(
+            workspace,
+            locale_key,
+        )
+    except ValueError as exc:
+        raise DerivedLayerError(str(exc)) from exc
+    return resolved
+
+
+def archive_excluded_semantic_sources(actor: str) -> list[dict]:
+    if not SEMANTIC:
+        raise SemanticClientError(
+            "Semantic service is not configured.",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+            payload={"code": "semantic.not_configured"},
+        )
+    catalog = SEMANTIC.request(
+        "/v1/catalog",
+        actor=actor,
+        scopes=["semantic:inspect"],
+    )
+    assets = catalog.get("assets")
+    if not isinstance(assets, list):
+        raise SemanticClientError(
+            "Semantic service returned an invalid catalog.",
+            status=HTTPStatus.BAD_GATEWAY,
+            payload={"code": "semantic.invalid_response"},
+        )
+    archived = []
+    for asset in assets:
+        generated = asset.get("generated") if isinstance(asset, dict) else None
+        binding = generated.get("binding") if isinstance(generated, dict) else None
+        if (
+            not isinstance(asset, dict)
+            or asset.get("status") != "ready"
+            or not isinstance(binding, dict)
+            or binding.get("adapter") != "postgresql"
+            or not all(isinstance(binding.get(key), str) for key in ("alias", "schema", "relation"))
+            or not any(pattern.permits(
+                binding["alias"], binding["schema"], binding["relation"],
+            ) for pattern in SEMANTIC_SOURCE_EXCLUSIONS)
+        ):
+            continue
+        generation = asset.get("generation")
+        asset_id = asset.get("id")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1 or not isinstance(asset_id, str):
+            raise SemanticClientError(
+                "Semantic service returned an invalid source asset.",
+                status=HTTPStatus.BAD_GATEWAY,
+                payload={"code": "semantic.invalid_response"},
+            )
+        event = {
+            "eventId": str(uuid.uuid4()),
+            "assetId": asset_id,
+            "type": "archive",
+            "generation": generation + 1,
+            "actor": actor,
+        }
+        event["payloadHash"] = semantic_event_payload_hash(event)
+        response = SEMANTIC.request(
+            "/v1/events",
+            method="POST",
+            payload=event,
+            actor=actor,
+            scopes=["semantic:admin"],
+        )
+        validate_semantic_event_ack(event, event, response)
+        archived.append({
+            "id": asset_id,
+            "binding": binding,
+        })
+    return archived
 
 
 def start_derived_background(
@@ -285,18 +2195,37 @@ def start_derived_background(
     remote: str,
     name: str | None = None,
 ) -> dict:
-    operation = CONTROL.create_operation(
-        f"derived-layer.{action}",
-        actor,
-        {"name": name or payload.get("name"), "action": action},
-    )
-    threading.Thread(
-        target=run_derived_background,
-        args=(operation["id"], action, payload, actor, remote, name),
-        name=f"derived-{action}-{operation['id'][:8]}",
-        daemon=True,
-    ).start()
-    return operation
+    reserve_derived_background_job()
+    operation = None
+    try:
+        operation = CONTROL.create_operation(
+            f"derived-layer.{action}",
+            actor,
+            {
+                "name": name or payload.get("name"),
+                "action": action,
+                "spatialScope": payload.get("spatialScope"),
+            },
+        )
+        threading.Thread(
+            target=run_reserved_derived_background,
+            args=(operation["id"], action, payload, actor, remote, name),
+            name=f"derived-{action}-{operation['id'][:8]}",
+            daemon=True,
+        ).start()
+        return operation
+    except Exception:
+        release_derived_background_job()
+        if operation is not None:
+            CONTROL.finish_operation(
+                operation["id"],
+                status="failed",
+                error={
+                    "code": "derived_layer.background_start_failed",
+                    "message": "The background worker could not be started.",
+                },
+            )
+        raise
 
 
 def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
@@ -527,42 +2456,196 @@ def schedule_live_preview_sync(encoded: bytes | None = None) -> None:
     ).start()
 
 
+_STATIC_INFO_LITERAL = re.compile(
+    r"\A\s*'((?:[^']|'')*)'\s*(?:::\s*(?:text|varchar|character\s+varying))?\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _static_info_text(entry: dict) -> str | None:
+    """Return visible text only for a simple, constant information expression."""
+    expression = entry.get("fieldfx")
+    if not isinstance(expression, str):
+        return None
+    match = _STATIC_INFO_LITERAL.fullmatch(expression)
+    if match is None:
+        return None
+    text = match.group(1).replace("''", "'")
+    if entry.get("type") == "html":
+        text = html.unescape(re.sub(r"<[^<>]*>", " ", text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1000] or None
+
+
+def _info_expectations(entries: list, changed_indexes: set[int]) -> list[str]:
+    expected = []
+    for index in sorted(changed_indexes):
+        if index >= len(entries):
+            continue
+        entry = entries[index]
+        if not isinstance(entry, dict) or entry.get("display") is False:
+            continue
+        for value in (
+            entry.get("title"),
+            entry.get("label"),
+            _static_info_text(entry),
+        ):
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and value.strip() not in expected
+            ):
+                expected.append(value.strip())
+    return expected[:20]
+
+
+def proposal_feature_info_evidence(
+    proposal: dict,
+    layer_key: str,
+    locale_key: str,
+) -> dict:
+    """Plan clicked-feature evidence independently for each proposal side."""
+    try:
+        _, original_locale = select_locale(proposal.get("original"), locale_key)
+        _, candidate_locale = select_locale(proposal.get("candidate"), locale_key)
+        original_layer = (original_locale.get("layers") or {}).get(layer_key)
+        candidate_layer = (candidate_locale.get("layers") or {}).get(layer_key)
+    except (AttributeError, TypeError, ValueError):
+        prefixes = [["locale", "layers", layer_key, "infoj"]]
+        if locale_key != "locale":
+            prefixes.append(
+                ["locales", locale_key, "layers", layer_key, "infoj"]
+            )
+        changed = False
+        for item in proposal.get("diff") or []:
+            try:
+                parts = pointer_parts(item.get("path"))
+            except (TypeError, ValueError):
+                continue
+            if any(parts[:len(prefix)] == prefix for prefix in prefixes):
+                changed = True
+                break
+        return {
+            "changed": changed,
+            "original": {"requested": changed, "expectedText": []},
+            "candidate": {"requested": changed, "expectedText": []},
+        }
+    original_entries = (
+        original_layer.get("infoj")
+        if isinstance(original_layer, dict)
+        and isinstance(original_layer.get("infoj"), list)
+        else []
+    )
+    candidate_entries = (
+        candidate_layer.get("infoj")
+        if isinstance(candidate_layer, dict)
+        and isinstance(candidate_layer.get("infoj"), list)
+        else []
+    )
+    changed = original_entries != candidate_entries
+    changed_indexes = {
+        index
+        for index in range(max(len(original_entries), len(candidate_entries)))
+        if (
+            original_entries[index] if index < len(original_entries) else None
+        ) != (
+            candidate_entries[index] if index < len(candidate_entries) else None
+        )
+    }
+
+    def side(layer: object, entries: list) -> dict:
+        visible = any(
+            isinstance(entry, dict) and entry.get("display") is not False
+            for entry in entries
+        )
+        return {
+            "requested": bool(changed and isinstance(layer, dict) and visible),
+            "expectedText": _info_expectations(entries, changed_indexes),
+        }
+
+    return {
+        "changed": changed,
+        "original": side(original_layer, original_entries),
+        "candidate": side(candidate_layer, candidate_entries),
+    }
+
+
 def proposal_changes_feature_info(
     proposal: dict,
     layer_key: str,
     locale_key: str,
 ) -> bool:
     """Whether this proposal changes feature information for the rendered layer."""
-    resolved_layers = False
-    try:
-        _, original_locale = select_locale(proposal.get("original"), locale_key)
-        _, candidate_locale = select_locale(proposal.get("candidate"), locale_key)
-        original_layer = (original_locale.get("layers") or {}).get(layer_key)
-        candidate_layer = (candidate_locale.get("layers") or {}).get(layer_key)
-        resolved_layers = True
+    return proposal_feature_info_evidence(
+        proposal,
+        layer_key,
+        locale_key,
+    )["changed"]
+
+
+def expected_info_panel_text(payload: dict) -> list[str]:
+    raw = payload.get("expectedInfoPanelText")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 20:
+        raise ValueError(
+            "expectedInfoPanelText must be an array containing at most 20 strings."
+        )
+    expected = []
+    for value in raw:
         if (
-            isinstance(original_layer, dict)
-            and isinstance(candidate_layer, dict)
-            and original_layer.get("infoj") != candidate_layer.get("infoj")
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > 1000
         ):
-            return True
-    except (AttributeError, TypeError, ValueError):
-        # Retain path-based detection for an older or incomplete proposal
-        # record; preview integrity checks still gate rendering separately.
-        pass
-    if resolved_layers:
-        return False
-    prefixes = [["locale", "layers", layer_key, "infoj"]]
-    if locale_key != "locale":
-        prefixes.append(["locales", locale_key, "layers", layer_key, "infoj"])
-    for item in proposal.get("diff") or []:
-        try:
-            parts = pointer_parts(item.get("path"))
-        except (TypeError, ValueError):
-            continue
-        if any(parts[:len(prefix)] == prefix for prefix in prefixes):
-            return True
-    return False
+            raise ValueError(
+                "expectedInfoPanelText entries must be non-empty strings of "
+                "at most 1000 characters."
+            )
+        if value.strip() not in expected:
+            expected.append(value.strip())
+    return expected
+
+
+def plan_expected_info_panel(plan: dict, payload: dict) -> None:
+    expected = expected_info_panel_text(payload)
+    if not expected:
+        return
+    interaction = plan.get("interaction")
+    if not isinstance(interaction, dict) or not interaction.get("type"):
+        raise ValueError(
+            "Clicked-feature information evidence is unavailable for this layer."
+        )
+    plan["interaction"] = {
+        **interaction,
+        "requireInfoPanel": True,
+        "expectedInfoPanelText": expected,
+    }
+
+
+def feature_info_observation(result: dict, evidence: dict) -> dict:
+    interaction = result.get("interaction")
+    interaction = interaction if isinstance(interaction, dict) else {}
+    found = interaction.get("expectedInfoPanelTextFound")
+    found = found if isinstance(found, dict) else {}
+    expected = evidence.get("expectedText") or []
+    captured = interaction.get("infoPanelExpanded") is True
+    return {
+        **evidence,
+        "captured": captured,
+        "artifact": (result.get("artifacts") or {}).get("infoPanel"),
+        "expectedTextFound": {
+            text: found.get(text) is True
+            for text in expected
+        },
+        "passed": (
+            not evidence.get("requested")
+            or (
+                captured
+                and all(found.get(text) is True for text in expected)
+            )
+        ),
+    }
 
 
 def proposal_group_preview(
@@ -739,12 +2822,15 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
         {
             "url": target_url,
             "layer": layer_key,
+            "layerTitle": plan.get("layerTitle") if layer_key else None,
             "layers": plan.get("layers", [layer_key]),
             "plan": plan,
             "viewport": payload.get("viewport", {"width": 1920, "height": 1080}),
             "deviceScaleFactor": payload.get("deviceScaleFactor", 2),
             "fullPage": payload.get("fullPage", True),
             "viewMode": payload.get("viewMode", "focus"),
+            "hover": requested_hover(payload),
+            "expectedHoverText": expected_hover_text(payload),
             "panels": panels,
             "expectedPanelText": payload.get("expectedPanelText", []),
             "metadata": payload.get("metadata"),
@@ -801,6 +2887,38 @@ def visual_panels(payload: dict) -> list[str]:
         if item not in panels:
             panels.append(item)
     return panels
+
+
+def expected_hover_text(payload: dict) -> list[str]:
+    raw = payload.get("expectedHoverText")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 20:
+        raise ValueError(
+            "expectedHoverText must be an array containing at most 20 strings."
+        )
+    expected = []
+    for value in raw:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > 1000
+        ):
+            raise ValueError(
+                "expectedHoverText entries must be non-empty strings of at "
+                "most 1000 characters."
+            )
+        if value.strip() not in expected:
+            expected.append(value.strip())
+    return expected
+
+
+def requested_hover(payload: dict) -> bool | None:
+    if "hover" not in payload:
+        return None
+    if not isinstance(payload["hover"], bool):
+        raise ValueError("hover must be true or false.")
+    return payload["hover"]
 
 
 def apply_proposal_and_reload(
@@ -1011,7 +3129,20 @@ def discover_catalog() -> list[dict]:
     recognise an explicitly configured legacy ``public.*`` layer.  The public
     schema is omitted only from the server catalog used to add new layers.
     """
-    return [table for table in discover() if table.get("schema") != "public"]
+    ready_derived = {
+        profile["name"]
+        for profile in derived_semantic_profiles()
+        if profile["status"] == "ready"
+    } if DERIVED else set()
+    return [
+        table
+        for table in discover()
+        if table.get("schema") != "public"
+        and (
+            table.get("schema") != "derived_layers"
+            or table.get("table") in ready_derived
+        )
+    ]
 
 
 def layer_db(data: dict, layer: dict) -> str | None:
@@ -1026,6 +3157,72 @@ def locale_items(data: dict) -> list[tuple[str, dict]]:
         )
         for key, locale in effective_locales(data).items()
     ]
+
+
+def workspace_derived_bindings(data: dict) -> list[dict]:
+    bindings = []
+    for locale_path, locale in locale_items(data):
+        if not isinstance(locale, dict):
+            continue
+        for layer_key, layer in (locale.get("layers") or {}).items():
+            if (
+                not isinstance(layer, dict)
+                or not str(layer.get("table") or "").startswith("derived_layers.")
+            ):
+                continue
+            bindings.append({
+                "identity": (
+                    locale_path,
+                    layer_key,
+                    layer_db(data, layer),
+                    layer["table"],
+                ),
+                "path": f"{locale_path}.layers.{layer_key}.table",
+                "relation": layer["table"],
+                "name": layer["table"].removeprefix("derived_layers."),
+            })
+    return bindings
+
+
+def semantic_publication_diagnostics(
+    candidate: dict,
+    original: dict | None = None,
+) -> tuple[list[dict], list[dict]]:
+    candidate_bindings = workspace_derived_bindings(candidate)
+    if not candidate_bindings:
+        return [], []
+    original_bindings = {
+        binding["identity"]
+        for binding in workspace_derived_bindings(original or {})
+    }
+    try:
+        profiles = {
+            profile["name"]: profile
+            for profile in derived_semantic_profiles()
+        }
+    except (DerivedLayerError, psycopg.Error):
+        profiles = {}
+    errors, warnings = [], []
+    for binding in candidate_bindings:
+        profile = profiles.get(binding["name"])
+        status = profile.get("status") if profile else "unavailable"
+        if status == "ready":
+            continue
+        diagnostic = {
+            "path": binding["path"],
+            "code": "semantic.derived_not_ready",
+            "status": status,
+            "relation": binding["relation"],
+            "message": (
+                f'{binding["relation"]} has semantic profile status '
+                f"“{status}”. Resolve the cause and retry semantic delivery."
+            ),
+        }
+        if binding["identity"] in original_bindings:
+            warnings.append(diagnostic)
+        else:
+            errors.append(diagnostic)
+    return errors, warnings
 
 
 def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
@@ -1352,8 +3549,13 @@ def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index
     }
 
 
-def validate_candidate(candidate) -> list[dict[str, str]]:
+def validate_candidate(
+    candidate,
+    original: dict | None = None,
+) -> list[dict[str, str]]:
     errors = validate_workspace(candidate, set(DB_CONNECTIONS))
+    semantic_errors, _ = semantic_publication_diagnostics(candidate, original)
+    errors.extend(semantic_errors)
     icon_urls = {entry["url"] for entry in discover_icons()}
     has_probeable_layers = False
     if not errors:
@@ -1390,7 +3592,9 @@ def annotated(errors):
     for error in errors:
         path = error.get("path", "")
         message = error.get("message", "")
-        if "fieldfx" in path:
+        if error.get("code") == "semantic.derived_not_ready":
+            rule, phase = "semantic.derived_ready", "semantic"
+        elif "fieldfx" in path:
             rule, phase = "sql.scalar_read_only", "security"
         elif ".plugins" in path or "Plugin" in message or "plugin" in message:
             rule, phase = "plugin.catalogue", "plugin"
@@ -1486,7 +3690,14 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _actor(self, *, state_change=False):
         self._authentication = None
-        authorization = self.headers.get("Authorization", "")
+        authorization_values = self.headers.get_all("Authorization", [])
+        if len(authorization_values) > 1:
+            return None
+        authorization = (
+            authorization_values[0]
+            if authorization_values
+            else ""
+        )
         if authorization.startswith("Bearer "):
             token = CONTROL.authenticate_token(authorization[7:], self._remote())
             if not token:
@@ -1494,7 +3705,9 @@ class Handler(SimpleHTTPRequestHandler):
             actor = f"token:{token['id']}"
             self._authentication = {
                 "actor": actor,
+                "tokenId": token["id"],
                 "scopes": token.get("scopes") or [],
+                "expires": token.get("expires"),
             }
             return actor
         cookies = self._cookies()
@@ -1510,7 +3723,10 @@ class Handler(SimpleHTTPRequestHandler):
     def _authorized(self, *, state_change=False, required_scope: str | None = None):
         actor = self._actor(state_change=state_change)
         if not actor:
-            self._json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required."})
+            self._json(HTTPStatus.UNAUTHORIZED, {
+                "error": "Authentication required.",
+                "code": "auth.authentication_required",
+            })
             return None
         required_scope = required_scope or getattr(self, "_authorization_scope", None)
         scopes = set((self._authentication or {}).get("scopes") or [])
@@ -1529,8 +3745,64 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return actor
 
+    def _scope_granted(self, actor: str, required_scope: str) -> bool:
+        scopes = set((self._authentication or {}).get("scopes") or [])
+        if actor == "admin" or "full" in scopes or required_scope in scopes:
+            return True
+        self._json(HTTPStatus.FORBIDDEN, {
+            "error": "The credential does not grant the required scope.",
+            "code": "auth.scope_required",
+            "requiredScope": required_scope,
+            "grantedScopes": sorted(scopes),
+        })
+        return False
+
     @staticmethod
     def _required_scope(path: str, method: str) -> str | None:
+        if method == "GET" and path in {
+            "/api/capabilities",
+            "/api/contract",
+            "/api/connect",
+            "/api/auth/me",
+        }:
+            # Contract discovery and a credential's own identity do not expose
+            # workspace state. Any authenticated narrow-scope token may read
+            # them before invoking its domain-specific API.
+            return None
+        if path.startswith("/api/semantic/"):
+            if method == "GET":
+                return "semantic:inspect"
+            if path == "/api/semantic/source/sync":
+                return "semantic:source"
+            if path == "/api/semantic/generate":
+                return "semantic:generate"
+            if re.fullmatch(
+                r"/api/semantic/derived-profiles/"
+                r"[a-z][a-z0-9_]{0,62}/repair",
+                path,
+            ):
+                return "semantic:admin"
+            semantic_proposal_action = re.fullmatch(
+                r"/api/semantic/proposals/[A-Za-z0-9._-]+/(apply|decline)",
+                path,
+            )
+            if (
+                semantic_proposal_action
+                and semantic_proposal_action.group(1) == "apply"
+            ):
+                return "semantic:apply"
+            if (
+                path in {
+                    "/api/semantic/proposals",
+                    "/api/semantic/proposals/check",
+                }
+                or (
+                    semantic_proposal_action
+                    and semantic_proposal_action.group(1) == "decline"
+                )
+            ):
+                return "semantic:propose"
+            return "semantic:admin"
         if method == "GET":
             if path.startswith("/api/operations/"):
                 return None
@@ -1541,15 +3813,139 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/proposals/[^/]+/(visual-plan|visual-test|screenshot)", path
         ):
             return "visual"
-        if path.endswith("/apply"):
+        proposal_action = re.fullmatch(
+            r"/api/proposals/[A-Za-z0-9._-]+/(apply|decline)",
+            path,
+        )
+        if proposal_action and proposal_action.group(1) == "apply":
             return "apply"
         if path == "/api/xyz/reload":
             return "reload"
         if path == "/api/derived-layers" or path.startswith("/api/derived-layers/"):
             return "derive" if method != "GET" else "inspect"
-        if path in {"/api/proposals", "/api/proposals/check"} or path.endswith("/decline"):
+        if (
+            path in {"/api/proposals", "/api/proposals/check"}
+            or proposal_action
+            and proposal_action.group(1) == "decline"
+        ):
             return "propose"
         return "full"
+
+    def _semantic_scopes(self, actor: str) -> list[str]:
+        semantic_scopes = [
+            "semantic:inspect",
+            "semantic:source",
+            "semantic:generate",
+            "semantic:data",
+            "semantic:propose",
+            "semantic:apply",
+            "semantic:admin",
+        ]
+        if actor == "admin":
+            return semantic_scopes
+        scopes = list((self._authentication or {}).get("scopes") or [])
+        return list(dict.fromkeys(
+            scopes + (semantic_scopes if "full" in scopes else [])
+        ))
+
+    def _semantic_request(
+        self,
+        actor: str,
+        internal_path: str,
+        *,
+        method: str = "GET",
+        payload: dict | None = None,
+    ) -> dict:
+        if not SEMANTIC:
+            raise SemanticClientError(
+                "Semantic service is not configured.",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                payload={"code": "semantic.not_configured"},
+            )
+        return SEMANTIC.request(
+            internal_path,
+            method=method,
+            payload=payload,
+            actor=actor,
+            scopes=self._semantic_scopes(actor),
+        )
+
+    def _semantic_error(self, error: SemanticClientError) -> None:
+        status = error.status or HTTPStatus.SERVICE_UNAVAILABLE
+        if status < 400 or status > 599:
+            status = HTTPStatus.BAD_GATEWAY
+        if status == HTTPStatus.UNAUTHORIZED:
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "Semantic service authentication is misconfigured.",
+                    "code": "semantic.internal_auth_failed",
+                },
+            )
+            return
+        upstream = dict(error.payload)
+        nested = upstream.get("error")
+        payload = {
+            key: value
+            for key, value in upstream.items()
+            if key != "error"
+        }
+        if isinstance(nested, dict):
+            payload.setdefault("code", nested.get("code"))
+            payload.setdefault("details", nested.get("details"))
+            payload["error"] = nested.get("message") or str(error)
+        else:
+            payload["error"] = nested or str(error)
+        code = payload.get("code")
+        if isinstance(code, str) and code:
+            if code == "pagination_invalid":
+                payload["code"] = "pagination.invalid"
+            elif code == "pagination_required":
+                payload["code"] = "pagination.required"
+            else:
+                payload["code"] = (
+                    code if code.startswith("semantic.") else f"semantic.{code}"
+                )
+        else:
+            payload["code"] = (
+                "semantic.unavailable"
+                if status >= 500
+                else "semantic.request_failed"
+            )
+        if payload.get("details") is None:
+            payload.pop("details", None)
+        self._json(status, payload)
+
+    def _collection_pagination_error(
+        self,
+        error: CollectionPaginationError,
+    ) -> None:
+        self._json(
+            error.status,
+            {
+                "error": str(error),
+                "code": error.code,
+                "details": error.details,
+            },
+        )
+
+    def _gemini_error(self, error: GeminiClientError) -> None:
+        status = error.status
+        if status < 400 or status > 599:
+            status = HTTPStatus.BAD_GATEWAY
+        self._json(status, {
+            "error": str(error),
+            "code": error.code,
+        })
+
+    def _semantic_source_error(self, error: SemanticSourceError) -> None:
+        status = error.status
+        if status < 400 or status > 599:
+            status = HTTPStatus.BAD_GATEWAY
+        self._json(status, {
+            "error": str(error),
+            "code": error.code,
+        })
 
     def _payload(self):
         size = int(self.headers.get("Content-Length", "0"))
@@ -1581,7 +3977,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.OK, {
                 "instanceId": CONTROL.instance_id(),
                 "authentication": "bearer-or-session",
-                "contractVersion": "1.0",
+                "contractVersion": CONTRACT_VERSION,
                 "xyzVersion": os.environ.get("XYZ_VERSION", "v4.23.4"),
             })
             return
@@ -1594,6 +3990,281 @@ class Handler(SimpleHTTPRequestHandler):
             actor = self._authorized()
             if not actor:
                 return
+        derived_semantic_path = re.fullmatch(
+            r"/api/semantic/derived-profiles(?:/([a-z][a-z0-9_]{0,62}))?",
+            path,
+        )
+        if derived_semantic_path:
+            try:
+                query = parse_qs(
+                    urlparse(self.path).query,
+                    keep_blank_values=True,
+                )
+                authentication = self._authentication or {}
+                granted = set(authentication.get("scopes") or [])
+                include_delivery_diagnostics = (
+                    actor == "admin"
+                    or "full" in granted
+                    or "semantic:admin" in granted
+                )
+                revision = current_semantic_revision(actor)
+                name = derived_semantic_path.group(1)
+                if name:
+                    if query:
+                        raise ValueError(
+                            "Derived-profile show does not accept query parameters."
+                        )
+                    delivery_blockers = []
+                    if include_delivery_diagnostics and DERIVED:
+                        delivery_blockers, _, _ = (
+                            semantic_delivery_blocker_page(
+                                [name],
+                                include_unmatched=False,
+                            )
+                        )
+                    profile = derived_semantic_profiles(
+                        name=name,
+                        include_delivery_diagnostics=(
+                            include_delivery_diagnostics
+                        ),
+                        delivery_blockers=delivery_blockers,
+                    )[0]
+                    self._json(HTTPStatus.OK, {
+                        "catalogRevision": revision,
+                        "derivedProfile": profile,
+                    })
+                else:
+                    unmatched_blockers = []
+                    delivery_blockers_more = False
+                    if query:
+                        limit, cursor = pagination_parameters(query)
+                        scope = json.dumps(
+                            {
+                                "collection": "semantic-derived-profiles-v1",
+                                "catalogRevision": revision,
+                                "diagnostics": include_delivery_diagnostics,
+                                "instanceId": CONTROL.instance_id(),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        after_name = decode_position_cursor(
+                            cursor,
+                            scope,
+                            CONTROL.pagination_key(),
+                        )
+                        if after_name is not None and (
+                            not isinstance(after_name, str)
+                            or re.fullmatch(
+                                r"[a-z][a-z0-9_]{0,62}", after_name
+                            )
+                            is None
+                        ):
+                            raise ValueError("cursor is invalid or expired.")
+                        profiles = derived_semantic_profiles(
+                            after_name=after_name,
+                            fetch_limit=limit + 1,
+                        )
+                        delivery_blockers = []
+                        if include_delivery_diagnostics and DERIVED:
+                            (
+                                delivery_blockers,
+                                unmatched_blockers,
+                                delivery_blockers_more,
+                            ) = semantic_delivery_blocker_page(
+                                [
+                                    profile["name"]
+                                    for profile in profiles[:limit]
+                                ],
+                                include_unmatched=cursor is None,
+                            )
+                        if include_delivery_diagnostics:
+                            add_semantic_delivery_diagnostics(
+                                profiles,
+                                delivery_blockers,
+                            )
+                        profiles, pagination = paginate_keyset_page(
+                            profiles,
+                            limit=limit,
+                            scope=scope,
+                            key=CONTROL.pagination_key(),
+                            position=lambda item: item["name"],
+                        )
+                        payload = {
+                            "derivedProfiles": profiles,
+                            "pagination": pagination,
+                        }
+                    else:
+                        profiles = derived_semantic_profiles(
+                            fetch_limit=MAX_PAGE_LIMIT + 1,
+                        )
+                        delivery_blockers = []
+                        if include_delivery_diagnostics:
+                            (
+                                delivery_blockers,
+                                unmatched_blockers,
+                                delivery_blockers_more,
+                            ) = semantic_delivery_blocker_page(
+                                [
+                                    profile["name"]
+                                    for profile in profiles[:MAX_PAGE_LIMIT]
+                                ],
+                                include_unmatched=True,
+                            )
+                            add_semantic_delivery_diagnostics(
+                                profiles,
+                                delivery_blockers,
+                            )
+                        profiles = legacy_collection(profiles)
+                        payload = {"derivedProfiles": profiles}
+                    payload["catalogRevision"] = revision
+                    if include_delivery_diagnostics:
+                        payload["deliveryBlockers"] = legacy_collection(
+                            unmatched_semantic_delivery_blockers(
+                                profiles, unmatched_blockers,
+                            )
+                        )
+                        payload["deliveryBlockersMore"] = (
+                            delivery_blockers_more
+                        )
+                    enforce_collection_payload(
+                        payload,
+                        paginated=bool(query),
+                    )
+                    self._json(HTTPStatus.OK, payload)
+                schedule_semantic_outbox()
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
+            except ValueError as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "pagination.invalid"},
+                )
+            except FileNotFoundError as exc:
+                self._json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": str(exc), "code": "semantic.derived_not_found"},
+                )
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            except (DerivedLayerError, psycopg.Error) as exc:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": str(exc), "code": "semantic.derived_unavailable"},
+                )
+            return
+        if path == "/api/semantic/source/relations":
+            if not self._scope_granted(actor, "semantic:source"):
+                return
+            try:
+                query = parse_qs(
+                    urlparse(self.path).query,
+                    keep_blank_values=True,
+                )
+                if query:
+                    limit, cursor = pagination_parameters(query)
+                    key = CONTROL.pagination_key()
+                    scope = json.dumps(
+                        {
+                            "collection": "semantic-source-relations-v1",
+                            "instanceId": CONTROL.instance_id(),
+                            "sourceConfiguration": (
+                                SEMANTIC_SOURCES.configuration_fingerprint(key)
+                            ),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    position = decode_position_cursor(cursor, scope, key)
+                    if (
+                        position is not None
+                        and (
+                            not isinstance(position, list)
+                            or len(position) != 3
+                        )
+                    ):
+                        raise ValueError("cursor is invalid or expired.")
+                    if position is None:
+                        after = None
+                    else:
+                        after = tuple(position)
+                    relations = SEMANTIC_SOURCES.discover_page(
+                        after=after,
+                        fetch_limit=limit + 1,
+                    )
+                    relations, pagination = paginate_keyset_page(
+                        relations,
+                        limit=limit,
+                        scope=scope,
+                        key=key,
+                        position=lambda item: [
+                            item["alias"],
+                            item["schema"],
+                            item["relation"],
+                        ],
+                    )
+                    payload = {
+                        "relations": relations,
+                        "pagination": pagination,
+                    }
+                else:
+                    relations = SEMANTIC_SOURCES.discover_page(
+                        after=None,
+                        fetch_limit=MAX_PAGE_LIMIT + 1,
+                    )
+                    payload = {"relations": legacy_collection(relations)}
+                enforce_collection_payload(
+                    payload,
+                    paginated=bool(query),
+                )
+                self._json(HTTPStatus.OK, payload)
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
+            except ValueError as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "pagination.invalid"},
+                )
+            except SemanticSourceError as exc:
+                self._semantic_source_error(exc)
+            except psycopg.Error:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "Semantic source discovery is unavailable.",
+                        "code": "semantic.source_unavailable",
+                    },
+                )
+            return
+        if path.startswith("/api/semantic/"):
+            internal = semantic_proxy_path(
+                path,
+                urlparse(self.path).query,
+            )
+            if not internal:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                result = self._semantic_request(actor, internal)
+                if path == "/api/semantic/status":
+                    result = dict(result)
+                    semantic_capabilities = result.get("capabilities")
+                    semantic_capabilities = (
+                        dict(semantic_capabilities)
+                        if isinstance(semantic_capabilities, dict)
+                        else {}
+                    )
+                    semantic_capabilities["generation"] = (
+                        semantic_generation_capability()
+                    )
+                    result["capabilities"] = semantic_capabilities
+                self._json(
+                    HTTPStatus.OK,
+                    result,
+                )
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            return
         if path == "/healthz":
             try:
                 if not DB_CONNECTIONS:
@@ -1605,9 +4276,17 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/workspace":
             try:
                 _, data, current_revision = read_workspace()
+                _, semantic_warnings = semantic_publication_diagnostics(
+                    data,
+                    data,
+                )
                 self._json(
                     HTTPStatus.OK,
-                    {"workspace": data, "revision": current_revision},
+                    {
+                        "workspace": data,
+                        "revision": current_revision,
+                        "semanticWarnings": annotated(semantic_warnings),
+                    },
                 )
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
@@ -1634,9 +4313,11 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif path == "/api/catalog":
             try:
+                profiles = derived_semantic_profiles() if DERIVED else []
                 self._json(HTTPStatus.OK, {
                     "databases": sorted(DB_CONNECTIONS),
                     "tables": discover_catalog(),
+                    "derivedProfiles": profiles,
                 })
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
@@ -1649,12 +4330,63 @@ class Handler(SimpleHTTPRequestHandler):
                         "configured": False,
                         "schema": "derived_layers",
                         "kinds": ["view", "materialized"],
+                        "spatialScopeTypes": ["workspace-map-extent"],
                         "h3Available": False,
                     }
                 )
+                result["backgroundJobs"] = derived_background_capacity()
                 self._json(HTTPStatus.OK, result)
             except (DerivedLayerError, psycopg.Error) as exc:
-                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    derived_read_error(
+                        code="derived_layer.capabilities_unavailable",
+                        message="Derived-layer capabilities are unavailable.",
+                        suggested_action=(
+                            "Check derived-layer database configuration and "
+                            "connectivity, then retry."
+                        ),
+                        exc=exc,
+                    ),
+                )
+        elif path == "/api/derived-layers/map-extent":
+            requested_locale = parse_qs(
+                urlparse(self.path).query,
+                keep_blank_values=True,
+            ).get("locale", [None])[0]
+            try:
+                _, workspace, _ = read_workspace()
+                self._json(HTTPStatus.OK, {
+                    "spatialScope": workspace_map_extent(
+                        workspace,
+                        requested_locale,
+                    ),
+                })
+            except ValueError as exc:
+                message = str(exc)
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": message,
+                    "userMessage": message,
+                    "suggestedAction": (
+                        "Select a workspace locale with a valid map view, then "
+                        "request the derived-layer extent again."
+                    ),
+                    "code": "derived_layer.map_extent_unavailable",
+                })
+            except Exception:
+                self._json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "error": "The workspace map extent is unavailable.",
+                        "userMessage": (
+                            "The workspace map extent could not be resolved."
+                        ),
+                        "suggestedAction": (
+                            "Check the workspace map view and retry."
+                        ),
+                        "code": "derived_layer.map_extent_unavailable",
+                    },
+                )
         elif path == "/api/derived-layers":
             try:
                 if not DERIVED:
@@ -1663,7 +4395,18 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 self._json(HTTPStatus.OK, {"derivedLayers": DERIVED.list()})
             except (DerivedLayerError, psycopg.Error) as exc:
-                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    derived_read_error(
+                        code="derived_layer.catalog_unavailable",
+                        message="The derived-layer catalog is unavailable.",
+                        suggested_action=(
+                            "Check derived-layer database connectivity and "
+                            "retry the list request."
+                        ),
+                        exc=exc,
+                    ),
+                )
         elif path.startswith("/api/derived-layers/"):
             try:
                 if not DERIVED:
@@ -1675,13 +4418,52 @@ class Handler(SimpleHTTPRequestHandler):
                     raise FileNotFoundError(name)
                 self._json(HTTPStatus.OK, {"derivedLayer": DERIVED.get(name)})
             except FileNotFoundError as exc:
-                self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                name = str(exc)
+                message = f'The derived layer “{name}” does not exist.'
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": message,
+                    "message": message,
+                    "userMessage": message,
+                    "suggestedAction": (
+                        "List derived layers and retry with an existing name."
+                    ),
+                    "code": "derived_layer.not_found",
+                    "name": name,
+                })
             except (DerivedLayerError, psycopg.Error) as exc:
-                self._json(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    derived_read_error(
+                        code="derived_layer.read_unavailable",
+                        message="The derived layer could not be read.",
+                        suggested_action=(
+                            "Check derived-layer database connectivity and "
+                            "retry."
+                        ),
+                        exc=exc,
+                    ),
+                )
         elif path == "/api/icons":
             self._json(HTTPStatus.OK, {"icons": discover_icons()})
         elif path == "/api/contract":
             self._json(HTTPStatus.OK, contract(CONTROL.instance_id()))
+        elif path == "/api/connect":
+            authentication = self._authentication or {
+                "actor": actor,
+                "scopes": ["admin"] if actor == "admin" else [],
+                "expires": None,
+            }
+            self._json(HTTPStatus.OK, {
+                "authenticated": True,
+                "actor": authentication["actor"],
+                "scopes": authentication.get("scopes") or [],
+                "expires": authentication.get("expires"),
+                **(
+                    {"tokenId": authentication["tokenId"]}
+                    if authentication.get("tokenId")
+                    else {}
+                ),
+            })
         elif path == "/api/capabilities":
             self._json(HTTPStatus.OK, capabilities(CONTROL.instance_id()))
         elif path == "/api/schema":
@@ -1729,7 +4511,65 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, {"events": CONTROL.audit_tail()})
         elif path == "/api/proposals":
-            self._json(HTTPStatus.OK, {"proposals": proposal_list(CONTROL)})
+            try:
+                query = parse_qs(
+                    urlparse(self.path).query,
+                    keep_blank_values=True,
+                )
+                if query:
+                    limit, cursor = pagination_parameters(query)
+                    scope = json.dumps(
+                        {
+                            "collection": "workspace-proposals-v1",
+                            "instanceId": CONTROL.instance_id(),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    after_id = decode_position_cursor(
+                        cursor,
+                        scope,
+                        CONTROL.pagination_key(),
+                    )
+                    if after_id is not None and (
+                        not isinstance(after_id, str)
+                        or re.fullmatch(r"[A-Za-z0-9._-]+", after_id) is None
+                    ):
+                        raise ValueError("cursor is invalid or expired.")
+                    proposals = proposal_list(
+                        CONTROL,
+                        after_id=after_id,
+                        fetch_limit=limit + 1,
+                    )
+                    proposals, pagination = paginate_keyset_page(
+                        proposals,
+                        limit=limit,
+                        scope=scope,
+                        key=CONTROL.pagination_key(),
+                        position=lambda item: item["id"],
+                    )
+                    payload = {
+                        "proposals": proposals,
+                        "pagination": pagination,
+                    }
+                else:
+                    proposals = proposal_list(
+                        CONTROL,
+                        fetch_limit=MAX_PAGE_LIMIT + 1,
+                    )
+                    payload = {"proposals": legacy_collection(proposals)}
+                enforce_collection_payload(
+                    payload,
+                    paginated=bool(query),
+                )
+                self._json(HTTPStatus.OK, payload)
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
+            except ValueError as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "pagination.invalid"},
+                )
         elif path.startswith("/api/proposals/"):
             try:
                 self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, path.rsplit("/", 1)[1])})
@@ -1801,7 +4641,13 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = self._payload()
                 result = CONTROL.start_device_authorization(
                     payload.get("deviceName", ""),
-                    payload.get("scopes", ["inspect", "propose", "visual"]),
+                    payload.get(
+                        "scopes",
+                        [
+                            "inspect", "propose", "visual",
+                            "semantic:inspect",
+                        ],
+                    ),
                     self._remote(),
                 )
                 result["verificationUri"] = "/"
@@ -1851,6 +4697,578 @@ class Handler(SimpleHTTPRequestHandler):
         actor = self._authorized(state_change=True)
         if not actor:
             return
+        if request_path == "/api/semantic/generate":
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            audit_details = None
+            try:
+                asset_id, target, context_options = _semantic_generation_request(
+                    self._payload()
+                )
+                audit_details = {
+                    "assetId": asset_id,
+                    "target": target["kind"],
+                    "provider": "gemini",
+                    "model": GEMINI_MODEL,
+                    "contextOptions": dict(context_options),
+                }
+                if target["kind"] == "field":
+                    audit_details["fieldId"] = target["fieldId"]
+                if (
+                    any(context_options.values())
+                    and not self._scope_granted(actor, "semantic:data")
+                ):
+                    return
+                if GEMINI is None:
+                    if GEMINI_CONFIGURATION_ERROR is not None:
+                        raise GEMINI_CONFIGURATION_ERROR
+                    raise GeminiClientError(
+                        "Gemini semantic generation is not configured.",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        code="semantic.generation_not_configured",
+                    )
+                response = self._semantic_request(
+                    actor,
+                    f"/v1/assets/{quote(asset_id, safe='')}",
+                )
+                asset = response.get("asset")
+                if (
+                    not isinstance(asset, dict)
+                    or asset.get("id") != asset_id
+                    or isinstance(asset.get("version"), bool)
+                    or not isinstance(asset.get("version"), int)
+                    or asset["version"] < 1
+                ):
+                    raise GeminiClientError(
+                        "Semantic service returned an invalid asset.",
+                        status=HTTPStatus.BAD_GATEWAY,
+                        code="semantic.generation_context_invalid",
+                    )
+                if asset.get("status") == "archived":
+                    raise GeminiClientError(
+                        "Archived semantic assets cannot receive new drafts.",
+                        status=HTTPStatus.CONFLICT,
+                        code="semantic.asset_archived",
+                    )
+                context, field_name = semantic_generation_context(
+                    asset,
+                    target,
+                )
+                optional_context = semantic_generation_optional_context(
+                    asset,
+                    target,
+                    context_options,
+                )
+                if optional_context:
+                    context["dataContext"] = optional_context
+                    sample_context = optional_context.get("sampleRows")
+                    statistics_context = optional_context.get("statistics")
+                    audit_details["dataContext"] = {
+                        **(
+                            {
+                                "sampleRowsReturned": sample_context.get(
+                                    "returnedRows", 0
+                                )
+                            }
+                            if isinstance(sample_context, dict)
+                            else {}
+                        ),
+                        **(
+                            {
+                                "statisticsScope": statistics_context.get(
+                                    "scope"
+                                )
+                            }
+                            if isinstance(statistics_context, dict)
+                            else {}
+                        ),
+                    }
+                profile = GEMINI.generate(
+                    context,
+                    target_kind=target["kind"],
+                )
+                operations = semantic_generation_operations(
+                    target,
+                    profile,
+                    context.get("currentAnnotation"),
+                )
+                subject = (
+                    f"field {field_name!r}"
+                    if target["kind"] == "field"
+                    else "table"
+                )
+                draft = {
+                    "assetId": asset_id,
+                    "baseVersion": asset["version"],
+                    "target": target,
+                    "operations": operations,
+                    "explanation": (
+                        (
+                            f"Gemini draft for {subject}, using semantic "
+                            "metadata and the explicitly selected bounded "
+                            "data context. "
+                            if any(context_options.values())
+                            else f"Gemini metadata-only draft for {subject}. "
+                        )
+                        + "Review every generated value before checking or "
+                        "creating a semantic proposal."
+                    ),
+                }
+                CONTROL.audit(
+                    "semantic.draft.generated",
+                    actor=actor,
+                    remote=self._remote(),
+                    details=audit_details,
+                )
+                self._json(HTTPStatus.OK, {
+                    "draft": draft,
+                    "generation": {
+                        "provider": "gemini",
+                        "model": GEMINI_MODEL,
+                        "metadataOnly": not any(context_options.values()),
+                        "contextOptions": context_options,
+                        "proposalCreated": False,
+                    },
+                })
+            except (ValueError, json.JSONDecodeError) as exc:
+                error = GeminiClientError(
+                    str(exc),
+                    status=HTTPStatus.BAD_REQUEST,
+                    code="semantic.generation_invalid_request",
+                )
+                self._gemini_error(error)
+            except SemanticClientError as exc:
+                if audit_details is not None:
+                    details = {
+                        **audit_details,
+                        "code": "semantic.asset_lookup_failed",
+                    }
+                    if (
+                        isinstance(exc.status, int)
+                        and 400 <= exc.status <= 599
+                    ):
+                        details["status"] = exc.status
+                    CONTROL.audit(
+                        "semantic.draft.generation_failed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details=details,
+                    )
+                self._semantic_error(exc)
+            except GeminiClientError as exc:
+                if audit_details is not None:
+                    CONTROL.audit(
+                        "semantic.draft.generation_failed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details={
+                            **audit_details,
+                            "code": exc.code,
+                        },
+                    )
+                self._gemini_error(exc)
+            return
+        if request_path == "/api/semantic/source/archive-excluded":
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            try:
+                if self._payload() != {"confirmed": True}:
+                    raise ValueError(
+                        "Archiving excluded semantic sources requires confirmed: true."
+                    )
+                archived = archive_excluded_semantic_sources(actor)
+                CONTROL.audit(
+                    "semantic.source.exclusions_archived",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={"assetIds": [item["id"] for item in archived]},
+                )
+                self._json(HTTPStatus.OK, {"archived": archived})
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            return
+        semantic_archive_path = re.fullmatch(
+            r"/api/semantic/catalog/objects/([^/]+)/archive",
+            request_path,
+        )
+        if semantic_archive_path:
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            try:
+                if self._payload() != {"confirmed": True}:
+                    raise ValueError("Archiving a semantic profile requires confirmed: true.")
+                asset_id = semantic_archive_path.group(1)
+                response = self._semantic_request(
+                    actor,
+                    f"/v1/assets/{quote(asset_id, safe='')}",
+                )
+                asset = response.get("asset")
+                generation = asset.get("generation") if isinstance(asset, dict) else None
+                if (
+                    not isinstance(asset, dict)
+                    or asset.get("id") != asset_id
+                    or asset.get("status") != "ready"
+                    or isinstance(generation, bool)
+                    or not isinstance(generation, int)
+                    or generation < 1
+                ):
+                    raise ValueError("Only a ready semantic profile can be archived.")
+                event = {
+                    "eventId": str(uuid.uuid4()),
+                    "assetId": asset_id,
+                    "type": "archive",
+                    "generation": generation + 1,
+                    "actor": actor,
+                }
+                event["payloadHash"] = semantic_event_payload_hash(event)
+                archived = SEMANTIC.request(
+                    "/v1/events", method="POST", payload=event,
+                    actor=actor, scopes=["semantic:admin"],
+                )
+                validate_semantic_event_ack(event, event, archived)
+                CONTROL.audit("semantic.asset.archived", actor=actor, remote=self._remote(), details={"assetId": asset_id})
+                self._json(HTTPStatus.OK, {"asset": archived["asset"]})
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            return
+        if request_path == "/api/semantic/source/sync":
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            audit_details = None
+            try:
+                alias, schema, relation = validate_source_selector(
+                    self._payload()
+                )
+                audit_details = {
+                    "alias": alias,
+                    "schema": schema,
+                    "relation": relation,
+                }
+                if not SEMANTIC:
+                    raise SemanticClientError(
+                        "Semantic service is not configured.",
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        payload={"code": "semantic.not_configured"},
+                    )
+                with SEMANTIC_SOURCE_LOCK, SEMANTIC_SOURCES.locked_relation(
+                    alias,
+                    schema,
+                    relation,
+                ) as source:
+                    asset_id = source["assetId"]
+                    existing = None
+                    try:
+                        existing_response = self._semantic_request(
+                            actor,
+                            f"/v1/assets/{quote(asset_id, safe='')}",
+                        )
+                        existing = existing_response.get("asset")
+                    except SemanticClientError as exc:
+                        if exc.status != HTTPStatus.NOT_FOUND:
+                            raise
+                    if existing is None:
+                        operation = "register"
+                        generation = 1
+                    else:
+                        binding = (
+                            existing.get("generated", {}).get("binding")
+                            if isinstance(existing, dict)
+                            and isinstance(existing.get("generated"), dict)
+                            else None
+                        )
+                        expected_binding = {
+                            "adapter": "postgresql",
+                            "alias": alias,
+                            "schema": schema,
+                            "relation": relation,
+                        }
+                        if (
+                            not isinstance(existing, dict)
+                            or existing.get("id") != asset_id
+                            or existing.get("status") != "ready"
+                            or binding != expected_binding
+                            or isinstance(existing.get("generation"), bool)
+                            or not isinstance(existing.get("generation"), int)
+                            or existing["generation"] < 1
+                        ):
+                            raise SemanticSourceError(
+                                "The existing semantic source identity is invalid.",
+                                status=HTTPStatus.CONFLICT,
+                                code="semantic.source_identity_conflict",
+                            )
+                        operation = "refresh"
+                        generation = existing["generation"] + 1
+                    generated = source_generated(source)
+                    if (
+                        existing is not None
+                        and existing["generated"].get("definitionDigest")
+                        == generated["definitionDigest"]
+                    ):
+                        operation = "unchanged"
+                        asset = existing
+                        revision = existing_response.get("catalogRevision")
+                        if (
+                            isinstance(revision, bool)
+                            or not isinstance(revision, int)
+                            or revision < 0
+                        ):
+                            raise SemanticSourceError(
+                                "The semantic catalog revision is invalid.",
+                                status=HTTPStatus.BAD_GATEWAY,
+                                code="semantic.source_invalid_response",
+                            )
+                    else:
+                        event = {
+                            "eventId": str(uuid.uuid4()),
+                            "assetId": asset_id,
+                            "type": operation,
+                            "generation": generation,
+                            "generated": generated,
+                            "visibility": "inspect",
+                            "actor": actor,
+                        }
+                        event["payloadHash"] = semantic_event_payload_hash(event)
+                        response = SEMANTIC.request(
+                            "/v1/events",
+                            method="POST",
+                            payload=event,
+                            actor=actor,
+                            scopes=["semantic:admin"],
+                        )
+                        revision = validate_semantic_event_ack(
+                            event,
+                            event,
+                            response,
+                        )
+                        asset = response["asset"]
+                source_response = {
+                    key: source[key]
+                    for key in (
+                        "alias",
+                        "schema",
+                        "relation",
+                        "kind",
+                        "assetId",
+                    )
+                }
+                CONTROL.audit(
+                    "semantic.source.synced",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        **audit_details,
+                        "assetId": asset_id,
+                        "operation": operation,
+                        "generation": asset["generation"],
+                        "catalogRevision": revision,
+                    },
+                )
+                self._json(
+                    HTTPStatus.CREATED if operation == "register" else HTTPStatus.OK,
+                    {
+                        "catalogRevision": revision,
+                        "operation": operation,
+                        "source": source_response,
+                        "asset": asset,
+                    },
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": str(exc),
+                        "code": "semantic.source_invalid_request",
+                    },
+                )
+            except SemanticSourceError as exc:
+                if audit_details is not None:
+                    CONTROL.audit(
+                        "semantic.source.sync_failed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details={
+                            **audit_details,
+                            "code": exc.code,
+                        },
+                    )
+                self._semantic_source_error(exc)
+            except SemanticClientError as exc:
+                if audit_details is not None:
+                    details = {
+                        **audit_details,
+                        "code": "semantic.source_delivery_failed",
+                    }
+                    if (
+                        isinstance(exc.status, int)
+                        and 400 <= exc.status <= 599
+                    ):
+                        details["status"] = exc.status
+                    CONTROL.audit(
+                        "semantic.source.sync_failed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details=details,
+                    )
+                self._semantic_error(exc)
+            except psycopg.Error:
+                if audit_details is not None:
+                    CONTROL.audit(
+                        "semantic.source.sync_failed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details={
+                            **audit_details,
+                            "code": "semantic.source_unavailable",
+                        },
+                    )
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "Semantic source synchronization is unavailable.",
+                        "code": "semantic.source_unavailable",
+                    },
+                )
+            return
+        semantic_repair_path = re.fullmatch(
+            r"/api/semantic/derived-profiles/([a-z][a-z0-9_]{0,62})/repair",
+            request_path,
+        )
+        if semantic_repair_path:
+            try:
+                payload = self._payload()
+                if set(payload) != {"confirmed"}:
+                    self._json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                "Semantic repair accepts only confirmed."
+                            ),
+                            "code": "semantic.invalid_request",
+                        },
+                    )
+                    return
+                if payload["confirmed"] is not True:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": (
+                            "Explicit confirmation is required before a "
+                            "semantic delivery retry is queued."
+                        ),
+                        "code": "semantic.confirmation_required",
+                    })
+                    return
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                catalog_revision = current_semantic_revision(actor)
+                profile = DERIVED.repair_semantic_profile(
+                    semantic_repair_path.group(1)
+                )
+                schedule_semantic_outbox()
+                CONTROL.audit(
+                    "semantic.derived_repair_requested",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        "name": profile["name"],
+                        "assetId": profile["assetId"],
+                        "generation": profile["generation"],
+                    },
+                )
+                self._json(HTTPStatus.ACCEPTED, {
+                    "catalogRevision": catalog_revision,
+                    "derivedProfile": profile,
+                })
+            except DerivedLayerMaintenanceError as exc:
+                self._json(HTTPStatus.CONFLICT, {
+                    "error": str(exc),
+                    "code": "derived_layer.maintenance",
+                    "operation": "reset-data",
+                    "blocked": True,
+                })
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            except DerivedLayerError as exc:
+                self._json(
+                    HTTPStatus.CONFLICT,
+                    {"error": str(exc), "code": "semantic.repair_not_available"},
+                )
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            except psycopg.Error as exc:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": str(exc), "code": "semantic.derived_unavailable"},
+                )
+            return
+        if (
+            request_path.startswith("/api/semantic/")
+            and not request_path.endswith("/repair")
+        ):
+            internal = semantic_proxy_path(
+                request_path,
+                urlparse(self.path).query,
+            )
+            if not internal:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                payload = self._payload()
+                if internal.endswith(("/apply", "/decline")):
+                    if payload.get("confirmed") is not True:
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": (
+                                "Explicit confirmation is required before a "
+                                "semantic proposal decision is recorded."
+                            ),
+                            "code": "semantic.confirmation_required",
+                        })
+                        return
+                    payload.pop("confirmed", None)
+                result = self._semantic_request(
+                    actor,
+                    internal,
+                    method="POST",
+                    payload=payload,
+                )
+                event = None
+                if request_path == "/api/semantic/proposals":
+                    event = "semantic.proposal.created"
+                elif request_path.endswith("/apply"):
+                    event = "semantic.proposal.applied"
+                elif request_path.endswith("/decline"):
+                    event = "semantic.proposal.declined"
+                if event:
+                    proposal = result.get("proposal")
+                    proposal = proposal if isinstance(proposal, dict) else {}
+                    details = {}
+                    for input_key, output_key in (
+                        ("id", "id"),
+                        ("assetId", "assetId"),
+                        ("state", "status"),
+                    ):
+                        value = proposal.get(input_key)
+                        if isinstance(value, str):
+                            details[output_key] = value
+                    CONTROL.audit(
+                        event,
+                        actor=actor,
+                        remote=self._remote(),
+                        details=details,
+                    )
+                self._json(HTTPStatus.OK, result)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": str(exc), "code": "semantic.invalid_request"},
+                )
+            except SemanticClientError as exc:
+                self._semantic_error(exc)
+            return
         allowed = {
             "/api/workspace", "/api/validate", "/api/expression-test", "/api/mutate",
             "/api/proposals", "/api/proposals/check", "/api/xyz/reload", "/api/visual-plan",
@@ -1864,13 +5282,22 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/derived-layers/([a-z][a-z0-9_]{0,62})/(refresh|replace|drop)",
             request_path,
         )
+        proposal_action_path = re.fullmatch(
+            r"/api/proposals/([A-Za-z0-9._-]+)/(apply|decline)",
+            request_path,
+        )
+        token_revoke_path = re.fullmatch(
+            r"/api/admin/tokens/([A-Za-z0-9._-]+)/revoke",
+            request_path,
+        )
         proposal_visual_path = re.fullmatch(
             r"/api/proposals/([A-Za-z0-9._-]+)/(visual-plan|visual-test|screenshot)",
             request_path,
         )
         if (
             request_path not in allowed
-            and not request_path.endswith(("/apply", "/decline", "/revoke"))
+            and not proposal_action_path
+            and not token_revoke_path
             and not proposal_visual_path
             and not derived_action_path
         ):
@@ -1884,6 +5311,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "Derived-layer database management is not configured."
                     )
                 background = payload.pop("background", False)
+                payload = resolve_derived_spatial_scope(payload)
+                require_semantic_derived_sources(
+                    payload,
+                    self._semantic_request(actor, "/v1/catalog"),
+                )
+                DERIVED.preflight_definition(payload)
                 if background is True:
                     operation = start_derived_background(
                         "create", payload, actor, self._remote()
@@ -1894,6 +5327,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 result = DERIVED.create(payload, actor)
+                schedule_semantic_outbox()
                 CONTROL.audit(
                     "derived_layer.created",
                     actor=actor,
@@ -1902,6 +5336,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "name": result["name"],
                         "kind": result["kind"],
                         "sources": result["sources"],
+                        "spatialScope": result.get("spatialScope"),
                     },
                 )
                 self._json(HTTPStatus.CREATED, {"derivedLayer": result})
@@ -1913,21 +5348,36 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                 name, action = derived_action_path.groups()
                 if payload.get("confirmed") is not True:
-                    self._json(HTTPStatus.CONFLICT, {
-                        "error": (
-                            "Please confirm this derived-layer change before "
-                            "it is applied."
+                    self._json(
+                        HTTPStatus.CONFLICT,
+                        derived_blocked_error(
+                            code="derived_layer.confirmation_required",
+                            message=(
+                                "Please confirm this derived-layer change "
+                                "before it is applied."
+                            ),
+                            suggested_action=(
+                                "Review the change, then retry with confirmation."
+                            ),
+                            operation=action,
+                            name=name,
                         ),
-                        "code": "derived_layer.confirmation_required",
-                        "suggestedAction": (
-                            "Review the change, then retry with confirmation."
-                        ),
-                    })
+                    )
                     return
                 background = payload.pop("background", False)
-                if background is True and action in {"refresh", "replace"}:
+                replacement = None
+                if action == "replace":
                     replacement = {**payload}
                     replacement.pop("confirmed", None)
+                    replacement = resolve_derived_spatial_scope(replacement)
+                    require_semantic_derived_sources(
+                        replacement,
+                        self._semantic_request(actor, "/v1/catalog"),
+                    )
+                    DERIVED.preflight_definition(replacement)
+                elif action == "refresh":
+                    DERIVED.preflight_refresh(name)
+                if background is True and action in {"refresh", "replace"}:
                     operation = start_derived_background(
                         action,
                         replacement if action == "replace" else {},
@@ -1941,11 +5391,9 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 if action == "refresh":
-                    result = DERIVED.refresh(name)
+                    result = DERIVED.refresh(name, actor)
                     event = "derived_layer.refreshed"
                 elif action == "replace":
-                    replacement = {**payload}
-                    replacement.pop("confirmed", None)
                     result = DERIVED.replace(name, replacement, actor)
                     changes = result.get("columnChanges", {})
                     result.update(derived_workspace_impact(
@@ -2006,42 +5454,46 @@ class Handler(SimpleHTTPRequestHandler):
                     workspace_references = workspace_impact["workspaceReferences"]
                     dependents = DERIVED.dependents(name)
                     if workspace_references or dependents:
-                        reasons = []
-                        if workspace_references:
-                            reasons.append("workspace_references")
-                        if dependents:
-                            reasons.append("postgresql_dependents")
-                        self._json(HTTPStatus.CONFLICT, {
-                            "error": (
-                                f'The derived layer “{name}” cannot be deleted '
-                                "because it is still in use."
+                        reasons = derived_in_use_reasons(
+                            has_workspace_references=bool(workspace_references),
+                            has_postgresql_dependents=bool(dependents),
+                        )
+                        self._json(
+                            HTTPStatus.CONFLICT,
+                            derived_blocked_error(
+                                code="derived_layer.in_use",
+                                message=(
+                                    f'The derived layer “{name}” cannot be '
+                                    "deleted because it is still in use."
+                                ),
+                                suggested_action=(
+                                    "Remove it from the listed map layers and "
+                                    "database views, then try again."
+                                ),
+                                operation="drop",
+                                reasons=reasons,
+                                name=name,
+                                dependents=dependents,
+                                workspaceReferences=workspace_references,
+                                consumerLabels=(
+                                    workspace_impact["consumerLabels"]
+                                ),
+                                dropped=False,
                             ),
-                            "userMessage": (
-                                f'The derived layer “{name}” cannot be deleted '
-                                "because it is still in use. Nothing was changed."
-                            ),
-                            "suggestedAction": (
-                                "Remove it from the listed map layers and "
-                                "database views, then try again."
-                            ),
-                            "code": "derived_layer.in_use",
-                            "operation": "drop",
-                            "blocked": True,
-                            "reasons": reasons,
-                            "name": name,
-                            "dependents": dependents,
-                            "workspaceReferences": workspace_references,
-                            "consumerLabels": workspace_impact["consumerLabels"],
-                            "dropped": False,
-                        })
+                        )
                         return
-                    result = DERIVED.drop(name)
+                    result = DERIVED.drop(name, actor)
                     event = "derived_layer.dropped"
+                schedule_semantic_outbox()
                 CONTROL.audit(
                     event,
                     actor=actor,
                     remote=self._remote(),
-                    details={"name": name, "kind": result["kind"]},
+                    details={
+                        "name": name,
+                        "kind": result["kind"],
+                        "spatialScope": result.get("spatialScope"),
+                    },
                 )
                 self._json(HTTPStatus.OK, {"derivedLayer": result})
                 return
@@ -2053,9 +5505,28 @@ class Handler(SimpleHTTPRequestHandler):
                 if actor != "admin":
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
                     return
+                unexpected = sorted(
+                    set(payload)
+                    - {
+                        "name",
+                        "expires",
+                        "scopes",
+                        "extendedExpiryConfirmed",
+                    }
+                )
+                if unexpected:
+                    raise ValueError(
+                        "Token request contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                if "scopes" in payload and payload["scopes"] is None:
+                    raise ValueError(
+                        "Token scopes must be a non-empty array."
+                    )
+                expires = requested_token_expiry(payload)
                 raw, token = CONTROL.create_token(
                     payload.get("name", "CLI token"),
-                    payload.get("expires"),
+                    expires,
                     payload.get("scopes"),
                 )
                 self._json(HTTPStatus.CREATED, {"token": raw, "record": token, "warning": "Copy this token now; it will not be shown again."})
@@ -2076,11 +5547,11 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     self._json(HTTPStatus.OK, {"message": "Password changed; existing sessions were revoked."})
                 return
-            if request_path.endswith("/revoke"):
+            if token_revoke_path:
                 if actor != "admin":
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
                     return
-                token_id = request_path.split("/")[-2]
+                token_id = token_revoke_path.group(1)
                 self._json(HTTPStatus.OK if CONTROL.revoke_token(token_id) else HTTPStatus.NOT_FOUND, {"revoked": token_id})
                 return
             if proposal_visual_path:
@@ -2111,6 +5582,8 @@ class Handler(SimpleHTTPRequestHandler):
                 layer_key = payload.get("layer")
                 if not isinstance(layer_key, str) or not layer_key.strip():
                     raise ValueError("Visual requests require a layer key.")
+                hover_request = requested_hover(payload)
+                hover_expectations = expected_hover_text(payload)
                 group_preview = proposal_group_preview(
                     proposal,
                     layer_key,
@@ -2127,14 +5600,12 @@ class Handler(SimpleHTTPRequestHandler):
                     else "original"
                 )
                 plan_selection = group_preview[plan_source]
-                plan = apply_visual_override(
-                    visual_plan(
-                        proposal[plan_source],
-                        plan_selection["anchorLayer"],
-                        DB_CONNECTIONS,
-                        group_preview["locale"],
-                    ),
-                    payload,
+                plan = visual_plan(
+                    proposal[plan_source],
+                    plan_selection["anchorLayer"],
+                    DB_CONNECTIONS,
+                    group_preview["locale"],
+                    visual_request=payload,
                 )
                 plan.update({
                     "layer": layer_key,
@@ -2146,10 +5617,39 @@ class Handler(SimpleHTTPRequestHandler):
                     "requestedLayerDeleted": not group_preview[
                         "candidate"
                     ]["requestedLayerPresent"],
+                    "evidenceApplicability": {
+                        side: group_preview[side]["requestedLayerPresent"]
+                        for side in ("original", "candidate")
+                    },
                     "viewSource": plan_source,
                     "viewMode": view_mode,
                     "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                 })
+                feature_info_evidence = proposal_feature_info_evidence(
+                    proposal,
+                    layer_key,
+                    plan.get("locale", "locale"),
+                )
+                explicit_info_text = expected_info_panel_text(payload)
+                candidate_evidence = feature_info_evidence["candidate"]
+                if (
+                    explicit_info_text
+                    and group_preview["candidate"]["renderLayer"] is not None
+                ):
+                    candidate_evidence["requested"] = True
+                    candidate_evidence["expectedText"] = list(dict.fromkeys([
+                        *candidate_evidence["expectedText"],
+                        *explicit_info_text,
+                    ]))
+                base_interaction = plan.get("interaction")
+                for side in ("original", "candidate"):
+                    feature_info_evidence[side]["planned"] = bool(
+                        feature_info_evidence[side]["requested"]
+                        and group_preview[side]["renderLayer"] is not None
+                        and isinstance(base_interaction, dict)
+                        and base_interaction.get("type")
+                    )
+                plan["featureInfoEvidence"] = feature_info_evidence
                 binding = {
                     "source": "candidate",
                     "proposalId": proposal_id,
@@ -2160,10 +5660,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 feature_info_comparison = (
                     action == "screenshot"
-                    and proposal_changes_feature_info(
-                        proposal,
-                        layer_key,
-                        plan.get("locale", "locale"),
+                    and any(
+                        feature_info_evidence[side]["requested"]
+                        for side in ("original", "candidate")
                     )
                 )
                 panels = visual_panels(payload) if action == "screenshot" else []
@@ -2190,11 +5689,33 @@ class Handler(SimpleHTTPRequestHandler):
                         group_preview["candidate"]["layers"],
                     ),
                 }
-                if group_preview["changeKind"] != "edited":
+                for side, side_plan in (
+                    ("original", original_render_plan),
+                    ("candidate", candidate_render_plan),
+                ):
+                    side_plan.pop("hover", None)
+                    render_layer = group_preview[side]["renderLayer"]
+                    if not isinstance(render_layer, str):
+                        continue
+                    _, side_locale = select_locale(
+                        proposal[side],
+                        group_preview["locale"],
+                    )
+                    side_layer = (
+                        side_locale.get("layers") or {}
+                    ).get(render_layer)
+                    if isinstance(side_layer, dict):
+                        hover_plan = visual_hover_plan(side_layer)
+                        if hover_plan:
+                            side_plan["hover"] = hover_plan
+                if group_preview["original"]["renderLayer"] is None:
                     original_render_plan.pop("interaction", None)
+                if group_preview["candidate"]["renderLayer"] is None:
                     candidate_render_plan.pop("interaction", None)
                 render_payload = dict(payload)
                 render_payload["viewMode"] = view_mode
+                render_payload["hover"] = hover_request
+                render_payload["expectedHoverText"] = hover_expectations
                 if action == "screenshot":
                     render_payload.setdefault(
                         "viewport",
@@ -2205,18 +5726,35 @@ class Handler(SimpleHTTPRequestHandler):
                     # instead of extending them to the document's full height.
                     render_payload["fullPage"] = False
                     if feature_info_comparison:
-                        interaction = {
-                            **(render_plan.get("interaction") or {}),
-                            "requireInfoPanel": True,
-                        }
-                        original_render_plan["interaction"] = interaction
-                        candidate_render_plan["interaction"] = interaction
+                        for side, side_plan in (
+                            ("original", original_render_plan),
+                            ("candidate", candidate_render_plan),
+                        ):
+                            evidence = feature_info_evidence[side]
+                            if evidence["planned"]:
+                                side_plan["interaction"] = {
+                                    **(render_plan.get("interaction") or {}),
+                                    "requireInfoPanel": True,
+                                    "expectedInfoPanelText": evidence[
+                                        "expectedText"
+                                    ],
+                                }
+                            else:
+                                side_plan.pop("interaction", None)
                     else:
                         # A proposal screenshot compares configuration states.
                         # Selection would obscure point-style changes, so it is
                         # reserved for feature-information comparisons.
                         original_render_plan.pop("interaction", None)
                         candidate_render_plan.pop("interaction", None)
+                elif feature_info_evidence["candidate"]["planned"]:
+                    candidate_render_plan["interaction"] = {
+                        **(candidate_render_plan.get("interaction") or {}),
+                        "requireInfoPanel": True,
+                        "expectedInfoPanelText": feature_info_evidence[
+                            "candidate"
+                        ]["expectedText"],
+                    }
                 operation = CONTROL.create_operation(
                     (
                         "proposal.screenshot"
@@ -2231,6 +5769,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "originalLayers": group_preview["original"]["layers"],
                         "candidateLayers": group_preview["candidate"]["layers"],
                         "featureInfoComparison": feature_info_comparison,
+                        "featureInfoEvidence": feature_info_evidence,
                         "panels": panels,
                         "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                     },
@@ -2254,24 +5793,42 @@ class Handler(SimpleHTTPRequestHandler):
                                 "proposalId": proposal_id,
                                 "originalHash": proposal["originalHash"],
                             }
+                            original_render_payload = {
+                                **render_payload,
+                                "metadata": original_binding,
+                            }
+                            if not group_preview["original"]["requestedLayerPresent"]:
+                                original_render_payload["panels"] = []
+                            if (
+                                render_payload.get("hover") is True
+                                and plan_source != "original"
+                                and "hover" not in original_render_plan
+                            ):
+                                original_render_payload["hover"] = False
                             original_preview = prepare_original_preview(proposal)
                             original_status, original_result = run_browser_visual(
                                 group_preview["original"]["renderLayer"],
                                 original_render_plan,
-                                {
-                                    **render_payload,
-                                    "metadata": original_binding,
-                                },
+                                original_render_payload,
                                 target_url=target_url,
                             )
                         candidate_preview = prepare_candidate_preview(proposal)
+                        candidate_render_payload = {
+                            **render_payload,
+                            "metadata": binding,
+                        }
+                        if not group_preview["candidate"]["requestedLayerPresent"]:
+                            candidate_render_payload["panels"] = []
+                        if (
+                            render_payload.get("hover") is True
+                            and plan_source != "candidate"
+                            and "hover" not in candidate_render_plan
+                        ):
+                            candidate_render_payload["hover"] = False
                         status, candidate_result = run_browser_visual(
                             group_preview["candidate"]["renderLayer"],
                             candidate_render_plan,
-                            {
-                                **render_payload,
-                                "metadata": binding,
-                            },
+                            candidate_render_payload,
                             target_url=target_url,
                         )
                     if proposal["pluginCatalogueFingerprint"] != plugin_catalogue()["fingerprint"]:
@@ -2292,23 +5849,47 @@ class Handler(SimpleHTTPRequestHandler):
                             )
                             original_artifacts = original_result.get("artifacts") or {}
                             candidate_artifacts = candidate_result.get("artifacts") or {}
-                            page_key = (
+                            original_page_key = (
                                 "afterPage"
-                                if feature_info_comparison
+                                if feature_info_evidence["original"]["planned"]
                                 else "beforePage"
                             )
-                            map_key = (
+                            candidate_page_key = (
+                                "afterPage"
+                                if feature_info_evidence["candidate"]["planned"]
+                                else "beforePage"
+                            )
+                            original_map_key = (
                                 "afterMap"
-                                if feature_info_comparison
+                                if feature_info_evidence["original"]["planned"]
+                                else "beforeMap"
+                            )
+                            candidate_map_key = (
+                                "afterMap"
+                                if feature_info_evidence["candidate"]["planned"]
                                 else "beforeMap"
                             )
                             comparison_artifacts = {
-                                "beforePage": original_artifacts.get(page_key),
-                                "beforeMap": original_artifacts.get(map_key),
-                                "afterPage": candidate_artifacts.get(page_key),
-                                "afterMap": candidate_artifacts.get(map_key),
+                                "beforePage": original_artifacts.get(
+                                    original_page_key
+                                ),
+                                "beforeMap": original_artifacts.get(
+                                    original_map_key
+                                ),
+                                "afterPage": candidate_artifacts.get(
+                                    candidate_page_key
+                                ),
+                                "afterMap": candidate_artifacts.get(
+                                    candidate_map_key
+                                ),
                                 "beforeReport": original_artifacts.get("report"),
                                 "afterReport": candidate_artifacts.get("report"),
+                                "beforeHoverTooltip": original_artifacts.get(
+                                    "hoverTooltip"
+                                ),
+                                "afterHoverTooltip": candidate_artifacts.get(
+                                    "hoverTooltip"
+                                ),
                             }
                             if feature_info_comparison:
                                 comparison_artifacts.update({
@@ -2319,6 +5900,17 @@ class Handler(SimpleHTTPRequestHandler):
                                         "infoPanel"
                                     ),
                                 })
+                            feature_info_observations = {
+                                side: feature_info_observation(
+                                    (
+                                        original_result
+                                        if side == "original"
+                                        else candidate_result
+                                    ),
+                                    feature_info_evidence[side],
+                                )
+                                for side in ("original", "candidate")
+                            }
                             for panel in panels:
                                 key = (
                                     "filteringPanel"
@@ -2352,6 +5944,15 @@ class Handler(SimpleHTTPRequestHandler):
                                     HTTPStatus.BAD_GATEWAY,
                                 )
                             )
+                            if (
+                                status == HTTPStatus.OK
+                                and not all(
+                                    observation["passed"]
+                                    for observation
+                                    in feature_info_observations.values()
+                                )
+                            ):
+                                status = HTTPStatus.UNPROCESSABLE_ENTITY
                             result = {
                                 "runId": candidate_result.get("runId"),
                                 "passed": status == HTTPStatus.OK,
@@ -2360,6 +5961,9 @@ class Handler(SimpleHTTPRequestHandler):
                                     "before": "original",
                                     "after": "candidate",
                                     "featureInfoPanel": feature_info_comparison,
+                                    "featureInfoEvidence": (
+                                        feature_info_observations
+                                    ),
                                     "original": original_result,
                                     "candidate": candidate_result,
                                 },
@@ -2376,6 +5980,9 @@ class Handler(SimpleHTTPRequestHandler):
                                     ),
                                     "original": original_result.get("diagnosis"),
                                     "candidate": candidate_result.get("diagnosis"),
+                                    "featureInfoEvidence": (
+                                        feature_info_observations
+                                    ),
                                 },
                             }
                         preview = {
@@ -2516,6 +6123,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(status, {**response, "operation": operation})
                 return
             if request_path == "/api/xyz/reload":
+                unexpected = sorted(
+                    set(payload)
+                    - {"confirmed", "workspaceFingerprint", "timeout"}
+                )
+                if unexpected:
+                    raise ValueError(
+                        "XYZ reload contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                if payload.get("confirmed") is not True:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": (
+                            "Explicit confirmation is required before XYZ reload."
+                        ),
+                        "code": "xyz.confirmation_required",
+                    })
+                    return
                 timeout = reload_timeout(payload.get("timeout", 30))
                 with SAVE_RELOAD_LOCK:
                     supplied_fingerprint = payload.get("workspaceFingerprint")
@@ -2605,7 +6229,9 @@ class Handler(SimpleHTTPRequestHandler):
                     layer_key,
                     DB_CONNECTIONS,
                     payload.get("locale"),
+                    visual_request=payload,
                 )
+                plan_expected_info_panel(plan, payload)
                 workspace_for_plan = payload.get("workspace", current_workspace)
                 plan["pluginChecks"] = plugin_preview_checks(
                     workspace_for_plan,
@@ -2615,7 +6241,7 @@ class Handler(SimpleHTTPRequestHandler):
                 plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
                 self._json(
                     HTTPStatus.OK,
-                    {"plan": apply_visual_override(plan, payload)},
+                    {"plan": plan},
                 )
                 return
             if request_path == "/api/visual-test":
@@ -2623,15 +6249,14 @@ class Handler(SimpleHTTPRequestHandler):
                 if not isinstance(layer_key, str) or not layer_key.strip():
                     raise ValueError("Visual requests require a layer key.")
                 _, current_workspace, _ = read_workspace()
-                plan = apply_visual_override(
-                    visual_plan(
-                        payload.get("workspace", current_workspace),
-                        layer_key,
-                        DB_CONNECTIONS,
-                        payload.get("locale"),
-                    ),
-                    payload,
+                plan = visual_plan(
+                    payload.get("workspace", current_workspace),
+                    layer_key,
+                    DB_CONNECTIONS,
+                    payload.get("locale"),
+                    visual_request=payload,
                 )
+                plan_expected_info_panel(plan, payload)
                 workspace_for_plan = payload.get("workspace", current_workspace)
                 plan["pluginChecks"] = plugin_preview_checks(
                     workspace_for_plan,
@@ -2652,6 +6277,8 @@ class Handler(SimpleHTTPRequestHandler):
                             {"width": 1920, "height": 1080},
                         ),
                         "deviceScaleFactor": payload.get("deviceScaleFactor"),
+                        "hover": requested_hover(payload),
+                        "expectedHoverText": expected_hover_text(payload),
                     },
                     allow_nan=False,
                 ).encode()
@@ -2794,20 +6421,21 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.CONFLICT, {"error": "Workspace changed on disk. Reload before continuing."})
                     return
                 candidate, diff = apply_operations(current_workspace, payload.get("operations") or [])
-                errors = validate_candidate(candidate)
+                errors = validate_candidate(candidate, current_workspace)
                 if errors:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Validation failed.", "errors": annotated(errors)})
                     return
                 supplied_check = payload.get("checkFingerprint")
+                validated_check = None
                 if request_path == "/api/proposals" and supplied_check is not None:
-                    checked = proposal_check(
+                    validated_check = proposal_check(
                         current_workspace, expected, candidate,
                         payload.get("operations") or [], diff,
                         payload.get("explanation"),
                     )
                     if (
                         not isinstance(supplied_check, str)
-                        or supplied_check != checked["checkFingerprint"]
+                        or supplied_check != validated_check["checkFingerprint"]
                     ):
                         self._json(HTTPStatus.CONFLICT, {
                             "error": "Checked operations no longer match this proposal request.",
@@ -2821,9 +6449,36 @@ class Handler(SimpleHTTPRequestHandler):
                         payload.get("operations") or [], diff,
                         payload.get("explanation"),
                     )
+                    _, warnings = semantic_publication_diagnostics(
+                        candidate,
+                        current_workspace,
+                    )
+                    checked["warnings"] = annotated(warnings)
                     self._json(HTTPStatus.OK, {"check": checked})
                 elif request_path == "/api/proposals":
-                    proposal = proposal_create(CONTROL, current_workspace, expected, candidate, payload.get("operations") or [], diff, actor, payload.get("explanation"))
+                    proposal = proposal_create(
+                        CONTROL,
+                        current_workspace,
+                        expected,
+                        candidate,
+                        payload.get("operations") or [],
+                        diff,
+                        actor,
+                        payload.get("explanation"),
+                        plugin_catalogue_fingerprint=(
+                            validated_check["pluginCatalogueFingerprint"]
+                            if validated_check is not None
+                            else None
+                        ),
+                    )
+                    if supplied_check is not None:
+                        proposal["checkFingerprint"] = supplied_check
+                    _, warnings = semantic_publication_diagnostics(
+                        candidate,
+                        current_workspace,
+                    )
+                    proposal["warnings"] = annotated(warnings)
+                    proposal_write(CONTROL, proposal)
                     self._json(HTTPStatus.CREATED, {"proposal": proposal})
                 elif payload.get("save"):
                     try:
@@ -2870,7 +6525,10 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     self._json(HTTPStatus.OK, {"workspace": candidate, "revision": expected, "fingerprint": workspace_hash(candidate), "diff": diff, "saved": False})
                 return
-            if request_path.endswith("/apply"):
+            if (
+                proposal_action_path
+                and proposal_action_path.group(2) == "apply"
+            ):
                 if payload.get("approved") is not True:
                     self._json(HTTPStatus.BAD_REQUEST, {
                         "error": "Proposal application requires explicit approval.",
@@ -2878,7 +6536,10 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 with PROPOSAL_LOCK:
-                    proposal = proposal_read(CONTROL, request_path.split("/")[-2])
+                    proposal = proposal_read(
+                        CONTROL,
+                        proposal_action_path.group(1),
+                    )
                     if proposal["status"] not in {"pending", "applying"}:
                         self._json(HTTPStatus.CONFLICT, {"error": f"Proposal is {proposal['status']}."})
                         return
@@ -2921,7 +6582,10 @@ class Handler(SimpleHTTPRequestHandler):
                             and current_matches_original_revision
                         )
                     if validate_before_apply:
-                        errors = validate_candidate(proposal["candidate"])
+                        errors = validate_candidate(
+                            proposal["candidate"],
+                            proposal.get("original"),
+                        )
                         if errors:
                             self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
                                 "error": "Proposal no longer passes current validation.",
@@ -3019,9 +6683,15 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 )
                 return
-            if request_path.endswith("/decline"):
+            if (
+                proposal_action_path
+                and proposal_action_path.group(2) == "decline"
+            ):
                 with PROPOSAL_LOCK:
-                    proposal = proposal_read(CONTROL, request_path.split("/")[-2])
+                    proposal = proposal_read(
+                        CONTROL,
+                        proposal_action_path.group(1),
+                    )
                     if proposal["status"] != "pending":
                         self._json(HTTPStatus.CONFLICT, {"error": f"Proposal is {proposal['status']}."})
                         return
@@ -3048,12 +6718,20 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                 return
             expected = payload.get("revision")
-            errors = validate_candidate(candidate)
+            _, current_workspace, _ = read_workspace()
+            errors = validate_candidate(candidate, current_workspace)
             if errors:
                 self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Validation failed.", "errors": annotated(errors)})
                 return
             if request_path == "/api/validate":
-                self._json(HTTPStatus.OK, {"message": "Configuration is valid."})
+                _, warnings = semantic_publication_diagnostics(
+                    candidate,
+                    current_workspace,
+                )
+                self._json(HTTPStatus.OK, {
+                    "message": "Configuration is valid.",
+                    "semanticWarnings": annotated(warnings),
+                })
                 return
             try:
                 encoded, next_revision, fingerprint, reload_result = save_and_reload(
@@ -3086,6 +6764,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "fingerprint": fingerprint,
                     "saved": True,
                     "reload": reload_result,
+                    "semanticWarnings": annotated(
+                        semantic_publication_diagnostics(
+                            candidate,
+                            current_workspace,
+                        )[1]
+                    ),
                 },
             )
         except json.JSONDecodeError:
@@ -3096,69 +6780,145 @@ class Handler(SimpleHTTPRequestHandler):
                 if derived_action_path and derived_action_path.group(2) == "replace"
                 else "drop"
             )
-            action = "edited" if operation == "replace" else "deleted"
-            columns = sorted(set(exc.removed_columns) & set(exc.dependent_columns))
-            column_message = (
-                " The database uses these affected fields: "
-                + ", ".join(f"“{column}”" for column in columns) + "."
-                if columns else ""
+            self._json(
+                HTTPStatus.CONFLICT,
+                derived_dependency_error(exc, operation),
             )
-            message = (
-                f'The derived layer “{exc.name}” cannot be {action} because '
-                f"other database views or objects use it.{column_message} "
-                "Nothing was changed."
+        except DerivedLayerMaintenanceError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
             )
-            self._json(HTTPStatus.CONFLICT, {
-                "error": message,
-                "userMessage": message,
-                "suggestedAction": (
-                    "Update or remove the dependent database views first, "
-                    "then try again."
+            self._json(
+                HTTPStatus.CONFLICT,
+                derived_maintenance_error(exc, derived_operation),
+            )
+        except DerivedLayerBackgroundCapacityError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            message = str(exc)
+            self._json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                derived_blocked_error(
+                    code="derived_layer.background_capacity",
+                    message=message,
+                    suggested_action=(
+                        "Wait for the active derived-layer operation to finish, "
+                        "then retry the same request."
+                    ),
+                    operation=derived_operation,
+                    retryable=True,
+                    activeJobs=exc.active_jobs,
+                    maxActiveJobs=exc.max_active_jobs,
                 ),
-                "code": "derived_layer.in_use",
-                "operation": operation,
-                "blocked": True,
-                "reasons": ["postgresql_dependents"],
-                "name": exc.name,
-                "dependents": exc.dependents,
-                "removedColumns": exc.removed_columns,
-                "dependentColumns": exc.dependent_columns,
-                "workspaceReferences": derived_workspace_references(exc.name),
-                "requiresSecondOrderChanges": bool(
-                    exc.removed_columns or exc.dependent_columns
+            )
+        except DerivedLayerQueryTooExpensive as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            self._json(
+                derived_query_error_status(exc),
+                derived_query_too_expensive_error(exc, derived_operation),
+            )
+        except DerivedLayerMaterializationTooLarge as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            self._json(
+                HTTPStatus.CONFLICT,
+                derived_materialization_too_large_error(
+                    exc, derived_operation,
                 ),
-                "dropped": False,
-            })
-        except (DerivedLayerError, ValueError) as exc:
+            )
+        except DerivedLayerSourceMismatchError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            self._json(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                derived_source_mismatch_error(exc, derived_operation),
+            )
+        except DerivedLayerError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            if derived_operation is not None:
+                response = derived_validation_error(exc, derived_operation)
+                self._json(
+                    derived_validation_error_status(response),
+                    response,
+                )
+            else:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileExistsError as exc:
             if request_path == "/api/derived-layers":
-                self._json(HTTPStatus.CONFLICT, {
-                    "error": (
-                        f'A derived layer named “{exc}” already exists. '
-                        "Choose a different name or edit the existing layer."
-                    ),
-                    "code": "derived_layer.already_exists",
-                })
+                self._json(
+                    HTTPStatus.CONFLICT,
+                    derived_already_exists_error(str(exc)),
+                )
             else:
                 self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
-        except psycopg.Error as exc:
-            self._json(
-                HTTPStatus.UNPROCESSABLE_ENTITY,
-                {
-                    "error": (
-                        "The database could not apply this derived-layer "
-                        "change. Check the query, source tables, and selected "
-                        "ID and geometry fields, then try again."
-                    ),
-                    "code": "derived_layer.database_error",
-                    "technicalDetail": str(exc),
-                },
+        except FileNotFoundError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
             )
+            if derived_operation is not None:
+                self._json(
+                    HTTPStatus.NOT_FOUND,
+                    derived_not_found_error(str(exc), derived_operation),
+                )
+            else:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+        except VisualPlanningDatabaseError as exc:
+            response = {
+                "error": str(exc),
+                "code": (
+                    "visual.planning_timeout"
+                    if exc.timed_out
+                    else "visual.planning_database_error"
+                ),
+                "planningStage": exc.stage,
+                "queryPurpose": exc.query_purpose,
+            }
+            if exc.timed_out:
+                response["timeoutMilliseconds"] = exc.timeout_milliseconds
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, response)
+        except psycopg.Error as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            if derived_operation is not None:
+                self._json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    derived_database_error(exc, derived_operation),
+                )
+            else:
+                self._json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {"error": "The database could not complete the request."},
+                )
+        except SemanticClientError as exc:
+            self._semantic_error(exc)
         except Exception as exc:
-            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            if derived_operation is not None:
+                self._json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    derived_operation_failed_error(derived_operation),
+                )
+            else:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
 
 if __name__ == "__main__":
     schedule_live_preview_sync()
+    threading.Thread(
+        target=run_semantic_outbox,
+        name="semantic-outbox",
+        daemon=True,
+    ).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Advanced workspace configuration</title>
+  <style>
+    body { font-family: system-ui, sans-serif; color: #252a28; line-height: 1.5; margin: 0; }
+    main { max-width: 900px; margin: 2rem auto; padding: 2rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { background: #f3f6f4; overflow: auto; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Advanced workspace configuration</h1>
+    <p>These are optional XYZ capabilities. Empty JSON means the capability has not been configured; it is not a dashboard or API error.</p>
+
+    <h2>Where each setting belongs</h2>
+    <ul>
+      <li><strong>Workspace templates</strong> are named definitions under top-level <code>templates</code>. Locale and layer <code>template</code> or <code>templates</code> entries refer to them.</li>
+      <li><strong>Dictionaries</strong> use <code>keyvalue_dictionary</code> in Advanced locale JSON, or in Advanced layer JSON when the replacement is layer-specific.</li>
+      <li><strong>Bundled plugins</strong> are configured with their documented locale property. Check the connected server’s plugin catalogue before adding one.</li>
+      <li><strong>Gazetteer search</strong> is a <code>layer.gazetteer</code> setting in Advanced layer JSON, not a locale setting.</li>
+    </ul>
+
+    <h2>Safe setup workflow</h2>
+    <ol>
+      <li>Inspect the exact supported shape in the connected server schema.</li>
+      <li>Add the smallest configuration needed and validate it.</li>
+      <li>Save through the dashboard, or create and review a revision-bound CLI proposal.</li>
+      <li>After reload, verify the affected map behavior. Template descriptors are checked on save but fetched by XYZ only when used.</li>
+    </ol>
+
+    <h2>CLI equivalents</h2>
+    <pre><code>config-cli schema --pointer '/$defs/templateDefinition'
+config-cli schema --pointer '/$defs/locale/properties'
+config-cli schema --pointer '/$defs/layer/properties/gazetteer'
+config-cli plugins list
+config-cli plugins usage PLUGIN_KEY
+config-cli workspace get
+config-cli layers get "LAYER KEY"</code></pre>
+    <p>Use <code>config-cli proposals check</code> to validate a focused JSON Pointer change before creating a proposal. Do not directly replace the workspace document.</p>
+  </main>
+</body>
+</html>

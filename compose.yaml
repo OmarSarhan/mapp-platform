@@ -65,6 +65,31 @@ services:
       - backend
       - automation
 
+  semantic-service:
+    image: mapp-semantic-service:local
+    build:
+      context: ./semantic-service
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      PORT: 8080
+      STATE_DIR: /state
+      SEMANTIC_INTERNAL_TOKEN: ${SEMANTIC_INTERNAL_TOKEN:?Set SEMANTIC_INTERNAL_TOKEN in .env}
+    expose:
+      - "8080"
+    volumes:
+      - ./var/semantic:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - semantic-control
+
   config-ui:
     image: mapp-config-ui:local
     build:
@@ -76,6 +101,7 @@ services:
       DBS_MAPP: ${DBS_MAPP:?Set DBS_MAPP in .env}
       DERIVED_DATABASE_URL: ${DERIVED_DATABASE_URL:-}
       DERIVED_READER_ROLE: ${DERIVED_READER_ROLE:-}
+      DERIVED_MAX_BACKGROUND_JOBS: ${DERIVED_MAX_BACKGROUND_JOBS:-1}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
       PLUGIN_DIR: /instance-public/plugins
@@ -92,6 +118,12 @@ services:
       BROWSER_PREVIEW_XYZ_URL: http://xyz-preview:3000
       PREVIEW_WORKSPACE_PATH: /preview/workspace.json
       PREVIEW_RELOAD_DIR: /preview-reload
+      SEMANTIC_SERVICE_URL: http://semantic-service:8080
+      SEMANTIC_INTERNAL_TOKEN: ${SEMANTIC_INTERNAL_TOKEN:?Set SEMANTIC_INTERNAL_TOKEN in .env}
+      SEMANTIC_SOURCE_ALLOWLIST: ${SEMANTIC_SOURCE_ALLOWLIST-MAPP:leeds.*}
+      SEMANTIC_SOURCE_EXCLUSIONS: ${SEMANTIC_SOURCE_EXCLUSIONS-}
+      GEMINI_APIKEY: ${GEMINI_APIKEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
     volumes:
       # The workspace directory is writable so atomic rename remains possible.
       # Public SVGs and the schema are read-only; sensitive control state is
@@ -113,9 +145,17 @@ services:
       - backend
       - edge
       - automation
+      - semantic-control
+    depends_on:
+      semantic-service:
+        condition: service_healthy
+        restart: true
 
   caddy:
-    image: ${CADDY_IMAGE:-caddy:2.10.0-alpine}
+    image: mapp-caddy:2.10.0
+    build:
+      context: ./docker/caddy
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
       - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-3000}:80"
@@ -162,6 +202,8 @@ services:
       ALLOWED_ORIGIN: http://caddy:8081
       ALLOWED_ORIGINS: http://caddy:8081,http://xyz-preview:3000
       MAX_CONCURRENT_RUNS: ${BROWSER_MAX_CONCURRENT_RUNS:-1}
+      BROWSER_PROXY_SERVER: http://egress-proxy:3128
+      BROWSER_PROXY_BYPASS: caddy,xyz-preview,localhost,127.0.0.1
     volumes:
       - ./var/control/artifacts:/artifacts
     expose:
@@ -174,11 +216,45 @@ services:
       start_period: 20s
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
+        restart: true
     networks:
       - automation
-      # The runner needs outbound access for map CDN/basemap assets, but it
-      # does not join the database/backend or public edge networks. The
-      # automation network is shared only with config-ui and Caddy.
+
+  egress-proxy:
+    image: mapp-egress-proxy:local
+    build:
+      context: ./docker/egress-proxy
+    init: true
+    user: "13:13"
+    entrypoint: [/usr/sbin/squid]
+    command: [-f, /etc/squid/squid.conf, -NYC]
+    restart: unless-stopped
+    read_only: true
+    volumes:
+      - ./docker/egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./instance/browser-egress-allowlist.txt:/etc/squid/browser-egress-allowlist.txt:ro
+    tmpfs:
+      - /run:size=1m,mode=0755,uid=13,gid=13
+      - /tmp:size=8m,mode=1777
+      - /var/log/squid:size=8m,mode=0750,uid=13,gid=13
+      - /var/spool/squid:size=8m,mode=0750,uid=13,gid=13
+    expose:
+      - "3128"
+    healthcheck:
+      test: [CMD-SHELL, "squid -k check >/dev/null 2>&1 && pidof squid >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - automation
       - browser-egress
 
 volumes:
@@ -197,3 +273,6 @@ networks:
     internal: true
   browser-egress:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_browser-egress
+  semantic-control:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_semantic-control
+    internal: true

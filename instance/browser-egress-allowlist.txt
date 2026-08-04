@@ -1,0 +1,2 @@
+# Leading dot includes the exact hostname and its a/b/c tile subdomains.
+.tile.openstreetmap.org

@@ -18,6 +18,7 @@ PRODUCTION_KEYS = (
     "HTTPS_PORT",
     "CONFIG_UID",
     "CONFIG_GID",
+    "SEMANTIC_INTERNAL_TOKEN",
 )
 ENV_OVERRIDE_KEYS = PRODUCTION_KEYS
 RESERVED_SUFFIXES = (
@@ -148,6 +149,15 @@ def validate(values: dict[str, str]) -> list[str]:
             errors.append(
                 f"{key} must be a positive non-root numeric ID for production."
             )
+    semantic_token = values["SEMANTIC_INTERNAL_TOKEN"].strip()
+    if (
+        len(semantic_token) < 32
+        or semantic_token == "CHANGEME_SEMANTIC"
+    ):
+        errors.append(
+            "SEMANTIC_INTERNAL_TOKEN must be a generated secret of at least "
+            "32 characters for production."
+        )
 
     raw_bind_address = values["EDGE_BIND_ADDRESS"].strip()
     try:

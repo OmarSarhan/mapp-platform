@@ -6,6 +6,7 @@ ENV_FILE="${MAPP_ENV_FILE:-${ROOT_DIR}/.env}"
 STATE_DIR="${ROOT_DIR}/var"
 WORKSPACE_DIR="${STATE_DIR}/workspace"
 CONTROL_DIR="${STATE_DIR}/control"
+SEMANTIC_DIR="${STATE_DIR}/semantic"
 RELOAD_DIR="${STATE_DIR}/reload"
 PREVIEW_DIR="${STATE_DIR}/preview"
 PREVIEW_RELOAD_DIR="${STATE_DIR}/preview-reload"
@@ -16,19 +17,23 @@ usage() {
     "" \
     "  init         create a private .env from .env.example" \
     "  up           build/start the configured database mode and platform services" \
-    "  serve        start platform services without running the sample ETL" \
+    "  serve        start platform services without running bundled ETL" \
     "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
     "  config-ui    build/start the workspace configuration dashboard" \
     "  config-ui-down stop and remove only the configuration dashboard" \
+    "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  load sample data in bundled-database mode" \
-    "  reset-data --confirm remove the bundled database and reload only configured ETL data" \
+    "  etl [layer]  load sample and Census data in bundled-database mode" \
+    "  census-etl   load the reviewed England Census 2021 OA dataset" \
+    "  census-check [topic] validate all or one reviewed census source without loading" \
+    "  reset-data --confirm remove the bundled database and reload configured ETL data" \
     "  upgrade-derived install H3 and derived-layer roles into an existing bundled database" \
-    "  all          start bundled mode, load sample data, then verify it" \
+    "  all          start bundled mode, load bundled ETL data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
     "  production-acceptance [options] collect redacted production readiness evidence" \
+    "  cleanup-temp [--confirm] list or remove disposable state older than seven days" \
     "  verify       run end-to-end acceptance checks" \
     "  config       validate the Compose configuration" \
     "  build-xyz    rebuild the pinned XYZ image" \
@@ -84,7 +89,8 @@ reject_database_environment_overrides() {
   for key in \
     DBS_MAPP ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
     ETL_DB_USER ETL_DB_PASSWORD XYZ_DB_USER XYZ_DB_PASSWORD \
-    DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL
+    DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL \
+    DERIVED_READER_ROLE
   do
     if [[ -v "${key}" ]]; then
       configured="$(dotenv_value "${key}")"
@@ -137,6 +143,7 @@ check_state_owner() {
       "${CONTROL_DIR}" \
       "${CONTROL_DIR}/artifacts" \
       "${CONTROL_DIR}/proposals" \
+      "${SEMANTIC_DIR}" \
       "${RELOAD_DIR}" \
       "${PREVIEW_DIR}" \
       "${PREVIEW_RELOAD_DIR}"
@@ -154,6 +161,7 @@ init_state() {
     "${WORKSPACE_DIR}" \
     "${CONTROL_DIR}/artifacts" \
     "${CONTROL_DIR}/proposals" \
+    "${SEMANTIC_DIR}" \
     "${RELOAD_DIR}" \
     "${PREVIEW_DIR}" \
     "${PREVIEW_RELOAD_DIR}"
@@ -163,6 +171,7 @@ init_state() {
     "${CONTROL_DIR}" \
     "${CONTROL_DIR}/artifacts" \
     "${CONTROL_DIR}/proposals" \
+    "${SEMANTIC_DIR}" \
     "${RELOAD_DIR}" \
     "${PREVIEW_DIR}" \
     "${PREVIEW_RELOAD_DIR}"
@@ -216,6 +225,7 @@ init_env() {
     -e "s/CHANGEME_ETL/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_DERIVED/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_SEMANTIC/$(openssl rand -hex 32)/" \
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \
     "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
@@ -242,6 +252,13 @@ fi
 if [[ "${1:-}" == "production-acceptance" ]]; then
   python3 "${ROOT_DIR}/scripts/production_acceptance.py" \
     --environment "${ENV_FILE}" \
+    "${@:2}"
+  exit $?
+fi
+
+if [[ "${1:-}" == "cleanup-temp" ]]; then
+  python3 "${ROOT_DIR}/scripts/cleanup_temp.py" \
+    --state-dir "${STATE_DIR}" \
     "${@:2}"
   exit $?
 fi
@@ -276,10 +293,10 @@ fi
 case "${database_mode}" in
   bundled)
     compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-    runtime_services=(db xyz xyz-preview config-ui browser-runner caddy)
+    runtime_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
   external)
-    runtime_services=(xyz xyz-preview config-ui browser-runner caddy)
+    runtime_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
   *)
     printf 'MAPP_DATABASE_MODE must be bundled or external.\n' >&2
@@ -314,6 +331,21 @@ if [[ "${database_mode}" == "external" ]]; then
     | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
 fi
 
+run_sample_etl() {
+  "${compose[@]}" run --rm --build etl
+}
+
+run_census_etl() {
+  "${compose[@]}" run --rm --build etl \
+    python -m leeds_arcgis_etl.census_main \
+    --config /config/census.json
+}
+
+run_all_etl() {
+  run_sample_etl
+  run_census_etl
+}
+
 case "${1:-}" in
   up|serve)
     "${compose[@]}" up --detach --build "${runtime_services[@]}"
@@ -330,14 +362,60 @@ case "${1:-}" in
     ;;
   etl)
     if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp etl is sample-data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
+      printf './bin/mapp etl is bundled data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
       exit 2
     fi
     if [[ -n "${2:-}" ]]; then
       "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
     else
-      "${compose[@]}" run --rm --build etl
+      run_all_etl
     fi
+    ;;
+  census-etl)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp census-etl is optional data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
+      exit 2
+    fi
+    if [[ -n "${2:-}" ]]; then
+      printf 'Usage: ./bin/mapp census-etl\n' >&2
+      exit 2
+    fi
+    run_census_etl
+    ;;
+  census-check)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp census-check is available only with the bundled ETL tool image.\n' >&2
+      exit 2
+    fi
+    if [[ -n "${3:-}" ]]; then
+      printf 'Usage: ./bin/mapp census-check [topic]\n' >&2
+      exit 2
+    fi
+    census_check_args=(
+      python -m leeds_arcgis_etl.census_main
+      --config /config/census.json
+      --check-source
+    )
+    if [[ -n "${2:-}" ]]; then
+      census_check_args+=(--topic "${2}")
+    fi
+    "${compose[@]}" run --rm --build etl "${census_check_args[@]}"
+    ;;
+  recover-reset-data)
+    if [[ "${database_mode}" != "bundled" ]]; then
+      printf './bin/mapp recover-reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+      exit 2
+    fi
+    if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
+      printf '%s\n' \
+        'This force-recovers a retained bundled database from an interrupted reset-data operation.' \
+        'Confirm that no reset-data process is still running, then run ./bin/mapp recover-reset-data --confirm.' >&2
+      exit 2
+    fi
+    printf 'Starting the private control plane for explicit interrupted-reset recovery.\n'
+    "${compose[@]}" up --detach --build --wait db semantic-service config-ui
+    "${compose[@]}" exec -T config-ui python -c \
+      'import json; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(force=True, wait_for_ready=True), separators=(",", ":")))'
     ;;
   reset-data)
     if [[ "${database_mode}" != "bundled" ]]; then
@@ -347,7 +425,7 @@ case "${1:-}" in
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
       printf '%s\n' \
         'This permanently removes the bundled PostgreSQL database, including derived layers and any non-ETL tables.' \
-        'The live workspace is replaced by instance/workspace.seed.json; dashboard authentication, audit records, proposals, and public assets are preserved.' \
+        'Active derived semantic profiles are archived first. The live workspace is replaced by instance/workspace.seed.json; dashboard authentication, audit records, proposals, semantic history, and public assets are preserved.' \
         'Run ./bin/mapp reset-data --confirm to continue.' >&2
       exit 2
     fi
@@ -355,21 +433,74 @@ case "${1:-}" in
       "${compose[@]}" config --format json \
         | python3 -c 'import json, sys; print(json.load(sys.stdin)["volumes"]["postgres_data"]["name"], end="")'
     )"
+    reset_gate_may_be_owned=0
+    reset_gate_owner="$(
+      python3 -c 'import uuid; print(uuid.uuid4())'
+    )"
+    recover_interrupted_reset() {
+      local reset_status="$1"
+      trap - ERR INT TERM
+      if [[ "${reset_gate_may_be_owned}" == "1" ]]; then
+        printf 'Reset stopped after semantic archival began; checking its owned maintenance gate for compensation.\n' >&2
+        set +e
+        local recovery_volume_inspection=""
+        if recovery_volume_inspection="$(docker volume inspect "${database_volume}" 2>&1)"; then
+          "${compose[@]}" up --detach --no-build --wait db semantic-service config-ui
+          local start_status=$?
+          if [[ "${start_status}" == "0" ]]; then
+            "${compose[@]}" exec -T \
+              -e "MAPP_RESET_GATE_OWNER=${reset_gate_owner}" \
+              config-ui python -c \
+              'import json, os; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(reset_owner=os.environ["MAPP_RESET_GATE_OWNER"], wait_for_ready=True), separators=(",", ":")))'
+            local recovery_status=$?
+            if [[ "${recovery_status}" != "0" ]]; then
+              printf 'Owned semantic reset recovery failed; keep the database volume, confirm no reset-data process is active, then run ./bin/mapp recover-reset-data --confirm.\n' >&2
+            fi
+          else
+            printf 'The control plane could not restart for semantic reset recovery; keep the database volume, confirm no reset-data process is active, then run ./bin/mapp recover-reset-data --confirm.\n' >&2
+          fi
+        elif [[ "${recovery_volume_inspection}" == *"No such volume"* ]]; then
+          printf 'The bundled database volume was already removed; semantic compensation is no longer safe. Run reset-data --confirm again to finish initialization.\n' >&2
+        else
+          printf 'The bundled database volume state could not be verified; no semantic compensation was attempted. Inspect Docker state before explicit recovery.\n' >&2
+        fi
+        set -e
+      fi
+      exit "${reset_status}"
+    }
+    trap 'recover_interrupted_reset $?' ERR
+    trap 'recover_interrupted_reset 130' INT
+    trap 'recover_interrupted_reset 143' TERM
+    printf 'Starting the private control plane to archive derived semantic profiles.\n'
+    "${compose[@]}" up --detach --build --wait db semantic-service config-ui
+    reset_gate_may_be_owned=1
+    "${compose[@]}" exec -T \
+      -e "MAPP_RESET_GATE_OWNER=${reset_gate_owner}" \
+      config-ui python -c \
+      'import json, os; from app import archive_derived_semantics_before_reset; print(json.dumps(archive_derived_semantics_before_reset(os.environ["MAPP_RESET_GATE_OWNER"]), separators=(",", ":")))'
+    printf 'Derived semantic profiles are archived; proceeding with the confirmed reset.\n'
     printf 'Stopping the platform before removing bundled database volume %s.\n' "${database_volume}"
     "${compose[@]}" down
-    if docker volume inspect "${database_volume}" >/dev/null 2>&1; then
+    volume_inspection=""
+    if volume_inspection="$(docker volume inspect "${database_volume}" 2>&1)"; then
       docker volume rm "${database_volume}"
-    else
+      reset_gate_may_be_owned=0
+    elif [[ "${volume_inspection}" == *"No such volume"* ]]; then
       printf 'Bundled database volume did not exist; a new one will be initialized.\n'
+      reset_gate_may_be_owned=0
+    else
+      printf 'Could not verify the bundled database volume; leaving reset compensation active.\n' >&2
+      false
     fi
+    trap - ERR INT TERM
     install -m 0644 "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
     install -m 0600 "${ROOT_DIR}/instance/workspace.seed.json" "${PREVIEW_DIR}/workspace.json"
     printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
     "${compose[@]}" up --detach --build "${runtime_services[@]}"
-    "${compose[@]}" run --rm --build etl
+    run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     printf '%s\n' \
-      'Bundled database reset completed, all configured ETL sources were loaded, and the seed workspace was restored.'
+      'Bundled database reset completed, all configured ETL sources including Census were loaded, and the seed workspace was restored.'
     ;;
   upgrade-derived)
     if [[ "${database_mode}" != "bundled" ]]; then
@@ -382,24 +513,30 @@ case "${1:-}" in
     ;;
   all)
     if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp all includes the sample ETL and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
+      printf './bin/mapp all includes bundled ETL data and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
       exit 2
     fi
     "${compose[@]}" up --detach --build "${runtime_services[@]}"
-    "${compose[@]}" run --rm --build etl
+    run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   verify)
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   test)
-    "${compose[@]}" build config-ui
+    "${compose[@]}" build config-ui semantic-service
     docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
     docker run --rm \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
       mapp-config-ui:local \
       python -m unittest discover -s /workspace/config-ui/tests -v
+    docker run --rm \
+      --volume "${ROOT_DIR}/semantic-service:/workspace:ro" \
+      --workdir /workspace \
+      --env PYTHONDONTWRITEBYTECODE=1 \
+      mapp-semantic-service:local \
+      python -m unittest discover -s tests -v
     docker run --rm \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app/src \
@@ -410,7 +547,7 @@ case "${1:-}" in
     docker run --rm \
       --volume "${ROOT_DIR}:/source:ro" \
       --workdir /tmp \
-      "${NODE_IMAGE:-node:22.23.1-bookworm-slim}" \
+      "${NODE_IMAGE:-node:22.23.1-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3}" \
       sh -c '
         cp -a /source/config-ui /tmp/config-ui
         cd /tmp/config-ui
@@ -421,6 +558,8 @@ case "${1:-}" in
         node --check /source/docker/xyz/supervisor.mjs
         node --check /source/browser-runner/server.mjs
       '
+    "${compose[@]}" build egress-proxy
+    PYTHONDONTWRITEBYTECODE=1 python3 "${ROOT_DIR}/scripts/test_egress_proxy.py"
     "${compose[@]}" config --quiet
     docker compose \
       --project-directory "${ROOT_DIR}" \
@@ -433,7 +572,7 @@ case "${1:-}" in
       --file "${ROOT_DIR}/compose.yaml" \
       --file "${ROOT_DIR}/compose.bundled-db.yaml" \
       config --quiet
-    printf 'Unit tests and bundled/external Compose validation passed.\n'
+    printf 'Unit tests, semantic-service tests, and bundled/external Compose validation passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet

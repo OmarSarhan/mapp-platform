@@ -17,8 +17,15 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
   through the operator-approved route. The browser runner shares only the
   narrow automation network with the configuration service and Caddy; it has
   no platform credential.
-- The browser runner has a separate outbound network for external map assets;
-  it does not join the database, backend, or public edge networks.
+- The browser runner has no direct outbound network. External map assets pass
+  through the dedicated HTTPS-only hostname-allowlisting proxy, which is the
+  only service on both the internal automation network and the external
+  browser-egress network. Unlisted hostnames are rejected without DNS lookup;
+  reviewed names are then resolved and rejected if they map to private,
+  loopback, link-local, or reserved space.
+- The semantic service shares only the internal `semantic-control` network
+  with the configuration service. It has no public route, database network, or
+  database credential.
 - The map and configuration service use separate hostnames.
 - The standalone CLI runs on another computer and is untrusted until its
   bearer token is authenticated.
@@ -27,10 +34,11 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
 
 ## Filesystem isolation
 
-XYZ must never receive `var/control`. Its readable inputs are limited to the
-live workspace and explicitly public instance assets. The configuration
-service receives only the writable paths needed for atomic workspace saves,
-control records, artifacts, and reload coordination.
+XYZ must never receive `var/control` or `var/semantic`. Its readable inputs are
+limited to the live workspace and explicitly public instance assets. The
+configuration service receives only the writable paths needed for atomic
+workspace saves, control records, artifacts, and reload coordination. The
+semantic service receives only `var/semantic` as writable state.
 
 This matters because the pinned XYZ version has a local file-provider surface
 that this deployment does not need. Caddy blocks its HTTP route as defence in
@@ -56,11 +64,96 @@ remain compatible. Device-authorized tokens separate:
 - reload access.
 
 Device authorization defaults to expiring `inspect + propose + visual` access;
-apply and reload are explicit additional grants. Direct workspace saves remain
+it also includes read-only `semantic:inspect`. Apply, reload, derived-layer
+mutation, external semantic generation, semantic proposals, semantic apply,
+and semantic administration are explicit additional grants. Direct workspace saves remain
 full-token/administrator operations. Scope checks are server-enforced; written
 agent instructions remain defence in depth rather than authorization.
 Dashboard password changes, token issuance/revocation, and audit access already
 require an administrator session and are not bearer-token capabilities.
+
+For CLI-token provisioning, the dashboard offers semantic reader, proposal
+author, AI semantic author, curator, delivery operator, semantic administrator,
+and full platform operator presets. The custom-scope control can instead
+select the exact workspace and semantic scopes required. These presets are UI
+conveniences, not role inheritance; server authorization evaluates the stored
+scope list. New dashboard and administrator-API tokens default to a 30-day
+expiry. The 1-, 7-, and 30-day choices need no additional acknowledgement;
+90-day and non-expiring tokens require an explicit extended-lifetime
+confirmation that the API also enforces. Prefer the shortest practical
+lifetime. The bearer value is shown only once, while its name, scopes, expiry,
+use, revocation, and issuance metadata remain available for administration and
+audit.
+
+The configuration service is the semantic authorization gateway:
+
+- `semantic:inspect` reads visible catalog, asset history, and proposal state;
+- `semantic:source`, together with `semantic:inspect`, discovers and
+  synchronizes only allowlisted PostgreSQL catalog metadata through the exact
+  configured read-only alias;
+- `semantic:generate`, together with `semantic:inspect`, sends whitelisted
+  semantic metadata to Gemini and returns a non-persisted draft;
+- `semantic:data`, together with both generation scopes, permits an explicit
+  opt-in to a bounded 5% row sample and/or data-derived statistics;
+- `semantic:propose` checks and creates curated proposals;
+- `semantic:apply` applies an approved pending proposal; and
+- `semantic:admin` permits a confirmed retry of a retained derived-profile
+  event; together with `semantic:inspect`, it also permits source/profile
+  archival and exact-ID administrative visibility.
+
+These narrow bearer-token scopes are not hierarchical. Grant only the exact
+combination needed; `semantic:generate` alone does not imply inspect or
+data-derived egress, `semantic:data` alone does not imply inspect or generate,
+`semantic:source` alone does not imply inspect or database row access, and
+`semantic:admin` alone does not imply inspect, propose, or apply. The endpoint
+named `repair` requeues the same retained event and
+payload; it is not authority to rewrite semantic facts or a mechanism that can
+correct a deterministic conflict. An authenticated dashboard administrator is
+handled separately.
+
+`GEMINI_APIKEY` is optional and is exposed only to `config-ui`. The default
+Gemini request contains no source rows or sample values. A caller holding
+`semantic:data` may explicitly add an up-to-100-row, 96-KiB sample selected
+from 5% of the relation and/or bounded statistics. A table sample is further
+limited to 20 eligible columns and 512 characters per serialized value;
+geometry and binary values are omitted, and a field request can include only
+that field. Field statistics aggregate at most 1,000 rows selected from 5% of
+the relation. Raw SQL, unrelated field annotations, bearer tokens, internal
+semantic tokens, and database credentials are never sent. The key, prompt,
+provider body, sampled values, statistics values, and generated values are
+excluded from audit records and client-visible errors. Provider output and all
+supplied context are treated as untrusted data, while curated operation paths
+are always constructed by the server.
+
+`SEMANTIC_SOURCE_ALLOWLIST` defaults to `MAPP:leeds.*`; an explicitly empty
+value disables source discovery. `SEMANTIC_SOURCE_EXCLUSIONS` uses the same
+selector syntax to omit internal relations from discovery and synchronization.
+System and managed derived schemas are always excluded. Adding an exclusion
+does not automatically remove an already-registered profile. The separately
+confirmed archive-excluded action requires both `semantic:inspect` and
+`semantic:admin`; it archives matching ready profiles without changing their
+database relations. Archived assets are omitted from catalog, search, and
+derived-profile collections even for administrators and return `404` to an
+ordinary exact lookup. Exact asset and immutable-history reads remain
+available by a previously retained ID only to an administrator or a token with
+both scopes. The same authority can archive one selected ready profile through
+the dashboard. Archival cannot be undone by merely removing the exclusion.
+Synchronization holds a read-only catalog snapshot and relation lock, checks
+current `USAGE` and `SELECT`, and reads only relation/column metadata and
+bounded standard comments. It never queries table rows, values, defaults, or
+expressions, and it fails closed after privilege loss or relation change.
+
+When combined with `semantic:inspect`, administrative access also adds a
+sanitized name-level delivery diagnostic to derived-profile reads. It contains
+bounded event metadata and a single-line error, never the retained payload,
+worker claim, or database credential. Ordinary semantic inspectors receive
+only the public profile state. Unmatched blockers left by an already-dropped
+definition are likewise visible only to administrative reads.
+
+The private service accepts a separate internal bearer token plus the trusted
+actor and effective scopes forwarded by the configuration service. It is not
+safe to publish that service or let a browser supply those internal headers
+directly.
 
 ## Workspace validation
 
@@ -96,10 +189,11 @@ separate concerns covered in [`../LICENSING.md`](../LICENSING.md).
 The browser runner receives a platform-generated XYZ URL, layer, view plan,
 and viewport. The top-level target origin is fixed to Caddy's un-published
 automation listener on port 8081, where the same file-provider denial applies
-as on the public map route. A separate egress-only network is required because
-the live map loads external framework, icon, and basemap assets. The runner
-has no database or configuration credentials and does not join the
-database/backend or public edge networks. It can address the configuration
+as on the public map route. External framework, icon, and basemap requests use
+the reviewed Squid hostname allowlist; internal Caddy and preview navigation
+bypasses the proxy. The runner has no direct external route, database or
+configuration credentials, and does not join the database/backend or public
+edge networks. It can address the configuration
 service on the shared automation network, so that service must continue to
 require authentication for every non-public API. Its output can reveal map
 content and failed request URLs, so artifacts are authenticated and must be
@@ -127,8 +221,31 @@ artifact retention, storage quotas, or host-level resource controls.
   service intentionally receive the same read-only runtime URI.
 - Treat `DERIVED_DATABASE_URL` as a separate privileged credential. Only the
   configuration service receives it, and its role must own only
-  `derived_layers`. Creation, materialized refresh, and drop require the
-  `derive` scope and are audited.
+  `derived_layers`. Creation and replacement also require `semantic:inspect`
+  and ready semantic profiles for every declared relation source; H3 and
+  PostGIS functions do not require profiles. Creation, materialized refresh,
+  replacement, and drop require the `derive` scope and are audited.
+  The mandatory map-extent guard filters final output geometry and is not an
+  authorization or source-row boundary. Derived SQL passes a PostgreSQL AST
+  policy and a transient-view catalog OID/provenance check before `EXPLAIN`;
+  custom, volatile, security-definer, configured, unproved set-returning, and
+  administrative routines and custom operators/casts/types are rejected as
+  `derived_layer.query_not_allowed`, distinctly from malformed SQL and
+  over-budget computation. The materialization planner and post-population
+  actual-size guards limit obvious stored-output growth but do not prevent
+  transient relation, index, TOAST, or WAL use and do not replace query-cost
+  review, database quotas, monitoring, or host resource controls. Durable
+  operation errors expose safe user guidance and keep database diagnostics out
+  of the primary message; an uncertain commit is marked indeterminate rather
+  than claiming the state is unchanged.
+- Treat `SEMANTIC_INTERNAL_TOKEN` as a service credential. Only
+  `config-ui` and `semantic-service` receive it. It must be random, at least 32
+  characters in production, and distinct from database and user credentials.
+- Treat `GEMINI_APIKEY` as an optional external-provider credential. Only
+  `config-ui` receives it. Keep it in the private environment file or approved
+  secret manager, use a dedicated restricted key, and review provider terms,
+  billing, retention, regional processing, and metadata-egress policy before
+  enabling it.
 - Store administrator passwords and CLI tokens in an approved secret manager.
 - Never pass tokens in command arguments, logs, proposals, screenshots, or
   issue reports.
@@ -141,11 +258,16 @@ The application containers use read-only roots where practical,
 `no-new-privileges`, dropped capabilities, dedicated non-root users, bounded
 temporary filesystems, and internal networks. The configuration service and
 CLI do not require Docker socket access; do not add it.
+The semantic service follows the same hardening and has only its narrow state
+mount. A future data/function executor must be a separate container with its
+own least-privilege credential rather than adding database access to the
+metadata service.
 Initialize and operate production as a dedicated unprivileged host account.
 Production validation rejects `CONFIG_UID=0` or `CONFIG_GID=0` so a root-run
 initialization cannot silently make the application services run as root.
 
 Production hardening should also include immutable image digests, SBOMs,
 vulnerability scanning, host patching, firewall rules, backup encryption, log
-retention, and storage monitoring. Where practical, restrict browser egress to
-the reviewed asset and basemap origins or mirror those assets locally.
+retention, and storage monitoring. Keep browser destinations in the reviewed
+`instance/browser-egress-allowlist.txt`; mirror an asset locally when its
+origin cannot meet the deployment's availability or privacy requirements.

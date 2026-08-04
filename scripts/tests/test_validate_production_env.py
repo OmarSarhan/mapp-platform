@@ -14,6 +14,7 @@ def production_values() -> dict[str, str]:
         "HTTPS_PORT": "443",
         "CONFIG_UID": "1000",
         "CONFIG_GID": "1000",
+        "SEMANTIC_INTERNAL_TOKEN": "a" * 64,
     }
 
 
@@ -144,6 +145,17 @@ class ProductionEnvironmentTests(unittest.TestCase):
                 values = production_values()
                 values[key] = value
                 self.assertTrue(any(key in error for error in validate(values)))
+
+    def test_requires_a_non_placeholder_semantic_service_token(self):
+        for token in ("", "CHANGEME_SEMANTIC", "too-short"):
+            values = production_values()
+            values["SEMANTIC_INTERNAL_TOKEN"] = token
+            self.assertTrue(
+                any(
+                    "SEMANTIC_INTERNAL_TOKEN" in error
+                    for error in validate(values)
+                )
+            )
 
 
 if __name__ == "__main__":

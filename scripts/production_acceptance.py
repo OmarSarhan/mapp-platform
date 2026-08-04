@@ -158,7 +158,10 @@ def docker_checks(environment: Path, values: dict[str, str], live: bool) -> list
             )
         )
         return checks
-    services = ["xyz", "xyz-preview", "config-ui", "browser-runner", "caddy"]
+    services = [
+        "semantic-service", "xyz", "xyz-preview", "config-ui",
+        "browser-runner", "egress-proxy", "caddy",
+    ]
     if values.get("MAPP_DATABASE_MODE") == "bundled":
         services.insert(0, "db")
     ps = run_quiet(command + ["ps", "--format", "json"], 30)

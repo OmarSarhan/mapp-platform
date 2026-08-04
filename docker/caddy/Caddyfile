@@ -31,7 +31,7 @@
 		-Server
 	}
 	request_body {
-		max_size 5MB
+		max_size 5MiB
 	}
 	reverse_proxy config-ui:8080 {
 		health_uri /healthz

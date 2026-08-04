@@ -14,6 +14,8 @@ const allowedOrigins = new Set(
     || "http://caddy:8081"
   ).split(",").map(value => new URL(value.trim()).origin),
 );
+const browserProxyServer = process.env.BROWSER_PROXY_SERVER || null;
+const browserProxyBypass = process.env.BROWSER_PROXY_BYPASS || "";
 const maxBodyBytes = 1024 * 1024;
 const configuredConcurrency = Number(
   process.env.MAX_CONCURRENT_RUNS || 1,
@@ -60,10 +62,6 @@ async function captureMap(page, directory, label, fullPage = true) {
   };
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function requestedPanels(input) {
   const raw = Array.isArray(input.panels)
     ? input.panels
@@ -75,19 +73,83 @@ function requestedPanels(input) {
   )))];
 }
 
-async function clickVisibleText(page, text, {exact = false} = {}) {
-  if (!text) return false;
-  const locator = exact
-    ? page.getByText(text, {exact: true})
-    : page.getByText(new RegExp(escapeRegExp(text), "i"));
-  const count = await locator.count().catch(() => 0);
-  for (let index = count - 1; index >= 0; index -= 1) {
-    const item = locator.nth(index);
-    if (!await item.isVisible().catch(() => false)) continue;
-    await item.click({timeout: 1_500}).catch(() => null);
-    return true;
+async function locatorWithDataId(scope, selector, dataId) {
+  if (!dataId) return null;
+  const candidates = scope.locator(selector);
+  const count = await candidates.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const candidate = candidates.nth(index);
+    if (await candidate.getAttribute("data-id").catch(() => null) === dataId) {
+      return candidate;
+    }
   }
-  return false;
+  return null;
+}
+
+async function drawerWithHeading(scope, selector, heading) {
+  if (!heading) return null;
+  const expected = String(heading).replace(/\s+/g, " ").trim();
+  const candidates = scope.locator(selector);
+  const count = await candidates.count().catch(() => 0);
+  for (let index = 0; index < count; index += 1) {
+    const candidate = candidates.nth(index);
+    const text = await candidate.locator(
+      ":scope > .header h1, :scope > .header h2, :scope > .header h3",
+    ).first().innerText().catch(() => "");
+    if (text.replace(/\s+/g, " ").trim() === expected) return candidate;
+  }
+  return null;
+}
+
+async function ensureDrawerOpen(drawer) {
+  if (!drawer) {
+    return {attempted: false, opened: false, failureReason: "drawer-not-found"};
+  }
+  const visible = await drawer.isVisible().catch(() => false);
+  const state = await drawer.evaluate(element => ({
+    empty: element.classList.contains("empty"),
+    expandable: element.classList.contains("expandable"),
+    expanded: element.classList.contains("expanded"),
+  })).catch(() => null);
+  if (!visible || !state) {
+    return {attempted: false, opened: false, failureReason: "drawer-not-visible"};
+  }
+  if (state.empty) {
+    return {attempted: false, opened: false, failureReason: "drawer-empty"};
+  }
+  if (!state.expandable || state.expanded) {
+    return {attempted: false, opened: true, failureReason: null};
+  }
+  const header = drawer.locator(":scope > .header").first();
+  const attempted = await header.isVisible().catch(() => false);
+  if (attempted) {
+    await header.click({timeout: 2_000}).catch(() => null);
+  }
+  const opened = await drawer.evaluate(
+    element => element.classList.contains("expanded"),
+  ).catch(() => false);
+  return {
+    attempted,
+    opened,
+    failureReason: opened ? null : "drawer-did-not-open",
+  };
+}
+
+async function findRequestedLayer(page, input) {
+  const byKey = await locatorWithDataId(
+    page,
+    ".drawer.layer-view[data-id]",
+    input.layer,
+  );
+  if (byKey) return {locator: byKey, match: "key"};
+  const byTitle = await drawerWithHeading(
+    page,
+    ".drawer.layer-view",
+    input.layerTitle || input.layer,
+  );
+  return byTitle
+    ? {locator: byTitle, match: "title"}
+    : {locator: null, match: null};
 }
 
 async function expandRequestedLayer(page, input) {
@@ -95,81 +157,231 @@ async function expandRequestedLayer(page, input) {
     ? input.plan.activeGroups
     : [];
   const openedGroups = [];
+  const groupResults = [];
   for (const group of groups) {
-    if (await clickVisibleText(page, group, {exact: true})) {
-      openedGroups.push(group);
-      await page.waitForTimeout(250);
-    }
+    const drawer = (
+      await locatorWithDataId(
+        page,
+        ".drawer.layer-group[data-id]",
+        group,
+      )
+      || await drawerWithHeading(page, ".drawer.layer-group", group)
+    );
+    const result = await ensureDrawerOpen(drawer);
+    groupResults.push({group, found: Boolean(drawer), ...result});
+    if (result.opened) openedGroups.push(group);
   }
-  const layerOpened = await clickVisibleText(page, input.layer, {exact: false});
-  if (layerOpened) await page.waitForTimeout(500);
-  return {openedGroups, layerOpened};
+  const layer = await findRequestedLayer(page, input);
+  if (!layer.locator) {
+    return {
+      openedGroups,
+      groups: groupResults,
+      layerFound: false,
+      layerOpened: false,
+      layerMatch: null,
+      failureReason: "layer-not-found",
+    };
+  }
+  const parentGroup = layer.locator.locator(
+    "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' layer-group ')][1]",
+  );
+  if (await parentGroup.count().catch(() => 0)) {
+    await ensureDrawerOpen(parentGroup);
+  }
+  const result = await ensureDrawerOpen(layer.locator);
+  return {
+    openedGroups,
+    groups: groupResults,
+    layerFound: true,
+    layerOpened: result.opened,
+    layerMatch: layer.match,
+    failureReason: result.failureReason,
+  };
+}
+
+async function revealFirstFilteringControl(panel, expectedText) {
+  const selector = panel.locator(
+    'select[data-id$="-filter-dropdown"]',
+  ).first();
+  if (!await selector.isVisible().catch(() => false)) return null;
+  const option = await selector.evaluate((element, expected) => {
+    const values = [...element.options].map((item, index) => ({
+      index,
+      disabled: item.disabled,
+      label: (item.textContent || "").replace(/\s+/g, " ").trim(),
+    }));
+    const wanted = expected.map(value => value.toLowerCase());
+    return values.find(item => (
+      !item.disabled
+      && wanted.some(value => (
+        item.label.toLowerCase().includes(value)
+        || value.includes(item.label.toLowerCase())
+      ))
+    )) || values.find(item => !item.disabled) || null;
+  }, expectedText).catch(() => null);
+  if (!option) return null;
+  await selector.selectOption({index: option.index}).catch(() => null);
+  await panel.locator('[data-id="card"]').first().waitFor({
+    state: "visible",
+    timeout: 3_000,
+  }).catch(() => null);
+  return option.label;
 }
 
 async function openPanel(page, panel, input, directory) {
   const label = panel === "filtering" ? "Filtering" : "Styling";
+  const dataId = panel === "filtering" ? "filter-drawer" : "style-drawer";
   const artifactKey = panel === "filtering" ? "filteringPanel" : "stylingPanel";
   const filename = panel === "filtering" ? "filtering-panel.png" : "styling-panel.png";
-  const attempted = await clickVisibleText(page, label, {exact: false});
-  await page.waitForTimeout(750);
-  const bodyText = await interactionText(page);
-  const handle = await page.evaluateHandle(({panelLabel}) => {
-    const visible = element => {
-      const style = getComputedStyle(element);
-      const box = element.getBoundingClientRect();
-      return (
-        style.visibility !== "hidden"
-        && style.display !== "none"
-        && box.width >= 120
-        && box.height >= 40
-      );
-    };
-    const score = element => {
-      const text = element.innerText || "";
-      const box = element.getBoundingClientRect();
-      let value = 0;
-      if (new RegExp(panelLabel, "i").test(text)) value += 20;
-      if (/panel|drawer|view|layer|control|filter|style/i.test(String(element.className || ""))) {
-        value += 10;
-      }
-      if (box.width >= 180 && box.width <= 700) value += 5;
-      if (box.height >= 80 && box.height <= 1200) value += 5;
-      value -= Math.abs(text.length - 800) / 1000;
-      return value;
-    };
-    const candidates = [...document.querySelectorAll("body *")]
-      .filter(element => visible(element) && new RegExp(panelLabel, "i").test(element.innerText || ""))
-      .sort((left, right) => score(right) - score(left));
-    return candidates[0] || null;
-  }, {panelLabel: label});
-  const element = handle.asElement();
-  const box = element ? await element.boundingBox().catch(() => null) : null;
-  const opened = Boolean(box);
-  let image = null;
-  if (opened) {
-    const buffer = await element.screenshot({path: `${directory}/${filename}`});
-    image = pngSize(buffer);
-  }
   const expectedText = Array.isArray(input.expectedPanelText)
     ? input.expectedPanelText.filter(value => typeof value === "string" && value)
     : [];
+  const layer = await findRequestedLayer(page, input);
+  if (!layer.locator) {
+    return {
+      panel,
+      label,
+      artifactKey,
+      dataId,
+      found: false,
+      attempted: false,
+      opened: false,
+      captured: false,
+      image: null,
+      textLength: 0,
+      textSample: "",
+      expectedTextFound: Object.fromEntries(
+        expectedText.map(value => [value, false]),
+      ),
+      missingExpectedText: expectedText,
+      failureReason: "layer-not-found",
+      passed: false,
+    };
+  }
+  // Panel controls are nested in the layer drawer.  They may be present in
+  // the DOM while that drawer is collapsed, so reveal the layer before
+  // deciding whether its panel can be opened.
+  const layerNavigation = await ensureDrawerOpen(layer.locator);
+  if (!layerNavigation.opened) {
+    return {
+      panel,
+      label,
+      artifactKey,
+      dataId,
+      found: true,
+      attempted: layerNavigation.attempted,
+      opened: false,
+      captured: false,
+      image: null,
+      textLength: 0,
+      textSample: "",
+      expectedTextFound: Object.fromEntries(
+        expectedText.map(value => [value, false]),
+      ),
+      missingExpectedText: expectedText,
+      failureReason: layerNavigation.failureReason,
+      passed: false,
+    };
+  }
+  const trigger = await locatorWithDataId(
+    layer.locator,
+    "[data-id]",
+    dataId,
+  );
+  if (!trigger) {
+    return {
+      panel,
+      label,
+      artifactKey,
+      dataId,
+      found: false,
+      attempted: false,
+      opened: false,
+      captured: false,
+      image: null,
+      textLength: 0,
+      textSample: "",
+      expectedTextFound: Object.fromEntries(
+        expectedText.map(value => [value, false]),
+      ),
+      missingExpectedText: expectedText,
+      failureReason: "panel-not-found",
+      passed: false,
+    };
+  }
+  const tagName = await trigger.evaluate(
+    element => element.tagName.toLowerCase(),
+  ).catch(() => "");
+  let target = trigger;
+  let navigation;
+  if (tagName === "button") {
+    const attempted = await trigger.isVisible().catch(() => false);
+    if (attempted) {
+      await trigger.click({timeout: 2_000}).catch(() => null);
+    }
+    target = await locatorWithDataId(
+      page,
+      "[data-id]",
+      `${dataId}-dialog`,
+    );
+    const opened = Boolean(target)
+      && await target.isVisible().catch(() => false);
+    navigation = {
+      attempted,
+      opened,
+      failureReason: opened ? null : "dialog-did-not-open",
+    };
+  } else {
+    navigation = await ensureDrawerOpen(trigger);
+  }
+  if (navigation.opened && panel === "filtering") {
+    await revealFirstFilteringControl(target, expectedText);
+  }
+  const panelText = navigation.opened && target
+    ? (await target.innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim()
+    : "";
   const expectedTextFound = Object.fromEntries(
     expectedText.map(value => [
       value,
-      bodyText.toLowerCase().includes(value.toLowerCase()),
+      panelText.toLowerCase().includes(value.toLowerCase()),
     ]),
+  );
+  const missingExpectedText = Object.entries(expectedTextFound)
+    .filter(([, found]) => !found)
+    .map(([value]) => value);
+  let image = null;
+  if (navigation.opened && target) {
+    const buffer = await target.screenshot({
+      path: `${directory}/${filename}`,
+    }).catch(() => null);
+    image = buffer ? pngSize(buffer) : null;
+  }
+  const captured = Boolean(image);
+  const failureReason = (
+    navigation.failureReason
+    || (!captured ? "panel-capture-failed" : null)
+    || (missingExpectedText.length ? "expected-text-missing" : null)
   );
   return {
     panel,
     label,
     artifactKey,
-    attempted,
-    opened,
+    dataId,
+    found: true,
+    attempted: navigation.attempted,
+    opened: navigation.opened,
+    captured,
     image,
-    textLength: bodyText.length,
-    textSample: bodyText.slice(0, 2000),
+    textLength: panelText.length,
+    textSample: panelText.slice(0, 2000),
     expectedTextFound,
-    passed: opened && Object.values(expectedTextFound).every(Boolean),
+    missingExpectedText,
+    failureReason,
+    passed: navigation.opened
+      && captured
+      && missingExpectedText.length === 0,
   };
 }
 
@@ -177,6 +389,109 @@ async function interactionText(page) {
   return (await page.locator("body").innerText({timeout: 2_000}))
     .replace(/\s+/g, " ")
     .trim();
+}
+
+async function exerciseHover(page, input, directory, timeout) {
+  const configured = input.plan?.hover?.type === "hover-centre-feature";
+  const expectedText = Array.isArray(input.expectedHoverText)
+    ? input.expectedHoverText.filter(value => typeof value === "string" && value)
+    : [];
+  const requested = input.hover !== false
+    && (input.hover === true || expectedText.length > 0 || configured);
+  const result = {
+    requested,
+    configured,
+    suppressed: input.hover === false,
+    attempted: false,
+    opened: false,
+    point: null,
+    field: input.plan?.hover?.field ?? null,
+    title: input.plan?.hover?.title ?? null,
+    text: null,
+    textLength: 0,
+    image: null,
+    expectedText,
+    expectedTextFound: Object.fromEntries(
+      expectedText.map(value => [value, false]),
+    ),
+    passed: !requested,
+  };
+  if (!requested) return result;
+
+  const mapCanvas = page.locator("canvas").first();
+  const box = await mapCanvas.boundingBox().catch(() => null);
+  if (!box) {
+    result.reason = "The map canvas was unavailable.";
+    return result;
+  }
+  const hoverPoint = {
+    x: Math.round(box.x + box.width / 2),
+    y: Math.round(box.y + box.height / 2),
+  };
+  result.point = hoverPoint;
+  result.attempted = true;
+  await page.mouse.move(
+    Math.round(box.x + Math.min(box.width / 4, 100)),
+    Math.round(box.y + Math.min(box.height / 4, 100)),
+  );
+  await page.mouse.move(hoverPoint.x, hoverPoint.y, {steps: 12});
+
+  const tooltip = page.locator(".infotip").last();
+  await tooltip.waitFor({
+    state: "visible",
+    timeout: Math.min(timeout, 10_000),
+  }).catch(() => {});
+  await page.waitForTimeout(400);
+  result.opened = await tooltip.evaluate(element => {
+    const style = getComputedStyle(element);
+    const box = element.getBoundingClientRect();
+    return (
+      style.display !== "none"
+      && style.visibility !== "hidden"
+      && Number.parseFloat(style.opacity || "1") > 0
+      && box.width > 0
+      && box.height > 0
+    );
+  }).catch(() => false);
+  let observedText = "";
+  if (result.opened) {
+    observedText = (await tooltip.innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
+    result.text = observedText.slice(0, 2000);
+    result.textLength = observedText.length;
+    const image = await tooltip.screenshot({
+      path: `${directory}/hover-tooltip.png`,
+    }).catch(() => null);
+    result.image = image ? pngSize(image) : null;
+  }
+  result.expectedTextFound = Object.fromEntries(
+    expectedText.map(value => [
+      value,
+      Boolean(observedText)
+        && observedText.toLowerCase().includes(value.toLowerCase()),
+    ]),
+  );
+  result.passed = Boolean(
+    configured
+    && result.attempted
+    && result.opened
+    && observedText
+    && result.image
+    && Object.values(result.expectedTextFound).every(Boolean)
+  );
+  if (!result.passed) {
+    result.reason = !configured
+      ? "The selected layer has no active hover configuration."
+      : !result.opened
+        ? "No visible hover tooltip was observed."
+        : !observedText
+          ? "The hover tooltip contained no observable text."
+          : !result.image
+            ? "The hover tooltip artifact was not captured."
+            : "Expected hover text was absent.";
+  }
+  return result;
 }
 
 async function evaluatePluginChecks(page, requested, report) {
@@ -351,7 +666,15 @@ async function runVisual(input) {
     passed: false,
   };
 
-  const browser = await chromium.launch({headless: true});
+  const browser = await chromium.launch({
+    headless: true,
+    ...(browserProxyServer ? {
+      proxy: {
+        server: browserProxyServer,
+        ...(browserProxyBypass ? {bypass: browserProxyBypass} : {}),
+      },
+    } : {}),
+  });
   try {
     const page = await browser.newPage({viewport, deviceScaleFactor});
     page.on("console", message => report.console.push({
@@ -369,10 +692,11 @@ async function runVisual(input) {
     });
     report.httpStatus = response?.status();
     report.canvasCount = await page.locator("canvas").count();
+    const layerText = input.layerTitle || input.layer;
     report.layerTextFound = viewMode === "default"
       ? true
-      : input.layer
-      ? await page.getByText(input.layer, {exact: false}).count() > 0
+      : layerText
+      ? await page.getByText(layerText, {exact: false}).count() > 0
       : true;
     report.groupTextFound = (
       await Promise.all(
@@ -386,6 +710,7 @@ async function runVisual(input) {
     }
     report.plugins = await evaluatePluginChecks(page, input.pluginChecks, report);
     const beforeCapture = await captureMap(page, directory, "before", fullPage);
+    report.hover = await exerciseHover(page, input, directory, timeout);
     report.interaction = null;
     if (input.plan?.interaction?.type === "click-centre-feature") {
       const beforeText = await interactionText(page);
@@ -412,9 +737,31 @@ async function runVisual(input) {
       ).catch(() => {});
       await page.waitForTimeout(500);
       const afterText = await interactionText(page);
-      const expectedLayer = input.plan.interaction.expectedLayer || input.layer || "";
+      const expectedLayer = input.plan.interaction.expectedLayerTitle
+        || input.plan.interaction.expectedLayer
+        || input.layerTitle
+        || input.layer
+        || "";
       const expectedFeatureId = input.plan.interaction.expectedFeatureId;
       const infoPanelExpanded = await infoPanel.isVisible().catch(() => false);
+      const infoPanelText = infoPanelExpanded
+        ? (await infoPanel.innerText().catch(() => ""))
+          .replace(/\s+/g, " ")
+          .trim()
+        : "";
+      const expectedInfoPanelText = Array.isArray(
+        input.plan.interaction.expectedInfoPanelText,
+      )
+        ? input.plan.interaction.expectedInfoPanelText.filter(
+          value => typeof value === "string" && value,
+        )
+        : [];
+      const expectedInfoPanelTextFound = Object.fromEntries(
+        expectedInfoPanelText.map(value => [
+          value,
+          infoPanelText.toLowerCase().includes(value.toLowerCase()),
+        ]),
+      );
       let infoPanelImage = null;
       if (infoPanelExpanded) {
         infoPanelImage = await infoPanel.screenshot({
@@ -428,6 +775,10 @@ async function runVisual(input) {
         textChanged: afterText !== beforeText,
         infoPanelExpanded,
         infoPanelImage: infoPanelImage ? pngSize(infoPanelImage) : null,
+        expectedInfoPanelText,
+        expectedInfoPanelTextFound,
+        infoPanelTextLength: infoPanelText.length,
+        infoPanelTextSample: infoPanelText.slice(0, 2000),
         expectedLayerFound: expectedLayer
           ? afterText.toLowerCase().includes(String(expectedLayer).toLowerCase())
           : true,
@@ -437,6 +788,14 @@ async function runVisual(input) {
         beforeTextLength: beforeText.length,
         afterTextLength: afterText.length,
         afterTextSample: afterText.slice(0, 2000),
+        passed: (
+          afterText !== beforeText
+          && (
+            !input.plan.interaction.requireInfoPanel
+            || infoPanelExpanded
+          )
+          && Object.values(expectedInfoPanelTextFound).every(Boolean)
+        ),
       };
     }
     report.panelNavigation = panels.length
@@ -470,14 +829,9 @@ async function runVisual(input) {
       },
     };
     const interactionPassed = report.interaction
-      ? (
-        report.interaction.textChanged
-        && (
-          !input.plan?.interaction?.requireInfoPanel
-          || report.interaction.infoPanelExpanded
-        )
-      )
+      ? report.interaction.passed
       : true;
+    const hoverPassed = report.hover ? report.hover.passed : true;
     const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
     const pluginsPassed = report.plugins.every(plugin => plugin.passed);
     report.passed = Boolean(
@@ -485,6 +839,7 @@ async function runVisual(input) {
       && report.canvasCount
       && report.layerTextFound
       && report.groupTextFound
+      && hoverPassed
       && interactionPassed
       && panelsPassed
       && pluginsPassed
@@ -530,16 +885,13 @@ async function runVisual(input) {
         observed: report.pageErrors.length,
       },
       {
+        id: "visual.hover",
+        passed: report.hover ? report.hover.passed : true,
+        observed: report.hover ?? null,
+      },
+      {
         id: "visual.feature_interaction",
-        passed: report.interaction
-          ? (
-            report.interaction.textChanged
-            && (
-              !input.plan?.interaction?.requireInfoPanel
-              || report.interaction.infoPanelExpanded
-            )
-          )
-          : true,
+        passed: report.interaction ? report.interaction.passed : true,
         observed: report.interaction,
       },
       ...panels.map(panel => ({
@@ -572,8 +924,9 @@ async function runVisual(input) {
               ? "binding"
               : !report.groupTextFound
                 ? "group"
-                : report.interaction
-                  && !report.interaction.textChanged
+                : report.hover && !report.hover.passed
+                  ? "hover"
+                  : report.interaction && !report.interaction.passed
                   ? "feature"
                   : panels.some(panel => !report.panels?.[panel]?.passed)
                     ? "panel"
@@ -599,10 +952,13 @@ async function runVisual(input) {
       infoPanel: report.interaction?.infoPanelExpanded
         ? `${runId}/info-panel.png`
         : null,
-      filteringPanel: report.panels?.filtering?.opened
+      hoverTooltip: report.hover?.image
+        ? `${runId}/hover-tooltip.png`
+        : null,
+      filteringPanel: report.panels?.filtering?.captured
         ? `${runId}/filtering-panel.png`
         : null,
-      stylingPanel: report.panels?.styling?.opened
+      stylingPanel: report.panels?.styling?.captured
         ? `${runId}/styling-panel.png`
         : null,
     },
