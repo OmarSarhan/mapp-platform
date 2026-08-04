@@ -72,6 +72,8 @@ jobs:
         run: node --check docker/xyz/supervisor.mjs
 
       - name: Validate shell and Compose configuration
+        env:
+          SEMANTIC_INTERNAL_TOKEN: ci-only-not-a-secret-semantic-token-000000
         run: |
           bash -n bin/mapp scripts/verify.sh docker/postgis/healthcheck.sh docker/postgis/init/10-roles.sh
           docker compose --env-file .env.example -f compose.yaml config --quiet
@@ -82,7 +84,7 @@ jobs:
           docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml -f compose.db-port.yaml config --quiet
           DBS_MAPP='postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require' \
             docker compose --env-file /dev/null -f compose.yaml config --format json \
-            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require"; assert services["xyz"]["environment"]["DBS_MAPP"] == expected == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" not in services and "etl" not in services; assert "depends_on" not in services["xyz"] and "depends_on" not in services["config-ui"]'
+            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require"; assert services["xyz"]["environment"]["DBS_MAPP"] == expected == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" not in services and "etl" not in services; assert "db" not in services["xyz"].get("depends_on", {}); assert set(services["config-ui"].get("depends_on", {})) == {"semantic-service"}'
           export PRODUCTION_MAP_SITE=https://maps.company.co.uk
           export PRODUCTION_CONFIG_SITE=https://config.company.co.uk
           export PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui
