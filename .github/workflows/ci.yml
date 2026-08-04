@@ -39,8 +39,19 @@ jobs:
       - name: Test ETL
         run: PYTHONPATH=etl/src python -m unittest discover -s etl/tests -v
 
+      - name: Test semantic service
+        run: PYTHONPATH=semantic-service python -m unittest discover -s semantic-service/tests -v
+
+      - name: Build semantic service image
+        run: docker build --tag mapp-semantic-service:ci semantic-service
+
       - name: Test deployment helpers
         run: PYTHONPATH=. python -m unittest discover -s scripts/tests -v
+
+      - name: Test browser egress allowlist
+        run: |
+          docker build --tag mapp-egress-proxy:ci docker/egress-proxy
+          python scripts/test_egress_proxy.py --proxy-image mapp-egress-proxy:ci
 
       - name: Build dashboard
         working-directory: config-ui

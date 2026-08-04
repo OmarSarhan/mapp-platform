@@ -24,9 +24,9 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
     sql = None
 
 
-API_VERSION = "1.0"
-CONTRACT_VERSION = "1.0"
-RULES_VERSION = "1.4"
+API_VERSION = "1.4"
+CONTRACT_VERSION = "1.4"
+RULES_VERSION = "1.6"
 XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -43,6 +43,24 @@ ARTIFACT_DIR = Path(
 RELOAD_LOCK = threading.Lock()
 PROPOSAL_LOCK = threading.RLock()
 
+DERIVED_ERROR_PRESENTATION = {
+    "errorCodeField": "code",
+    "errorCategoryField": "category",
+    "reasonField": "reasons",
+    "reasonActionField": "suggestedAction",
+    "safeStateField": "safeState",
+    "stateUnchangedField": "stateUnchanged",
+    "probeField": "probe",
+    "queryErrorCodes": {
+        "invalid": "derived_layer.query_invalid",
+        "policy": "derived_layer.query_not_allowed",
+        "compute": "derived_layer.query_too_expensive",
+    },
+    "materializationFallbackCode": (
+        "derived_layer.materialization_too_large"
+    ),
+}
+
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect `config-cli schema` and correct the reported path."},
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
@@ -56,13 +74,126 @@ RULES = [
     {"id": "workspace.render", "category": "render", "description": "XYZ-equivalent bounded database reads must succeed.", "remediation": "Review the relation, SRID, expressions, and database permissions."},
     {"id": "sql.scalar_read_only", "category": "security", "description": "Calculated information values are one read-only scalar expression.", "remediation": "Remove statements, comments, subqueries, session functions, and system access."},
     {"id": "derived_layer.select_only", "category": "security", "description": "Managed derived layers are one dependency-checked SELECT materialized only inside derived_layers.", "remediation": "Declare every schema-qualified source and remove statements, comments, undeclared relations, or unsafe operations."},
+    {"id": "derived_layer.query_cost", "category": "database", "description": "Every managed derived-layer query must pass bounded SQL-shape, H3-expansion, and recursive PostgreSQL plan checks before a view or materialized view is created, replaced, or refreshed.", "remediation": "Reduce joins, generated rows, H3 resolution or traversal distance, and intermediate work; changing an over-budget query to an ordinary view does not bypass this guard."},
+    {"id": "derived_layer.materialization_size", "category": "database", "description": "Materialized derived layers must pass the server-side PostgreSQL plan-size probe and stay within the advertised 1 GiB estimated-storage limit.", "remediation": "Use an ordinary view, reduce the derived result, or choose a tighter source query; the materialized operation remains blocked while its estimate exceeds the limit."},
     {"id": "svg.safe", "category": "security", "description": "Dashboard SVGs must be bounded, parseable, and free of active content.", "remediation": "Use a safe SVG from `config-cli icons list`."},
     {"id": "plugin.catalogue", "category": "security", "description": "External XYZ plugins must be source-controlled, manifest-backed, compatible, contained, and schema-closed.", "remediation": "Run `config-cli plugins validate` and correct the deployment plugin package."},
     {"id": "proposal.plugin_catalogue", "category": "proposal", "description": "A proposal and its preview evidence apply only to the plugin catalogue fingerprint against which they were created.", "remediation": "Create and preview a new proposal after any plugin deployment change."},
     {"id": "proposal.revision", "category": "proposal", "description": "A proposal applies only to the revision from which it was created.", "remediation": "Create a new proposal against the current workspace."},
+    {"id": "semantic.generated_read_only", "category": "semantic", "description": "Generated source facts are updated only by the managed derived-layer lifecycle.", "remediation": "Edit curated semantic annotations through a revision-bound semantic proposal."},
+    {"id": "semantic.derived_ready", "category": "semantic", "description": "A managed derived layer must have a ready semantic profile before a new workspace reference can be published.", "remediation": "Wait for automatic delivery or ask a semantic administrator to resolve the failure and explicitly retry delivery."},
     {"id": "visual.data", "category": "visual", "description": "A database-backed visual test needs non-empty valid geometry.", "remediation": "Load data or provide an explicit centre and zoom."},
 ]
 DATABASE_LAYER_FORMATS = {"cluster", "geojson", "mvt", "vector", "wkt"}
+MAP_EXTENT_VIEWPORT_WIDTH = 1920
+MAP_EXTENT_VIEWPORT_HEIGHT = 1080
+MAP_EXTENT_TILE_SIZE = 256
+WEB_MERCATOR_MAX_LATITUDE = 85.0511287798066
+VISUAL_PLANNING_STATEMENT_TIMEOUT_MS = 5000
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 100
+_PAGE_CURSOR_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def pagination_requested(query: dict[str, list[str]]) -> bool:
+    return "limit" in query or "cursor" in query
+
+
+def pagination_parameters(
+    query: dict[str, list[str]],
+    *,
+    allowed: set[str] | None = None,
+) -> tuple[int, str | None]:
+    allowed_keys = {"limit", "cursor"} | (allowed or set())
+    unexpected = sorted(set(query) - allowed_keys)
+    if unexpected:
+        raise ValueError(
+            "Unsupported query parameters: " + ", ".join(unexpected)
+        )
+
+    def one(name: str) -> str | None:
+        values = query.get(name)
+        if values is None:
+            return None
+        if len(values) != 1:
+            raise ValueError(f"Query parameter {name} may be supplied only once.")
+        return values[0]
+
+    limit_text = one("limit")
+    if limit_text is None:
+        limit = DEFAULT_PAGE_LIMIT
+    elif not re.fullmatch(r"[1-9][0-9]*", limit_text):
+        raise ValueError("limit must be an integer from 1 to 100.")
+    else:
+        limit = int(limit_text, 10)
+        if limit > MAX_PAGE_LIMIT:
+            raise ValueError("limit must be an integer from 1 to 100.")
+
+    cursor = one("cursor")
+    if cursor is not None and _PAGE_CURSOR_RE.fullmatch(cursor) is None:
+        raise ValueError("cursor is invalid or expired.")
+    return limit, cursor
+
+
+def _page_cursor(scope: str, item: Any) -> str:
+    value = json.dumps(
+        {"scope": scope, "position": item},
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def paginate_collection(
+    items: list[Any],
+    *,
+    limit: int,
+    cursor: str | None,
+    scope: str,
+) -> tuple[list[Any], dict[str, Any]]:
+    start = 0
+    if cursor is not None:
+        for index, item in enumerate(items):
+            if _page_cursor(scope, item) == cursor:
+                start = index + 1
+                break
+        else:
+            raise ValueError("cursor is invalid or expired.")
+
+    page_items = items[start : start + limit]
+    has_more = start + len(page_items) < len(items)
+    next_cursor = (
+        _page_cursor(scope, page_items[-1])
+        if has_more and page_items
+        else None
+    )
+    return page_items, {"limit": limit, "nextCursor": next_cursor}
+
+
+class VisualPlanningDatabaseError(RuntimeError):
+    """A database failure with safe, structured visual-planning context."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        query_purpose: str,
+        timed_out: bool,
+    ) -> None:
+        self.stage = stage
+        self.query_purpose = query_purpose
+        self.timed_out = timed_out
+        self.timeout_milliseconds = (
+            VISUAL_PLANNING_STATEMENT_TIMEOUT_MS if timed_out else None
+        )
+        message = (
+            "Visual planning timed out before browser validation began."
+            if timed_out
+            else "The database could not prepare this read-only visual check."
+        )
+        super().__init__(message)
 
 PLUGIN_MANIFEST: list[dict[str, Any]] = [
     {"key": "admin", "configuration": "object", "execution": "locale", "purpose": "Administrator navigation for authenticated administrators.", "prerequisites": ["standard map button column", "authenticated administrator"]},
@@ -116,12 +247,378 @@ def plugin_manifest() -> dict[str, Any]:
         "valid": external["valid"],
     }
 
+def _semantic_proposal_input_schema(*, require_fingerprint: bool) -> dict[str, Any]:
+    curated_path = r"^/curated(?:/(?:[^/~]|~[01])+)*$"
+    nested_curated_path = r"^/curated/(?:[^/~]|~[01])+(?:/(?:[^/~]|~[01])+)*$"
+    properties: dict[str, Any] = {
+        "assetId": {"type": "string", "minLength": 1, "maxLength": 200},
+        "baseVersion": {"type": "integer", "minimum": 1},
+        "operations": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["op", "path", "value"],
+                        "properties": {
+                            "op": {"const": "set"},
+                            "path": {
+                                "type": "string",
+                                "pattern": curated_path,
+                            },
+                            "value": {},
+                        },
+                        "additionalProperties": False,
+                        "allOf": [
+                            {
+                                "if": {
+                                    "properties": {
+                                        "path": {"const": "/curated"},
+                                    },
+                                    "required": ["path"],
+                                },
+                                "then": {
+                                    "properties": {
+                                        "value": {"type": "object"},
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "type": "object",
+                        "required": ["op", "path"],
+                        "properties": {
+                            "op": {"const": "unset"},
+                            "path": {
+                                "type": "string",
+                                "pattern": nested_curated_path,
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                ],
+            },
+        },
+        "explanation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "pattern": r"\S",
+        },
+    }
+    required = ["assetId", "baseVersion", "operations"]
+    if require_fingerprint:
+        properties["fingerprint"] = {
+            "type": "string",
+            "pattern": r"^[0-9a-f]{64}$",
+        }
+        required.append("fingerprint")
+    return {
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": False,
+    }
+
+
+def _live_visual_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["layer"],
+        "properties": {
+            "layer": {"type": "string", "minLength": 1},
+            "locale": {"type": "string"},
+            "centre": {
+                "type": "array",
+                "prefixItems": [{"type": "number"}, {"type": "number"}],
+                "minItems": 2,
+                "maxItems": 2,
+            },
+            "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+            "hover": {"type": "boolean"},
+            "expectedHoverText": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                },
+                "uniqueItems": True,
+            },
+            "expectedInfoPanelText": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                },
+                "uniqueItems": True,
+            },
+        },
+        "additionalProperties": True,
+    }
+
+
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "semantic.status": {
+        "method": "GET",
+        "path": "/api/semantic/status",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.catalog.export": {
+        "method": "GET",
+        "path": "/api/semantic/catalog",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.catalog.search": {
+        "method": "GET",
+        "path": "/api/semantic/catalog/search",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.catalog.show": {
+        "method": "GET",
+        "pathTemplate": "/api/semantic/catalog/objects/{assetId}",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.catalog.history": {
+        "method": "GET",
+        "pathTemplate": "/api/semantic/catalog/objects/{assetId}/history",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.catalog.archive": {
+        "method": "POST",
+        "pathTemplate": "/api/semantic/catalog/objects/{assetId}/archive",
+        "risk": "semantic-archive",
+        "scope": "semantic:admin",
+        "requiredScopes": ["semantic:inspect", "semantic:admin"],
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "semantic.source.relations": {
+        "method": "GET",
+        "path": "/api/semantic/source/relations",
+        "risk": "inspect",
+        "scope": "semantic:source",
+        "requiredScopes": ["semantic:inspect", "semantic:source"],
+    },
+    "semantic.source.sync": {
+        "method": "POST",
+        "path": "/api/semantic/source/sync",
+        "risk": "semantic-source",
+        "scope": "semantic:source",
+        "requiredScopes": ["semantic:inspect", "semantic:source"],
+        "inputSchema": {
+            "type": "object",
+            "required": ["alias", "schema", "relation"],
+            "properties": {
+                "alias": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
+                },
+                "schema": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,62}$",
+                },
+                "relation": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,62}$",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "semantic.source.archive-excluded": {
+        "method": "POST",
+        "path": "/api/semantic/source/archive-excluded",
+        "risk": "semantic-archive",
+        "scope": "semantic:admin",
+        "requiredScopes": ["semantic:inspect", "semantic:admin"],
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "semantic.derived-profiles.repair": {
+        "method": "POST",
+        "pathTemplate": "/api/semantic/derived-profiles/{name}/repair",
+        "risk": "semantic-repair",
+        "scope": "semantic:admin",
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "semantic.derived-profiles.list": {
+        "method": "GET",
+        "path": "/api/semantic/derived-profiles",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.derived-profiles.show": {
+        "method": "GET",
+        "pathTemplate": "/api/semantic/derived-profiles/{name}",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.generate": {
+        "method": "POST",
+        "path": "/api/semantic/generate",
+        "risk": "external-semantic-egress",
+        "scope": "semantic:generate",
+        "requiredScopes": ["semantic:inspect", "semantic:generate"],
+        "conditionalScopes": [{
+            "whenAnyTrue": [
+                "contextOptions.sampleRows",
+                "contextOptions.statistics",
+            ],
+            "requiredScopes": ["semantic:data"],
+            "reason": (
+                "Optional row samples or data-derived statistics require "
+                "explicit data access."
+            ),
+        }],
+        "inputSchema": {
+            "type": "object",
+            "required": ["assetId", "target"],
+            "properties": {
+                "assetId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                },
+                "target": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"const": "table"},
+                            },
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "fieldId"],
+                            "properties": {
+                                "kind": {"const": "field"},
+                                "fieldId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 200,
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    ],
+                },
+                "contextOptions": {
+                    "type": "object",
+                    "properties": {
+                        "sampleRows": {"type": "boolean"},
+                        "statistics": {"type": "boolean"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "semantic.proposals.check": {
+        "method": "POST",
+        "path": "/api/semantic/proposals/check",
+        "risk": "inspect",
+        "scope": "semantic:propose",
+        "inputSchema": _semantic_proposal_input_schema(
+            require_fingerprint=False
+        ),
+    },
+    "semantic.proposals.create": {
+        "method": "POST",
+        "path": "/api/semantic/proposals",
+        "risk": "propose",
+        "scope": "semantic:propose",
+        "inputSchema": _semantic_proposal_input_schema(
+            require_fingerprint=True
+        ),
+    },
+    "semantic.proposals.apply": {
+        "method": "POST",
+        "pathTemplate": "/api/semantic/proposals/{proposalId}/apply",
+        "risk": "semantic-apply",
+        "scope": "semantic:apply",
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "semantic.proposals.list": {
+        "method": "GET",
+        "path": "/api/semantic/proposals",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.proposals.show": {
+        "method": "GET",
+        "pathTemplate": "/api/semantic/proposals/{proposalId}",
+        "risk": "inspect",
+        "scope": "semantic:inspect",
+    },
+    "semantic.proposals.decline": {
+        "method": "POST",
+        "pathTemplate": "/api/semantic/proposals/{proposalId}/decline",
+        "risk": "propose",
+        "scope": "semantic:propose",
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {
+                "confirmed": {"const": True},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "derived-layers.map-extent": {
+        "method": "GET",
+        "path": "/api/derived-layers/map-extent",
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "derived-layers.create": {
         "method": "POST",
         "path": "/api/derived-layers",
         "risk": "database-definition",
         "scope": "derive",
+        "requiredScopes": ["derive", "semantic:inspect"],
+        "operationKind": "derived-layer.create",
+        "presentation": {
+            **DERIVED_ERROR_PRESENTATION,
+            "messageField": "userMessage",
+            "nextActionField": "suggestedAction",
+            "technicalFields": [
+                "queryPlanProbe", "materializationProbe", "technicalDetail",
+            ],
+        },
         "inputSchema": {
             "type": "object",
             "required": [
@@ -142,6 +639,17 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "idColumn": {"type": "string"},
                 "geometryColumn": {"type": "string"},
                 "description": {"type": "string"},
+                "background": {"type": "boolean"},
+                "spatialScope": {
+                    "type": "object",
+                    "default": {"type": "workspace-map-extent"},
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"const": "workspace-map-extent"},
+                        "locale": {"type": "string", "minLength": 1},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -151,10 +659,22 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "pathTemplate": "/api/derived-layers/{name}/refresh",
         "risk": "database-refresh",
         "scope": "derive",
+        "operationKind": "derived-layer.refresh",
+        "presentation": {
+            **DERIVED_ERROR_PRESENTATION,
+            "messageField": "userMessage",
+            "nextActionField": "suggestedAction",
+            "technicalFields": [
+                "queryPlanProbe", "materializationProbe", "technicalDetail",
+            ],
+        },
         "inputSchema": {
             "type": "object",
             "required": ["confirmed"],
-            "properties": {"confirmed": {"const": True}},
+            "properties": {
+                "confirmed": {"const": True},
+                "background": {"type": "boolean"},
+            },
             "additionalProperties": False,
         },
     },
@@ -163,12 +683,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "pathTemplate": "/api/derived-layers/{name}/replace",
         "risk": "database-definition",
         "scope": "derive",
+        "requiredScopes": ["derive", "semantic:inspect"],
+        "operationKind": "derived-layer.replace",
         "presentation": {
+            **DERIVED_ERROR_PRESENTATION,
             "messageField": "derivedLayer.userMessage",
             "nextActionField": "derivedLayer.suggestedAction",
             "technicalFields": [
                 "workspaceReferences", "fieldReferences", "dependents",
-                "technicalDetail",
+                "queryPlanProbe", "materializationProbe", "technicalDetail",
             ],
         },
         "inputSchema": {
@@ -193,6 +716,17 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "idColumn": {"type": "string"},
                 "geometryColumn": {"type": "string"},
                 "description": {"type": "string"},
+                "background": {"type": "boolean"},
+                "spatialScope": {
+                    "type": "object",
+                    "default": {"type": "workspace-map-extent"},
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"const": "workspace-map-extent"},
+                        "locale": {"type": "string", "minLength": 1},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -203,6 +737,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "risk": "database-definition",
         "scope": "derive",
         "presentation": {
+            **DERIVED_ERROR_PRESENTATION,
             "messageField": "userMessage",
             "nextActionField": "suggestedAction",
             "technicalFields": [
@@ -261,28 +796,28 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "visual.plan": {
+        "method": "POST",
+        "path": "/api/visual-plan",
+        "risk": "visual",
+        "scope": "visual",
+        "inputSchema": _live_visual_input_schema(),
+    },
     "visual.test": {
         "method": "POST",
         "path": "/api/visual-test",
         "risk": "visual",
         "scope": "visual",
         "operationKind": "visual.test",
-        "inputSchema": {
-            "type": "object",
-            "required": ["layer"],
-            "properties": {
-                "layer": {"type": "string", "minLength": 1},
-                "locale": {"type": "string"},
-                "centre": {
-                    "type": "array",
-                    "prefixItems": [{"type": "number"}, {"type": "number"}],
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                "zoom": {"type": "number", "minimum": 0, "maximum": 22},
-            },
-            "additionalProperties": True,
-        },
+        "inputSchema": _live_visual_input_schema(),
+    },
+    "visual.screenshot": {
+        "method": "POST",
+        "path": "/api/visual-test",
+        "risk": "visual",
+        "scope": "visual",
+        "operationKind": "visual.test",
+        "inputSchema": _live_visual_input_schema(),
     },
     "proposals.visual-test": {
         "method": "POST",
@@ -302,6 +837,27 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": ["focus", "default"],
                     "default": "focus",
+                },
+                "hover": {"type": "boolean"},
+                "expectedHoverText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedInfoPanelText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
                 },
             },
             "additionalProperties": True,
@@ -365,6 +921,27 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1},
                 },
+                "hover": {"type": "boolean"},
+                "expectedHoverText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedInfoPanelText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
             },
             "additionalProperties": True,
         },
@@ -389,6 +966,16 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "viewport": {"type": "object"},
                 "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+                "expectedInfoPanelText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
             },
             "additionalProperties": True,
         },
@@ -414,6 +1001,27 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "viewport": {"type": "object"},
                 "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+                "hover": {"type": "boolean"},
+                "expectedHoverText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedInfoPanelText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
             },
             "additionalProperties": True,
         },
@@ -470,6 +1078,27 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1},
                 },
+                "hover": {"type": "boolean"},
+                "expectedHoverText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
+                "expectedInfoPanelText": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000,
+                    },
+                    "uniqueItems": True,
+                },
             },
             "additionalProperties": True,
         },
@@ -482,7 +1111,9 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "operationKind": "xyz.reload",
         "inputSchema": {
             "type": "object",
+            "required": ["confirmed"],
             "properties": {
+                "confirmed": {"const": True},
                 "workspaceFingerprint": {
                     "type": "string",
                     "pattern": "^[0-9a-f]{64}$",
@@ -505,8 +1136,16 @@ def contract(instance_id: str) -> dict[str, Any]:
         "authentication": {
             "type": "bearer",
             "tokens": "issued by config UI or approved device authorization",
-            "scopes": ["full", "inspect", "propose", "visual", "apply", "reload", "derive"],
-            "defaultDeviceScopes": ["inspect", "propose", "visual"],
+            "scopes": [
+                "full", "inspect", "propose", "visual", "apply", "reload",
+                "derive", "semantic:inspect", "semantic:source",
+                "semantic:generate", "semantic:data",
+                "semantic:propose",
+                "semantic:apply", "semantic:admin",
+            ],
+            "defaultDeviceScopes": [
+                "inspect", "propose", "visual", "semantic:inspect",
+            ],
         },
         "commands": [
             "describe", "schema", "rules", "examples",
@@ -517,8 +1156,22 @@ def contract(instance_id: str) -> dict[str, Any]:
             "catalog list", "icons list",
             "derived-layers capabilities", "derived-layers list",
             "derived-layers show", "derived-layers create",
+            "derived-layers map-extent",
             "derived-layers refresh", "derived-layers replace",
             "derived-layers drop",
+            "semantic status",
+            "semantic catalog export", "semantic catalog search",
+            "semantic catalog show", "semantic catalog history",
+            "semantic catalog archive",
+            "semantic source relations", "semantic source sync",
+            "semantic source archive-excluded",
+            "semantic derived-profiles list",
+            "semantic derived-profiles show",
+            "semantic derived-profiles repair",
+            "semantic generate table", "semantic generate field",
+            "semantic proposals check", "semantic proposals create",
+            "semantic proposals list", "semantic proposals show",
+            "semantic proposals apply", "semantic proposals decline",
             "validate", "set", "unset", "amend", "sql capabilities", "sql test",
             "visual-plan", "visual-test", "screenshot",
             "proposals preview-plan", "proposals preview-test",
@@ -539,7 +1192,7 @@ def contract(instance_id: str) -> dict[str, Any]:
             "check reload status",
             "verify",
         ],
-        "exitCodes": {"success": 0, "usage": 2, "validation": 3, "conflict": 4, "connectivity": 5, "visual": 6, "authentication": 7},
+        "exitCodes": {"success": 0, "usage": 2, "validation": 3, "conflict": 4, "connectivity": 5, "visual": 6, "authentication": 7, "interrupted": 130},
         "capabilities": {
             "discovery": "/api/capabilities",
             "operations": {
@@ -547,6 +1200,13 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "terminalStatuses": ["succeeded", "failed", "indeterminate"],
             },
             "responseMetadata": "meta",
+        },
+        "pagination": {
+            "version": "1",
+            "defaultLimit": DEFAULT_PAGE_LIMIT,
+            "maxLimit": MAX_PAGE_LIMIT,
+            "cursor": "opaque",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
         },
     }
 
@@ -564,6 +1224,12 @@ def capabilities(instance_id: str) -> dict[str, Any]:
             "metadataField": "meta",
             "requestIdField": "requestId",
             "operationIdField": "operationId",
+        },
+        "pagination": {
+            "version": "1",
+            "defaultLimit": DEFAULT_PAGE_LIMIT,
+            "maxLimit": MAX_PAGE_LIMIT,
+            "cursor": "opaque",
         },
     }
 
@@ -927,7 +1593,18 @@ def examples() -> dict:
     }
 
 
-def proposal_create(store, original: dict, original_revision: str, candidate: dict, operations: list, diff: list, actor: str, explanation: str | None = None) -> dict:
+def proposal_create(
+    store,
+    original: dict,
+    original_revision: str,
+    candidate: dict,
+    operations: list,
+    diff: list,
+    actor: str,
+    explanation: str | None = None,
+    *,
+    plugin_catalogue_fingerprint: str | None = None,
+) -> dict:
     proposal_id = (
         f"{int(time.time())}-{workspace_hash(candidate)[:12]}-"
         f"{secrets.token_hex(3)}"
@@ -940,7 +1617,11 @@ def proposal_create(store, original: dict, original_revision: str, candidate: di
         "originalRevision": original_revision,
         "originalHash": workspace_hash(original),
         "candidateHash": workspace_hash(candidate),
-        "pluginCatalogueFingerprint": external_plugin_catalogue()["fingerprint"],
+        "pluginCatalogueFingerprint": (
+            plugin_catalogue_fingerprint
+            if plugin_catalogue_fingerprint is not None
+            else external_plugin_catalogue()["fingerprint"]
+        ),
         "operations": operations,
         "diff": diff,
         "explanation": explanation or explain_diff(diff),
@@ -1123,7 +1804,7 @@ def wait_reload(generation: int, fingerprint: str | None = None, timeout: float 
     return {**reload_status(), "completed": False, "timeoutSeconds": timeout}
 
 
-def apply_visual_override(plan: dict, payload: dict) -> dict:
+def _visual_override(payload: dict) -> dict:
     override = {}
     if "centre" in payload:
         centre = payload["centre"]
@@ -1150,6 +1831,11 @@ def apply_visual_override(plan: dict, payload: dict) -> dict:
         ):
             raise ValueError("Visual zoom must be a finite number from 0 to 22.")
         override["zoom"] = zoom
+    return override
+
+
+def apply_visual_override(plan: dict, payload: dict) -> dict:
+    override = _visual_override(payload)
     if not override:
         return plan
     return {
@@ -1275,12 +1961,165 @@ def select_locale(
     raise ValueError("Workspace does not contain a usable locale.")
 
 
+def workspace_map_extent(
+    workspace: dict,
+    locale_key: str | None = None,
+) -> dict[str, Any]:
+    selected_locale, locale = select_locale(workspace, locale_key)
+    view = locale.get("view")
+    if not isinstance(view, dict):
+        raise ValueError(
+            f"Locale {selected_locale!r} needs view.lng, view.lat, and view.z "
+            "before a workspace map extent can be calculated."
+        )
+
+    values: dict[str, float] = {}
+    for key in ("lng", "lat", "z"):
+        value = view.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(
+                f"Locale {selected_locale!r} view.{key} must be a finite number "
+                "before a workspace map extent can be calculated."
+            )
+        values[key] = float(value)
+
+    longitude = values["lng"]
+    latitude = values["lat"]
+    zoom = values["z"]
+    if longitude < -180 or longitude > 180:
+        raise ValueError(
+            f"Locale {selected_locale!r} view.lng must be between -180 and 180."
+        )
+    if latitude < -90 or latitude > 90:
+        raise ValueError(
+            f"Locale {selected_locale!r} view.lat must be between -90 and 90."
+        )
+    if zoom < 0 or zoom > 30:
+        raise ValueError(
+            f"Locale {selected_locale!r} view.z must be between 0 and 30."
+        )
+
+    scope_zoom = max(0.0, zoom - 1.0)
+    world_size = MAP_EXTENT_TILE_SIZE * (2.0 ** scope_zoom)
+    half_longitude_span = (
+        MAP_EXTENT_VIEWPORT_WIDTH / world_size * 360.0 / 2.0
+    )
+
+    projected_latitude = max(
+        -WEB_MERCATOR_MAX_LATITUDE,
+        min(WEB_MERCATOR_MAX_LATITUDE, latitude),
+    )
+    latitude_radians = math.radians(projected_latitude)
+    centre_y = (
+        1.0
+        - math.asinh(math.tan(latitude_radians)) / math.pi
+    ) / 2.0 * world_size
+    north_y = max(0.0, centre_y - MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
+    south_y = min(world_size, centre_y + MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
+
+    def latitude_at(pixel_y: float) -> float:
+        return math.degrees(math.atan(math.sinh(
+            math.pi * (1.0 - 2.0 * pixel_y / world_size)
+        )))
+
+    def coordinate(value: float) -> float:
+        rounded = round(value, 12)
+        return 0.0 if rounded == 0 else rounded
+
+    north = coordinate(latitude_at(north_y))
+    south = coordinate(latitude_at(south_y))
+    longitude_span = half_longitude_span * 2.0
+    if longitude_span >= 360.0:
+        longitude_ranges = [(-180.0, 180.0)]
+    else:
+        west = longitude - half_longitude_span
+        east = longitude + half_longitude_span
+        if west < -180.0:
+            longitude_ranges = [
+                (west + 360.0, 180.0),
+                (-180.0, east),
+            ]
+        elif east > 180.0:
+            longitude_ranges = [
+                (west, 180.0),
+                (-180.0, east - 360.0),
+            ]
+        else:
+            longitude_ranges = [(west, east)]
+
+    def json_number(value: float) -> int | float:
+        return int(value) if value.is_integer() else value
+
+    return {
+        "type": "workspace-map-extent",
+        "locale": selected_locale,
+        "sourceView": {
+            "lng": json_number(longitude),
+            "lat": json_number(latitude),
+            "z": json_number(zoom),
+        },
+        "scopeZoom": json_number(scope_zoom),
+        "zoomOffset": json_number(scope_zoom - zoom),
+        "viewport": {
+            "width": MAP_EXTENT_VIEWPORT_WIDTH,
+            "height": MAP_EXTENT_VIEWPORT_HEIGHT,
+            "tileSize": MAP_EXTENT_TILE_SIZE,
+        },
+        "crs": "EPSG:4326",
+        "envelopes": [
+            {
+                "west": coordinate(west),
+                "south": south,
+                "east": coordinate(east),
+                "north": north,
+            }
+            for west, east in longitude_ranges
+        ],
+        "selection": "intersects-output-geometry",
+        "clipsGeometry": False,
+        "guidance": (
+            "This is an output-row guard only; it keeps complete output "
+            "features intersecting the fixed extent. It is not a security "
+            "boundary and does not scope source-side aggregates, clip "
+            "geometry, or follow later map movements. Add the envelope inside "
+            "source-side SQL before aggregation when metrics must be map-scoped."
+        ),
+    }
+
+
+def visual_hover_plan(layer: dict) -> dict | None:
+    style = layer.get("style")
+    if not isinstance(style, dict):
+        return None
+    hovers = style.get("hovers")
+    hover = style.get("hover")
+    if hover is None and isinstance(hovers, dict) and hovers:
+        hover = next(iter(hovers.values()))
+    elif isinstance(hover, str) and isinstance(hovers, dict):
+        hover = hovers.get(hover)
+    if not isinstance(hover, dict) or hover.get("display") is not True:
+        return None
+    return {
+        "type": "hover-centre-feature",
+        "field": hover.get("field"),
+        "title": hover.get("title"),
+    }
+
+
 def visual_plan(
     workspace: dict,
     layer_key: str,
     db_connections: dict[str, str],
     locale_key: str | None = None,
+    *,
+    visual_request: dict | None = None,
 ) -> dict:
+    visual_request = visual_request or {}
+    override = _visual_override(visual_request)
     selected_locale, locale = select_locale(workspace, locale_key)
     background_layers = [
         key
@@ -1297,10 +2136,43 @@ def visual_plan(
         raise ValueError(
             f"Unknown layer in locale {selected_locale}: {layer_key}"
         )
+    layer_title = layer.get("name") if isinstance(layer.get("name"), str) else layer_key
+    layer_title = layer_title.strip() or layer_key
+    hover_plan = visual_hover_plan(layer)
+    if "centre" in override and "zoom" in override:
+        plan = {
+            "layer": layer_key,
+            "layerTitle": layer_title,
+            "locale": selected_locale,
+            "source": "browser-centre-feature",
+            "backgroundLayers": background_layers,
+            "centre": override["centre"],
+            "zoom": override["zoom"],
+            "warnings": [
+                "The complete explicit view skips database-wide feature-count "
+                "and extent queries; browser interaction targets the map centre."
+            ],
+        }
+        if is_probeable_database_layer(layer):
+            plan.update({
+                "database": layer.get("dbs") or workspace.get("dbs"),
+                "table": layer["table"],
+                "geometry": layer["geom"],
+                "featureIdField": layer["qID"],
+                "interaction": {
+                    "type": "click-centre-feature",
+                    "expectedLayer": layer_key,
+                    "expectedLayerTitle": layer_title,
+                },
+            })
+        if hover_plan:
+            plan["hover"] = hover_plan
+        return apply_visual_override(plan, visual_request)
     if not is_probeable_database_layer(layer):
         view = locale.get("view") or {}
         plan = {
             "layer": layer_key,
+            "layerTitle": layer_title,
             "locale": selected_locale,
             "source": "workspace-view",
             "backgroundLayers": background_layers,
@@ -1309,6 +2181,8 @@ def visual_plan(
                 "visual check uses the configured workspace view."
             ],
         }
+        if hover_plan:
+            plan["hover"] = hover_plan
         if all(
             isinstance(view.get(key), (int, float))
             and not isinstance(view.get(key), bool)
@@ -1322,7 +2196,7 @@ def visual_plan(
             and math.isfinite(view["z"])
         ):
             plan["zoom"] = view["z"]
-        return plan
+        return apply_visual_override(plan, visual_request)
     if psycopg is None or sql is None:
         raise RuntimeError("PostgreSQL support is unavailable.")
     db_name = layer.get("dbs") or workspace.get("dbs")
@@ -1351,12 +2225,22 @@ def visual_plan(
         LIMIT 1
       ) sample ON TRUE
     """).format(geom=geom, relation=relation_sql)
-    with psycopg.connect(database_url, connect_timeout=5) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SET TRANSACTION READ ONLY")
-            cur.execute("SET statement_timeout = '5000ms'")
-            cur.execute(query)
-            count, west, south, east, north, geometry_type = cur.fetchone()
+    try:
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute(
+                    "SET statement_timeout = "
+                    f"'{VISUAL_PLANNING_STATEMENT_TIMEOUT_MS}ms'"
+                )
+                cur.execute(query)
+                count, west, south, east, north, geometry_type = cur.fetchone()
+    except psycopg.Error as exc:
+        raise VisualPlanningDatabaseError(
+            stage="layer-summary",
+            query_purpose="feature-count-and-extent",
+            timed_out=getattr(exc, "sqlstate", None) == "57014",
+        ) from exc
     if not count or None in (west, south, east, north):
         raise ValueError("Layer has no non-null renderable geometry.")
     centre_x, centre_y = (west + east) / 2, (south + north) / 2
@@ -1386,12 +2270,22 @@ def visual_plan(
         qid=sql.Identifier(layer["qID"]),
         relation=relation_sql,
     )
-    with psycopg.connect(database_url, connect_timeout=5) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SET TRANSACTION READ ONLY")
-            cur.execute("SET statement_timeout = '5000ms'")
-            cur.execute(sample_query, (centre_x, centre_y))
-            sample = cur.fetchone()
+    try:
+        with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute(
+                    "SET statement_timeout = "
+                    f"'{VISUAL_PLANNING_STATEMENT_TIMEOUT_MS}ms'"
+                )
+                cur.execute(sample_query, (centre_x, centre_y))
+                sample = cur.fetchone()
+    except psycopg.Error as exc:
+        raise VisualPlanningDatabaseError(
+            stage="representative-feature",
+            query_purpose="centre-feature-selection",
+            timed_out=getattr(exc, "sqlstate", None) == "57014",
+        ) from exc
     (
         feature_id,
         sample_geometry_type,
@@ -1418,8 +2312,9 @@ def visual_plan(
         zoom = max(16, zoom)
     elif "POLYGON" in upper_geometry:
         zoom = max(14, zoom)
-    return {
+    plan = {
         "layer": layer_key,
+        "layerTitle": layer_title,
         "locale": selected_locale,
         "source": "postgis-feature",
         "backgroundLayers": background_layers,
@@ -1437,7 +2332,11 @@ def visual_plan(
         "interaction": {
             "type": "click-centre-feature",
             "expectedLayer": layer_key,
+            "expectedLayerTitle": layer_title,
             "expectedFeatureId": feature_id,
         },
         "warnings": ["The visual check is focused on one representative feature."],
     }
+    if hover_plan:
+        plan["hover"] = hover_plan
+    return apply_visual_override(plan, visual_request)

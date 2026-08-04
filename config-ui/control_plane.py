@@ -30,6 +30,12 @@ AUDIT_RETAIN_BYTES = 5 * 1024 * 1024
 AUDIT_READ_BYTES = 2 * 1024 * 1024
 AUDIT_RECORD_MAX_BYTES = 64 * 1024
 FAILED_TOKEN_AUDIT_INTERVAL = 60
+DEVICE_SCOPES = {
+    "inspect", "propose", "visual", "apply", "reload", "derive",
+    "semantic:inspect", "semantic:source", "semantic:generate",
+    "semantic:data", "semantic:propose", "semantic:apply", "semantic:admin",
+}
+TOKEN_SCOPES = {"full", *DEVICE_SCOPES}
 
 # Authentication, audit, and proposal state must never be created with
 # process-default world-readable permissions, even briefly.
@@ -389,6 +395,7 @@ class ControlStore:
             current = now()
             valid = False
             retained = []
+            changed = False
             for item in state["sessions"]:
                 created = parse_time(item["created"])
                 used = parse_time(item["lastUsed"])
@@ -398,6 +405,7 @@ class ControlStore:
                     or (current - used).total_seconds() > SESSION_IDLE_SECONDS
                 )
                 if expired:
+                    changed = True
                     continue
                 if hmac.compare_digest(item["hash"], token_hash(session)):
                     if require_csrf and (not csrf or not hmac.compare_digest(item["csrfHash"], token_hash(csrf))):
@@ -405,9 +413,11 @@ class ControlStore:
                         continue
                     item["lastUsed"] = iso(current)
                     valid = True
+                    changed = True
                 retained.append(item)
-            state["sessions"] = retained
-            self._write(state)
+            if changed:
+                state["sessions"] = retained
+                self._write(state)
             return valid
 
     def logout(self, session: str | None) -> None:
@@ -450,13 +460,12 @@ class ControlStore:
                 raise ValueError("Token expiry must be a future ISO-8601 timestamp.")
             normalized_expiry = iso(expiry)
         raw = "mapp_" + secrets.token_urlsafe(32)
-        normalized_scopes = scopes or ["full"]
-        allowed_scopes = {"full", "inspect", "propose", "visual", "apply", "reload", "derive"}
+        normalized_scopes = ["full"] if scopes is None else scopes
         if (
             not isinstance(normalized_scopes, list)
             or not normalized_scopes
             or any(
-                not isinstance(scope, str) or scope not in allowed_scopes
+                not isinstance(scope, str) or scope not in TOKEN_SCOPES
                 for scope in normalized_scopes
             )
         ):
@@ -478,7 +487,16 @@ class ControlStore:
             state = self._state()
             state["tokens"].append(record)
             self._write(state)
-        self.audit("token.created", actor="admin", details={"id": record["id"], "name": name})
+        self.audit(
+            "token.created",
+            actor="admin",
+            details={
+                "id": record["id"],
+                "name": record["name"],
+                "scopes": record["scopes"],
+                "expires": record["expires"],
+            },
+        )
         return raw, self.public_token(record)
 
     def start_device_authorization(
@@ -489,11 +507,13 @@ class ControlStore:
     ) -> dict:
         if not isinstance(device_name, str) or not device_name.strip() or len(device_name) > 100:
             raise ValueError("Device names must contain 1 to 100 characters.")
-        allowed = {"inspect", "propose", "visual", "apply", "reload", "derive"}
         if (
             not isinstance(scopes, list)
             or not scopes
-            or any(not isinstance(scope, str) or scope not in allowed for scope in scopes)
+            or any(
+                not isinstance(scope, str) or scope not in DEVICE_SCOPES
+                for scope in scopes
+            )
         ):
             raise ValueError("Requested device scopes are invalid.")
         current = now()
@@ -547,6 +567,7 @@ class ControlStore:
 
     def approve_device_authorization(self, user_code: str) -> bool:
         approved = False
+        approved_details = None
         with self._locked():
             state = self._state()
             current = now()
@@ -563,12 +584,17 @@ class ControlStore:
                     })
                     self._write(state)
                     approved = True
+                    approved_details = {
+                        "userCode": user_code,
+                        "deviceName": item["deviceName"],
+                        "scopes": item["scopes"],
+                    }
                     break
         if approved:
             self.audit(
                 "device.approved",
                 actor="admin",
-                details={"userCode": user_code},
+                details=approved_details,
             )
         return approved
 
@@ -593,12 +619,11 @@ class ControlStore:
                     return {"status": "invalid"}
 
                 scopes = item.get("scopes")
-                allowed = {"inspect", "propose", "visual", "apply", "reload", "derive"}
                 if (
                     not isinstance(scopes, list)
                     or not scopes
                     or any(
-                        not isinstance(scope, str) or scope not in allowed
+                        not isinstance(scope, str) or scope not in DEVICE_SCOPES
                         for scope in scopes
                     )
                 ):

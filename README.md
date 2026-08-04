@@ -2,8 +2,10 @@
 
 MAPP Platform is the deployable server half of the project. It runs a pinned
 GEOLYTIX XYZ build against PostgreSQL/PostGIS, the workspace configuration
-dashboard and API, server-side browser validation, and Caddy. An optional
-Leeds ArcGIS container can populate the bundled database with sample data.
+dashboard and API, a private semantic metadata service, server-side browser
+validation, and Caddy. An optional one-shot ETL container can populate the
+bundled database with small Leeds samples or the reviewed England Census 2021
+Output Area dataset.
 
 The remote [`config-cli`](https://github.com/OmarSarhan/mapp-config-cli) is a
 separate project. It is installed on an operator or AI-agent computer and
@@ -17,9 +19,9 @@ the complete history as described in
 [Repository split](docs/repository-split.md).
 
 ```text
-optional Leeds ETL ──> bundled sample PostGIS ─┐
+optional one-shot ETL ──> bundled PostGIS ─────┐
                                                ├─ DBS_MAPP ─┬─> XYZ
-external operator-managed PostGIS ─────────────┘            └─> config API
+external operator-managed PostGIS ─────────────┘            └─> config API ──> semantic service
 
 browser ── HTTPS ──> Caddy ──> XYZ
                            └─> config API <── standalone config-cli
@@ -34,7 +36,8 @@ The repository separates reviewed deployment inputs from mutable live state:
 instance/                         versioned deployment inputs
 ├── workspace.seed.json          initial workspace only
 ├── xyz.env                      non-secret XYZ runtime settings
-├── etl/layers.json              ETL source and field manifest
+├── etl/layers.json              Leeds sample source and field manifest
+├── etl/census.json              pinned England Census 2021 manifest
 └── public/
     ├── svg/                     public custom map icons
     └── plugins/                 trusted manifest-backed XYZ plugins
@@ -51,6 +54,8 @@ var/                              ignored mutable runtime state
 │   └── artifacts/               visual reports and screenshots
 ├── preview/
 │   └── workspace.json           private proposal-preview workspace
+├── semantic/
+│   └── semantic.sqlite3         generated and curated semantic catalog
 ├── reload/                       narrow live XYZ reload coordination
 └── preview-reload/               isolated preview XYZ reload coordination
 ```
@@ -68,12 +73,16 @@ The intended mount boundary is:
 - XYZ preview: private preview workspace read-only, `instance/public`
   read-only, preview reload channel read/write.
 - Configuration service: live and preview workspaces, control state, and both
-  reload channels read/write; public SVGs read-only.
+  reload channels read/write; public SVGs read-only; private access to the
+  semantic service.
+- Semantic service: only `var/semantic` read/write; no database credential or
+  public network.
 - Browser runner: only `var/control/artifacts` read/write.
 - ETL: only `instance/etl` read-only.
 
-See [Architecture](docs/architecture.md) and [Security](docs/security.md) for
-the complete trust boundary.
+See [Architecture](docs/architecture.md), [Semantic metadata control
+plane](docs/semantic-layer.md), and [Security](docs/security.md) for the
+complete trust boundary.
 
 ## Quick start
 
@@ -104,9 +113,12 @@ Development-only local defaults:
 - Map: <http://localhost:3000>
 - Configuration dashboard: <http://config.localhost:3000>
 
-`./bin/mapp serve` starts the long-running services without running the sample
+`./bin/mapp serve` starts the long-running services without running bundled
 ETL. In bundled-database mode, `./bin/mapp etl` loads every sample layer and
-`./bin/mapp etl bus_stops` selects one configured sample layer.
+then the reviewed England Census 2021 OA dataset; `./bin/mapp etl bus_stops`
+selects one configured sample layer. To work with Census alone, validate one
+source with `./bin/mapp census-check TS001`, or provision all reviewed topics
+with `./bin/mapp census-etl`.
 
 The broken recent-planning sample was replaced with Leeds Smoke Control Orders,
 a healthy bounded polygon source. The replacement has its own table and
@@ -166,7 +178,7 @@ dashboard from validating against a different database from the one XYZ uses.
 | `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
 | `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role used by the default bundled `DBS_MAPP`. |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the bundled sample database only. They are not passed to XYZ or the dashboard. |
-| `ETL_DB_USER`, `ETL_DB_PASSWORD` | Writer role for the optional bundled sample ETL only. |
+| `ETL_DB_USER`, `ETL_DB_PASSWORD` | Writer role for bundled ETL provisioning only. |
 | `ETL_DATABASE_URL` | Separate ETL destination; it is never used by XYZ or the dashboard. |
 | `DB_BIND_ADDRESS`, `DB_PORT` | Optional host publication of the bundled database through `compose.db-port.yaml`; these do not select an external server. |
 
@@ -190,9 +202,18 @@ configured ETL sources, run:
 This deletes derived layers and every other non-ETL database object. It
 replaces the live and preview workspaces with `instance/workspace.seed.json`,
 clearing layer configuration that depended on deleted data. Dashboard
-authentication, audit, proposal, artifact, and public-asset state is preserved.
-The command is unavailable in external-database mode and requires the explicit
-`--confirm` guard.
+authentication, audit, proposal, semantic-history, artifact, and public-asset
+state is preserved. Before archiving, the command installs an owner-fenced
+maintenance gate and waits for every current semantic profile to be `ready`
+with no undelivered outbox blocker. It then archives every active profile and
+checks the outbox again; a `repair_required` event or timeout aborts before
+volume deletion.
+
+A handled interruption compensates only the reset operation's own gate. If the
+host or process stops before compensation, confirm that no `reset-data`
+process remains and run `./bin/mapp recover-reset-data --confirm`; ordinary
+service startup does not force reset recovery. Both commands are unavailable
+in external-database mode and require their explicit `--confirm` guards.
 Source availability can change independently; treat a non-zero ETL exit as a
 failed refresh and inspect the recorded run before retrying.
 
@@ -315,6 +336,15 @@ scoped, expiring device credentials for agents; legacy full tokens remain
 available for operators and migration as documented in
 [Security](docs/security.md).
 
+The dashboard's **Semantic catalog** exposes generated and curated profiles,
+orphaned annotations, immutable per-asset history, and the reviewed semantic
+proposal workflow. **Access and audit** offers named least-privilege semantic
+token presets or exact custom scope selection. Gemini drafting is metadata-only
+by default, with separate `semantic:data` opt-ins for bounded samples or
+statistics. Source exclusions are deployment configuration; administrators can
+archive matching existing profiles or one selected profile without changing
+the database, while retained exact-ID history remains auditable.
+
 The public custom SVG catalog is versioned under
 [`instance/public/svg`](instance/public/svg). SVGs are exposed as
 `/instance/svg/<filename>.svg` after bounded safety checks.
@@ -342,6 +372,8 @@ release hardening is still outstanding.
 ```sh
 ./bin/mapp serve
 ./bin/mapp etl bus_stops
+./bin/mapp census-check TS001
+./bin/mapp census-etl
 ./bin/mapp test
 ./bin/mapp doctor
 ./bin/mapp verify
@@ -381,10 +413,10 @@ runs standard-library wrapper/production helper tests and Compose validation
 from the host. `doctor` compares environment key names without printing their
 values. The last command is a mode-aware runtime check and requires the stack,
 the selected PostGIS connection, and at least one discoverable relation. In
-bundled mode it additionally verifies the sample ETL relations and tile; in
-external mode it verifies generic connectivity, catalog, service, and gateway
-gates. Finish external acceptance with layer-specific visual tests for that
-workspace.
+bundled mode it additionally verifies the ETL relations, optional Census
+snapshot when present, and tile; in external mode it verifies generic
+connectivity, catalog, service, and gateway gates. Finish external acceptance
+with layer-specific visual tests for that workspace.
 Dated results and their exact scope are recorded in
 [`docs/validation-log.md`](docs/validation-log.md). Treat only the checks
 explicitly recorded there as evidence; source restructuring alone is not an
@@ -393,6 +425,9 @@ acceptance result.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Semantic metadata control plane](docs/semantic-layer.md)
+- [Managed derived layers](docs/derived-layers.md)
+- [External XYZ plugins](docs/external-plugins.md)
 - [Deployment](docs/deployment.md)
 - [External PostgreSQL administrator handoff](docs/external-postgresql.md)
 - [Operations](docs/operations.md)
@@ -406,6 +441,7 @@ acceptance result.
 - [Security reporting](SECURITY.md)
 - [Licensing status](LICENSING.md)
 
-The project does not yet declare a project-level licence. Do not assume that
-the source or bundled assets may be redistributed until the owner completes
-the decisions listed in [`LICENSING.md`](LICENSING.md).
+Project code is licensed under the [MIT License](LICENSE). Bundled and
+downloaded data or third-party assets retain their own terms; review
+[`LICENSING.md`](LICENSING.md) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before redistribution.

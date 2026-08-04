@@ -61,6 +61,7 @@ services:
     environment:
       DATABASE_URL: ${ETL_DATABASE_URL:?Set ETL_DATABASE_URL in .env}
       ETL_CONFIG: /config/layers.json
+      ETL_CENSUS_CONFIG: /config/census.json
       LOG_LEVEL: INFO
     command:
       - python

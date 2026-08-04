@@ -2,10 +2,12 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import psycopg
 from control_api import (
     RULES,
+    VisualPlanningDatabaseError,
     apply_operations,
     apply_visual_override,
     capabilities,
@@ -14,6 +16,8 @@ from control_api import (
     effective_locales,
     examples,
     is_probeable_database_layer,
+    paginate_collection,
+    pagination_parameters,
     pointer_get,
     plugin_manifest,
     proposal_create,
@@ -25,11 +29,27 @@ from control_api import (
     strict_json_loads,
     visual_plan,
     workspace_fingerprint,
+    workspace_map_extent,
 )
 from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_contract_advertises_every_stable_cli_exit_code(self):
+        self.assertEqual(
+            {
+                "success": 0,
+                "usage": 2,
+                "validation": 3,
+                "conflict": 4,
+                "connectivity": 5,
+                "visual": 6,
+                "authentication": 7,
+                "interrupted": 130,
+            },
+            contract("instance")["exitCodes"],
+        )
+
     def test_plugin_manifest_describes_loader_dispatch_and_exact_registry(self):
         payload = plugin_manifest()
         keys = {item["key"] for item in payload["bundled"]}
@@ -54,6 +74,8 @@ class ControlApiTests(unittest.TestCase):
         payload = capabilities("instance")
         actions = {item["id"]: item for item in payload["actions"]}
         self.assertEqual("instance", payload["instanceId"])
+        self.assertEqual("1.4", payload["apiVersion"])
+        self.assertEqual("1.4", payload["contractVersion"])
         self.assertEqual(
             ["revision", "operations"],
             actions["proposals.check"]["inputSchema"]["required"],
@@ -80,9 +102,20 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(3, screenshot_properties["deviceScaleFactor"]["maximum"])
         self.assertEqual(1, screenshot_properties["deviceScaleFactor"]["default"])
         self.assertEqual(
+            20,
+            screenshot_properties["expectedInfoPanelText"]["maxItems"],
+        )
+        self.assertEqual(
+            1000,
+            screenshot_properties["expectedInfoPanelText"]["items"][
+                "maxLength"
+            ],
+        )
+        self.assertEqual(
             "proposal.visual-test",
             actions["proposals.preview-screenshot"]["operationKind"],
         )
+
         screenshot_schema = actions[
             "proposals.preview-screenshot"
         ]["inputSchema"]["properties"]
@@ -91,6 +124,7 @@ class ControlApiTests(unittest.TestCase):
             screenshot_schema["viewport"]["properties"]["width"]["maximum"],
         )
         self.assertEqual(3, screenshot_schema["deviceScaleFactor"]["maximum"])
+        self.assertIn("expectedInfoPanelText", screenshot_schema)
         self.assertIn(
             "workspaceFingerprint",
             actions["xyz.reload"]["inputSchema"]["properties"],
@@ -99,16 +133,256 @@ class ControlApiTests(unittest.TestCase):
             "fingerprint",
             actions["xyz.reload"]["inputSchema"]["properties"],
         )
+        semantic_check = actions["semantic.proposals.check"]["inputSchema"]
+        semantic_create = actions["semantic.proposals.create"]["inputSchema"]
+        self.assertFalse(semantic_check["additionalProperties"])
+        self.assertFalse(semantic_create["additionalProperties"])
+        self.assertEqual(
+            ["assetId", "baseVersion", "operations"],
+            semantic_check["required"],
+        )
+        self.assertEqual(
+            ["assetId", "baseVersion", "operations", "fingerprint"],
+            semantic_create["required"],
+        )
+        self.assertNotIn("fingerprint", semantic_check["properties"])
+        self.assertEqual(
+            r"^[0-9a-f]{64}$",
+            semantic_create["properties"]["fingerprint"]["pattern"],
+        )
+        operations = semantic_check["properties"]["operations"]
+        self.assertEqual((1, 100), (operations["minItems"], operations["maxItems"]))
+        variants = operations["items"]["oneOf"]
+        self.assertEqual({"set", "unset"}, {
+            variant["properties"]["op"]["const"] for variant in variants
+        })
+        self.assertTrue(all(
+            variant["additionalProperties"] is False for variant in variants
+        ))
+        self.assertEqual(
+            2000,
+            actions["semantic.proposals.decline"]["inputSchema"][
+                "properties"
+            ]["reason"]["maxLength"],
+        )
+        generation = actions["semantic.generate"]
+        self.assertEqual(
+            ["semantic:inspect", "semantic:generate"],
+            generation["requiredScopes"],
+        )
+        self.assertEqual(
+            [{
+                "whenAnyTrue": [
+                    "contextOptions.sampleRows",
+                    "contextOptions.statistics",
+                ],
+                "requiredScopes": ["semantic:data"],
+                "reason": (
+                    "Optional row samples or data-derived statistics require "
+                    "explicit data access."
+                ),
+            }],
+            generation["conditionalScopes"],
+        )
+        source_sync = actions["semantic.source.sync"]
+        self.assertEqual(
+            ["semantic:inspect", "semantic:source"],
+            source_sync["requiredScopes"],
+        )
+        self.assertEqual(
+            ["alias", "schema", "relation"],
+            source_sync["inputSchema"]["required"],
+        )
+        self.assertFalse(
+            source_sync["inputSchema"]["additionalProperties"]
+        )
+        for action_id, path_key, path in (
+            (
+                "semantic.catalog.archive",
+                "pathTemplate",
+                "/api/semantic/catalog/objects/{assetId}/archive",
+            ),
+            (
+                "semantic.source.archive-excluded",
+                "path",
+                "/api/semantic/source/archive-excluded",
+            ),
+        ):
+            archive = actions[action_id]
+            self.assertEqual(path, archive[path_key])
+            self.assertEqual(
+                ["semantic:inspect", "semantic:admin"],
+                archive["requiredScopes"],
+            )
+            self.assertEqual(
+                ["confirmed"],
+                archive["inputSchema"]["required"],
+            )
+        self.assertEqual(
+            "/api/semantic/catalog/objects/{assetId}/history",
+            actions["semantic.catalog.history"]["pathTemplate"],
+        )
+        self.assertEqual(
+            "/api/derived-layers/map-extent",
+            actions["derived-layers.map-extent"]["path"],
+        )
+        spatial_scope = actions["derived-layers.create"]["inputSchema"][
+            "properties"
+        ]["spatialScope"]
+        self.assertEqual(
+            "workspace-map-extent",
+            spatial_scope["properties"]["type"]["const"],
+        )
+        self.assertFalse(spatial_scope["additionalProperties"])
+        self.assertEqual(
+            {"type": "workspace-map-extent"},
+            spatial_scope["default"],
+        )
+        for action in (
+            "derived-layers.create",
+            "derived-layers.refresh",
+            "derived-layers.replace",
+        ):
+            presentation = actions[action]["presentation"]
+            self.assertTrue(
+                presentation["nextActionField"].endswith("suggestedAction")
+            )
+            self.assertIn(
+                "materializationProbe",
+                presentation["technicalFields"],
+            )
+            self.assertIn(
+                "queryPlanProbe",
+                presentation["technicalFields"],
+            )
+            self.assertEqual("reasons", presentation["reasonField"])
+            self.assertEqual(
+                "suggestedAction",
+                presentation["reasonActionField"],
+            )
+            self.assertEqual("safeState", presentation["safeStateField"])
+            self.assertEqual("probe", presentation["probeField"])
+            self.assertEqual(
+                {
+                    "invalid": "derived_layer.query_invalid",
+                    "policy": "derived_layer.query_not_allowed",
+                    "compute": "derived_layer.query_too_expensive",
+                },
+                presentation["queryErrorCodes"],
+            )
+        for action_id, operation_kind in (
+            ("derived-layers.create", "derived-layer.create"),
+            ("derived-layers.replace", "derived-layer.replace"),
+            ("derived-layers.refresh", "derived-layer.refresh"),
+        ):
+            action = actions[action_id]
+            self.assertEqual(operation_kind, action["operationKind"])
+            self.assertEqual(
+                {"type": "boolean"},
+                action["inputSchema"]["properties"]["background"],
+            )
+        self.assertEqual(
+            ["derive", "semantic:inspect"],
+            actions["derived-layers.create"]["requiredScopes"],
+        )
+        self.assertEqual(
+            ["derive", "semantic:inspect"],
+            actions["derived-layers.replace"]["requiredScopes"],
+        )
+        self.assertIn(
+            "semantic catalog history",
+            contract("instance")["commands"],
+        )
+        self.assertIn(
+            "derived-layers map-extent",
+            contract("instance")["commands"],
+        )
+        self.assertIn(
+            "semantic catalog archive",
+            contract("instance")["commands"],
+        )
+        self.assertIn(
+            "semantic source archive-excluded",
+            contract("instance")["commands"],
+        )
+        self.assertIn("layers effective", contract("instance")["commands"])
+        self.assertFalse(generation["inputSchema"]["additionalProperties"])
+        self.assertEqual(
+            {"table", "field"},
+            {
+                target["properties"]["kind"]["const"]
+                for target in generation["inputSchema"]["properties"][
+                    "target"
+                ]["oneOf"]
+            },
+        )
         self.assertEqual("meta", payload["responseEnvelope"]["metadataField"])
+        for action_id in ("visual.plan", "visual.test", "visual.screenshot"):
+            self.assertIn(
+                "expectedInfoPanelText",
+                actions[action_id]["inputSchema"]["properties"],
+            )
+        self.assertIn(
+            "expectedInfoPanelText",
+            actions["proposals.preview-test"]["inputSchema"]["properties"],
+        )
+        self.assertEqual(
+            ["confirmed"],
+            actions["xyz.reload"]["inputSchema"]["required"],
+        )
+
+    def test_pagination_is_bounded_opaque_and_filter_bound(self):
+        items = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        limit, cursor = pagination_parameters({"limit": ["1"]})
+        first, first_page = paginate_collection(
+            items,
+            limit=limit,
+            cursor=cursor,
+            scope="proposals-v1",
+        )
+        self.assertEqual([{"id": "a"}], first)
+        self.assertRegex(first_page["nextCursor"], r"^[0-9a-f]{64}$")
+
+        second, second_page = paginate_collection(
+            items,
+            limit=1,
+            cursor=first_page["nextCursor"],
+            scope="proposals-v1",
+        )
+        self.assertEqual([{"id": "b"}], second)
+        self.assertRegex(second_page["nextCursor"], r"^[0-9a-f]{64}$")
+
+        with self.assertRaisesRegex(ValueError, "invalid or expired"):
+            paginate_collection(
+                items,
+                limit=1,
+                cursor=first_page["nextCursor"],
+                scope="different-filter",
+            )
+        for query in (
+            {"limit": ["0"]},
+            {"limit": ["101"]},
+            {"cursor": ["readable-offset"]},
+            {"limit": ["1", "2"]},
+            {"unknown": ["1"]},
+        ):
+            with self.subTest(query=query), self.assertRaises(ValueError):
+                pagination_parameters(query)
 
     def test_contract_advertises_scoped_device_authorization(self):
         authentication = contract("instance")["authentication"]
         self.assertEqual(
-            ["inspect", "propose", "visual"],
+            ["inspect", "propose", "visual", "semantic:inspect"],
             authentication["defaultDeviceScopes"],
         )
         self.assertEqual(
-            {"full", "inspect", "propose", "visual", "apply", "reload", "derive"},
+            {
+                "full", "inspect", "propose", "visual", "apply", "reload",
+                "derive", "semantic:inspect", "semantic:source",
+                "semantic:generate", "semantic:data",
+                "semantic:propose",
+                "semantic:apply", "semantic:admin",
+            },
             set(authentication["scopes"]),
         )
 
@@ -194,6 +468,50 @@ class ControlApiTests(unittest.TestCase):
                 & 0o777,
             )
 
+    def test_checked_proposal_reuses_bound_plugin_catalogue_fingerprint(self):
+        checked_fingerprint = "a" * 64
+        changed_fingerprint = "b" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            original = {"key": "workspace", "locale": {"layers": {}}}
+            operations = [
+                {"op": "set", "path": "/title", "value": "Candidate"}
+            ]
+            candidate, diff = apply_operations(original, operations)
+            with patch(
+                "control_api.external_plugin_catalogue",
+                side_effect=[
+                    {"fingerprint": checked_fingerprint},
+                    {"fingerprint": changed_fingerprint},
+                ],
+            ) as catalogue:
+                checked = proposal_check(
+                    original,
+                    "revision",
+                    candidate,
+                    operations,
+                    diff,
+                )
+                proposal = proposal_create(
+                    store,
+                    original,
+                    "revision",
+                    candidate,
+                    operations,
+                    diff,
+                    "token:test",
+                    plugin_catalogue_fingerprint=checked[
+                        "pluginCatalogueFingerprint"
+                    ],
+                )
+
+        self.assertEqual(
+            checked_fingerprint,
+            proposal["pluginCatalogueFingerprint"],
+        )
+        catalogue.assert_called_once_with()
+
     def test_proposal_check_returns_evidence_without_persisting(self):
         original = {"key": "workspace", "locale": {"layers": {}}}
         operations = [{"op": "set", "path": "/title", "value": "Candidate"}]
@@ -225,6 +543,9 @@ class ControlApiTests(unittest.TestCase):
         advertised = contract("instance")
         commands = advertised["commands"]
         self.assertIn("proposals check", commands)
+        self.assertIn("semantic generate table", commands)
+        self.assertIn("semantic generate field", commands)
+        self.assertNotIn("semantic generate", commands)
         self.assertNotIn("proposals delete", commands)
         self.assertNotIn("completion-spec", commands)
         self.assertIn("apply with managed reload", advertised["workflow"])
@@ -314,6 +635,8 @@ class ControlApiTests(unittest.TestCase):
         self.assertIn("workspace.theme_semantics", rule_ids)
         self.assertIn("workspace.infoj_geometry_symbol", rule_ids)
         self.assertIn("workspace.viewport_count", rule_ids)
+        self.assertIn("derived_layer.query_cost", rule_ids)
+        self.assertIn("derived_layer.materialization_size", rule_ids)
 
     def test_visual_override_is_bounded_and_preserves_base_evidence(self):
         plan = {
@@ -511,11 +834,95 @@ class ControlApiTests(unittest.TestCase):
             effective_locales(workspace)["alternative"],
         )
 
+    def test_workspace_map_extent_uses_zoom_minus_one_and_fixed_viewport(self):
+        scope = workspace_map_extent({
+            "locale": {
+                "view": {"lng": -1.5491, "lat": 53.8008, "z": 11},
+            },
+        })
+
+        self.assertEqual("workspace-map-extent", scope["type"])
+        self.assertEqual("locale", scope["locale"])
+        self.assertEqual(
+            {"lng": -1.5491, "lat": 53.8008, "z": 11},
+            scope["sourceView"],
+        )
+        self.assertEqual(10, scope["scopeZoom"])
+        self.assertEqual(
+            {"width": 1920, "height": 1080, "tileSize": 256},
+            scope["viewport"],
+        )
+        self.assertEqual("EPSG:4326", scope["crs"])
+        self.assertFalse(scope["clipsGeometry"])
+        self.assertEqual(1, len(scope["envelopes"]))
+        envelope = scope["envelopes"][0]
+        self.assertLess(envelope["west"], -1.5491)
+        self.assertGreater(envelope["east"], -1.5491)
+        self.assertLess(envelope["south"], 53.8008)
+        self.assertGreater(envelope["north"], 53.8008)
+
+    def test_workspace_map_extent_splits_antimeridian_and_covers_world(self):
+        wrapped = workspace_map_extent({
+            "locale": {
+                "view": {"lng": 179, "lat": 0, "z": 5},
+            },
+        })
+        self.assertEqual(2, len(wrapped["envelopes"]))
+        self.assertEqual(180, wrapped["envelopes"][0]["east"])
+        self.assertEqual(-180, wrapped["envelopes"][1]["west"])
+
+        whole_world = workspace_map_extent({
+            "locale": {
+                "view": {"lng": 180, "lat": 0, "z": 0},
+            },
+        })
+        self.assertEqual(
+            [{"west": -180.0, "south": whole_world["envelopes"][0]["south"],
+              "east": 180.0, "north": whole_world["envelopes"][0]["north"]}],
+            whole_world["envelopes"],
+        )
+        self.assertEqual(0, whole_world["zoomOffset"])
+
+    def test_workspace_map_extent_clamps_poles_for_web_mercator(self):
+        north = workspace_map_extent({
+            "locale": {
+                "view": {"lng": 0, "lat": 90, "z": 10.5},
+            },
+        })
+        south = workspace_map_extent({
+            "locale": {
+                "view": {"lng": 0, "lat": -90, "z": 10.5},
+            },
+        })
+
+        self.assertEqual(90, north["sourceView"]["lat"])
+        self.assertLessEqual(north["envelopes"][0]["north"], 85.05112878)
+        self.assertEqual(-90, south["sourceView"]["lat"])
+        self.assertGreaterEqual(south["envelopes"][0]["south"], -85.05112878)
+        self.assertEqual(9.5, north["scopeZoom"])
+
+    def test_workspace_map_extent_requires_a_complete_finite_view(self):
+        for workspace, message in (
+            ({"locale": {}}, "needs view.lng"),
+            (
+                {"locale": {"view": {"lng": 0, "lat": 0}}},
+                "view.z must be a finite number",
+            ),
+            (
+                {"locale": {"view": {"lng": 0, "lat": 0, "z": True}}},
+                "view.z must be a finite number",
+            ),
+        ):
+            with self.subTest(workspace=workspace):
+                with self.assertRaisesRegex(ValueError, message):
+                    workspace_map_extent(workspace)
+
     def test_advanced_layers_use_workspace_view_without_database_probe(self):
         workspace = {
             "locale": {
                 "layers": {
                     "External": {
+                        "name": "Friendly external layer",
                         "format": "maplibre",
                         "style": {"URL": "https://tiles.example.invalid/style"},
                     }
@@ -524,12 +931,47 @@ class ControlApiTests(unittest.TestCase):
         }
         plan = visual_plan(workspace, "External", {})
         self.assertEqual("workspace-view", plan["source"])
+        self.assertEqual("External", plan["layer"])
+        self.assertEqual("Friendly external layer", plan["layerTitle"])
         self.assertNotIn("centre", plan)
         self.assertNotIn("zoom", plan)
         self.assertFalse(
             is_probeable_database_layer(
                 {"template": "OSM"}
             )
+        )
+
+    def test_visual_plan_marks_the_active_named_hover_for_evidence(self):
+        workspace = {
+            "locale": {
+                "layers": {
+                    "External": {
+                        "format": "maplibre",
+                        "style": {
+                            "URL": "https://tiles.example.invalid/style",
+                            "hover": "name",
+                            "hovers": {
+                                "name": {
+                                    "display": True,
+                                    "field": "display_name",
+                                    "title": "Place name",
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+        plan = visual_plan(workspace, "External", {})
+
+        self.assertEqual(
+            {
+                "type": "hover-centre-feature",
+                "field": "display_name",
+                "title": "Place name",
+            },
+            plan["hover"],
         )
 
     def test_visual_plan_uses_configured_visible_tile_key_as_background(self):
@@ -548,3 +990,122 @@ class ControlApiTests(unittest.TestCase):
         plan = visual_plan(workspace, "Open_Street_Map", {})
 
         self.assertEqual(["Open_Street_Map"], plan["backgroundLayers"])
+
+    @staticmethod
+    def database_visual_workspace() -> dict:
+        return {
+            "dbs": "MAPP",
+            "locale": {
+                "layers": {
+                    "Arrivals 1951-1960": {
+                        "name": "Arrivals 1951-1960",
+                        "format": "mvt",
+                        "table": "derived_layers.arrivals_1951_1960_oa",
+                        "geom": "geom_3857",
+                        "qID": "oa21cd",
+                        "srid": "3857",
+                        "style": {
+                            "hover": {
+                                "display": True,
+                                "field": "percentage",
+                                "title": "Percentage of all usual residents",
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+    def test_complete_explicit_visual_view_skips_database_auto_framing(self):
+        with patch("control_api.psycopg.connect") as connect:
+            plan = visual_plan(
+                self.database_visual_workspace(),
+                "Arrivals 1951-1960",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+                visual_request={
+                    "centre": [-1.532, 53.814],
+                    "zoom": 14,
+                },
+            )
+
+        connect.assert_not_called()
+        self.assertEqual("explicit-view", plan["source"])
+        self.assertEqual("browser-centre-feature", plan["baseSource"])
+        self.assertEqual([-1.532, 53.814], plan["centre"])
+        self.assertEqual(14, plan["zoom"])
+        self.assertNotIn("featureCount", plan)
+        self.assertNotIn("bounds3857", plan)
+        self.assertNotIn("expectedFeatureId", plan["interaction"])
+        self.assertEqual(
+            "hover-centre-feature",
+            plan["hover"]["type"],
+        )
+
+    @staticmethod
+    def failing_visual_connection(error: psycopg.Error) -> MagicMock:
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.execute.side_effect = [None, None, error]
+        connection.cursor.return_value = cursor
+        return connection
+
+    def test_auto_visual_plan_identifies_summary_timeout_stage(self):
+        connection = self.failing_visual_connection(
+            psycopg.errors.QueryCanceled(
+                "secret relation and query text must not be exposed"
+            )
+        )
+        with (
+            patch("control_api.psycopg.connect", return_value=connection),
+            self.assertRaises(VisualPlanningDatabaseError) as raised,
+        ):
+            visual_plan(
+                self.database_visual_workspace(),
+                "Arrivals 1951-1960",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+            )
+
+        error = raised.exception
+        self.assertTrue(error.timed_out)
+        self.assertEqual("layer-summary", error.stage)
+        self.assertEqual("feature-count-and-extent", error.query_purpose)
+        self.assertNotIn("secret relation", str(error))
+
+    def test_auto_visual_plan_identifies_feature_selection_timeout_stage(self):
+        summary_connection = MagicMock()
+        summary_connection.__enter__.return_value = summary_connection
+        summary_cursor = MagicMock()
+        summary_cursor.__enter__.return_value = summary_cursor
+        summary_cursor.fetchone.return_value = (
+            178605,
+            -200000,
+            7000000,
+            -150000,
+            7100000,
+            "ST_Polygon",
+        )
+        summary_connection.cursor.return_value = summary_cursor
+        feature_connection = self.failing_visual_connection(
+            psycopg.errors.QueryCanceled("private query detail")
+        )
+
+        with (
+            patch(
+                "control_api.psycopg.connect",
+                side_effect=[summary_connection, feature_connection],
+            ),
+            self.assertRaises(VisualPlanningDatabaseError) as raised,
+        ):
+            visual_plan(
+                self.database_visual_workspace(),
+                "Arrivals 1951-1960",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+            )
+
+        error = raised.exception
+        self.assertTrue(error.timed_out)
+        self.assertEqual("representative-feature", error.stage)
+        self.assertEqual("centre-feature-selection", error.query_purpose)
+        self.assertNotIn("private query detail", str(error))

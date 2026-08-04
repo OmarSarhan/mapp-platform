@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "leeds-arcgis-etl"
 version = "0.1.0"
-description = "Small, idempotent ArcGIS REST to PostGIS loader for selected Leeds datasets"
+description = "Reviewed Leeds and England Census geospatial loaders for bundled PostGIS"
 requires-python = ">=3.11"
 dependencies = [
   "psycopg[binary]==3.3.4",

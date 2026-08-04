@@ -49,6 +49,21 @@ configuration only as unsaved local workspace state. Preserve calculated
 `fieldfx` entries and named-locale override boundaries. The confirmed database
 replacement is not approval to save or apply the follow-on workspace change.
 
+Every derived create/replace and materialized refresh must retain the universal
+SQL-shape, bounded-H3, and recursive PostgreSQL-plan guard. It applies to
+ordinary views as well as materialized views; a computation failure must never
+be presented as eligible for the view fallback. The separate 1 GiB planned
+storage guard applies to materialized output, and only that failure may recommend
+reviewing an ordinary view. Preserve legitimate H3 aggregation: generate
+polygon cells directly from the server-provided `_mapp_h3_scope`, allow bounded
+literal traversal and provable one-level child expansion, and then enforce the
+same plan budget. Do not push the output map predicate below user aggregates or
+replace their complete input with a sample.
+Keep the derived-owner and runtime-reader role resource ceilings, effective-
+session verification, fixed derived-owner `pg_catalog, public` search path, and
+bounded background admission in place; planner estimates do not replace
+PostgreSQL memory, spill, timeout, or connection limits.
+
 ## XYZ framework invariant
 
 Do not vendor, fork, or patch the GEOLYTIX XYZ source in this repository. The
@@ -59,6 +74,32 @@ External browser plugins are trusted, source-controlled deployment inputs under
 `instance/public/plugins`. Each requires a closed manifest contract and
 isolated candidate-preview evidence. Never import plugin code during discovery
 or offer executable-code upload through the dashboard.
+
+## Semantic invariants
+
+Generated relation and field facts are lifecycle-owned; only curated
+annotations change through checked, version-bound semantic proposals. A
+focused `/curated/...` unset removes an annotation without changing generated
+facts or database data. Archiving a profile is a separate confirmed
+`semantic:inspect + semantic:admin` action: normal catalog/search collections
+then omit it even for administrators, while exact-ID show/history remains
+available to the same authority for audit.
+
+Keep ordinary source inclusion and exclusion in
+`SEMANTIC_SOURCE_ALLOWLIST`/`SEMANTIC_SOURCE_EXCLUSIONS`; do not hard-code data
+table names. Exclusions prevent future discovery/sync and do not retroactively
+archive existing profiles. Derived-layer planning must use ready semantic
+source profiles as the authority over agent guesses, falling back to explicit
+authorized discovery/sync only when a profile is absent. Database functions,
+including PostGIS and H3 functions, are not relation sources and need no
+profile.
+
+Gemini generation is metadata-only by default. Optional 5% sample rows and
+statistics are independent, explicit `semantic:data` opt-ins and must remain
+bounded and advertised through semantic status. The dashboard may submit at
+most ten selected field requests concurrently, retain selection order, and
+publish no partial combined draft on failure. Generation never checks, creates,
+approves, or applies a proposal.
 
 ## Filesystem safety
 
@@ -88,6 +129,6 @@ backup, or restore works without running its relevant check.
 ## Documentation
 
 Keep the root README concise. Put architecture, deployment, operations,
-security, backup, API, and split details in `docs`. Do not add a project licence
-until the owner has made the licence and asset-provenance decisions recorded in
-`LICENSING.md`.
+security, backup, API, and split details in `docs`. Keep project licensing and
+asset-provenance statements aligned with `LICENSE`, `LICENSING.md`, and
+`THIRD_PARTY_NOTICES.md`.

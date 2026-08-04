@@ -10,6 +10,7 @@ images and the versioned `instance` directory are not sufficient.
 | PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records in bundled mode |
 | Live workspace | `var/workspace` | Current configuration and previous atomic save |
 | Control state | `var/control` | Authentication and device state, token records, audit, proposals, durable operations, artifacts |
+| Semantic state | `var/semantic` | Generated and curated profiles, proposals, event receipts, history, and archive tombstones |
 | Reload state | `var/reload` | Useful for consistent recovery diagnostics; can be regenerated cautiously |
 | Preview scratch state | `var/preview`, `var/preview-reload` | Ephemeral proposal rendering state; recreate it from the restored live workspace rather than treating it as authoritative |
 | Deployment secrets | `.env` and external secret-store records | Database and service credentials |
@@ -48,12 +49,25 @@ physical-backup process.
 
 ## State backup
 
-For the strongest consistency, pause configuration writes while copying
-`var/workspace` and `var/control`. Preserve file modes and ownership. Proposal
-records contain complete original and candidate workspaces; device
-authorization, durable operation, audit, and screenshot records may also be
-sensitive. The preview workspace and preview reload channel are scratch state,
-not required backup inputs.
+For the strongest consistency, pause configuration and derived-layer writes
+while copying `var/workspace`, `var/control`, and `var/semantic`. Stop
+`config-ui` first so it cannot commit another PostgreSQL outbox event, then
+stop `semantic-service` before copying its directory. The semantic database
+uses SQLite write-ahead logging; copy the complete directory while the service
+is stopped rather than copying only `semantic.sqlite3` from a running service.
+
+Take the PostgreSQL dump or coordinated external snapshot during the same
+write-quiesced interval. The derived definition and semantic outbox live in
+PostgreSQL, while delivered profiles and event receipts live in SQLite. A
+coordinated recovery point lets pending events replay idempotently after
+restore; unrelated snapshots can instead claim that an event was delivered
+when the restored semantic catalog does not contain it.
+
+Preserve file modes and ownership. Proposal records contain complete original
+and candidate workspaces; device authorization, durable operation, audit,
+semantic annotations/history, and screenshot records may also be sensitive.
+The preview workspace and preview reload channel are scratch state, not
+required backup inputs.
 
 Back up `.env` separately through an encrypted secret-management process. Do
 not place it in the same unencrypted archive as public release files.
@@ -64,17 +78,32 @@ not place it in the same unencrypted archive as public release files.
 2. Restore `.env` from the approved secret store without committing it.
 3. Restore the PostgreSQL dump into a fresh compatible bundled volume, or have
    the external operator restore the target PostGIS database and connection.
-4. Restore `var/workspace` and `var/control`, including durable operation
-   records, with the configured host UID/GID and restrictive modes. Do not
-   restore stale `var/preview` scratch state; leave it absent so initialization
-   seeds it from the restored live workspace.
+4. Restore `var/workspace`, `var/control`, and the matching `var/semantic`
+   snapshot, including durable operation records, with the configured host
+   UID/GID and restrictive modes. Do not restore stale `var/preview` scratch
+   state; leave it absent so initialization seeds it from the restored live
+   workspace.
 5. Restore Caddy data if retaining the existing certificate state is
    appropriate, or allow Caddy to obtain new certificates.
 6. Initialize or clear stale live and preview reload coordination
-   deliberately, then start the stack.
-7. Verify database health, current workspace revision, authentication, audit
-   readability, XYZ reload fingerprint, public map rendering, and a visual
-   test.
+   deliberately, then start the stack. Startup resumes ordinary pending and
+   retrying outbox delivery, but deliberately does not force recovery of a
+   retained reset maintenance gate.
+7. If the restored PostgreSQL state contains a gate from an interrupted reset,
+   confirm that no `reset-data` process exists in the restored environment,
+   then run `./bin/mapp recover-reset-data --confirm`. The command assigns new
+   semantic asset IDs at generation 1 to definitions left in reset archival
+   state. Each registration names its validated archived predecessor so
+   curated metadata, orphans, visibility, and matching field IDs carry into
+   the audited successor without unarchiving or reusing the old tombstone.
+8. Allow the outbox to deliver every retained event before evaluating profile
+   readiness. Do not clear a restored worker claim manually; its bounded lease
+   expires and makes abandoned work eligible again. A restored
+   `repair_required` event does not self-requeue; correct its cause and use the
+   confirmed administrator retry, which sends the same retained payload.
+9. Verify database health, current workspace revision, authentication, audit
+   readability, semantic schema/catalog revision, derived-profile readiness,
+   XYZ reload fingerprint, public map rendering, and a visual test.
 
 Do not overwrite a healthy production deployment while testing a restore. Use
 an isolated host, DNS name, network, and database.
@@ -94,6 +123,7 @@ Until automated schedules exist, record:
 - backup time and platform release;
 - database and PostGIS versions;
 - workspace revision and fingerprint;
+- semantic schema version and catalog revision;
 - archive checksums;
 - restore-test date and result;
 - the operator who performed the test.

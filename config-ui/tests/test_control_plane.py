@@ -1,3 +1,4 @@
+import json
 import stat
 import tempfile
 import unittest
@@ -5,8 +6,16 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
-from control_plane import ControlStore, iso, now, token_hash
+from control_plane import (
+    DEVICE_SCOPES,
+    TOKEN_SCOPES,
+    ControlStore,
+    iso,
+    now,
+    token_hash,
+)
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -54,6 +63,33 @@ class ControlPlaneTests(unittest.TestCase):
                 stat.S_IMODE((Path(directory) / "auth.json").stat().st_mode),
             )
 
+    def test_invalid_sessions_do_not_write_but_expiry_pruning_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            session, _csrf = store.login(
+                "correct horse battery staple",
+                "127.0.0.1",
+            )
+
+            with patch.object(store, "_write", wraps=store._write) as write:
+                self.assertFalse(store.session("not-a-session"))
+                self.assertFalse(
+                    store.session(session, "wrong-csrf", require_csrf=True)
+                )
+                write.assert_not_called()
+
+            state = store._state()
+            state["sessions"][0]["lastUsed"] = iso(
+                now() - timedelta(seconds=31 * 60)
+            )
+            store._write(state)
+
+            with patch.object(store, "_write", wraps=store._write) as write:
+                self.assertFalse(store.session("not-a-session"))
+                write.assert_called_once()
+            self.assertEqual([], store._state()["sessions"])
+
     def test_password_changes_require_a_nonempty_minimum_length(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))
@@ -70,10 +106,15 @@ class ControlPlaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))
             store.initialize("correct horse battery staple", "instance")
-            with self.assertRaises(ValueError):
-                store.create_token("invalid", "not-a-date")
-            with self.assertRaises(ValueError):
-                store.create_token("expired", iso(now() - timedelta(seconds=1)))
+            for invalid_expiry in (
+                "not-a-date",
+                "2026-07-26T12:00:00",
+                iso(now() - timedelta(seconds=1)),
+                7,
+            ):
+                with self.subTest(expires=invalid_expiry):
+                    with self.assertRaises(ValueError):
+                        store.create_token("invalid", invalid_expiry)
 
             first_raw, first = store.create_token(
                 "legacy",
@@ -94,13 +135,98 @@ class ControlPlaneTests(unittest.TestCase):
             records = {item["id"]: item for item in store.list_tokens()}
             self.assertIsNotNone(records[first["id"]]["revoked"])
 
+    def test_semantic_token_scopes_are_closed_canonical_and_audited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ControlStore(root)
+            store.initialize("correct horse battery staple", "instance")
+            expiry = iso(now() + timedelta(days=30))
+
+            raw, record = store.create_token(
+                "semantic curator",
+                expiry,
+                [
+                    "semantic:inspect",
+                    "semantic:propose",
+                    "semantic:inspect",
+                    "semantic:apply",
+                ],
+            )
+
+            self.assertEqual(
+                [
+                    "semantic:inspect",
+                    "semantic:propose",
+                    "semantic:apply",
+                ],
+                record["scopes"],
+            )
+            self.assertEqual(expiry, record["expires"])
+            self.assertNotIn(raw, (root / "auth.json").read_text())
+            audit = [
+                json.loads(line)
+                for line in (root / "audit.jsonl").read_text().splitlines()
+            ]
+            created = audit[-1]
+            self.assertEqual("token.created", created["event"])
+            self.assertEqual(record["id"], created["details"]["id"])
+            self.assertEqual(record["scopes"], created["details"]["scopes"])
+            self.assertEqual(expiry, created["details"]["expires"])
+            self.assertNotIn(raw, json.dumps(created))
+
+    def test_every_supported_scope_is_issued_without_expansion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+
+            for scope in sorted(TOKEN_SCOPES):
+                with self.subTest(credential="token", scope=scope):
+                    raw, record = store.create_token(
+                        f"single scope {scope}",
+                        scopes=[scope],
+                    )
+                    self.assertEqual([scope], record["scopes"])
+                    self.assertEqual(
+                        [scope],
+                        store.authenticate_token(raw, "127.0.0.1")["scopes"],
+                    )
+
+            for index, scope in enumerate(sorted(DEVICE_SCOPES)):
+                with self.subTest(credential="device", scope=scope):
+                    started = store.start_device_authorization(
+                        f"single scope {scope}",
+                        [scope],
+                        f"127.0.0.{index + 1}",
+                    )
+                    self.assertEqual([scope], started["scopes"])
+
+    def test_token_scope_validation_never_expands_explicit_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+
+            for scopes in (
+                [],
+                {},
+                ["semantic:unknown"],
+                ["full", "semantic:inspect"],
+                ["semantic:inspect", 7],
+            ):
+                with self.subTest(scopes=scopes):
+                    with self.assertRaises(ValueError):
+                        store.create_token("invalid", scopes=scopes)
+
+            _raw, legacy = store.create_token("legacy default", scopes=None)
+            self.assertEqual(["full"], legacy["scopes"])
+            self.assertEqual(1, len(store.list_tokens()))
+
     def test_scoped_device_authorization_is_expiring_and_one_time(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))
             store.initialize("correct horse battery staple", "instance")
             started = store.start_device_authorization(
                 "codex",
-                ["inspect", "propose", "visual"],
+                ["inspect", "propose", "visual", "semantic:inspect"],
                 "127.0.0.1",
             )
             self.assertEqual("pending", store.poll_device_authorization(started["deviceId"])["status"])
@@ -118,7 +244,7 @@ class ControlPlaneTests(unittest.TestCase):
             authorized = store.poll_device_authorization(started["deviceId"])
             self.assertEqual("authorized", authorized["status"])
             self.assertEqual(
-                ["inspect", "propose", "visual"],
+                ["inspect", "propose", "visual", "semantic:inspect"],
                 authorized["record"]["scopes"],
             )
             self.assertIsNotNone(authorized["record"]["expires"])

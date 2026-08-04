@@ -33,10 +33,19 @@ channel.
   TLS connections from the deployment.
 - H3 extensions only when a proposed derived query uses H3 functions.
 
+Use a dedicated database for MAPP, even when it shares a PostgreSQL cluster
+with other applications. PostgreSQL grants `CONNECT` and `TEMPORARY` to
+`PUBLIC` by default; the provisioning contract below revokes both on the MAPP
+database. On an existing shared database, inventory legitimate users and
+replace those public rights with explicit grants before revoking them.
+
 The application roles must not be superusers, database owners, source-schema
 owners, members of privileged roles, or granted `BYPASSRLS`. If a source uses
 row-level security, the database administrator must verify the rows visible to
 both application roles; MAPP does not bypass that policy.
+Membership in a read-only group is acceptable, but every role reachable with
+`SET ROLE` must remain non-administrative, lack `TEMPORARY`, and have no source
+writes or source-schema `CREATE`.
 
 ## Role model
 
@@ -44,8 +53,8 @@ Use two separate login roles when managed derived layers are enabled.
 
 | Role | Application setting | Required access |
 | --- | --- | --- |
-| Runtime reader | `DBS_MAPP` | `CONNECT` to the database, `USAGE` on each approved source schema, and `SELECT` on each approved source relation. It also receives `USAGE` on `derived_layers` and `SELECT` on published derived outputs. |
-| Derived owner | `DERIVED_DATABASE_URL` | `CONNECT` to the database, read-only access to approved source schemas and relations, and ownership of only the `derived_layers` schema. |
+| Runtime reader | `DBS_MAPP` | `CONNECT` but not `TEMPORARY`, `USAGE` on each approved source schema, and `SELECT` on each approved source relation. It also receives `USAGE` on `derived_layers` and `SELECT` on published derived outputs. |
+| Derived owner | `DERIVED_DATABASE_URL` | `CONNECT` but not `TEMPORARY`, read-only access to approved source schemas and relations, and ownership of only the `derived_layers` schema. |
 
 The runtime reader is shared by XYZ and configuration-service catalog and
 validation reads. It must not receive `CREATE`, source DML, truncate, trigger,
@@ -82,8 +91,42 @@ CREATE ROLE mapp_runtime_reader
 CREATE ROLE mapp_derived_owner
   LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
-GRANT CONNECT ON DATABASE maps TO mapp_runtime_reader;
-GRANT CONNECT ON DATABASE maps TO mapp_derived_owner;
+ALTER ROLE mapp_runtime_reader CONNECTION LIMIT 32;
+ALTER ROLE mapp_runtime_reader SET work_mem = '8MB';
+ALTER ROLE mapp_runtime_reader SET hash_mem_multiplier = '1';
+ALTER ROLE mapp_runtime_reader SET maintenance_work_mem = '32MB';
+ALTER ROLE mapp_runtime_reader SET max_parallel_workers_per_gather = '1';
+ALTER ROLE mapp_runtime_reader SET temp_file_limit = '256MB';
+ALTER ROLE mapp_runtime_reader SET statement_timeout = '15s';
+ALTER ROLE mapp_runtime_reader SET lock_timeout = '5s';
+ALTER ROLE mapp_runtime_reader
+  SET idle_in_transaction_session_timeout = '30s';
+
+ALTER ROLE mapp_derived_owner CONNECTION LIMIT 4;
+ALTER ROLE mapp_derived_owner SET search_path = pg_catalog, public;
+ALTER ROLE mapp_derived_owner SET work_mem = '16MB';
+ALTER ROLE mapp_derived_owner SET hash_mem_multiplier = '1';
+ALTER ROLE mapp_derived_owner SET maintenance_work_mem = '64MB';
+ALTER ROLE mapp_derived_owner SET max_parallel_workers_per_gather = '2';
+ALTER ROLE mapp_derived_owner SET temp_file_limit = '1GB';
+ALTER ROLE mapp_derived_owner SET statement_timeout = '30min';
+ALTER ROLE mapp_derived_owner SET lock_timeout = '5s';
+ALTER ROLE mapp_derived_owner
+  SET idle_in_transaction_session_timeout = '1min';
+
+-- PostgreSQL 17 and later only.
+ALTER ROLE mapp_runtime_reader SET transaction_timeout = '30s';
+ALTER ROLE mapp_derived_owner SET transaction_timeout = '35min';
+
+REVOKE CONNECT, TEMPORARY ON DATABASE maps FROM PUBLIC;
+REVOKE TEMPORARY ON DATABASE maps
+  FROM mapp_runtime_reader, mapp_derived_owner;
+GRANT CONNECT ON DATABASE maps
+  TO mapp_runtime_reader, mapp_derived_owner;
+
+-- Prevent either login from creating unrelated objects through the default
+-- public schema. Grant CREATE explicitly to a separate owner when required.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA transport
   TO mapp_runtime_reader, mapp_derived_owner;
@@ -98,6 +141,35 @@ CREATE SCHEMA derived_layers AUTHORIZATION mapp_derived_owner;
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
 GRANT USAGE ON SCHEMA derived_layers TO mapp_runtime_reader;
 ```
+
+On PostgreSQL 16 and earlier, omit the two `transaction_timeout` statements;
+that setting was introduced in PostgreSQL 17. Retain the finite statement,
+lock, idle-transaction, connection, memory, parallel-worker, and temporary-file
+limits, and use the database proxy or workload manager to impose an equivalent
+whole-transaction lifetime. `./bin/mapp verify` requires the transaction limit
+when the server advertises PostgreSQL 17 or later and accepts its absence only
+on older servers.
+
+These are maximum supported resource envelopes, not tuning targets. Stricter
+positive limits are accepted. `temp_file_limit` bounds executor spill per
+PostgreSQL process; it does not limit the main materialized relation or its
+TOAST and index files, so the derived-layer size checks and database free-space
+monitoring remain necessary. Role settings take effect on new connections;
+restart long-lived XYZ pools after changing them.
+
+The derived owner must use exactly `pg_catalog, public` as its `search_path`.
+Putting `pg_catalog` first prevents an identically named function or operator
+in another schema from taking precedence; `public` remains available for
+PostGIS and H3 installations, while `CREATE` on `public` stays revoked. Every
+submitted source relation is schema-qualified, so source lookup never depends
+on this path. `./bin/mapp verify` checks the effective derived-owner setting.
+
+The verifier does not impose this setting on the runtime reader because the
+supported XYZ workspace contract still accepts legacy unqualified relations
+that an external deployment may resolve through an operator-selected schema.
+If every workspace `table` and zoom-keyed `tables` entry is schema-qualified,
+operators should also set the runtime reader to `pg_catalog, public` after
+testing the workspace.
 
 Repeat the `USAGE` and explicit `SELECT` grants for every approved source
 schema and relation. PostgreSQL treats views and materialized views as tables
@@ -148,7 +220,10 @@ published outputs.
 Percent-encode URI-reserved characters in usernames and passwords. For private
 certificate authorities or client certificates, both application images need
 reviewed read-only mounts at the same absolute paths used in their connection
-URIs. Do not weaken TLS verification to compensate for a missing certificate.
+URIs. Each URI must contain its login name explicitly. Do not use connection
+options that change `ROLE`: verification requires `current_user`,
+`session_user`, and the decoded URI username to be identical. Do not weaken TLS
+verification to compensate for a missing certificate.
 
 ## Administrator verification
 
@@ -159,6 +234,9 @@ permissions using the real database, schemas, and representative relations:
 SELECT has_database_privilege(
   'mapp_runtime_reader', 'maps', 'CONNECT'
 );
+SELECT has_database_privilege(
+  'mapp_runtime_reader', 'maps', 'TEMPORARY'
+); -- must be false
 SELECT has_schema_privilege(
   'mapp_runtime_reader', 'transport', 'USAGE'
 );
@@ -172,6 +250,9 @@ SELECT has_schema_privilege(
 SELECT has_database_privilege(
   'mapp_derived_owner', 'maps', 'CONNECT'
 );
+SELECT has_database_privilege(
+  'mapp_derived_owner', 'maps', 'TEMPORARY'
+); -- must be false
 SELECT has_table_privilege(
   'mapp_derived_owner', 'transport.bus_stops', 'SELECT'
 );
@@ -182,12 +263,36 @@ SELECT has_schema_privilege(
 SELECT nspowner::regrole = 'mapp_derived_owner'::regrole
 FROM pg_namespace
 WHERE nspname = 'derived_layers'; -- must be true
+
+SELECT NOT EXISTS (
+  SELECT 1
+  FROM pg_database AS database
+  CROSS JOIN LATERAL aclexplode(
+    COALESCE(database.datacl, acldefault('d', database.datdba))
+  ) AS privilege
+  WHERE database.datname = 'maps'
+    AND privilege.grantee = 0
+    AND privilege.privilege_type IN ('CONNECT', 'TEMPORARY')
+); -- must be true
+
+SELECT rolname,
+       rolcanlogin
+       AND NOT rolsuper
+       AND NOT rolcreatedb
+       AND NOT rolcreaterole
+       AND NOT rolreplication
+       AND NOT rolbypassrls AS hardened
+FROM pg_roles
+WHERE rolname IN ('mapp_runtime_reader', 'mapp_derived_owner');
+-- both hardened values must be true
 ```
 
 Also connect as each role and confirm that representative permitted `SELECT`
 queries succeed, source writes and source-schema creation fail, and the runtime
 reader cannot create objects in or inspect the private registry under
-`derived_layers`.
+`derived_layers`. In each real application session, confirm that
+`current_user = session_user` and that both equal that URI's explicit login
+name.
 
 The MAPP operator must then run:
 
@@ -209,8 +314,10 @@ strings.
 - Preserve the grants when source relations are replaced or ownership changes.
 - Review access whenever the workspace adds a schema, relation, or extension.
 - Monitor expensive ordinary views and materialized refreshes.
-- Back up `derived_layers` with the external database if its definitions and
-  materialized results are required for recovery.
+- Back up the complete `derived_layers` schema, including its private semantic
+  outbox, with the external database. Coordinate that recovery point with the
+  MAPP operator's `var/semantic` snapshot so retained events and delivered
+  semantic profiles can reconcile after restore.
 - Rotate both login secrets through the approved deployment procedure.
 - Re-run permission and visual checks after database migrations, role changes,
   PostGIS upgrades, or restore operations.

@@ -28,6 +28,7 @@ def valid_environment(path: Path) -> None:
                 "HTTPS_PORT=443",
                 "CONFIG_UID=1000",
                 "CONFIG_GID=1000",
+                f"SEMANTIC_INTERNAL_TOKEN={'a' * 64}",
             )
         )
         + "\n",
@@ -47,6 +48,7 @@ class ProductionAcceptanceTests(unittest.TestCase):
         serialized = json.dumps([item.__dict__ for item in checks])
         self.assertNotIn("operations@company.co.uk", serialized)
         self.assertNotIn("maps.company.co.uk", serialized)
+        self.assertNotIn("a" * 64, serialized)
 
     def test_environment_permissions_are_enforced(self):
         with tempfile.TemporaryDirectory() as directory:

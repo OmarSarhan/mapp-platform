@@ -82,16 +82,17 @@ Each hook must:
 - clean up only resources it created;
 - perform the assertions below rather than merely completing a command.
 
-The backup hook must create a fresh database-aware backup plus protected copies
-of `var/workspace`, `var/control`, Caddy state, and the release identity. It
-must verify archive readability, private permissions, checksums, and the
-off-host destination.
+The backup hook must create a fresh database-aware backup plus protected,
+coordinated copies of `var/workspace`, `var/control`, `var/semantic`, Caddy
+state, and the release identity. It must verify archive readability, private
+permissions, checksums, and the off-host destination.
 
 The restore hook must restore that exact backup into new storage and verify
 database/PostGIS health, representative data, workspace revision and
-fingerprint, authentication state, audit readability, proposal/artifact
-access, XYZ reload status, and representative visual behavior. It must never
-restore over the live deployment.
+fingerprint, authentication state, audit readability, semantic catalog
+revision and derived-profile readiness, proposal/artifact access, XYZ reload
+status, and representative visual behavior. It must never restore over the
+live deployment.
 
 The upgrade hook must start the candidate release against the isolated restored
 state, record accepted image digests, and run `./bin/mapp verify` plus the
@@ -116,6 +117,7 @@ dated external review. Record:
 
 - release/tag and immutable image digests;
 - production and restored workspace revisions/fingerprints;
+- production and restored semantic catalog revisions;
 - database and PostGIS versions;
 - backup identifiers, checksums, recovery point, and retention destination;
 - restore start/end times and measured recovery time;

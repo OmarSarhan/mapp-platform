@@ -4,13 +4,98 @@ import io
 import threading
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http.client import HTTPMessage
 from http import HTTPStatus
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import app
-from control_plane import ControlStore
+from control_plane import ControlStore, TOKEN_SCOPES
+from semantic_sources import parse_exclusions
+
+
+class DerivedSemanticSourcePolicyTests(unittest.TestCase):
+    @staticmethod
+    def payload():
+        return {
+            "name": "roads_h3_r9",
+            "kind": "view",
+            "query": "SELECT id, geom_3857 FROM leeds.roads",
+            "sources": ["leeds.roads"],
+            "idColumn": "id",
+            "geometryColumn": "geom_3857",
+        }
+
+    @staticmethod
+    def catalog(*, status="ready"):
+        return {"assets": [{
+            "status": status,
+            "generated": {"binding": {
+                "adapter": "postgresql",
+                "alias": "MAPP",
+                "schema": "leeds",
+                "relation": "roads",
+            }},
+        }]}
+
+    def test_allows_declared_sources_with_ready_semantic_profiles(self):
+        app.require_semantic_derived_sources(self.payload(), self.catalog())
+
+    def test_rejects_declared_sources_without_semantic_profiles(self):
+        with self.assertRaisesRegex(
+            app.DerivedLayerError,
+            "leeds.roads.*semantic source sync",
+        ):
+            app.require_semantic_derived_sources(self.payload(), {"assets": []})
+
+    def test_rejects_archived_semantic_source_profiles(self):
+        with self.assertRaisesRegex(app.DerivedLayerError, "leeds.roads"):
+            app.require_semantic_derived_sources(
+                self.payload(), self.catalog(status="archived")
+            )
+
+
+class ExcludedSemanticSourceArchivalTests(unittest.TestCase):
+    def test_archives_only_ready_assets_matching_configured_exclusions(self):
+        asset = {
+            "id": "asset:census-datasets",
+            "status": "ready",
+            "generation": 4,
+            "generated": {"binding": {
+                "adapter": "postgresql",
+                "alias": "MAPP",
+                "schema": "leeds",
+                "relation": "census_datasets",
+            }},
+        }
+        semantic = Mock()
+        semantic.request.side_effect = [
+            {"assets": [asset]},
+            {
+                "catalogRevision": 8,
+                "event": {
+                    "eventId": ANY,
+                    "payloadHash": ANY,
+                    "idempotent": False,
+                },
+                "asset": {
+                    "id": asset["id"],
+                    "generation": 5,
+                    "status": "archived",
+                    "catalogRevision": 8,
+                },
+            },
+        ]
+        with patch.object(app, "SEMANTIC", semantic), patch.object(
+            app,
+            "SEMANTIC_SOURCE_EXCLUSIONS",
+            parse_exclusions("MAPP:leeds.census_datasets"),
+        ):
+            archived = app.archive_excluded_semantic_sources("admin")
+
+        self.assertEqual([{"id": asset["id"], "binding": asset["generated"]["binding"]}], archived)
+        self.assertEqual(2, semantic.request.call_count)
 
 
 class CatalogSymbologyValidationTests(unittest.TestCase):
@@ -147,6 +232,325 @@ class JsonResponseTests(unittest.TestCase):
         handler.send_response.assert_called_once_with(HTTPStatus.OK)
 
 
+class TokenAdministrationRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(
+        payload: dict,
+        *,
+        actor: str = "admin",
+        path: str = "/api/admin/tokens",
+    ) -> tuple[app.Handler, list[tuple[HTTPStatus, dict]]]:
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: payload
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_explicit_empty_scopes_fail_closed_at_admin_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            handler, responses = self.handler({
+                "name": "must not become full",
+                "scopes": [],
+            })
+
+            with patch.object(app, "CONTROL", store):
+                handler.do_POST()
+
+            self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+            self.assertEqual([], store.list_tokens())
+
+    def test_misspelled_or_null_scopes_never_expand_to_legacy_full(self):
+        invalid_requests = (
+            {
+                "name": "misspelled scope",
+                "scope": ["semantic:inspect"],
+            },
+            {
+                "name": "explicit null scope",
+                "scopes": None,
+            },
+            {
+                "name": "explicit null expiry",
+                "scopes": ["semantic:inspect"],
+                "expires": None,
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+
+            for payload in invalid_requests:
+                with self.subTest(payload=payload):
+                    handler, responses = self.handler(payload)
+                    with patch.object(app, "CONTROL", store):
+                        handler.do_POST()
+                    self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+
+            self.assertEqual([], store.list_tokens())
+
+    def test_missing_expiry_defaults_to_thirty_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            handler, responses = self.handler({
+                "name": "default lifetime",
+                "scopes": ["semantic:inspect"],
+            })
+            before = datetime.now(timezone.utc)
+
+            with patch.object(app, "CONTROL", store):
+                handler.do_POST()
+
+            self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+            expiry = datetime.fromisoformat(
+                responses[0][1]["record"]["expires"].replace("Z", "+00:00")
+            )
+            self.assertGreaterEqual(expiry, before + timedelta(days=30))
+            self.assertLess(expiry, before + timedelta(days=30, seconds=2))
+
+    def test_extended_or_non_expiring_tokens_require_confirmation(self):
+        expiry = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+
+            for requested_expiry in (expiry, None):
+                with self.subTest(expires=requested_expiry):
+                    handler, responses = self.handler({
+                        "name": "unconfirmed extension",
+                        "scopes": ["semantic:inspect"],
+                        "expires": requested_expiry,
+                    })
+                    with patch.object(app, "CONTROL", store):
+                        handler.do_POST()
+                    self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+
+            handler, responses = self.handler({
+                "name": "confirmed extension",
+                "scopes": ["semantic:inspect"],
+                "expires": expiry,
+                "extendedExpiryConfirmed": True,
+            })
+            with patch.object(app, "CONTROL", store):
+                handler.do_POST()
+            self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+
+            handler, responses = self.handler({
+                "name": "confirmed non-expiring",
+                "scopes": ["semantic:inspect"],
+                "expires": None,
+                "extendedExpiryConfirmed": True,
+            })
+            with patch.object(app, "CONTROL", store):
+                handler.do_POST()
+            self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+            self.assertIsNone(responses[0][1]["record"]["expires"])
+
+    def test_extended_expiry_confirmation_must_be_boolean(self):
+        handler, responses = self.handler({
+            "name": "ambiguous confirmation",
+            "scopes": ["semantic:inspect"],
+            "extendedExpiryConfirmed": "yes",
+        })
+        control = MagicMock()
+
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        control.create_token.assert_not_called()
+
+    def test_full_bearer_token_cannot_provision_more_tokens(self):
+        handler, responses = self.handler(
+            {"name": "nested administrator", "scopes": ["full"]},
+            actor="token:existing",
+        )
+        control = MagicMock()
+
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+        control.create_token.assert_not_called()
+
+    def test_only_exact_admin_token_route_can_revoke(self):
+        control = MagicMock()
+        control.revoke_token.return_value = True
+
+        handler, responses = self.handler(
+            {},
+            path="/api/admin/tokens/token-1/revoke",
+        )
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        control.revoke_token.assert_called_once_with("token-1")
+
+        control.reset_mock()
+        for path in (
+            "/api/not-admin/token-1/revoke",
+            "/api/admin/tokens/token-1/extra/revoke",
+            "/api/admin/tokens/token-1/revoke/extra",
+        ):
+            with self.subTest(path=path):
+                handler, responses = self.handler({}, path=path)
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+                self.assertEqual(HTTPStatus.NOT_FOUND, responses[0][0])
+                control.revoke_token.assert_not_called()
+
+    def test_full_bearer_token_cannot_revoke_tokens(self):
+        handler, responses = self.handler(
+            {},
+            actor="token:existing",
+            path="/api/admin/tokens/token-1/revoke",
+        )
+        control = MagicMock()
+
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+        control.revoke_token.assert_not_called()
+
+
+class AdministratorSessionBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def get_handler(
+        path: str,
+        actor: str,
+    ) -> tuple[app.Handler, list[tuple[HTTPStatus, dict]]]:
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_admin_reads_require_a_session_even_for_full_bearers(self):
+        cases = (
+            ("/api/admin/tokens", "list_tokens", "tokens"),
+            (
+                "/api/admin/device-authorizations",
+                "list_device_authorizations",
+                "authorizations",
+            ),
+            ("/api/admin/audit", "audit_tail", "events"),
+        )
+        for path, method_name, response_key in cases:
+            with self.subTest(path=path, actor="token:full"):
+                handler, responses = self.get_handler(
+                    path,
+                    "token:full",
+                )
+                control = MagicMock()
+                with patch.object(app, "CONTROL", control):
+                    handler.do_GET()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                getattr(control, method_name).assert_not_called()
+
+            with self.subTest(path=path, actor="admin"):
+                handler, responses = self.get_handler(path, "admin")
+                control = MagicMock()
+                getattr(control, method_name).return_value = []
+                with patch.object(app, "CONTROL", control):
+                    handler.do_GET()
+                self.assertEqual(
+                    (HTTPStatus.OK, {response_key: []}),
+                    responses[0],
+                )
+                getattr(control, method_name).assert_called_once_with()
+
+    def test_connect_reports_narrow_token_scopes_and_expiry(self):
+        handler, responses = self.get_handler("/api/connect", "token:visual")
+        handler._authentication = {
+            "actor": "token:visual",
+            "tokenId": "visual",
+            "scopes": ["visual"],
+            "expires": "2030-01-01T00:00:00Z",
+        }
+
+        handler.do_GET()
+
+        self.assertEqual(
+            (
+                HTTPStatus.OK,
+                {
+                    "authenticated": True,
+                    "actor": "token:visual",
+                    "tokenId": "visual",
+                    "scopes": ["visual"],
+                    "expires": "2030-01-01T00:00:00Z",
+                },
+            ),
+            responses[0],
+        )
+
+
+class AuthenticationHeaderTests(unittest.TestCase):
+    def test_duplicate_authorization_headers_fail_closed(self):
+        for values in (
+            ("Bearer valid", "Bearer other"),
+            ("Bearer invalid", "Bearer valid"),
+        ):
+            with self.subTest(values=values):
+                handler = object.__new__(app.Handler)
+                handler.headers = HTTPMessage()
+                for value in values:
+                    handler.headers.add_header("Authorization", value)
+                handler.headers.add_header(
+                    "Cookie",
+                    "mapp_session=valid-session",
+                )
+                handler.client_address = ("127.0.0.1", 12345)
+                control = MagicMock()
+
+                with patch.object(app, "CONTROL", control):
+                    actor = handler._actor()
+
+                self.assertIsNone(actor)
+                control.authenticate_token.assert_not_called()
+                control.session.assert_not_called()
+
+    def test_single_authorization_header_uses_the_bearer_identity(self):
+        handler = object.__new__(app.Handler)
+        handler.headers = HTTPMessage()
+        handler.headers.add_header("Authorization", "Bearer valid")
+        handler.client_address = ("127.0.0.1", 12345)
+        control = MagicMock()
+        control.authenticate_token.return_value = {
+            "id": "token-1",
+            "scopes": ["semantic:inspect"],
+        }
+
+        with patch.object(app, "CONTROL", control):
+            actor = handler._actor()
+
+        self.assertEqual("token:token-1", actor)
+        self.assertEqual(
+            {
+                "actor": "token:token-1",
+                "tokenId": "token-1",
+                "scopes": ["semantic:inspect"],
+                "expires": None,
+            },
+            handler._authentication,
+        )
+        control.authenticate_token.assert_called_once_with(
+            "valid",
+            "127.0.0.1",
+        )
+        control.session.assert_not_called()
+
+
 class LayersRouteTests(unittest.TestCase):
     @staticmethod
     def handler(path: str) -> tuple[app.Handler, list[tuple[HTTPStatus, dict]]]:
@@ -271,6 +675,743 @@ class LayersRouteTests(unittest.TestCase):
         )
 
 
+class DerivedMapExtentRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(path: str, payload: dict | None = None):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "token:test"
+        handler._authentication = {"scopes": ["inspect", "derive"]}
+        handler._payload = lambda: {**(payload or {})}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    @staticmethod
+    def workspace():
+        return {
+            "locale": {
+                "view": {"lng": -1.5, "lat": 53.8, "z": 11},
+            },
+            "locales": {
+                "city-centre": {
+                    "view": {"lng": -1.54, "lat": 53.81},
+                },
+            },
+        }
+
+    @staticmethod
+    def catalog():
+        return {"assets": [{
+            "status": "ready",
+            "generated": {"binding": {
+                "adapter": "postgresql",
+                "schema": "leeds",
+                "relation": "roads",
+            }},
+        }]}
+
+    @staticmethod
+    def materialization_probe(*, estimated_bytes=2 * 1024 ** 3):
+        return {
+            "method": "postgresql-explain",
+            "estimatedRows": 1_000_000,
+            "planRowWidthBytes": 2048,
+            "rowOverheadBytes": 32,
+            "safetyMultiplier": 1.2,
+            "estimatedBytes": estimated_bytes,
+            "maxEstimatedBytes": 1024 ** 3,
+        }
+
+    def test_capabilities_advertise_background_job_capacity(self):
+        handler, responses = self.handler("/api/derived-layers/capabilities")
+        derived = Mock()
+        derived.capabilities.return_value = {
+            "configured": True,
+            "schema": "derived_layers",
+            "kinds": ["view", "materialized"],
+        }
+        with patch.object(app, "DERIVED", derived):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        capacity = responses[0][1]["backgroundJobs"]
+        self.assertEqual(app.DERIVED_MAX_BACKGROUND_JOBS, capacity["maxActiveJobs"])
+        self.assertGreaterEqual(capacity["activeJobs"], 0)
+
+    def test_capabilities_database_error_does_not_expose_raw_context(self):
+        class DetailedProgrammingError(app.psycopg.ProgrammingError):
+            @property
+            def sqlstate(self):
+                return "08006"
+
+            @property
+            def diag(self):
+                return type("Diagnostics", (), {
+                    "message_primary": "database connection failed",
+                })()
+
+        handler, responses = self.handler(
+            "/api/derived-layers/capabilities"
+        )
+        derived = Mock()
+        derived.capabilities.side_effect = DetailedProgrammingError(
+            "SECRET host and connection string",
+        )
+        with patch.object(app, "DERIVED", derived):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual(
+            "derived_layer.capabilities_unavailable",
+            body["code"],
+        )
+        self.assertEqual("08006", body["technicalDetail"]["sqlstate"])
+        self.assertNotIn("SECRET", repr(body))
+
+    def test_show_missing_layer_has_structured_next_action(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/missing_layer"
+        )
+        derived = Mock()
+        derived.get.side_effect = FileNotFoundError("missing_layer")
+        with patch.object(app, "DERIVED", derived):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("derived_layer.not_found", body["code"])
+        self.assertEqual("missing_layer", body["name"])
+        self.assertIn("List derived layers", body["suggestedAction"])
+        self.assertNotIn("stateUnchanged", body)
+
+    @staticmethod
+    def query_plan_probe():
+        return {
+            "method": "postgresql-explain",
+            "estimatedTotalCost": 25_000_000,
+            "estimatedFinalRows": 1_000,
+            "maxIntermediateRows": 80_000_000,
+            "maxIntermediateBytes": 12 * 1024 ** 3,
+            "planNodeCount": 12,
+            "planDepth": 5,
+            "plannedWorkers": 0,
+            "recursivePlan": False,
+            "h3Expansion": {
+                "polygonToCellsCalls": 1,
+                "resolutions": [12],
+                "estimatedScopeCells": 20_000_000,
+            },
+            "limits": {
+                "maxTotalCost": 10_000_000,
+                "maxIntermediateRows": 50_000_000,
+                "maxIntermediateBytes": 8 * 1024 ** 3,
+            },
+        }
+
+    @staticmethod
+    def definition(**updates):
+        payload = {
+            "name": "roads_visible",
+            "kind": "view",
+            "query": "SELECT id, geom_3857 FROM leeds.roads",
+            "sources": ["leeds.roads"],
+            "idColumn": "id",
+            "geometryColumn": "geom_3857",
+        }
+        payload.update(updates)
+        return payload
+
+    def test_preview_uses_effective_named_locale_without_derived_database(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/map-extent?locale=city-centre"
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", None):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        scope = body["spatialScope"]
+        self.assertEqual("city-centre", scope["locale"])
+        self.assertEqual(
+            {"lng": -1.54, "lat": 53.81, "z": 11},
+            scope["sourceView"],
+        )
+
+    def test_preview_reports_structured_unavailable_view(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/map-extent"
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", {"locale": {}}, "revision"),
+        ), patch.object(app, "DERIVED", None):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual(
+            "derived_layer.map_extent_unavailable",
+            responses[0][1]["code"],
+        )
+
+    def test_synchronous_create_resolves_scope_before_semantics_and_store(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(spatialScope={
+                "type": "workspace-map-extent",
+                "locale": "city-centre",
+            }),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+
+        def create(payload, actor):
+            return {
+                **payload,
+                "semanticProfile": {
+                    "assetId": "asset",
+                    "generation": 1,
+                    "status": "registering",
+                    "revision": None,
+                },
+            }
+
+        derived.create.side_effect = create
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "schedule_semantic_outbox"
+        ), patch.object(app, "CONTROL", Mock()):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+        stored = derived.create.call_args.args[0]
+        self.assertEqual("city-centre", stored["spatialScope"]["locale"])
+        self.assertIn("envelopes", stored["spatialScope"])
+        self.assertNotEqual(
+            {"type": "workspace-map-extent", "locale": "city-centre"},
+            stored["spatialScope"],
+        )
+        derived.preflight_definition.assert_called_once_with(stored)
+
+    def test_create_defaults_to_the_workspace_map_extent(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.create.side_effect = lambda payload, _actor: payload
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "schedule_semantic_outbox"
+        ), patch.object(app, "CONTROL", Mock()):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+        stored = derived.create.call_args.args[0]
+        self.assertEqual("locale", stored["spatialScope"]["locale"])
+        self.assertEqual(10, stored["spatialScope"]["scopeZoom"])
+        derived.preflight_definition.assert_called_once_with(stored)
+
+    def test_oversized_materialization_is_blocked_before_background_create(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(kind="materialized", background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        probe = self.materialization_probe()
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerMaterializationTooLarge("roads_visible", probe)
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "start_derived_background"
+        ) as start:
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("derived_layer.materialization_too_large", body["code"])
+        self.assertTrue(body["blocked"])
+        self.assertEqual("view", body["recommendedKind"])
+        self.assertEqual(probe, body["probe"])
+        self.assertEqual("estimate", body["probeStage"])
+        self.assertNotIn("rolledBack", body)
+        self.assertEqual("create", body["operation"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        start.assert_not_called()
+        derived.create.assert_not_called()
+
+    def test_expensive_view_query_is_blocked_before_background_create(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(kind="view", background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        probe = self.query_plan_probe()
+        reasons = [
+            {"code": "total_cost", "message": "Planner cost exceeds the limit."},
+            {
+                "code": "intermediate_bytes",
+                "message": "An intermediate plan node exceeds the byte limit.",
+            },
+        ]
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerQueryTooExpensive(
+                "roads_visible",
+                probe,
+                reasons,
+            )
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "start_derived_background"
+        ) as start:
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("derived_layer.query_too_expensive", body["code"])
+        self.assertEqual("compute", body["category"])
+        self.assertEqual("create", body["operation"])
+        self.assertTrue(body["stateUnchanged"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        self.assertTrue(body["blocked"])
+        self.assertEqual(probe, body["probe"])
+        self.assertEqual(
+            [reason["code"] for reason in reasons],
+            [reason["code"] for reason in body["reasons"]],
+        )
+        self.assertTrue(all(
+            reason.get("suggestedAction") for reason in body["reasons"]
+        ))
+        self.assertNotIn("recommendedKind", body)
+        self.assertIn("ordinary view", body["suggestedAction"])
+        start.assert_not_called()
+        derived.create.assert_not_called()
+
+    def test_invalid_query_has_a_syntax_specific_error(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerQueryTooExpensive(
+                "roads_visible",
+                {"method": "postgresql-ast-guard"},
+                [{
+                    "code": "invalid_sql",
+                    "message": "PostgreSQL could not parse the query.",
+                }],
+            )
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("derived_layer.query_invalid", body["code"])
+        self.assertEqual("invalid", body["category"])
+        self.assertIn("is invalid", body["userMessage"])
+        self.assertNotIn("too expensive", body["userMessage"])
+        self.assertNotIn("recommendedKind", body)
+
+    def test_sql_contract_rejection_uses_the_same_invalid_query_code(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(query=(
+                "SELECT id, geom_3857 FROM leeds.roads;"
+            )),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", Mock()):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("derived_layer.query_invalid", body["code"])
+        self.assertEqual("invalid", body["category"])
+        self.assertEqual("invalid_sql", body["reasons"][0]["code"])
+        self.assertTrue(body["stateUnchanged"])
+
+    def test_forbidden_sql_keyword_uses_policy_code_and_status(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(query=(
+                "WITH changed AS (UPDATE leeds.roads SET id = id RETURNING *) "
+                "SELECT id, geom_3857 FROM changed"
+            )),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", Mock()):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("derived_layer.query_not_allowed", body["code"])
+        self.assertEqual("policy", body["category"])
+        self.assertEqual("prohibited_sql", body["reasons"][0]["code"])
+        self.assertNotIn("recommendedKind", body)
+
+    def test_security_policy_query_has_policy_specific_guidance(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerQueryTooExpensive(
+                "roads_visible",
+                {"method": "postgresql-catalog-guard"},
+                [{
+                    "code": "security_definer_routine",
+                    "message": "Resolved routine private.wrapper is SECURITY DEFINER.",
+                }],
+            )
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("derived_layer.query_not_allowed", body["code"])
+        self.assertEqual("policy", body["category"])
+        self.assertIn("not allowed", body["userMessage"])
+        self.assertIn("Remove the routine", body["suggestedAction"])
+        self.assertIn(
+            "approved pg_catalog",
+            body["reasons"][0]["suggestedAction"],
+        )
+        self.assertNotIn("recommendedKind", body)
+
+    def test_source_mismatch_identifies_missing_and_unused_declarations(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerSourceMismatchError(
+                ["leeds.roads", "leeds.unused"],
+                ["leeds.roads", "leeds.boundaries"],
+            )
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("derived_layer.source_mismatch", body["code"])
+        self.assertEqual(["leeds.boundaries"], body["missingSources"])
+        self.assertEqual(["leeds.unused"], body["extraSources"])
+        self.assertIn("Add every relation", body["suggestedAction"])
+        self.assertTrue(body["stateUnchanged"])
+
+    def test_missing_semantic_source_profile_names_the_cli_remediation(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(),
+        )
+        handler._semantic_request = Mock(return_value={"assets": []})
+        derived = Mock()
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual(
+            "derived_layer.source_profile_required",
+            body["code"],
+        )
+        self.assertIn("semantic source sync", body["suggestedAction"])
+        self.assertIn("leeds.roads", body["userMessage"])
+        self.assertTrue(body["stateUnchanged"])
+        derived.preflight_definition.assert_not_called()
+
+    def test_database_error_exposes_only_sanitized_diagnostics(self):
+        class DetailedProgrammingError(app.psycopg.ProgrammingError):
+            @property
+            def sqlstate(self):
+                return "42703"
+
+            @property
+            def diag(self):
+                return type("Diagnostics", (), {
+                    "message_primary": "column score does not exist",
+                })()
+
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.side_effect = DetailedProgrammingError(
+            "SECRET SELECT text and server context",
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("derived_layer.database_error", body["code"])
+        self.assertEqual(
+            {
+                "sqlstate": "42703",
+                "message": "column score does not exist",
+            },
+            body["technicalDetail"],
+        )
+        self.assertNotIn("SECRET SELECT", repr(body))
+        self.assertNotIn("stateUnchanged", body)
+
+    def test_unexpected_synchronous_failure_is_safe_and_indeterminate(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.side_effect = RuntimeError(
+            "SECRET internal path",
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, status)
+        self.assertEqual("derived_layer.operation_failed", body["code"])
+        self.assertTrue(body["indeterminate"])
+        self.assertNotIn("SECRET", repr(body))
+        self.assertNotIn("stateUnchanged", body)
+
+    def test_refresh_confirmation_error_names_the_unchanged_state(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/roads_visible/refresh",
+            {"confirmed": False},
+        )
+        derived = Mock()
+        with patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("derived_layer.confirmation_required", body["code"])
+        self.assertEqual("refresh", body["operation"])
+        self.assertEqual(
+            "The existing materialized data remains unchanged.",
+            body["safeState"],
+        )
+        derived.preflight_refresh.assert_not_called()
+
+    def test_oversized_refresh_is_blocked_before_background_start(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/roads_visible/refresh",
+            {"confirmed": True, "background": True},
+        )
+        derived = Mock()
+        probe = self.materialization_probe()
+        derived.preflight_refresh.side_effect = (
+            app.DerivedLayerMaterializationTooLarge("roads_visible", probe)
+        )
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "start_derived_background"
+        ) as start:
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        body = responses[0][1]
+        self.assertEqual(probe, body["probe"])
+        self.assertEqual("refresh", body["operation"])
+        self.assertEqual("estimate", body["probeStage"])
+        self.assertNotIn("rolledBack", body)
+        self.assertEqual(
+            "The existing materialized data remains unchanged.",
+            body["safeState"],
+        )
+        self.assertIn("Convert this materialized layer", body["suggestedAction"])
+        start.assert_not_called()
+        derived.refresh.assert_not_called()
+
+    def test_missing_refresh_target_returns_a_recoverable_not_found_error(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/missing_layer/refresh",
+            {"confirmed": True, "background": True},
+        )
+        derived = Mock()
+        derived.preflight_refresh.side_effect = FileNotFoundError(
+            "missing_layer"
+        )
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "start_derived_background",
+        ) as start:
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("derived_layer.not_found", body["code"])
+        self.assertEqual("missing_layer", body["name"])
+        self.assertEqual("refresh", body["operation"])
+        self.assertIn("List derived layers", body["suggestedAction"])
+        start.assert_not_called()
+
+    def test_background_capacity_returns_retryable_structured_rejection(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        capacity = app.DerivedLayerBackgroundCapacityError(1, 1)
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app,
+            "start_derived_background",
+            side_effect=capacity,
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual("derived_layer.background_capacity", body["code"])
+        self.assertTrue(body["blocked"])
+        self.assertTrue(body["retryable"])
+        self.assertEqual("create", body["operation"])
+        self.assertTrue(body["stateUnchanged"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        self.assertEqual(1, body["activeJobs"])
+        self.assertEqual(1, body["maxActiveJobs"])
+        derived.create.assert_not_called()
+
+    def test_create_rejects_client_supplied_extent_bounds(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(spatialScope={
+                "type": "workspace-map-extent",
+                "envelopes": [{
+                    "west": -2,
+                    "south": 53,
+                    "east": -1,
+                    "north": 54,
+                }],
+            }),
+        )
+        derived = Mock()
+        with patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertIn("Unknown spatialScope properties", responses[0][1]["error"])
+        derived.create.assert_not_called()
+
+    def test_background_create_and_replace_receive_resolved_scope(self):
+        cases = (
+            (
+                "/api/derived-layers",
+                self.definition(
+                    background=True,
+                    spatialScope={"type": "workspace-map-extent"},
+                ),
+                "create",
+                None,
+            ),
+            (
+                "/api/derived-layers/roads_visible/replace",
+                self.definition(
+                    confirmed=True,
+                    background=True,
+                    spatialScope={"type": "workspace-map-extent"},
+                ),
+                "replace",
+                "roads_visible",
+            ),
+        )
+        for path, payload, action, name in cases:
+            with self.subTest(action=action):
+                handler, responses = self.handler(path, payload)
+                handler._semantic_request = Mock(return_value=self.catalog())
+                with patch.object(
+                    app,
+                    "read_workspace",
+                    return_value=(b"{}", self.workspace(), "revision"),
+                ), patch.object(app, "DERIVED", Mock()), patch.object(
+                    app,
+                    "start_derived_background",
+                    return_value={"id": "operation-1"},
+                ) as start:
+                    handler.do_POST()
+
+                self.assertEqual(HTTPStatus.ACCEPTED, responses[0][0])
+                args = start.call_args.args
+                self.assertEqual(action, args[0])
+                self.assertEqual("workspace-map-extent", args[1]["spatialScope"]["type"])
+                self.assertIn("envelopes", args[1]["spatialScope"])
+                if name is not None:
+                    self.assertEqual(name, args[4])
+
+
 class CatalogDiscoveryTests(unittest.TestCase):
     def test_server_catalog_omits_public_schema_without_hiding_it_from_validation(self):
         discovered = [
@@ -283,6 +1424,51 @@ class CatalogDiscoveryTests(unittest.TestCase):
 
         # Full discovery remains available to workspace validation.
         self.assertEqual("public", discovered[0]["schema"])
+
+    def test_server_catalog_offers_only_semantically_ready_derived_layers(self):
+        discovered = [
+            {"dbs": "MAPP", "schema": "etl", "table": "places"},
+            {
+                "dbs": "MAPP",
+                "schema": "derived_layers",
+                "table": "ready_places",
+            },
+            {
+                "dbs": "MAPP",
+                "schema": "derived_layers",
+                "table": "pending_places",
+            },
+        ]
+        derived = Mock()
+        derived.list.return_value = [
+            {
+                "name": "ready_places",
+                "kind": "view",
+                "semanticProfile": {
+                    "assetId": "1",
+                    "generation": 1,
+                    "status": "ready",
+                    "revision": "4",
+                },
+            },
+            {
+                "name": "pending_places",
+                "kind": "view",
+                "semanticProfile": {
+                    "assetId": "2",
+                    "generation": 1,
+                    "status": "registering",
+                    "revision": None,
+                },
+            },
+        ]
+
+        with patch.object(app, "discover", return_value=discovered), patch.object(
+            app, "DERIVED", derived
+        ):
+            result = app.discover_catalog()
+
+        self.assertEqual(discovered[:2], result)
 
     def test_materialized_geometry_uses_relation_typmod_metadata(self):
         connection = MagicMock()
@@ -302,6 +1488,54 @@ class CatalogDiscoveryTests(unittest.TestCase):
 
 
 class DerivedBackgroundOperationTests(unittest.TestCase):
+    def test_background_job_admission_is_bounded(self):
+        reserved = 0
+        try:
+            for _ in range(app.DERIVED_MAX_BACKGROUND_JOBS):
+                app.reserve_derived_background_job()
+                reserved += 1
+            capacity = app.derived_background_capacity()
+            self.assertEqual(
+                app.DERIVED_MAX_BACKGROUND_JOBS,
+                capacity["activeJobs"],
+            )
+            self.assertEqual(app.DERIVED_MAX_BACKGROUND_JOBS, capacity["maxActiveJobs"])
+            with self.assertRaises(app.DerivedLayerBackgroundCapacityError):
+                app.reserve_derived_background_job()
+        finally:
+            for _ in range(reserved):
+                app.release_derived_background_job()
+
+        self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
+
+    def test_started_worker_releases_its_admission_slot(self):
+        control = Mock()
+        control.create_operation.return_value = {
+            "id": "a" * 32,
+            "status": "running",
+        }
+
+        def immediate_thread(*, target, args, **_kwargs):
+            thread = Mock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        with patch.object(app, "CONTROL", control), patch.object(
+            app.threading,
+            "Thread",
+            side_effect=immediate_thread,
+        ), patch.object(app, "run_derived_background") as run:
+            operation = app.start_derived_background(
+                "create",
+                {"name": "safe_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        self.assertEqual("a" * 32, operation["id"])
+        run.assert_called_once()
+        self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
+
     def test_create_records_success_only_after_store_returns(self):
         derived = Mock()
         derived.create.return_value = {
@@ -327,9 +1561,11 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             result={"derivedLayer": derived.create.return_value},
         )
 
-    def test_database_failure_is_available_to_status_polling(self):
+    def test_unexpected_failure_is_safe_and_indeterminate_in_status_polling(self):
         derived = Mock()
-        derived.refresh.side_effect = RuntimeError("statement timed out")
+        derived.refresh.side_effect = RuntimeError(
+            "secret SQL and internal connection path"
+        )
         control = Mock()
 
         with patch.object(app, "DERIVED", derived), patch.object(app, "CONTROL", control):
@@ -343,11 +1579,216 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             )
 
         call = control.finish_operation.call_args
-        self.assertEqual("failed", call.kwargs["status"])
-        self.assertEqual(
-            "statement timed out",
-            call.kwargs["error"]["message"],
+        self.assertEqual("indeterminate", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.operation_failed", error["code"])
+        self.assertTrue(error["indeterminate"])
+        self.assertNotIn("secret SQL", error["message"])
+        self.assertNotIn("stateUnchanged", error)
+        self.assertNotIn("safeState", error)
+
+    def test_background_database_failure_uses_sanitized_diagnostics(self):
+        class DetailedProgrammingError(app.psycopg.ProgrammingError):
+            @property
+            def sqlstate(self):
+                return "57014"
+
+            @property
+            def diag(self):
+                return type("Diagnostics", (), {
+                    "message_primary": "canceling statement due to timeout",
+                })()
+
+        derived = Mock()
+        derived.refresh.side_effect = DetailedProgrammingError(
+            "SECRET SQL query context",
         )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "1" * 32,
+                "refresh",
+                {},
+                "admin",
+                "127.0.0.1",
+                "slow_places",
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("failed", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.database_error", error["code"])
+        self.assertEqual(
+            {
+                "sqlstate": "57014",
+                "message": "canceling statement due to timeout",
+            },
+            error["technicalDetail"],
+        )
+        self.assertNotIn("SECRET SQL", repr(error))
+
+    def test_background_legacy_policy_rejection_keeps_422_status(self):
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerError(
+            "SQL keyword UPDATE is not allowed."
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "2" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("derived_layer.query_not_allowed", error["code"])
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, error["status"])
+        self.assertEqual("policy", error["category"])
+
+    def test_materialization_growth_race_preserves_structured_failure(self):
+        probe = DerivedMapExtentRouteTests.materialization_probe()
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerMaterializationTooLarge(
+            "slow_places",
+            probe,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control
+        ):
+            app.run_derived_background(
+                "c" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("derived_layer.materialization_too_large", error["code"])
+        self.assertEqual(HTTPStatus.CONFLICT, error["status"])
+        self.assertEqual("view", error["recommendedKind"])
+        self.assertEqual(probe, error["probe"])
+        self.assertEqual("create", error["operation"])
+        self.assertEqual("estimate", error["probeStage"])
+        self.assertNotIn("rolledBack", error)
+
+    def test_query_cost_race_preserves_structured_failure(self):
+        probe = DerivedMapExtentRouteTests.query_plan_probe()
+        reasons = [
+            {"code": "total_cost", "message": "Planner cost exceeds the limit."},
+            {
+                "code": "intermediate_rows",
+                "message": "An intermediate plan node exceeds the row limit.",
+            },
+        ]
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerQueryTooExpensive(
+            "slow_places",
+            probe,
+            reasons,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control
+        ):
+            app.run_derived_background(
+                "d" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("derived_layer.query_too_expensive", error["code"])
+        self.assertEqual(HTTPStatus.CONFLICT, error["status"])
+        self.assertEqual(probe, error["probe"])
+        self.assertEqual(
+            [reason["code"] for reason in reasons],
+            [reason["code"] for reason in error["reasons"]],
+        )
+        self.assertTrue(all(
+            reason.get("suggestedAction") for reason in error["reasons"]
+        ))
+        self.assertNotIn("recommendedKind", error)
+
+    def test_actual_materialization_growth_reports_transaction_rollback(self):
+        probe = {
+            **DerivedMapExtentRouteTests.materialization_probe(
+                estimated_bytes=512 * 1024 ** 2,
+            ),
+            "actualBytes": 2 * 1024 ** 3,
+        }
+        derived = Mock()
+        derived.refresh.side_effect = app.DerivedLayerMaterializationTooLarge(
+            "slow_places", probe,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "e" * 32,
+                "refresh",
+                {},
+                "admin",
+                "127.0.0.1",
+                "slow_places",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("actual", error["probeStage"])
+        self.assertTrue(error["rolledBack"])
+        self.assertEqual("refresh", error["operation"])
+        self.assertEqual(
+            "The existing materialized data remains unchanged.",
+            error["safeState"],
+        )
+
+    def test_dependency_race_preserves_in_use_guidance(self):
+        derived = Mock()
+        derived.replace.side_effect = app.DerivedLayerDependencyError(
+            "slow_places",
+            ["public.consumer"],
+            removed_columns=["score"],
+            dependent_columns=["score"],
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ), patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", {"locale": {"layers": {}}}, "revision"),
+        ):
+            app.run_derived_background(
+                "f" * 32,
+                "replace",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+                "slow_places",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("derived_layer.in_use", error["code"])
+        self.assertEqual(["public.consumer"], error["dependents"])
+        self.assertEqual(["score"], error["removedColumns"])
+        self.assertEqual("replace", error["operation"])
+        self.assertTrue(error["stateUnchanged"])
 
     def test_background_create_with_datetime_metadata_records_success(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -398,6 +1839,949 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             )
 
 
+class SemanticDerivedIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def workspace() -> dict:
+        return {
+            "dbs": "MAPP",
+            "locale": {
+                "layers": {
+                    "Places": {
+                        "dbs": "MAPP",
+                        "table": "derived_layers.places",
+                    },
+                },
+            },
+        }
+
+    @staticmethod
+    def derived(status: str = "registering") -> Mock:
+        derived = Mock()
+        derived.list.return_value = [{
+            "name": "places",
+            "kind": "view",
+            "semanticProfile": {
+                "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 2,
+                "status": status,
+                "revision": "8" if status == "ready" else None,
+            },
+        }]
+        return derived
+
+    def test_new_nonready_binding_is_blocked_but_existing_binding_warns(self):
+        candidate = self.workspace()
+        with patch.object(app, "DERIVED", self.derived()):
+            errors, warnings = app.semantic_publication_diagnostics(candidate, {})
+            existing_errors, existing_warnings = (
+                app.semantic_publication_diagnostics(candidate, candidate)
+            )
+
+        self.assertEqual("semantic.derived_not_ready", errors[0]["code"])
+        self.assertEqual([], warnings)
+        self.assertEqual([], existing_errors)
+        self.assertEqual("registering", existing_warnings[0]["status"])
+
+    def test_ready_binding_has_no_publication_diagnostic(self):
+        candidate = self.workspace()
+        with patch.object(app, "DERIVED", self.derived("ready")):
+            self.assertEqual(
+                ([], []),
+                app.semantic_publication_diagnostics(candidate, {}),
+            )
+
+    def test_outbox_delivery_atomically_completes_claimed_event(self):
+        payload = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 2,
+            "actor": "token:test",
+            "visibility": "inspect",
+            "generated": {"name": "places"},
+        }
+        payload["payloadHash"] = app.semantic_event_payload_hash(payload)
+        event = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "claimId": "cb39b58c-3487-49da-94ce-0a9633cc848a",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 2,
+            "attempts": 0,
+            "payload": payload,
+        }
+        derived = Mock()
+        derived.claim_semantic_events.side_effect = [[event], []]
+        semantic = Mock()
+        semantic.request.return_value = {
+            "catalogRevision": 11,
+            "event": {
+                "eventId": event["eventId"],
+                "payloadHash": payload["payloadHash"],
+                "idempotent": False,
+            },
+            "asset": {
+                "id": event["assetId"],
+                "generation": 2,
+                "status": "ready",
+                "catalogRevision": 11,
+            },
+        }
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            result = app.drain_semantic_outbox()
+
+        self.assertEqual({"delivered": 1, "retried": 0, "repairRequired": 0}, result)
+        sent = semantic.request.call_args.kwargs["payload"]
+        self.assertEqual(payload["payloadHash"], sent["payloadHash"])
+        self.assertEqual(
+            [
+                "claim_semantic_events",
+                "mark_semantic_delivered",
+                "claim_semantic_events",
+            ],
+            [call[0] for call in derived.method_calls],
+        )
+
+    def test_mismatched_event_ack_never_marks_profile_ready(self):
+        payload = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 2,
+            "actor": "token:test",
+            "generated": {"name": "places"},
+        }
+        payload["payloadHash"] = app.semantic_event_payload_hash(payload)
+        event = {
+            **{
+                key: payload[key]
+                for key in ("eventId", "assetId", "type", "generation")
+            },
+            "claimId": "cb39b58c-3487-49da-94ce-0a9633cc848a",
+            "attempts": 0,
+            "payload": payload,
+        }
+        derived = Mock()
+        derived.claim_semantic_events.side_effect = [[event], []]
+        semantic = Mock()
+        semantic.request.return_value = {
+            "catalogRevision": 11,
+            "event": {
+                "eventId": "wrong-event",
+                "payloadHash": payload["payloadHash"],
+                "idempotent": False,
+            },
+            "asset": {
+                "id": event["assetId"],
+                "generation": 2,
+                "status": "ready",
+                "catalogRevision": 11,
+            },
+        }
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            result = app.drain_semantic_outbox()
+
+        self.assertEqual(1, result["retried"])
+        derived.mark_semantic_delivered.assert_not_called()
+
+    def test_corrupt_outbox_hash_requires_repair_without_sending(self):
+        event = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "claimId": "cb39b58c-3487-49da-94ce-0a9633cc848a",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 2,
+            "attempts": 0,
+            "payload": {
+                "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "type": "register",
+                "generation": 2,
+                "actor": "token:test",
+                "payloadHash": "0" * 64,
+            },
+        }
+        derived = Mock()
+        derived.claim_semantic_events.side_effect = [[event], []]
+        semantic = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            result = app.drain_semantic_outbox()
+
+        self.assertEqual(1, result["repairRequired"])
+        semantic.request.assert_not_called()
+        derived.mark_semantic_repair.assert_called_once()
+
+    def test_semantic_event_integers_reject_bool_and_float_coercion(self):
+        event = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 1,
+        }
+        for invalid in (True, 1.0):
+            with self.subTest(retained_generation=invalid):
+                payload = {
+                    **event,
+                    "generation": invalid,
+                    "actor": "token:test",
+                    "generated": {"name": "places"},
+                }
+                payload["payloadHash"] = app.semantic_event_payload_hash(
+                    payload
+                )
+                with self.assertRaises(app.SemanticClientError):
+                    app.validate_semantic_outbox_event({
+                        **event,
+                        "payload": payload,
+                    })
+
+        payload = {**event, "payloadHash": "a" * 64}
+        valid_ack = {
+            "catalogRevision": 1,
+            "event": {
+                "eventId": event["eventId"],
+                "payloadHash": payload["payloadHash"],
+                "idempotent": False,
+            },
+            "asset": {
+                "id": event["assetId"],
+                "generation": 1,
+                "status": "ready",
+                "catalogRevision": 1,
+            },
+        }
+        for field, invalid in (
+            ("generation", True),
+            ("generation", 1.0),
+            ("catalogRevision", True),
+            ("catalogRevision", 1.0),
+        ):
+            with self.subTest(ack_field=field, invalid=invalid):
+                response = {
+                    **valid_ack,
+                    "event": dict(valid_ack["event"]),
+                    "asset": {
+                        **valid_ack["asset"],
+                        field: invalid,
+                    },
+                }
+                with self.assertRaises(app.SemanticClientError):
+                    app.validate_semantic_event_ack(
+                        event,
+                        payload,
+                        response,
+                    )
+
+    def test_permanent_semantic_rejection_requires_manual_repair(self):
+        derived = Mock()
+        event = {
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "claimId": "cb39b58c-3487-49da-94ce-0a9633cc848a",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "register",
+            "generation": 2,
+            "attempts": 0,
+            "payload": {"actor": "token:test"},
+        }
+        derived.claim_semantic_events.side_effect = [[event], []]
+        semantic = Mock()
+        semantic.request.side_effect = app.SemanticClientError(
+            "Invalid event.",
+            status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            payload={"code": "semantic.invalid_event"},
+        )
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            result = app.drain_semantic_outbox()
+
+        self.assertEqual(1, result["repairRequired"])
+        derived.mark_semantic_repair.assert_called_once()
+        derived.mark_semantic_retry.assert_not_called()
+
+    def test_confirmed_reset_archives_profiles_before_database_removal(self):
+        reset_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        derived = self.derived("ready")
+        semantic = Mock()
+        archived = [{
+            "name": "places",
+            "relation": "derived_layers.places",
+            "kind": "view",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "generation": 3,
+            "status": "archived",
+            "revision": "12",
+        }]
+        ready = [{**archived[0], "status": "ready", "revision": "11"}]
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "drain_semantic_outbox") as drain, patch.object(
+            app,
+            "derived_semantic_profiles",
+            side_effect=[ready, archived],
+        ):
+            derived.semantic_outbox_blockers.return_value = []
+            result = app.archive_derived_semantics_before_reset(reset_owner)
+
+        derived.begin_semantic_reset.assert_called_once_with(
+            "system:reset-data",
+            reset_owner,
+        )
+        derived.queue_semantic_archives.assert_called_once_with(
+            "system:reset-data"
+        )
+        self.assertEqual(2, drain.call_count)
+        self.assertEqual(1, result["archived"])
+        self.assertEqual(12, result["catalogRevision"])
+
+    def test_reset_refuses_orphaned_semantic_outbox_repair(self):
+        reset_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        derived = self.derived("ready")
+        derived.semantic_outbox_blockers.return_value = [{
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "archive",
+            "generation": 4,
+            "status": "repair_required",
+            "name": "already_dropped",
+            "lastError": "asset not found",
+        }]
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ), patch.object(app, "drain_semantic_outbox"), patch.object(
+            app,
+            "derived_semantic_profiles",
+            return_value=[{
+                "name": "places",
+                "status": "ready",
+            }],
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "already_dropped",
+            ):
+                app.archive_derived_semantics_before_reset(reset_owner)
+        derived.queue_semantic_archives.assert_not_called()
+
+    def test_explicit_force_recovery_rebinds_interrupted_reset_profiles(self):
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.return_value = {
+            "resetOwner": "289d495d-6642-4525-8a63-bb5e4f0c764c",
+            "profiles": [{
+                "name": "places",
+                "assetId": "b22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 1,
+                "status": "registering",
+                "revision": None,
+            }],
+        }
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "schedule_semantic_outbox"
+        ) as wake:
+            result = app.recover_interrupted_reset_semantics(force=True)
+
+        self.assertEqual(1, result["recovered"])
+        derived.recover_reset_semantic_profiles.assert_called_once_with(
+            "system:reset-recovery",
+            None,
+        )
+        wake.assert_called_once_with()
+        derived.complete_reset_semantic_recovery.assert_not_called()
+
+    def test_force_recovery_pins_completion_to_the_observed_gate_owner(self):
+        observed_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.return_value = {
+            "resetOwner": observed_owner,
+            "profiles": [{
+                "name": "places",
+                "assetId": "b22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 1,
+                "status": "registering",
+                "revision": None,
+            }],
+        }
+        derived.semantic_outbox_blockers.return_value = []
+        ready = [{
+            "name": "places",
+            "status": "ready",
+            "revision": "14",
+        }]
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ), patch.object(app, "drain_semantic_outbox"), patch.object(
+            app,
+            "derived_semantic_profiles",
+            return_value=ready,
+        ):
+            result = app.recover_interrupted_reset_semantics(
+                force=True,
+                wait_for_ready=True,
+            )
+
+        self.assertEqual(1, result["recovered"])
+        derived.recover_reset_semantic_profiles.assert_called_once_with(
+            "system:reset-recovery",
+            None,
+        )
+        derived.complete_reset_semantic_recovery.assert_called_once_with(
+            observed_owner
+        )
+
+    def test_empty_owned_recovery_completes_its_observed_gate(self):
+        observed_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.return_value = {
+            "resetOwner": observed_owner,
+            "profiles": [],
+        }
+        derived.reset_recovery_names.return_value = []
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ):
+            result = app.recover_interrupted_reset_semantics(
+                reset_owner=observed_owner,
+                wait_for_ready=True,
+            )
+
+        self.assertEqual(0, result["recovered"])
+        derived.complete_reset_semantic_recovery.assert_called_once_with(
+            observed_owner
+        )
+
+    def test_reset_compensation_requires_old_archive_to_finish(self):
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.return_value = {
+            "resetOwner": "289d495d-6642-4525-8a63-bb5e4f0c764c",
+            "profiles": [{
+                "name": "places",
+                "assetId": "b22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 1,
+                "status": "registering",
+                "revision": None,
+            }],
+        }
+        derived.semantic_outbox_blockers.return_value = [{
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "archive",
+            "generation": 3,
+            "status": "repair_required",
+            "name": "places",
+            "lastError": "stale generation",
+        }]
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ), patch.object(app, "drain_semantic_outbox"), patch.object(
+            app,
+            "derived_semantic_profiles",
+            return_value=[{
+                "name": "places",
+                "status": "registering",
+            }],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "places"):
+                app.recover_interrupted_reset_semantics(
+                    reset_owner=(
+                        "289d495d-6642-4525-8a63-bb5e4f0c764c"
+                    ),
+                    wait_for_ready=True
+                )
+        derived.complete_reset_semantic_recovery.assert_not_called()
+
+    def test_reset_compensation_waits_for_recovery_started_at_boot(self):
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.return_value = {
+            "resetOwner": "289d495d-6642-4525-8a63-bb5e4f0c764c",
+            "profiles": [],
+        }
+        derived.reset_recovery_names.return_value = ["places"]
+        derived.semantic_outbox_blockers.return_value = []
+        ready = [{
+            "name": "places",
+            "status": "ready",
+            "revision": "14",
+        }]
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ), patch.object(app, "drain_semantic_outbox"), patch.object(
+            app,
+            "derived_semantic_profiles",
+            return_value=ready,
+        ):
+            result = app.recover_interrupted_reset_semantics(
+                reset_owner="289d495d-6642-4525-8a63-bb5e4f0c764c",
+                wait_for_ready=True
+            )
+
+        self.assertEqual(1, result["recovered"])
+        self.assertEqual(ready, result["profiles"])
+        derived.reset_recovery_names.assert_called_once_with()
+        derived.complete_reset_semantic_recovery.assert_called_once_with(
+            "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        )
+
+    def test_losing_reset_compensation_does_not_touch_winning_gate(self):
+        derived = Mock()
+        derived.recover_reset_semantic_profiles.side_effect = (
+            app.DerivedLayerResetOwnershipError(
+                "The maintenance gate belongs to another reset operation."
+            )
+        )
+        with patch.object(app, "DERIVED", derived):
+            result = app.recover_interrupted_reset_semantics(
+                reset_owner="ae7846cd-594b-4a42-91b7-06f533906b43",
+                wait_for_ready=True,
+            )
+
+        self.assertEqual(0, result["recovered"])
+        self.assertFalse(result["gateOwned"])
+        self.assertEqual("foreign_gate", result["reason"])
+        derived.reset_recovery_names.assert_not_called()
+        derived.complete_reset_semantic_recovery.assert_not_called()
+
+
+class SemanticGatewayRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(path: str, payload: dict | None = None):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "token:test"
+        handler._authentication = {}
+        handler._payload = lambda: payload or {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_derived_profile_readiness_is_served_from_local_outbox_state(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places"
+        )
+        derived = SemanticDerivedIntegrationTests.derived("registering")
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 14}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        status, payload = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(14, payload["catalogRevision"])
+        self.assertEqual("places", payload["derivedProfile"]["name"])
+        self.assertEqual(
+            "registering",
+            payload["derivedProfile"]["status"],
+        )
+
+    def test_admin_profile_read_surfaces_name_level_delivery_blocker(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places"
+        )
+        handler._authentication = {
+            "scopes": ["semantic:inspect", "semantic:admin"],
+        }
+        derived = SemanticDerivedIntegrationTests.derived("registering")
+        derived.semantic_outbox_blockers.return_value = [{
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "archive",
+            "generation": 3,
+            "status": "repair_required",
+            "attempts": 8,
+            "name": "places",
+            "lastError": "stale\n generation",
+        }]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        status, payload = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            {
+                "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "operation": "archive",
+                "generation": 3,
+                "status": "repair_required",
+                "attempts": 8,
+                "lastError": "stale generation",
+            },
+            payload["derivedProfile"]["delivery"],
+        )
+
+    def test_admin_list_surfaces_unmatched_dropped_archive_blocker(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles"
+        )
+        handler._authentication = {
+            "scopes": ["semantic:inspect", "semantic:admin"],
+        }
+        derived = SemanticDerivedIntegrationTests.derived("ready")
+        derived.semantic_outbox_blockers.return_value = [{
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "archive",
+            "generation": 3,
+            "status": "repair_required",
+            "attempts": 8,
+            "name": "already_dropped",
+            "lastError": "private\n failure",
+        }]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        status, payload = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(
+            [{
+                "name": "already_dropped",
+                "relation": "derived_layers.already_dropped",
+                "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "eventId": (
+                    derived.semantic_outbox_blockers.return_value[0]["eventId"]
+                ),
+                "operation": "archive",
+                "generation": 3,
+                "status": "repair_required",
+                "attempts": 8,
+                "lastError": "private failure",
+            }],
+            payload["deliveryBlockers"],
+        )
+
+    def test_inspect_only_list_omits_dropped_archive_blockers(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles"
+        )
+        handler._authentication = {"scopes": ["semantic:inspect"]}
+        derived = SemanticDerivedIntegrationTests.derived("ready")
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertNotIn("deliveryBlockers", responses[0][1])
+        derived.semantic_outbox_blockers.assert_not_called()
+
+    def test_inspect_only_profile_read_redacts_delivery_diagnostics(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places"
+        )
+        handler._authentication = {"scopes": ["semantic:inspect"]}
+        derived = SemanticDerivedIntegrationTests.derived("registering")
+        derived.semantic_outbox_blockers.return_value = [{
+            "eventId": "e22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "type": "archive",
+            "generation": 3,
+            "status": "repair_required",
+            "attempts": 8,
+            "name": "places",
+            "lastError": "private database detail",
+        }]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertNotIn("delivery", responses[0][1]["derivedProfile"])
+        derived.semantic_outbox_blockers.assert_not_called()
+
+    def test_derived_profile_read_never_fabricates_catalog_revision(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places"
+        )
+        derived = SemanticDerivedIntegrationTests.derived("ready")
+        semantic = Mock()
+        semantic.request.side_effect = app.SemanticClientError(
+            "semantic service unavailable",
+        )
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, responses[0][0])
+        self.assertEqual("semantic.unavailable", responses[0][1]["code"])
+        self.assertNotIn("catalogRevision", responses[0][1])
+
+    def test_semantic_apply_requires_confirmation_and_strips_gateway_field(self):
+        handler, responses = self.handler(
+            "/api/semantic/proposals/sem-1/apply",
+            {"confirmed": True},
+        )
+        handler._semantic_request = Mock(
+            return_value={"proposal": {
+                "id": "sem-1",
+                "assetId": "asset-1",
+                "state": "applied",
+            }}
+        )
+        control = Mock()
+
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(
+            {},
+            handler._semantic_request.call_args.kwargs["payload"],
+        )
+        control.audit.assert_called_once_with(
+            "semantic.proposal.applied",
+            actor="token:test",
+            remote="127.0.0.1",
+            details={
+                "id": "sem-1",
+                "assetId": "asset-1",
+                "status": "applied",
+            },
+        )
+
+        unconfirmed, unconfirmed_responses = self.handler(
+            "/api/semantic/proposals/sem-1/apply",
+            {},
+        )
+        unconfirmed._semantic_request = Mock()
+        unconfirmed.do_POST()
+        self.assertEqual(HTTPStatus.CONFLICT, unconfirmed_responses[0][0])
+        unconfirmed._semantic_request.assert_not_called()
+
+    def test_semantic_create_and_decline_audit_metadata_only(self):
+        cases = (
+            (
+                "/api/semantic/proposals",
+                {
+                    "assetId": "asset-1",
+                    "baseVersion": 2,
+                    "operations": [{
+                        "op": "set",
+                        "path": "/curated/description",
+                        "value": "sensitive curated value",
+                    }],
+                    "fingerprint": "a" * 64,
+                },
+                "pending",
+                "semantic.proposal.created",
+            ),
+            (
+                "/api/semantic/proposals/sem-1/decline",
+                {"confirmed": True, "reason": "Superseded"},
+                "declined",
+                "semantic.proposal.declined",
+            ),
+        )
+        for path, request, state, event in cases:
+            with self.subTest(path=path):
+                handler, responses = self.handler(path, request)
+                handler._semantic_request = Mock(return_value={
+                    "proposal": {
+                        "id": "sem-1",
+                        "assetId": "asset-1",
+                        "state": state,
+                        "operations": request.get("operations"),
+                    }
+                })
+                control = Mock()
+
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+
+                self.assertEqual(HTTPStatus.OK, responses[0][0])
+                control.audit.assert_called_once_with(
+                    event,
+                    actor="token:test",
+                    remote="127.0.0.1",
+                    details={
+                        "id": "sem-1",
+                        "assetId": "asset-1",
+                        "status": state,
+                    },
+                )
+
+    def test_semantic_errors_namespace_private_service_envelopes(self):
+        cases = (
+            (
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": {
+                        "code": "asset_not_found",
+                        "message": "Semantic asset was not found.",
+                        "details": {"assetId": "asset-1"},
+                    }
+                },
+                {
+                    "error": "Semantic asset was not found.",
+                    "code": "semantic.asset_not_found",
+                    "details": {"assetId": "asset-1"},
+                },
+            ),
+            (
+                HTTPStatus.CONFLICT,
+                {
+                    "error": {
+                        "code": "semantic.revision_conflict",
+                        "message": "Asset version changed.",
+                    }
+                },
+                {
+                    "error": "Asset version changed.",
+                    "code": "semantic.revision_conflict",
+                },
+            ),
+            (
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": {
+                        "code": "pagination_invalid",
+                        "message": "cursor is invalid or expired.",
+                    }
+                },
+                {
+                    "error": "cursor is invalid or expired.",
+                    "code": "pagination.invalid",
+                },
+            ),
+        )
+        for status, envelope, expected in cases:
+            with self.subTest(status=status, envelope=envelope):
+                handler, responses = self.handler("/api/semantic/catalog")
+                handler._semantic_error(app.SemanticClientError(
+                    "Semantic service request failed.",
+                    status=status,
+                    payload=envelope,
+                ))
+                self.assertEqual([(status, expected)], responses)
+
+    def test_private_semantic_unauthorized_is_not_caller_authentication(self):
+        handler, responses = self.handler("/api/semantic/catalog")
+
+        handler._semantic_error(app.SemanticClientError(
+            "Semantic service request failed.",
+            status=HTTPStatus.UNAUTHORIZED,
+            payload={
+                "error": {
+                    "code": "unauthorized",
+                    "message": "Invalid internal service token.",
+                }
+            },
+        ))
+
+        self.assertEqual(
+            [(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "Semantic service authentication is misconfigured.",
+                    "code": "semantic.internal_auth_failed",
+                },
+            )],
+            responses,
+        )
+
+    def test_admin_repair_requeues_and_wakes_delivery(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places/repair",
+            {"confirmed": True},
+        )
+        derived = SemanticDerivedIntegrationTests.derived("registering")
+        derived.repair_semantic_profile.return_value = {
+            "name": "places",
+            "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+            "generation": 2,
+            "status": "registering",
+            "revision": None,
+            "operation": "replace",
+        }
+        control = Mock()
+        wake = Mock()
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 16}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control
+        ), patch.object(app, "SEMANTIC", semantic), patch.object(
+            app, "schedule_semantic_outbox", wake
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.ACCEPTED, responses[0][0])
+        derived.repair_semantic_profile.assert_called_once_with("places")
+        wake.assert_called_once_with()
+        control.audit.assert_called_once()
+
+    def test_admin_repair_rejects_properties_outside_closed_contract(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places/repair",
+            {"confirmed": True, "retryAll": True},
+        )
+        derived = SemanticDerivedIntegrationTests.derived("repair_required")
+
+        with patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("semantic.invalid_request", responses[0][1]["code"])
+        derived.repair_semantic_profile.assert_not_called()
+
+    def test_admin_retry_reports_reset_maintenance_as_conflict(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles/places/repair",
+            {"confirmed": True},
+        )
+        derived = SemanticDerivedIntegrationTests.derived("repair_required")
+        derived.repair_semantic_profile.side_effect = (
+            app.DerivedLayerMaintenanceError(
+                "Derived-layer changes are paused while reset-data archives "
+                "semantic profiles."
+            )
+        )
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 16}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        self.assertEqual(
+            "derived_layer.maintenance",
+            responses[0][1]["code"],
+        )
+
+
 class ReloadRouteTests(unittest.TestCase):
     @staticmethod
     def handler(payload: dict) -> tuple[app.Handler, list]:
@@ -445,6 +2829,19 @@ class ReloadRouteTests(unittest.TestCase):
         wait_reload.assert_called_once_with(7, fingerprint, 30.0)
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual(fingerprint, responses[0][1]["status"]["workspaceFingerprint"])
+
+    def test_reload_requires_explicit_confirmation(self) -> None:
+        handler, responses = self.handler({})
+        with (
+            patch.object(app, "read_workspace") as read_workspace,
+            patch.object(app.CONTROL, "create_operation") as create_operation,
+        ):
+            handler.do_POST()
+
+        read_workspace.assert_not_called()
+        create_operation.assert_not_called()
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        self.assertEqual("xyz.confirmation_required", responses[0][1]["code"])
 
     def test_reload_rejects_a_stale_fingerprint_before_requesting(self) -> None:
         raw = b'{"key":"current"}\n'
@@ -525,6 +2922,148 @@ class ReloadRouteTests(unittest.TestCase):
         )
         self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, responses[0][0])
         self.assertEqual("indeterminate", responses[0][1]["operation"]["status"])
+
+
+class CollectionPaginationRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(path: str) -> tuple[app.Handler, list]:
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "token:test"
+        handler._authentication = {"scopes": ["inspect"]}
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_workspace_proposal_list_returns_one_bounded_page(self):
+        proposals = [
+            {"id": "proposal-1", "status": "pending"},
+            {"id": "proposal-2", "status": "applied"},
+        ]
+        handler, responses = self.handler("/api/proposals?limit=1")
+        with patch.object(app, "proposal_list", return_value=proposals):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([proposals[0]], responses[0][1]["proposals"])
+        self.assertEqual(1, responses[0][1]["pagination"]["limit"])
+        self.assertRegex(
+            responses[0][1]["pagination"]["nextCursor"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_workspace_proposal_list_rejects_invalid_cursor(self):
+        handler, responses = self.handler(
+            "/api/proposals?limit=1&cursor=readable-offset"
+        )
+        with patch.object(app, "proposal_list", return_value=[]):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("pagination.invalid", responses[0][1]["code"])
+
+
+class ProposalCreationRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(check_fingerprint: str) -> tuple[app.Handler, list]:
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/proposals"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "token:test"
+        handler._payload = lambda: {
+            "revision": "revision-1",
+            "operations": [],
+            "checkFingerprint": check_fingerprint,
+        }
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_verified_check_fingerprint_is_persisted_and_returned(self):
+        fingerprint = "a" * 64
+        plugin_fingerprint = "b" * 64
+        current = {"locale": {"layers": {}}}
+        candidate = {"locale": {"layers": {}}}
+        proposal = {"id": "proposal-1", "status": "pending"}
+        handler, responses = self.handler(fingerprint)
+
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", current, "revision-1"),
+            ),
+            patch.object(
+                app,
+                "apply_operations",
+                return_value=(candidate, []),
+            ),
+            patch.object(app, "validate_candidate", return_value=[]),
+            patch.object(
+                app,
+                "proposal_check",
+                return_value={
+                    "checkFingerprint": fingerprint,
+                    "pluginCatalogueFingerprint": plugin_fingerprint,
+                },
+            ),
+            patch.object(
+                app,
+                "proposal_create",
+                return_value=proposal,
+            ) as create_proposal,
+            patch.object(
+                app,
+                "semantic_publication_diagnostics",
+                return_value=([], []),
+            ),
+            patch.object(app, "proposal_write") as proposal_write,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+        self.assertEqual(
+            fingerprint,
+            responses[0][1]["proposal"]["checkFingerprint"],
+        )
+        self.assertEqual(
+            fingerprint,
+            proposal_write.call_args.args[1]["checkFingerprint"],
+        )
+        self.assertEqual(
+            plugin_fingerprint,
+            create_proposal.call_args.kwargs[
+                "plugin_catalogue_fingerprint"
+            ],
+        )
+
+    def test_stale_check_fingerprint_is_not_persisted(self):
+        handler, responses = self.handler("a" * 64)
+
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", {}, "revision-1"),
+            ),
+            patch.object(app, "apply_operations", return_value=({}, [])),
+            patch.object(app, "validate_candidate", return_value=[]),
+            patch.object(
+                app,
+                "proposal_check",
+                return_value={"checkFingerprint": "b" * 64},
+            ),
+            patch.object(app, "proposal_create") as proposal_create,
+            patch.object(app, "proposal_write") as proposal_write,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        proposal_create.assert_not_called()
+        proposal_write.assert_not_called()
 
 
 class ApplyRouteTests(unittest.TestCase):
@@ -634,6 +3173,143 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "diff": [],
         }
 
+    @staticmethod
+    def planning_timeout() -> app.VisualPlanningDatabaseError:
+        return app.VisualPlanningDatabaseError(
+            stage="layer-summary",
+            query_purpose="feature-count-and-extent",
+            timed_out=True,
+        )
+
+    def test_live_visual_timeout_reports_read_only_planning_stage(self):
+        payload = {
+            "layer": "Stops",
+            "centre": [-1.532, 53.814],
+            "zoom": 14,
+        }
+        handler, responses = self.handler("/api/visual-test", payload)
+
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", self.proposal()["candidate"], "revision-1"),
+            ),
+            patch.object(
+                app,
+                "visual_plan",
+                side_effect=self.planning_timeout(),
+            ) as visual_plan,
+            patch.object(app, "urlopen") as browser,
+            patch.object(app.CONTROL, "create_operation") as create_operation,
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("visual.planning_timeout", body["code"])
+        self.assertEqual("layer-summary", body["planningStage"])
+        self.assertEqual("feature-count-and-extent", body["queryPurpose"])
+        self.assertEqual(5000, body["timeoutMilliseconds"])
+        self.assertNotIn("derived-layer", body["error"])
+        self.assertNotIn("technicalDetail", body)
+        self.assertEqual(payload, visual_plan.call_args.kwargs["visual_request"])
+        browser.assert_not_called()
+        create_operation.assert_not_called()
+
+    def test_live_visual_test_sends_requested_information_evidence(self):
+        payload = {
+            "layer": "Stops",
+            "expectedInfoPanelText": ["Source: ONS"],
+        }
+        handler, responses = self.handler("/api/visual-test", payload)
+        browser_response = MagicMock()
+        browser_response.__enter__.return_value = io.BytesIO(app.json.dumps({
+            "runId": "run-live",
+            "passed": True,
+            "interaction": {
+                "infoPanelExpanded": True,
+                "expectedInfoPanelTextFound": {"Source: ONS": True},
+            },
+            "artifacts": {"infoPanel": "run-live/info-panel.png"},
+        }).encode())
+        running = {"id": "a" * 32, "status": "running"}
+
+        def finish(operation_id, *, status, result=None, error=None):
+            return {
+                **running,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
+
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", self.proposal()["candidate"], "revision-1"),
+            ),
+            patch.object(app, "visual_plan", return_value={
+                "layer": "Stops",
+                "locale": "locale",
+                "interaction": {"type": "click-centre-feature"},
+            }),
+            patch.object(app, "plugin_preview_checks", return_value=[]),
+            patch.object(app, "urlopen", return_value=browser_response) as browser,
+            patch.object(
+                app.CONTROL,
+                "create_operation",
+                return_value=running,
+            ),
+            patch.object(
+                app.CONTROL,
+                "finish_operation",
+                side_effect=finish,
+            ),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        runner_request = browser.call_args.args[0]
+        runner_payload = app.json.loads(runner_request.data)
+        interaction = runner_payload["plan"]["interaction"]
+        self.assertTrue(interaction["requireInfoPanel"])
+        self.assertEqual(
+            ["Source: ONS"],
+            interaction["expectedInfoPanelText"],
+        )
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertTrue(
+            responses[0][1]["visual"]["interaction"]
+            ["expectedInfoPanelTextFound"]["Source: ONS"]
+        )
+
+    def test_proposal_visual_timeout_uses_same_safe_planning_error(self):
+        payload = {"layer": "Stops"}
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/visual-plan",
+            payload,
+        )
+        proposal = self.proposal()
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(
+                app,
+                "visual_plan",
+                side_effect=self.planning_timeout(),
+            ) as visual_plan,
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("visual.planning_timeout", body["code"])
+        self.assertEqual("layer-summary", body["planningStage"])
+        self.assertEqual("feature-count-and-extent", body["queryPurpose"])
+        self.assertNotIn("technicalDetail", body)
+        self.assertEqual(payload, visual_plan.call_args.kwargs["visual_request"])
+
     def test_browser_request_defaults_to_high_resolution_capture(self) -> None:
         response = MagicMock()
         response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
@@ -674,6 +3350,22 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual("default", payload["viewMode"])
 
+    def test_browser_request_omits_title_when_comparison_side_has_no_layer(self):
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
+        with patch.object(app, "urlopen", return_value=response) as urlopen:
+            app.run_browser_visual(
+                None,
+                {"layerTitle": "Candidate-only title", "layers": []},
+                {},
+                target_url="http://xyz-preview:3000",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = app.json.loads(request.data)
+        self.assertIsNone(payload["layer"])
+        self.assertIsNone(payload["layerTitle"])
+
     def test_browser_request_propagates_panel_capture_options(self) -> None:
         response = MagicMock()
         response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
@@ -694,6 +3386,94 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(["filtering"], payload["panels"])
         self.assertEqual(["Cost", "Length"], payload["expectedPanelText"])
+
+    def test_feature_info_evidence_extracts_only_constant_visible_text(self):
+        proposal = self.proposal()
+        proposal["candidate"]["locale"]["layers"]["Stops"]["infoj"] = [
+            {
+                "type": "html",
+                "title": "Data source and calculation",
+                "field": "source_note",
+                "fieldfx": (
+                    "'<div><strong>Source:</strong> ONS Census "
+                    "2021.</div>'::text"
+                ),
+            },
+            {
+                "type": "text",
+                "title": "Dynamic",
+                "field": "dynamic_note",
+                "fieldfx": "concat('Source: ', source_name)",
+            },
+        ]
+
+        evidence = app.proposal_feature_info_evidence(
+            proposal,
+            "Stops",
+            "locale",
+        )
+
+        self.assertTrue(evidence["changed"])
+        self.assertFalse(evidence["original"]["requested"])
+        self.assertTrue(evidence["candidate"]["requested"])
+        self.assertEqual(
+            [
+                "Data source and calculation",
+                "Source: ONS Census 2021.",
+                "Dynamic",
+            ],
+            evidence["candidate"]["expectedText"],
+        )
+        self.assertNotIn(
+            "Source: ",
+            evidence["candidate"]["expectedText"],
+        )
+
+    def test_expected_info_panel_text_is_bounded(self):
+        self.assertEqual(
+            ["Source", "Calculation"],
+            app.expected_info_panel_text({
+                "expectedInfoPanelText": [
+                    " Source ",
+                    "Calculation",
+                    "Source",
+                ],
+            }),
+        )
+        with self.assertRaisesRegex(ValueError, "at most 20"):
+            app.expected_info_panel_text({
+                "expectedInfoPanelText": ["text"] * 21,
+            })
+
+    def test_feature_info_observation_requires_capture_and_expected_text(self):
+        evidence = {
+            "requested": True,
+            "planned": True,
+            "expectedText": ["Source: ONS"],
+        }
+        missing = app.feature_info_observation(
+            {"interaction": None, "artifacts": {}},
+            evidence,
+        )
+        not_found = app.feature_info_observation(
+            {
+                "interaction": {
+                    "infoPanelExpanded": True,
+                    "expectedInfoPanelTextFound": {"Source: ONS": False},
+                },
+                "artifacts": {"infoPanel": "run/info-panel.png"},
+            },
+            evidence,
+        )
+
+        self.assertFalse(missing["passed"])
+        self.assertFalse(missing["captured"])
+        self.assertFalse(not_found["passed"])
+        self.assertTrue(not_found["captured"])
+        self.assertEqual(
+            {"Source: ONS": False},
+            not_found["expectedTextFound"],
+        )
 
     def test_group_preview_isolates_added_and_deleted_layers(self):
         existing = {"group": "Transport", "format": "mvt"}
@@ -1142,10 +3922,17 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         def run(layer, plan, payload, **kwargs):
             source = payload["metadata"]["source"]
             self.assertTrue(plan["interaction"]["requireInfoPanel"])
+            expected = plan["interaction"]["expectedInfoPanelText"]
             return HTTPStatus.OK, {
                 "runId": f"run-{source}",
                 "passed": True,
                 "metadata": payload["metadata"],
+                "interaction": {
+                    "infoPanelExpanded": True,
+                    "expectedInfoPanelTextFound": {
+                        text: True for text in expected
+                    },
+                },
                 "artifacts": {
                     "afterPage": f"run-{source}/after-page.png",
                     "afterMap": f"run-{source}/after-map.png",
@@ -1187,6 +3974,116 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual(
             "run-original/info-panel.png",
             visual["artifacts"]["beforeInfoPanel"],
+        )
+        self.assertEqual(
+            "run-candidate/info-panel.png",
+            visual["artifacts"]["afterInfoPanel"],
+        )
+
+    def test_added_layer_screenshot_captures_candidate_static_source_note(self):
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/screenshot",
+            {
+                "layer": "Added",
+                "expectedInfoPanelText": ["ONS Census 2021"],
+            },
+        )
+        proposal = self.proposal()
+        proposal["candidate"]["locale"]["layers"]["Added"] = {
+            "name": "Added layer",
+            "infoj": [{
+                "type": "html",
+                "title": "Data source and calculation",
+                "field": "source_note",
+                "fieldfx": (
+                    "'<div><strong>Source:</strong> ONS Census "
+                    "2021.</div>'::text"
+                ),
+            }],
+        }
+        proposal["candidateHash"] = app.workspace_hash(proposal["candidate"])
+
+        def run(layer, plan, payload, **kwargs):
+            source = payload["metadata"]["source"]
+            if source == "original":
+                self.assertIsNone(layer)
+                self.assertNotIn("interaction", plan)
+                return HTTPStatus.OK, {
+                    "runId": "run-original",
+                    "passed": True,
+                    "metadata": payload["metadata"],
+                    "interaction": None,
+                    "artifacts": {
+                        "beforePage": "run-original/before-page.png",
+                        "beforeMap": "run-original/before-map.png",
+                        "report": "run-original/report.json",
+                    },
+                }
+            self.assertEqual("Added", layer)
+            self.assertTrue(plan["interaction"]["requireInfoPanel"])
+            self.assertEqual(
+                [
+                    "Data source and calculation",
+                    "Source: ONS Census 2021.",
+                    "ONS Census 2021",
+                ],
+                plan["interaction"]["expectedInfoPanelText"],
+            )
+            found = {
+                text: True
+                for text in plan["interaction"]["expectedInfoPanelText"]
+            }
+            return HTTPStatus.OK, {
+                "runId": "run-candidate",
+                "passed": True,
+                "metadata": payload["metadata"],
+                "interaction": {
+                    "infoPanelExpanded": True,
+                    "expectedInfoPanelTextFound": found,
+                },
+                "artifacts": {
+                    "afterPage": "run-candidate/after-page.png",
+                    "afterMap": "run-candidate/after-map.png",
+                    "infoPanel": "run-candidate/info-panel.png",
+                    "report": "run-candidate/report.json",
+                },
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(app, "visual_plan", return_value={
+                "locale": "locale",
+                "interaction": {"type": "click-centre-feature"},
+            }),
+            patch.object(
+                app, "prepare_original_preview",
+                return_value={"source": "original", "generation": 1},
+            ),
+            patch.object(
+                app, "prepare_candidate_preview",
+                return_value={"source": "candidate", "generation": 2},
+            ),
+            patch.object(app, "run_browser_visual", side_effect=run),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        visual = responses[0][1]["visual"]
+        evidence = visual["comparison"]["featureInfoEvidence"]
+        self.assertFalse(evidence["original"]["requested"])
+        self.assertTrue(evidence["original"]["passed"])
+        self.assertTrue(evidence["candidate"]["requested"])
+        self.assertTrue(evidence["candidate"]["captured"])
+        self.assertTrue(evidence["candidate"]["passed"])
+        self.assertEqual(
+            "run-original/before-page.png",
+            visual["artifacts"]["beforePage"],
+        )
+        self.assertIsNone(visual["artifacts"]["beforeInfoPanel"])
+        self.assertEqual(
+            "run-candidate/after-page.png",
+            visual["artifacts"]["afterPage"],
         )
         self.assertEqual(
             "run-candidate/info-panel.png",
@@ -1330,6 +4227,114 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             wait=False,
         )
 
+    def test_browser_request_propagates_hover_evidence_options(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = io.BytesIO(b'{"passed": true}')
+        with patch.object(app, "urlopen", return_value=response) as urlopen:
+            status, result = app.run_browser_visual(
+                "Stops",
+                {
+                    "centre": [1, 2],
+                    "hover": {
+                        "type": "hover-centre-feature",
+                        "field": "stop_name",
+                        "title": "Stop name",
+                    },
+                },
+                {
+                    "hover": True,
+                    "expectedHoverText": ["City Square"],
+                },
+                target_url="http://xyz-preview:3000",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = app.json.loads(request.data)
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(result["passed"])
+        self.assertIs(payload["hover"], True)
+        self.assertEqual(["City Square"], payload["expectedHoverText"])
+
+    def test_proposal_screenshot_plans_hover_for_each_workspace_side(self) -> None:
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/screenshot",
+            {"layer": "Stops", "hover": True},
+        )
+        proposal = self.proposal()
+        for side, field in (
+            ("original", "old_name"),
+            ("candidate", "new_name"),
+        ):
+            proposal[side]["locale"]["layers"]["Stops"]["style"] = {
+                "hover": {
+                    "display": True,
+                    "field": field,
+                    "title": "Stop name",
+                },
+            }
+            proposal[f"{side}Hash"] = app.workspace_hash(proposal[side])
+        observed = {}
+
+        def run(layer, plan, payload, **kwargs):
+            source = payload["metadata"]["source"]
+            observed[source] = plan["hover"]["field"]
+            return HTTPStatus.OK, {
+                "runId": f"run-{source}",
+                "passed": True,
+                "metadata": payload["metadata"],
+                "artifacts": {
+                    "beforePage": f"run-{source}/before-page.png",
+                    "beforeMap": f"run-{source}/before-map.png",
+                    "hoverTooltip": f"run-{source}/hover-tooltip.png",
+                    "report": f"run-{source}/report.json",
+                },
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(app, "visual_plan", return_value={
+                "locale": "locale",
+                "hover": {
+                    "type": "hover-centre-feature",
+                    "field": "new_name",
+                    "title": "Stop name",
+                },
+            }),
+            patch.object(
+                app, "prepare_original_preview",
+                return_value={"source": "original", "generation": 1},
+            ),
+            patch.object(
+                app, "prepare_candidate_preview",
+                return_value={"source": "candidate", "generation": 2},
+            ),
+            patch.object(app, "run_browser_visual", side_effect=run),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        self.assertEqual(
+            {"original": "old_name", "candidate": "new_name"},
+            observed,
+        )
+        artifacts = responses[0][1]["visual"]["artifacts"]
+        self.assertEqual(
+            "run-original/hover-tooltip.png",
+            artifacts["beforeHoverTooltip"],
+        )
+        self.assertEqual(
+            "run-candidate/hover-tooltip.png",
+            artifacts["afterHoverTooltip"],
+        )
+
+    def test_hover_evidence_options_are_bounded(self) -> None:
+        with self.assertRaisesRegex(ValueError, "hover must be true or false"):
+            app.requested_hover({"hover": "yes"})
+        with self.assertRaisesRegex(ValueError, "at most 20 strings"):
+            app.expected_hover_text({
+                "expectedHoverText": [str(index) for index in range(21)],
+            })
+
 
 class AuthorizationScopeTests(unittest.TestCase):
     def handler(self, scopes):
@@ -1358,6 +4363,320 @@ class AuthorizationScopeTests(unittest.TestCase):
             "token:test",
             full._authorized(required_scope="reload"),
         )
+        semantic = self.handler(["semantic:inspect"])
+        self.assertEqual(
+            "token:test",
+            semantic._authorized(required_scope="semantic:inspect"),
+        )
+        self.assertIsNone(
+            semantic._authorized(required_scope="semantic:propose")
+        )
+
+    def test_semantic_routes_use_narrow_scopes(self):
+        cases = {
+            ("GET", "/api/semantic/status"): "semantic:inspect",
+            ("GET", "/api/semantic/catalog"): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/catalog/search",
+            ): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/catalog/objects/asset%3Aderived%2Froads",
+            ): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/catalog/objects/"
+                "asset%3Aderived%2Froads/history",
+            ): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/derived-profiles",
+            ): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/derived-profiles/example",
+            ): "semantic:inspect",
+            ("GET", "/api/semantic/proposals"): "semantic:inspect",
+            (
+                "GET",
+                "/api/semantic/proposals/proposal-1",
+            ): "semantic:inspect",
+            ("POST", "/api/semantic/generate"): "semantic:generate",
+            (
+                "POST",
+                "/api/semantic/source/archive-excluded",
+            ): "semantic:admin",
+            (
+                "POST",
+                "/api/semantic/catalog/objects/asset-1/archive",
+            ): "semantic:admin",
+            ("POST", "/api/semantic/proposals/check"): "semantic:propose",
+            ("POST", "/api/semantic/proposals"): "semantic:propose",
+            (
+                "POST",
+                "/api/semantic/proposals/proposal-1/apply",
+            ): "semantic:apply",
+            (
+                "POST",
+                "/api/semantic/proposals/proposal-1/decline",
+            ): "semantic:propose",
+            (
+                "POST",
+                "/api/semantic/derived-profiles/example/repair",
+            ): "semantic:admin",
+        }
+        for (method, path), expected in cases.items():
+            with self.subTest(method=method, path=path):
+                self.assertEqual(
+                    expected,
+                    app.Handler._required_scope(path, method),
+                )
+                allowed = self.handler([expected])
+                self.assertEqual(
+                    "token:test",
+                    allowed._authorized(required_scope=expected),
+                )
+                denied = self.handler(["inspect"])
+                self.assertIsNone(
+                    denied._authorized(required_scope=expected)
+                )
+                self.assertEqual(
+                    expected,
+                    denied._json.call_args.args[1]["requiredScope"],
+                )
+
+    def test_every_token_scope_is_isolated_at_each_narrow_route_gate(self):
+        required_scopes = TOKEN_SCOPES - {"full"}
+        for required in sorted(required_scopes):
+            for granted in sorted(TOKEN_SCOPES):
+                with self.subTest(required=required, granted=granted):
+                    handler = self.handler([granted])
+                    result = handler._authorized(required_scope=required)
+                    if granted in {required, "full"}:
+                        self.assertEqual("token:test", result)
+                        handler._json.assert_not_called()
+                    else:
+                        self.assertIsNone(result)
+                        self.assertEqual(
+                            required,
+                            handler._json.call_args.args[1]["requiredScope"],
+                        )
+
+    def test_administrator_session_can_cross_each_narrow_route_gate(self):
+        for required in sorted(TOKEN_SCOPES - {"full"}):
+            with self.subTest(required=required):
+                handler = self.handler([])
+                handler._actor = lambda state_change=False: "admin"
+                self.assertEqual(
+                    "admin",
+                    handler._authorized(required_scope=required),
+                )
+                handler._json.assert_not_called()
+
+    def test_unauthenticated_actor_cannot_cross_any_narrow_route_gate(self):
+        for required in sorted(TOKEN_SCOPES - {"full"}):
+            with self.subTest(required=required):
+                handler = self.handler([])
+                handler._actor = lambda state_change=False: None
+                self.assertIsNone(
+                    handler._authorized(required_scope=required)
+                )
+                self.assertEqual(
+                    HTTPStatus.UNAUTHORIZED,
+                    handler._json.call_args.args[0],
+                )
+                self.assertEqual(
+                    "Authentication required.",
+                    handler._json.call_args.args[1]["error"],
+                )
+                self.assertEqual(
+                    "auth.authentication_required",
+                    handler._json.call_args.args[1]["code"],
+                )
+
+    def test_narrow_scopes_are_forwarded_without_implicit_expansion(self):
+        semantic_scopes = {
+            "semantic:inspect",
+            "semantic:source",
+            "semantic:generate",
+            "semantic:data",
+            "semantic:propose",
+            "semantic:apply",
+            "semantic:admin",
+        }
+        for granted in sorted(TOKEN_SCOPES - {"full"}):
+            with self.subTest(granted=granted):
+                handler = self.handler([granted])
+                self.assertEqual(
+                    [granted],
+                    handler._semantic_scopes("token:test"),
+                )
+
+        combined = self.handler([
+            "semantic:inspect",
+            "semantic:generate",
+            "semantic:admin",
+        ])
+        self.assertEqual(
+            [
+                "semantic:inspect",
+                "semantic:generate",
+                "semantic:admin",
+            ],
+            combined._semantic_scopes("token:test"),
+        )
+
+        administrator = self.handler([])
+        self.assertEqual(
+            semantic_scopes,
+            set(administrator._semantic_scopes("admin")),
+        )
+
+    def test_semantic_action_scopes_require_exact_routes(self):
+        cases = {
+            "/api/semantic/generate/": "semantic:admin",
+            "/api/semantic/not-generate": "semantic:admin",
+            "/api/semantic/proposals//apply": "semantic:admin",
+            "/api/semantic/proposals/proposal-1/apply/": "semantic:admin",
+            "/api/semantic/proposals/proposal-1/extra/apply": "semantic:admin",
+            "/api/semantic/proposals/proposal-1/extra/decline": "semantic:admin",
+            "/api/semantic/derived-profiles/example/repair/": "semantic:admin",
+            "/api/semantic/derived-profiles/example/extra/repair": (
+                "semantic:admin"
+            ),
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    expected,
+                    app.Handler._required_scope(path, "POST"),
+                )
+                self.assertIsNone(app.semantic_proxy_path(path))
+
+    def test_workspace_proposal_action_scopes_require_exact_routes(self):
+        self.assertEqual(
+            "apply",
+            app.Handler._required_scope(
+                "/api/proposals/proposal-1/apply",
+                "POST",
+            ),
+        )
+        self.assertEqual(
+            "propose",
+            app.Handler._required_scope(
+                "/api/proposals/proposal-1/decline",
+                "POST",
+            ),
+        )
+        for path in (
+            "/api/not-proposals/proposal-1/apply",
+            "/api/proposals/proposal-1/extra/apply",
+            "/api/not-proposals/proposal-1/decline",
+            "/api/proposals/proposal-1/extra/decline",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    "full",
+                    app.Handler._required_scope(path, "POST"),
+                )
+
+    def test_workspace_proposal_actions_reject_suffix_aliases(self):
+        for path in (
+            "/api/not-proposals/proposal-1/apply",
+            "/api/proposals/proposal-1/extra/apply",
+            "/api/not-proposals/proposal-1/decline",
+            "/api/proposals/proposal-1/extra/decline",
+        ):
+            with self.subTest(path=path):
+                responses = []
+                handler = object.__new__(app.Handler)
+                handler.path = path
+                handler._host_allowed = lambda: True
+                handler._authorized = (
+                    lambda state_change=False: "admin"
+                )
+                handler._json = (
+                    lambda status, body: responses.append((status, body))
+                )
+                handler.send_error = (
+                    lambda status: responses.append((status, {}))
+                )
+
+                handler.do_POST()
+
+                self.assertEqual(
+                    [(HTTPStatus.NOT_FOUND, {})],
+                    responses,
+                )
+
+    def test_semantic_only_tokens_can_discover_contract_and_identity(self):
+        self.assertIsNone(
+            app.Handler._required_scope("/api/capabilities", "GET")
+        )
+        self.assertIsNone(
+            app.Handler._required_scope("/api/contract", "GET")
+        )
+        self.assertIsNone(
+            app.Handler._required_scope("/api/auth/me", "GET")
+        )
+        semantic = self.handler(["semantic:inspect"])
+        self.assertEqual("token:test", semantic._authorized())
+
+    def test_every_nonempty_token_scope_can_discover_api_identity(self):
+        for granted in sorted(TOKEN_SCOPES):
+            with self.subTest(granted=granted):
+                handler = self.handler([granted])
+                self.assertEqual("token:test", handler._authorized())
+                handler._json.assert_not_called()
+
+    def test_legacy_full_scope_expands_at_private_semantic_boundary(self):
+        handler = object.__new__(app.Handler)
+        handler._authentication = {"scopes": ["full"]}
+
+        scopes = handler._semantic_scopes("token:legacy")
+
+        self.assertIn("full", scopes)
+        self.assertIn("semantic:inspect", scopes)
+        self.assertIn("semantic:generate", scopes)
+        self.assertIn("semantic:data", scopes)
+        self.assertIn("semantic:propose", scopes)
+        self.assertIn("semantic:apply", scopes)
+        self.assertIn("semantic:admin", scopes)
+
+    def test_semantic_proxy_paths_are_closed_and_exact(self):
+        self.assertEqual(
+            "/v1/status",
+            app.semantic_proxy_path("/api/semantic/status"),
+        )
+        self.assertEqual(
+            "/v1/search?q=bus%20stops",
+            app.semantic_proxy_path(
+                "/api/semantic/catalog/search",
+                "q=bus%20stops",
+            ),
+        )
+        self.assertEqual(
+            "/v1/assets/asset%3Atransport.bus",
+            app.semantic_proxy_path(
+                "/api/semantic/catalog/objects/asset%3Atransport.bus"
+            ),
+        )
+        self.assertEqual(
+            "/v1/assets/asset%3Atransport.bus/history",
+            app.semantic_proxy_path(
+                "/api/semantic/catalog/objects/"
+                "asset%3Atransport.bus/history"
+            ),
+        )
+        for path in (
+            "/api/semantic",
+            "/api/semantic/unknown",
+            "/api/semantic/catalog/objects/a/b",
+            "/api/semantic/proposals/x/unknown",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(app.semantic_proxy_path(path))
 
 
 if __name__ == "__main__":

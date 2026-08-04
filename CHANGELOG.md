@@ -8,12 +8,51 @@ first release.
 
 ### Fixed
 
+- Forwarded live visual-test clicked-feature text assertions into the browser
+  interaction plan so `expectedInfoPanelText` produces dedicated, verifiable
+  information-panel evidence instead of being accepted but ignored.
+- Archived semantic assets are now omitted from catalog, search, and
+  derived-profile collections, including administrator collection reads;
+  exact administrator lookups retain their immutable audit history.
+- Made proposal evidence use friendly layer titles for visible-text checks,
+  exact pinned-XYZ drawer hooks for Filtering/Styling capture, deliberate
+  hover-tooltip interaction, and per-side clicked-feature capture for added,
+  removed, or edited information content.
 - Fixed catalog discovery for PostGIS geometry columns on materialized derived
   layers, allowing dashboard and CLI validation and XYZ map configuration to
   recognize them.
 
 ### Changed
 
+- Split managed-derived query failures into malformed, policy-prohibited, and
+  over-budget codes with reason-specific remediation, operation-specific
+  unchanged-state messages, synchronous/background parity, and explicit
+  estimated-versus-rolled-back actual materialization evidence.
+- Completed machine-readable action discovery for live visual plan, test, and
+  screenshot commands and for durable derived-layer work, including exact
+  scopes, operation kinds, request schemas, and presentation metadata.
+- Added configuration-driven semantic source exclusions plus confirmed
+  administrator actions to archive all existing matches or one selected
+  semantic profile without changing PostgreSQL data; normal collections hide
+  tombstones while exact-ID administrator history remains auditable.
+- Added independently opt-in, permission-gated Gemini context for a capped 5%
+  row sample and table/field statistics in Guided, Advanced, API, and CLI
+  generation flows; batches of up to ten field drafts now run concurrently
+  with completion progress while preserving review order.
+- Made the server-resolved fixed workspace-map extent mandatory for managed
+  derived layers, with antimeridian-safe output filtering at one zoom level
+  wider, whole-query aggregate semantics, and a non-writing 1 GiB plan-size
+  guard that blocks oversized materialized creates, conversions, and refreshes
+  while offering an ordinary view instead.
+- Added a fail-closed computation guard for every managed derived query, with
+  structural SQL limits, map-bounded H3 expansion, recursive PostgreSQL plan
+  budgets, structured probe evidence, and no ordinary-view escape for queries
+  whose intermediate work is unsafe.
+- Added PostgreSQL role-level connection, memory, temporary-file, parallelism,
+  statement, transaction, lock, and idle-transaction limits for derived work
+  and runtime reads, fixed derived-owner namespace resolution to
+  `pg_catalog, public`, and bounded background-job admission with a retryable
+  structured capacity response.
 - Added a manifest-backed external XYZ plugin registry with hashed discovery,
   strict dynamic schemas, proposal and preview bindings, declarative browser
   evidence, dashboard/CLI discovery, and cross-service mount verification.
