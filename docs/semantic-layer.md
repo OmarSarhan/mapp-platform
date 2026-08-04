@@ -1,6 +1,6 @@
 # Semantic metadata control plane
 
-Semantic service `1.0.0` is a metadata control plane beside the data plane. It gives
+Semantic service `1.1.0` is a metadata control plane beside the data plane. It gives
 the dashboard, standalone CLI, and approved agents a durable description of a
 data asset without making the semantic service a database proxy. In v1, the
 private semantic service stores generated source facts and reviewed human
@@ -369,12 +369,45 @@ diagnostics, use the per-asset `version` for semantic proposals, and always
 consume the revision returned with the particular catalog/search/history
 snapshot they inspected.
 
-Catalog, search, asset-history, derived-profile, and proposal collections use
-the platform's pagination contract `1`: at most 100 items per response, an
-opaque continuation cursor, and a null `nextCursor` at the end. The CLI keeps
-one page in memory and requires an explicit cursor for the next page. If the
-catalog revision or visible boundary changes, restart from the first page when
-the service rejects an expired cursor.
+Catalog, search, asset-history, derived-profile, source-relation, and proposal
+collections use the platform's pagination contract `1`: at most 100 items per
+response, an opaque continuation cursor, and a null `nextCursor` at the end.
+The CLI keeps one page in memory and requires an explicit cursor for the next
+page. If the catalog revision, source configuration, or visible boundary
+changes, restart from the first page when the service rejects an expired
+cursor. Storage queries resume from the cursor key and fetch only `limit + 1`
+rows. Source-relation discovery orders by alias, schema, and relation, applies
+allowlist and exclusion rules before the database limit, and binds its cursor
+to the platform instance plus a keyed digest of effective source configuration,
+without exposing connection credentials as a public verifier. Each alias
+query uses a read-only repeatable-read transaction, but pages do not share a
+catalog snapshot: concurrent relation creation or deletion follows ordinary
+keyset semantics. A semantic response may be shorter than `limit` when its 16
+MiB page budget is reached, so only a null `nextCursor` means completion; one
+item that cannot fit fails with `page_too_large` rather than being truncated.
+Parameterless compatibility reads keep their old response shape only through
+100 items and return `pagination.required` above that threshold or when the
+legacy response would exceed its byte budget. They fetch at most 101 records to
+make that decision. Parameterless search still returns its historical first 20
+matches when no more than 100 exist, while using the 101-row probe to detect
+overflow.
+
+For administrator derived-profile reads, delivery diagnostics are bounded
+separately. The service selects at most one blocker for each displayed profile.
+On the first page it also returns a repair-work batch of at most 100 unmatched
+archive blockers. `deliveryBlockersMore: true` means the administrator should
+repair the displayed batch and refresh the first page; later profile pages do
+not repeat unmatched blockers. First-party consumers accept only a literal JSON
+boolean for this flag, and the CLI rejects a flag without its accompanying
+blocker array. The complete profiles, blockers, pagination, and diagnostic
+envelope must remain under the advertised response ceiling.
+
+Roll out a contract-1.4-aware dashboard and CLI first: they send `limit=100`,
+keep independent cursors for catalog, source, derived profile, proposal, and
+asset-history views, and load another page only on an explicit user action.
+Then activate the 1.1.0 legacy threshold. This ordering works with the prior
+pagination-capable service and prevents first-party consumers from encountering
+the compatibility error during the transition.
 
 [gemini-terms]: https://ai.google.dev/gemini-api/terms
 [gemini-zdr]: https://ai.google.dev/gemini-api/docs/zdr

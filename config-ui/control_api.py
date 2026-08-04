@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import copy
 import fcntl
 import hashlib
+import heapq
+import hmac
 import json
 import math
 import os
@@ -11,6 +14,7 @@ import secrets
 import tempfile
 import threading
 import time
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +96,127 @@ WEB_MERCATOR_MAX_LATITUDE = 85.0511287798066
 VISUAL_PLANNING_STATEMENT_TIMEOUT_MS = 5000
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 100
-_PAGE_CURSOR_RE = re.compile(r"^[0-9a-f]{64}$")
+COLLECTION_PAGE_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+COLLECTION_PAGE_MAX_ITEMS_BYTES = 15 * 1024 * 1024
+SEMANTIC_PAGE_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+SEMANTIC_PAGE_TOO_LARGE_CODE = "semantic.page_too_large"
+_PAGE_CURSOR_RE = re.compile(
+    r"^(?:[0-9a-f]{64}|[A-Za-z0-9_-]{1,2048}\.[0-9a-f]{64})$"
+)
+
+
+class CollectionPaginationError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int,
+        details: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.details = details
+
+
+def _bounded_collection_items(
+    items: list[Any],
+    *,
+    maximum_items: int,
+) -> tuple[list[Any], bool]:
+    bounded: list[Any] = []
+    used_bytes = 2
+    has_more = len(items) > maximum_items
+    for item in items[:maximum_items]:
+        item_bytes = len(json.dumps(
+            item,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"))
+        separator_bytes = 1 if bounded else 0
+        if item_bytes + 2 > COLLECTION_PAGE_MAX_ITEMS_BYTES:
+            raise CollectionPaginationError(
+                "pagination.page_too_large",
+                "One collection item exceeds the bounded response limit.",
+                status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                details={
+                    "maxPageBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES,
+                    "maxItemsBytes": COLLECTION_PAGE_MAX_ITEMS_BYTES,
+                },
+            )
+        if (
+            used_bytes + separator_bytes + item_bytes
+            > COLLECTION_PAGE_MAX_ITEMS_BYTES
+        ):
+            has_more = True
+            break
+        bounded.append(item)
+        used_bytes += separator_bytes + item_bytes
+    return bounded, has_more
+
+
+def legacy_collection(items: list[Any]) -> list[Any]:
+    if len(items) > MAX_PAGE_LIMIT:
+        raise CollectionPaginationError(
+            "pagination.required",
+            "This collection has more than 100 items; retry with limit and "
+            "follow pagination.nextCursor.",
+            status=HTTPStatus.CONFLICT,
+            details={"maxLegacyItems": MAX_PAGE_LIMIT},
+        )
+    bounded, has_more = _bounded_collection_items(
+        items,
+        maximum_items=MAX_PAGE_LIMIT,
+    )
+    if has_more:
+        raise CollectionPaginationError(
+            "pagination.required",
+            "This legacy response exceeds the collection byte limit; retry "
+            "with limit and follow pagination.nextCursor.",
+            status=HTTPStatus.CONFLICT,
+            details={
+                "maxLegacyItems": MAX_PAGE_LIMIT,
+                "maxPageBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES,
+            },
+        )
+    return bounded
+
+
+def enforce_collection_payload(
+    payload: dict[str, Any],
+    *,
+    paginated: bool,
+) -> None:
+    encoded_bytes = len(json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8"))
+    if encoded_bytes <= COLLECTION_PAGE_MAX_RESPONSE_BYTES:
+        return
+    if paginated:
+        raise CollectionPaginationError(
+            "pagination.page_too_large",
+            "The bounded collection response exceeds the response byte limit; "
+            "retry with a smaller limit.",
+            status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            details={"maxPageBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES},
+        )
+    raise CollectionPaginationError(
+        "pagination.required",
+        "This legacy response exceeds the collection byte limit; retry with "
+        "limit and follow pagination.nextCursor.",
+        status=HTTPStatus.CONFLICT,
+        details={
+            "maxLegacyItems": MAX_PAGE_LIMIT,
+            "maxPageBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES,
+        },
+    )
 
 
 def pagination_requested(query: dict[str, list[str]]) -> bool:
@@ -166,6 +290,81 @@ def paginate_collection(
     has_more = start + len(page_items) < len(items)
     next_cursor = (
         _page_cursor(scope, page_items[-1])
+        if has_more and page_items
+        else None
+    )
+    return page_items, {"limit": limit, "nextCursor": next_cursor}
+
+
+def encode_position_cursor(
+    scope: str,
+    position: Any,
+    key: bytes,
+) -> str:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "scope": hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+            "position": position,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def decode_position_cursor(
+    cursor: str | None,
+    scope: str,
+    key: bytes,
+) -> Any:
+    if cursor is None:
+        return None
+    try:
+        encoded, signature = cursor.rsplit(".", 1)
+        padding = "=" * (-len(encoded) % 4)
+        payload = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("signature")
+        value = json.loads(payload.decode("utf-8"))
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"version", "scope", "position"}
+            or value["version"] != 1
+            or not hmac.compare_digest(
+                str(value["scope"]),
+                hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+            )
+        ):
+            raise ValueError("scope")
+        return value["position"]
+    except (TypeError, UnicodeError, ValueError):
+        raise ValueError("cursor is invalid or expired.") from None
+
+
+def paginate_keyset_page(
+    fetched: list[Any],
+    *,
+    limit: int,
+    scope: str,
+    key: bytes,
+    position,
+) -> tuple[list[Any], dict[str, Any]]:
+    page_items, has_more = _bounded_collection_items(
+        fetched,
+        maximum_items=limit,
+    )
+    next_cursor = (
+        encode_position_cursor(scope, position(page_items[-1]), key)
         if has_more and page_items
         else None
     )
@@ -1206,6 +1405,20 @@ def contract(instance_id: str) -> dict[str, Any]:
             "defaultLimit": DEFAULT_PAGE_LIMIT,
             "maxLimit": MAX_PAGE_LIMIT,
             "cursor": "opaque",
+            "pageMaxResponseBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES,
+            "pageTooLargeCode": "pagination.page_too_large",
+            "legacyMaxItems": MAX_PAGE_LIMIT,
+            "legacyOverflowCode": "pagination.required",
+            "semanticPageMaxResponseBytes": (
+                SEMANTIC_PAGE_MAX_RESPONSE_BYTES
+            ),
+            "semanticPageTooLargeCode": SEMANTIC_PAGE_TOO_LARGE_CODE,
+            "derivedDeliveryBlockers": {
+                "itemsField": "deliveryBlockers",
+                "moreField": "deliveryBlockersMore",
+                "maxItems": MAX_PAGE_LIMIT,
+                "firstPageOnly": True,
+            },
             "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
         },
     }
@@ -1230,6 +1443,20 @@ def capabilities(instance_id: str) -> dict[str, Any]:
             "defaultLimit": DEFAULT_PAGE_LIMIT,
             "maxLimit": MAX_PAGE_LIMIT,
             "cursor": "opaque",
+            "pageMaxResponseBytes": COLLECTION_PAGE_MAX_RESPONSE_BYTES,
+            "pageTooLargeCode": "pagination.page_too_large",
+            "legacyMaxItems": MAX_PAGE_LIMIT,
+            "legacyOverflowCode": "pagination.required",
+            "semanticPageMaxResponseBytes": (
+                SEMANTIC_PAGE_MAX_RESPONSE_BYTES
+            ),
+            "semanticPageTooLargeCode": SEMANTIC_PAGE_TOO_LARGE_CODE,
+            "derivedDeliveryBlockers": {
+                "itemsField": "deliveryBlockers",
+                "moreField": "deliveryBlockersMore",
+                "maxItems": MAX_PAGE_LIMIT,
+                "firstPageOnly": True,
+            },
         },
     }
 
@@ -1701,12 +1928,68 @@ def proposal_write(store, proposal: dict) -> None:
     )
 
 
-def proposal_list(store) -> list[dict]:
-    output = []
-    for path in sorted(store.proposals.glob("*/proposal.json"), reverse=True):
-        item = strict_json_loads(path.read_text())
-        output.append({key: item.get(key) for key in ("id", "status", "created", "actor", "explanation", "originalRevision", "candidateHash", "pluginCatalogueFingerprint")})
-    return output
+def _proposal_summary(path: Path) -> dict:
+    item = strict_json_loads(path.read_text())
+    return {
+        key: item.get(key)
+        for key in (
+            "id",
+            "status",
+            "created",
+            "actor",
+            "explanation",
+            "originalRevision",
+            "candidateHash",
+            "pluginCatalogueFingerprint",
+        )
+    }
+
+
+def proposal_list(
+    store,
+    *,
+    after_id: str | None = None,
+    fetch_limit: int | None = None,
+) -> list[dict]:
+    if after_id is not None and not re.fullmatch(r"[A-Za-z0-9._-]+", after_id):
+        raise ValueError("cursor is invalid or expired.")
+    if fetch_limit is None:
+        return [
+            _proposal_summary(path)
+            for path in sorted(
+                store.proposals.glob("*/proposal.json"),
+                reverse=True,
+            )
+        ]
+    if (
+        isinstance(fetch_limit, bool)
+        or not isinstance(fetch_limit, int)
+        or not 1 <= fetch_limit <= MAX_PAGE_LIMIT + 1
+    ):
+        raise ValueError("Proposal fetch limit is invalid.")
+
+    # Proposal IDs begin with a Unix timestamp and retain the legacy reverse
+    # lexical ordering. Keep only the next bounded set of names while scanning
+    # the directory, then parse only those limit+1 JSON documents.
+    candidate_names: list[str] = []
+    with os.scandir(store.proposals) as entries:
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            name = entry.name
+            if after_id is not None and name >= after_id:
+                continue
+            proposal_path = Path(entry.path) / "proposal.json"
+            if not proposal_path.is_file() or proposal_path.is_symlink():
+                continue
+            if len(candidate_names) < fetch_limit:
+                heapq.heappush(candidate_names, name)
+            elif name > candidate_names[0]:
+                heapq.heapreplace(candidate_names, name)
+    return [
+        _proposal_summary(store.proposals / name / "proposal.json")
+        for name in sorted(candidate_names, reverse=True)
+    ]
 
 
 def _reload_generation(path: Path) -> int | None:

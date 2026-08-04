@@ -38,6 +38,11 @@ const deferred = () => {
   return {promise, resolve, reject};
 };
 
+const firstPage = path => `${path}?limit=100`;
+const pagePathForTest = (path, cursor) => (
+  `${firstPage(path)}&cursor=${encodeURIComponent(cursor)}`
+);
+
 function fieldGenerationResult(catalogAsset, fieldId, contextOptions) {
   return {
     draft: {
@@ -78,14 +83,14 @@ function fieldBatchApi(catalogAsset, onGenerate, contextOptions = undefined) {
         },
       };
     }
-    if (path === '/api/semantic/catalog') {
+    if (path === firstPage('/api/semantic/catalog')) {
       return {assets: [catalogAsset], catalogRevision: 7};
     }
-    if (path === '/api/semantic/source/relations') return {relations: []};
-    if (path === '/api/semantic/derived-profiles') {
+    if (path === firstPage('/api/semantic/source/relations')) return {relations: []};
+    if (path === firstPage('/api/semantic/derived-profiles')) {
       return {derivedProfiles: [], catalogRevision: 7};
     }
-    if (path === '/api/semantic/proposals' && !options.method) {
+    if (path === firstPage('/api/semantic/proposals') && !options.method) {
       return {proposals: []};
     }
     if (path === '/api/semantic/generate' && options.method === 'POST') {
@@ -237,13 +242,13 @@ describe('semantic target selection', () => {
           }},
         };
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [asset, otherAsset], catalogRevision: 7};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals') return {proposals: []};
+      if (path === firstPage('/api/semantic/proposals')) return {proposals: []};
       throw new Error(`Unexpected request: ${path}`);
     });
 
@@ -296,6 +301,160 @@ describe('semantic source access matrix', () => {
 });
 
 describe('SemanticCatalog', () => {
+  test('uses bounded first pages and isolated user-driven continuations', async () => {
+    const secondAsset = {
+      ...asset,
+      id: 'source:leeds.roads',
+      generated: {qualifiedName: 'leeds.roads', fields: []},
+      curated: {},
+    };
+    const firstSource = {
+      alias: 'MAPP',
+      schema: 'leeds',
+      relation: 'buildings',
+      kind: 'table',
+      assetId: 'source-buildings',
+    };
+    const secondSource = {
+      ...firstSource,
+      relation: 'roads',
+      assetId: 'source-roads',
+    };
+    const firstDerived = {
+      name: 'buildings',
+      status: 'ready',
+      generation: 1,
+      revision: '7',
+    };
+    const secondDerived = {...firstDerived, name: 'roads'};
+    const firstProposal = {
+      id: 'proposal-1',
+      assetId: asset.id,
+      baseVersion: asset.version,
+      state: 'declined',
+    };
+    const secondProposal = {...firstProposal, id: 'proposal-2'};
+    const historyPath = (
+      `/api/semantic/catalog/objects/${encodeURIComponent(asset.id)}/history`
+    );
+    const cursors = {
+      catalog: 'catalog-next',
+      source: 'source-next',
+      derived: 'derived-next',
+      proposals: 'proposals-next',
+      history: 'history-next',
+    };
+    const api = vi.fn(async path => {
+      if (path === '/api/semantic/status') {
+        return {catalogRevision: 7, schemaVersion: 2};
+      }
+      if (path === firstPage('/api/semantic/catalog')) {
+        return {
+          assets: [asset],
+          pagination: {limit: 100, nextCursor: cursors.catalog},
+        };
+      }
+      if (path === firstPage('/api/semantic/source/relations')) {
+        return {
+          relations: [firstSource],
+          pagination: {limit: 100, nextCursor: cursors.source},
+        };
+      }
+      if (path === firstPage('/api/semantic/derived-profiles')) {
+        return {
+          derivedProfiles: [firstDerived],
+          deliveryBlockers: [],
+          pagination: {limit: 100, nextCursor: cursors.derived},
+        };
+      }
+      if (path === firstPage('/api/semantic/proposals')) {
+        return {
+          proposals: [firstProposal],
+          pagination: {limit: 100, nextCursor: cursors.proposals},
+        };
+      }
+      if (path === firstPage(historyPath)) {
+        return {
+          history: [{catalogRevision: 1, changeType: 'generated'}],
+          pagination: {limit: 100, nextCursor: cursors.history},
+        };
+      }
+      if (path === pagePathForTest('/api/semantic/catalog', cursors.catalog)) {
+        return {assets: [secondAsset], pagination: {limit: 100, nextCursor: null}};
+      }
+      if (path === pagePathForTest('/api/semantic/source/relations', cursors.source)) {
+        return {relations: [secondSource], pagination: {limit: 100, nextCursor: null}};
+      }
+      if (path === pagePathForTest('/api/semantic/derived-profiles', cursors.derived)) {
+        return {
+          derivedProfiles: [secondDerived],
+          deliveryBlockers: [],
+          pagination: {limit: 100, nextCursor: null},
+        };
+      }
+      if (path === pagePathForTest('/api/semantic/proposals', cursors.proposals)) {
+        return {proposals: [secondProposal], pagination: {limit: 100, nextCursor: null}};
+      }
+      if (path === pagePathForTest(historyPath, cursors.history)) {
+        return {
+          history: [{catalogRevision: 2, changeType: 'curated'}],
+          pagination: {limit: 100, nextCursor: null},
+        };
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    });
+
+    render(<SemanticCatalog
+      api={api}
+      close={() => {}}
+      identity={{actor: 'admin', scopes: []}}
+    />);
+
+    await waitFor(() => {
+      expect(api).toHaveBeenCalledWith(firstPage('/api/semantic/catalog'));
+      expect(api).toHaveBeenCalledWith(firstPage('/api/semantic/source/relations'));
+      expect(api).toHaveBeenCalledWith(firstPage('/api/semantic/derived-profiles'));
+      expect(api).toHaveBeenCalledWith(firstPage('/api/semantic/proposals'));
+    });
+    expect(api.mock.calls.some(([path]) => path.includes('&cursor='))).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', {name: 'Advanced mode'}));
+    fireEvent.click(screen.getByRole('button', {name: 'Load history'}));
+    await screen.findByText(content => content.includes('"changeType": "generated"'));
+    expect(api).toHaveBeenCalledWith(firstPage(historyPath));
+    expect(api.mock.calls.some(([path]) => path.includes('&cursor='))).toBe(false);
+
+    const continuations = [
+      ['Load more semantic assets', '/api/semantic/catalog', cursors.catalog],
+      ['Load more source relations', '/api/semantic/source/relations', cursors.source],
+      ['Load more derived profiles', '/api/semantic/derived-profiles', cursors.derived],
+      ['Load more semantic proposals', '/api/semantic/proposals', cursors.proposals],
+      ['Load more asset history', historyPath, cursors.history],
+    ];
+    for (const [label, path, cursor] of continuations) {
+      fireEvent.click(screen.getByRole('button', {name: label}));
+      await waitFor(() => expect(
+        screen.queryByRole('button', {name: label}),
+      ).toBeNull());
+      expect(api).toHaveBeenCalledWith(pagePathForTest(path, cursor));
+    }
+
+    expect(screen.getByRole('button', {name: /leeds\.roads/})).toBeTruthy();
+    expect(screen.getByRole('option', {name: /MAPP:leeds\.roads/})).toBeTruthy();
+    expect(screen.getByText('derived_layers.roads')).toBeTruthy();
+    expect(screen.getByText(new RegExp(secondProposal.id))).toBeTruthy();
+    expect(screen.getByText(
+      content => content.includes('"catalogRevision": 2'),
+    )).toBeTruthy();
+    expect(
+      api.mock.calls
+        .map(([path]) => path)
+        .filter(path => path.includes('&cursor=')),
+    ).toEqual(continuations.map(([, path, cursor]) => (
+      pagePathForTest(path, cursor)
+    )));
+  });
+
   test('offers context options in guided and advanced generation', async () => {
     let finishGeneration;
     const generationResult = new Promise(resolve => {
@@ -337,16 +496,16 @@ describe('SemanticCatalog', () => {
           },
         };
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [asset], catalogRevision: 7};
       }
-      if (path === '/api/semantic/source/relations') {
+      if (path === firstPage('/api/semantic/source/relations')) {
         return {relations: []};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (path === '/api/semantic/generate' && options.method === 'POST') {
@@ -486,7 +645,7 @@ describe('SemanticCatalog', () => {
           },
         };
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {
           assets: [{
             ...asset,
@@ -501,10 +660,10 @@ describe('SemanticCatalog', () => {
           catalogRevision: 7,
         };
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (path === '/api/semantic/generate' && options.method === 'POST') {
@@ -769,16 +928,16 @@ describe('SemanticCatalog', () => {
           },
         };
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [asset], catalogRevision: 7};
       }
-      if (path === '/api/semantic/source/relations') {
+      if (path === firstPage('/api/semantic/source/relations')) {
         return {relations: []};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (path === '/api/semantic/generate' && options.method === 'POST') {
@@ -837,19 +996,19 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: registered ? 8 : 7, schemaVersion: 2};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {
           assets: registered ? [sourceAsset] : [],
           catalogRevision: registered ? 8 : 7,
         };
       }
-      if (path === '/api/semantic/source/relations') {
+      if (path === firstPage('/api/semantic/source/relations')) {
         return {relations: [source]};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (
@@ -916,18 +1075,20 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: 7, schemaVersion: 2};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [assetWithHistory], catalogRevision: 7};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (
         path
-        === `/api/semantic/catalog/objects/${encodeURIComponent(asset.id)}/history`
+        === firstPage(
+          `/api/semantic/catalog/objects/${encodeURIComponent(asset.id)}/history`,
+        )
       ) {
         return {
           catalogRevision: 7,
@@ -953,13 +1114,13 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: 7, schemaVersion: 1};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [asset], catalogRevision: 7};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (path === '/api/semantic/proposals/check') {
@@ -1036,13 +1197,13 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: 7, schemaVersion: 1};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [asset], catalogRevision: 7};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {derivedProfiles: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {
           proposals: [{
             id: 'sem-1',
@@ -1107,9 +1268,11 @@ describe('SemanticCatalog', () => {
     };
     const api = vi.fn(async path => {
       if (path === '/api/semantic/status') return {catalogRevision: 7, schemaVersion: 1};
-      if (path === '/api/semantic/catalog') return {assets: [asset], catalogRevision: 7};
-      if (path === '/api/semantic/derived-profiles') return {derivedProfiles: [], catalogRevision: 7};
-      if (path === '/api/semantic/proposals') return {proposals: [accepted]};
+      if (path === firstPage('/api/semantic/catalog')) return {assets: [asset], catalogRevision: 7};
+      if (path === firstPage('/api/semantic/derived-profiles')) return {derivedProfiles: [], catalogRevision: 7};
+      if (path === firstPage('/api/semantic/proposals')) {
+        return {proposals: [accepted]};
+      }
       throw new Error(`Unexpected request: ${path}`);
     });
 
@@ -1130,15 +1293,16 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: 7, schemaVersion: 1};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/source/relations') {
+      if (path === firstPage('/api/semantic/source/relations')) {
         return {relations: []};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {
           catalogRevision: 7,
+          deliveryBlockersMore: 'true',
           derivedProfiles: [{
             name: 'walkability',
             generation: 1,
@@ -1154,7 +1318,7 @@ describe('SemanticCatalog', () => {
           }],
         };
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (
@@ -1181,6 +1345,9 @@ describe('SemanticCatalog', () => {
     fireEvent.click(await screen.findByRole('button', {name: 'Advanced mode'}));
     expect(await screen.findByText(/Blocking archive delivery: repair_required/))
       .toBeTruthy();
+    expect(screen.queryByText(
+      /More dropped-relation delivery blockers are waiting/,
+    )).toBeNull();
     fireEvent.click(await screen.findByRole('button', {name: 'Retry delivery'}));
 
     await waitFor(() => expect(api).toHaveBeenCalledWith(
@@ -1201,16 +1368,17 @@ describe('SemanticCatalog', () => {
       if (path === '/api/semantic/status') {
         return {catalogRevision: 7, schemaVersion: 1};
       }
-      if (path === '/api/semantic/catalog') {
+      if (path === firstPage('/api/semantic/catalog')) {
         return {assets: [], catalogRevision: 7};
       }
-      if (path === '/api/semantic/source/relations') {
+      if (path === firstPage('/api/semantic/source/relations')) {
         return {relations: []};
       }
-      if (path === '/api/semantic/derived-profiles') {
+      if (path === firstPage('/api/semantic/derived-profiles')) {
         return {
           catalogRevision: 7,
           derivedProfiles: [],
+          deliveryBlockersMore: true,
           deliveryBlockers: [{
             name: 'already_dropped',
             relation: 'derived_layers.already_dropped',
@@ -1224,7 +1392,7 @@ describe('SemanticCatalog', () => {
           }],
         };
       }
-      if (path === '/api/semantic/proposals' && !options.method) {
+      if (path === firstPage('/api/semantic/proposals') && !options.method) {
         return {proposals: []};
       }
       if (
@@ -1251,6 +1419,9 @@ describe('SemanticCatalog', () => {
     fireEvent.click(await screen.findByRole('button', {name: 'Advanced mode'}));
     expect(await screen.findByText(
       /Dropped relation · blocking archive delivery: repair_required/,
+    )).toBeTruthy();
+    expect(await screen.findByText(
+      /Repair the displayed blockers, then refresh the semantic catalog/,
     )).toBeTruthy();
     fireEvent.click(screen.getByRole('button', {name: 'Retry delivery'}));
     await waitFor(() => expect(api).toHaveBeenCalledWith(

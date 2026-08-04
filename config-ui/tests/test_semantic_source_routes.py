@@ -31,10 +31,13 @@ class FakeSources:
     def __init__(self, source=SOURCE, *, error=None):
         self.source = source
         self.error = error
-        self.discover = Mock(return_value=[{
+        summary = {
             key: source[key]
             for key in ("alias", "schema", "relation", "kind", "assetId")
-        }])
+        }
+        self.discover = Mock(return_value=[summary])
+        self.discover_page = Mock(return_value=[summary])
+        self.configuration_fingerprint = Mock(return_value="f" * 64)
         self.locked_calls = []
 
     @contextmanager
@@ -86,7 +89,110 @@ class SemanticSourceRouteTests(unittest.TestCase):
             handler.do_GET()
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual(SOURCE["assetId"], responses[0][1]["relations"][0]["assetId"])
-        sources.discover.assert_called_once_with()
+        self.assertNotIn("pagination", responses[0][1])
+        sources.discover.assert_not_called()
+        sources.discover_page.assert_called_once_with(
+            after=None,
+            fetch_limit=101,
+        )
+
+    def test_bounded_source_discovery_uses_scoped_keyset_cursor(self):
+        first = {
+            key: SOURCE[key]
+            for key in ("alias", "schema", "relation", "kind", "assetId")
+        }
+        first["relation"] = "2021 census"
+        second = {
+            **first,
+            "relation": "roads",
+            "assetId": "77c9f802-493d-5c54-af17-9ae846dd93a7",
+        }
+        sources = FakeSources()
+        sources.discover_page.return_value = [first, second]
+        control = Mock()
+        control.instance_id.return_value = "instance-1"
+        control.pagination_key.return_value = b"p" * 32
+
+        handler, responses = self.handler(
+            "/api/semantic/source/relations?limit=1",
+            scopes=["semantic:inspect", "semantic:source"],
+        )
+        with patch.object(app, "SEMANTIC_SOURCES", sources), patch.object(
+            app, "CONTROL", control
+        ):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([first], body["relations"])
+        cursor = body["pagination"]["nextCursor"]
+        self.assertRegex(cursor, r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+        sources.discover.assert_not_called()
+        sources.discover_page.assert_called_once_with(
+            after=None,
+            fetch_limit=2,
+        )
+        sources.configuration_fingerprint.assert_called_once_with(b"p" * 32)
+
+        sources.discover_page.reset_mock()
+        sources.discover_page.return_value = [second]
+        handler, responses = self.handler(
+            "/api/semantic/source/relations?limit=1&cursor=" + cursor,
+            scopes=["semantic:inspect", "semantic:source"],
+        )
+        with patch.object(app, "SEMANTIC_SOURCES", sources), patch.object(
+            app, "CONTROL", control
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([second], responses[0][1]["relations"])
+        self.assertIsNone(responses[0][1]["pagination"]["nextCursor"])
+        sources.discover_page.assert_called_once_with(
+            after=(first["alias"], first["schema"], first["relation"]),
+            fetch_limit=2,
+        )
+
+        sources.discover_page.reset_mock()
+        sources.configuration_fingerprint.return_value = "0" * 64
+        handler, responses = self.handler(
+            "/api/semantic/source/relations?limit=1&cursor=" + cursor,
+            scopes=["semantic:inspect", "semantic:source"],
+        )
+        with patch.object(app, "SEMANTIC_SOURCES", sources), patch.object(
+            app, "CONTROL", control
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("pagination.invalid", responses[0][1]["code"])
+        sources.discover_page.assert_not_called()
+
+    def test_legacy_source_discovery_requires_pagination_above_100(self):
+        sources = FakeSources()
+        sources.discover_page.return_value = [
+            {
+                "alias": "MAPP",
+                "schema": "leeds",
+                "relation": f"roads_{index}",
+                "kind": "table",
+                "assetId": f"asset-{index}",
+            }
+            for index in range(101)
+        ]
+        handler, responses = self.handler(
+            "/api/semantic/source/relations",
+            scopes=["semantic:inspect", "semantic:source"],
+        )
+        with patch.object(app, "SEMANTIC_SOURCES", sources):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        self.assertEqual("pagination.required", responses[0][1]["code"])
+        sources.discover_page.assert_called_once_with(
+            after=None,
+            fetch_limit=101,
+        )
 
     def test_admin_and_full_authority_include_source_scope(self):
         for actor, scopes in (

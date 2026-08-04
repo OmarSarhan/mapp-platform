@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import uuid
@@ -33,6 +34,7 @@ GENERATION_SAMPLE_MAX_BYTES = 96 * 1024
 GENERATION_SAMPLE_MAX_COLUMNS = 20
 GENERATION_SAMPLE_VALUE_MAX_CHARS = 512
 GENERATION_STATISTICS_MAX_ROWS = 1000
+MAX_DISCOVERY_PAGE_FETCH = 101
 _GENERATION_FIELDS_SQL = """
     SELECT a.attname AS name,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS type,
@@ -88,6 +90,15 @@ def _system_schema(schema: str) -> bool:
 
 def _internal_relation(relation: str) -> bool:
     return relation.startswith("_")
+
+
+def _catalog_name(value: Any) -> bool:
+    if not isinstance(value, str) or not value or "\0" in value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 63
+    except UnicodeEncodeError:
+        return False
 
 
 def parse_allowlist(value: str) -> tuple[SourcePattern, ...]:
@@ -318,6 +329,40 @@ class PostgresSemanticSources:
             )
         )
 
+    def _aliases(self) -> list[str]:
+        return sorted({
+            pattern.alias
+            for pattern in self.allowlist
+            if pattern.alias in self.connections
+        })
+
+    def configuration_fingerprint(self, key: bytes) -> str:
+        if not isinstance(key, bytes) or not key:
+            raise ValueError("Semantic source fingerprint key is invalid.")
+        aliases = self._aliases()
+        value = {
+            "connections": {
+                alias: self.connections[alias]
+                for alias in aliases
+            },
+            "allowlist": [
+                [pattern.alias, pattern.schema, pattern.relation]
+                for pattern in self.allowlist
+            ],
+            "exclusions": [
+                [pattern.alias, pattern.schema, pattern.relation]
+                for pattern in self.exclusions
+            ],
+        }
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
     @staticmethod
     def _begin_read_only(cursor) -> None:
         cursor.execute(
@@ -369,12 +414,7 @@ class PostgresSemanticSources:
 
     def discover(self) -> list[dict[str, Any]]:
         relations: list[dict[str, Any]] = []
-        aliases = sorted({
-            pattern.alias
-            for pattern in self.allowlist
-            if pattern.alias in self.connections
-        })
-        for alias in aliases:
+        for alias in self._aliases():
             with psycopg.connect(
                 self.connections[alias],
                 connect_timeout=5,
@@ -404,6 +444,137 @@ class PostgresSemanticSources:
                 item["relation"],
             ),
         )
+
+    def _paged_relations_query(
+        self,
+        alias: str,
+        after: tuple[str, str] | None,
+        fetch_limit: int,
+    ) -> tuple[str, tuple[Any, ...]]:
+        allowed = [
+            pattern for pattern in self.allowlist
+            if pattern.alias == alias
+        ]
+        if not allowed:
+            raise ValueError("Semantic source page position is invalid.")
+        values: list[Any] = []
+        allow_clauses: list[str] = []
+        for pattern in allowed:
+            if pattern.relation == "*":
+                allow_clauses.append("n.nspname = %s")
+                values.append(pattern.schema)
+            else:
+                allow_clauses.append(
+                    "(n.nspname = %s AND c.relname = %s)"
+                )
+                values.extend((pattern.schema, pattern.relation))
+
+        exclusion_clauses: list[str] = []
+        for pattern in self.exclusions:
+            if pattern.alias != alias:
+                continue
+            if pattern.relation == "*":
+                exclusion_clauses.append("n.nspname = %s")
+                values.append(pattern.schema)
+            else:
+                exclusion_clauses.append(
+                    "(n.nspname = %s AND c.relname = %s)"
+                )
+                values.extend((pattern.schema, pattern.relation))
+
+        exclusion_sql = (
+            "AND NOT (" + " OR ".join(exclusion_clauses) + ")"
+            if exclusion_clauses
+            else ""
+        )
+        after_sql = ""
+        if after is not None:
+            after_sql = (
+                "AND (n.nspname > %s OR "
+                "(n.nspname = %s AND c.relname > %s))"
+            )
+            values.extend((after[0], after[0], after[1]))
+        values.append(fetch_limit)
+        statement = f"""
+            SELECT n.nspname AS schema,
+                   c.relname AS relation,
+                   c.relkind AS relation_kind
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'v', 'm')
+              AND has_schema_privilege(n.oid, 'USAGE')
+              AND has_table_privilege(c.oid, 'SELECT')
+              AND left(c.relname, 1) <> '_'
+              AND ({' OR '.join(allow_clauses)})
+              {exclusion_sql}
+              {after_sql}
+            ORDER BY n.nspname, c.relname
+            LIMIT %s
+        """
+        return statement, tuple(values)
+
+    def discover_page(
+        self,
+        *,
+        after: tuple[str, str, str] | None,
+        fetch_limit: int,
+    ) -> list[dict[str, Any]]:
+        if (
+            isinstance(fetch_limit, bool)
+            or not isinstance(fetch_limit, int)
+            or not 1 <= fetch_limit <= MAX_DISCOVERY_PAGE_FETCH
+        ):
+            raise ValueError("Semantic source page limit is invalid.")
+        aliases = self._aliases()
+        if after is not None and (
+            not isinstance(after, tuple)
+            or len(after) != 3
+            or not isinstance(after[0], str)
+            or ALIAS_RE.fullmatch(after[0]) is None
+            or not _catalog_name(after[1])
+            or not _catalog_name(after[2])
+            or after[0] not in aliases
+        ):
+            raise ValueError("Semantic source page position is invalid.")
+
+        relations: list[dict[str, Any]] = []
+        for alias in aliases:
+            if after is not None and alias < after[0]:
+                continue
+            remaining = fetch_limit - len(relations)
+            if remaining == 0:
+                break
+            alias_after = (
+                (after[1], after[2])
+                if after is not None and alias == after[0]
+                else None
+            )
+            statement, values = self._paged_relations_query(
+                alias,
+                alias_after,
+                remaining,
+            )
+            with psycopg.connect(
+                self.connections[alias],
+                connect_timeout=5,
+                row_factory=dict_row,
+            ) as connection:
+                with connection.cursor() as cursor:
+                    self._begin_read_only(cursor)
+                    cursor.execute(statement, values)
+                    rows = cursor.fetchmany(remaining)
+            relations.extend({
+                "alias": alias,
+                "schema": row["schema"],
+                "relation": row["relation"],
+                "kind": RELATION_KINDS[row["relation_kind"]],
+                "assetId": source_asset_id(
+                    alias,
+                    row["schema"],
+                    row["relation"],
+                ),
+            } for row in rows)
+        return relations
 
     @contextmanager
     def locked_relation(

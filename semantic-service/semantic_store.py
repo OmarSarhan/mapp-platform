@@ -23,12 +23,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_ID_LENGTH = 200
 MAX_OPERATIONS = 100
 MAX_CURATED_FIELDS_BYTES = 1024 * 1024
 MAX_FIELD_ANNOTATION_BYTES = 16 * 1024
 MAX_FIELD_ANNOTATION_PROPERTIES = 64
+MAX_COLLECTION_FETCH = 101
 _MISSING = object()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -69,6 +70,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _sqlite_casefold(value: Any) -> str:
+    return str(value or "").casefold()
 
 
 def _require_object(value: Any, name: str) -> dict[str, Any]:
@@ -136,6 +141,12 @@ class SemanticStore:
             timeout=5,
         )
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "mapp_casefold",
+            1,
+            _sqlite_casefold,
+            deterministic=True,
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -189,6 +200,8 @@ class SemanticStore:
                 self._migration_2(connection)
             if 3 not in applied:
                 self._migration_3(connection)
+            if 4 not in applied:
+                self._migration_4(connection)
         os.chmod(self.db_path, 0o600)
 
     @staticmethod
@@ -303,6 +316,40 @@ class SemanticStore:
             """
         )
 
+    @staticmethod
+    def _migration_4(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+
+            CREATE INDEX IF NOT EXISTS proposals_created_page_idx
+                ON proposals(created_at, proposal_id);
+            CREATE INDEX IF NOT EXISTS proposals_asset_page_idx
+                ON proposals(asset_id, created_at, proposal_id);
+            CREATE INDEX IF NOT EXISTS proposals_state_page_idx
+                ON proposals(state, created_at, proposal_id);
+
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _validated_fetch_limit(fetch_limit: int | None) -> int | None:
+        if fetch_limit is None:
+            return None
+        if (
+            isinstance(fetch_limit, bool)
+            or not isinstance(fetch_limit, int)
+            or not 1 <= fetch_limit <= MAX_COLLECTION_FETCH
+        ):
+            raise SemanticError(
+                "invalid_request",
+                f"fetch limit must be an integer from 1 to {MAX_COLLECTION_FETCH}.",
+            )
+        return fetch_limit
+
     def database_settings(self) -> dict[str, Any]:
         with self._connection() as connection:
             return {
@@ -398,21 +445,36 @@ class SemanticStore:
         *,
         is_admin: bool,
         connection: sqlite3.Connection | None = None,
+        after_asset_id: str | None = None,
+        fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        fetch_limit = self._validated_fetch_limit(fetch_limit)
+        if after_asset_id is not None:
+            _require_string(after_asset_id, "afterAssetId")
         if connection is None:
             with self._connection() as own_connection:
                 return self.list_assets(
                     is_admin=is_admin,
                     connection=own_connection,
+                    after_asset_id=after_asset_id,
+                    fetch_limit=fetch_limit,
                 )
-        rows = connection.execute(
-            "SELECT * FROM assets WHERE status = 'ready' ORDER BY asset_id"
-        ).fetchall()
-        return [
-            self._asset_from_row(row)
-            for row in rows
-            if self._visible(row, is_admin)
-        ]
+        clauses = ["status = 'ready'"]
+        values: list[Any] = []
+        if not is_admin:
+            clauses.append("visibility = 'inspect'")
+        if after_asset_id is not None:
+            clauses.append("asset_id > ?")
+            values.append(after_asset_id)
+        statement = (
+            f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
+            "ORDER BY asset_id"
+        )
+        if fetch_limit is not None:
+            statement += " LIMIT ?"
+            values.append(fetch_limit)
+        rows = connection.execute(statement, values).fetchall()
+        return [self._asset_from_row(row) for row in rows]
 
     def search_assets(
         self,
@@ -421,6 +483,8 @@ class SemanticStore:
         limit: int | None,
         is_admin: bool,
         connection: sqlite3.Connection | None = None,
+        after_asset_id: str | None = None,
+        fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or len(query) > 256:
             raise SemanticError(
@@ -434,21 +498,49 @@ class SemanticStore:
             raise SemanticError(
                 "invalid_request", "limit must be an integer between 1 and 100."
             )
-        needle = query.casefold().strip()
-        results: list[dict[str, Any]] = []
-        for asset in self.list_assets(
-            is_admin=is_admin,
-            connection=connection,
-        ):
-            searchable = " ".join(
-                (
-                    asset["id"],
-                    canonical_json(asset["generated"]),
-                    canonical_json(asset["curated"]),
+        fetch_limit = self._validated_fetch_limit(fetch_limit)
+        if limit is not None and fetch_limit is not None:
+            raise SemanticError(
+                "invalid_request", "limit and fetch limit cannot both be supplied."
+            )
+        if after_asset_id is not None:
+            _require_string(after_asset_id, "afterAssetId")
+        if connection is None:
+            with self._connection() as own_connection:
+                return self.search_assets(
+                    query,
+                    limit=limit,
+                    is_admin=is_admin,
+                    connection=own_connection,
+                    after_asset_id=after_asset_id,
+                    fetch_limit=fetch_limit,
                 )
-            ).casefold()
-            if needle and needle not in searchable:
-                continue
+        needle = query.casefold().strip()
+        clauses = ["status = 'ready'"]
+        values: list[Any] = []
+        if not is_admin:
+            clauses.append("visibility = 'inspect'")
+        if after_asset_id is not None:
+            clauses.append("asset_id > ?")
+            values.append(after_asset_id)
+        if needle:
+            clauses.append(
+                "instr(mapp_casefold(asset_id || ' ' || generated_json || ' ' || "
+                "curated_json), ?) > 0"
+            )
+            values.append(needle)
+        effective_limit = fetch_limit if fetch_limit is not None else limit
+        statement = (
+            f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
+            "ORDER BY asset_id"
+        )
+        if effective_limit is not None:
+            statement += " LIMIT ?"
+            values.append(effective_limit)
+        rows = connection.execute(statement, values).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            asset = self._asset_from_row(row)
             generated = asset["generated"]
             curated = asset["curated"]
             results.append(
@@ -467,8 +559,6 @@ class SemanticStore:
                     "catalogRevision": asset["catalogRevision"],
                 }
             )
-            if limit is not None and len(results) == limit:
-                break
         return results
 
     def asset_history(
@@ -477,31 +567,58 @@ class SemanticStore:
         *,
         is_admin: bool,
         connection: sqlite3.Connection | None = None,
+        after_history_id: int | None = None,
+        fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        fetch_limit = self._validated_fetch_limit(fetch_limit)
+        if (
+            after_history_id is not None
+            and (
+                isinstance(after_history_id, bool)
+                or not isinstance(after_history_id, int)
+                or after_history_id < 1
+            )
+        ):
+            raise SemanticError(
+                "invalid_request", "after history ID must be a positive integer."
+            )
         if connection is None:
             with self.read_snapshot() as (own_connection, _revision):
                 return self.asset_history(
                     asset_id,
                     is_admin=is_admin,
                     connection=own_connection,
+                    after_history_id=after_history_id,
+                    fetch_limit=fetch_limit,
                 )
         self.get_asset(
             asset_id,
             is_admin=is_admin,
             connection=connection,
         )
-        rows = connection.execute(
-            """
-            SELECT version, generation, catalog_revision, change_type,
+        clauses = ["asset_id = ?"]
+        values: list[Any] = [asset_id]
+        if after_history_id is not None:
+            clauses.append("history_id > ?")
+            values.append(after_history_id)
+        statement = f"""
+            SELECT history_id, version, generation, catalog_revision, change_type,
                    event_id, proposal_id, actor, snapshot_json, changed_at
               FROM asset_history
-             WHERE asset_id = ?
+             WHERE {' AND '.join(clauses)}
              ORDER BY history_id
-            """,
-            (asset_id,),
-        ).fetchall()
+            """
+        if fetch_limit is not None:
+            statement += " LIMIT ?"
+            values.append(fetch_limit)
+        rows = connection.execute(statement, values).fetchall()
         return [
             {
+                **(
+                    {"_historyId": row["history_id"]}
+                    if fetch_limit is not None
+                    else {}
+                ),
                 "version": row["version"],
                 "generation": row["generation"],
                 "catalogRevision": row["catalog_revision"],
@@ -1397,6 +1514,8 @@ class SemanticStore:
         asset_id: str | None,
         is_admin: bool,
         connection: sqlite3.Connection | None = None,
+        after: tuple[str, str] | None = None,
+        fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if state is not None and state not in {"pending", "applied", "declined"}:
             raise SemanticError(
@@ -1404,6 +1523,14 @@ class SemanticStore:
             )
         if asset_id is not None:
             _require_string(asset_id, "assetId")
+        fetch_limit = self._validated_fetch_limit(fetch_limit)
+        if after is not None:
+            if not isinstance(after, tuple) or len(after) != 2:
+                raise SemanticError(
+                    "invalid_request", "proposal page position is invalid."
+                )
+            _require_string(after[0], "afterCreatedAt")
+            _require_string(after[1], "afterProposalId")
         clauses: list[str] = []
         values: list[Any] = []
         if state is not None:
@@ -1412,6 +1539,14 @@ class SemanticStore:
         if asset_id is not None:
             clauses.append("p.asset_id = ?")
             values.append(asset_id)
+        if not is_admin:
+            clauses.append("a.visibility = 'inspect'")
+        if after is not None:
+            clauses.append(
+                "(p.created_at > ? OR "
+                "(p.created_at = ? AND p.proposal_id > ?))"
+            )
+            values.extend((after[0], after[0], after[1]))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         if connection is None:
             with self._connection() as own_connection:
@@ -1420,22 +1555,21 @@ class SemanticStore:
                     asset_id=asset_id,
                     is_admin=is_admin,
                     connection=own_connection,
+                    after=after,
+                    fetch_limit=fetch_limit,
                 )
-        rows = connection.execute(
-            f"""
+        statement = f"""
             SELECT p.*, a.visibility
               FROM proposals p
               JOIN assets a ON a.asset_id = p.asset_id
               {where}
              ORDER BY p.created_at, p.proposal_id
-            """,
-            values,
-        ).fetchall()
-        return [
-            self._proposal_from_row(row)
-            for row in rows
-            if self._visible(row, is_admin)
-        ]
+            """
+        if fetch_limit is not None:
+            statement += " LIMIT ?"
+            values.append(fetch_limit)
+        rows = connection.execute(statement, values).fetchall()
+        return [self._proposal_from_row(row) for row in rows]
 
     def apply_proposal(
         self,
@@ -1619,19 +1753,41 @@ class SemanticStore:
         *,
         is_admin: bool,
         connection: sqlite3.Connection | None = None,
+        after_asset_id: str | None = None,
+        fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        profiles = []
-        for asset in self.list_assets(
-            is_admin=is_admin,
-            connection=connection,
-        ):
-            generated = asset["generated"]
-            binding = generated.get("binding")
-            schema = binding.get("schema") if isinstance(binding, dict) else None
-            kind = str(generated.get("kind", "")).casefold()
-            if schema == "derived_layers" or "derived" in kind:
-                profiles.append(asset)
-        return profiles
+        fetch_limit = self._validated_fetch_limit(fetch_limit)
+        if after_asset_id is not None:
+            _require_string(after_asset_id, "afterAssetId")
+        if connection is None:
+            with self._connection() as own_connection:
+                return self.derived_profiles(
+                    is_admin=is_admin,
+                    connection=own_connection,
+                    after_asset_id=after_asset_id,
+                    fetch_limit=fetch_limit,
+                )
+        clauses = [
+            "status = 'ready'",
+            "(json_extract(generated_json, '$.binding.schema') = 'derived_layers' "
+            "OR instr(mapp_casefold(json_extract(generated_json, '$.kind')), "
+            "'derived') > 0)",
+        ]
+        values: list[Any] = []
+        if not is_admin:
+            clauses.append("visibility = 'inspect'")
+        if after_asset_id is not None:
+            clauses.append("asset_id > ?")
+            values.append(after_asset_id)
+        statement = (
+            f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
+            "ORDER BY asset_id"
+        )
+        if fetch_limit is not None:
+            statement += " LIMIT ?"
+            values.append(fetch_limit)
+        rows = connection.execute(statement, values).fetchall()
+        return [self._asset_from_row(row) for row in rows]
 
     @staticmethod
     def derived_name(asset: dict[str, Any]) -> str | None:

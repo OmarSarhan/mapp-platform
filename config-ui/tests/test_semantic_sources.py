@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
@@ -35,6 +36,8 @@ class FakeCursor:
         self.execute_error = execute_error
         self.fetchall_results = list(fetchall_results or [])
         self.executed = []
+        self.fetchall_calls = 0
+        self.fetchmany_sizes = []
 
     def __enter__(self):
         return self
@@ -53,9 +56,14 @@ class FakeCursor:
             raise self.execute_error
 
     def fetchall(self):
+        self.fetchall_calls += 1
         if self.fetchall_results:
             return self.fetchall_results.pop(0)
         return self.rows
+
+    def fetchmany(self, size):
+        self.fetchmany_sizes.append(size)
+        return self.rows[:size]
 
     def fetchone(self):
         return self.one
@@ -185,6 +193,147 @@ class SemanticSourceContractTests(unittest.TestCase):
         self.assertIn("pg_catalog.pg_class", sql_text)
         self.assertNotIn("secret.people", sql_text)
         self.assertNotIn("SELECT *", sql_text.upper())
+
+    def test_bounded_discovery_filters_before_keyset_limit(self):
+        cursor = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+            {"schema": "leeds", "relation": "transit", "relation_kind": "v"},
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+            parse_exclusions("MAPP:leeds.census_datasets"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            discovered = sources.discover_page(
+                after=("MAPP", "leeds", "paths"),
+                fetch_limit=2,
+            )
+
+        self.assertEqual(
+            [("MAPP", "leeds", "roads"), ("MAPP", "leeds", "transit")],
+            [
+                (item["alias"], item["schema"], item["relation"])
+                for item in discovered
+            ],
+        )
+        self.assertEqual(0, cursor.fetchall_calls)
+        self.assertEqual([2], cursor.fetchmany_sizes)
+        statement, values = cursor.executed[-1]
+        self.assertIn("left(c.relname, 1) <> '_'", statement)
+        self.assertIn("has_schema_privilege", statement)
+        self.assertIn("has_table_privilege", statement)
+        self.assertIn("AND NOT (", statement)
+        self.assertIn("n.nspname > %s", statement)
+        self.assertIn("ORDER BY n.nspname, c.relname", statement)
+        self.assertIn("LIMIT %s", statement)
+        self.assertEqual(
+            (
+                "leeds",
+                "leeds",
+                "census_datasets",
+                "leeds",
+                "leeds",
+                "paths",
+                2,
+            ),
+            values,
+        )
+
+    def test_bounded_discovery_merges_aliases_with_one_global_limit(self):
+        alpha = FakeCursor([
+            {"schema": "open", "relation": "alpha", "relation_kind": "r"},
+        ])
+        mapp = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+            {"schema": "leeds", "relation": "transit", "relation_kind": "v"},
+        ])
+        sources = PostgresSemanticSources(
+            {
+                "ALPHA": "postgresql://alpha",
+                "MAPP": "postgresql://mapp",
+            },
+            parse_allowlist("MAPP:leeds.*,ALPHA:open.*"),
+        )
+
+        def connect(url, **_kwargs):
+            return FakeConnection(
+                alpha if url == "postgresql://alpha" else mapp
+            )
+
+        with patch("semantic_sources.psycopg.connect", side_effect=connect):
+            discovered = sources.discover_page(after=None, fetch_limit=2)
+
+        self.assertEqual(
+            [("ALPHA", "alpha"), ("MAPP", "roads")],
+            [(item["alias"], item["relation"]) for item in discovered],
+        )
+        self.assertEqual([2], alpha.fetchmany_sizes)
+        self.assertEqual([1], mapp.fetchmany_sizes)
+        self.assertEqual(0, alpha.fetchall_calls + mapp.fetchall_calls)
+
+    def test_bounded_discovery_resumes_after_quoted_identifier(self):
+        cursor = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            discovered = sources.discover_page(
+                after=("MAPP", "leeds", "2024 roads"),
+                fetch_limit=1,
+            )
+
+        self.assertEqual("roads", discovered[0]["relation"])
+        self.assertEqual(
+            ("leeds", "leeds", "leeds", "2024 roads", 1),
+            cursor.executed[-1][1],
+        )
+
+    def test_source_configuration_fingerprint_tracks_effective_inputs(self):
+        key = b"k" * 32
+        base = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader:secret@database/mapp"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        self.assertEqual(
+            base.configuration_fingerprint(key),
+            base.configuration_fingerprint(key),
+        )
+        self.assertNotEqual(
+            base.configuration_fingerprint(key),
+            base.configuration_fingerprint(b"q" * 32),
+        )
+        self.assertNotEqual(
+            base.configuration_fingerprint(key),
+            PostgresSemanticSources(
+                {"MAPP": "postgresql://different"},
+                parse_allowlist("MAPP:leeds.*"),
+            ).configuration_fingerprint(key),
+        )
+        self.assertNotEqual(
+            base.configuration_fingerprint(key),
+            PostgresSemanticSources(
+                {"MAPP": "postgresql://reader:secret@database/mapp"},
+                parse_allowlist("MAPP:leeds.*"),
+                parse_exclusions("MAPP:leeds.roads"),
+            ).configuration_fingerprint(key),
+        )
+        fingerprint = base.configuration_fingerprint(key)
+        connection_url = "postgresql://reader:secret@database/mapp"
+        self.assertNotIn("secret", fingerprint)
+        self.assertNotEqual(
+            hashlib.sha256(connection_url.encode("utf-8")).hexdigest(),
+            fingerprint,
+        )
 
     def test_sync_introspection_is_read_only_metadata_and_bounds_comments(self):
         cursor = FakeCursor([

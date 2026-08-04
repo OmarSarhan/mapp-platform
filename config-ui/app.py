@@ -65,10 +65,13 @@ from workspace_schema import expression_function_names, validate_workspace
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, parse_time
 from control_api import (
-    CONTRACT_VERSION, PROPOSAL_LOCK, RULES, VisualPlanningDatabaseError,
+    CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
+    CollectionPaginationError, VisualPlanningDatabaseError,
     apply_operations, capabilities, contract, examples, plugin_manifest,
-    effective_locales, is_probeable_database_layer,
-    paginate_collection, pagination_parameters,
+    decode_position_cursor,
+    effective_locales, enforce_collection_payload, is_probeable_database_layer,
+    legacy_collection, paginate_collection, paginate_keyset_page,
+    pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
     reload_status, reload_timeout, request_reload, visual_hover_plan,
     schema as contract_schema, select_locale, visual_plan,
@@ -681,11 +684,23 @@ def derived_semantic_profiles(
     *,
     include_delivery_diagnostics: bool = False,
     delivery_blockers: list[dict] | None = None,
+    name: str | None = None,
+    after_name: str | None = None,
+    fetch_limit: int | None = None,
 ) -> list[dict]:
     if not DERIVED:
         raise DerivedLayerError(
             "Derived-layer database management is not configured."
         )
+    if name is not None:
+        definitions = [DERIVED.get(name, include_query=False)]
+    elif fetch_limit is not None:
+        definitions = DERIVED.list_page(
+            after_name=after_name,
+            fetch_limit=fetch_limit,
+        )
+    else:
+        definitions = DERIVED.list()
     profiles = [
         {
             "name": item["name"],
@@ -693,16 +708,24 @@ def derived_semantic_profiles(
             "kind": item["kind"],
             **item["semanticProfile"],
         }
-        for item in DERIVED.list()
+        for item in definitions
     ]
     if not include_delivery_diagnostics:
         return profiles
-    blockers_by_name = {}
     blockers = (
         delivery_blockers
         if delivery_blockers is not None
         else DERIVED.semantic_outbox_blockers()
     )
+    add_semantic_delivery_diagnostics(profiles, blockers)
+    return profiles
+
+
+def add_semantic_delivery_diagnostics(
+    profiles: list[dict],
+    blockers: list[dict],
+) -> None:
+    blockers_by_name = {}
     for blocker in blockers:
         name = blocker.get("name")
         if isinstance(name, str) and name and name not in blockers_by_name:
@@ -724,7 +747,30 @@ def derived_semantic_profiles(
                 else None
             ),
         }
-    return profiles
+
+
+def semantic_delivery_blocker_page(
+    profile_names: list[str],
+    *,
+    include_unmatched: bool,
+) -> tuple[list[dict], list[dict], bool]:
+    matched = (
+        DERIVED.semantic_outbox_blockers(
+            profile_names=profile_names,
+            include_unmatched=False,
+            one_per_profile=True,
+            fetch_limit=len(profile_names),
+        )
+        if profile_names
+        else []
+    )
+    if not include_unmatched:
+        return matched, [], False
+    unmatched = DERIVED.semantic_outbox_blockers(
+        unmatched_only=True,
+        fetch_limit=MAX_PAGE_LIMIT + 1,
+    )
+    return matched, unmatched[:MAX_PAGE_LIMIT], len(unmatched) > MAX_PAGE_LIMIT
 
 
 def unmatched_semantic_delivery_blockers(
@@ -3854,6 +3900,8 @@ class Handler(SimpleHTTPRequestHandler):
         if isinstance(code, str) and code:
             if code == "pagination_invalid":
                 payload["code"] = "pagination.invalid"
+            elif code == "pagination_required":
+                payload["code"] = "pagination.required"
             else:
                 payload["code"] = (
                     code if code.startswith("semantic.") else f"semantic.{code}"
@@ -3867,6 +3915,19 @@ class Handler(SimpleHTTPRequestHandler):
         if payload.get("details") is None:
             payload.pop("details", None)
         self._json(status, payload)
+
+    def _collection_pagination_error(
+        self,
+        error: CollectionPaginationError,
+    ) -> None:
+        self._json(
+            error.status,
+            {
+                "error": str(error),
+                "code": error.code,
+                "details": error.details,
+            },
+        )
 
     def _gemini_error(self, error: GeminiClientError) -> None:
         status = error.status
@@ -3946,16 +4007,6 @@ class Handler(SimpleHTTPRequestHandler):
                     or "full" in granted
                     or "semantic:admin" in granted
                 )
-                delivery_blockers = (
-                    DERIVED.semantic_outbox_blockers()
-                    if include_delivery_diagnostics and DERIVED
-                    else []
-                )
-                profiles = derived_semantic_profiles(
-                    include_delivery_diagnostics=include_delivery_diagnostics,
-                    delivery_blockers=delivery_blockers,
-                )
-                schedule_semantic_outbox()
                 revision = current_semantic_revision(actor)
                 name = derived_semantic_path.group(1)
                 if name:
@@ -3963,32 +4014,127 @@ class Handler(SimpleHTTPRequestHandler):
                         raise ValueError(
                             "Derived-profile show does not accept query parameters."
                         )
-                    profile = next(
-                        (item for item in profiles if item["name"] == name),
-                        None,
-                    )
-                    if not profile:
-                        raise FileNotFoundError(name)
+                    delivery_blockers = []
+                    if include_delivery_diagnostics and DERIVED:
+                        delivery_blockers, _, _ = (
+                            semantic_delivery_blocker_page(
+                                [name],
+                                include_unmatched=False,
+                            )
+                        )
+                    profile = derived_semantic_profiles(
+                        name=name,
+                        include_delivery_diagnostics=(
+                            include_delivery_diagnostics
+                        ),
+                        delivery_blockers=delivery_blockers,
+                    )[0]
                     self._json(HTTPStatus.OK, {
                         "catalogRevision": revision,
                         "derivedProfile": profile,
                     })
                 else:
-                    payload = paginated_collection_payload(
-                        "derivedProfiles",
-                        profiles,
-                        query,
-                        scope="semantic-derived-profiles-v1",
-                    )
-                    payload["catalogRevision"] = revision
-                    if include_delivery_diagnostics:
-                        payload["deliveryBlockers"] = (
-                            unmatched_semantic_delivery_blockers(
+                    unmatched_blockers = []
+                    delivery_blockers_more = False
+                    if query:
+                        limit, cursor = pagination_parameters(query)
+                        scope = json.dumps(
+                            {
+                                "collection": "semantic-derived-profiles-v1",
+                                "catalogRevision": revision,
+                                "diagnostics": include_delivery_diagnostics,
+                                "instanceId": CONTROL.instance_id(),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        after_name = decode_position_cursor(
+                            cursor,
+                            scope,
+                            CONTROL.pagination_key(),
+                        )
+                        if after_name is not None and (
+                            not isinstance(after_name, str)
+                            or re.fullmatch(
+                                r"[a-z][a-z0-9_]{0,62}", after_name
+                            )
+                            is None
+                        ):
+                            raise ValueError("cursor is invalid or expired.")
+                        profiles = derived_semantic_profiles(
+                            after_name=after_name,
+                            fetch_limit=limit + 1,
+                        )
+                        delivery_blockers = []
+                        if include_delivery_diagnostics and DERIVED:
+                            (
+                                delivery_blockers,
+                                unmatched_blockers,
+                                delivery_blockers_more,
+                            ) = semantic_delivery_blocker_page(
+                                [
+                                    profile["name"]
+                                    for profile in profiles[:limit]
+                                ],
+                                include_unmatched=cursor is None,
+                            )
+                        if include_delivery_diagnostics:
+                            add_semantic_delivery_diagnostics(
                                 profiles,
                                 delivery_blockers,
                             )
+                        profiles, pagination = paginate_keyset_page(
+                            profiles,
+                            limit=limit,
+                            scope=scope,
+                            key=CONTROL.pagination_key(),
+                            position=lambda item: item["name"],
                         )
+                        payload = {
+                            "derivedProfiles": profiles,
+                            "pagination": pagination,
+                        }
+                    else:
+                        profiles = derived_semantic_profiles(
+                            fetch_limit=MAX_PAGE_LIMIT + 1,
+                        )
+                        delivery_blockers = []
+                        if include_delivery_diagnostics:
+                            (
+                                delivery_blockers,
+                                unmatched_blockers,
+                                delivery_blockers_more,
+                            ) = semantic_delivery_blocker_page(
+                                [
+                                    profile["name"]
+                                    for profile in profiles[:MAX_PAGE_LIMIT]
+                                ],
+                                include_unmatched=True,
+                            )
+                            add_semantic_delivery_diagnostics(
+                                profiles,
+                                delivery_blockers,
+                            )
+                        profiles = legacy_collection(profiles)
+                        payload = {"derivedProfiles": profiles}
+                    payload["catalogRevision"] = revision
+                    if include_delivery_diagnostics:
+                        payload["deliveryBlockers"] = legacy_collection(
+                            unmatched_semantic_delivery_blockers(
+                                profiles, unmatched_blockers,
+                            )
+                        )
+                        payload["deliveryBlockersMore"] = (
+                            delivery_blockers_more
+                        )
+                    enforce_collection_payload(
+                        payload,
+                        paginated=bool(query),
+                    )
                     self._json(HTTPStatus.OK, payload)
+                schedule_semantic_outbox()
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
             except ValueError as exc:
                 self._json(
                     HTTPStatus.BAD_REQUEST,
@@ -4015,16 +4161,65 @@ class Handler(SimpleHTTPRequestHandler):
                     urlparse(self.path).query,
                     keep_blank_values=True,
                 )
-                relations = SEMANTIC_SOURCES.discover()
-                self._json(
-                    HTTPStatus.OK,
-                    paginated_collection_payload(
-                        "relations",
+                if query:
+                    limit, cursor = pagination_parameters(query)
+                    key = CONTROL.pagination_key()
+                    scope = json.dumps(
+                        {
+                            "collection": "semantic-source-relations-v1",
+                            "instanceId": CONTROL.instance_id(),
+                            "sourceConfiguration": (
+                                SEMANTIC_SOURCES.configuration_fingerprint(key)
+                            ),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    position = decode_position_cursor(cursor, scope, key)
+                    if (
+                        position is not None
+                        and (
+                            not isinstance(position, list)
+                            or len(position) != 3
+                        )
+                    ):
+                        raise ValueError("cursor is invalid or expired.")
+                    if position is None:
+                        after = None
+                    else:
+                        after = tuple(position)
+                    relations = SEMANTIC_SOURCES.discover_page(
+                        after=after,
+                        fetch_limit=limit + 1,
+                    )
+                    relations, pagination = paginate_keyset_page(
                         relations,
-                        query,
-                        scope="semantic-source-relations-v1",
-                    ),
+                        limit=limit,
+                        scope=scope,
+                        key=key,
+                        position=lambda item: [
+                            item["alias"],
+                            item["schema"],
+                            item["relation"],
+                        ],
+                    )
+                    payload = {
+                        "relations": relations,
+                        "pagination": pagination,
+                    }
+                else:
+                    relations = SEMANTIC_SOURCES.discover_page(
+                        after=None,
+                        fetch_limit=MAX_PAGE_LIMIT + 1,
+                    )
+                    payload = {"relations": legacy_collection(relations)}
+                enforce_collection_payload(
+                    payload,
+                    paginated=bool(query),
                 )
+                self._json(HTTPStatus.OK, payload)
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
             except ValueError as exc:
                 self._json(
                     HTTPStatus.BAD_REQUEST,
@@ -4053,16 +4248,16 @@ class Handler(SimpleHTTPRequestHandler):
                 result = self._semantic_request(actor, internal)
                 if path == "/api/semantic/status":
                     result = dict(result)
-                    capabilities = result.get("capabilities")
-                    capabilities = (
-                        dict(capabilities)
-                        if isinstance(capabilities, dict)
+                    semantic_capabilities = result.get("capabilities")
+                    semantic_capabilities = (
+                        dict(semantic_capabilities)
+                        if isinstance(semantic_capabilities, dict)
                         else {}
                     )
-                    capabilities["generation"] = (
+                    semantic_capabilities["generation"] = (
                         semantic_generation_capability()
                     )
-                    result["capabilities"] = capabilities
+                    result["capabilities"] = semantic_capabilities
                 self._json(
                     HTTPStatus.OK,
                     result,
@@ -4321,15 +4516,55 @@ class Handler(SimpleHTTPRequestHandler):
                     urlparse(self.path).query,
                     keep_blank_values=True,
                 )
-                self._json(
-                    HTTPStatus.OK,
-                    paginated_collection_payload(
-                        "proposals",
-                        proposal_list(CONTROL),
-                        query,
-                        scope="workspace-proposals-v1",
-                    ),
+                if query:
+                    limit, cursor = pagination_parameters(query)
+                    scope = json.dumps(
+                        {
+                            "collection": "workspace-proposals-v1",
+                            "instanceId": CONTROL.instance_id(),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    after_id = decode_position_cursor(
+                        cursor,
+                        scope,
+                        CONTROL.pagination_key(),
+                    )
+                    if after_id is not None and (
+                        not isinstance(after_id, str)
+                        or re.fullmatch(r"[A-Za-z0-9._-]+", after_id) is None
+                    ):
+                        raise ValueError("cursor is invalid or expired.")
+                    proposals = proposal_list(
+                        CONTROL,
+                        after_id=after_id,
+                        fetch_limit=limit + 1,
+                    )
+                    proposals, pagination = paginate_keyset_page(
+                        proposals,
+                        limit=limit,
+                        scope=scope,
+                        key=CONTROL.pagination_key(),
+                        position=lambda item: item["id"],
+                    )
+                    payload = {
+                        "proposals": proposals,
+                        "pagination": pagination,
+                    }
+                else:
+                    proposals = proposal_list(
+                        CONTROL,
+                        fetch_limit=MAX_PAGE_LIMIT + 1,
+                    )
+                    payload = {"proposals": legacy_collection(proposals)}
+                enforce_collection_payload(
+                    payload,
+                    paginated=bool(query),
                 )
+                self._json(HTTPStatus.OK, payload)
+            except CollectionPaginationError as exc:
+                self._collection_pagination_error(exc)
             except ValueError as exc:
                 self._json(
                     HTTPStatus.BAD_REQUEST,

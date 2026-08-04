@@ -1587,6 +1587,43 @@ class DerivedLayerStore:
                 for item in cur.fetchall()
             ]
 
+    def list_page(
+        self,
+        *,
+        after_name: str | None,
+        fetch_limit: int,
+    ) -> list[dict[str, Any]]:
+        if after_name is not None and not NAME_RE.fullmatch(after_name):
+            raise DerivedLayerError("Derived-layer page position is invalid.")
+        if (
+            isinstance(fetch_limit, bool)
+            or not isinstance(fetch_limit, int)
+            or not 1 <= fetch_limit <= 101
+        ):
+            raise DerivedLayerError("Derived-layer page limit is invalid.")
+        with self._connect() as connection, connection.cursor() as cur:
+            where = sql.SQL("WHERE name > %s") if after_name else sql.SQL("")
+            values = (after_name, fetch_limit) if after_name else (fetch_limit,)
+            cur.execute(sql.SQL("""
+                SELECT name, kind, sources, id_column AS "idColumn",
+                       geometry_column AS "geometryColumn", description,
+                       spatial_scope AS "spatialScope",
+                       created_at AS "createdAt", created_by AS "createdBy",
+                       refreshed_at AS "refreshedAt",
+                       semantic_asset_id AS "semanticAssetId",
+                       semantic_generation AS "semanticGeneration",
+                       semantic_status AS "semanticStatus",
+                       semantic_revision AS "semanticRevision"
+                FROM {}._definitions
+                {}
+                ORDER BY name
+                LIMIT %s
+            """).format(sql.Identifier(SCHEMA), where), values)
+            return [
+                self._with_semantic_profile(item)
+                for item in cur.fetchall()
+            ]
+
     def get(self, name: str, *, include_query: bool = True) -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
@@ -2123,10 +2160,97 @@ class DerivedLayerStore:
             ), (limit, claim_id, lease_seconds))
             return list(cur.fetchall())
 
-    def semantic_outbox_blockers(self) -> list[dict[str, Any]]:
+    def semantic_outbox_blockers(
+        self,
+        *,
+        profile_names: list[str] | None = None,
+        include_unmatched: bool = True,
+        one_per_profile: bool = False,
+        unmatched_only: bool = False,
+        fetch_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if profile_names is not None and (
+            len(profile_names) > 100
+            or any(not NAME_RE.fullmatch(name) for name in profile_names)
+        ):
+            raise DerivedLayerError("Semantic profile names are invalid.")
+        if not isinstance(include_unmatched, bool):
+            raise DerivedLayerError("Semantic blocker scope is invalid.")
+        if (
+            not isinstance(unmatched_only, bool)
+            or (unmatched_only and profile_names is not None)
+        ):
+            raise DerivedLayerError("Semantic blocker scope is invalid.")
+        if (
+            not isinstance(one_per_profile, bool)
+            or (
+                one_per_profile
+                and (profile_names is None or include_unmatched)
+            )
+        ):
+            raise DerivedLayerError("Semantic blocker grouping is invalid.")
+        if (
+            fetch_limit is not None
+            and (
+                isinstance(fetch_limit, bool)
+                or not isinstance(fetch_limit, int)
+                or not 1 <= fetch_limit <= 101
+            )
+        ):
+            raise DerivedLayerError("Semantic blocker limit is invalid.")
         with self._connect() as connection, connection.cursor() as cur:
+            filter_sql = sql.SQL("")
+            values: list[Any] = []
+            if unmatched_only:
+                filter_sql = sql.SQL("""
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM {}._definitions AS definition
+                      WHERE definition.name =
+                            event.payload #>> '{{generated,name}}'
+                    )
+                """).format(sql.Identifier(SCHEMA))
+            elif profile_names is not None:
+                if include_unmatched:
+                    filter_sql = sql.SQL("""
+                        AND (
+                          event.payload #>> '{{generated,name}}' = ANY(%s)
+                          OR NOT EXISTS (
+                            SELECT 1
+                            FROM {}._definitions AS definition
+                            WHERE definition.name =
+                                  event.payload #>> '{{generated,name}}'
+                          )
+                        )
+                    """).format(sql.Identifier(SCHEMA))
+                else:
+                    filter_sql = sql.SQL("""
+                        AND event.payload #>> '{{generated,name}}' = ANY(%s)
+                    """)
+                values.append(profile_names)
+            limit_sql = sql.SQL("")
+            if fetch_limit is not None:
+                limit_sql = sql.SQL("LIMIT %s")
+                values.append(fetch_limit)
+            distinct_sql = (
+                sql.SQL(
+                    "DISTINCT ON (event.payload #>> "
+                    "'{{generated,name}}')"
+                )
+                if one_per_profile
+                else sql.SQL("")
+            )
+            order_sql = (
+                sql.SQL(
+                    "event.payload #>> '{{generated,name}}', "
+                    "event.created_at, event.event_id"
+                )
+                if one_per_profile
+                else sql.SQL("event.created_at, event.event_id")
+            )
             cur.execute(sql.SQL("""
-                SELECT event_id::text AS "eventId",
+                SELECT {}
+                       event_id::text AS "eventId",
                        asset_id::text AS "assetId",
                        event_type AS "type",
                        generation,
@@ -2134,10 +2258,18 @@ class DerivedLayerStore:
                        attempts,
                        payload #>> '{{generated,name}}' AS name,
                        last_error AS "lastError"
-                FROM {}._semantic_outbox
-                WHERE status <> 'delivered'
-                ORDER BY created_at, event_id
-            """).format(sql.Identifier(SCHEMA)))
+                FROM {}._semantic_outbox AS event
+                WHERE event.status <> 'delivered'
+                {}
+                ORDER BY {}
+                {}
+            """).format(
+                distinct_sql,
+                sql.Identifier(SCHEMA),
+                filter_sql,
+                order_sql,
+                limit_sql,
+            ), tuple(values))
             return list(cur.fetchall())
 
     @staticmethod

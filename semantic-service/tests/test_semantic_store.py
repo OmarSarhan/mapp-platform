@@ -95,7 +95,7 @@ class SemanticStoreTest(unittest.TestCase):
 
     def test_database_is_migrated_and_restrictive(self) -> None:
         settings = self.store.database_settings()
-        self.assertEqual(settings["schemaVersion"], 3)
+        self.assertEqual(settings["schemaVersion"], 4)
         self.assertEqual(settings["journalMode"].lower(), "wal")
         self.assertEqual(settings["foreignKeys"], 1)
         self.assertEqual(settings["synchronous"], 2)  # FULL
@@ -162,7 +162,7 @@ class SemanticStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SemanticStore(legacy_path)
-        self.assertEqual(upgraded.database_settings()["schemaVersion"], 3)
+        self.assertEqual(upgraded.database_settings()["schemaVersion"], 4)
         proposal = upgraded.get_proposal(
             "proposal:legacy",
             is_admin=False,
@@ -180,7 +180,7 @@ class SemanticStoreTest(unittest.TestCase):
         )
 
         reopened = SemanticStore(legacy_path)
-        self.assertEqual(reopened.database_settings()["schemaVersion"], 3)
+        self.assertEqual(reopened.database_settings()["schemaVersion"], 4)
 
     def test_generated_event_lifecycle_is_idempotent(self) -> None:
         first = self.register()
@@ -1120,6 +1120,131 @@ class SemanticStoreTest(unittest.TestCase):
         self.assertEqual(
             self.store.get_derived_profile("roads", is_admin=False)["id"],
             asset["id"],
+        )
+
+    def test_growing_collections_use_bounded_keyset_fetches(self) -> None:
+        assets = []
+        for index, asset_id in enumerate(("asset:a", "asset:b", "asset:c")):
+            assets.append(self.register(
+                event_id=f"event-page-{index}",
+                asset_id=asset_id,
+                generated={
+                    "kind": "managed-derived",
+                    "name": f"roads_{index}",
+                    "description": "Straße" if index == 1 else "Roads",
+                    "binding": {
+                        "schema": "derived_layers",
+                        "relation": f"roads_{index}",
+                    },
+                },
+            )["asset"])
+        self.register(
+            event_id="event-page-hidden",
+            asset_id="asset:aa-hidden",
+            visibility="admin",
+        )
+
+        first_assets = self.store.list_assets(
+            is_admin=False,
+            fetch_limit=2,
+        )
+        second_assets = self.store.list_assets(
+            is_admin=False,
+            after_asset_id=first_assets[-1]["id"],
+            fetch_limit=2,
+        )
+        self.assertEqual(
+            [item["id"] for item in first_assets + second_assets],
+            ["asset:a", "asset:b", "asset:c"],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.store.search_assets(
+                "STRASSE",
+                limit=None,
+                is_admin=False,
+                fetch_limit=2,
+            )],
+            ["asset:b"],
+        )
+
+        first_profiles = self.store.derived_profiles(
+            is_admin=False,
+            fetch_limit=2,
+        )
+        second_profiles = self.store.derived_profiles(
+            is_admin=False,
+            after_asset_id=first_profiles[-1]["id"],
+            fetch_limit=2,
+        )
+        self.assertEqual(
+            [item["id"] for item in first_profiles + second_profiles],
+            ["asset:a", "asset:b", "asset:c"],
+        )
+
+        current = assets[0]
+        for generation in (2, 3):
+            current = self.store.apply_event({
+                "eventId": f"event-history-{generation}",
+                "assetId": current["id"],
+                "type": "refresh",
+                "generation": generation,
+                "generated": current["generated"],
+            })["asset"]
+        first_history = self.store.asset_history(
+            current["id"],
+            is_admin=False,
+            fetch_limit=2,
+        )
+        second_history = self.store.asset_history(
+            current["id"],
+            is_admin=False,
+            after_history_id=first_history[-1]["_historyId"],
+            fetch_limit=2,
+        )
+        self.assertEqual(len(first_history + second_history), 3)
+        self.assertNotIn(
+            "_historyId",
+            self.store.asset_history(current["id"], is_admin=False)[0],
+        )
+
+        request = {
+            "assetId": current["id"],
+            "baseVersion": current["version"],
+            "operations": [{
+                "op": "set",
+                "path": "/curated/description",
+                "value": "Keyset proposal",
+            }],
+        }
+        checked = self.store.check_proposal(request, is_admin=False)
+        for index in range(3):
+            self.store.create_proposal(
+                {**request, "fingerprint": checked["fingerprint"]},
+                actor=f"author-{index}",
+                is_admin=False,
+            )
+        all_proposals = self.store.list_proposals(
+            state=None,
+            asset_id=current["id"],
+            is_admin=False,
+        )
+        first_proposals = self.store.list_proposals(
+            state=None,
+            asset_id=current["id"],
+            is_admin=False,
+            fetch_limit=2,
+        )
+        boundary = first_proposals[-1]
+        second_proposals = self.store.list_proposals(
+            state=None,
+            asset_id=current["id"],
+            is_admin=False,
+            after=(boundary["createdAt"], boundary["id"]),
+            fetch_limit=2,
+        )
+        self.assertEqual(
+            [item["id"] for item in first_proposals + second_proposals],
+            [item["id"] for item in all_proposals],
         )
 
 

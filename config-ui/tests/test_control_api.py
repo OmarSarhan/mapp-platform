@@ -1,27 +1,35 @@
+import json
 import tempfile
 import threading
 import unittest
+from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psycopg
 from control_api import (
+    CollectionPaginationError,
     RULES,
     VisualPlanningDatabaseError,
     apply_operations,
     apply_visual_override,
     capabilities,
     contract,
+    decode_position_cursor,
     deep_merge,
     effective_locales,
+    enforce_collection_payload,
     examples,
     is_probeable_database_layer,
+    legacy_collection,
     paginate_collection,
+    paginate_keyset_page,
     pagination_parameters,
     pointer_get,
     plugin_manifest,
     proposal_create,
     proposal_check,
+    proposal_list,
     reload_status,
     reload_timeout,
     request_reload,
@@ -368,6 +376,135 @@ class ControlApiTests(unittest.TestCase):
         ):
             with self.subTest(query=query), self.assertRaises(ValueError):
                 pagination_parameters(query)
+
+    def test_keyset_cursor_is_integrity_and_scope_bound(self):
+        key = b"k" * 32
+        first, pagination = paginate_keyset_page(
+            [{"id": "a"}, {"id": "b"}],
+            limit=1,
+            scope="catalog:revision-7:inspect",
+            key=key,
+            position=lambda item: item["id"],
+        )
+        self.assertEqual(first, [{"id": "a"}])
+        cursor = pagination["nextCursor"]
+        self.assertRegex(cursor, r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+        self.assertEqual(
+            decode_position_cursor(
+                cursor,
+                "catalog:revision-7:inspect",
+                key,
+            ),
+            "a",
+        )
+        with self.assertRaisesRegex(ValueError, "invalid or expired"):
+            decode_position_cursor(
+                cursor,
+                "catalog:revision-8:inspect",
+                key,
+            )
+        pagination_parameters({"cursor": [cursor]})
+
+    def test_collection_pages_apply_count_and_byte_bounds(self):
+        with self.assertRaises(CollectionPaginationError) as required:
+            legacy_collection([{"id": index} for index in range(101)])
+        self.assertEqual("pagination.required", required.exception.code)
+        self.assertEqual(HTTPStatus.CONFLICT, required.exception.status)
+
+        items = [
+            {"id": "a", "explanation": "x" * 200},
+            {"id": "b", "explanation": "y" * 200},
+        ]
+        first_size = len(json.dumps(
+            items[0],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"))
+        with patch(
+            "control_api.COLLECTION_PAGE_MAX_ITEMS_BYTES",
+            first_size + 2,
+        ):
+            page, pagination = paginate_keyset_page(
+                items,
+                limit=2,
+                scope="workspace-proposals-v1",
+                key=b"k" * 32,
+                position=lambda item: item["id"],
+            )
+            with self.assertRaises(CollectionPaginationError) as legacy:
+                legacy_collection(items)
+        self.assertEqual([items[0]], page)
+        self.assertIsNotNone(pagination["nextCursor"])
+        self.assertEqual("pagination.required", legacy.exception.code)
+
+        with patch(
+            "control_api.COLLECTION_PAGE_MAX_ITEMS_BYTES",
+            first_size + 1,
+        ), self.assertRaises(CollectionPaginationError) as oversized:
+            paginate_keyset_page(
+                items,
+                limit=1,
+                scope="workspace-proposals-v1",
+                key=b"k" * 32,
+                position=lambda item: item["id"],
+            )
+        self.assertEqual(
+            "pagination.page_too_large",
+            oversized.exception.code,
+        )
+
+        combined = {"primary": items[:1], "diagnostics": items[1:]}
+        complete_payload_size = len(json.dumps(
+            combined,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"))
+        with patch(
+            "control_api.COLLECTION_PAGE_MAX_RESPONSE_BYTES",
+            complete_payload_size,
+        ):
+            enforce_collection_payload(combined, paginated=True)
+        with patch(
+            "control_api.COLLECTION_PAGE_MAX_RESPONSE_BYTES",
+            complete_payload_size - 1,
+        ), self.assertRaises(CollectionPaginationError) as complete_payload:
+            enforce_collection_payload(combined, paginated=True)
+        self.assertEqual(
+            "pagination.page_too_large",
+            complete_payload.exception.code,
+        )
+
+    def test_workspace_proposal_page_parses_only_limit_plus_one_bodies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proposals = Path(directory)
+            for name in ("103-c", "102-b", "101-a", "100-z"):
+                path = proposals / name
+                path.mkdir()
+                (path / "proposal.json").write_text("{}")
+            store = MagicMock()
+            store.proposals = proposals
+
+            def summary(path):
+                return {"id": path.parent.name}
+
+            with patch(
+                "control_api._proposal_summary",
+                side_effect=summary,
+            ) as read_summary:
+                first = proposal_list(store, fetch_limit=2)
+                second = proposal_list(
+                    store,
+                    after_id=first[-1]["id"],
+                    fetch_limit=2,
+                )
+
+            self.assertEqual(first, [{"id": "103-c"}, {"id": "102-b"}])
+            self.assertEqual(second, [{"id": "101-a"}, {"id": "100-z"}])
+            self.assertEqual(read_summary.call_count, 4)
 
     def test_contract_advertises_scoped_device_authorization(self):
         authentication = contract("instance")["authentication"]

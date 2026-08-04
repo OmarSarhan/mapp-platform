@@ -1857,7 +1857,7 @@ class SemanticDerivedIntegrationTests(unittest.TestCase):
     @staticmethod
     def derived(status: str = "registering") -> Mock:
         derived = Mock()
-        derived.list.return_value = [{
+        item = {
             "name": "places",
             "kind": "view",
             "semanticProfile": {
@@ -1866,7 +1866,10 @@ class SemanticDerivedIntegrationTests(unittest.TestCase):
                 "status": status,
                 "revision": "8" if status == "ready" else None,
             },
-        }]
+        }
+        derived.list.return_value = [item]
+        derived.list_page.return_value = [item]
+        derived.get.return_value = item
         return derived
 
     def test_new_nonready_binding_is_blocked_but_existing_binding_warns(self):
@@ -2490,6 +2493,258 @@ class SemanticGatewayRouteTests(unittest.TestCase):
         self.assertNotIn("deliveryBlockers", responses[0][1])
         derived.semantic_outbox_blockers.assert_not_called()
 
+    def test_legacy_derived_profiles_require_pagination_above_100(self):
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles"
+        )
+        handler._authentication = {"scopes": ["semantic:inspect"]}
+        derived = Mock()
+        derived.list_page.return_value = [
+            {
+                "name": f"profile_{index}",
+                "kind": "view",
+                "semanticProfile": {
+                    "assetId": f"asset-{index}",
+                    "generation": 1,
+                    "status": "ready",
+                    "revision": "15",
+                },
+            }
+            for index in range(101)
+        ]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "schedule_semantic_outbox"):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        self.assertEqual("pagination.required", responses[0][1]["code"])
+        derived.list_page.assert_called_once_with(
+            after_name=None,
+            fetch_limit=101,
+        )
+        derived.semantic_outbox_blockers.assert_not_called()
+
+    def test_derived_profile_cursor_is_storage_revision_and_visibility_bound(
+        self,
+    ):
+        first_item = {
+            "name": "places",
+            "kind": "view",
+            "semanticProfile": {
+                "assetId": "a22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 2,
+                "status": "ready",
+                "revision": "15",
+            },
+        }
+        second_item = {
+            "name": "roads",
+            "kind": "view",
+            "semanticProfile": {
+                "assetId": "b22c52cb-f1d2-4146-bb1b-8f6e3c59fa61",
+                "generation": 1,
+                "status": "ready",
+                "revision": "15",
+            },
+        }
+        derived = Mock()
+        derived.list_page.return_value = [first_item, second_item]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+        control = Mock()
+        control.instance_id.return_value = "instance-1"
+        control.pagination_key.return_value = b"p" * 32
+
+        first_handler, first_responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1"
+        )
+        first_handler._authentication = {"scopes": ["semantic:inspect"]}
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control), patch.object(
+            app, "schedule_semantic_outbox"
+        ):
+            first_handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, first_responses[0][0])
+        cursor = first_responses[0][1]["pagination"]["nextCursor"]
+        self.assertRegex(cursor, r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
+        derived.list_page.assert_called_once_with(
+            after_name=None,
+            fetch_limit=2,
+        )
+
+        derived.list_page.reset_mock()
+        derived.list_page.return_value = [second_item]
+        second_handler, second_responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1&cursor=" + cursor
+        )
+        second_handler._authentication = {"scopes": ["semantic:inspect"]}
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control), patch.object(
+            app, "schedule_semantic_outbox"
+        ):
+            second_handler.do_GET()
+        self.assertEqual(HTTPStatus.OK, second_responses[0][0])
+        self.assertEqual(
+            "roads",
+            second_responses[0][1]["derivedProfiles"][0]["name"],
+        )
+        derived.list_page.assert_called_once_with(
+            after_name="places",
+            fetch_limit=2,
+        )
+
+        semantic.request.return_value = {"catalogRevision": 16}
+        changed_handler, changed_responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1&cursor=" + cursor
+        )
+        changed_handler._authentication = {"scopes": ["semantic:inspect"]}
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control):
+            changed_handler.do_GET()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, changed_responses[0][0])
+        self.assertEqual("pagination.invalid", changed_responses[0][1]["code"])
+
+        semantic.request.return_value = {"catalogRevision": 15}
+        admin_handler, admin_responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1&cursor=" + cursor
+        )
+        admin_handler._authentication = {
+            "scopes": ["semantic:inspect", "semantic:admin"],
+        }
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control):
+            admin_handler.do_GET()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, admin_responses[0][0])
+        self.assertEqual("pagination.invalid", admin_responses[0][1]["code"])
+
+    def test_admin_derived_page_batches_unmatched_blockers_only_once(self):
+        first_item = {
+            "name": "places",
+            "kind": "view",
+            "semanticProfile": {
+                "assetId": "asset-places",
+                "generation": 2,
+                "status": "ready",
+                "revision": "15",
+            },
+        }
+        second_item = {
+            "name": "roads",
+            "kind": "view",
+            "semanticProfile": {
+                "assetId": "asset-roads",
+                "generation": 1,
+                "status": "ready",
+                "revision": "15",
+            },
+        }
+        matching = [{
+            "eventId": "event-places",
+            "assetId": "asset-places",
+            "type": "register",
+            "generation": 2,
+            "status": "repair_required",
+            "attempts": 3,
+            "name": "places",
+            "lastError": "delivery failed",
+        }]
+        unmatched = [
+            {
+                "eventId": f"event-dropped-{index}",
+                "assetId": f"asset-dropped-{index}",
+                "type": "archive",
+                "generation": 3,
+                "status": "repair_required",
+                "attempts": 8,
+                "name": f"dropped_{index}",
+                "lastError": "archive failed",
+            }
+            for index in range(101)
+        ]
+        derived = Mock()
+        derived.list_page.return_value = [first_item, second_item]
+        derived.semantic_outbox_blockers.side_effect = [matching, unmatched]
+        semantic = Mock()
+        semantic.request.return_value = {"catalogRevision": 15}
+        control = Mock()
+        control.instance_id.return_value = "instance-1"
+        control.pagination_key.return_value = b"p" * 32
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1"
+        )
+        handler._authentication = {
+            "scopes": ["semantic:inspect", "semantic:admin"],
+        }
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control), patch.object(
+            app, "schedule_semantic_outbox"
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        payload = responses[0][1]
+        self.assertEqual(100, len(payload["deliveryBlockers"]))
+        self.assertTrue(payload["deliveryBlockersMore"])
+        self.assertEqual(
+            "repair_required",
+            payload["derivedProfiles"][0]["delivery"]["status"],
+        )
+        cursor = payload["pagination"]["nextCursor"]
+        self.assertEqual(
+            [
+                {
+                    "profile_names": ["places"],
+                    "include_unmatched": False,
+                    "one_per_profile": True,
+                    "fetch_limit": 1,
+                },
+                {"unmatched_only": True, "fetch_limit": 101},
+            ],
+            [call.kwargs for call in derived.semantic_outbox_blockers.call_args_list],
+        )
+
+        derived.list_page.return_value = [second_item]
+        derived.semantic_outbox_blockers.reset_mock()
+        derived.semantic_outbox_blockers.side_effect = [[{
+            **matching[0],
+            "eventId": "event-roads",
+            "assetId": "asset-roads",
+            "name": "roads",
+        }]]
+        handler, responses = self.handler(
+            "/api/semantic/derived-profiles?limit=1&cursor=" + cursor
+        )
+        handler._authentication = {
+            "scopes": ["semantic:inspect", "semantic:admin"],
+        }
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(app, "CONTROL", control), patch.object(
+            app, "schedule_semantic_outbox"
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([], responses[0][1]["deliveryBlockers"])
+        self.assertFalse(responses[0][1]["deliveryBlockersMore"])
+        derived.semantic_outbox_blockers.assert_called_once_with(
+            profile_names=["roads"],
+            include_unmatched=False,
+            one_per_profile=True,
+            fetch_limit=1,
+        )
+
     def test_inspect_only_profile_read_redacts_delivery_diagnostics(self):
         handler, responses = self.handler(
             "/api/semantic/derived-profiles/places"
@@ -2672,6 +2927,36 @@ class SemanticGatewayRouteTests(unittest.TestCase):
                 {
                     "error": "cursor is invalid or expired.",
                     "code": "pagination.invalid",
+                },
+            ),
+            (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {
+                    "error": {
+                        "code": "page_too_large",
+                        "message": "One collection item is too large.",
+                        "details": {"maxPageBytes": 16 * 1024 * 1024},
+                    }
+                },
+                {
+                    "error": "One collection item is too large.",
+                    "code": "semantic.page_too_large",
+                    "details": {"maxPageBytes": 16 * 1024 * 1024},
+                },
+            ),
+            (
+                HTTPStatus.CONFLICT,
+                {
+                    "error": {
+                        "code": "pagination_required",
+                        "message": "Retry this collection with limit.",
+                        "details": {"maxLegacyItems": 100},
+                    }
+                },
+                {
+                    "error": "Retry this collection with limit.",
+                    "code": "pagination.required",
+                    "details": {"maxLegacyItems": 100},
                 },
             ),
         )
@@ -2943,7 +3228,14 @@ class CollectionPaginationRouteTests(unittest.TestCase):
             {"id": "proposal-2", "status": "applied"},
         ]
         handler, responses = self.handler("/api/proposals?limit=1")
-        with patch.object(app, "proposal_list", return_value=proposals):
+        control = Mock()
+        control.instance_id.return_value = "instance-1"
+        control.pagination_key.return_value = b"p" * 32
+        with patch.object(
+            app,
+            "proposal_list",
+            return_value=proposals,
+        ) as proposal_page, patch.object(app, "CONTROL", control):
             handler.do_GET()
 
         self.assertEqual(HTTPStatus.OK, responses[0][0])
@@ -2951,7 +3243,12 @@ class CollectionPaginationRouteTests(unittest.TestCase):
         self.assertEqual(1, responses[0][1]["pagination"]["limit"])
         self.assertRegex(
             responses[0][1]["pagination"]["nextCursor"],
-            r"^[0-9a-f]{64}$",
+            r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$",
+        )
+        proposal_page.assert_called_once_with(
+            control,
+            after_id=None,
+            fetch_limit=2,
         )
 
     def test_workspace_proposal_list_rejects_invalid_cursor(self):
@@ -2963,6 +3260,21 @@ class CollectionPaginationRouteTests(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
         self.assertEqual("pagination.invalid", responses[0][1]["code"])
+
+    def test_legacy_workspace_proposals_require_pagination_above_100(self):
+        proposals = [{"id": f"proposal-{index}"} for index in range(101)]
+        handler, responses = self.handler("/api/proposals")
+        control = Mock()
+        with patch.object(
+            app,
+            "proposal_list",
+            return_value=proposals,
+        ) as proposal_page, patch.object(app, "CONTROL", control):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+        self.assertEqual("pagination.required", responses[0][1]["code"])
+        proposal_page.assert_called_once_with(control, fetch_limit=101)
 
 
 class ProposalCreationRouteTests(unittest.TestCase):
@@ -4371,6 +4683,22 @@ class AuthorizationScopeTests(unittest.TestCase):
         self.assertIsNone(
             semantic._authorized(required_scope="semantic:propose")
         )
+
+    def test_capabilities_route_returns_runtime_pagination_contract(self):
+        handler = self.handler(["semantic:inspect"])
+        handler.path = "/api/capabilities"
+        handler._host_allowed = lambda: True
+        control = Mock()
+        control.instance_id.return_value = "instance-1"
+
+        with patch.object(app, "CONTROL", control):
+            handler.do_GET()
+
+        status, payload = handler._json.call_args.args
+        self.assertEqual(HTTPStatus.OK, status)
+        expected = dict(app.contract("instance-1")["pagination"])
+        expected.pop("compatibilityArtifact")
+        self.assertEqual(expected, payload["pagination"])
 
     def test_semantic_routes_use_narrow_scopes(self):
         cases = {

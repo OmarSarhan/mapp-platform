@@ -2102,6 +2102,73 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertIn("status <> 'delivered'", statement)
         self.assertIn("payload #>>", statement)
 
+    def test_derived_profile_page_pushes_keyset_and_limit_to_postgresql(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        self.assertEqual(
+            [],
+            store.list_page(after_name="places", fetch_limit=3),
+        )
+        statement, values = cursor.execute.call_args.args
+        self.assertIn("WHERE name > %s", str(statement))
+        self.assertIn("ORDER BY name", str(statement))
+        self.assertIn("LIMIT %s", str(statement))
+        self.assertEqual(("places", 3), values)
+
+    def test_profile_blockers_query_only_page_names_and_tombstones(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        self.assertEqual(
+            [],
+            store.semantic_outbox_blockers(profile_names=["places"]),
+        )
+        statement, values = cursor.execute.call_args.args
+        self.assertIn("= ANY(%s)", str(statement))
+        self.assertIn("NOT EXISTS", str(statement))
+        self.assertEqual((["places"],), values)
+
+    def test_profile_and_unmatched_blocker_queries_are_independently_bounded(
+        self,
+    ):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        self.assertEqual(
+            [],
+            store.semantic_outbox_blockers(
+                profile_names=["places", "roads"],
+                include_unmatched=False,
+                one_per_profile=True,
+                fetch_limit=2,
+            ),
+        )
+        statement, values = cursor.execute.call_args.args
+        rendered = str(statement)
+        self.assertIn("DISTINCT ON", rendered)
+        self.assertIn("= ANY(%s)", rendered)
+        self.assertNotIn("NOT EXISTS", rendered)
+        self.assertIn("LIMIT %s", rendered)
+        self.assertEqual((["places", "roads"], 2), values)
+
+        self.assertEqual(
+            [],
+            store.semantic_outbox_blockers(
+                unmatched_only=True,
+                fetch_limit=101,
+            ),
+        )
+        statement, values = cursor.execute.call_args.args
+        rendered = str(statement)
+        self.assertNotIn("DISTINCT ON", rendered)
+        self.assertIn("NOT EXISTS", rendered)
+        self.assertIn("LIMIT %s", rendered)
+        self.assertEqual((101,), values)
+
     def test_interrupted_reset_rebinds_to_a_new_semantic_asset(self):
         old_asset = "b630c2db-6f96-49f8-a190-edabc1fc65c8"
         reset_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"

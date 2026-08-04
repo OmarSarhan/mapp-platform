@@ -5,6 +5,19 @@ const emptyContextOptions = () => ({
   sampleRows: false,
   statistics: false,
 });
+const PAGE_LIMIT = 100;
+
+const pagePath = (path, cursor = null) => (
+  `${path}?limit=${PAGE_LIMIT}${cursor
+    ? `&cursor=${encodeURIComponent(cursor)}`
+    : ''}`
+);
+
+const nextCursor = result => (
+  typeof result?.pagination?.nextCursor === 'string'
+    ? result.pagination.nextCursor
+    : null
+);
 
 function generationMatchesContext(generation, contextOptions) {
   const returnedOptions = generation?.contextOptions;
@@ -116,11 +129,16 @@ function hasArchivePermission(identity) {
 export function SemanticCatalog({api, close, identity}) {
   const [service, setService] = useState(null);
   const [assets, setAssets] = useState([]);
+  const [catalogCursor, setCatalogCursor] = useState(null);
   const [sourceRelations, setSourceRelations] = useState([]);
+  const [sourceCursor, setSourceCursor] = useState(null);
   const [sourceId, setSourceId] = useState('');
   const [derivedProfiles, setDerivedProfiles] = useState([]);
+  const [derivedCursor, setDerivedCursor] = useState(null);
   const [deliveryBlockers, setDeliveryBlockers] = useState([]);
+  const [deliveryBlockersMore, setDeliveryBlockersMore] = useState(false);
   const [proposals, setProposals] = useState([]);
+  const [proposalCursor, setProposalCursor] = useState(null);
   const [selectedId, setSelectedId] = useState('');
   const [curatedText, setCuratedText] = useState('{}');
   const [explanation, setExplanation] = useState('');
@@ -128,6 +146,7 @@ export function SemanticCatalog({api, close, identity}) {
   const [review, setReview] = useState(null);
   const [proposalReview, setProposalReview] = useState(null);
   const [history, setHistory] = useState(null);
+  const [historyCursor, setHistoryCursor] = useState(null);
   const [busy, setBusy] = useState(false);
   const [generating, setGenerating] = useState('');
   const [generationProgress, setGenerationProgress] = useState(null);
@@ -178,28 +197,34 @@ export function SemanticCatalog({api, close, identity}) {
       proposalResult,
     ] = await Promise.all([
       api('/api/semantic/status'),
-      api('/api/semantic/catalog'),
+      api(pagePath('/api/semantic/catalog')),
       sourcePermitted
-        ? api('/api/semantic/source/relations')
+        ? api(pagePath('/api/semantic/source/relations'))
         : Promise.resolve({relations: []}),
-      api('/api/semantic/derived-profiles'),
-      api('/api/semantic/proposals'),
+      api(pagePath('/api/semantic/derived-profiles')),
+      api(pagePath('/api/semantic/proposals')),
     ]);
     const nextAssets = catalogResult.assets || [];
     const nextSources = sourceResult.relations || [];
     setService(statusResult);
     setAssets(nextAssets);
+    setCatalogCursor(nextCursor(catalogResult));
     setSourceRelations(nextSources);
+    setSourceCursor(nextCursor(sourceResult));
     setSourceId(current => (
       nextSources.some(source => source.assetId === current)
         ? current
         : nextSources[0]?.assetId || ''
     ));
     setDerivedProfiles(derivedResult.derivedProfiles || []);
+    setDerivedCursor(nextCursor(derivedResult));
     setDeliveryBlockers(derivedResult.deliveryBlockers || []);
+    setDeliveryBlockersMore(derivedResult.deliveryBlockersMore === true);
     setProposals(proposalResult.proposals || []);
+    setProposalCursor(nextCursor(proposalResult));
     setProposalReview(null);
     setHistory(null);
+    setHistoryCursor(null);
     setGeneratedDraft(null);
     setCreatedProposal(null);
     const nextId = nextAssets.some(asset => asset.id === preferredId)
@@ -231,6 +256,7 @@ export function SemanticCatalog({api, close, identity}) {
     setReview(null);
     setProposalReview(null);
     setHistory(null);
+    setHistoryCursor(null);
     setGeneratedDraft(null);
     setCreatedProposal(null);
     setGenerationFieldIds([]);
@@ -444,12 +470,42 @@ export function SemanticCatalog({api, close, identity}) {
     setError('');
     try {
       const result = await api(
-        `/api/semantic/catalog/objects/${encodeURIComponent(selected.id)}/history`,
+        pagePath(
+          `/api/semantic/catalog/objects/${encodeURIComponent(selected.id)}/history`,
+        ),
       );
       if (!Array.isArray(result.history)) {
         throw new Error('Semantic asset history is unavailable.');
       }
       setHistory(result.history);
+      setHistoryCursor(nextCursor(result));
+    } catch (reason) {
+      setError(reason.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const loadMore = async ({
+    path,
+    cursor,
+    field,
+    setItems,
+    setCursor,
+    afterLoad,
+  }) => {
+    if (!cursor) return;
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api(pagePath(path, cursor));
+      const items = result?.[field];
+      if (!Array.isArray(items)) {
+        throw new Error(`Semantic ${field} page is unavailable.`);
+      }
+      setItems(current => [...current, ...items]);
+      setCursor(nextCursor(result));
+      if (afterLoad) afterLoad(result);
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -708,6 +764,16 @@ export function SemanticCatalog({api, close, identity}) {
           {!busy && sourceRelations.length === 0 && <p className="muted">
             No allowlisted selectable PostgreSQL relations were found.
           </p>}
+          {sourceCursor && <button
+            disabled={busy || generationRunning}
+            onClick={() => loadMore({
+              path: '/api/semantic/source/relations',
+              cursor: sourceCursor,
+              field: 'relations',
+              setItems: setSourceRelations,
+              setCursor: setSourceCursor,
+            })}
+          >Load more source relations</button>}
         </>}
       </section>}
       <div className="semantic-layout" aria-busy={busy || !!generating}>
@@ -734,6 +800,16 @@ export function SemanticCatalog({api, close, identity}) {
             </button>)}
             {!busy && visibleAssets.length === 0 && <p className="muted">No semantic assets found.</p>}
           </div>
+          {catalogCursor && <button
+            disabled={busy || generationRunning}
+            onClick={() => loadMore({
+              path: '/api/semantic/catalog',
+              cursor: catalogCursor,
+              field: 'assets',
+              setItems: setAssets,
+              setCursor: setCatalogCursor,
+            })}
+          >Load more semantic assets</button>}
         </aside>
         <div className="semantic-editor">
           {!selected && <div className="panel empty">No semantic profiles have been registered yet.</div>}
@@ -796,7 +872,19 @@ export function SemanticCatalog({api, close, identity}) {
               <p className="muted">Source events and curated decisions retained by catalog revision.</p>
               {history === null
                 ? <button disabled={busy || generationRunning} onClick={loadHistory}>Load history</button>
-                : <pre>{formatJson(history)}</pre>}
+                : <>
+                  <pre>{formatJson(history)}</pre>
+                  {historyCursor && <button
+                    disabled={busy || generationRunning}
+                    onClick={() => loadMore({
+                      path: `/api/semantic/catalog/objects/${encodeURIComponent(selected.id)}/history`,
+                      cursor: historyCursor,
+                      field: 'history',
+                      setItems: setHistory,
+                      setCursor: setHistoryCursor,
+                    })}
+                  >Load more asset history</button>}
+                </>}
             </details>}
             {(advanced || wizardStep === 2) && <section className="semantic-generator" aria-labelledby="semantic-generator-title">
               <h3 id="semantic-generator-title">Generate with Gemini</h3>
@@ -1030,10 +1118,29 @@ export function SemanticCatalog({api, close, identity}) {
             onClick={() => repair(blocker)}
           >Retry delivery</button>}
         </div>)}
+        {deliveryBlockersMore && <p className="muted" role="status">
+          More dropped-relation delivery blockers are waiting. Repair the
+          displayed blockers, then refresh the semantic catalog to retrieve
+          the next batch.
+        </p>}
         {!busy
           && derivedProfiles.length === 0
           && deliveryBlockers.length === 0
           && <p className="muted">No managed derived profiles.</p>}
+        {derivedCursor && <button
+          disabled={busy || generationRunning}
+          onClick={() => loadMore({
+            path: '/api/semantic/derived-profiles',
+            cursor: derivedCursor,
+            field: 'derivedProfiles',
+            setItems: setDerivedProfiles,
+            setCursor: setDerivedCursor,
+            afterLoad: result => setDeliveryBlockers(current => [
+              ...current,
+              ...(result.deliveryBlockers || []),
+            ]),
+          })}
+        >Load more derived profiles</button>}
       </div>
       <h3>Semantic proposals</h3>
       <div className="semantic-proposals">
@@ -1061,6 +1168,16 @@ export function SemanticCatalog({api, close, identity}) {
           </details>}
         </React.Fragment>)}
         {!busy && proposals.length === 0 && <p className="muted">No semantic proposals.</p>}
+        {proposalCursor && <button
+          disabled={busy || generationRunning}
+          onClick={() => loadMore({
+            path: '/api/semantic/proposals',
+            cursor: proposalCursor,
+            field: 'proposals',
+            setItems: setProposals,
+            setCursor: setProposalCursor,
+          })}
+        >Load more semantic proposals</button>}
       </div>
       {proposalReview && <div className="semantic-review">
         <h3>Stored proposal evidence</h3>

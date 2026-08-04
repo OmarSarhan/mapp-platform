@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import quote
@@ -129,8 +130,8 @@ class SemanticServerTest(unittest.TestCase):
 
         status, body = self.request("GET", "/v1/status")
         self.assertEqual(status, 200)
-        self.assertEqual(body["schemaVersion"], 3)
-        self.assertEqual(body["serviceVersion"], "1.0.0")
+        self.assertEqual(body["schemaVersion"], 4)
+        self.assertEqual(body["serviceVersion"], "1.1.0")
         self.assertEqual(
             body["capabilities"]["pagination"],
             {
@@ -138,6 +139,10 @@ class SemanticServerTest(unittest.TestCase):
                 "defaultLimit": 100,
                 "maxLimit": 100,
                 "cursor": "opaque",
+                "maxResponseBytes": 16 * 1024 * 1024,
+                "oversizedItemError": "page_too_large",
+                "legacyMaxItems": 100,
+                "legacyOverflowError": "pagination_required",
             },
         )
 
@@ -282,7 +287,7 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(first["assets"]), 1)
         cursor = first["pagination"]["nextCursor"]
-        self.assertRegex(cursor, r"^[0-9a-f]{64}$")
+        self.assertRegex(cursor, r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$")
 
         status, second = self.request(
             "GET", f"/v1/catalog?limit=1&cursor={cursor}"
@@ -296,7 +301,7 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(len(search["results"]), 1)
         self.assertRegex(
             search["pagination"]["nextCursor"],
-            r"^[0-9a-f]{64}$",
+            r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$",
         )
 
         status, profiles = self.request(
@@ -306,7 +311,7 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(len(profiles["derivedProfiles"]), 1)
         self.assertRegex(
             profiles["pagination"]["nextCursor"],
-            r"^[0-9a-f]{64}$",
+            r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$",
         )
 
         asset = assets[0]
@@ -332,7 +337,7 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(len(history["history"]), 1)
         self.assertRegex(
             history["pagination"]["nextCursor"],
-            r"^[0-9a-f]{64}$",
+            r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$",
         )
 
         check_request = {
@@ -369,7 +374,7 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(len(proposals["proposals"]), 1)
         self.assertRegex(
             proposals["pagination"]["nextCursor"],
-            r"^[0-9a-f]{64}$",
+            r"^[A-Za-z0-9_-]+\.[0-9a-f]{64}$",
         )
 
         status, invalid = self.request(
@@ -382,6 +387,174 @@ class SemanticServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(legacy["assets"]), 3)
         self.assertNotIn("pagination", legacy)
+
+    def test_parameterless_collections_fetch_only_overflow_sentinel(self) -> None:
+        cases = (
+            ("list_assets", "/v1/catalog"),
+            ("search_assets", "/v1/search?q=roads"),
+            ("derived_profiles", "/v1/derived-profiles"),
+            ("list_proposals", "/v1/proposals"),
+            ("asset_history", "/v1/assets/asset%3Aroads/history"),
+        )
+        rows = [{"id": f"item-{index}"} for index in range(101)]
+        for method_name, path in cases:
+            with self.subTest(path=path), patch.object(
+                self.store,
+                method_name,
+                return_value=rows,
+            ) as read_collection:
+                status, body = self.request("GET", path)
+
+            self.assertEqual(HTTPStatus.CONFLICT, status)
+            self.assertEqual("pagination_required", body["error"]["code"])
+            self.assertEqual(101, read_collection.call_args.kwargs["fetch_limit"])
+
+    def test_parameterless_search_retains_legacy_twenty_result_shape(self) -> None:
+        rows = [{"id": f"item-{index:03d}"} for index in range(100)]
+        with patch.object(
+            self.store,
+            "search_assets",
+            return_value=rows,
+        ) as search_assets:
+            status, body = self.request("GET", "/v1/search?q=roads")
+
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(rows[:20], body["results"])
+        self.assertNotIn("pagination", body)
+        self.assertIsNone(search_assets.call_args.kwargs["limit"])
+        self.assertEqual(101, search_assets.call_args.kwargs["fetch_limit"])
+
+    def test_catalog_page_pushes_keyset_and_limit_into_storage(self) -> None:
+        for index in range(3):
+            status, _created = self.request(
+                "POST",
+                "/v1/events",
+                self.event(
+                    event_id=f"event-storage-{index}",
+                    asset_id=f"asset:storage/{index}",
+                ),
+                scopes="semantic:admin",
+            )
+            self.assertEqual(status, 200)
+
+        with patch.object(
+            self.store,
+            "list_assets",
+            wraps=self.store.list_assets,
+        ) as list_assets:
+            status, first = self.request("GET", "/v1/catalog?limit=1")
+            self.assertEqual(status, 200)
+            status, second = self.request(
+                "GET",
+                "/v1/catalog?limit=1&cursor="
+                + first["pagination"]["nextCursor"],
+            )
+            self.assertEqual(status, 200)
+
+        self.assertEqual(list_assets.call_count, 2)
+        self.assertEqual(list_assets.call_args_list[0].kwargs["fetch_limit"], 2)
+        self.assertIsNone(
+            list_assets.call_args_list[0].kwargs["after_asset_id"]
+        )
+        self.assertEqual(list_assets.call_args_list[1].kwargs["fetch_limit"], 2)
+        self.assertEqual(
+            list_assets.call_args_list[1].kwargs["after_asset_id"],
+            first["assets"][0]["id"],
+        )
+        self.assertNotEqual(first["assets"], second["assets"])
+
+    def test_page_byte_budget_shortens_pages_and_rejects_one_large_item(
+        self,
+    ) -> None:
+        for index in range(2):
+            status, _created = self.request(
+                "POST",
+                "/v1/events",
+                self.event(
+                    event_id=f"event-budget-{index}",
+                    asset_id=f"asset:budget/{index}",
+                ),
+                scopes="semantic:admin",
+            )
+            self.assertEqual(status, 200)
+        first_asset = self.store.list_assets(is_admin=False)[0]
+        item_bytes = len(json.dumps(
+            first_asset,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"))
+
+        with patch("server.MAX_PAGE_ITEMS_BYTES", item_bytes + 2):
+            status, bounded = self.request("GET", "/v1/catalog?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(bounded["assets"]), 1)
+        self.assertIsNotNone(bounded["pagination"]["nextCursor"])
+        self.assertEqual(bounded["pagination"]["limit"], 2)
+
+        with patch("server.MAX_PAGE_ITEMS_BYTES", item_bytes + 1):
+            status, oversized = self.request("GET", "/v1/catalog?limit=1")
+        self.assertEqual(status, 413)
+        self.assertEqual(oversized["error"]["code"], "page_too_large")
+
+        with patch("server.MAX_PAGE_ITEMS_BYTES", item_bytes + 2):
+            status, legacy_bounded = self.request("GET", "/v1/catalog")
+        self.assertEqual(status, HTTPStatus.CONFLICT)
+        self.assertEqual(
+            "pagination_required",
+            legacy_bounded["error"]["code"],
+        )
+
+        with patch("server.MAX_PAGE_ITEMS_BYTES", item_bytes + 1):
+            status, legacy_oversized = self.request("GET", "/v1/catalog")
+        self.assertEqual(status, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        self.assertEqual(
+            "page_too_large",
+            legacy_oversized["error"]["code"],
+        )
+
+    def test_cursor_is_invalidated_by_revision_or_visibility_scope(self) -> None:
+        for index in range(2):
+            status, _created = self.request(
+                "POST",
+                "/v1/events",
+                self.event(
+                    event_id=f"event-cursor-{index}",
+                    asset_id=f"asset:cursor/{index}",
+                ),
+                scopes="semantic:admin",
+            )
+            self.assertEqual(status, 200)
+        status, first = self.request("GET", "/v1/catalog?limit=1")
+        self.assertEqual(status, 200)
+        cursor = first["pagination"]["nextCursor"]
+
+        status, wrong_visibility = self.request(
+            "GET",
+            f"/v1/catalog?limit=1&cursor={cursor}",
+            scopes="semantic:inspect,semantic:admin",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            wrong_visibility["error"]["code"], "pagination_invalid"
+        )
+
+        status, _created = self.request(
+            "POST",
+            "/v1/events",
+            self.event(
+                event_id="event-cursor-revision",
+                asset_id="asset:cursor/revision",
+            ),
+            scopes="semantic:admin",
+        )
+        self.assertEqual(status, 200)
+        status, changed = self.request(
+            "GET", f"/v1/catalog?limit=1&cursor={cursor}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(changed["error"]["code"], "pagination_invalid")
 
     def test_encoded_slash_in_asset_id_is_decoded(self) -> None:
         event = self.event(asset_id="asset:derived/area/roads")
@@ -943,10 +1116,18 @@ class SemanticServerTest(unittest.TestCase):
         first = self.store.apply_event(self.event())["asset"]
         original = self.store.list_assets
 
-        def list_then_write(*, is_admin: bool, connection=None):
+        def list_then_write(
+            *,
+            is_admin: bool,
+            connection=None,
+            after_asset_id=None,
+            fetch_limit=None,
+        ):
             assets = original(
                 is_admin=is_admin,
                 connection=connection,
+                after_asset_id=after_asset_id,
+                fetch_limit=fetch_limit,
             )
             self.store.apply_event(
                 self.event(
@@ -979,15 +1160,19 @@ class SemanticServerTest(unittest.TestCase):
         def search_then_write(
             query: str,
             *,
-            limit: int,
+            limit: int | None,
             is_admin: bool,
             connection=None,
+            after_asset_id: str | None = None,
+            fetch_limit: int | None = None,
         ):
             results = original(
                 query,
                 limit=limit,
                 is_admin=is_admin,
                 connection=connection,
+                after_asset_id=after_asset_id,
+                fetch_limit=fetch_limit,
             )
             self.store.apply_event(
                 {
@@ -1070,11 +1255,15 @@ class SemanticServerTest(unittest.TestCase):
             *,
             is_admin: bool,
             connection=None,
+            after_history_id=None,
+            fetch_limit=None,
         ):
             history = original(
                 asset_id,
                 is_admin=is_admin,
                 connection=connection,
+                after_history_id=after_history_id,
+                fetch_limit=fetch_limit,
             )
             self.store.apply_event(
                 {
@@ -1133,12 +1322,16 @@ class SemanticServerTest(unittest.TestCase):
             asset_id: str | None,
             is_admin: bool,
             connection=None,
+            after=None,
+            fetch_limit=None,
         ):
             proposals = original(
                 state=state,
                 asset_id=asset_id,
                 is_admin=is_admin,
                 connection=connection,
+                after=after,
+                fetch_limit=fetch_limit,
             )
             self.store.apply_proposal(
                 proposal["id"],

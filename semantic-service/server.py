@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import hashlib
 import json
@@ -13,7 +14,7 @@ import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from semantic_store import SemanticError, SemanticStore, canonical_json
@@ -22,11 +23,17 @@ from semantic_store import SemanticError, SemanticStore, canonical_json
 DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 100
+LEGACY_SEARCH_LIMIT = 20
+LEGACY_COLLECTION_FETCH = MAX_PAGE_LIMIT + 1
+MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_PAGE_ITEMS_BYTES = 15 * 1024 * 1024
 SERVICE_VERSION = (
     Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
 )
 READ_SCOPES = {"semantic:inspect"}
-_PAGE_CURSOR_RE = re.compile(r"^[0-9a-f]{64}$")
+_PAGE_CURSOR_RE = re.compile(
+    r"^[A-Za-z0-9_-]{1,2048}\.[0-9a-f]{64}$"
+)
 
 
 def strict_json_loads(raw: bytes) -> Any:
@@ -267,40 +274,189 @@ class SemanticHandler(BaseHTTPRequestHandler):
         return limit, cursor, pagination_requested
 
     @staticmethod
-    def _page_cursor(scope: str, item: Any) -> str:
-        value = canonical_json(
-            {"scope": scope, "position": item}
-        ).encode("utf-8")
-        return hashlib.sha256(value).hexdigest()
+    def _pagination_scope(
+        collection: str,
+        revision: int,
+        is_admin: bool,
+        **filters: str,
+    ) -> str:
+        return canonical_json({
+            "collection": collection,
+            "revision": revision,
+            "visibility": "admin" if is_admin else "inspect",
+            "filters": filters,
+        })
 
-    @classmethod
-    def _paginate(
-        cls,
-        items: list[Any],
+    def _encode_cursor(self, scope: str, position: Any) -> str:
+        payload = canonical_json({
+            "version": 1,
+            "scope": hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+            "position": position,
+        }).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        signature = hmac.new(
+            self.server.internal_token.encode("utf-8"),
+            payload,
+            hashlib.sha256,
+        ).hexdigest()
+        return f"{encoded}.{signature}"
+
+    def _decode_cursor(self, cursor: str | None, scope: str) -> Any:
+        if cursor is None:
+            return None
+        try:
+            encoded, signature = cursor.rsplit(".", 1)
+            padding = "=" * (-len(encoded) % 4)
+            payload = base64.b64decode(
+                encoded + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+            expected = hmac.new(
+                self.server.internal_token.encode("utf-8"),
+                payload,
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                raise ValueError("signature")
+            value = strict_json_loads(payload)
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"version", "scope", "position"}
+                or value["version"] != 1
+                or not hmac.compare_digest(
+                    str(value["scope"]),
+                    hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+                )
+            ):
+                raise ValueError("scope")
+            return value["position"]
+        except (SemanticError, TypeError, UnicodeError, ValueError):
+            raise SemanticError(
+                "pagination_invalid",
+                "cursor is invalid or expired.",
+            ) from None
+
+    @staticmethod
+    def _string_position(value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value or len(value) > 200:
+            raise SemanticError(
+                "pagination_invalid", "cursor is invalid or expired."
+            )
+        return value
+
+    @staticmethod
+    def _history_position(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise SemanticError(
+                "pagination_invalid", "cursor is invalid or expired."
+            )
+        return value
+
+    @staticmethod
+    def _proposal_position(value: Any) -> tuple[str, str] | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or any(not isinstance(item, str) or not item for item in value)
+            or len(value[0]) > 200
+            or len(value[1]) > 200
+        ):
+            raise SemanticError(
+                "pagination_invalid", "cursor is invalid or expired."
+            )
+        return value[0], value[1]
+
+    def _bounded_page(
+        self,
+        fetched: list[Any],
         *,
         limit: int,
-        cursor: str | None,
         scope: str,
+        position_of: Callable[[Any], Any],
+        public_item: Callable[[Any], Any] | None = None,
     ) -> tuple[list[Any], dict[str, Any]]:
-        start = 0
-        if cursor is not None:
-            for index, item in enumerate(items):
-                if cls._page_cursor(scope, item) == cursor:
-                    start = index + 1
-                    break
-            else:
+        has_more = len(fetched) > limit
+        page_items: list[Any] = []
+        last_position: Any = None
+        used_bytes = 2
+        for stored_item in fetched[:limit]:
+            item = public_item(stored_item) if public_item else stored_item
+            item_bytes = len(canonical_json(item).encode("utf-8"))
+            separator_bytes = 1 if page_items else 0
+            if item_bytes + 2 > MAX_PAGE_ITEMS_BYTES:
                 raise SemanticError(
-                    "pagination_invalid",
-                    "cursor is invalid or expired.",
+                    "page_too_large",
+                    "One collection item exceeds the bounded page response limit.",
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    details={
+                        "maxPageBytes": MAX_PAGE_RESPONSE_BYTES,
+                        "maxItemsBytes": MAX_PAGE_ITEMS_BYTES,
+                    },
                 )
-        page_items = items[start : start + limit]
-        has_more = start + len(page_items) < len(items)
+            if used_bytes + separator_bytes + item_bytes > MAX_PAGE_ITEMS_BYTES:
+                has_more = True
+                break
+            page_items.append(item)
+            used_bytes += separator_bytes + item_bytes
+            last_position = position_of(stored_item)
         next_cursor = (
-            cls._page_cursor(scope, page_items[-1])
-            if has_more and page_items
+            self._encode_cursor(scope, last_position)
+            if has_more and last_position is not None
             else None
         )
         return page_items, {"limit": limit, "nextCursor": next_cursor}
+
+    def _legacy_collection(
+        self,
+        fetched: list[Any],
+        *,
+        public_item: Callable[[Any], Any] | None = None,
+    ) -> list[Any]:
+        if len(fetched) > MAX_PAGE_LIMIT:
+            raise SemanticError(
+                "pagination_required",
+                "This collection has more than 100 items; retry with limit "
+                "and follow pagination.nextCursor.",
+                status=HTTPStatus.CONFLICT,
+                details={"maxLegacyItems": MAX_PAGE_LIMIT},
+            )
+        items: list[Any] = []
+        used_bytes = 2
+        for stored_item in fetched:
+            item = public_item(stored_item) if public_item else stored_item
+            item_bytes = len(canonical_json(item).encode("utf-8"))
+            separator_bytes = 1 if items else 0
+            if item_bytes + 2 > MAX_PAGE_ITEMS_BYTES:
+                raise SemanticError(
+                    "page_too_large",
+                    "One collection item exceeds the bounded response limit.",
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    details={
+                        "maxPageBytes": MAX_PAGE_RESPONSE_BYTES,
+                        "maxItemsBytes": MAX_PAGE_ITEMS_BYTES,
+                    },
+                )
+            if used_bytes + separator_bytes + item_bytes > MAX_PAGE_ITEMS_BYTES:
+                raise SemanticError(
+                    "pagination_required",
+                    "This legacy response exceeds the collection byte limit; "
+                    "retry with limit and follow pagination.nextCursor.",
+                    status=HTTPStatus.CONFLICT,
+                    details={
+                        "maxLegacyItems": MAX_PAGE_LIMIT,
+                        "maxPageBytes": MAX_PAGE_RESPONSE_BYTES,
+                    },
+                )
+            items.append(item)
+            used_bytes += separator_bytes + item_bytes
+        return items
 
     def do_GET(self) -> None:
         try:
@@ -345,6 +501,10 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 "defaultLimit": DEFAULT_PAGE_LIMIT,
                 "maxLimit": MAX_PAGE_LIMIT,
                 "cursor": "opaque",
+                "maxResponseBytes": MAX_PAGE_RESPONSE_BYTES,
+                "oversizedItemError": "page_too_large",
+                "legacyMaxItems": MAX_PAGE_LIMIT,
+                "legacyOverflowError": "pagination_required",
             }
             self._send_json(HTTPStatus.OK, status)
             return
@@ -357,19 +517,33 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 connection,
                 revision,
             ):
+                scope = self._pagination_scope(
+                    "catalog-v1", revision, is_admin
+                )
+                after = (
+                    self._string_position(self._decode_cursor(cursor, scope))
+                    if paginated
+                    else None
+                )
                 assets = self.server.store.list_assets(
                     is_admin=is_admin,
                     connection=connection,
+                    after_asset_id=after,
+                    fetch_limit=(
+                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                    ),
                 )
             payload = {"catalogRevision": revision, "assets": assets}
             if paginated:
-                assets, pagination = self._paginate(
+                assets, pagination = self._bounded_page(
                     assets,
                     limit=limit,
-                    cursor=cursor,
-                    scope=f"catalog-v1:{revision}:{is_admin}",
+                    scope=scope,
+                    position_of=lambda item: item["id"],
                 )
                 payload.update({"assets": assets, "pagination": pagination})
+            else:
+                payload["assets"] = self._legacy_collection(assets)
             self._send_json(HTTPStatus.OK, payload)
             return
         if path == "/v1/search":
@@ -382,11 +556,26 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 connection,
                 revision,
             ):
+                scope = self._pagination_scope(
+                    "search-v1",
+                    revision,
+                    is_admin,
+                    q=search_query or "",
+                )
+                after = (
+                    self._string_position(self._decode_cursor(cursor, scope))
+                    if paginated
+                    else None
+                )
                 results = self.server.store.search_assets(
                     search_query or "",
-                    limit=None if paginated else 20,
+                    limit=None,
                     is_admin=is_admin,
                     connection=connection,
+                    after_asset_id=after,
+                    fetch_limit=(
+                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                    ),
                 )
             payload = {
                 "catalogRevision": revision,
@@ -394,16 +583,21 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 "results": results,
             }
             if paginated:
-                results, pagination = self._paginate(
+                results, pagination = self._bounded_page(
                     results,
                     limit=limit,
-                    cursor=cursor,
-                    scope=(
-                        f"search-v1:{revision}:{is_admin}:"
-                        f"{search_query or ''}"
-                    ),
+                    scope=scope,
+                    position_of=lambda item: item["id"],
                 )
                 payload.update({"results": results, "pagination": pagination})
+            else:
+                if len(results) > MAX_PAGE_LIMIT:
+                    # Detect growth past the platform-wide legacy threshold,
+                    # while retaining search's established 20-result shape.
+                    self._legacy_collection(results)
+                payload["results"] = self._legacy_collection(
+                    results[:LEGACY_SEARCH_LIMIT]
+                )
             self._send_json(HTTPStatus.OK, payload)
             return
         if path == "/v1/derived-profiles":
@@ -412,24 +606,38 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 connection,
                 revision,
             ):
+                scope = self._pagination_scope(
+                    "derived-profiles-v1", revision, is_admin
+                )
+                after = (
+                    self._string_position(self._decode_cursor(cursor, scope))
+                    if paginated
+                    else None
+                )
                 profiles = self.server.store.derived_profiles(
                     is_admin=is_admin,
                     connection=connection,
+                    after_asset_id=after,
+                    fetch_limit=(
+                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                    ),
                 )
             payload = {
                 "catalogRevision": revision,
                 "derivedProfiles": profiles,
             }
             if paginated:
-                profiles, pagination = self._paginate(
+                profiles, pagination = self._bounded_page(
                     profiles,
                     limit=limit,
-                    cursor=cursor,
-                    scope=f"derived-profiles-v1:{revision}:{is_admin}",
+                    scope=scope,
+                    position_of=lambda item: item["id"],
                 )
                 payload.update(
                     {"derivedProfiles": profiles, "pagination": pagination}
                 )
+            else:
+                payload["derivedProfiles"] = self._legacy_collection(profiles)
             self._send_json(HTTPStatus.OK, payload)
             return
         derived_prefix = "/v1/derived-profiles/"
@@ -464,27 +672,42 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 connection,
                 revision,
             ):
+                scope = self._pagination_scope(
+                    "proposals-v1",
+                    revision,
+                    is_admin,
+                    state=state or "",
+                    assetId=asset_id or "",
+                )
+                after = (
+                    self._proposal_position(self._decode_cursor(cursor, scope))
+                    if paginated
+                    else None
+                )
                 proposals = self.server.store.list_proposals(
                     state=state,
                     asset_id=asset_id,
                     is_admin=is_admin,
                     connection=connection,
+                    after=after,
+                    fetch_limit=(
+                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                    ),
                 )
             payload = {
                 "catalogRevision": revision,
                 "proposals": proposals,
             }
             if paginated:
-                proposals, pagination = self._paginate(
+                proposals, pagination = self._bounded_page(
                     proposals,
                     limit=limit,
-                    cursor=cursor,
-                    scope=(
-                        f"proposals-v1:{revision}:{is_admin}:"
-                        f"{state or ''}:{asset_id or ''}"
-                    ),
+                    scope=scope,
+                    position_of=lambda item: [item["createdAt"], item["id"]],
                 )
                 payload.update({"proposals": proposals, "pagination": pagination})
+            else:
+                payload["proposals"] = self._legacy_collection(proposals)
             self._send_json(HTTPStatus.OK, payload)
             return
         asset_prefix = "/v1/assets/"
@@ -499,10 +722,29 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     connection,
                     revision,
                 ):
+                    scope = self._pagination_scope(
+                        "asset-history-v1",
+                        revision,
+                        is_admin,
+                        assetId=asset_id,
+                    )
+                    after = (
+                        self._history_position(
+                            self._decode_cursor(cursor, scope)
+                        )
+                        if paginated
+                        else None
+                    )
                     history_items = self.server.store.asset_history(
                         asset_id,
                         is_admin=is_admin,
                         connection=connection,
+                        after_history_id=after,
+                        fetch_limit=(
+                            limit + 1
+                            if paginated
+                            else LEGACY_COLLECTION_FETCH
+                        ),
                     )
                 payload = {
                     "assetId": asset_id,
@@ -510,17 +752,28 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     "history": history_items,
                 }
                 if paginated:
-                    history_items, pagination = self._paginate(
+                    history_items, pagination = self._bounded_page(
                         history_items,
                         limit=limit,
-                        cursor=cursor,
-                        scope=(
-                            f"asset-history-v1:{revision}:{is_admin}:"
-                            f"{asset_id}"
-                        ),
+                        scope=scope,
+                        position_of=lambda item: item["_historyId"],
+                        public_item=lambda item: {
+                            key: value
+                            for key, value in item.items()
+                            if key != "_historyId"
+                        },
                     )
                     payload.update(
                         {"history": history_items, "pagination": pagination}
+                    )
+                else:
+                    payload["history"] = self._legacy_collection(
+                        history_items,
+                        public_item=lambda item: {
+                            key: value
+                            for key, value in item.items()
+                            if key != "_historyId"
+                        },
                     )
                 self._send_json(HTTPStatus.OK, payload)
             else:

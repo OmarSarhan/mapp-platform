@@ -310,6 +310,16 @@ class ControlStore:
         with self._locked():
             return self._state()["instanceId"]
 
+    def pagination_key(self) -> bytes:
+        """Return a stable private key for integrity-bound opaque cursors."""
+        with self._locked():
+            state = self._state()
+            material = (
+                f"mapp-pagination-v1\0{state['instanceId']}\0"
+                f"{state['adminPassword']}"
+            ).encode("utf-8")
+        return hashlib.sha256(material).digest()
+
     def _trim_audit(self) -> None:
         try:
             size = self.audit_path.stat().st_size

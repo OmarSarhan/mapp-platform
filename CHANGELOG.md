@@ -8,6 +8,16 @@ first release.
 
 ### Fixed
 
+- Changed growing semantic, derived-profile, source-relation, and
+  workspace-proposal pages to bounded keyset/limit+1 reads with
+  integrity-bound revision, configuration, and visibility cursors, plus a
+  documented 16 MiB response ceiling below the gateway client limit. Legacy
+  parameterless shapes remain compatible through 100 items and now fail with
+  `pagination.required` instead of materializing more; the dashboard uses
+  explicit, independent Load-more cursors for every semantic collection.
+- Bounded administrator derived-profile delivery diagnostics to one blocker
+  per displayed profile plus a 100-item unmatched repair batch, with
+  `deliveryBlockersMore` making remaining work explicit.
 - Forwarded live visual-test clicked-feature text assertions into the browser
   interaction plan so `expectedInfoPanelText` produces dedicated, verifiable
   information-panel evidence instead of being accepted but ignored.

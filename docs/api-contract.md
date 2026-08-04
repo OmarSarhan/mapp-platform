@@ -53,15 +53,61 @@ Growing collection routes advertise pagination contract `1`. A bounded
 request supplies `limit` (1–100, default 100) and may supply the opaque
 `cursor` returned as `pagination.nextCursor` by the preceding request. A null
 `nextCursor` is the only end-of-collection signal. Keep all filters unchanged
-between pages. A cursor that no longer matches the current revision,
-visibility, filters, or boundary item returns `pagination.invalid`; restart at
-the first page rather than interpreting or modifying the cursor.
+between pages. A cursor that fails integrity checks or no longer matches its
+declared revision, visibility, filters, or configuration scope returns
+`pagination.invalid`; restart at the first page rather than interpreting or
+modifying the cursor. Source-relation cursors do not bind live PostgreSQL
+catalog contents or grants; those follow the keyset consistency behavior below.
 
-API-major-1 parameterless reads retain the legacy unpaged response so an older
-independently released CLI is not broken. Contract-1.4-aware clients always
-send `limit`, keep one page in memory, and surface `nextCursor` for an explicit
-subsequent invocation. The paginated routes and item fields are enumerated in
-the compatibility artifact.
+Every collection response has a 16 MiB ceiling. Item arrays use a 15 MiB
+budget, reserving response headroom for pagination and diagnostic fields and
+remaining below the configuration service's 20 MiB semantic-upstream guard. A
+bounded response may therefore contain fewer items than the requested `limit`
+while returning a non-null `nextCursor`; clients must not infer completion
+from a short page. If one item cannot fit, the gateway returns HTTP `413` with
+`semantic.page_too_large` for private-semantic collections or
+`pagination.page_too_large` for local collections. The requested bound remains
+in `pagination.limit`, and the supported range remains 1–100.
+
+Paged semantic catalog, search, history, derived-profile, source-relation, and
+proposal reads use ordered storage keysets and fetch at most `limit + 1` rows.
+The local derived-profile cursor is additionally bound to the semantic catalog
+revision and whether administrator delivery diagnostics are visible. A
+source-relation cursor is bound through a keyed digest to the platform instance
+and effective source connections, allowlist, and exclusions; connection
+credentials are not exposed as a public verifier. Eligibility is applied in
+PostgreSQL before its ordered keyset limit, and discovery keeps no more than
+`limit + 1` relation summaries in memory across aliases. It is not a
+cross-request catalog snapshot: a relation created after the boundary may
+appear on a later page, one created before it may require a fresh traversal,
+and a dropped relation disappears. Filesystem-backed workspace proposal pages
+parse at most `limit + 1` proposal documents; they scan proposal directory
+names with bounded memory to preserve the established newest-first order.
+
+Administrator derived-profile reads query at most one delivery failure per
+displayed profile. Their first page also carries at most 100 unmatched archive
+repair records in `deliveryBlockers`; `deliveryBlockersMore: true` means more
+work remains. Repair the displayed blockers and refresh the first page for the
+next batch. Continuation pages do not repeat the unmatched batch. Consumers
+must treat `deliveryBlockersMore` as a JSON boolean: the dashboard acts only on
+literal `true`, and the CLI fails closed if the flag is malformed or appears
+without the accompanying blocker array.
+
+API-major-1 parameterless reads retain the exact legacy response shape through
+100 items. Above that threshold, or when the legacy shape would exceed the byte
+ceiling, they fail with HTTP `409` and `pagination.required`; they never fully
+materialize an unbounded collection. Parameterless search keeps its historical
+20-result window while probing up to 101 matching rows to enforce that same
+collection threshold. Contract-1.4-aware clients always send `limit`, keep one
+page in memory, and expose `nextCursor` for an explicit user request. The
+paginated routes and item fields are enumerated in the compatibility artifact.
+
+Release consumers before enforcing the legacy threshold: first deploy a
+dashboard and CLI that always send `limit=100` and expose manual continuation,
+then deploy the 1.1.0 service/gateway behavior. The bounded request shape is
+accepted by the preceding service, while older parameterless clients remain
+compatible for collections of at most 100 items and receive an actionable
+error rather than a partial result above that threshold.
 
 ## CLI commands, actions, and scopes
 

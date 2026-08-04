@@ -33,10 +33,45 @@ class ContractArtifactTests(unittest.TestCase):
             "defaultLimit": value["pagination"]["defaultLimit"],
             "maxLimit": value["pagination"]["maxLimit"],
             "cursor": "opaque",
+            "pageMaxResponseBytes": value["pagination"][
+                "pageMaxResponseBytes"
+            ],
+            "pageTooLargeCode": value["pagination"]["pageTooLargeCode"],
+            "legacyMaxItems": value["pagination"]["legacyMaxItems"],
+            "legacyOverflowCode": value["pagination"][
+                "legacyOverflowCode"
+            ],
+            "semanticPageMaxResponseBytes": value["pagination"][
+                "semanticPageMaxResponseBytes"
+            ],
+            "semanticPageTooLargeCode": value["pagination"][
+                "semanticPageTooLargeCode"
+            ],
+            "derivedDeliveryBlockers": value["pagination"][
+                "derivedDeliveryBlockers"
+            ],
             "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
         })
+        self.assertEqual("1.1.0", value["artifactVersion"])
         self.assertEqual(DEFAULT_PAGE_LIMIT, value["pagination"]["defaultLimit"])
         self.assertEqual(MAX_PAGE_LIMIT, value["pagination"]["maxLimit"])
+        self.assertLess(
+            value["pagination"]["semanticPageMaxResponseBytes"],
+            20 * 1024 * 1024,
+        )
+        self.assertEqual(
+            "semantic.page_too_large",
+            value["pagination"]["semanticPageTooLargeCode"],
+        )
+        self.assertEqual(
+            {
+                "itemsField": "deliveryBlockers",
+                "moreField": "deliveryBlockersMore",
+                "maxItems": 100,
+                "firstPageOnly": True,
+            },
+            value["pagination"]["derivedDeliveryBlockers"],
+        )
         self.assertEqual(
             value["semanticServiceVersion"],
             (PLATFORM_ROOT / "semantic-service/VERSION")
