@@ -402,12 +402,14 @@ boolean for this flag, and the CLI rejects a flag without its accompanying
 blocker array. The complete profiles, blockers, pagination, and diagnostic
 envelope must remain under the advertised response ceiling.
 
-Roll out a contract-1.4-aware dashboard and CLI first: they send `limit=100`,
-keep independent cursors for catalog, source, derived profile, proposal, and
-asset-history views, and load another page only on an explicit user action.
-Then activate the 1.1.0 legacy threshold. This ordering works with the prior
-pagination-capable service and prevents first-party consumers from encountering
-the compatibility error during the transition.
+Roll out the contract-1.4-aware CLI first. Then deploy semantic service 1.1.0
+together with the matching `config-ui` image, which packages the gateway and
+its bundled dashboard as one platform artifact. That dashboard sends
+`limit=100`, keeps independent cursors for catalog, source, derived profile,
+proposal, and asset-history views, and loads another page only on an explicit
+user action. An older browser session remains compatible through 100 items and
+receives an actionable pagination error above that threshold; refresh it onto
+the dashboard bundled with the new gateway.
 
 [gemini-terms]: https://ai.google.dev/gemini-api/terms
 [gemini-zdr]: https://ai.google.dev/gemini-api/docs/zdr

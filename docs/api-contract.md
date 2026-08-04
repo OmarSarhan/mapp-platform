@@ -102,12 +102,14 @@ collection threshold. Contract-1.4-aware clients always send `limit`, keep one
 page in memory, and expose `nextCursor` for an explicit user request. The
 paginated routes and item fields are enumerated in the compatibility artifact.
 
-Release consumers before enforcing the legacy threshold: first deploy a
-dashboard and CLI that always send `limit=100` and expose manual continuation,
-then deploy the 1.1.0 service/gateway behavior. The bounded request shape is
-accepted by the preceding service, while older parameterless clients remain
-compatible for collections of at most 100 items and receive an actionable
-error rather than a partial result above that threshold.
+Release the contract-1.4-aware CLI before enforcing the legacy threshold. Then
+deploy semantic service 1.1.0 together with the matching `config-ui` image;
+that image contains both the gateway and its bundled dashboard, so the
+dashboard is not a separately deployable release step. The bundled dashboard
+already sends `limit=100` and exposes manual continuation. An older browser
+session that still makes parameterless requests remains compatible through 100
+items and receives an actionable `pagination.required` error rather than a
+partial result above that threshold; refresh it onto the bundled dashboard.
 
 ## CLI commands, actions, and scopes
 
