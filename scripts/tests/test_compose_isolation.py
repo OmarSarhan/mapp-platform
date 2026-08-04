@@ -206,15 +206,20 @@ class ComposeIsolationTests(unittest.TestCase):
         squid = (ROOT / "docker/egress-proxy/squid.conf").read_text(
             encoding="utf-8"
         )
-        self.assertLess(
-            squid.index("http_access deny blocked_destinations"),
-            squid.index("http_access allow allowed_destinations"),
+        self.assertIn(
+            'acl allowed_destinations dstdomain -n '
+            '"/etc/squid/browser-egress-allowlist.txt"',
+            squid,
         )
-        self.assertLess(
-            squid.index("http_access allow allowed_destinations"),
-            squid.index("http_access deny all"),
-        )
+        hostname_deny = squid.index("http_access deny !allowed_destinations")
+        address_deny = squid.index("http_access deny blocked_destinations")
+        allow = squid.index("http_access allow CONNECT allowed_destinations")
+        self.assertLess(hostname_deny, address_deny)
+        self.assertLess(address_deny, allow)
+        self.assertLess(allow, squid.index("http_access deny all"))
         self.assertIn("http_access deny CONNECT !SSL_ports", squid)
+        self.assertIn("http_access deny !CONNECT", squid)
+        self.assertNotIn("acl Safe_ports port 80", squid)
         self.assertIn("access_log none", squid)
 
     def test_census_loader_keeps_the_existing_bundled_etl_boundary(self) -> None:

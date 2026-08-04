@@ -18,10 +18,11 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
   narrow automation network with the configuration service and Caddy; it has
   no platform credential.
 - The browser runner has no direct outbound network. External map assets pass
-  through the dedicated hostname-allowlisting proxy, which is the only service
-  on both the internal automation network and the external browser-egress
-  network. Private, loopback, link-local, reserved, and unlisted destinations
-  are denied.
+  through the dedicated HTTPS-only hostname-allowlisting proxy, which is the
+  only service on both the internal automation network and the external
+  browser-egress network. Unlisted hostnames are rejected without DNS lookup;
+  reviewed names are then resolved and rejected if they map to private,
+  loopback, link-local, or reserved space.
 - The semantic service shares only the internal `semantic-control` network
   with the configuration service. It has no public route, database network, or
   database credential.

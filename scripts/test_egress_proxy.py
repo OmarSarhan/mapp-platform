@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise the Squid hostname allowlist with one allowed and one denied host."""
+"""Exercise the HTTPS-only Squid allowlist with allowed and denied hosts."""
 
 from __future__ import annotations
 
 import argparse
+import ssl
 import subprocess
 import tempfile
 import time
@@ -69,6 +70,17 @@ def main() -> int:
                 "allowed.test\n",
                 encoding="utf-8",
             )
+            (fixture / "Caddyfile").write_text(
+                "{\n"
+                "    admin off\n"
+                "}\n"
+                "https://allowed.test, https://denied.test {\n"
+                "    tls internal\n"
+                "    root * /srv\n"
+                "    file_server\n"
+                "}\n",
+                encoding="utf-8",
+            )
             production_config = (
                 ROOT / "docker/egress-proxy/squid.conf"
             ).read_text(encoding="utf-8")
@@ -91,8 +103,10 @@ def main() -> int:
                 "--network-alias", "allowed.test",
                 "--network-alias", "denied.test",
                 "--volume", f"{fixture}:/srv:ro",
+                "--volume", f"{fixture / 'Caddyfile'}:/etc/caddy/Caddyfile:ro",
                 args.origin_image,
-                "caddy", "file-server", "--root", "/srv", "--listen", ":80",
+                "caddy", "run", "--config", "/etc/caddy/Caddyfile",
+                "--adapter", "caddyfile",
             )
             created_containers.append(origin)
 
@@ -123,15 +137,20 @@ def main() -> int:
                 "docker", "port", proxy, "3128/tcp", capture=True
             )
             proxy_port = int(binding.rsplit(":", 1)[1])
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({
-                "http": f"http://127.0.0.1:{proxy_port}",
-            }))
+            proxy_url = f"http://127.0.0.1:{proxy_port}"
+            tls_context = ssl.create_default_context()
+            tls_context.check_hostname = False
+            tls_context.verify_mode = ssl.CERT_NONE
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"https": proxy_url}),
+                urllib.request.HTTPSHandler(context=tls_context),
+            )
 
             deadline = time.monotonic() + 20
             last_error: Exception | None = None
             while time.monotonic() < deadline:
                 try:
-                    with opener.open("http://allowed.test/", timeout=2) as response:
+                    with opener.open("https://allowed.test/", timeout=2) as response:
                         body = response.read().decode("utf-8")
                         if response.status != 200 or body != "allowed\n":
                             raise RuntimeError(
@@ -147,16 +166,37 @@ def main() -> int:
                 )
 
             try:
-                opener.open("http://denied.test/", timeout=3)
+                opener.open("https://denied.test/", timeout=3)
             except urllib.error.HTTPError as error:
                 if error.code != 403:
                     raise RuntimeError(
                         f"Denied destination returned HTTP {error.code}, expected 403."
                     ) from error
+            except urllib.error.URLError as error:
+                if "403" not in str(error.reason):
+                    raise RuntimeError(
+                        "Denied CONNECT did not return the expected 403."
+                    ) from error
             else:
                 raise RuntimeError("Denied destination unexpectedly succeeded.")
 
-            print("PASS: allowed.test returned 200 and denied.test returned 403.")
+            http_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url})
+            )
+            try:
+                http_opener.open("http://allowed.test/", timeout=3)
+            except urllib.error.HTTPError as error:
+                if error.code != 403:
+                    raise RuntimeError(
+                        f"Plain HTTP returned {error.code}, expected 403."
+                    ) from error
+            else:
+                raise RuntimeError("Plain HTTP egress unexpectedly succeeded.")
+
+            print(
+                "PASS: allowed HTTPS returned 200; denied hostname and plain "
+                "HTTP returned 403."
+            )
         return 0
     except Exception:
         if proxy in created_containers:

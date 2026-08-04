@@ -384,8 +384,9 @@ the dedicated Squid proxy; the browser runner itself remains on an internal
 network. `instance/browser-egress-allowlist.txt` contains reviewed Squid
 `dstdomain` entries and defaults to OpenStreetMap's tile domain. Add a hostname
 only in the same review as the workspace asset that needs it. The proxy allows
-HTTP 80 and HTTPS tunnels to 443, rejects private and reserved destination
-addresses before hostname approval, and does not log request URLs.
+only HTTPS `CONNECT` tunnels to port 443. It rejects unlisted hostnames without
+DNS lookup, then rejects reviewed names that resolve to private or reserved
+addresses, and does not log request URLs.
 
 Run the deterministic behavior check after changing the policy:
 
@@ -394,8 +395,9 @@ docker compose --env-file .env.example -f compose.yaml build egress-proxy
 python scripts/test_egress_proxy.py
 ```
 
-The check uses an isolated local origin and requires an allowlisted hostname to
-return 200 while an unlisted hostname returns 403. It removes its uniquely
+The check uses an isolated local TLS origin and requires an allowlisted HTTPS
+hostname to return 200 while an unlisted hostname and plaintext HTTP return
+403. It removes its uniquely
 named test containers and network when complete.
 Use the standalone CLI's bounded `--lng`, `--lat`, and `--zoom` options
 together when the automatic extent is not representative. A complete explicit
