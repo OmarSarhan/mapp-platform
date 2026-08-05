@@ -1,14 +1,16 @@
-FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+FROM python:3.12.13-alpine3.23@sha256:601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
     STATE_DIR=/state
 
-RUN groupadd --gid 10001 semantic \
-    && useradd --uid 10001 --gid semantic --no-create-home --home-dir /nonexistent semantic \
-    && install -d -o semantic -g semantic -m 0700 /state \
-    && install -d -o semantic -g semantic -m 0755 /app
+RUN addgroup -S -g 10001 semantic \
+    && adduser -S -D -H -h /nonexistent -u 10001 -G semantic semantic \
+    && mkdir -p /state /app \
+    && chown semantic:semantic /state /app \
+    && chmod 0700 /state \
+    && chmod 0755 /app
 
 COPY --chown=semantic:semantic VERSION semantic_store.py server.py /app/
 
