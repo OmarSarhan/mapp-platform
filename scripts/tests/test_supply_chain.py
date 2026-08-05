@@ -124,6 +124,18 @@ class SupplyChainWorkflowTests(unittest.TestCase):
         self.assertEqual(set(dockerfiles), expected)
         self.assertEqual(len(dockerfiles), len(expected))
 
+    def test_image_matrix_is_compacted_before_export(self) -> None:
+        plan = self.jobs["plan"]
+        self.assertIn('matrix="$(jq -c . <<<"$MATRIX_JSON")"', plan)
+        self.assertIn(
+            "printf 'matrix=%s\\n' \"$matrix\" >> \"$GITHUB_OUTPUT\"",
+            plan,
+        )
+        self.assertNotIn(
+            "printf 'matrix=%s\\n' \"$MATRIX_JSON\" >> \"$GITHUB_OUTPUT\"",
+            plan,
+        )
+
     def test_scanners_have_no_publish_or_oidc_authority(self) -> None:
         self.assertEqual(set(self.jobs), {"plan", "build", "scan", "sign"})
 

@@ -35,7 +35,9 @@ jobs:
               {"image":"egress-proxy","context":"docker/egress-proxy","dockerfile":"docker/egress-proxy/Dockerfile"},
               {"image":"caddy","context":"docker/caddy","dockerfile":"docker/caddy/Dockerfile"}
             ]}
-        run: printf 'matrix=%s\n' "$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+        run: |
+          matrix="$(jq -c . <<<"$MATRIX_JSON")"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
 
   build:
     needs: plan
