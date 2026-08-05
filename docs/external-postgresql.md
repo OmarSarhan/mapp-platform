@@ -164,6 +164,39 @@ PostGIS and H3 installations, while `CREATE` on `public` stays revoked. Every
 submitted source relation is schema-qualified, so source lookup never depends
 on this path. `./bin/mapp verify` checks the effective derived-owner setting.
 
+PostgreSQL replaces that session path with a security-restricted path while it
+refreshes a materialized view. In H3 4.2.3, the PostGIS polygon wrappers are SQL
+functions whose delayed body contains unqualified PostGIS calls. If H3-derived
+materialized layers are required, a database administrator must pin the four
+affected extension routines after installing or upgrading `h3_postgis`:
+
+```sql
+ALTER FUNCTION public.h3_polygon_to_cells(public.geometry, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_polygon_to_cells(public.geography, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_polygon_to_cells_experimental(
+  public.geometry, integer, text
+) SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_polygon_to_cells_experimental(
+  public.geography, integer, text
+) SET search_path = pg_catalog, public;
+```
+
+Before altering them, verify each exact overload through `pg_proc`, `pg_depend`,
+and `pg_extension`: it must be an extension member with `extname =
+'h3_postgis'`, and its routine namespace must equal `pg_extension.extnamespace`.
+Keep `CREATE` revoked from untrusted roles on every namespace in the pinned
+path. The query guard independently repeats the extension-membership and
+authoritative-namespace checks and rejects same-named custom functions.
+
+When H3 itself is installed in dedicated namespaces, do not copy the `public`
+commands literally. The administrator must use the exact catalog-resolved H3
+overload identities and pin `pg_catalog` followed by the distinct authoritative
+PostGIS/H3 extension namespaces sorted by namespace name. This does not broaden
+the separate derived output contract: schema-qualified PostGIS geometry typmods
+still require the supported authoritative `public.geometry` installation.
+
 The verifier does not impose this setting on the runtime reader because the
 supported XYZ workspace contract still accepts legacy unqualified relations
 that an external deployment may resolve through an operator-selected schema.

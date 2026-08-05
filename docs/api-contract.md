@@ -546,6 +546,11 @@ extension's authoritative namespace and the controlled `public` schema. The
 selected output geometry must still carry an explicit geometry subtype and
 positive-SRID typmod; a runtime SRID on a generic `geometry` column is
 insufficient.
+Configured routines remain prohibited except for SQL-language H3 PostGIS
+polygon wrappers whose exact routine setting is the catalog-derived
+`pg_catalog` plus authoritative allowlisted-extension namespace path. Both the
+routine and implementation must resolve as members of an approved extension;
+same-named custom routines and every other configuration remain prohibited.
 Successful mutations include `queryPlanProbe`. Query guard failures use this
 stable taxonomy:
 

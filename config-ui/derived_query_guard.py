@@ -365,8 +365,10 @@ class RoutineDependency:
     schema: str
     name: str
     extension: str | None
+    extension_schema: str | None
     implementation_schema: str
     implementation_extension: str | None
+    implementation_extension_schema: str | None
     volatility: str
     returns_set: bool
     routine_kind: str
@@ -375,6 +377,7 @@ class RoutineDependency:
     language: str
     object_builtin: bool
     implementation_builtin: bool
+    approved_extension_search_path: str
 
 
 @dataclass(frozen=True)
@@ -1159,7 +1162,23 @@ def inspect_relation_routines(
     names = sorted({name.lower() for name in function_names})
     cur.execute(
         """
-        WITH relation_rewrites AS (
+        WITH approved_extension_namespaces AS (
+          SELECT DISTINCT namespace.nspname
+          FROM pg_extension AS extension
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = extension.extnamespace
+          WHERE extension.extname = ANY(%s::text[])
+        ), approved_extension_path AS (
+          SELECT
+            'search_path=pg_catalog'
+              || COALESCE(
+                   ', ' || string_agg(
+                     quote_ident(nspname), ', ' ORDER BY nspname
+                   ),
+                   ''
+                 ) AS value
+          FROM approved_extension_namespaces
+        ), relation_rewrites AS (
           SELECT rewrite.oid
           FROM pg_rewrite AS rewrite
           WHERE rewrite.ev_class = %s::regclass
@@ -1266,8 +1285,11 @@ def inspect_relation_routines(
           objects.schema,
           objects.name,
           object_extension.extname AS extension,
+          object_extension_ns.nspname AS extension_schema,
           objects.implementation_schema,
           implementation_extension.extname AS implementation_extension,
+          implementation_extension_ns.nspname
+            AS implementation_extension_schema,
           objects.volatility,
           objects.returns_set,
           objects.routine_kind,
@@ -1275,8 +1297,10 @@ def inspect_relation_routines(
           objects.routine_config,
           objects.language,
           objects.object_builtin,
-          objects.implementation_builtin
+          objects.implementation_builtin,
+          approved_extension_path.value AS approved_extension_search_path
         FROM objects
+        CROSS JOIN approved_extension_path
         LEFT JOIN pg_depend AS object_membership
           ON object_membership.classid = CASE objects.kind
                WHEN 'operator' THEN 'pg_operator'::regclass
@@ -1287,6 +1311,8 @@ def inspect_relation_routines(
          AND object_membership.deptype = 'e'
         LEFT JOIN pg_extension AS object_extension
           ON object_extension.oid = object_membership.refobjid
+        LEFT JOIN pg_namespace AS object_extension_ns
+          ON object_extension_ns.oid = object_extension.extnamespace
         LEFT JOIN pg_depend AS implementation_membership
           ON implementation_membership.classid = 'pg_proc'::regclass
          AND implementation_membership.objid = objects.implementation_oid
@@ -1294,9 +1320,12 @@ def inspect_relation_routines(
          AND implementation_membership.deptype = 'e'
         LEFT JOIN pg_extension AS implementation_extension
           ON implementation_extension.oid = implementation_membership.refobjid
+        LEFT JOIN pg_namespace AS implementation_extension_ns
+          ON implementation_extension_ns.oid =
+               implementation_extension.extnamespace
         ORDER BY objects.kind, objects.identity
         """,
-        (f'{schema}."{relation}"', names),
+        (sorted(APPROVED_EXTENSIONS), f'{schema}."{relation}"', names),
     )
     dependencies = []
     for item in cur.fetchall():
@@ -1491,6 +1520,29 @@ def validate_relation_types_and_casts(
     return dependencies
 
 
+def _is_h3_sql_wrapper(dependency: RoutineDependency) -> bool:
+    return (
+        dependency.kind == "function"
+        and dependency.extension == "h3_postgis"
+        and dependency.language == "sql"
+        and dependency.name.lower() in H3_POLYGON_FUNCTIONS
+    )
+
+
+def _has_approved_extension_search_path(
+    dependency: RoutineDependency,
+) -> bool:
+    return (
+        _is_h3_sql_wrapper(dependency)
+        and dependency.implementation_extension == dependency.extension
+        and dependency.schema == dependency.extension_schema
+        and dependency.implementation_schema
+        == dependency.implementation_extension_schema
+        and dependency.routine_config
+        == (dependency.approved_extension_search_path,)
+    )
+
+
 def validate_relation_routines(
     cur,
     schema: str,
@@ -1526,11 +1578,20 @@ def validate_relation_routines(
                 "security_definer_routine",
                 f"Resolved routine {dependency.identity} is SECURITY DEFINER.",
             ))
-        if dependency.routine_config:
+        approved_search_path = _has_approved_extension_search_path(dependency)
+        requires_approved_search_path = _is_h3_sql_wrapper(dependency)
+        if (
+            dependency.routine_config and not approved_search_path
+        ) or (
+            requires_approved_search_path and not approved_search_path
+        ):
             reasons.append(_reason(
                 "configured_routine",
-                f"Resolved routine {dependency.identity} changes session "
-                "configuration or search_path.",
+                f"Resolved routine {dependency.identity} must not change "
+                "session configuration. Approved H3 SQL wrappers are the "
+                "only exception and must pin search_path exactly to "
+                "pg_catalog plus the authoritative schemas of the installed "
+                "PostGIS/H3 extensions.",
             ))
         if dependency.language not in APPROVED_ROUTINE_LANGUAGES:
             reasons.append(_reason(

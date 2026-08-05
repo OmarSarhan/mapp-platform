@@ -8,6 +8,10 @@ first release.
 
 ### Fixed
 
+- Pinned the installed H3 PostGIS polygon SQL wrappers to the catalog-derived
+  trusted extension path, allowing their nested `ST_Dump` call to resolve while
+  PostgreSQL plans and refreshes materialized views under its restricted search
+  path without admitting same-named custom routines.
 - Allowed schema-qualified PostGIS/H3 cast types only after pre-analysis proves
   exact allowlisted-extension membership and an authoritative controlled
   `public` namespace match, so geometry typmods can resolve under the restricted

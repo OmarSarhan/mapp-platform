@@ -35,8 +35,10 @@ def dependency(**updates):
         "schema": "public",
         "name": "wrapper",
         "extension": None,
+        "extension_schema": None,
         "implementation_schema": "public",
         "implementation_extension": None,
+        "implementation_extension_schema": None,
         "volatility": "i",
         "returns_set": False,
         "routine_kind": "f",
@@ -45,6 +47,7 @@ def dependency(**updates):
         "language": "sql",
         "object_builtin": False,
         "implementation_builtin": False,
+        "approved_extension_search_path": "search_path=pg_catalog, public",
     }
     value.update(updates)
     return value
@@ -457,6 +460,144 @@ class CatalogRoutineGuardTests(unittest.TestCase):
         )
         self.assertEqual(3, len(result))
 
+    def test_allows_only_catalog_derived_path_for_h3_sql_wrappers(self):
+        inspection = inspect_query_ast(
+            "SELECT h3_polygon_to_cells("
+            "_mapp_h3_scope.geom_4326, 9) FROM _mapp_h3_scope"
+        )
+        rows = (
+            dependency(
+                identity="public.h3_polygon_to_cells(geometry,integer)",
+                name="h3_polygon_to_cells",
+                extension="h3_postgis",
+                extension_schema="public",
+                implementation_extension="h3_postgis",
+                implementation_extension_schema="public",
+                routine_config=("search_path=pg_catalog, public",),
+                returns_set=True,
+            ),
+            dependency(
+                identity="hex.h3_polygon_to_cells(geo.geometry,integer)",
+                schema="hex",
+                name="h3_polygon_to_cells",
+                extension="h3_postgis",
+                extension_schema="hex",
+                implementation_schema="hex",
+                implementation_extension="h3_postgis",
+                implementation_extension_schema="hex",
+                routine_config=("search_path=pg_catalog, geo, hex",),
+                approved_extension_search_path=(
+                    "search_path=pg_catalog, geo, hex"
+                ),
+                returns_set=True,
+            ),
+        )
+
+        for row in rows:
+            with self.subTest(identity=row["identity"]):
+                cursor = Cursor([row])
+                validate_relation_routines(
+                    cursor, "derived_layers", "probe", inspection
+                )
+                query, parameters = cursor.calls[0]
+                self.assertIn(
+                    "approved_extension_namespaces AS", query
+                )
+                self.assertEqual(
+                    ["h3", "h3_postgis", "postgis"], parameters[0]
+                )
+
+    def test_rejects_unpinned_or_unproven_h3_sql_wrappers(self):
+        inspection = inspect_query_ast(
+            "SELECT h3_polygon_to_cells("
+            "_mapp_h3_scope.geom_4326, 9) FROM _mapp_h3_scope"
+        )
+        approved = {
+            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "name": "h3_polygon_to_cells",
+            "extension": "h3_postgis",
+            "extension_schema": "public",
+            "implementation_extension": "h3_postgis",
+            "implementation_extension_schema": "public",
+            "returns_set": True,
+        }
+        rows = (
+            dependency(**approved),
+            dependency(
+                **approved,
+                routine_config=("search_path=pg_catalog, public, unsafe",),
+            ),
+            dependency(**{
+                **approved,
+                "extension_schema": "hex",
+                "routine_config": ("search_path=pg_catalog, public",),
+            }),
+            dependency(**{
+                **approved,
+                "implementation_extension": "postgis",
+                "routine_config": ("search_path=pg_catalog, public",),
+            }),
+            dependency(
+                **approved,
+                routine_config=(
+                    "search_path=pg_catalog, public",
+                    "work_mem=1GB",
+                ),
+            ),
+        )
+
+        for row in rows:
+            with self.subTest(row=row):
+                with self.assertRaises(QueryGuardViolation) as raised:
+                    validate_relation_routines(
+                        Cursor([row]), "derived_layers", "probe", inspection
+                    )
+                self.assertIn(
+                    "configured_routine",
+                    {reason.code for reason in raised.exception.reasons},
+                )
+
+    def test_catalog_path_does_not_approve_arbitrary_public_routine(self):
+        row = dependency(
+            routine_config=("search_path=pg_catalog, public",),
+        )
+
+        with self.assertRaises(QueryGuardViolation) as raised:
+            validate_relation_routines(
+                Cursor([row]),
+                "derived_layers",
+                "probe",
+                self.inspection(),
+            )
+
+        self.assertIn(
+            "unapproved_function",
+            {reason.code for reason in raised.exception.reasons},
+        )
+
+    def test_catalog_path_does_not_approve_unrelated_extension_config(self):
+        row = dependency(
+            identity="public.extension_helper(integer)",
+            extension="postgis",
+            extension_schema="public",
+            implementation_extension="postgis",
+            implementation_extension_schema="public",
+            routine_config=("search_path=pg_catalog, public",),
+        )
+
+        with self.assertRaises(QueryGuardViolation) as raised:
+            validate_relation_routines(
+                Cursor([row]),
+                "derived_layers",
+                "probe",
+                self.inspection(),
+            )
+
+        self.assertIn(
+            "configured_routine",
+            {reason.code for reason in raised.exception.reasons},
+        )
+
     def test_allows_qualified_cast_type_in_authoritative_extension_schema(self):
         inspection = inspect_query_ast(
             "SELECT geom::public.geometry(Polygon, 3857) FROM source.values"
@@ -579,7 +720,7 @@ class CatalogRoutineGuardTests(unittest.TestCase):
         validate_relation_routines(
             cursor, "derived_layers", "probe", inspection
         )
-        self.assertIn("generate_series", cursor.calls[0][1][1])
+        self.assertIn("generate_series", cursor.calls[0][1][2])
 
     def test_rejects_security_definer_configured_and_untrusted_languages(self):
         cases = (

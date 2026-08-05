@@ -36,6 +36,30 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(path=relative_path, contract=contract):
                 self.assertIn(contract, source)
 
+    def assert_h3_sql_wrapper_hardening(self, relative_path: str) -> None:
+        source = self.normalized(relative_path)
+        for contract in (
+            "extension_membership.classid = "
+            "'pg_catalog.pg_proc'::pg_catalog.regclass",
+            "extension_membership.deptype = 'e'",
+            "extension.extname = 'h3_postgis'",
+            "extension.extnamespace = routine.pronamespace",
+            "routine_namespace.nspname = 'public'",
+            "public.h3_polygon_to_cells(public.geometry,pg_catalog.int4)",
+            "public.h3_polygon_to_cells(public.geography,pg_catalog.int4)",
+            "public.h3_polygon_to_cells_experimental(public.geometry,pg_catalog.int4,pg_catalog.text)",
+            "public.h3_polygon_to_cells_experimental(public.geography,pg_catalog.int4,pg_catalog.text)",
+            "ALTER FUNCTION %s SET search_path = pg_catalog, public",
+            "IF hardened_count <> 4 THEN",
+        ):
+            with self.subTest(path=relative_path, contract=contract):
+                self.assertIn(contract, source)
+
+    def test_fresh_h3_install_hardens_catalog_owned_sql_wrappers(self) -> None:
+        self.assert_h3_sql_wrapper_hardening(
+            "docker/postgis/init/05-h3.sql"
+        )
+
     def test_wrappers_reject_every_database_environment_override(self) -> None:
         expected = {
             "DBS_MAPP",
@@ -140,6 +164,9 @@ class DatabaseAccessContractTests(unittest.TestCase):
             source,
         )
         self.assert_resource_role_defaults("docker/postgis/upgrade-derived.sh")
+        self.assert_h3_sql_wrapper_hardening(
+            "docker/postgis/upgrade-derived.sh"
+        )
 
     def test_verifier_covers_reader_derived_and_census_audit_edges(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
@@ -225,6 +252,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "REVOKE CONNECT, TEMPORARY ON DATABASE maps FROM PUBLIC;",
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
             "ALTER ROLE mapp_derived_owner SET search_path = pg_catalog, public;",
+            "ALTER FUNCTION public.h3_polygon_to_cells(public.geometry, integer)",
+            "routine namespace must equal `pg_extension.extnamespace`",
             "`current_user`,\n`session_user`, and the decoded URI username",
         ):
             with self.subTest(contract=contract):

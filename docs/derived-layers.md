@@ -157,7 +157,8 @@ continues to use read-only `DBS_MAPP`; it can select managed outputs but cannot
 create, refresh, or drop them. Ordinary views use `security_invoker=true` and
 `security_barrier=true`.
 
-New bundled volumes receive the roles, schema, H3 extensions, and grants
+New bundled volumes receive the roles, schema, H3 extensions, grants, and the
+restricted-path setting required by the H3 PostGIS polygon SQL wrappers
 automatically. Upgrade an existing bundled volume explicitly after rebuilding
 the database image:
 
@@ -328,13 +329,18 @@ function, operator, cast, and type OIDs without reading source rows. Declared
 relation dependencies must match exactly, and routines must be genuine
 `pg_catalog` objects or members of the approved `postgis`, `h3`, or
 `h3_postgis` extensions. Volatile, set-returning without an AST proof,
-`SECURITY DEFINER`, configured/search-path-changing, unapproved-language,
-custom wrapper/operator/cast/type, dynamic-query, file, large-object, and
-server-control dependencies are rejected. The savepoint is rolled back before
-the five-second `EXPLAIN`; the same catalog checks run again on the created
-relation before materialized population and before every refresh. Every derived
-database connection first pins its session `search_path` to `pg_catalog,
-public`; catalog OID and extension-membership checks remain the authority.
+`SECURITY DEFINER`, unapproved-language, custom wrapper/operator/cast/type,
+dynamic-query, file, large-object, and server-control dependencies are
+rejected. Routine configuration is also rejected except for the H3 PostGIS
+polygon SQL wrappers: those extension-owned routines must pin `search_path`
+exactly to `pg_catalog` plus the distinct authoritative namespaces of the
+installed allowlisted extensions. The catalog must prove both object and
+implementation provenance; a same-named custom routine or any wider setting is
+rejected. The savepoint is rolled back before the five-second `EXPLAIN`; the
+same catalog checks run again on the created relation before materialized
+population and before every refresh. Every derived database connection first
+pins its session `search_path` to `pg_catalog, public`; catalog OID and
+extension-membership checks remain the authority.
 
 Schema-qualified PostGIS/H3 cast types are a narrow exception to fixed-search-
 path type lookup. Before transient-view analysis, the server resolves the exact
@@ -450,6 +456,14 @@ The bundled image builds
 [`h3-pg` v4.2.3](https://github.com/postgis/h3-pg/tree/a26630b8353d441e6bc8065c0a8dcaa3d89ef87b)
 from its pinned full commit and installs `h3` and `h3_postgis`. H3 PostGIS
 functions expect EPSG:4326 longitude/latitude and do not reproject input.
+PostgreSQL narrows the search path while refreshing a materialized view. This
+H3 version's polygon SQL wrappers resolve nested PostGIS calls only when their
+bodies run. Bundled initialization and `./bin/mapp upgrade-derived` therefore
+catalog-check the four regular/experimental geometry/geography overloads as
+members of `h3_postgis` before pinning their routine path to `pg_catalog,
+public`. External operators must apply the equivalent administrator-owned
+setting described in the external PostgreSQL handoff; the service never alters
+extension-owned routines.
 
 The service supplies `_mapp_h3_scope(geom_4326)` from the saved map envelopes.
 Use it as the direct polygon input when generating output cells. This example
