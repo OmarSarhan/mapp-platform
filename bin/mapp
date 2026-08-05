@@ -59,6 +59,40 @@ require_docker() {
   fi
 }
 
+is_buildkit_lease_failure() {
+  local log_file="$1"
+  grep -Eq 'lease "[^"]+": not found|lease [^ ]+ not found' "${log_file}"
+}
+
+run_with_buildkit_lease_retry() {
+  local log_file status retry_status
+  log_file="$(mktemp "${TMPDIR:-/tmp}/mapp-buildkit.XXXXXX")"
+  set +e
+  "$@" 2> >(tee "${log_file}" >&2)
+  status=$?
+  set -e
+  if [[ "${status}" == "0" ]]; then
+    rm -f "${log_file}"
+    return 0
+  fi
+  if ! is_buildkit_lease_failure "${log_file}"; then
+    rm -f "${log_file}"
+    return "${status}"
+  fi
+
+  printf '%s\n' \
+    'Docker BuildKit reported a missing cache lease; pruning BuildKit cache and retrying once.' \
+    'If the retry also fails, inspect Docker daemon health and available disk space.' >&2
+  docker buildx prune --all --force
+
+  set +e
+  "$@"
+  retry_status=$?
+  set -e
+  rm -f "${log_file}"
+  return "${retry_status}"
+}
+
 dotenv_value() {
   local key="$1"
   local value
@@ -332,11 +366,11 @@ if [[ "${database_mode}" == "external" ]]; then
 fi
 
 run_sample_etl() {
-  "${compose[@]}" run --rm --build etl
+  run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl
 }
 
 run_census_etl() {
-  "${compose[@]}" run --rm --build etl \
+  run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl \
     python -m leeds_arcgis_etl.census_main \
     --config /config/census.json
 }
@@ -348,10 +382,10 @@ run_all_etl() {
 
 case "${1:-}" in
   up|serve)
-    "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     ;;
   config-ui)
-    "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     ;;
   config-ui-down)
     "${compose[@]}" rm --stop --force config-ui
@@ -366,7 +400,7 @@ case "${1:-}" in
       exit 2
     fi
     if [[ -n "${2:-}" ]]; then
-      "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
+      run_with_buildkit_lease_retry "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
     else
       run_all_etl
     fi
@@ -399,7 +433,7 @@ case "${1:-}" in
     if [[ -n "${2:-}" ]]; then
       census_check_args+=(--topic "${2}")
     fi
-    "${compose[@]}" run --rm --build etl "${census_check_args[@]}"
+    run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl "${census_check_args[@]}"
     ;;
   recover-reset-data)
     if [[ "${database_mode}" != "bundled" ]]; then
@@ -413,7 +447,7 @@ case "${1:-}" in
       exit 2
     fi
     printf 'Starting the private control plane for explicit interrupted-reset recovery.\n'
-    "${compose[@]}" up --detach --build --wait db semantic-service config-ui
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --wait db semantic-service config-ui
     "${compose[@]}" exec -T config-ui python -c \
       'import json; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(force=True, wait_for_ready=True), separators=(",", ":")))'
     ;;
@@ -472,7 +506,7 @@ case "${1:-}" in
     trap 'recover_interrupted_reset 130' INT
     trap 'recover_interrupted_reset 143' TERM
     printf 'Starting the private control plane to archive derived semantic profiles.\n'
-    "${compose[@]}" up --detach --build --wait db semantic-service config-ui
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --wait db semantic-service config-ui
     reset_gate_may_be_owned=1
     "${compose[@]}" exec -T \
       -e "MAPP_RESET_GATE_OWNER=${reset_gate_owner}" \
@@ -496,7 +530,7 @@ case "${1:-}" in
     install -m 0644 "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
     install -m 0600 "${ROOT_DIR}/instance/workspace.seed.json" "${PREVIEW_DIR}/workspace.json"
     printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
-    "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     printf '%s\n' \
@@ -507,7 +541,7 @@ case "${1:-}" in
       printf './bin/mapp upgrade-derived is available only for the bundled database; provision external roles and extensions with your database administrator.\n' >&2
       exit 2
     fi
-    "${compose[@]}" build db
+    run_with_buildkit_lease_retry "${compose[@]}" build db
     "${compose[@]}" up --detach --no-deps db
     "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
     ;;
@@ -516,7 +550,7 @@ case "${1:-}" in
       printf './bin/mapp all includes bundled ETL data and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
       exit 2
     fi
-    "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
@@ -524,8 +558,8 @@ case "${1:-}" in
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   test)
-    "${compose[@]}" build config-ui semantic-service
-    docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
+    run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service
+    run_with_buildkit_lease_retry docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
     docker run --rm \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
@@ -558,7 +592,7 @@ case "${1:-}" in
         node --check /source/docker/xyz/supervisor.mjs
         node --check /source/browser-runner/server.mjs
       '
-    "${compose[@]}" build egress-proxy
+    run_with_buildkit_lease_retry "${compose[@]}" build egress-proxy
     PYTHONDONTWRITEBYTECODE=1 python3 "${ROOT_DIR}/scripts/test_egress_proxy.py"
     "${compose[@]}" config --quiet
     docker compose \
@@ -579,7 +613,7 @@ case "${1:-}" in
     printf 'Compose configuration is valid.\n'
     ;;
   build-xyz)
-    "${compose[@]}" build --pull xyz
+    run_with_buildkit_lease_retry "${compose[@]}" build --pull xyz
     ;;
   ps)
     "${compose[@]}" ps

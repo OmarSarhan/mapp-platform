@@ -92,6 +92,25 @@ class ResetCommandSafetyTests(unittest.TestCase):
         self.assertIn("including Census", self.script)
         self.assertNotIn("reload only configured ETL data", self.script)
 
+    def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
+        self.assertIn("is_buildkit_lease_failure()", self.script)
+        self.assertIn("run_with_buildkit_lease_retry()", self.script)
+        self.assertIn('lease "[^"]+": not found', self.script)
+        self.assertIn("docker buildx prune --all --force", self.script)
+        self.assertIn(
+            "Docker BuildKit reported a missing cache lease",
+            self.script,
+        )
+        self.assertIn(
+            'run_with_buildkit_lease_retry "${compose[@]}" '
+            'up --detach --build "${runtime_services[@]}"',
+            self.script,
+        )
+        self.assertIn(
+            'run_with_buildkit_lease_retry "${compose[@]}" build --pull xyz',
+            self.script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
