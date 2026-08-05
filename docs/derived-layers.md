@@ -203,9 +203,15 @@ The server requires:
 - schema-qualified relations declared in `sources`;
 - execution by the derived owner with an effective `search_path` fixed to
   `pg_catalog, public`, independent of every schema-qualified source lookup;
+- schema-qualified casts to allowlisted PostGIS/H3 types only when pre-analysis
+  resolves the exact type as a member of the expected extension and the
+  qualifier is the controlled `public` namespace and that extension's
+  authoritative namespace;
 - a ready PostgreSQL semantic profile for every declared source relation;
 - PostgreSQL's recorded relation dependencies to exactly match `sources`;
-- a typed PostGIS geometry with a positive SRID;
+- an explicit PostGIS geometry typmod with an allowed geometry subtype and a
+  positive SRID on the selected output column; a generic `geometry` column with
+  only a runtime SRID does not satisfy this output check;
 - a non-null, unique feature ID and at least one non-null geometry;
 - a bounded query shape and H3 expansion, followed by a recursively bounded
   PostgreSQL plan for every ordinary or materialized result;
@@ -329,6 +335,17 @@ the five-second `EXPLAIN`; the same catalog checks run again on the created
 relation before materialized population and before every refresh. Every derived
 database connection first pins its session `search_path` to `pg_catalog,
 public`; catalog OID and extension-membership checks remain the authority.
+
+Schema-qualified PostGIS/H3 cast types are a narrow exception to fixed-search-
+path type lookup. Before transient-view analysis, the server resolves the exact
+schema and type through the PostgreSQL catalogs, verifies exact membership in
+the allowlisted extension, and requires the qualifier to be both the controlled
+`public` namespace and that extension's authoritative namespace. A matching
+type name in another schema is rejected.
+For PostGIS `geometry(...)` casts, only allowlisted geometry typmods with a
+positive literal SRID are accepted. This cast admission does not relax output
+validation: the selected geometry attribute must still retain that explicit
+typmod and positive SRID.
 
 Successful mutations include `queryPlanProbe`; capabilities advertise the
 ordered AST/catalog/EXPLAIN `stages`, `shapeLimits`, plan `limits`, H3 bounds,
@@ -457,7 +474,8 @@ candidate_cells AS (
 projected_cells AS (
   SELECT
     h3,
-    ST_Transform(geom_4326, 3857)::geometry(Polygon, 3857) AS geom_3857
+    public.ST_Transform(geom_4326, 3857)
+      ::public.geometry(Polygon, 3857) AS geom_3857
   FROM candidate_cells
 )
 SELECT
@@ -476,6 +494,22 @@ Declare `leeds.definitive_paths` as the source, `h3_id` as the ID, and
 `geom_3857` as geometry. The map envelope bounds candidate-cell generation;
 every candidate's values still use all intersecting rows in the complete source
 relation.
+
+The example uses the `public` namespace required by the supported derived-owner
+provisioning. The guard does not trust that spelling alone: before PostgreSQL
+analyzes the query, it proves that `public.geometry` is the installed PostGIS
+type and that `public` is the extension's authoritative namespace. Qualifying
+both the routine and output cast also makes the required type contract explicit:
+
+```sql
+public.ST_Transform(geom_4326, 3857)
+  ::public.geometry(Polygon, 3857)
+```
+
+An external database must keep its PostGIS/H3 installation compatible with the
+controlled `pg_catalog, public` search path described in provisioning. Qualified
+cast admission does not broaden that path. The explicit typmod remains necessary
+for derived-output validation.
 
 `h3_polygon_to_cells` requires a literal resolution from 0 through 15 and the
 direct `_mapp_h3_scope.geom_4326` argument. The service estimates scope cells

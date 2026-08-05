@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import psycopg
 
+from derived_query_guard import GuardReason, QueryGuardViolation
 from derived_layers import (
     H3_SCOPE_MAX_ESTIMATED_EXPANDED_CELLS,
     H3_SCOPE_MAX_ESTIMATED_CELLS,
@@ -998,6 +999,99 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         store._validate_catalog_dependencies.assert_called_once()
 
+    def test_catalog_probe_approves_qualified_geometry_cast_before_view(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = self.explain_plan()
+        store = self.store_with_cursor(cursor)
+        store._catalog_query_probe = (
+            DerivedLayerStore._catalog_query_probe.__get__(
+                store, DerivedLayerStore
+            )
+        )
+        payload = self.valid(
+            query=(
+                "SELECT cell_id, "
+                "geom_3857::public.geometry(Polygon, 3857) AS geom_3857 "
+                "FROM leeds.h3_cells"
+            ),
+            sources=["leeds.h3_cells"],
+            spatialScope=self.spatial_scope(),
+        )
+        store._dependencies = MagicMock(return_value=payload["sources"])
+
+        def approve_qualified_casts(actual_cursor, inspection):
+            self.assertIs(cursor, actual_cursor)
+            self.assertEqual(
+                [("public", "geometry")],
+                [
+                    (cast_type.schema, cast_type.name)
+                    for cast_type in inspection.qualified_cast_types
+                ],
+            )
+            self.assertFalse(any(
+                "CREATE VIEW" in str(call.args[0])
+                for call in cursor.execute.call_args_list
+            ))
+
+        with patch(
+            "derived_layers.validate_qualified_cast_types",
+            side_effect=approve_qualified_casts,
+        ) as validate_casts:
+            store.preflight_definition(payload)
+
+        validate_casts.assert_called_once()
+        create = next(
+            call for call in cursor.execute.call_args_list
+            if "CREATE VIEW" in str(call.args[0])
+        )
+        self.assertIn(
+            "public.geometry(Polygon, 3857)",
+            create.args[0].as_string(None),
+        )
+
+    def test_qualified_cast_catalog_rejection_precedes_view_and_explain(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = self.explain_plan()
+        store = self.store_with_cursor(cursor)
+        store._catalog_query_probe = (
+            DerivedLayerStore._catalog_query_probe.__get__(
+                store, DerivedLayerStore
+            )
+        )
+        store._dependencies = MagicMock()
+        payload = self.valid(
+            query=(
+                "SELECT cell_id, "
+                "geom_3857::public.geometry(Polygon, 3857) AS geom_3857 "
+                "FROM leeds.h3_cells"
+            ),
+            sources=["leeds.h3_cells"],
+            spatialScope=self.spatial_scope(),
+        )
+        rejection = GuardReason(
+            "unapproved_cast_type",
+            "Resolved type public.geometry is not owned by PostGIS.",
+        )
+
+        with patch(
+            "derived_layers.validate_qualified_cast_types",
+            side_effect=QueryGuardViolation((rejection,)),
+        ):
+            with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+                store.preflight_definition(payload)
+
+        self.assertEqual(
+            {"method": "postgresql-catalog-guard"},
+            raised.exception.probe,
+        )
+        self.assertEqual([rejection.as_dict()], raised.exception.reasons)
+        statements = "\n".join(
+            str(call.args[0]) for call in cursor.execute.call_args_list
+        )
+        self.assertNotIn("CREATE VIEW", statements)
+        self.assertNotIn("EXPLAIN (FORMAT JSON)", statements)
+        store._dependencies.assert_not_called()
+
     def test_catalog_rejection_cannot_reach_explain_or_population(self):
         cursor = MagicMock()
         cursor.fetchone.return_value = self.explain_plan()
@@ -1140,6 +1234,42 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
                 cursor,
                 definition,
             )
+
+    def test_output_metadata_accepts_explicit_geometry_typmod(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "geometry_type": "Polygon",
+            "srid": 3857,
+        }
+        definition = validate_definition(self.valid(
+            spatialScope=self.spatial_scope(),
+        ))
+
+        output = DerivedLayerStore._validate_output_metadata(
+            cursor,
+            definition,
+        )
+
+        self.assertEqual(
+            {"geometryType": "Polygon", "srid": 3857},
+            output,
+        )
+
+    def test_output_metadata_rejects_generic_geometry_without_srid(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "geometry_type": "Geometry",
+            "srid": 0,
+        }
+        definition = validate_definition(self.valid(
+            spatialScope=self.spatial_scope(),
+        ))
+
+        with self.assertRaisesRegex(
+            DerivedLayerError,
+            "PostGIS geometry with a known coordinate system",
+        ):
+            DerivedLayerStore._validate_output_metadata(cursor, definition)
 
     def test_output_validation_bounds_one_scan_and_skips_materialized_group(self):
         definition = validate_definition(self.valid(

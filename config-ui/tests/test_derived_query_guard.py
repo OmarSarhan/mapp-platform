@@ -1,9 +1,11 @@
 import unittest
 
 from derived_query_guard import (
+    QualifiedCastType,
     QueryGuardViolation,
     inspect_query_ast,
     inspect_relation_types_and_casts,
+    validate_qualified_cast_types,
     validate_relation_routines,
 )
 
@@ -69,6 +71,20 @@ def type_dependency(**updates):
     return value
 
 
+def qualified_cast_type(**updates):
+    value = {
+        "schema": "public",
+        "name": "geometry",
+        "object_oid": 30000,
+        "type_defined": True,
+        "type_kind": "b",
+        "extension": "postgis",
+        "extension_schema": "public",
+    }
+    value.update(updates)
+    return value
+
+
 class QueryAstGuardTests(unittest.TestCase):
     def reason_codes(self, query):
         with self.assertRaises(QueryGuardViolation) as raised:
@@ -129,6 +145,53 @@ class QueryAstGuardTests(unittest.TestCase):
             "SELECT geom::geometry(Point, 3857), value::text "
             "FROM source.values"
         )
+
+    def test_qualified_postgis_geometry_cast_is_recorded_for_catalog_validation(self):
+        inspection = inspect_query_ast(
+            "SELECT geom::public.geometry(Polygon, 3857) FROM source.values"
+        )
+
+        self.assertEqual(
+            (QualifiedCastType(schema="public", name="geometry"),),
+            inspection.qualified_cast_types,
+        )
+
+    def test_lower_level_h3_wkb_query_records_qualified_geometry_cast(self):
+        inspection = inspect_query_ast(
+            "WITH scope_cells AS ("
+            "SELECT h3_polygon_to_cells(_mapp_h3_scope.geom_4326, 9) AS h3_id "
+            "FROM _mapp_h3_scope"
+            ") "
+            "SELECT h3_id::text AS h3_id, "
+            "public.ST_Transform("
+            "public.ST_GeomFromWKB(h3_cell_to_boundary_wkb(h3_id), 4326), "
+            "3857"
+            ")::public.geometry(Polygon, 3857) AS geom_3857 "
+            "FROM scope_cells"
+        )
+
+        self.assertEqual(
+            (QualifiedCastType(schema="public", name="geometry"),),
+            inspection.qualified_cast_types,
+        )
+
+    def test_qualified_non_extension_cast_type_is_rejected(self):
+        self.assertIn(
+            "unapproved_cast_type",
+            self.reason_codes("SELECT value::public.text FROM source.values"),
+        )
+
+    def test_qualified_geometry_cast_requires_static_valid_positive_typmods(self):
+        queries = (
+            "SELECT geom::public.geometry(NotGeometry, 3857) FROM source.values",
+            "SELECT geom::public.geometry(Polygon) FROM source.values",
+            "SELECT geom::public.geometry(Polygon, srid) FROM source.values",
+            "SELECT geom::public.geometry(Polygon, 0) FROM source.values",
+            "SELECT geom::public.geometry(Polygon, -1) FROM source.values",
+        )
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertIn("unapproved_cast_typmod", self.reason_codes(query))
 
     def test_reserved_bindings_include_quoted_unicode_identifiers(self):
         queries = (
@@ -393,6 +456,58 @@ class CatalogRoutineGuardTests(unittest.TestCase):
             ),
         )
         self.assertEqual(3, len(result))
+
+    def test_allows_qualified_cast_type_in_authoritative_extension_schema(self):
+        inspection = inspect_query_ast(
+            "SELECT geom::public.geometry(Polygon, 3857) FROM source.values"
+        )
+        cursor = Cursor([qualified_cast_type()])
+
+        validate_qualified_cast_types(
+            cursor,
+            inspection,
+        )
+        query, params = cursor.calls[0]
+        self.assertEqual(2, query.count("%s"))
+        self.assertEqual(2, query.count("WITH ORDINALITY"))
+        self.assertEqual((["public"], ["geometry"]), params)
+
+    def test_rejects_qualified_cast_type_without_exact_extension_catalog_match(self):
+        inspection = inspect_query_ast(
+            "SELECT geom::public.geometry(Polygon, 3857) FROM source.values"
+        )
+        catalog_results = (
+            (),
+            (qualified_cast_type(object_oid=None),),
+            (qualified_cast_type(type_defined=False),),
+            (qualified_cast_type(type_kind="c"),),
+            (qualified_cast_type(extension=None),),
+            (qualified_cast_type(extension="h3"),),
+            (qualified_cast_type(extension_schema="postgis"),),
+            (qualified_cast_type(schema="other"),),
+        )
+        for rows in catalog_results:
+            with self.subTest(rows=rows):
+                with self.assertRaises(QueryGuardViolation) as raised:
+                    validate_qualified_cast_types(Cursor(rows), inspection)
+                self.assertIn(
+                    "unapproved_cast_type",
+                    {reason.code for reason in raised.exception.reasons},
+                )
+
+        non_public = inspect_query_ast(
+            "SELECT geom::geo.geometry(Polygon, 3857) FROM source.values"
+        )
+        with self.assertRaises(QueryGuardViolation):
+            validate_qualified_cast_types(
+                Cursor([
+                    qualified_cast_type(
+                        schema="geo",
+                        extension_schema="geo",
+                    )
+                ]),
+                non_public,
+            )
 
     def test_rejects_volatile_unproved_set_and_geometry_aggregates(self):
         cases = (

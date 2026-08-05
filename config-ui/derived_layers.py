@@ -21,6 +21,7 @@ from derived_query_guard import (
     H3_RING_FUNCTIONS,
     QueryAstInspection,
     QueryGuardViolation,
+    validate_qualified_cast_types,
     validate_query_ast,
     validate_relation_routines,
 )
@@ -1506,6 +1507,14 @@ class DerivedLayerStore:
         definition: dict[str, Any],
         inspection: QueryAstInspection,
     ) -> None:
+        try:
+            validate_qualified_cast_types(cur, inspection)
+        except QueryGuardViolation as exc:
+            raise DerivedLayerQueryTooExpensive(
+                definition["name"],
+                {"method": "postgresql-catalog-guard"},
+                [reason.as_dict() for reason in exc.reasons],
+            ) from exc
         probe_name = f"probe_{secrets.token_hex(10)}"
         target = sql.Identifier(SCHEMA, probe_name)
         cur.execute("SAVEPOINT derived_catalog_probe")

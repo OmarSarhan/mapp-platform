@@ -8,6 +8,11 @@ first release.
 
 ### Fixed
 
+- Allowed schema-qualified PostGIS/H3 cast types only after pre-analysis proves
+  exact allowlisted-extension membership and an authoritative controlled
+  `public` namespace match, so geometry typmods can resolve under the restricted
+  search path without weakening the existing explicit-typmod and positive-SRID
+  output requirement.
 - Changed growing semantic, derived-profile, source-relation, and
   workspace-proposal pages to bounded keyset/limit+1 reads with
   integrity-bound revision, configuration, and visibility cursors, plus a

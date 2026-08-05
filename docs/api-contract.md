@@ -539,6 +539,13 @@ recursively enforces advertised cost, row, intermediate-byte, join-expansion,
 node, depth, and worker limits. SQL-shape and bounded H3-expansion checks run
 before planning. `queryGuard` advertises its ordered AST/catalog/EXPLAIN
 `stages`, `shapeLimits`, plan `limits`, H3 bounds, and `errorCategories`.
+Schema-qualified PostGIS/H3 cast targets enter catalog validation only when the
+type name is allowlisted; before query analysis, the server proves exact type
+membership in the expected extension and requires the qualifier to match that
+extension's authoritative namespace and the controlled `public` schema. The
+selected output geometry must still carry an explicit geometry subtype and
+positive-SRID typmod; a runtime SRID on a generic `geometry` column is
+insufficient.
 Successful mutations include `queryPlanProbe`. Query guard failures use this
 stable taxonomy:
 

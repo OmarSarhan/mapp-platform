@@ -9,6 +9,7 @@ from pglast import parse_sql
 
 
 APPROVED_EXTENSIONS = frozenset({"postgis", "h3", "h3_postgis"})
+CONTROLLED_EXTENSION_SCHEMA = "public"
 MAX_GENERATED_ROWS = 100_000
 RESERVED_NAME_PREFIX = "_mapp_"
 SERVER_H3_SCOPE = "_mapp_h3_scope"
@@ -117,14 +118,38 @@ APPROVED_BUILTIN_AGGREGATES = frozenset({
     "stddev_pop", "stddev_samp", "sum", "var_pop", "var_samp", "variance",
 })
 APPROVED_EXTENSION_AGGREGATES = frozenset({"st_3dextent", "st_extent"})
-APPROVED_UNQUALIFIED_EXTENSION_TYPES = frozenset({
-    "box2d",
-    "box3d",
-    "geography",
+APPROVED_EXTENSION_TYPE_OWNERS = {
+    "box2d": frozenset({"postgis"}),
+    "box3d": frozenset({"postgis"}),
+    "geography": frozenset({"postgis"}),
+    "geometry": frozenset({"postgis"}),
+    "h3index": frozenset({"h3"}),
+    "spheroid": frozenset({"postgis"}),
+}
+APPROVED_EXTENSION_TYPES = frozenset(APPROVED_EXTENSION_TYPE_OWNERS)
+POSTGIS_GEOMETRY_TYPE_BASES = frozenset({
+    "circularstring",
+    "compoundcurve",
+    "curvepolygon",
     "geometry",
-    "h3index",
-    "spheroid",
+    "geometrycollection",
+    "linestring",
+    "multicurve",
+    "multilinestring",
+    "multipoint",
+    "multipolygon",
+    "multisurface",
+    "point",
+    "polygon",
+    "polyhedralsurface",
+    "tin",
+    "triangle",
 })
+APPROVED_POSTGIS_GEOMETRY_TYPMODS = frozenset(
+    f"{geometry_type}{dimensions}"
+    for geometry_type in POSTGIS_GEOMETRY_TYPE_BASES
+    for dimensions in ("", "z", "m", "zm")
+)
 APPROVED_UNQUALIFIED_BUILTIN_TYPES = frozenset({
     "bit",
     "bool",
@@ -302,9 +327,16 @@ class FunctionCall:
         return tuple(_integer_literal(argument) for argument in self.arguments)
 
 
+@dataclass(frozen=True, order=True)
+class QualifiedCastType:
+    schema: str
+    name: str
+
+
 @dataclass(frozen=True)
 class QueryAstInspection:
     function_calls: tuple[FunctionCall, ...]
+    qualified_cast_types: tuple[QualifiedCastType, ...]
     join_count: int
     cte_count: int
     set_operation_count: int
@@ -448,6 +480,29 @@ def _integer_literal(value: Any) -> int | None:
     }:
         return None
     return _integer_literal(value.get("arg"))
+
+
+def _postgis_typmods_are_allowed(type_name: dict[str, Any]) -> bool:
+    typmods = tuple(type_name.get("typmods", ()))
+    if not typmods:
+        return True
+    if len(typmods) != 2:
+        return False
+    geometry_type = typmods[0]
+    if (
+        not isinstance(geometry_type, dict)
+        or geometry_type.get("@") != "ColumnRef"
+    ):
+        return False
+    fields = tuple(geometry_type.get("fields", ()))
+    subtype = _string_node(fields[0]) if len(fields) == 1 else None
+    srid = _integer_literal(typmods[1])
+    return (
+        isinstance(subtype, str)
+        and subtype.lower() in APPROVED_POSTGIS_GEOMETRY_TYPMODS
+        and srid is not None
+        and srid > 0
+    )
 
 
 def _boolean_literal(value: Any) -> bool | None:
@@ -736,6 +791,7 @@ def inspect_query_ast(query: str) -> QueryAstInspection:
 
     reasons: list[GuardReason] = []
     calls: list[FunctionCall] = []
+    qualified_cast_types: set[QualifiedCastType] = set()
     join_count = 0
     cte_count = 0
     set_operation_count = 0
@@ -870,21 +926,42 @@ def inspect_query_ast(query: str) -> QueryAstInspection:
                 )
                 if part is not None
             )
+            qualified_extension_type = (
+                len(names) == 2
+                and names[1].lower() in APPROVED_EXTENSION_TYPES
+            )
             trusted_type = (
                 len(names) == 2 and names[0] == "pg_catalog"
-            ) or (
+            ) or qualified_extension_type or (
                 len(names) == 1
                 and names[0].lower() in (
                     APPROVED_UNQUALIFIED_BUILTIN_TYPES
-                    | APPROVED_UNQUALIFIED_EXTENSION_TYPES
+                    | APPROVED_EXTENSION_TYPES
                 )
             )
+            if qualified_extension_type:
+                if (
+                    names[1].lower() in {"geography", "geometry"}
+                    and not _postgis_typmods_are_allowed(type_name)
+                ):
+                    reasons.append(_reason(
+                        "unapproved_cast_typmod",
+                        "Schema-qualified PostGIS geometry casts with type "
+                        "modifiers require an allowed literal geometry subtype "
+                        "and a positive literal SRID.",
+                    ))
+                else:
+                    qualified_cast_types.add(QualifiedCastType(
+                        schema=names[0],
+                        name=names[1],
+                    ))
             if not trusted_type:
                 reasons.append(_reason(
                     "unapproved_cast_type",
                     "Explicit casts may target only pg_catalog types or "
-                    "unqualified PostGIS/H3 types; resolved extension "
-                    "membership is checked before planning.",
+                    "approved PostGIS/H3 type names; schema-qualified extension "
+                    "types must pass catalog membership validation before "
+                    "planning.",
                 ))
         elif kind == "A_Expr":
             operator_name = tuple(
@@ -974,6 +1051,7 @@ def inspect_query_ast(query: str) -> QueryAstInspection:
         raise QueryGuardViolation(reasons)
     return QueryAstInspection(
         function_calls=tuple(calls),
+        qualified_cast_types=tuple(sorted(qualified_cast_types)),
         join_count=join_count,
         cte_count=cte_count,
         set_operation_count=set_operation_count,
@@ -983,6 +1061,87 @@ def inspect_query_ast(query: str) -> QueryAstInspection:
 
 def validate_query_ast(query: str) -> QueryAstInspection:
     return inspect_query_ast(query)
+
+
+def validate_qualified_cast_types(
+    cur,
+    inspection: QueryAstInspection,
+) -> list[dict[str, Any]]:
+    references = inspection.qualified_cast_types
+    if not references:
+        return []
+    cur.execute(
+        """
+        WITH requested(schema, name) AS (
+          SELECT requested_schema.schema, requested_name.name
+          FROM pg_catalog.unnest(%s::pg_catalog.text[])
+            WITH ORDINALITY AS requested_schema(schema, ordinal)
+          JOIN pg_catalog.unnest(%s::pg_catalog.text[])
+            WITH ORDINALITY AS requested_name(name, ordinal)
+            USING (ordinal)
+        )
+        SELECT
+          requested.schema,
+          requested.name,
+          target_type.oid AS object_oid,
+          target_type.typisdefined AS type_defined,
+          target_type.typtype AS type_kind,
+          extension.extname AS extension,
+          extension_namespace.nspname AS extension_schema
+        FROM requested
+        LEFT JOIN pg_catalog.pg_namespace AS type_namespace
+          ON type_namespace.nspname = requested.schema
+        LEFT JOIN pg_catalog.pg_type AS target_type
+          ON target_type.typnamespace = type_namespace.oid
+         AND target_type.typname = requested.name
+        LEFT JOIN pg_catalog.pg_depend AS extension_membership
+          ON extension_membership.classid =
+               'pg_catalog.pg_type'::pg_catalog.regclass
+         AND extension_membership.objid = target_type.oid
+         AND extension_membership.refclassid =
+               'pg_catalog.pg_extension'::pg_catalog.regclass
+         AND extension_membership.deptype = 'e'
+        LEFT JOIN pg_catalog.pg_extension AS extension
+          ON extension.oid = extension_membership.refobjid
+        LEFT JOIN pg_catalog.pg_namespace AS extension_namespace
+          ON extension_namespace.oid = extension.extnamespace
+        ORDER BY requested.schema, requested.name
+        """,
+        (
+            [reference.schema for reference in references],
+            [reference.name for reference in references],
+        ),
+    )
+    rows = [dict(item) for item in cur.fetchall()]
+    resolved = {
+        (row.get("schema"), row.get("name")): row
+        for row in rows
+    }
+    reasons: list[GuardReason] = []
+    for reference in references:
+        row = resolved.get((reference.schema, reference.name), {})
+        allowed_extensions = APPROVED_EXTENSION_TYPE_OWNERS.get(
+            reference.name.lower(),
+            frozenset(),
+        )
+        if not (
+            row.get("object_oid") is not None
+            and row.get("type_defined") is True
+            and row.get("type_kind") == "b"
+            and row.get("extension") in allowed_extensions
+            and reference.schema == CONTROLLED_EXTENSION_SCHEMA
+            and row.get("extension_schema") == reference.schema
+        ):
+            reasons.append(_reason(
+                "unapproved_cast_type",
+                f"Qualified cast type {reference.schema}.{reference.name} "
+                "must be a defined base type owned by its approved PostGIS/H3 "
+                f"extension in the controlled {CONTROLLED_EXTENSION_SCHEMA} "
+                "schema, which must be that extension's authoritative schema.",
+            ))
+    if reasons:
+        raise QueryGuardViolation(reasons)
+    return rows
 
 
 def inspect_relation_routines(
