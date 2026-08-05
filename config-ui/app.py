@@ -4515,6 +4515,10 @@ class Handler(SimpleHTTPRequestHandler):
                         "kinds": ["view", "materialized"],
                         "spatialScopeTypes": ["workspace-map-extent"],
                         "h3Available": False,
+                        "h3Readiness": {
+                            "method": "postgresql-catalog-and-execution",
+                            "ready": False,
+                        },
                     }
                 )
                 result["backgroundJobs"] = derived_background_capacity()

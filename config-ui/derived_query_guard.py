@@ -1336,6 +1336,112 @@ def inspect_relation_routines(
     return dependencies
 
 
+def inspect_h3_polygon_wrapper(
+    cur,
+) -> tuple[RoutineDependency, str] | None:
+    cur.execute(
+        """
+        WITH approved_extension_namespaces AS (
+          SELECT DISTINCT namespace.nspname
+          FROM pg_extension AS extension
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = extension.extnamespace
+          WHERE extension.extname = ANY(%s::text[])
+        ), approved_extension_path AS (
+          SELECT
+            'search_path=pg_catalog'
+              || COALESCE(
+                   ', ' || string_agg(
+                     quote_ident(nspname), ', ' ORDER BY nspname
+                   ),
+                   ''
+                 ) AS value
+          FROM approved_extension_namespaces
+        ), postgis_geometry AS (
+          SELECT
+            geometry_type.oid,
+            geometry_namespace.nspname AS geometry_schema
+          FROM pg_type AS geometry_type
+          JOIN pg_namespace AS geometry_namespace
+            ON geometry_namespace.oid = geometry_type.typnamespace
+          JOIN pg_depend AS extension_membership
+            ON extension_membership.classid = 'pg_type'::regclass
+           AND extension_membership.objid = geometry_type.oid
+           AND extension_membership.refclassid = 'pg_extension'::regclass
+           AND extension_membership.deptype = 'e'
+          JOIN pg_extension AS extension
+            ON extension.oid = extension_membership.refobjid
+          WHERE geometry_type.typname = 'geometry'
+            AND geometry_type.typisdefined
+            AND geometry_type.typtype = 'b'
+            AND extension.extname = 'postgis'
+            AND extension.extnamespace = geometry_type.typnamespace
+        ), wrapper AS (
+          SELECT
+            routine.*,
+            routine_namespace.nspname AS routine_schema,
+            extension.extname AS extension,
+            extension_namespace.nspname AS extension_schema,
+            language.lanname AS language,
+            postgis_geometry.geometry_schema
+          FROM pg_proc AS routine
+          JOIN pg_namespace AS routine_namespace
+            ON routine_namespace.oid = routine.pronamespace
+          JOIN pg_depend AS extension_membership
+            ON extension_membership.classid = 'pg_proc'::regclass
+           AND extension_membership.objid = routine.oid
+           AND extension_membership.refclassid = 'pg_extension'::regclass
+           AND extension_membership.deptype = 'e'
+          JOIN pg_extension AS extension
+            ON extension.oid = extension_membership.refobjid
+          JOIN pg_namespace AS extension_namespace
+            ON extension_namespace.oid = extension.extnamespace
+          JOIN pg_language AS language
+            ON language.oid = routine.prolang
+          CROSS JOIN postgis_geometry
+          WHERE routine.proname = 'h3_polygon_to_cells'
+            AND routine.pronargs = 2
+            AND routine.proargtypes[0] = postgis_geometry.oid
+            AND routine.proargtypes[1] = 'int4'::regtype
+            AND extension.extname = 'h3_postgis'
+            AND extension.extnamespace = routine.pronamespace
+        )
+        SELECT
+          'function'::text AS kind,
+          wrapper.oid AS object_oid,
+          wrapper.oid::regprocedure::text AS identity,
+          wrapper.routine_schema AS schema,
+          wrapper.proname AS name,
+          wrapper.extension,
+          wrapper.extension_schema,
+          wrapper.routine_schema AS implementation_schema,
+          wrapper.extension AS implementation_extension,
+          wrapper.extension_schema AS implementation_extension_schema,
+          wrapper.provolatile AS volatility,
+          wrapper.proretset AS returns_set,
+          wrapper.prokind AS routine_kind,
+          wrapper.prosecdef AS security_definer,
+          wrapper.proconfig AS routine_config,
+          wrapper.language,
+          false AS object_builtin,
+          false AS implementation_builtin,
+          approved_extension_path.value AS approved_extension_search_path,
+          wrapper.geometry_schema
+        FROM wrapper
+        CROSS JOIN approved_extension_path
+        """,
+        (sorted(APPROVED_EXTENSIONS),),
+    )
+    rows = cur.fetchall()
+    if len(rows) != 1:
+        return None
+    row = dict(rows[0])
+    geometry_schema = row.pop("geometry_schema")
+    if row.get("routine_config") is not None:
+        row["routine_config"] = tuple(row["routine_config"])
+    return RoutineDependency(**row), geometry_schema
+
+
 def inspect_relation_types_and_casts(
     cur,
     schema: str,
@@ -1529,18 +1635,106 @@ def _is_h3_sql_wrapper(dependency: RoutineDependency) -> bool:
     )
 
 
+def _parse_search_path(value: str) -> tuple[str, ...] | None:
+    schemas: list[str] = []
+    index = 0
+    while index < len(value):
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index == len(value):
+            return None
+        if value[index] == '"':
+            index += 1
+            name: list[str] = []
+            while index < len(value):
+                if value[index] != '"':
+                    name.append(value[index])
+                    index += 1
+                    continue
+                if index + 1 < len(value) and value[index + 1] == '"':
+                    name.append('"')
+                    index += 2
+                    continue
+                index += 1
+                break
+            else:
+                return None
+            while index < len(value) and value[index].isspace():
+                index += 1
+            schema = "".join(name)
+        else:
+            start = index
+            while index < len(value) and value[index] != ",":
+                index += 1
+            raw_schema = value[start:index].strip()
+            if not raw_schema or '"' in raw_schema or any(
+                character.isspace() for character in raw_schema
+            ):
+                return None
+            schema = raw_schema.lower()
+        if not schema:
+            return None
+        schemas.append(schema)
+        if index == len(value):
+            break
+        if value[index] != ",":
+            return None
+        index += 1
+        if index == len(value):
+            return None
+    return tuple(schemas)
+
+
+def _configured_search_path(
+    routine_config: tuple[str, ...] | None,
+) -> tuple[str, ...] | None:
+    if not routine_config or len(routine_config) != 1:
+        return None
+    setting, separator, value = routine_config[0].partition("=")
+    if separator != "=" or setting.strip() != "search_path":
+        return None
+    return _parse_search_path(value)
+
+
 def _has_approved_extension_search_path(
     dependency: RoutineDependency,
 ) -> bool:
+    configured = _configured_search_path(dependency.routine_config)
+    approved = _configured_search_path((
+        dependency.approved_extension_search_path,
+    ))
     return (
         _is_h3_sql_wrapper(dependency)
         and dependency.implementation_extension == dependency.extension
         and dependency.schema == dependency.extension_schema
         and dependency.implementation_schema
         == dependency.implementation_extension_schema
-        and dependency.routine_config
-        == (dependency.approved_extension_search_path,)
+        and configured is not None
+        and approved is not None
+        and configured[0] == "pg_catalog"
+        and approved[0] == "pg_catalog"
+        and len(configured) == len(set(configured))
+        and frozenset(configured[1:]) == frozenset(approved[1:])
     )
+
+
+def approved_h3_polygon_wrapper(
+    cur,
+) -> tuple[RoutineDependency, str] | None:
+    inspected = inspect_h3_polygon_wrapper(cur)
+    if inspected is None:
+        return None
+    dependency, geometry_schema = inspected
+    if not (
+        _has_approved_extension_search_path(dependency)
+        and dependency.returns_set
+        and dependency.routine_kind == "f"
+        and not dependency.security_definer
+        and dependency.volatility != "v"
+        and dependency.language in APPROVED_ROUTINE_LANGUAGES
+    ):
+        return None
+    return dependency, geometry_schema
 
 
 def validate_relation_routines(
@@ -1589,7 +1783,7 @@ def validate_relation_routines(
                 "configured_routine",
                 f"Resolved routine {dependency.identity} must not change "
                 "session configuration. Approved H3 SQL wrappers are the "
-                "only exception and must pin search_path exactly to "
+                "only exception and must pin search_path to "
                 "pg_catalog plus the authoritative schemas of the installed "
                 "PostGIS/H3 extensions.",
             ))

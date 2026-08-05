@@ -3,6 +3,7 @@ import unittest
 from derived_query_guard import (
     QualifiedCastType,
     QueryGuardViolation,
+    approved_h3_polygon_wrapper,
     inspect_query_ast,
     inspect_relation_types_and_casts,
     validate_qualified_cast_types,
@@ -491,6 +492,31 @@ class CatalogRoutineGuardTests(unittest.TestCase):
                 ),
                 returns_set=True,
             ),
+            dependency(
+                identity="public.h3_polygon_to_cells(geometry,integer)",
+                name="h3_polygon_to_cells",
+                extension="h3_postgis",
+                extension_schema="public",
+                implementation_extension="h3_postgis",
+                implementation_extension_schema="public",
+                routine_config=("search_path= pg_catalog , \"public\" ",),
+                returns_set=True,
+            ),
+            dependency(
+                identity="hex.h3_polygon_to_cells(geo.geometry,integer)",
+                schema="hex",
+                name="h3_polygon_to_cells",
+                extension="h3_postgis",
+                extension_schema="hex",
+                implementation_schema="hex",
+                implementation_extension="h3_postgis",
+                implementation_extension_schema="hex",
+                routine_config=("search_path=pg_catalog, hex, geo",),
+                approved_extension_search_path=(
+                    "search_path=pg_catalog, geo, hex"
+                ),
+                returns_set=True,
+            ),
         )
 
         for row in rows:
@@ -544,6 +570,32 @@ class CatalogRoutineGuardTests(unittest.TestCase):
                     "work_mem=1GB",
                 ),
             ),
+            dependency(
+                **approved,
+                routine_config=("search_path=public, pg_catalog",),
+            ),
+            dependency(
+                **approved,
+                routine_config=(
+                    "search_path=pg_catalog, public, public",
+                ),
+            ),
+            dependency(
+                **approved,
+                routine_config=(
+                    "search_path=pg_catalog, public, $user",
+                ),
+            ),
+            dependency(
+                **approved,
+                routine_config=(
+                    "search_path=pg_catalog, public, pg_temp",
+                ),
+            ),
+            dependency(
+                **approved,
+                routine_config=("search_path=pg_catalog, public,",),
+            ),
         )
 
         for row in rows:
@@ -556,6 +608,39 @@ class CatalogRoutineGuardTests(unittest.TestCase):
                     "configured_routine",
                     {reason.code for reason in raised.exception.reasons},
                 )
+
+    def test_capability_resolves_the_exact_extension_owned_geometry_wrapper(self):
+        cursor = Cursor([{
+            **dependency(
+                identity="public.h3_polygon_to_cells(geometry,integer)",
+                name="h3_polygon_to_cells",
+                extension="h3_postgis",
+                extension_schema="public",
+                implementation_extension="h3_postgis",
+                implementation_extension_schema="public",
+                routine_config=("search_path=pg_catalog, public",),
+                returns_set=True,
+            ),
+            "geometry_schema": "public",
+        }])
+
+        wrapper = approved_h3_polygon_wrapper(cursor)
+
+        self.assertIsNotNone(wrapper)
+        dependency_result, geometry_schema = wrapper
+        self.assertEqual("h3_postgis", dependency_result.extension)
+        self.assertEqual("public", geometry_schema)
+        query, parameters = cursor.calls[0]
+        self.assertIn(
+            "routine.proargtypes[0] = postgis_geometry.oid",
+            query,
+        )
+        self.assertIn("extension.extname = 'h3_postgis'", query)
+        self.assertIn("extension_membership.deptype = 'e'", query)
+        self.assertEqual(
+            (["h3", "h3_postgis", "postgis"],),
+            parameters,
+        )
 
     def test_catalog_path_does_not_approve_arbitrary_public_routine(self):
         row = dependency(

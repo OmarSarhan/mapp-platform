@@ -8,6 +8,11 @@ first release.
 
 ### Fixed
 
+- Compared approved H3 polygon-wrapper `search_path` settings semantically,
+  retaining `pg_catalog` precedence and exact authoritative extension-schema
+  membership while tolerating harmless quoting, whitespace, and extension
+  ordering. H3 capability reporting now verifies the exact extension-owned
+  geometry overload and executes a bounded nested-dependency readiness probe.
 - Reported authoritative derived-mutation failure phases and commit state,
   distinguishing preflight and proven rollback from commit, reporting,
   polling, and recovery uncertainty without exposing database internals.

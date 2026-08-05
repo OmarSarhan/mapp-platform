@@ -334,10 +334,13 @@ relation dependencies must match exactly, and routines must be genuine
 dynamic-query, file, large-object, and server-control dependencies are
 rejected. Routine configuration is also rejected except for the H3 PostGIS
 polygon SQL wrappers: those extension-owned routines must pin `search_path`
-exactly to `pg_catalog` plus the distinct authoritative namespaces of the
-installed allowlisted extensions. The catalog must prove both object and
-implementation provenance; a same-named custom routine or any wider setting is
-rejected. The savepoint is rolled back before the five-second `EXPLAIN`; the
+to `pg_catalog` first plus all and only the distinct authoritative namespaces
+of the installed allowlisted extensions. Comparison follows PostgreSQL
+identifier quoting and ignores harmless whitespace and extension-schema order;
+duplicates, `$user`, temporary schemas, missing schemas, unrelated schemas, and
+additional routine settings remain rejected. The catalog must prove both object
+and implementation provenance; a same-named custom routine or any wider setting
+is rejected. The savepoint is rolled back before the five-second `EXPLAIN`; the
 same catalog checks run again on the created relation before materialized
 population and before every refresh. Every derived database connection first
 pins its session `search_path` to `pg_catalog, public`; catalog OID and
@@ -556,7 +559,7 @@ PostgreSQL plan budget still applies after these H3-specific checks.
 
 | Route | Scope | Purpose |
 | --- | --- | --- |
-| `GET /api/derived-layers/capabilities` | `inspect` | Modes, PostGIS/H3 versions, universal query-plan limits, H3 bounds, and the materialized-size limit |
+| `GET /api/derived-layers/capabilities` | `inspect` | Modes, PostGIS/H3 versions, exact-overload catalog and bounded execution readiness, universal query-plan limits, H3 bounds, and the materialized-size limit |
 | `GET /api/derived-layers/map-extent?locale=KEY` | `inspect` | Preview the server-resolved fixed workspace map extent |
 | `GET /api/derived-layers` | `inspect` | Definitions without SQL |
 | `GET /api/derived-layers/{name}` | `inspect` | One definition including SQL |

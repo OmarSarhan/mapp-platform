@@ -832,14 +832,41 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
 
     def test_capabilities_advertise_closed_query_and_h3_guards(self):
         cursor = MagicMock()
-        cursor.fetchall.return_value = [
+        extensions = [
             {"extname": "h3", "extversion": "4.2"},
             {"extname": "h3_postgis", "extversion": "4.2"},
             {"extname": "postgis", "extversion": "3.5"},
         ]
+        wrapper = {
+            "kind": "function",
+            "object_oid": 100,
+            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "schema": "public",
+            "name": "h3_polygon_to_cells",
+            "extension": "h3_postgis",
+            "extension_schema": "public",
+            "implementation_schema": "public",
+            "implementation_extension": "h3_postgis",
+            "implementation_extension_schema": "public",
+            "volatility": "i",
+            "returns_set": True,
+            "routine_kind": "f",
+            "security_definer": False,
+            "routine_config": ["search_path=pg_catalog, public"],
+            "language": "sql",
+            "object_builtin": False,
+            "implementation_builtin": False,
+            "approved_extension_search_path": (
+                "search_path=pg_catalog, public"
+            ),
+            "geometry_schema": "public",
+        }
+        cursor.fetchall.side_effect = [extensions, [wrapper]]
+        cursor.fetchone.return_value = {"cellCount": 0}
         store = self.store_with_cursor(cursor)
 
-        query_guard = store.capabilities()["queryGuard"]
+        capabilities = store.capabilities()
+        query_guard = capabilities["queryGuard"]
 
         self.assertEqual({
             "method",
@@ -905,6 +932,62 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             H3_SCOPE_MAX_ESTIMATED_EXPANDED_CELLS,
             query_guard["h3"]["maxEstimatedExpandedCells"],
         )
+        self.assertTrue(capabilities["h3Available"])
+        self.assertEqual(
+            {
+                "method": "postgresql-catalog-and-execution",
+                "ready": True,
+            },
+            capabilities["h3Readiness"],
+        )
+        self.assertEqual(3, cursor.execute.call_count)
+
+    def test_capabilities_do_not_advertise_an_unsafe_h3_wrapper(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [[
+            {"extname": "h3", "extversion": "4.2"},
+            {"extname": "h3_postgis", "extversion": "4.2"},
+            {"extname": "postgis", "extversion": "3.5"},
+        ], [{
+            "kind": "function",
+            "object_oid": 100,
+            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "schema": "public",
+            "name": "h3_polygon_to_cells",
+            "extension": "h3_postgis",
+            "extension_schema": "public",
+            "implementation_schema": "public",
+            "implementation_extension": "h3_postgis",
+            "implementation_extension_schema": "public",
+            "volatility": "i",
+            "returns_set": True,
+            "routine_kind": "f",
+            "security_definer": False,
+            "routine_config": [
+                "search_path=pg_catalog, public, unsafe"
+            ],
+            "language": "sql",
+            "object_builtin": False,
+            "implementation_builtin": False,
+            "approved_extension_search_path": (
+                "search_path=pg_catalog, public"
+            ),
+            "geometry_schema": "public",
+        }]]
+        store = self.store_with_cursor(cursor)
+
+        capabilities = store.capabilities()
+
+        self.assertFalse(capabilities["h3Available"])
+        self.assertEqual(
+            {
+                "method": "postgresql-catalog-and-execution",
+                "ready": False,
+            },
+            capabilities["h3Readiness"],
+        )
+        cursor.fetchone.assert_not_called()
+        self.assertEqual(2, cursor.execute.call_count)
 
     def test_create_persists_scope_and_keeps_original_query(self):
         cursor = MagicMock()

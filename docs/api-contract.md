@@ -307,7 +307,7 @@ request as approval.
 | `GET /api/workspace` | Workspace plus bytes-and-file-generation revision |
 | `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
 | `GET /api/catalog` | Database connections and renderable tables offered for new layers; omits the PostgreSQL `public` schema |
-| `GET /api/derived-layers/capabilities` | Managed-view, H3, and materialized-size guard availability |
+| `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, and materialized-size guard availability |
 | `GET /api/derived-layers/map-extent?locale=KEY` | Preview a fixed 1920×1080 workspace extent at one zoom level wider than the selected effective locale |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
 | `GET /api/derived-layers/<name>` | One definition including its SQL |
@@ -323,6 +323,13 @@ request as approval.
 | `POST /api/semantic/generate` | Produce a review-only semantic draft for a table or stable field ID, with optional bounded data context |
 | `GET /api/icons` | Valid public SVG choices |
 | `GET /api/sql/capabilities` | Supported calculated-value expression model |
+
+Derived-layer capabilities set `h3Available` only when the exact
+extension-owned `h3_polygon_to_cells(geometry, integer)` overload passes the
+same catalog policy used for submitted queries and successfully executes a
+bounded synthetic polygon probe. `h3Readiness` reports
+`method: "postgresql-catalog-and-execution"` and the corresponding `ready`
+boolean; the probe reads no source relation or user row.
 | `GET /api/proposals?limit=N&cursor=CURSOR` | One bounded page of proposal summaries |
 | `GET /api/proposals/<id>` | Complete proposal record |
 | `GET /api/xyz/status` | Requested/applied reload generations and health |

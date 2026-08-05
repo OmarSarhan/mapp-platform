@@ -22,6 +22,7 @@ from derived_query_guard import (
     H3_RING_FUNCTIONS,
     QueryAstInspection,
     QueryGuardViolation,
+    approved_h3_polygon_wrapper,
     validate_qualified_cast_types,
     validate_query_ast,
     validate_relation_routines,
@@ -2941,6 +2942,40 @@ class DerivedLayerStore:
             ))
             return [row["name"] for row in cur.fetchall()]
 
+    @staticmethod
+    def _h3_capability_ready(
+        connection,
+        cur,
+        extensions: dict[str, str],
+    ) -> bool:
+        if not {"postgis", "h3", "h3_postgis"}.issubset(extensions):
+            return False
+        try:
+            with connection.transaction():
+                approved = approved_h3_polygon_wrapper(cur)
+                if approved is None:
+                    return False
+                wrapper, geometry_schema = approved
+                cur.execute(
+                    sql.SQL("""
+                        SELECT pg_catalog.count(*) AS "cellCount"
+                        FROM {}.h3_polygon_to_cells(
+                          {}.ST_GeomFromText(%s, 4326),
+                          0
+                        )
+                    """).format(
+                        sql.Identifier(wrapper.schema),
+                        sql.Identifier(geometry_schema),
+                    ),
+                    (
+                        "POLYGON((-0.01 -0.01,0.01 -0.01,0.01 0.01,"
+                        "-0.01 0.01,-0.01 -0.01))",
+                    ),
+                )
+                return cur.fetchone() is not None
+        except psycopg.Error:
+            return False
+
     def capabilities(self) -> dict[str, Any]:
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
@@ -2952,6 +2987,7 @@ class DerivedLayerStore:
                 """
             )
             extensions = {row["extname"]: row["extversion"] for row in cur.fetchall()}
+            h3_ready = self._h3_capability_ready(connection, cur, extensions)
             return {
                 "configured": True,
                 "schema": SCHEMA,
@@ -3008,5 +3044,9 @@ class DerivedLayerStore:
                     },
                 },
                 "extensions": extensions,
-                "h3Available": "h3" in extensions and "h3_postgis" in extensions,
+                "h3Available": h3_ready,
+                "h3Readiness": {
+                    "method": "postgresql-catalog-and-execution",
+                    "ready": h3_ready,
+                },
             }
