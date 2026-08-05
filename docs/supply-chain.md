@@ -8,18 +8,20 @@ merging it.
 
 ## Reviewed bases
 
-The following multi-platform index digests were resolved on 2026-08-04 with
+The following multi-platform index digests were resolved on 2026-08-05 with
 `docker buildx imagetools inspect IMAGE:TAG`. The static supply-chain test is the
 machine-readable allowlist and must change in the same review as a Dockerfile.
 
 | Base | Reviewed index digest | Used by |
 | --- | --- | --- |
-| `node:22.23.1-bookworm-slim` | `sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` | XYZ build/runtime and config UI web build |
-| `python:3.12.13-slim-bookworm` | `sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b` | config UI, semantic service, and ETL |
-| `postgis/postgis:17-3.5` | `sha256:45f2a608397fa67d236b012c14a9e3ea31e9fe813edbeb5c1c0d1acbf0d48ea9` | bundled PostgreSQL/PostGIS/H3 image |
+| `node:22.23.1-alpine3.23` | `sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e` | XYZ build/runtime and config UI web build |
+| `python:3.12.13-alpine3.23` | `sha256:601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d` | config UI, semantic service, and ETL |
+| `postgis/postgis:17-3.5-alpine` | `sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568` | bundled PostgreSQL/PostGIS/H3 image |
 | `mcr.microsoft.com/playwright:v1.61.1-noble` | `sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48` | browser runner |
-| `caddy:2.10.0-alpine` | `sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c` | Caddy edge wrapper |
+| `caddy:2.11.4-alpine` | `sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` | Caddy edge wrapper |
 | `ubuntu/squid:6.6-24.04_edge` | `sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c` | allowlisting egress proxy |
+| `golang:1.26.5-alpine3.23` | `sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc` | reproducible Caddy and gosu builds |
+| `node:22.23.1-bookworm-slim` | `sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` | development container only |
 | `mcr.microsoft.com/devcontainers/python:1-3.12-bookworm` | `sha256:7876580dc67fd460fd962f004cbeb480027e9bbc0657096f1087db11f9eaff39` | development container only |
 
 XYZ's external `docker/dockerfile:1.7` build frontend is also pinned to index
@@ -29,8 +31,27 @@ Canonical publishes `ubuntu/squid` as a Verified Publisher image. The selected
 Squid 6.6 / Ubuntu 24.04 line is supported through May 2029. Its configuration
 is mounted read-only at `/etc/squid/squid.conf`, it listens on port 3128, and
 its optional log/cache paths are `/var/log/squid` and `/var/spool/squid`.
-Caddy's wrapper adds nothing to the reviewed upstream image; Compose continues
-to mount the same Caddyfile and retains the upstream entrypoint and command.
+Caddy's wrapper retains the upstream entrypoint and command while replacing the
+binary with the same Caddy 2.11.4 source plus the reviewed patched `x/text` and
+gRPC module releases. Compose continues to mount the same Caddyfile.
+
+The first final-image scan on `main` exposed stale runtime packages despite the
+immutable pins. The refreshed final images keep the strict rule that every High
+or Critical result blocks signing: Python and Node runtime stages use the clean
+Alpine 3.23 variants; unused npm/corepack/yarn tooling is absent from XYZ;
+the Chromium-only browser runner removes unused vulnerable npm and GStreamer
+packages; and the Squid wrapper installs the publisher's fixed OpenSSL packages.
+Those final-stage repository upgrades are pinned to their reviewed package
+versions so repository drift fails the build instead of silently changing it.
+The PostGIS image uses the publisher's Alpine variant and replaces its stale
+`gosu` binary with a static build from gosu 1.19 commit
+`6456aaa0f3c854d199d0f037f068eb97515b7513` using the reviewed Go toolchain.
+Caddy 2.11.4 is likewise bound to commit
+`e2eee6a7fce366321294c9c2a79f3146891dcbdf`, rebuilt with Go 1.26.5,
+`golang.org/x/text` 0.39.0, and `google.golang.org/grpc` 1.82.1. No
+vulnerability is ignored or allowlisted by this remediation.
+The validated Caddy checkout is the build input, and the H3 compiler, CMake,
+Git, and PostgreSQL development packages are pinned to reviewed APK versions.
 
 ## Publication workflow
 
@@ -45,7 +66,7 @@ For every image digest the workflow:
 1. adds BuildKit maximum-mode SLSA provenance and an OCI SBOM attestation;
 2. retains the attached SLSA provenance and generates SPDX JSON and CycloneDX
    JSON SBOMs with Syft 1.44.0;
-3. scans OS and application packages with Trivy 0.70.0 and fails on every High
+3. scans OS and application packages with Trivy 0.73.0 and fails on every High
    or Critical finding, including findings without an available fix;
 4. signs the image, both retained SBOMs, and retained provenance keylessly with
    Cosign 3.0.6; and

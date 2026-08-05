@@ -20,36 +20,40 @@ EXPECTED_BASES = {
         "5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48",
     ),
     "docker/caddy/Dockerfile": (
-        "caddy:2.10.0-alpine@sha256:"
-        "ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c",
+        "golang:1.26.5-alpine3.23@sha256:"
+        "622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc",
+        "caddy:2.11.4-alpine@sha256:"
+        "5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648",
     ),
     "config-ui/Dockerfile": (
-        "node:22.23.1-bookworm-slim@sha256:"
-        "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
-        "python:3.12.13-slim-bookworm@sha256:"
-        "d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b",
+        "node:22.23.1-alpine3.23@sha256:"
+        "8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
+        "python:3.12.13-alpine3.23@sha256:"
+        "601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d",
     ),
     "docker/egress-proxy/Dockerfile": (
         "ubuntu/squid:6.6-24.04_edge@sha256:"
         "8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c",
     ),
     "docker/postgis/Dockerfile": (
-        "postgis/postgis:17-3.5@sha256:"
-        "45f2a608397fa67d236b012c14a9e3ea31e9fe813edbeb5c1c0d1acbf0d48ea9",
+        "golang:1.26.5-alpine3.23@sha256:"
+        "622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc",
+        "postgis/postgis:17-3.5-alpine@sha256:"
+        "978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568",
     ),
     "docker/xyz/Dockerfile": (
-        "node:22.23.1-bookworm-slim@sha256:"
-        "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
-        "node:22.23.1-bookworm-slim@sha256:"
-        "6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
+        "node:22.23.1-alpine3.23@sha256:"
+        "8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
+        "node:22.23.1-alpine3.23@sha256:"
+        "8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
     ),
     "etl/Dockerfile": (
-        "python:3.12.13-slim-bookworm@sha256:"
-        "d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b",
+        "python:3.12.13-alpine3.23@sha256:"
+        "601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d",
     ),
     "semantic-service/Dockerfile": (
-        "python:3.12.13-slim-bookworm@sha256:"
-        "d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b",
+        "python:3.12.13-alpine3.23@sha256:"
+        "601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d",
     ),
 }
 
@@ -82,6 +86,57 @@ class BaseImagePolicyTests(unittest.TestCase):
                 "a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e\n"
             )
         )
+
+    def test_runtime_vulnerability_remediation_is_preserved(self) -> None:
+        xyz = (REPOSITORY_ROOT / "docker/xyz/Dockerfile").read_text(
+            encoding="utf-8",
+        )
+        browser = (REPOSITORY_ROOT / "browser-runner/Dockerfile").read_text(
+            encoding="utf-8",
+        )
+        egress = (REPOSITORY_ROOT / "docker/egress-proxy/Dockerfile").read_text(
+            encoding="utf-8",
+        )
+        caddy = (REPOSITORY_ROOT / "docker/caddy/Dockerfile").read_text(
+            encoding="utf-8",
+        )
+        postgis = (REPOSITORY_ROOT / "docker/postgis/Dockerfile").read_text(
+            encoding="utf-8",
+        )
+
+        self.assertIn("/usr/local/lib/node_modules/npm", xyz)
+        self.assertIn("gstreamer1.0-plugins-bad", browser)
+        self.assertIn("/usr/lib/node_modules/npm", browser)
+        self.assertIn("--only-upgrade", egress)
+        self.assertIn("libssl3t64=3.0.13-0ubuntu3.12", egress)
+        self.assertIn("openssl=3.0.13-0ubuntu3.12", egress)
+        self.assertIn(
+            "CADDY_COMMIT=e2eee6a7fce366321294c9c2a79f3146891dcbdf",
+            caddy,
+        )
+        self.assertIn('"refs/tags/${CADDY_VERSION}"', caddy)
+        self.assertIn("'FETCH_HEAD^{commit}'", caddy)
+        self.assertIn(
+            'go mod edit -replace="github.com/caddyserver/caddy/v2=/reviewed-source"',
+            caddy,
+        )
+        self.assertIn("golang.org/x/text@v0.39.0", caddy)
+        self.assertIn("google.golang.org/grpc@v1.82.1", caddy)
+        self.assertIn("c-ares=1.34.8-r0", caddy)
+        self.assertIn("curl=8.20.0-r0", caddy)
+        self.assertIn("libcurl=8.20.0-r0", caddy)
+        self.assertIn(
+            "GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513",
+            postgis,
+        )
+        self.assertIn(
+            "COPY --from=gosu-builder /out/gosu /usr/local/bin/gosu",
+            postgis,
+        )
+        self.assertIn("build-base=0.5-r4", postgis)
+        self.assertIn("cmake=4.2.3-r0", postgis)
+        self.assertIn("git=2.54.0-r0", postgis)
+        self.assertIn("postgresql17-dev=17.10-r0", postgis)
 
 
 class SupplyChainWorkflowTests(unittest.TestCase):
@@ -152,6 +207,7 @@ class SupplyChainWorkflowTests(unittest.TestCase):
         self.assertNotIn("id-token: write", scan)
         self.assertIn("anchore/sbom-action", scan)
         self.assertIn("aquasecurity/trivy-action", scan)
+        self.assertIn("version: v0.73.0", scan)
         self.assertNotIn("sigstore/cosign-installer", scan)
 
         sign = self.jobs["sign"]
@@ -166,7 +222,7 @@ class SupplyChainWorkflowTests(unittest.TestCase):
     def test_compose_deploys_the_reviewed_caddy_wrapper(self) -> None:
         compose = (REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8")
         example_env = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
-        self.assertIn("image: mapp-caddy:2.10.0", compose)
+        self.assertIn("image: mapp-caddy:2.11.4", compose)
         self.assertRegex(
             compose,
             r"(?ms)^  caddy:\n.*?^    build:\n"
