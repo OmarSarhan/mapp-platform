@@ -15,6 +15,7 @@ from derived_layers import (
     MATERIALIZED_MAX_ESTIMATED_BYTES,
     QUERY_PLAN_MAX_INTERMEDIATE_BYTES,
     QUERY_PLAN_MAX_TOTAL_COST,
+    DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
     DerivedLayerMaterializationTooLarge,
@@ -30,10 +31,10 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
     @staticmethod
     def store_with_cursor(cursor):
         store = DerivedLayerStore("postgresql://database", "mapp_xyz")
-        connection_context = MagicMock()
-        connection = connection_context.__enter__.return_value
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
         connection.cursor.return_value.__enter__.return_value = cursor
-        store._connect = MagicMock(return_value=connection_context)
+        store._connect = MagicMock(return_value=connection)
         store._initialize = MagicMock()
         store._catalog_query_probe = MagicMock()
         store._validate_catalog_dependencies = MagicMock()
@@ -149,6 +150,74 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         self.assertIn("pg_advisory_xact_lock", events[1])
         self.assertEqual("initialize", events[2])
+
+    def test_mutation_body_database_failure_reports_proven_rollback(self):
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        failure = psycopg.ProgrammingError("statement failed")
+        connection = MagicMock()
+        store._connect = MagicMock(return_value=connection)
+
+        with self.assertRaises(DerivedLayerDatabaseOperationError) as raised:
+            with store._mutation_connection():
+                raise failure
+
+        self.assertIs(failure, raised.exception.cause)
+        self.assertEqual(
+            "database-transaction",
+            raised.exception.failure_phase,
+        )
+        self.assertTrue(raised.exception.state_unchanged)
+        self.assertTrue(raised.exception.rolled_back)
+        self.assertFalse(raised.exception.indeterminate)
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        connection.close.assert_called_once_with()
+
+    def test_mutation_commit_failure_is_indeterminate(self):
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        failure = psycopg.OperationalError("connection lost during commit")
+        connection = MagicMock()
+        connection.commit.side_effect = failure
+        store._connect = MagicMock(return_value=connection)
+
+        with self.assertRaises(DerivedLayerDatabaseOperationError) as raised:
+            with store._mutation_connection():
+                pass
+
+        self.assertIs(failure, raised.exception.cause)
+        self.assertEqual("transaction-commit", raised.exception.failure_phase)
+        self.assertFalse(raised.exception.state_unchanged)
+        self.assertFalse(raised.exception.rolled_back)
+        self.assertTrue(raised.exception.indeterminate)
+        connection.rollback.assert_not_called()
+        connection.commit.assert_called_once_with()
+        connection.close.assert_called_once_with()
+
+    def test_mutation_rollback_failure_is_indeterminate(self):
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        statement_failure = psycopg.ProgrammingError("statement failed")
+        rollback_failure = psycopg.OperationalError(
+            "connection lost during rollback",
+        )
+        connection = MagicMock()
+        connection.rollback.side_effect = rollback_failure
+        store._connect = MagicMock(return_value=connection)
+
+        with self.assertRaises(DerivedLayerDatabaseOperationError) as raised:
+            with store._mutation_connection():
+                raise statement_failure
+
+        self.assertIs(rollback_failure, raised.exception.cause)
+        self.assertEqual(
+            "transaction-rollback",
+            raised.exception.failure_phase,
+        )
+        self.assertFalse(raised.exception.state_unchanged)
+        self.assertFalse(raised.exception.rolled_back)
+        self.assertTrue(raised.exception.indeterminate)
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        connection.close.assert_called_once_with()
 
     def test_schema_initialization_serializes_threads_and_retries_failure(self):
         store = DerivedLayerStore("postgresql://database", "mapp_xyz")

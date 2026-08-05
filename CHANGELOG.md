@@ -8,6 +8,9 @@ first release.
 
 ### Fixed
 
+- Reported authoritative derived-mutation failure phases and commit state,
+  distinguishing preflight and proven rollback from commit, reporting,
+  polling, and recovery uncertainty without exposing database internals.
 - Pinned the installed H3 PostGIS polygon SQL wrappers to the catalog-derived
   trusted extension path, allowing their nested `ST_Dump` call to resolve while
   PostgreSQL plans and refreshes materialized views under its restricted search

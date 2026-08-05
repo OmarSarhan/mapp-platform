@@ -7,6 +7,7 @@ import re
 import secrets
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -78,6 +79,26 @@ FORBIDDEN_SQL = re.compile(
 )
 class DerivedLayerError(ValueError):
     pass
+
+
+class DerivedLayerDatabaseOperationError(Exception):
+    """Database failure with authoritative derived-mutation state."""
+
+    def __init__(
+        self,
+        cause: psycopg.Error,
+        *,
+        failure_phase: str,
+        state_unchanged: bool,
+        rolled_back: bool = False,
+        indeterminate: bool = False,
+    ):
+        self.cause = cause
+        self.failure_phase = failure_phase
+        self.state_unchanged = state_unchanged
+        self.rolled_back = rolled_back
+        self.indeterminate = indeterminate
+        super().__init__("Derived-layer database operation failed.")
 
 
 class DerivedLayerResetOwnershipError(DerivedLayerError):
@@ -592,6 +613,53 @@ class DerivedLayerStore:
         except Exception:
             connection.close()
             raise
+
+    @contextmanager
+    def _mutation_connection(self):
+        """Expose whether a mutation failed before, during, or after commit."""
+        try:
+            connection = self._connect()
+        except psycopg.Error as exc:
+            raise DerivedLayerDatabaseOperationError(
+                exc,
+                failure_phase="preflight",
+                state_unchanged=True,
+            ) from exc
+
+        try:
+            try:
+                yield connection
+            except Exception as body_error:
+                try:
+                    connection.rollback()
+                except psycopg.Error as rollback_error:
+                    raise DerivedLayerDatabaseOperationError(
+                        rollback_error,
+                        failure_phase="transaction-rollback",
+                        state_unchanged=False,
+                        indeterminate=True,
+                    ) from rollback_error
+                setattr(body_error, "failure_phase", "database-transaction")
+                setattr(body_error, "rolled_back", True)
+                if isinstance(body_error, psycopg.Error):
+                    raise DerivedLayerDatabaseOperationError(
+                        body_error,
+                        failure_phase="database-transaction",
+                        state_unchanged=True,
+                        rolled_back=True,
+                    ) from body_error
+                raise
+            try:
+                connection.commit()
+            except psycopg.Error as commit_error:
+                raise DerivedLayerDatabaseOperationError(
+                    commit_error,
+                    failure_phase="transaction-commit",
+                    state_unchanged=False,
+                    indeterminate=True,
+                ) from commit_error
+        finally:
+            connection.close()
 
     @staticmethod
     def _initialize(cur) -> None:
@@ -1665,7 +1733,7 @@ class DerivedLayerStore:
 
     def create(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         definition = validate_definition(payload)
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._mutation_connection() as connection, connection.cursor() as cur:
             # Materialization and output validation can legitimately outlive an
             # HTTP request. The dashboard submits these as durable background
             # operations; retain a finite database-side safety bound.
@@ -1789,7 +1857,7 @@ class DerivedLayerStore:
     def refresh(self, name: str, actor: str = "system") -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._mutation_connection() as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
@@ -1854,7 +1922,7 @@ class DerivedLayerStore:
         definition = validate_definition(payload)
         if definition["name"] != name:
             raise DerivedLayerError("Replacement name must match the existing relation.")
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._mutation_connection() as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
@@ -2030,7 +2098,7 @@ class DerivedLayerStore:
     def drop(self, name: str, actor: str = "system") -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._mutation_connection() as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._ensure_changes_allowed(cur)

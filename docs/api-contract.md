@@ -589,12 +589,33 @@ same envelope under `operation.error`, with the original HTTP `status` and
 exception `type` added. Polling clients must surface the nested
 `userMessage`, derived-layer code, `suggestedAction`, reasons, and known-state
 fields rather than replacing them with a generic operation failure. An
-unexpected infrastructure or result-recording failure instead ends as
-`indeterminate` with `derived_layer.operation_failed`; it deliberately has no
-`stateUnchanged` or `safeState`, so clients must inspect the operation, managed
-layer, and catalog before retrying. `technicalDetail`, when present on a
+unexpected preflight failure or failure followed by a proven rollback can use
+`derived_layer.operation_failed` with authoritative unchanged-state fields.
+An unexpected commit, rollback-finalization, or result-reporting failure uses
+the same code but ends as `indeterminate`; clients must inspect the operation,
+managed layer, and catalog before retrying. `technicalDetail`, when present on a
 database error directly or under `operation.error`, is diagnostic and must not
 be the primary user notification.
+
+`failurePhase` uses this closed vocabulary:
+
+| Phase | Authoritative meaning |
+| --- | --- |
+| `preflight` | No mutation transaction or DDL began; `stateUnchanged` and `safeState` are authoritative. |
+| `database-transaction` | The transaction body failed and an explicit rollback completed; `stateUnchanged`, `safeState`, and `rolledBack: true` are authoritative. |
+| `transaction-rollback` | Rollback completion could not be confirmed; the outcome is `indeterminate`. |
+| `transaction-commit` | Commit completion could not be confirmed; the outcome is `indeterminate`. |
+| `result-reporting` | The mutation returned from its commit boundary, but its result could not be durably reported; the outcome is `indeterminate`. |
+| `request-response` | The client lost the initial mutation response and cannot infer whether the server reached its commit boundary; the observed outcome is `indeterminate`. |
+| `operation-polling` | The client lost or timed out while observing a durable operation; the observed outcome is `indeterminate`, and the operation ID must be reconciled. |
+| `service-recovery` | The service restarted with an operation still marked running; the recovered record is `indeterminate`. |
+
+`stateUnchanged` is present only for `preflight` or a proven
+`database-transaction` rollback. `rolledBack` is present only after the server's
+explicit rollback call returns successfully. Indeterminate phases omit all
+three of `stateUnchanged`, `safeState`, and `rolledBack`. Safe failures direct
+the caller to correct the request and retry; indeterminate failures instead
+require operation, managed-layer, and catalog inspection before any retry.
 
 Other derived-layer failures are also structured rather than overloaded as
 query cost:
@@ -607,8 +628,8 @@ query cost:
 | HTTP `400`, `derived_layer.invalid_request` | Correct the named definition/request field. |
 | HTTP `404`/`409`, `derived_layer.not_found`/`derived_layer.already_exists` | List or rename/replace the layer as directed; the response states the preserved operation state. |
 | HTTP `409`, `derived_layer.maintenance` or `derived_layer.in_use` | Wait for maintenance, or resolve the reported PostgreSQL/workspace dependencies. |
-| HTTP `422`, `derived_layer.database_error` | Check the query, declared sources, ID, and geometry fields. The primary message is safe; optional `technicalDetail` contains only bounded `sqlstate` and primary `message`, never the SQL, context, detail, or hint. |
-| HTTP `500`, `derived_layer.operation_failed` | The outcome is indeterminate; inspect authoritative operation/layer/catalog state before retrying. |
+| HTTP `422`/`500`, `derived_layer.database_error` | A preflight or proven rollback response states the preserved state and may be corrected and retried. A commit, rollback-finalization, or reporting uncertainty is explicitly indeterminate and requires reconciliation. Optional `technicalDetail` contains only bounded `sqlstate` and primary `message`, never the SQL, context, detail, or hint. |
+| HTTP `500`, `derived_layer.operation_failed` | `preflight` and proven rollback failures state the preserved target; commit, rollback-finalization, and reporting failures are indeterminate and require authoritative operation/layer/catalog inspection. |
 
 Managed changes use a list of operations:
 

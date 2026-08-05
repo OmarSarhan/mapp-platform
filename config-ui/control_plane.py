@@ -276,6 +276,12 @@ class ControlStore:
                             "The service restarted before this operation recorded "
                             "a terminal result. Reconcile target state before retrying."
                         ),
+                        "suggestedAction": (
+                            "Inspect the operation target and authoritative state "
+                            "before retrying."
+                        ),
+                        "indeterminate": True,
+                        "failurePhase": "service-recovery",
                     },
                 })
                 _atomic_json(operation_path, operation)

@@ -387,4 +387,10 @@ class ControlPlaneTests(unittest.TestCase):
 
             self.assertEqual("indeterminate", recovered["status"])
             self.assertEqual("operation.interrupted", recovered["error"]["code"])
+            self.assertTrue(recovered["error"]["indeterminate"])
+            self.assertEqual(
+                "service-recovery",
+                recovered["error"]["failurePhase"],
+            )
+            self.assertIn("before retrying", recovered["error"]["suggestedAction"])
             self.assertIsNone(recovered["result"])

@@ -25,6 +25,7 @@ from psycopg.rows import dict_row
 from infoj_types import info_value_error
 from derived_layers import (
     SCHEMA as DERIVED_SCHEMA,
+    DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
     DerivedLayerMaterializationTooLarge,
@@ -1349,6 +1350,7 @@ def run_derived_background(
     name: str | None = None,
 ) -> None:
     """Complete a derived-layer database operation after HTTP has returned."""
+    failure_phase = "database-transaction"
     try:
         if not DERIVED:
             raise DerivedLayerError(
@@ -1356,8 +1358,10 @@ def run_derived_background(
             )
         if action == "create":
             result = DERIVED.create(payload, actor)
+            failure_phase = "result-reporting"
         elif action == "replace" and name:
             result = DERIVED.replace(name, payload, actor)
+            failure_phase = "result-reporting"
             changes = result.get("columnChanges", {})
             result.update(derived_workspace_impact(
                 name,
@@ -1365,6 +1369,7 @@ def run_derived_background(
             ))
         elif action == "refresh" and name:
             result = DERIVED.refresh(name, actor)
+            failure_phase = "result-reporting"
         else:
             raise DerivedLayerError("Unsupported background operation.")
         schedule_semantic_outbox()
@@ -1386,109 +1391,130 @@ def run_derived_background(
             result={"derivedLayer": result},
         )
     except DerivedLayerQueryTooExpensive as exc:
-        status = derived_query_error_status(exc)
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_query_too_expensive_error(exc, action),
-                "status": int(status),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_query_too_expensive_error(exc, action),
+            derived_query_error_status(exc),
+            failure_phase,
         )
     except DerivedLayerMaterializationTooLarge as exc:
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_materialization_too_large_error(exc, action),
-                "status": int(HTTPStatus.CONFLICT),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_materialization_too_large_error(exc, action),
+            HTTPStatus.CONFLICT,
+            failure_phase,
         )
     except DerivedLayerDependencyError as exc:
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_dependency_error(exc, action),
-                "status": int(HTTPStatus.CONFLICT),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_dependency_error(exc, action),
+            HTTPStatus.CONFLICT,
+            failure_phase,
         )
     except DerivedLayerSourceMismatchError as exc:
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_source_mismatch_error(exc, action),
-                "status": int(HTTPStatus.UNPROCESSABLE_ENTITY),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_source_mismatch_error(exc, action),
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            failure_phase,
         )
     except DerivedLayerMaintenanceError as exc:
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_maintenance_error(exc, action),
-                "status": int(HTTPStatus.CONFLICT),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_maintenance_error(exc, action),
+            HTTPStatus.CONFLICT,
+            failure_phase,
         )
     except FileExistsError as exc:
-        layer_name = str(exc)
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_already_exists_error(layer_name),
-                "status": int(HTTPStatus.CONFLICT),
-                "type": type(exc).__name__,
-            },
+            "create",
+            exc,
+            derived_already_exists_error(str(exc)),
+            HTTPStatus.CONFLICT,
+            failure_phase,
         )
     except FileNotFoundError as exc:
-        layer_name = str(exc) or str(name or "")
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_not_found_error(layer_name, action),
-                "status": int(HTTPStatus.NOT_FOUND),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            derived_not_found_error(str(exc) or str(name or ""), action),
+            HTTPStatus.NOT_FOUND,
+            failure_phase,
         )
     except DerivedLayerError as exc:
         response = derived_validation_error(exc, action)
-        status = derived_validation_error_status(response)
-        CONTROL.finish_operation(
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **response,
-                "status": int(status),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            response,
+            derived_validation_error_status(response),
+            failure_phase,
+        )
+    except DerivedLayerDatabaseOperationError as exc:
+        finish_derived_background_failure(
+            operation_id,
+            action,
+            exc,
+            derived_database_error(
+                exc.cause,
+                action,
+                failure_phase=exc.failure_phase,
+                state_unchanged=exc.state_unchanged,
+                rolled_back=exc.rolled_back,
+                indeterminate=exc.indeterminate,
+            ),
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            failure_phase,
+            type_exc=exc.cause,
         )
     except psycopg.Error as exc:
-        CONTROL.finish_operation(
+        phase, _ = derived_exception_failure_state(exc, failure_phase)
+        response = derived_database_error(
+            exc,
+            action,
+            failure_phase=phase,
+            state_unchanged=False,
+            indeterminate=True,
+        )
+        finish_derived_background_failure(
             operation_id,
-            status="failed",
-            error={
-                **derived_database_error(exc, action),
-                "status": int(HTTPStatus.UNPROCESSABLE_ENTITY),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            response,
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            failure_phase,
         )
     except Exception as exc:
-        CONTROL.finish_operation(
+        phase, rolled_back = derived_exception_failure_state(
+            exc, failure_phase,
+        )
+        state_unchanged = rolled_back and phase == "database-transaction"
+        response = derived_operation_failed_error(
+            action,
+            failure_phase=phase,
+            state_unchanged=state_unchanged,
+            rolled_back=rolled_back,
+        )
+        finish_derived_background_failure(
             operation_id,
-            status="indeterminate",
-            error={
-                **derived_operation_failed_error(action),
-                "status": int(HTTPStatus.INTERNAL_SERVER_ERROR),
-                "type": type(exc).__name__,
-            },
+            action,
+            exc,
+            response,
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            failure_phase,
         )
 
 
@@ -1552,6 +1578,15 @@ COMPUTE_QUERY_REASON_CODES = frozenset({
     "unbounded_scalar_output",
     "unbounded_set_function",
 })
+DERIVED_FAILURE_PHASES = frozenset({
+    "preflight",
+    "database-transaction",
+    "transaction-rollback",
+    "transaction-commit",
+    "result-reporting",
+    "request-response",
+    "service-recovery",
+})
 
 
 def derived_operation_safe_state(operation: str | None) -> str:
@@ -1571,6 +1606,122 @@ def derived_request_operation(request_path: str, derived_action_path) -> str | N
     return None
 
 
+def derived_failure_state(
+    response: dict,
+    operation: str | None,
+    *,
+    failure_phase: str,
+    rolled_back: bool = False,
+    indeterminate: bool = False,
+) -> dict:
+    if failure_phase not in DERIVED_FAILURE_PHASES:
+        raise ValueError("Invalid derived-layer failure phase.")
+    indeterminate = indeterminate or response.get("indeterminate") is True
+    if failure_phase == "database-transaction" and not rolled_back:
+        failure_phase = "transaction-rollback"
+    elif rolled_back and failure_phase != "database-transaction":
+        if failure_phase == "preflight":
+            failure_phase = "transaction-rollback"
+        rolled_back = False
+    response["failurePhase"] = failure_phase
+    preflight_is_proven = failure_phase == "preflight" and not rolled_back
+    rollback_is_proven = (
+        failure_phase == "database-transaction" and rolled_back
+    )
+    unchanged_is_proven = preflight_is_proven or rollback_is_proven
+    if indeterminate or not unchanged_is_proven:
+        response["indeterminate"] = True
+        response.pop("stateUnchanged", None)
+        response.pop("safeState", None)
+        response.pop("rolledBack", None)
+        return response
+    response["stateUnchanged"] = True
+    response["safeState"] = derived_operation_safe_state(operation)
+    response.pop("indeterminate", None)
+    if rolled_back:
+        response["rolledBack"] = True
+    else:
+        response.pop("rolledBack", None)
+    return response
+
+
+def derived_exception_failure_state(
+    exc: Exception,
+    default_phase: str,
+) -> tuple[str, bool]:
+    phase = getattr(exc, "failure_phase", default_phase)
+    if phase not in DERIVED_FAILURE_PHASES:
+        phase = default_phase
+    rolled_back = getattr(exc, "rolled_back", False) is True
+    if phase == "database-transaction" and not rolled_back:
+        phase = "transaction-rollback"
+    return phase, rolled_back
+
+
+def derived_exception_response(
+    response: dict,
+    exc: Exception,
+    operation: str | None,
+    default_phase: str,
+) -> dict:
+    phase, rolled_back = derived_exception_failure_state(exc, default_phase)
+    return derived_failure_state(
+        response,
+        operation,
+        failure_phase=phase,
+        rolled_back=rolled_back,
+        indeterminate=response.get("indeterminate") is True,
+    )
+
+
+def derived_failure_http_status(
+    response: dict,
+    expected_status: HTTPStatus,
+) -> HTTPStatus:
+    return (
+        HTTPStatus.INTERNAL_SERVER_ERROR
+        if response.get("indeterminate") is True
+        else expected_status
+    )
+
+
+def derived_failure_operation_status(response: dict) -> str:
+    return (
+        "indeterminate"
+        if response.get("indeterminate") is True
+        else "failed"
+    )
+
+
+def finish_derived_background_failure(
+    operation_id: str,
+    action: str,
+    exc: Exception,
+    response: dict,
+    expected_status: HTTPStatus,
+    default_phase: str,
+    *,
+    type_exc: Exception | None = None,
+) -> None:
+    response = derived_exception_response(
+        response,
+        exc,
+        action,
+        default_phase,
+    )
+    CONTROL.finish_operation(
+        operation_id,
+        status=derived_failure_operation_status(response),
+        error={
+            **response,
+            "status": int(derived_failure_http_status(
+                response, expected_status,
+            )),
+            "type": type(type_exc or exc).__name__,
+        },
+    )
+
+
 def derived_blocked_error(
     *,
     code: str,
@@ -1579,7 +1730,7 @@ def derived_blocked_error(
     operation: str | None,
     **fields,
 ) -> dict:
-    return {
+    return derived_failure_state({
         "error": message,
         "message": message,
         "userMessage": message,
@@ -1587,10 +1738,8 @@ def derived_blocked_error(
         "code": code,
         "operation": operation,
         "blocked": True,
-        "stateUnchanged": True,
-        "safeState": derived_operation_safe_state(operation),
         **fields,
-    }
+    }, operation, failure_phase="preflight")
 
 
 def derived_materialization_too_large_error(
@@ -1624,8 +1773,6 @@ def derived_materialization_too_large_error(
         probe=exc.probe,
         probeStage="actual" if actual else "estimate",
     )
-    if actual:
-        response["rolledBack"] = True
     return response
 
 
@@ -1992,16 +2139,28 @@ def sanitized_postgres_detail(exc: psycopg.Error) -> dict:
 def derived_database_error(
     exc: psycopg.Error,
     operation: str | None,
+    *,
+    failure_phase: str,
+    state_unchanged: bool,
+    rolled_back: bool = False,
+    indeterminate: bool = False,
 ) -> dict:
     message = "The database could not apply this derived-layer change."
+    uncertain = indeterminate or not state_unchanged
     response = {
         "error": message,
         "message": message,
         "userMessage": message,
         "suggestedAction": (
-            "Check the query, declared source tables, and selected ID and "
-            "geometry fields. If the request ran in the background, inspect "
-            "the authoritative layer before retrying."
+            (
+                "Inspect the operation, managed derived layer, and catalog "
+                "before retrying; the requested change may have committed."
+            )
+            if uncertain
+            else (
+                "Correct the query, declared source tables, or selected ID "
+                "and geometry fields, then retry."
+            )
         ),
         "code": "derived_layer.database_error",
         "operation": operation,
@@ -2010,7 +2169,13 @@ def derived_database_error(
     technical_detail = sanitized_postgres_detail(exc)
     if technical_detail:
         response["technicalDetail"] = technical_detail
-    return response
+    return derived_failure_state(
+        response,
+        operation,
+        failure_phase=failure_phase,
+        rolled_back=rolled_back,
+        indeterminate=indeterminate or not state_unchanged,
+    )
 
 
 def derived_read_error(
@@ -2034,23 +2199,36 @@ def derived_read_error(
     return response
 
 
-def derived_operation_failed_error(operation: str | None) -> dict:
+def derived_operation_failed_error(
+    operation: str | None,
+    *,
+    failure_phase: str,
+    state_unchanged: bool = False,
+    rolled_back: bool = False,
+) -> dict:
     message = (
         "The derived-layer operation ended without a confirmed result."
     )
-    return {
+    return derived_failure_state({
         "error": message,
         "message": message,
         "userMessage": message,
         "suggestedAction": (
-            "Inspect the authoritative derived-layer catalog before retrying; "
-            "the requested change may or may not have completed."
+            (
+                "Review the request and safe diagnostics, then retry; no "
+                "derived-layer change was applied."
+            )
+            if state_unchanged
+            else (
+                "Inspect the operation, managed derived layer, and catalog "
+                "before retrying; the requested change may have committed."
+            )
         ),
         "code": "derived_layer.operation_failed",
         "operation": operation,
         "blocked": True,
-        "indeterminate": True,
-    }
+    }, operation, failure_phase=failure_phase, rolled_back=rolled_back,
+       indeterminate=not state_unchanged)
 
 
 def require_semantic_derived_sources(
@@ -2220,10 +2398,15 @@ def start_derived_background(
             CONTROL.finish_operation(
                 operation["id"],
                 status="failed",
-                error={
-                    "code": "derived_layer.background_start_failed",
-                    "message": "The background worker could not be started.",
-                },
+                error=derived_blocked_error(
+                    code="derived_layer.background_start_failed",
+                    message="The background worker could not be started.",
+                    suggested_action=(
+                        "Retry after the local worker-start problem is "
+                        "resolved; no derived-layer change was started."
+                    ),
+                    operation=action,
+                ),
             )
         raise
 
@@ -5303,9 +5486,11 @@ class Handler(SimpleHTTPRequestHandler):
         ):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+        derived_failure_phase: str | None = None
         try:
             payload = self._payload()
             if request_path == "/api/derived-layers":
+                derived_failure_phase = "preflight"
                 if not DERIVED:
                     raise DerivedLayerError(
                         "Derived-layer database management is not configured."
@@ -5321,12 +5506,15 @@ class Handler(SimpleHTTPRequestHandler):
                     operation = start_derived_background(
                         "create", payload, actor, self._remote()
                     )
+                    derived_failure_phase = "request-response"
                     self._json(HTTPStatus.ACCEPTED, {
                         "operation": operation,
                         "statusUrl": f"/api/operations/{operation['id']}",
                     })
                     return
+                derived_failure_phase = "database-transaction"
                 result = DERIVED.create(payload, actor)
+                derived_failure_phase = "result-reporting"
                 schedule_semantic_outbox()
                 CONTROL.audit(
                     "derived_layer.created",
@@ -5342,6 +5530,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.CREATED, {"derivedLayer": result})
                 return
             if derived_action_path:
+                derived_failure_phase = "preflight"
                 if not DERIVED:
                     raise DerivedLayerError(
                         "Derived-layer database management is not configured."
@@ -5385,16 +5574,21 @@ class Handler(SimpleHTTPRequestHandler):
                         self._remote(),
                         name,
                     )
+                    derived_failure_phase = "request-response"
                     self._json(HTTPStatus.ACCEPTED, {
                         "operation": operation,
                         "statusUrl": f"/api/operations/{operation['id']}",
                     })
                     return
                 if action == "refresh":
+                    derived_failure_phase = "database-transaction"
                     result = DERIVED.refresh(name, actor)
+                    derived_failure_phase = "result-reporting"
                     event = "derived_layer.refreshed"
                 elif action == "replace":
+                    derived_failure_phase = "database-transaction"
                     result = DERIVED.replace(name, replacement, actor)
+                    derived_failure_phase = "result-reporting"
                     changes = result.get("columnChanges", {})
                     result.update(derived_workspace_impact(
                         name,
@@ -5482,7 +5676,9 @@ class Handler(SimpleHTTPRequestHandler):
                             ),
                         )
                         return
+                    derived_failure_phase = "database-transaction"
                     result = DERIVED.drop(name, actor)
+                    derived_failure_phase = "result-reporting"
                     event = "derived_layer.dropped"
                 schedule_semantic_outbox()
                 CONTROL.audit(
@@ -6780,17 +6976,29 @@ class Handler(SimpleHTTPRequestHandler):
                 if derived_action_path and derived_action_path.group(2) == "replace"
                 else "drop"
             )
-            self._json(
-                HTTPStatus.CONFLICT,
+            response = derived_exception_response(
                 derived_dependency_error(exc, operation),
+                exc,
+                operation,
+                derived_failure_phase or "preflight",
+            )
+            self._json(
+                derived_failure_http_status(response, HTTPStatus.CONFLICT),
+                response,
             )
         except DerivedLayerMaintenanceError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
             )
-            self._json(
-                HTTPStatus.CONFLICT,
+            response = derived_exception_response(
                 derived_maintenance_error(exc, derived_operation),
+                exc,
+                derived_operation,
+                derived_failure_phase or "preflight",
+            )
+            self._json(
+                derived_failure_http_status(response, HTTPStatus.CONFLICT),
+                response,
             )
         except DerivedLayerBackgroundCapacityError as exc:
             derived_operation = derived_request_operation(
@@ -6816,47 +7024,124 @@ class Handler(SimpleHTTPRequestHandler):
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
             )
-            self._json(
-                derived_query_error_status(exc),
+            response = derived_exception_response(
                 derived_query_too_expensive_error(exc, derived_operation),
+                exc,
+                derived_operation,
+                derived_failure_phase or "preflight",
+            )
+            self._json(
+                derived_failure_http_status(
+                    response, derived_query_error_status(exc),
+                ),
+                response,
             )
         except DerivedLayerMaterializationTooLarge as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
             )
-            self._json(
-                HTTPStatus.CONFLICT,
+            response = derived_exception_response(
                 derived_materialization_too_large_error(
                     exc, derived_operation,
                 ),
+                exc,
+                derived_operation,
+                derived_failure_phase or "preflight",
+            )
+            self._json(
+                derived_failure_http_status(response, HTTPStatus.CONFLICT),
+                response,
             )
         except DerivedLayerSourceMismatchError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
             )
-            self._json(
-                HTTPStatus.UNPROCESSABLE_ENTITY,
+            response = derived_exception_response(
                 derived_source_mismatch_error(exc, derived_operation),
+                exc,
+                derived_operation,
+                derived_failure_phase or "preflight",
             )
+            self._json(
+                derived_failure_http_status(
+                    response, HTTPStatus.UNPROCESSABLE_ENTITY,
+                ),
+                response,
+            )
+        except DerivedLayerDatabaseOperationError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            if derived_operation is not None:
+                response = derived_database_error(
+                    exc.cause,
+                    derived_operation,
+                    failure_phase=exc.failure_phase,
+                    state_unchanged=exc.state_unchanged,
+                    rolled_back=exc.rolled_back,
+                    indeterminate=exc.indeterminate,
+                )
+                self._json(
+                    derived_failure_http_status(
+                        response, HTTPStatus.UNPROCESSABLE_ENTITY,
+                    ),
+                    response,
+                )
+            else:
+                self._json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {"error": "The database could not complete the request."},
+                )
         except DerivedLayerError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
             )
             if derived_operation is not None:
                 response = derived_validation_error(exc, derived_operation)
+                response = derived_exception_response(
+                    response,
+                    exc,
+                    derived_operation,
+                    derived_failure_phase or "preflight",
+                )
                 self._json(
-                    derived_validation_error_status(response),
+                    derived_failure_http_status(
+                        response, derived_validation_error_status(response),
+                    ),
                     response,
                 )
             else:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except ValueError as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            if derived_operation is not None:
+                phase, rolled_back = derived_exception_failure_state(
+                    exc, derived_failure_phase or "preflight",
+                )
+                response = derived_operation_failed_error(
+                    derived_operation,
+                    failure_phase=phase,
+                    state_unchanged=phase == "preflight" or rolled_back,
+                    rolled_back=rolled_back,
+                )
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, response)
+            else:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileExistsError as exc:
             if request_path == "/api/derived-layers":
-                self._json(
-                    HTTPStatus.CONFLICT,
+                response = derived_exception_response(
                     derived_already_exists_error(str(exc)),
+                    exc,
+                    "create",
+                    derived_failure_phase or "preflight",
+                )
+                self._json(
+                    derived_failure_http_status(
+                        response, HTTPStatus.CONFLICT,
+                    ),
+                    response,
                 )
             else:
                 self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
@@ -6865,9 +7150,17 @@ class Handler(SimpleHTTPRequestHandler):
                 request_path, derived_action_path,
             )
             if derived_operation is not None:
-                self._json(
-                    HTTPStatus.NOT_FOUND,
+                response = derived_exception_response(
                     derived_not_found_error(str(exc), derived_operation),
+                    exc,
+                    derived_operation,
+                    derived_failure_phase or "preflight",
+                )
+                self._json(
+                    derived_failure_http_status(
+                        response, HTTPStatus.NOT_FOUND,
+                    ),
+                    response,
                 )
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
@@ -6890,9 +7183,24 @@ class Handler(SimpleHTTPRequestHandler):
                 request_path, derived_action_path,
             )
             if derived_operation is not None:
+                phase, _ = derived_exception_failure_state(
+                    exc, derived_failure_phase or "preflight",
+                )
+                state_unchanged = phase == "preflight"
+                response = derived_database_error(
+                    exc,
+                    derived_operation,
+                    failure_phase=phase,
+                    state_unchanged=state_unchanged,
+                    indeterminate=not state_unchanged,
+                )
                 self._json(
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                    derived_database_error(exc, derived_operation),
+                    (
+                        HTTPStatus.UNPROCESSABLE_ENTITY
+                        if state_unchanged
+                        else HTTPStatus.INTERNAL_SERVER_ERROR
+                    ),
+                    response,
                 )
             else:
                 self._json(
@@ -6906,9 +7214,18 @@ class Handler(SimpleHTTPRequestHandler):
                 request_path, derived_action_path,
             )
             if derived_operation is not None:
+                phase, rolled_back = derived_exception_failure_state(
+                    exc, derived_failure_phase or "preflight",
+                )
+                state_unchanged = phase == "preflight" or rolled_back
                 self._json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
-                    derived_operation_failed_error(derived_operation),
+                    derived_operation_failed_error(
+                        derived_operation,
+                        failure_phase=phase,
+                        state_unchanged=state_unchanged,
+                        rolled_back=rolled_back,
+                    ),
                 )
             else:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})

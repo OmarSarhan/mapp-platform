@@ -269,6 +269,32 @@ class ControlApiTests(unittest.TestCase):
                 presentation["reasonActionField"],
             )
             self.assertEqual("safeState", presentation["safeStateField"])
+            self.assertEqual(
+                "stateUnchanged",
+                presentation["stateUnchangedField"],
+            )
+            self.assertEqual("rolledBack", presentation["rolledBackField"])
+            self.assertEqual(
+                "indeterminate",
+                presentation["indeterminateField"],
+            )
+            self.assertEqual(
+                "failurePhase",
+                presentation["failurePhaseField"],
+            )
+            self.assertEqual(
+                [
+                    "preflight",
+                    "database-transaction",
+                    "transaction-rollback",
+                    "transaction-commit",
+                    "result-reporting",
+                    "request-response",
+                    "operation-polling",
+                    "service-recovery",
+                ],
+                presentation["failurePhases"],
+            )
             self.assertEqual("probe", presentation["probeField"])
             self.assertEqual(
                 {

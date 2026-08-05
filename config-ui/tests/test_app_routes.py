@@ -15,6 +15,57 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class DerivedFailureStateTests(unittest.TestCase):
+    def test_exception_reclassification_cannot_downgrade_uncertainty(self):
+        failure = RuntimeError("failed")
+        failure.failure_phase = "preflight"
+        response = app.derived_exception_response(
+            {"error": "failed", "indeterminate": True},
+            failure,
+            "refresh",
+            "preflight",
+        )
+
+        self.assertTrue(response["indeterminate"])
+        self.assertNotIn("stateUnchanged", response)
+        self.assertNotIn("safeState", response)
+
+    def test_contradictory_rollback_claims_fail_closed(self):
+        for phase in ("preflight", "transaction-commit", "result-reporting"):
+            with self.subTest(phase=phase):
+                response = app.derived_failure_state(
+                    {"error": "failed"},
+                    "refresh",
+                    failure_phase=phase,
+                    rolled_back=True,
+                )
+
+                self.assertTrue(response["indeterminate"])
+                self.assertNotIn("stateUnchanged", response)
+                self.assertNotIn("safeState", response)
+                self.assertNotIn("rolledBack", response)
+
+    def test_only_explicit_database_rollback_proves_unchanged_state(self):
+        unconfirmed = app.derived_failure_state(
+            {"error": "failed"},
+            "refresh",
+            failure_phase="database-transaction",
+        )
+        response = app.derived_failure_state(
+            {"error": "failed"},
+            "refresh",
+            failure_phase="database-transaction",
+            rolled_back=True,
+        )
+
+        self.assertTrue(unconfirmed["indeterminate"])
+        self.assertEqual("transaction-rollback", unconfirmed["failurePhase"])
+        self.assertNotIn("stateUnchanged", unconfirmed)
+        self.assertTrue(response["stateUnchanged"])
+        self.assertTrue(response["rolledBack"])
+        self.assertNotIn("indeterminate", response)
+
+
 class DerivedSemanticSourcePolicyTests(unittest.TestCase):
     @staticmethod
     def payload():
@@ -1218,9 +1269,13 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             body["technicalDetail"],
         )
         self.assertNotIn("SECRET SELECT", repr(body))
-        self.assertNotIn("stateUnchanged", body)
+        self.assertTrue(body["stateUnchanged"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        self.assertEqual("preflight", body["failurePhase"])
+        self.assertNotIn("rolledBack", body)
+        self.assertNotIn("indeterminate", body)
 
-    def test_unexpected_synchronous_failure_is_safe_and_indeterminate(self):
+    def test_unexpected_preflight_failure_reports_unchanged_state(self):
         handler, responses = self.handler(
             "/api/derived-layers",
             self.definition(),
@@ -1240,9 +1295,11 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         status, body = responses[0]
         self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, status)
         self.assertEqual("derived_layer.operation_failed", body["code"])
-        self.assertTrue(body["indeterminate"])
         self.assertNotIn("SECRET", repr(body))
-        self.assertNotIn("stateUnchanged", body)
+        self.assertTrue(body["stateUnchanged"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        self.assertEqual("preflight", body["failurePhase"])
+        self.assertNotIn("indeterminate", body)
 
     def test_refresh_confirmation_error_names_the_unchanged_state(self):
         handler, responses = self.handler(
@@ -1488,6 +1545,17 @@ class CatalogDiscoveryTests(unittest.TestCase):
 
 
 class DerivedBackgroundOperationTests(unittest.TestCase):
+    @staticmethod
+    def failure_state(
+        exc,
+        *,
+        phase="database-transaction",
+        rolled_back=True,
+    ):
+        exc.failure_phase = phase
+        exc.rolled_back = rolled_back
+        return exc
+
     def test_background_job_admission_is_bounded(self):
         reserved = 0
         try:
@@ -1536,6 +1604,41 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
 
+    def test_worker_start_failure_persists_preflight_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            thread = Mock()
+            thread.start.side_effect = RuntimeError("thread unavailable")
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app.threading,
+                "Thread",
+                return_value=thread,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                    app.start_derived_background(
+                        "create",
+                        {"name": "safe_places"},
+                        "admin",
+                        "127.0.0.1",
+                    )
+
+            operation_path = next(control.operations.glob("*.json"))
+            stored = control.read_operation(operation_path.stem)
+            self.assertEqual("failed", stored["status"])
+            error = stored["error"]
+            self.assertEqual(
+                "derived_layer.background_start_failed",
+                error["code"],
+            )
+            self.assertEqual("preflight", error["failurePhase"])
+            self.assertTrue(error["stateUnchanged"])
+            self.assertEqual("No derived layer was created.", error["safeState"])
+            self.assertNotIn("indeterminate", error)
+            self.assertFalse(error["suggestedAction"].startswith("Inspect"))
+            self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
+
     def test_create_records_success_only_after_store_returns(self):
         derived = Mock()
         derived.create.return_value = {
@@ -1561,7 +1664,72 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             result={"derivedLayer": derived.create.return_value},
         )
 
-    def test_unexpected_failure_is_safe_and_indeterminate_in_status_polling(self):
+    def test_post_commit_reporting_failure_is_indeterminate(self):
+        derived = Mock()
+        derived.create.return_value = {
+            "name": "slow_places",
+            "kind": "materialized",
+            "sources": ["etl.places"],
+        }
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ), patch.object(
+            app,
+            "schedule_semantic_outbox",
+            side_effect=RuntimeError("private reporting failure"),
+        ):
+            app.run_derived_background(
+                "9" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("indeterminate", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.operation_failed", error["code"])
+        self.assertTrue(error["indeterminate"])
+        self.assertEqual("result-reporting", error["failurePhase"])
+        self.assertNotIn("stateUnchanged", error)
+        self.assertNotIn("private reporting failure", repr(error))
+
+    def test_commit_failure_is_indeterminate(self):
+        failure = app.psycopg.OperationalError("connection lost during commit")
+        derived = Mock()
+        derived.refresh.side_effect = app.DerivedLayerDatabaseOperationError(
+            failure,
+            failure_phase="transaction-commit",
+            state_unchanged=False,
+            indeterminate=True,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "8" * 32,
+                "refresh",
+                {},
+                "admin",
+                "127.0.0.1",
+                "slow_places",
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("indeterminate", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.database_error", error["code"])
+        self.assertTrue(error["indeterminate"])
+        self.assertEqual("transaction-commit", error["failurePhase"])
+        self.assertNotIn("stateUnchanged", error)
+        self.assertNotIn("rolledBack", error)
+
+    def test_unexpected_failure_is_indeterminate_in_status_polling(self):
         derived = Mock()
         derived.refresh.side_effect = RuntimeError(
             "secret SQL and internal connection path"
@@ -1583,6 +1751,7 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         error = call.kwargs["error"]
         self.assertEqual("derived_layer.operation_failed", error["code"])
         self.assertTrue(error["indeterminate"])
+        self.assertEqual("transaction-rollback", error["failurePhase"])
         self.assertNotIn("secret SQL", error["message"])
         self.assertNotIn("stateUnchanged", error)
         self.assertNotIn("safeState", error)
@@ -1600,8 +1769,12 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
                 })()
 
         derived = Mock()
-        derived.refresh.side_effect = DetailedProgrammingError(
-            "SECRET SQL query context",
+        failure = DetailedProgrammingError("SECRET SQL query context")
+        derived.refresh.side_effect = app.DerivedLayerDatabaseOperationError(
+            failure,
+            failure_phase="database-transaction",
+            state_unchanged=True,
+            rolled_back=True,
         )
         control = Mock()
 
@@ -1628,12 +1801,22 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             },
             error["technicalDetail"],
         )
+        self.assertTrue(error["stateUnchanged"])
+        self.assertEqual(
+            "The existing materialized data remains unchanged.",
+            error["safeState"],
+        )
+        self.assertTrue(error["rolledBack"])
+        self.assertEqual("database-transaction", error["failurePhase"])
+        self.assertNotIn("indeterminate", error)
         self.assertNotIn("SECRET SQL", repr(error))
 
     def test_background_legacy_policy_rejection_keeps_422_status(self):
         derived = Mock()
-        derived.create.side_effect = app.DerivedLayerError(
-            "SQL keyword UPDATE is not allowed."
+        derived.create.side_effect = self.failure_state(
+            app.DerivedLayerError("SQL keyword UPDATE is not allowed."),
+            phase="preflight",
+            rolled_back=False,
         )
         control = Mock()
 
@@ -1656,9 +1839,11 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
     def test_materialization_growth_race_preserves_structured_failure(self):
         probe = DerivedMapExtentRouteTests.materialization_probe()
         derived = Mock()
-        derived.create.side_effect = app.DerivedLayerMaterializationTooLarge(
-            "slow_places",
-            probe,
+        derived.create.side_effect = self.failure_state(
+            app.DerivedLayerMaterializationTooLarge(
+                "slow_places",
+                probe,
+            ),
         )
         control = Mock()
 
@@ -1680,7 +1865,8 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         self.assertEqual(probe, error["probe"])
         self.assertEqual("create", error["operation"])
         self.assertEqual("estimate", error["probeStage"])
-        self.assertNotIn("rolledBack", error)
+        self.assertTrue(error["rolledBack"])
+        self.assertEqual("database-transaction", error["failurePhase"])
 
     def test_query_cost_race_preserves_structured_failure(self):
         probe = DerivedMapExtentRouteTests.query_plan_probe()
@@ -1692,10 +1878,12 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             },
         ]
         derived = Mock()
-        derived.create.side_effect = app.DerivedLayerQueryTooExpensive(
-            "slow_places",
-            probe,
-            reasons,
+        derived.create.side_effect = self.failure_state(
+            app.DerivedLayerQueryTooExpensive(
+                "slow_places",
+                probe,
+                reasons,
+            ),
         )
         control = Mock()
 
@@ -1731,8 +1919,10 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             "actualBytes": 2 * 1024 ** 3,
         }
         derived = Mock()
-        derived.refresh.side_effect = app.DerivedLayerMaterializationTooLarge(
-            "slow_places", probe,
+        derived.refresh.side_effect = self.failure_state(
+            app.DerivedLayerMaterializationTooLarge(
+                "slow_places", probe,
+            ),
         )
         control = Mock()
 
@@ -1759,11 +1949,13 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
 
     def test_dependency_race_preserves_in_use_guidance(self):
         derived = Mock()
-        derived.replace.side_effect = app.DerivedLayerDependencyError(
-            "slow_places",
-            ["public.consumer"],
-            removed_columns=["score"],
-            dependent_columns=["score"],
+        derived.replace.side_effect = self.failure_state(
+            app.DerivedLayerDependencyError(
+                "slow_places",
+                ["public.consumer"],
+                removed_columns=["score"],
+                dependent_columns=["score"],
+            ),
         )
         control = Mock()
 
@@ -1837,6 +2029,46 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
                 "2026-07-21T11:11:52.489807+00:00",
                 layer["refreshedAt"],
             )
+
+    def test_result_serialization_failure_persists_indeterminate_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            operation = control.create_operation(
+                "derived-layer.create",
+                "admin",
+                {"name": "safe_places"},
+            )
+            derived = Mock()
+            derived.create.return_value = {
+                "name": "safe_places",
+                "kind": "view",
+                "sources": ["etl.places"],
+                "unsupported": {"not-json"},
+            }
+
+            with patch.object(app, "DERIVED", derived), patch.object(
+                app, "CONTROL", control,
+            ), patch.object(control, "audit"), patch.object(
+                app, "schedule_semantic_outbox",
+            ):
+                app.run_derived_background(
+                    operation["id"],
+                    "create",
+                    {"name": "safe_places"},
+                    "admin",
+                    "127.0.0.1",
+                )
+
+            stored = control.read_operation(operation["id"])
+            self.assertEqual("indeterminate", stored["status"])
+            self.assertIsNone(stored["result"])
+            error = stored["error"]
+            self.assertEqual("derived_layer.operation_failed", error["code"])
+            self.assertTrue(error["indeterminate"])
+            self.assertEqual("result-reporting", error["failurePhase"])
+            self.assertNotIn("stateUnchanged", error)
+            self.assertNotIn("safeState", error)
 
 
 class SemanticDerivedIntegrationTests(unittest.TestCase):

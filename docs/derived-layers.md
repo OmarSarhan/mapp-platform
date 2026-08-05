@@ -145,9 +145,10 @@ and dependencies have distinct stable codes and corrective actions. A safe
 `derived_layer.database_error` does not expose the raw PostgreSQL exception as
 its primary message. Its optional `technicalDetail` object contains only a
 bounded SQLSTATE and PostgreSQL primary message—not the query, context, detail,
-or hint. It also makes no unchanged-state claim; when the service cannot
-confirm the outcome, `derived_layer.operation_failed` is explicitly
-indeterminate and requires authoritative inspection before retry.
+or hint. A preflight database failure or a failure followed by a proven
+transaction rollback includes the strongest unchanged-state claim the server
+can make. A commit, rollback-finalization, or result-reporting uncertainty is
+explicitly indeterminate and requires authoritative inspection before retry.
 
 ## Database boundary
 
@@ -414,7 +415,8 @@ database transaction has committed and the output checks have passed or a
 terminal error is recorded. Closing the browser or an HTTP proxy timing out
 does not cancel the PostgreSQL work. A service restart cannot preserve an
 in-flight database connection: startup recovery marks such an operation
-indeterminate, while PostgreSQL rolls its uncommitted transaction back.
+indeterminate with `failurePhase: "service-recovery"`; it does not infer an
+unchanged target merely from the operation's failed or interrupted status.
 
 Expected query and materialization guard failures recorded by a durable job
 carry the same code, category where applicable, user guidance, reasons, probe,
@@ -423,12 +425,23 @@ HTTP response; the stored error additionally records its HTTP `status` and
 exception `type`.
 Clients should surface that nested `userMessage`, stable derived-layer code,
 and `suggestedAction` instead of replacing them with a generic background-job
-failure. An unexpected infrastructure or result-recording failure is different:
-the operation becomes `indeterminate` with
-`code: "derived_layer.operation_failed"` and safe inspection guidance. Because
-commit state may be uncertain, that error deliberately omits
-`stateUnchanged` and `safeState`; inspect the operation, managed layer, and
-catalog before retrying.
+failure. An unexpected preflight failure or failure followed by proven rollback
+can use `code: "derived_layer.operation_failed"` with authoritative unchanged
+state. An unexpected commit, rollback-finalization, or result-recording failure
+uses that code with an `indeterminate` operation and inspection guidance; it
+omits `stateUnchanged` and `safeState`, so inspect the operation, managed layer,
+and catalog before retrying.
+
+Failure phases are closed and machine-readable: `preflight` means no mutation
+transaction began; `database-transaction` plus `rolledBack: true` means the
+transaction body failed and an explicit rollback completed; failed rollback or
+commit confirmation uses `transaction-rollback` or `transaction-commit` and is
+indeterminate; `result-reporting` means the database mutation returned but its
+durable result could not be recorded. A client that loses the initial mutation
+response uses `request-response`, a client that loses observation of an
+accepted operation uses `operation-polling`, and startup recovery uses
+`service-recovery`. Only `preflight` and proven rollback responses may include
+`stateUnchanged` and `safeState`.
 
 The configuration service admits one active derived background job by default.
 `DERIVED_MAX_BACKGROUND_JOBS` may be set from 1 through 4, but one is recommended
