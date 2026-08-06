@@ -107,6 +107,10 @@ class ResetCommandSafetyTests(unittest.TestCase):
             self.script,
         )
         self.assertIn(
+            'up --detach --build --force-recreate "${runtime_services[@]}"',
+            self.script,
+        )
+        self.assertIn(
             'run_with_buildkit_lease_retry "${compose[@]}" build --pull xyz',
             self.script,
         )

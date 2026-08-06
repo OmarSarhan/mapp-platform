@@ -15,6 +15,9 @@
 Use `./bin/mapp config` after Compose or environment changes. Use
 `./bin/mapp verify` for the mode-aware runtime checks. External deployments
 also require layer-specific visual acceptance for their own workspace.
+If verification finds stale or unresolved container environment values, run
+`./bin/mapp up --force-recreate` to replace the runtime containers while
+preserving named volumes, then verify again.
 
 `MAPP_DATABASE_MODE=bundled` includes the local PostGIS service. With
 `MAPP_DATABASE_MODE=external`, `serve` starts only XYZ, the configuration

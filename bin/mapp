@@ -16,8 +16,8 @@ usage() {
     "Usage: ./bin/mapp <command>" \
     "" \
     "  init         create a private .env from .env.example" \
-    "  up           build/start the configured database mode and platform services" \
-    "  serve        start platform services without running bundled ETL" \
+    "  up [--force-recreate] build/start the configured database mode and platform services" \
+    "  serve [--force-recreate] start platform services without running bundled ETL" \
     "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
     "  config-ui    build/start the workspace configuration dashboard" \
     "  config-ui-down stop and remove only the configuration dashboard" \
@@ -388,7 +388,22 @@ run_all_etl() {
 
 case "${1:-}" in
   up|serve)
-    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    case "${2:-}" in
+      "")
+        run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
+        ;;
+      --force-recreate)
+        if [[ -n "${3:-}" ]]; then
+          printf 'Usage: ./bin/mapp %s [--force-recreate]\n' "$1" >&2
+          exit 2
+        fi
+        run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --force-recreate "${runtime_services[@]}"
+        ;;
+      *)
+        printf 'Usage: ./bin/mapp %s [--force-recreate]\n' "$1" >&2
+        exit 2
+        ;;
+    esac
     ;;
   config-ui)
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"

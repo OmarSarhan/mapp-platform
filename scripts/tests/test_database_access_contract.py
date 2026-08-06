@@ -190,7 +190,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "configuration service DBS_MAPP session",
             "for service in xyz xyz-preview config-ui",
             "is running with unresolved placeholders in DBS_MAPP",
-            "Run ./bin/mapp up to reconcile the live containers",
+            "Run ./bin/mapp up --force-recreate to replace the stale containers",
             "reader_resource_limits",
             "derived_resource_limits",
             'current_setting($$search_path$$) AS "searchPath"',

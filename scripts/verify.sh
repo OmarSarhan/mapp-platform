@@ -211,7 +211,7 @@ for service in xyz xyz-preview config-ui; do
       printf '%s is not running with the DBS_MAPP value resolved from the current environment.\n' \
         "${service}" >&2
     fi
-    printf 'Run ./bin/mapp up to reconcile the live containers, then run ./bin/mapp verify again.\n' >&2
+    printf 'Run ./bin/mapp up --force-recreate to replace the stale containers, then run ./bin/mapp verify again.\n' >&2
     exit 1
   fi
 done
