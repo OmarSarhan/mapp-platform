@@ -264,7 +264,10 @@ class ControlStore:
                     operation = _strict_json(operation_path.read_text())
                 except (OSError, UnicodeError, ValueError):
                     continue
-                if not isinstance(operation, dict) or operation.get("status") != "running":
+                if (
+                    not isinstance(operation, dict)
+                    or operation.get("status") not in {"running", "cancelling"}
+                ):
                     continue
                 operation.update({
                     "status": "indeterminate",
@@ -710,15 +713,33 @@ class ControlStore:
         result: dict | None = None,
         error: dict | None = None,
     ) -> dict:
-        if status not in {"succeeded", "failed", "indeterminate"}:
+        if status not in {"succeeded", "failed", "cancelled", "indeterminate"}:
             raise ValueError("Invalid terminal operation status.")
         with self._locked():
             operation = self.read_operation(operation_id)
+            if operation.get("status") in {
+                "succeeded", "failed", "cancelled", "indeterminate",
+            }:
+                return operation
             operation.update({
                 "status": status,
                 "updated": iso(),
                 "result": result,
                 "error": error,
+            })
+            _atomic_json(self.operations / f"{operation_id}.json", operation)
+            return operation
+
+    def request_operation_cancellation(self, operation_id: str) -> dict:
+        """Record a cancellation request without claiming rollback yet."""
+        with self._locked():
+            operation = self.read_operation(operation_id)
+            if operation.get("status") != "running":
+                return operation
+            operation.update({
+                "status": "cancelling",
+                "updated": iso(),
+                "cancellationRequested": iso(),
             })
             _atomic_json(self.operations / f"{operation_id}.json", operation)
             return operation

@@ -141,6 +141,60 @@ class DerivedLayerDatabaseOperationError(Exception):
         super().__init__("Derived-layer database operation failed.")
 
 
+class DerivedLayerCancellationRequested(DerivedLayerError):
+    """A background mutation was cancelled before its transaction committed."""
+
+
+class DerivedLayerCancellation:
+    """Coordinate cancellation with one background database transaction."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._requested = threading.Event()
+        self._connection = None
+        self._database_finished = False
+
+    @property
+    def requested(self) -> bool:
+        return self._requested.is_set()
+
+    def bind(self, connection) -> None:
+        with self._lock:
+            self._connection = connection
+            requested = self._requested.is_set()
+        if requested:
+            raise DerivedLayerCancellationRequested(
+                "The derived-layer operation was cancelled."
+            )
+
+    def checkpoint(self) -> None:
+        if self._requested.is_set():
+            raise DerivedLayerCancellationRequested(
+                "The derived-layer operation was cancelled."
+            )
+
+    def request(self) -> bool:
+        """Request rollback, returning false once the database phase is over."""
+        with self._lock:
+            if self._database_finished:
+                return False
+            self._requested.set()
+            connection = self._connection
+        if connection is not None:
+            try:
+                connection.cancel_safe(timeout=5.0)
+            except psycopg.Error:
+                # The pre-commit checkpoint still guarantees rollback if the
+                # cancel packet cannot interrupt the active statement.
+                pass
+        return True
+
+    def finish_database(self) -> None:
+        with self._lock:
+            self._connection = None
+            self._database_finished = True
+
+
 class DerivedLayerResetOwnershipError(DerivedLayerError):
     pass
 
@@ -655,7 +709,10 @@ class DerivedLayerStore:
             raise
 
     @contextmanager
-    def _mutation_connection(self):
+    def _mutation_connection(
+        self,
+        cancellation: DerivedLayerCancellation | None = None,
+    ):
         """Expose whether a mutation failed before, during, or after commit."""
         try:
             connection = self._connect()
@@ -668,7 +725,12 @@ class DerivedLayerStore:
 
         try:
             try:
+                if cancellation is not None:
+                    cancellation.bind(connection)
+                    cancellation.checkpoint()
                 yield connection
+                if cancellation is not None:
+                    cancellation.checkpoint()
             except Exception as body_error:
                 try:
                     connection.rollback()
@@ -699,6 +761,8 @@ class DerivedLayerStore:
                     indeterminate=True,
                 ) from commit_error
         finally:
+            if cancellation is not None:
+                cancellation.finish_database()
             connection.close()
 
     @staticmethod
@@ -1878,9 +1942,15 @@ class DerivedLayerStore:
         with self._connect() as connection, connection.cursor() as cur:
             return self._incoming_dependents(cur, name)
 
-    def create(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+    def create(
+        self,
+        payload: dict[str, Any],
+        actor: str,
+        *,
+        cancellation: DerivedLayerCancellation | None = None,
+    ) -> dict[str, Any]:
         definition = validate_definition(payload)
-        with self._mutation_connection() as connection, connection.cursor() as cur:
+        with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             # Materialization and output validation can legitimately outlive an
             # HTTP request. The dashboard submits these as durable background
             # operations; retain a finite database-side safety bound.
@@ -2002,10 +2072,16 @@ class DerivedLayerStore:
         item = cur.fetchone()
         return self._with_semantic_profile(item) if item else None
 
-    def refresh(self, name: str, actor: str = "system") -> dict[str, Any]:
+    def refresh(
+        self,
+        name: str,
+        actor: str = "system",
+        *,
+        cancellation: DerivedLayerCancellation | None = None,
+    ) -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
-        with self._mutation_connection() as connection, connection.cursor() as cur:
+        with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
@@ -2068,11 +2144,18 @@ class DerivedLayerStore:
             )
             return item
 
-    def replace(self, name: str, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+    def replace(
+        self,
+        name: str,
+        payload: dict[str, Any],
+        actor: str,
+        *,
+        cancellation: DerivedLayerCancellation | None = None,
+    ) -> dict[str, Any]:
         definition = validate_definition(payload)
         if definition["name"] != name:
             raise DerivedLayerError("Replacement name must match the existing relation.")
-        with self._mutation_connection() as connection, connection.cursor() as cur:
+        with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))

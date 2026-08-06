@@ -25,6 +25,8 @@ from psycopg.rows import dict_row
 from infoj_types import info_value_error
 from derived_layers import (
     SCHEMA as DERIVED_SCHEMA,
+    DerivedLayerCancellation,
+    DerivedLayerCancellationRequested,
     DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
@@ -159,6 +161,7 @@ SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
 DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
 DERIVED_BACKGROUND_ACTIVE_JOBS = 0
+DERIVED_BACKGROUND_CANCELLATIONS: dict[str, DerivedLayerCancellation] = {}
 PREVIEW_SYNC_LOCK = threading.Lock()
 PREVIEW_SYNC_STATE: dict[str, object] = {
     "pending": None,
@@ -1348,6 +1351,7 @@ def run_derived_background(
     actor: str,
     remote: str,
     name: str | None = None,
+    cancellation: DerivedLayerCancellation | None = None,
 ) -> None:
     """Complete a derived-layer database operation after HTTP has returned."""
     failure_phase = "database-transaction"
@@ -1357,10 +1361,19 @@ def run_derived_background(
                 "Derived-layer database management is not configured."
             )
         if action == "create":
-            result = DERIVED.create(payload, actor)
+            result = DERIVED.create(
+                payload,
+                actor,
+                **({"cancellation": cancellation} if cancellation else {}),
+            )
             failure_phase = "result-reporting"
         elif action == "replace" and name:
-            result = DERIVED.replace(name, payload, actor)
+            result = DERIVED.replace(
+                name,
+                payload,
+                actor,
+                **({"cancellation": cancellation} if cancellation else {}),
+            )
             failure_phase = "result-reporting"
             changes = result.get("columnChanges", {})
             result.update(derived_workspace_impact(
@@ -1368,7 +1381,11 @@ def run_derived_background(
                 changes.get("removed", []) + changes.get("changed", []),
             ))
         elif action == "refresh" and name:
-            result = DERIVED.refresh(name, actor)
+            result = DERIVED.refresh(
+                name,
+                actor,
+                **({"cancellation": cancellation} if cancellation else {}),
+            )
             failure_phase = "result-reporting"
         else:
             raise DerivedLayerError("Unsupported background operation.")
@@ -1390,6 +1407,8 @@ def run_derived_background(
             status="succeeded",
             result={"derivedLayer": result},
         )
+    except DerivedLayerCancellationRequested as exc:
+        finish_derived_background_cancellation(operation_id, action, exc)
     except DerivedLayerQueryTooExpensive as exc:
         finish_derived_background_failure(
             operation_id,
@@ -1464,22 +1483,32 @@ def run_derived_background(
             failure_phase,
         )
     except DerivedLayerDatabaseOperationError as exc:
-        finish_derived_background_failure(
-            operation_id,
-            action,
-            exc,
-            derived_database_error(
-                exc.cause,
+        if (
+            cancellation is not None
+            and cancellation.requested
+            and exc.rolled_back
+            and getattr(exc.cause, "sqlstate", None) == "57014"
+        ):
+            finish_derived_background_cancellation(
+                operation_id, action, exc.cause,
+            )
+        else:
+            finish_derived_background_failure(
+                operation_id,
                 action,
-                failure_phase=exc.failure_phase,
-                state_unchanged=exc.state_unchanged,
-                rolled_back=exc.rolled_back,
-                indeterminate=exc.indeterminate,
-            ),
-            HTTPStatus.UNPROCESSABLE_ENTITY,
-            failure_phase,
-            type_exc=exc.cause,
-        )
+                exc,
+                derived_database_error(
+                    exc.cause,
+                    action,
+                    failure_phase=exc.failure_phase,
+                    state_unchanged=exc.state_unchanged,
+                    rolled_back=exc.rolled_back,
+                    indeterminate=exc.indeterminate,
+                ),
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                failure_phase,
+                type_exc=exc.cause,
+            )
     except psycopg.Error as exc:
         phase, _ = derived_exception_failure_state(exc, failure_phase)
         response = derived_database_error(
@@ -1549,6 +1578,8 @@ def run_reserved_derived_background(*args) -> None:
     try:
         run_derived_background(*args)
     finally:
+        with DERIVED_BACKGROUND_JOB_LOCK:
+            DERIVED_BACKGROUND_CANCELLATIONS.pop(args[0], None)
         release_derived_background_job()
 
 
@@ -1720,6 +1751,42 @@ def finish_derived_background_failure(
             "type": type(type_exc or exc).__name__,
         },
     )
+
+
+def finish_derived_background_cancellation(
+    operation_id: str,
+    action: str,
+    exc: Exception,
+) -> None:
+    message = f"Derived-layer {action} was cancelled and rolled back."
+    error = derived_failure_state(
+        {
+            "error": message,
+            "message": message,
+            "userMessage": message,
+            "suggestedAction": (
+                "Inspect the operation record before submitting another "
+                "derived-layer change."
+            ),
+            "code": "derived_layer.cancelled",
+            "operation": action,
+            "cancelled": True,
+        },
+        action,
+        failure_phase="database-transaction",
+        rolled_back=True,
+    )
+    CONTROL.finish_operation(
+        operation_id,
+        status="cancelled",
+        error={**error, "type": type(exc).__name__},
+    )
+
+
+def request_derived_background_cancellation(operation_id: str) -> bool:
+    with DERIVED_BACKGROUND_JOB_LOCK:
+        cancellation = DERIVED_BACKGROUND_CANCELLATIONS.get(operation_id)
+    return cancellation.request() if cancellation is not None else False
 
 
 def derived_blocked_error(
@@ -2385,14 +2452,23 @@ def start_derived_background(
                 "spatialScope": payload.get("spatialScope"),
             },
         )
+        cancellation = DerivedLayerCancellation()
+        with DERIVED_BACKGROUND_JOB_LOCK:
+            DERIVED_BACKGROUND_CANCELLATIONS[operation["id"]] = cancellation
         threading.Thread(
             target=run_reserved_derived_background,
-            args=(operation["id"], action, payload, actor, remote, name),
+            args=(
+                operation["id"], action, payload, actor, remote, name,
+                cancellation,
+            ),
             name=f"derived-{action}-{operation['id'][:8]}",
             daemon=True,
         ).start()
         return operation
     except Exception:
+        if operation is not None:
+            with DERIVED_BACKGROUND_JOB_LOCK:
+                DERIVED_BACKGROUND_CANCELLATIONS.pop(operation["id"], None)
         release_derived_background_job()
         if operation is not None:
             CONTROL.finish_operation(
@@ -3992,6 +4068,11 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/artifacts/"):
                 return "visual"
             return "inspect"
+        if re.fullmatch(
+            r"/api/operations/[0-9a-f]{32}/cancel",
+            path,
+        ):
+            return "derive"
         if path in {"/api/visual-plan", "/api/visual-test"} or re.fullmatch(
             r"/api/proposals/[^/]+/(visual-plan|visual-test|screenshot)", path
         ):
@@ -4896,6 +4977,86 @@ class Handler(SimpleHTTPRequestHandler):
         self._authorization_scope = self._required_scope(request_path, "POST")
         actor = self._authorized(state_change=True)
         if not actor:
+            return
+        operation_cancel_path = re.fullmatch(
+            r"/api/operations/([0-9a-f]{32})/cancel",
+            request_path,
+        )
+        if operation_cancel_path:
+            operation_id = operation_cancel_path.group(1)
+            try:
+                payload = self._payload()
+                if payload.get("confirmed") is not True:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "Confirm cancellation before stopping this operation.",
+                        "code": "operation.confirmation_required",
+                    })
+                    return
+                operation = CONTROL.read_operation(operation_id)
+                if operation.get("kind") not in {
+                    "derived-layer.create",
+                    "derived-layer.replace",
+                    "derived-layer.refresh",
+                }:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "Only background derived-layer operations can be cancelled.",
+                        "code": "operation.not_cancellable",
+                        "operation": operation,
+                    })
+                    return
+                if operation.get("status") in {
+                    "succeeded", "failed", "cancelled", "indeterminate",
+                }:
+                    self._json(HTTPStatus.OK, {"operation": operation})
+                    return
+                if not request_derived_background_cancellation(operation_id):
+                    operation = CONTROL.read_operation(operation_id)
+                    if operation.get("status") in {
+                        "succeeded", "failed", "cancelled", "indeterminate",
+                    }:
+                        self._json(HTTPStatus.OK, {"operation": operation})
+                    else:
+                        self._json(HTTPStatus.CONFLICT, {
+                            "error": (
+                                "The database phase has already finished; "
+                                "wait for the terminal operation result."
+                            ),
+                            "code": "operation.cancel_too_late",
+                            "operation": operation,
+                        })
+                    return
+                operation = CONTROL.request_operation_cancellation(operation_id)
+                CONTROL.audit(
+                    "derived_layer.cancellation_requested",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        "operationId": operation_id,
+                        "name": (operation.get("target") or {}).get("name"),
+                        "action": (operation.get("target") or {}).get("action"),
+                    },
+                )
+                status = (
+                    HTTPStatus.OK
+                    if operation.get("status") in {
+                        "succeeded", "failed", "cancelled", "indeterminate",
+                    }
+                    else HTTPStatus.ACCEPTED
+                )
+                self._json(status, {
+                    "operation": operation,
+                    "statusUrl": f"/api/operations/{operation_id}",
+                })
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": str(exc),
+                    "code": "operation.invalid_cancellation",
+                })
+            except FileNotFoundError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": str(exc),
+                    "code": "operation.not_found",
+                })
             return
         if request_path == "/api/semantic/generate":
             if not self._scope_granted(actor, "semantic:inspect"):

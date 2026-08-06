@@ -1694,6 +1694,157 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             result={"derivedLayer": derived.create.return_value},
         )
 
+    def test_confirmed_database_rollback_records_cancelled(self):
+        derived = Mock()
+        cancellation = app.DerivedLayerCancellation()
+
+        def create(_payload, _actor, *, cancellation):
+            cancellation.request()
+            failure = app.DerivedLayerCancellationRequested("cancelled")
+            failure.failure_phase = "database-transaction"
+            failure.rolled_back = True
+            raise failure
+
+        derived.create.side_effect = create
+        control = Mock()
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "c" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+                cancellation=cancellation,
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("cancelled", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.cancelled", error["code"])
+        self.assertTrue(error["stateUnchanged"])
+        self.assertTrue(error["rolledBack"])
+        self.assertEqual("No derived layer was created.", error["safeState"])
+
+    def test_postgresql_query_cancellation_records_cancelled_after_rollback(self):
+        class CancelledQuery(app.psycopg.OperationalError):
+            @property
+            def sqlstate(self):
+                return "57014"
+
+        cancellation = app.DerivedLayerCancellation()
+        self.assertTrue(cancellation.request())
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerDatabaseOperationError(
+            CancelledQuery("query cancelled"),
+            failure_phase="database-transaction",
+            state_unchanged=True,
+            rolled_back=True,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "d" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+                cancellation=cancellation,
+            )
+
+        self.assertEqual(
+            "cancelled", control.finish_operation.call_args.kwargs["status"],
+        )
+
+    def test_cancellation_during_commit_remains_indeterminate(self):
+        cancellation = app.DerivedLayerCancellation()
+        self.assertTrue(cancellation.request())
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerDatabaseOperationError(
+            app.psycopg.OperationalError("commit interrupted"),
+            failure_phase="transaction-commit",
+            state_unchanged=False,
+            indeterminate=True,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "e" * 32,
+                "create",
+                {"name": "slow_places"},
+                "admin",
+                "127.0.0.1",
+                cancellation=cancellation,
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("indeterminate", call.kwargs["status"])
+        self.assertEqual("transaction-commit", call.kwargs["error"]["failurePhase"])
+
+    def test_cancel_route_requests_cancellation_without_claiming_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            operation = control.create_operation(
+                "derived-layer.create",
+                "token:test",
+                {"name": "slow_places", "action": "create"},
+            )
+            cancellation = app.DerivedLayerCancellation()
+            handler, responses = DerivedMapExtentRouteTests.handler(
+                f"/api/operations/{operation['id']}/cancel",
+                {"confirmed": True},
+            )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app,
+                "DERIVED_BACKGROUND_CANCELLATIONS",
+                {operation["id"]: cancellation},
+            ):
+                handler.do_POST()
+
+            self.assertEqual(HTTPStatus.ACCEPTED, responses[0][0])
+            self.assertTrue(cancellation.requested)
+            self.assertEqual(
+                "cancelling", responses[0][1]["operation"]["status"],
+            )
+            self.assertEqual(
+                "cancelling",
+                control.read_operation(operation["id"])["status"],
+            )
+
+    def test_cancel_route_rejects_request_after_database_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            operation = control.create_operation(
+                "derived-layer.create", "token:test",
+            )
+            cancellation = app.DerivedLayerCancellation()
+            cancellation.finish_database()
+            handler, responses = DerivedMapExtentRouteTests.handler(
+                f"/api/operations/{operation['id']}/cancel",
+                {"confirmed": True},
+            )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app,
+                "DERIVED_BACKGROUND_CANCELLATIONS",
+                {operation["id"]: cancellation},
+            ):
+                handler.do_POST()
+
+            self.assertEqual(HTTPStatus.CONFLICT, responses[0][0])
+            self.assertEqual("operation.cancel_too_late", responses[0][1]["code"])
+            self.assertEqual("running", control.read_operation(operation["id"])["status"])
+
     def test_post_commit_reporting_failure_is_indeterminate(self):
         derived = Mock()
         derived.create.return_value = {

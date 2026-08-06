@@ -15,6 +15,8 @@ from derived_layers import (
     MATERIALIZED_MAX_ESTIMATED_BYTES,
     QUERY_PLAN_MAX_INTERMEDIATE_BYTES,
     QUERY_PLAN_MAX_TOTAL_COST,
+    DerivedLayerCancellation,
+    DerivedLayerCancellationRequested,
     DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
@@ -25,6 +27,24 @@ from derived_layers import (
     DerivedLayerStore,
     validate_definition,
 )
+
+
+class DerivedLayerCancellationTests(unittest.TestCase):
+    def test_requested_cancellation_rolls_back_before_commit(self):
+        connection = MagicMock()
+        cancellation = DerivedLayerCancellation()
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        store._connect = MagicMock(return_value=connection)
+
+        with self.assertRaises(DerivedLayerCancellationRequested):
+            with store._mutation_connection(cancellation):
+                self.assertTrue(cancellation.request())
+
+        connection.cancel_safe.assert_called_once_with(timeout=5.0)
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        connection.close.assert_called_once_with()
+        self.assertFalse(cancellation.request())
 
 
 class DerivedLayerDefinitionTests(unittest.TestCase):

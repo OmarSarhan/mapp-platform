@@ -147,6 +147,7 @@ clients still use the route and response contract owned by the server.
 | `proposals preview-plan\|preview-test\|preview-screenshot` | Proposal visual-plan, visual-test, and screenshot routes | `proposals.preview-plan`, `proposals.preview-test`, `proposals.preview-screenshot` | `visual` |
 | `xyz status\|reload` (`reload-xyz` is a client alias) | `GET /api/xyz/status`, `POST /api/xyz/reload` | `xyz.reload` for reload | `inspect` or `reload` |
 | `operations show\|wait` | `GET /api/operations/{operationId}` | Determined by the originating action's `operationKind` | The originating `visual`, `apply`, `reload`, or `derive` scope |
+| `operations cancel` | `POST /api/operations/{operationId}/cancel` | `derived-layer.create`, `derived-layer.replace`, or `derived-layer.refresh` | `derive`; explicit confirmation required |
 | `auth status\|device` | Auth identity and device-authorization routes | — | Any authenticated credential can read its identity; the CLI verifies the current target before using the unauthenticated device start/poll endpoints |
 | `semantic *` | `/api/semantic/*` | `semantic.*` | See [Semantic catalog and proposals](#semantic-catalog-and-proposals) for the exact additive scopes |
 
@@ -344,11 +345,14 @@ readiness does not disable derived queries that do not use H3.
 | `GET /api/auth/me` | Current actor and reported scopes; session list for administrators |
 | `GET /api/capabilities` | Stable action IDs, risks, routes, schemas, and operation kinds |
 | `GET /api/operations/<id>` | Durable authorized status/result for a long action |
+| `POST /api/operations/<id>/cancel` | Request cancellation of a background derived-layer transaction |
 
 Derived-layer create, replace, and refresh requests accept an optional
 `"background": true`. They return `202 Accepted` with `operation` and
-`statusUrl`; poll that URL until `status` is `succeeded`, `failed`, or
-`indeterminate`. Omitting the flag preserves the synchronous API behaviour.
+`statusUrl`; poll that URL until `status` is `succeeded`, `failed`, `cancelled`,
+or `indeterminate`. `cancelling` is nonterminal: the server reports `cancelled`
+only after PostgreSQL confirms the transaction was rolled back. Omitting the
+flag preserves the synchronous API behaviour.
 The server advertises `backgroundJobs.activeJobs` and `maxActiveJobs` in
 derived-layer capabilities. If the bounded worker is full, admission returns
 HTTP `429` with `derived_layer.background_capacity`, `blocked: true`, and

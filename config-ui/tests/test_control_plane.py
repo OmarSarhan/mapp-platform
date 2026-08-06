@@ -370,6 +370,44 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual("2941", layer["rowCount"])
             self.assertEqual(str(identifier), layer["requestId"])
 
+    def test_cancellation_request_is_nonterminal_until_worker_confirms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "derived-layer.create",
+                "token:test",
+                {"name": "places"},
+            )
+
+            cancelling = store.request_operation_cancellation(operation["id"])
+            self.assertEqual("cancelling", cancelling["status"])
+            self.assertIsNotNone(cancelling["cancellationRequested"])
+            cancelled = store.finish_operation(
+                operation["id"],
+                status="cancelled",
+                error={"code": "derived_layer.cancelled"},
+            )
+            self.assertEqual("cancelled", cancelled["status"])
+
+    def test_terminal_operation_cannot_be_overwritten_by_racing_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "derived-layer.create", "token:test",
+            )
+            succeeded = store.finish_operation(
+                operation["id"], status="succeeded", result={"ok": True},
+            )
+
+            preserved = store.finish_operation(
+                operation["id"],
+                status="cancelled",
+                error={"code": "derived_layer.cancelled"},
+            )
+            self.assertEqual(succeeded, preserved)
+
     def test_running_operations_become_indeterminate_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -394,3 +432,20 @@ class ControlPlaneTests(unittest.TestCase):
             )
             self.assertIn("before retrying", recovered["error"]["suggestedAction"])
             self.assertIsNone(recovered["result"])
+
+    def test_cancelling_operations_become_indeterminate_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ControlStore(root)
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "derived-layer.refresh", "token:test",
+            )
+            store.request_operation_cancellation(operation["id"])
+
+            restarted = ControlStore(root)
+            restarted.recover_interrupted_operations()
+            recovered = restarted.read_operation(operation["id"])
+
+            self.assertEqual("indeterminate", recovered["status"])
+            self.assertEqual("operation.interrupted", recovered["error"]["code"])

@@ -963,6 +963,18 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "operations.cancel": {
+        "method": "POST",
+        "pathTemplate": "/api/operations/{operationId}/cancel",
+        "risk": "database-definition",
+        "scope": "derive",
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirmed"],
+            "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
     "proposals.check": {
         "method": "POST",
         "path": "/api/proposals/check",
@@ -1391,7 +1403,7 @@ def contract(instance_id: str) -> dict[str, Any]:
             "proposals check", "proposals create", "proposals show", "proposals list",
             "proposals apply", "proposals decline",
             "xyz status", "xyz reload",
-            "operations show", "operations wait",
+            "operations show", "operations wait", "operations cancel",
             "auth status", "auth device",
         ],
         "workflow": [
@@ -1409,7 +1421,10 @@ def contract(instance_id: str) -> dict[str, Any]:
             "discovery": "/api/capabilities",
             "operations": {
                 "statusTemplate": "/api/operations/{operationId}",
-                "terminalStatuses": ["succeeded", "failed", "indeterminate"],
+                "cancelTemplate": "/api/operations/{operationId}/cancel",
+                "terminalStatuses": [
+                    "succeeded", "failed", "cancelled", "indeterminate",
+                ],
             },
             "responseMetadata": "meta",
         },
