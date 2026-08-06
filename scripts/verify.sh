@@ -199,13 +199,19 @@ if response.status != 200 or not isinstance(payload.get("catalogRevision"), int)
 print("Private semantic service authentication and status contract verified.")
 '
 
-for service in xyz config-ui; do
+for service in xyz xyz-preview config-ui; do
   running_dbs="$(
     "${compose[@]}" exec -T "${service}" sh -c 'printf %s "$DBS_MAPP"'
   )"
   if [[ "${running_dbs}" != "${resolved_dbs}" ]]; then
-    printf '%s is not running with the DBS_MAPP value resolved from the current environment. Recreate the platform services before verification.\n' \
-      "${service}" >&2
+    if [[ "${running_dbs}" == *'${'* ]]; then
+      printf '%s is running with unresolved placeholders in DBS_MAPP. Start services through ./bin/mapp so the private environment is resolved before container creation.\n' \
+        "${service}" >&2
+    else
+      printf '%s is not running with the DBS_MAPP value resolved from the current environment.\n' \
+        "${service}" >&2
+    fi
+    printf 'Run ./bin/mapp up to reconcile the live containers, then run ./bin/mapp verify again.\n' >&2
     exit 1
   fi
 done
