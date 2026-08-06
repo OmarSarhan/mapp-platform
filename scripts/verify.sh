@@ -41,6 +41,9 @@ reject_database_environment_overrides() {
           "${key}" "${ENV_FILE}" >&2
         exit 2
       fi
+      # Shell values outrank --env-file interpolation in Compose. Remove an
+      # exact duplicate so nested values such as DBS_MAPP resolve from .env.
+      unset "${key}"
     fi
   done
 }

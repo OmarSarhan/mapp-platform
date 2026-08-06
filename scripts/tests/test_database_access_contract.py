@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -84,6 +87,39 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 guard = source[start:end]
                 for key in expected:
                     self.assertIn(key, guard)
+                self.assertIn('unset "${key}"', guard)
+
+    def test_matching_export_cannot_shadow_env_file_interpolation(self) -> None:
+        raw_dbs = (
+            "postgresql://${XYZ_DB_USER}:${XYZ_DB_PASSWORD}"
+            "@db:5432/${POSTGRES_DB}"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(f"DBS_MAPP={raw_dbs}\n", encoding="utf-8")
+            for relative_path in ("bin/mapp", "scripts/verify.sh"):
+                with self.subTest(path=relative_path):
+                    source = (ROOT / relative_path).read_text(encoding="utf-8")
+                    dotenv_start = source.index("dotenv_value()")
+                    dotenv_end = source.index("\n}", dotenv_start) + 2
+                    guard_start = source.index(
+                        "reject_database_environment_overrides()"
+                    )
+                    guard_end = source.index("\n}", guard_start) + 2
+                    script = "\n".join((
+                        'ENV_FILE="$1"',
+                        source[dotenv_start:dotenv_end],
+                        source[guard_start:guard_end],
+                        "reject_database_environment_overrides",
+                        "[[ ! -v DBS_MAPP ]]",
+                    ))
+                    subprocess.run(
+                        ["bash", "-c", script, "test", str(env_file)],
+                        check=True,
+                        env={"PATH": os.environ["PATH"], "DBS_MAPP": raw_dbs},
+                        capture_output=True,
+                        text=True,
+                    )
 
     def test_new_database_reader_has_only_table_select_defaults(self) -> None:
         source = (
