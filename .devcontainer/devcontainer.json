@@ -13,11 +13,21 @@
   "postCreateCommand": "python -m pip install --requirement config-ui/requirements.txt && npm --prefix config-ui ci",
   "runArgs": [
     "--publish",
-    "3000:3000"
+    "0.0.0.0:3000:3000",
+    "--publish",
+    "0.0.0.0:3443:3443"
+  ],
+  "forwardPorts": [
+    3000,
+    3443
   ],
   "portsAttributes": {
     "3000": {
       "label": "MAPP gateway",
+      "onAutoForward": "ignore"
+    },
+    "3443": {
+      "label": "MAPP gateway HTTPS",
       "onAutoForward": "ignore"
     }
   },
