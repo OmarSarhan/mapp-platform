@@ -793,6 +793,36 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual(app.DERIVED_MAX_BACKGROUND_JOBS, capacity["maxActiveJobs"])
         self.assertGreaterEqual(capacity["activeJobs"], 0)
 
+    def test_unconfigured_capabilities_include_safe_h3_diagnostics(self):
+        handler, responses = self.handler("/api/derived-layers/capabilities")
+
+        with patch.object(app, "DERIVED", None):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        capabilities = responses[0][1]
+        self.assertFalse(capabilities["h3Available"])
+        self.assertEqual(
+            {
+                "method": "postgresql-catalog-and-execution",
+                "ready": False,
+                "code": "derived_layer.h3_not_ready",
+                "stage": "extension-discovery",
+                "reasons": [{
+                    "code": "derived_layers_unconfigured",
+                    "message": (
+                        "H3 readiness cannot be checked because derived "
+                        "layers are not configured."
+                    ),
+                    "suggestedAction": (
+                        "Configure the derived-layer database, then retry "
+                        "the readiness check."
+                    ),
+                }],
+            },
+            capabilities["h3Readiness"],
+        )
+
     def test_capabilities_database_error_does_not_expose_raw_context(self):
         class DetailedProgrammingError(app.psycopg.ProgrammingError):
             @property

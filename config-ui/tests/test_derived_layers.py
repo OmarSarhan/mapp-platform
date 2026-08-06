@@ -940,7 +940,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             },
             capabilities["h3Readiness"],
         )
-        self.assertEqual(3, cursor.execute.call_count)
+        self.assertEqual(4, cursor.execute.call_count)
 
     def test_capabilities_do_not_advertise_an_unsafe_h3_wrapper(self):
         cursor = MagicMock()
@@ -983,11 +983,183 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             {
                 "method": "postgresql-catalog-and-execution",
                 "ready": False,
+                "code": "derived_layer.h3_not_ready",
+                "stage": "routine-policy",
+                "reasons": [{
+                    "code": "wrapper_not_approved",
+                    "message": (
+                        "The H3 polygon wrapper does not satisfy the "
+                        "derived-query routine policy."
+                    ),
+                    "suggestedAction": (
+                        "Apply the supported wrapper hardening migration, "
+                        "then retry."
+                    ),
+                }],
             },
             capabilities["h3Readiness"],
         )
         cursor.fetchone.assert_not_called()
         self.assertEqual(2, cursor.execute.call_count)
+
+    def test_h3_readiness_reports_each_bounded_failure_stage(self):
+        extensions = {
+            "postgis": "3.5.7",
+            "h3": "4.2.3",
+            "h3_postgis": "4.2.3",
+        }
+        wrapper = {
+            "kind": "function",
+            "object_oid": 100,
+            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "schema": "public",
+            "name": "h3_polygon_to_cells",
+            "extension": "h3_postgis",
+            "extension_schema": "public",
+            "implementation_schema": "public",
+            "implementation_extension": "h3_postgis",
+            "implementation_extension_schema": "public",
+            "volatility": "i",
+            "returns_set": True,
+            "routine_kind": "f",
+            "security_definer": False,
+            "routine_config": ["search_path=pg_catalog, public"],
+            "language": "sql",
+            "object_builtin": False,
+            "implementation_builtin": False,
+            "approved_extension_search_path": (
+                "search_path=pg_catalog, public"
+            ),
+            "geometry_schema": "public",
+        }
+
+        cases = []
+
+        missing_cursor = MagicMock()
+        cases.append((
+            {},
+            MagicMock(),
+            missing_cursor,
+            "extension-discovery",
+            "missing_extensions",
+        ))
+
+        version_cursor = MagicMock()
+        cases.append((
+            {**extensions, "h3_postgis": "4.2.2"},
+            MagicMock(),
+            version_cursor,
+            "version-validation",
+            "unsupported_extension_versions",
+        ))
+
+        catalog_cursor = MagicMock()
+        catalog_cursor.fetchall.return_value = []
+        cases.append((
+            extensions,
+            MagicMock(),
+            catalog_cursor,
+            "catalog-resolution",
+            "wrapper_not_found",
+        ))
+
+        policy_cursor = MagicMock()
+        policy_cursor.fetchall.return_value = [{
+            **wrapper,
+            "routine_config": [
+                "search_path=pg_catalog, public, secret_schema"
+            ],
+        }]
+        cases.append((
+            extensions,
+            MagicMock(),
+            policy_cursor,
+            "routine-policy",
+            "wrapper_not_approved",
+        ))
+
+        planning_cursor = MagicMock()
+        planning_cursor.fetchall.return_value = [wrapper]
+        planning_cursor.execute.side_effect = [
+            None,
+            psycopg.ProgrammingError("SECRET nested dependency"),
+        ]
+        cases.append((
+            extensions,
+            MagicMock(),
+            planning_cursor,
+            "nested-dependency-resolution",
+            "wrapper_dependencies_unresolved",
+        ))
+
+        execution_cursor = MagicMock()
+        execution_cursor.fetchall.return_value = [wrapper]
+        execution_cursor.execute.side_effect = [
+            None,
+            None,
+            psycopg.ProgrammingError("SECRET execution context"),
+        ]
+        cases.append((
+            extensions,
+            MagicMock(),
+            execution_cursor,
+            "execution-probe",
+            "execution_probe_failed",
+        ))
+
+        result_cursor = MagicMock()
+        result_cursor.fetchall.return_value = [wrapper]
+        result_cursor.fetchone.return_value = {
+            "cellCount": "SECRET invalid value",
+        }
+        cases.append((
+            extensions,
+            MagicMock(),
+            result_cursor,
+            "result-validation",
+            "invalid_probe_result",
+        ))
+
+        for (
+            installed,
+            connection,
+            cursor,
+            expected_stage,
+            expected_reason,
+        ) in cases:
+            with self.subTest(stage=expected_stage):
+                readiness = DerivedLayerStore._h3_readiness(
+                    connection,
+                    cursor,
+                    installed,
+                )
+                self.assertEqual(
+                    {
+                        "method",
+                        "ready",
+                        "code",
+                        "stage",
+                        "reasons",
+                    },
+                    set(readiness),
+                )
+                self.assertFalse(readiness["ready"])
+                self.assertEqual(
+                    "derived_layer.h3_not_ready",
+                    readiness["code"],
+                )
+                self.assertEqual(expected_stage, readiness["stage"])
+                self.assertEqual(1, len(readiness["reasons"]))
+                reason = readiness["reasons"][0]
+                self.assertEqual(
+                    {"code", "message", "suggestedAction"},
+                    set(reason),
+                )
+                self.assertEqual(expected_reason, reason["code"])
+                self.assertNotIn("SECRET", repr(readiness))
+
+        missing_cursor.execute.assert_not_called()
+        version_cursor.execute.assert_not_called()
 
     def test_create_persists_scope_and_keeps_original_query(self):
         cursor = MagicMock()

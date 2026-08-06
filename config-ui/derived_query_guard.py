@@ -1718,6 +1718,19 @@ def _has_approved_extension_search_path(
     )
 
 
+def h3_polygon_wrapper_is_approved(
+    dependency: RoutineDependency,
+) -> bool:
+    return (
+        _has_approved_extension_search_path(dependency)
+        and dependency.returns_set
+        and dependency.routine_kind == "f"
+        and not dependency.security_definer
+        and dependency.volatility != "v"
+        and dependency.language in APPROVED_ROUTINE_LANGUAGES
+    )
+
+
 def approved_h3_polygon_wrapper(
     cur,
 ) -> tuple[RoutineDependency, str] | None:
@@ -1725,14 +1738,7 @@ def approved_h3_polygon_wrapper(
     if inspected is None:
         return None
     dependency, geometry_schema = inspected
-    if not (
-        _has_approved_extension_search_path(dependency)
-        and dependency.returns_set
-        and dependency.routine_kind == "f"
-        and not dependency.security_definer
-        and dependency.volatility != "v"
-        and dependency.language in APPROVED_ROUTINE_LANGUAGES
-    ):
+    if not h3_polygon_wrapper_is_approved(dependency):
         return None
     return dependency, geometry_schema
 

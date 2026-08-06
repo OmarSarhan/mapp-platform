@@ -357,6 +357,24 @@ positive literal SRID are accepted. This cast admission does not relax output
 validation: the selected geometry attribute must still retain that explicit
 typmod and positive SRID.
 
+H3 capability readiness is a staged, fail-closed check. It requires PostGIS
+3.5.x, matching H3 and H3 PostGIS 4.2.x extension versions, the exact
+extension-owned `h3_polygon_to_cells(geometry, integer)` overload, and the same
+routine policy used by submitted queries. PostgreSQL then plans and executes a
+tiny synthetic polygon call, and the server validates its aggregate result.
+The probe reads no source relation or user row.
+
+On success, `h3Readiness` contains only
+`method: "postgresql-catalog-and-execution"` and `ready: true`. On failure it
+also contains `code: "derived_layer.h3_not_ready"`, one closed `stage`, and a
+bounded `reasons` list whose entries have `code`, `message`, and
+`suggestedAction`. The stages are `extension-discovery`, `version-validation`,
+`catalog-resolution`, `routine-policy`, `nested-dependency-resolution`,
+`execution-probe`, and `result-validation`. Diagnostics never include raw SQL,
+PostgreSQL error text, connection context, secrets, or database-supplied object
+names. `h3Available` is always equal to `h3Readiness.ready`; ordinary non-H3
+derived queries remain available when H3 is not ready.
+
 Successful mutations include `queryPlanProbe`; capabilities advertise the
 ordered AST/catalog/EXPLAIN `stages`, `shapeLimits`, plan `limits`, H3 bounds,
 and `errorCategories` in `queryGuard`. Failures distinguish a malformed query,

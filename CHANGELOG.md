@@ -13,6 +13,9 @@ first release.
   membership while tolerating harmless quoting, whitespace, and extension
   ordering. H3 capability reporting now verifies the exact extension-owned
   geometry overload and executes a bounded nested-dependency readiness probe.
+  Failed readiness now reports a closed, non-sensitive extension, version,
+  catalog, policy, planning, execution, or result-validation diagnosis while
+  keeping non-H3 derived queries available.
 - Reported authoritative derived-mutation failure phases and commit state,
   distinguishing preflight and proven rollback from commit, reporting,
   polling, and recovery uncertainty without exposing database internals.

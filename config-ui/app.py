@@ -4518,6 +4518,19 @@ class Handler(SimpleHTTPRequestHandler):
                         "h3Readiness": {
                             "method": "postgresql-catalog-and-execution",
                             "ready": False,
+                            "code": "derived_layer.h3_not_ready",
+                            "stage": "extension-discovery",
+                            "reasons": [{
+                                "code": "derived_layers_unconfigured",
+                                "message": (
+                                    "H3 readiness cannot be checked because "
+                                    "derived layers are not configured."
+                                ),
+                                "suggestedAction": (
+                                    "Configure the derived-layer database, "
+                                    "then retry the readiness check."
+                                ),
+                            }],
                         },
                     }
                 )

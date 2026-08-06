@@ -22,7 +22,8 @@ from derived_query_guard import (
     H3_RING_FUNCTIONS,
     QueryAstInspection,
     QueryGuardViolation,
-    approved_h3_polygon_wrapper,
+    h3_polygon_wrapper_is_approved,
+    inspect_h3_polygon_wrapper,
     validate_qualified_cast_types,
     validate_query_ast,
     validate_relation_routines,
@@ -53,6 +54,44 @@ H3_SCOPE_MAX_ESTIMATED_CELLS = 2_000_000
 H3_SCOPE_MAX_ESTIMATED_EXPANDED_CELLS = 10_000_000
 H3_SCOPE_ESTIMATE_SAFETY_MULTIPLIER = 1.5
 H3_MAX_GRID_DISTANCE = 25
+H3_READINESS_METHOD = "postgresql-catalog-and-execution"
+H3_READINESS_FAILURES = {
+    "extension-discovery": (
+        "missing_extensions",
+        "Required PostGIS, H3, and H3 PostGIS extensions are not all installed.",
+        "Install the supported extensions, then retry the readiness check.",
+    ),
+    "version-validation": (
+        "unsupported_extension_versions",
+        "The installed PostGIS and H3 extension versions are not a supported combination.",
+        "Use PostGIS 3.5.x and matching H3 and H3 PostGIS 4.2.x versions, then retry.",
+    ),
+    "catalog-resolution": (
+        "wrapper_not_found",
+        "The required extension-owned H3 polygon wrapper could not be resolved.",
+        "Verify the H3 PostGIS installation and exact geometry wrapper overload, then retry.",
+    ),
+    "routine-policy": (
+        "wrapper_not_approved",
+        "The H3 polygon wrapper does not satisfy the derived-query routine policy.",
+        "Apply the supported wrapper hardening migration, then retry.",
+    ),
+    "nested-dependency-resolution": (
+        "wrapper_dependencies_unresolved",
+        "PostgreSQL could not plan the H3 polygon wrapper with its nested dependencies.",
+        "Repair the wrapper search path or extension dependencies, then retry.",
+    ),
+    "execution-probe": (
+        "execution_probe_failed",
+        "The bounded H3 readiness probe did not execute successfully.",
+        "Check the supported extension installation and wrapper configuration, then retry.",
+    ),
+    "result-validation": (
+        "invalid_probe_result",
+        "The bounded H3 readiness probe returned an invalid result.",
+        "Repair or reinstall the supported H3 extensions, then retry.",
+    ),
+}
 H3_AVERAGE_HEX_AREA_KM2 = (
     4_357_449.416078381,
     609_788.441794133,
@@ -2943,38 +2982,95 @@ class DerivedLayerStore:
             return [row["name"] for row in cur.fetchall()]
 
     @staticmethod
-    def _h3_capability_ready(
+    def _h3_not_ready(stage: str) -> dict[str, Any]:
+        reason_code, message, suggested_action = H3_READINESS_FAILURES[stage]
+        return {
+            "method": H3_READINESS_METHOD,
+            "ready": False,
+            "code": "derived_layer.h3_not_ready",
+            "stage": stage,
+            "reasons": [{
+                "code": reason_code,
+                "message": message,
+                "suggestedAction": suggested_action,
+            }],
+        }
+
+    @staticmethod
+    def _supported_h3_versions(extensions: dict[str, str]) -> bool:
+        release = re.compile(r"^\d+\.\d+(?:\.\d+)*$")
+        postgis = extensions["postgis"]
+        h3 = extensions["h3"]
+        h3_postgis = extensions["h3_postgis"]
+        return (
+            release.fullmatch(postgis) is not None
+            and release.fullmatch(h3) is not None
+            and release.fullmatch(h3_postgis) is not None
+            and (postgis == "3.5" or postgis.startswith("3.5."))
+            and (h3 == "4.2" or h3.startswith("4.2."))
+            and h3_postgis == h3
+        )
+
+    @classmethod
+    def _h3_readiness(
+        cls,
         connection,
         cur,
         extensions: dict[str, str],
-    ) -> bool:
+    ) -> dict[str, Any]:
         if not {"postgis", "h3", "h3_postgis"}.issubset(extensions):
-            return False
+            return cls._h3_not_ready("extension-discovery")
+        if not cls._supported_h3_versions(extensions):
+            return cls._h3_not_ready("version-validation")
         try:
             with connection.transaction():
-                approved = approved_h3_polygon_wrapper(cur)
-                if approved is None:
-                    return False
-                wrapper, geometry_schema = approved
-                cur.execute(
-                    sql.SQL("""
-                        SELECT pg_catalog.count(*) AS "cellCount"
-                        FROM {}.h3_polygon_to_cells(
-                          {}.ST_GeomFromText(%s, 4326),
-                          0
-                        )
-                    """).format(
-                        sql.Identifier(wrapper.schema),
-                        sql.Identifier(geometry_schema),
-                    ),
-                    (
-                        "POLYGON((-0.01 -0.01,0.01 -0.01,0.01 0.01,"
-                        "-0.01 0.01,-0.01 -0.01))",
-                    ),
-                )
-                return cur.fetchone() is not None
+                inspected = inspect_h3_polygon_wrapper(cur)
         except psycopg.Error:
-            return False
+            return cls._h3_not_ready("catalog-resolution")
+        if inspected is None:
+            return cls._h3_not_ready("catalog-resolution")
+        wrapper, geometry_schema = inspected
+        if not h3_polygon_wrapper_is_approved(wrapper):
+            return cls._h3_not_ready("routine-policy")
+        probe = sql.SQL("""
+            SELECT pg_catalog.count(*) AS "cellCount"
+            FROM {}.h3_polygon_to_cells(
+              {}.ST_GeomFromText(%s, 4326),
+              0
+            )
+        """).format(
+            sql.Identifier(wrapper.schema),
+            sql.Identifier(geometry_schema),
+        )
+        parameters = (
+            "POLYGON((-0.01 -0.01,0.01 -0.01,0.01 0.01,"
+            "-0.01 0.01,-0.01 -0.01))",
+        )
+        try:
+            with connection.transaction():
+                cur.execute(
+                    sql.SQL("EXPLAIN (FORMAT JSON) ") + probe,
+                    parameters,
+                )
+        except psycopg.Error:
+            return cls._h3_not_ready("nested-dependency-resolution")
+        try:
+            with connection.transaction():
+                cur.execute(probe, parameters)
+                result = cur.fetchone()
+        except psycopg.Error:
+            return cls._h3_not_ready("execution-probe")
+        cell_count = result.get("cellCount") if isinstance(result, dict) else None
+        if (
+            not isinstance(cell_count, int)
+            or isinstance(cell_count, bool)
+            or cell_count < 0
+        ):
+            return cls._h3_not_ready("result-validation")
+        return {
+            "method": H3_READINESS_METHOD,
+            "ready": True,
+        }
 
     def capabilities(self) -> dict[str, Any]:
         with self._connect() as connection, connection.cursor() as cur:
@@ -2987,7 +3083,7 @@ class DerivedLayerStore:
                 """
             )
             extensions = {row["extname"]: row["extversion"] for row in cur.fetchall()}
-            h3_ready = self._h3_capability_ready(connection, cur, extensions)
+            h3_readiness = self._h3_readiness(connection, cur, extensions)
             return {
                 "configured": True,
                 "schema": SCHEMA,
@@ -3044,9 +3140,6 @@ class DerivedLayerStore:
                     },
                 },
                 "extensions": extensions,
-                "h3Available": h3_ready,
-                "h3Readiness": {
-                    "method": "postgresql-catalog-and-execution",
-                    "ready": h3_ready,
-                },
+                "h3Available": h3_readiness["ready"],
+                "h3Readiness": h3_readiness,
             }

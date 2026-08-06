@@ -329,7 +329,13 @@ extension-owned `h3_polygon_to_cells(geometry, integer)` overload passes the
 same catalog policy used for submitted queries and successfully executes a
 bounded synthetic polygon probe. `h3Readiness` reports
 `method: "postgresql-catalog-and-execution"` and the corresponding `ready`
-boolean; the probe reads no source relation or user row.
+boolean; the probe reads no source relation or user row. Readiness requires
+PostGIS 3.5.x plus matching H3 and H3 PostGIS 4.2.x versions. A false result
+also has `code: "derived_layer.h3_not_ready"`, a closed failure `stage`, and
+bounded `reasons` with `code`, `message`, and `suggestedAction`; it never
+contains raw SQL, database errors, connection context, secrets, or arbitrary
+catalog names. `h3Available` always equals `h3Readiness.ready`, and false H3
+readiness does not disable derived queries that do not use H3.
 | `GET /api/proposals?limit=N&cursor=CURSOR` | One bounded page of proposal summaries |
 | `GET /api/proposals/<id>` | Complete proposal record |
 | `GET /api/xyz/status` | Requested/applied reload generations and health |
