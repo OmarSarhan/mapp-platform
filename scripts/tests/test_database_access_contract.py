@@ -211,10 +211,49 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON",
             "metadataTopicHashes.get(topicId) !== expectedHash",
             "variableTopicHashes.get(topicId) !== expectedHash",
+            "mapp-prepare-spatial-indexes check",
         )
         for contract in required_contracts:
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
+
+    def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
+        source = self.normalized(
+            "docker/postgis/prepare-spatial-indexes.sh"
+        )
+        for contract in (
+            "namespace.nspname IN ('leeds', 'derived_layers')",
+            "type.typname IN ('geometry', 'geography')",
+            "access_method.amname = 'gist'",
+            "public.ST_Transform(%I, 4326)",
+            "public.ST_Transform(%I, 3857)",
+            "::public.geometry",
+            "::public.geography",
+            "ANALYZE %I.%I",
+            "exists but is not a valid ready non-partial GiST index",
+            "has no valid native GiST index; run ./bin/mapp upgrade-derived",
+            "is missing its valid ready % GiST index; run ./bin/mapp upgrade-derived",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
+
+        compose = (
+            ROOT / "compose.bundled-db.yaml"
+        ).read_text(encoding="utf-8")
+        wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+        self.assertIn("mapp-prepare-spatial-indexes:ro", compose)
+        self.assertIn(
+            "prepare_spatial_indexes()",
+            wrapper,
+        )
+        self.assertIn(
+            'exec -T db sh /usr/local/bin/mapp-prepare-spatial-indexes',
+            wrapper,
+        )
+        self.assertIn(
+            'up --detach --no-deps --wait db',
+            wrapper,
+        )
 
     def test_verifier_reads_the_closed_census_manifest_without_jq(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")

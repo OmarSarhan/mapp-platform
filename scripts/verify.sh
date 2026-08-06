@@ -252,6 +252,8 @@ if ! "${compose[@]}" exec -T browser-runner \
 fi
 
 if [[ "${database_mode}" == "bundled" ]]; then
+  "${compose[@]}" exec -T db \
+    sh /usr/local/bin/mapp-prepare-spatial-indexes check
   "${compose[@]}" exec -T \
     -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
     -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \

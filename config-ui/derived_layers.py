@@ -1236,6 +1236,107 @@ class DerivedLayerStore:
             ) from None
         return index_name
 
+    @staticmethod
+    def _materialized_spatial_index_name(
+        name: str,
+        geometry_column: str,
+        purpose: str,
+    ) -> str:
+        identity = f"{SCHEMA}.{name}.{geometry_column}:{purpose}"
+        digest = hashlib.md5(
+            identity.encode(), usedforsecurity=False,
+        ).hexdigest()[:8]
+        return (
+            f"{name[:20]}_{geometry_column[:14]}_{purpose[:14]}_"
+            f"{digest}_gix"
+        )
+
+    @classmethod
+    def _materialized_spatial_index_specs(
+        cls,
+        definition: dict[str, Any],
+        srid: int,
+    ) -> list[tuple[str, Any]]:
+        geometry = sql.Identifier(definition["geometryColumn"])
+        specs: list[tuple[str, Any]] = [
+            ("geom", geometry),
+        ]
+        if srid != 4326:
+            specs.append((
+                "geom_4326",
+                sql.SQL("public.ST_Transform({}, 4326)").format(geometry),
+            ))
+        if srid != 3857:
+            specs.append((
+                "geom_3857",
+                sql.SQL("public.ST_Transform({}, 3857)").format(geometry),
+            ))
+        geography_source = (
+            geometry
+            if srid == 4326
+            else sql.SQL("public.ST_Transform({}, 4326)").format(geometry)
+        )
+        specs.append((
+            "geog_4326",
+            sql.SQL("({}::public.geography)").format(geography_source),
+        ))
+        return specs
+
+    @classmethod
+    def _create_materialized_spatial_indexes(
+        cls,
+        cur,
+        definition: dict[str, Any],
+        srid: int,
+    ) -> list[str]:
+        relation = sql.Identifier(SCHEMA, definition["name"])
+        index_names = []
+        for purpose, expression in cls._materialized_spatial_index_specs(
+            definition, srid,
+        ):
+            index_name = cls._materialized_spatial_index_name(
+                definition["name"], definition["geometryColumn"], purpose,
+            )
+            cur.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} USING gist ({})"
+                ).format(
+                    sql.Identifier(index_name),
+                    relation,
+                    expression,
+                )
+            )
+            index_names.append(index_name)
+        return index_names
+
+    @classmethod
+    def _rename_materialized_spatial_indexes(
+        cls,
+        cur,
+        temporary: dict[str, Any],
+        final_name: str,
+        srid: int,
+    ) -> None:
+        geometry_column = temporary["geometryColumn"]
+        for purpose, _expression in cls._materialized_spatial_index_specs(
+            temporary, srid,
+        ):
+            cur.execute(
+                sql.SQL("ALTER INDEX {} RENAME TO {}").format(
+                    sql.Identifier(
+                        SCHEMA,
+                        cls._materialized_spatial_index_name(
+                            temporary["name"], geometry_column, purpose,
+                        ),
+                    ),
+                    sql.Identifier(
+                        cls._materialized_spatial_index_name(
+                            final_name, geometry_column, purpose,
+                        )
+                    ),
+                )
+            )
+
     def _finalize_materialized_output(
         self,
         cur,
@@ -1243,10 +1344,16 @@ class DerivedLayerStore:
         materialization_probe: dict[str, Any],
         *,
         create_index: bool,
+        output: dict[str, Any],
         error_name: str | None = None,
     ) -> dict[str, Any]:
         if create_index:
             self._create_materialized_id_index(cur, definition)
+        self._create_materialized_spatial_indexes(
+            cur,
+            definition,
+            int(output["srid"]),
+        )
         self._validate_output_rows(
             cur,
             definition,
@@ -1833,6 +1940,7 @@ class DerivedLayerStore:
                     definition,
                     materialization_probe,
                     create_index=True,
+                    output=output,
                 )
             else:
                 output = self._validate_output(cur, definition)
@@ -1923,6 +2031,7 @@ class DerivedLayerStore:
                 name,
                 validate_query_ast(definition["query"]),
             )
+            output = self._validate_output_metadata(cur, definition)
             cur.execute(
                 sql.SQL("REFRESH MATERIALIZED VIEW {}").format(
                     sql.Identifier(SCHEMA, name)
@@ -1937,6 +2046,7 @@ class DerivedLayerStore:
                 definition,
                 materialization_probe,
                 create_index=False,
+                output=output,
             )
             cur.execute(sql.SQL("""
                 UPDATE {}._definitions
@@ -2040,6 +2150,7 @@ class DerivedLayerStore:
                     temporary,
                     materialization_probe,
                     create_index=True,
+                    output=output,
                     error_name=name,
                 )
             else:
@@ -2090,6 +2201,12 @@ class DerivedLayerStore:
                         sql.Identifier(SCHEMA, temporary_index),
                         sql.Identifier(f"{name}_qid_uidx"),
                     )
+                )
+                self._rename_materialized_spatial_indexes(
+                    cur,
+                    temporary,
+                    name,
+                    int(output["srid"]),
                 )
             cur.execute(
                 sql.SQL("""

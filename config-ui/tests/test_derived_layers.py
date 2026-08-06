@@ -1491,10 +1491,16 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             definition,
             self.materialization_probe(),
             create_index=True,
+            output={"geometryType": "Polygon", "srid": 3857},
         )
 
         statements = [
-            str(call.args[0]) for call in cursor.execute.call_args_list
+            (
+                call.args[0]
+                if isinstance(call.args[0], str)
+                else call.args[0].as_string(None)
+            )
+            for call in cursor.execute.call_args_list
         ]
         index_position = next(
             index for index, statement in enumerate(statements)
@@ -1506,6 +1512,18 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         self.assertLess(index_position, size_position)
         self.assertIn("NULLS NOT DISTINCT", statements[index_position])
+        spatial_indexes = [
+            statement for statement in statements
+            if "USING gist" in statement
+        ]
+        self.assertEqual(3, len(spatial_indexes))
+        self.assertTrue(any('"geom_3857"' in item for item in spatial_indexes))
+        self.assertTrue(any("ST_Transform" in item and "4326" in item
+                            for item in spatial_indexes))
+        self.assertTrue(any("geography" in item for item in spatial_indexes))
+        self.assertTrue(all(
+            statements.index(item) < size_position for item in spatial_indexes
+        ))
         self.assertEqual(512 * 1024 ** 2, result["actualBytes"])
         self.assertEqual(28_800, result["estimatedBytes"])
         store._validate_output_rows.assert_called_once_with(
@@ -1532,6 +1550,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
                 definition,
                 self.materialization_probe(),
                 create_index=True,
+                output={"geometryType": "Polygon", "srid": 3857},
             )
 
         self.assertEqual("paths_h3_r9", raised.exception.name)
@@ -1541,6 +1560,87 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         self.assertEqual(28_800, raised.exception.probe["estimatedBytes"])
         self.assertIn("after population and indexing", str(raised.exception))
+
+    def test_materialized_spatial_indexes_cover_4326_3857_and_geography(self):
+        cursor = MagicMock()
+        definition = validate_definition(self.valid(
+            kind="materialized",
+            spatialScope=self.spatial_scope(),
+        ))
+
+        index_names = DerivedLayerStore._create_materialized_spatial_indexes(
+            cursor,
+            definition,
+            4326,
+        )
+
+        statements = [
+            call.args[0].as_string(None)
+            for call in cursor.execute.call_args_list
+        ]
+        self.assertEqual(3, len(index_names))
+        self.assertTrue(any('gist ("geom_3857")' in item for item in statements))
+        self.assertTrue(any(
+            'ST_Transform("geom_3857", 3857)' in item
+            for item in statements
+        ))
+        self.assertTrue(any(
+            '"geom_3857"::public.geography' in item
+            for item in statements
+        ))
+
+    def test_projected_materialized_geometry_transforms_before_geography_cast(self):
+        cursor = MagicMock()
+        definition = validate_definition(self.valid(
+            kind="materialized",
+            spatialScope=self.spatial_scope(),
+        ))
+
+        DerivedLayerStore._create_materialized_spatial_indexes(
+            cursor,
+            definition,
+            3857,
+        )
+
+        statements = "\n".join(
+            call.args[0].as_string(None)
+            for call in cursor.execute.call_args_list
+        )
+        self.assertIn('ST_Transform("geom_3857", 4326)', statements)
+        self.assertIn(
+            'ST_Transform("geom_3857", 4326)::public.geography',
+            statements,
+        )
+        self.assertNotIn('"geom_3857"::public.geography', statements)
+
+    def test_replacement_renames_every_materialized_spatial_index(self):
+        cursor = MagicMock()
+        temporary = {
+            **validate_definition(self.valid(
+                kind="materialized",
+                spatialScope=self.spatial_scope(),
+            )),
+            "name": "swap_0123456789abcdef0123",
+        }
+
+        DerivedLayerStore._rename_materialized_spatial_indexes(
+            cursor,
+            temporary,
+            "paths_h3_r9",
+            3857,
+        )
+
+        statements = [
+            call.args[0].as_string(None)
+            for call in cursor.execute.call_args_list
+        ]
+        self.assertEqual(3, len(statements))
+        self.assertTrue(all(
+            item.startswith('ALTER INDEX "derived_layers".')
+            for item in statements
+        ))
+        self.assertTrue(all("RENAME TO" in item for item in statements))
+        self.assertTrue(all("swap_0123456789abcd" in item for item in statements))
 
     def test_materialized_duplicate_index_failure_uses_id_error(self):
         cursor = MagicMock()
@@ -1953,6 +2053,10 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         }
         store.get_in_transaction = MagicMock(return_value=definition)
         store._dependencies = MagicMock(return_value=definition["sources"])
+        store._validate_output_metadata = MagicMock(return_value={
+            "geometryType": "Polygon",
+            "srid": 3857,
+        })
         store._finalize_materialized_output = MagicMock(
             side_effect=DerivedLayerMaterializationTooLarge(
                 "paths_h3_r9",

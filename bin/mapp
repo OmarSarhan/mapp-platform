@@ -375,9 +375,15 @@ run_census_etl() {
     --config /config/census.json
 }
 
+prepare_spatial_indexes() {
+  "${compose[@]}" exec -T db sh /usr/local/bin/mapp-prepare-spatial-indexes
+}
+
 run_all_etl() {
   run_sample_etl
+  prepare_spatial_indexes
   run_census_etl
+  prepare_spatial_indexes
 }
 
 case "${1:-}" in
@@ -401,6 +407,7 @@ case "${1:-}" in
     fi
     if [[ -n "${2:-}" ]]; then
       run_with_buildkit_lease_retry "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
+      prepare_spatial_indexes
     else
       run_all_etl
     fi
@@ -415,6 +422,7 @@ case "${1:-}" in
       exit 2
     fi
     run_census_etl
+    prepare_spatial_indexes
     ;;
   census-check)
     if [[ "${database_mode}" != "bundled" ]]; then
@@ -542,8 +550,9 @@ case "${1:-}" in
       exit 2
     fi
     run_with_buildkit_lease_retry "${compose[@]}" build db
-    "${compose[@]}" up --detach --no-deps db
+    "${compose[@]}" up --detach --no-deps --wait db
     "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
+    prepare_spatial_indexes
     ;;
   all)
     if [[ "${database_mode}" != "bundled" ]]; then

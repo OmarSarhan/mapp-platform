@@ -61,6 +61,12 @@ staging, the old and new snapshots, indexes, geometry, and WAL can coexist. Use
 headroom, and monitor the database volume during the run. Container `/tmp`
 capacity does not replace database-volume capacity.
 
+After bundled ETL publication, MAPP idempotently prepares native, EPSG:4326,
+EPSG:3857, and safe geometry/geography cross-cast GiST indexes and runs
+`ANALYZE`. Include this index set in capacity estimates. Existing bundled
+volumes receive the same preparation through `./bin/mapp upgrade-derived`, and
+`./bin/mapp verify` then audits it without changing database state.
+
 The final Census publication is atomic and preserves the stable table OID, but
 it uses `TRUNCATE` and a complete replacement insert while holding an
 `AccessExclusive` lock. Map, semantic, and derived-layer reads can block until

@@ -28,6 +28,7 @@ services:
       - ./docker/postgis/init/20-runtime-info.sql:/docker-entrypoint-initdb.d/95-mapp-runtime-info.sql:ro
       - ./docker/postgis/healthcheck.sh:/usr/local/bin/mapp-db-healthcheck:ro
       - ./docker/postgis/upgrade-derived.sh:/usr/local/bin/mapp-upgrade-derived:ro
+      - ./docker/postgis/prepare-spatial-indexes.sh:/usr/local/bin/mapp-prepare-spatial-indexes:ro
     healthcheck:
       test: [CMD, /usr/local/bin/mapp-db-healthcheck]
       interval: 5s

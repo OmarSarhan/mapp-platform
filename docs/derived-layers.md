@@ -9,8 +9,11 @@ XYZ-compatible relation. The service always creates the result in
 | `view` | Evaluated whenever XYZ reads it. | Results that must immediately follow source changes, including compute-safe results too large to store as a managed materialized view. |
 | `materialized` | Stored until explicitly refreshed. | Expensive but bounded spatial joins or H3 aggregation that pass both compute and materialization-size probes. |
 
-A materialized view receives a unique index on its declared feature ID.
-Refresh, replacement, and drop are confirmed, scoped, and audited actions.
+A materialized view receives a unique index on its declared feature ID and a
+GiST index set for its declared geometry: the native SRID, canonical EPSG:4326
+and EPSG:3857 expressions when they differ, and a safe EPSG:4326 geography
+expression. Projected geometry is transformed to EPSG:4326 before the geography
+cast. Refresh, replacement, and drop are confirmed, scoped, and audited actions.
 Before any view or materialized view is created or replaced—and before a
 materialized view is refreshed—PostgreSQL plans the exact map-scoped query and
 the service recursively checks its computation budget. A computation failure is
@@ -160,12 +163,21 @@ create, refresh, or drop them. Ordinary views use `security_invoker=true` and
 
 New bundled volumes receive the roles, schema, H3 extensions, grants, and the
 restricted-path setting required by the H3 PostGIS polygon SQL wrappers
-automatically. Upgrade an existing bundled volume explicitly after rebuilding
-the database image:
+automatically. Bundled ETL completion also prepares every managed geometry and
+geography source column with native, EPSG:4326, EPSG:3857, and safe cross-cast
+GiST indexes, then refreshes planner statistics. Upgrade an existing bundled
+volume explicitly after rebuilding the database image; the upgrade is
+idempotent and repairs both source and existing materialized spatial indexes:
 
 ```sh
 ./bin/mapp upgrade-derived
+./bin/mapp verify
 ```
+
+The verifier does not create indexes. It fails readiness if a managed spatial
+column has a generic or unknown SRID, lacks a valid native GiST index, or lacks
+one of the prepared canonical/cross-cast indexes. This keeps readiness checks
+non-mutating while the ETL and upgrade paths perform the required DDL.
 
 External-database operators must provision equivalent roles, grants, PostGIS,
 and optional H3 extensions themselves. `DERIVED_READER_ROLE` names the
