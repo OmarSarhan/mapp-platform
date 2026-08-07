@@ -326,7 +326,11 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 2
 fi
 reject_database_environment_overrides
-reject_edge_environment_overrides
+case "${1:-}" in
+  up|serve|config-ui|reset-data|all)
+    reject_edge_environment_overrides
+    ;;
+esac
 check_state_owner
 init_state
 check_state_owner
