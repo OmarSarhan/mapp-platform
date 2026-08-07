@@ -203,6 +203,18 @@ class DerivedLayerMaintenanceError(DerivedLayerError):
     pass
 
 
+class DerivedLayerContentionError(DerivedLayerError):
+    """A competing database transaction owns derived-mutation admission."""
+
+    def __init__(self, contention_scope: str):
+        if contention_scope != "derived-mutation":
+            raise ValueError("Invalid derived-layer contention scope.")
+        self.contention_scope = contention_scope
+        super().__init__(
+            "Another derived-layer database transaction is active."
+        )
+
+
 class DerivedLayerMaterializationTooLarge(DerivedLayerError):
     def __init__(self, name: str, probe: dict[str, Any]):
         self.name = name
@@ -922,6 +934,23 @@ class DerivedLayerStore:
                 "Derived-layer changes are paused while reset-data archives "
                 "semantic profiles."
             )
+
+    @staticmethod
+    def _acquire_mutation_lock(connection) -> None:
+        with connection.cursor(row_factory=dict_row) as lock_cur:
+            lock_cur.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS acquired",
+                (SCHEMA,),
+            )
+            result = lock_cur.fetchone()
+        if not isinstance(result, dict) or not isinstance(
+            result.get("acquired"), bool
+        ):
+            raise psycopg.InterfaceError(
+                "PostgreSQL returned an invalid derived-mutation lock result."
+            )
+        if not result["acquired"]:
+            raise DerivedLayerContentionError("derived-mutation")
 
     @staticmethod
     def _dependencies(cur, name: str) -> list[str]:
@@ -1955,8 +1984,8 @@ class DerivedLayerStore:
             # HTTP request. The dashboard submits these as durable background
             # operations; retain a finite database-side safety bound.
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._ensure_changes_allowed(cur)
             self._require_resolved_spatial_scope(definition)
             cur.execute(sql.SQL("SELECT 1 FROM {}._definitions WHERE name = %s").format(
@@ -2083,8 +2112,8 @@ class DerivedLayerStore:
             raise DerivedLayerError("Invalid derived-layer name.")
         with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._ensure_changes_allowed(cur)
             definition = self.get_in_transaction(cur, name)
             if not definition:
@@ -2157,8 +2186,8 @@ class DerivedLayerStore:
             raise DerivedLayerError("Replacement name must match the existing relation.")
         with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._ensure_changes_allowed(cur)
             current = self.get_in_transaction(cur, name)
             if not current:
@@ -2339,8 +2368,8 @@ class DerivedLayerStore:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
         with self._mutation_connection() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
             self._ensure_changes_allowed(cur)
             definition = self.get_in_transaction(cur, name)
             if not definition:

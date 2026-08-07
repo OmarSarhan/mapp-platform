@@ -274,6 +274,19 @@ class ControlApiTests(unittest.TestCase):
                 presentation["stateUnchangedField"],
             )
             self.assertEqual("rolledBack", presentation["rolledBackField"])
+            self.assertEqual("retryable", presentation["retryableField"])
+            self.assertEqual(
+                "derived_layer.database_contention",
+                presentation["contentionErrorCode"],
+            )
+            self.assertEqual(
+                "contentionScope",
+                presentation["contentionScopeField"],
+            )
+            self.assertEqual(
+                ["derived-mutation", "postgresql-lock"],
+                presentation["contentionScopes"],
+            )
             self.assertEqual(
                 "indeterminate",
                 presentation["indeterminateField"],

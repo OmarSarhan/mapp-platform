@@ -57,6 +57,10 @@ DERIVED_ERROR_PRESENTATION = {
     "rolledBackField": "rolledBack",
     "indeterminateField": "indeterminate",
     "failurePhaseField": "failurePhase",
+    "retryableField": "retryable",
+    "contentionErrorCode": "derived_layer.database_contention",
+    "contentionScopeField": "contentionScope",
+    "contentionScopes": ["derived-mutation", "postgresql-lock"],
     "failurePhases": [
         "preflight",
         "database-transaction",
