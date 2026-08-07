@@ -203,6 +203,10 @@ class DatabaseAccessContractTests(unittest.TestCase):
         self.assert_h3_sql_wrapper_hardening(
             "docker/postgis/upgrade-derived.sh"
         )
+        self.assertIn(
+            "sh /usr/local/bin/mapp-prepare-spatial-indexes ensure",
+            source,
+        )
 
     def test_verifier_covers_reader_derived_and_census_audit_edges(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
@@ -261,17 +265,21 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "docker/postgis/prepare-spatial-indexes.sh"
         )
         for contract in (
+            "prepare|ensure|check",
             "namespace.nspname IN ('leeds', 'derived_layers')",
             "type.typname IN ('geometry', 'geography')",
             "access_method.amname = 'gist'",
             "public.ST_Transform(%I, 4326)",
             "public.ST_Transform(%I, 3857)",
+            "public.ST_Transform(%I, 27700)",
             "::public.geometry",
             "::public.geography",
             "ANALYZE %I.%I",
             "exists but is not a valid ready non-partial GiST index",
             "has no valid native GiST index; run ./bin/mapp upgrade-derived",
             "is missing its valid ready % GiST index; run ./bin/mapp upgrade-derived",
+            "ensure_only",
+            "NOT ensure_only OR index_created",
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
@@ -287,6 +295,15 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'exec -T db sh /usr/local/bin/mapp-prepare-spatial-indexes',
+            wrapper,
+        )
+        self.assertIn("ensure_bundled_database_upgraded()", wrapper)
+        self.assertGreaterEqual(
+            wrapper.count("ensure_bundled_database_upgraded"),
+            6,
+        )
+        self.assertIn(
+            'exec -T db sh /usr/local/bin/mapp-upgrade-derived',
             wrapper,
         )
         self.assertIn(

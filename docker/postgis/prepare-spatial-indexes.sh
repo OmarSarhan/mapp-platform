@@ -6,13 +6,13 @@ set -eu
 
 mode="${1:-prepare}"
 if [ "$#" -gt 1 ]; then
-  printf 'Usage: mapp-prepare-spatial-indexes [prepare|check]\n' >&2
+  printf 'Usage: mapp-prepare-spatial-indexes [prepare|ensure|check]\n' >&2
   exit 2
 fi
 case "${mode}" in
-  prepare|check) ;;
+  prepare|ensure|check) ;;
   *)
-    printf 'Usage: mapp-prepare-spatial-indexes [prepare|check]\n' >&2
+    printf 'Usage: mapp-prepare-spatial-indexes [prepare|ensure|check]\n' >&2
     exit 2
     ;;
 esac
@@ -36,9 +36,13 @@ DECLARE
   index_oid pg_catalog.oid;
   native_index_exists boolean;
   managed_index_ready boolean;
+  index_created boolean;
   check_only boolean := pg_catalog.current_setting(
     'mapp.spatial_index_mode'
   ) = 'check';
+  ensure_only boolean := pg_catalog.current_setting(
+    'mapp.spatial_index_mode'
+  ) = 'ensure';
 BEGIN
   PERFORM pg_catalog.set_config('search_path', 'pg_catalog, public', true);
 
@@ -68,6 +72,7 @@ BEGIN
       AND type.typname IN ('geometry', 'geography')
     ORDER BY relation.oid, attribute.attnum
   LOOP
+    index_created := false;
     IF spatial_column.srid <= 0 THEN
       RAISE EXCEPTION
         'Managed spatial column %.%.% needs a fixed positive SRID before the database is ready',
@@ -153,6 +158,23 @@ BEGIN
             END
           ),
           (
+            'geom_27700',
+            CASE
+              WHEN spatial_column.srid <= 0 THEN NULL
+              WHEN spatial_column.spatial_type = 'geometry'
+                   AND spatial_column.srid <> 27700
+                THEN pg_catalog.format(
+                  'public.ST_Transform(%I, 27700)',
+                  spatial_column.column_name
+                )
+              WHEN spatial_column.spatial_type = 'geography'
+                THEN pg_catalog.format(
+                  'public.ST_Transform(%I::public.geometry, 27700)',
+                  spatial_column.column_name
+                )
+            END
+          ),
+          (
             'geog_4326',
             CASE
               WHEN spatial_column.spatial_type <> 'geometry'
@@ -203,6 +225,7 @@ BEGIN
           spatial_column.relation_name,
           index_spec.expression
         );
+        index_created := true;
       ELSE
         SELECT
           access_method.amname = 'gist'
@@ -225,7 +248,7 @@ BEGIN
       END IF;
     END LOOP;
 
-    IF NOT check_only THEN
+    IF NOT check_only AND (NOT ensure_only OR index_created) THEN
       EXECUTE pg_catalog.format(
         'ANALYZE %I.%I',
         spatial_column.schema_name,

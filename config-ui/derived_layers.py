@@ -1355,6 +1355,11 @@ class DerivedLayerStore:
                 "geom_3857",
                 sql.SQL("public.ST_Transform({}, 3857)").format(geometry),
             ))
+        if srid != 27700:
+            specs.append((
+                "geom_27700",
+                sql.SQL("public.ST_Transform({}, 27700)").format(geometry),
+            ))
         geography_source = (
             geometry
             if srid == 4326

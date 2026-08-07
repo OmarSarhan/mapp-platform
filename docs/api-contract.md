@@ -619,8 +619,8 @@ the transaction before `pg_total_relation_size` exceeded the limit; the
 probe includes `actualBytes`, the response includes `rolledBack: true`, and
 PostgreSQL rolls the transaction back. That check cannot prevent transient
 table, index, TOAST, or WAL growth. Materialized indexing includes the unique
-feature-ID index and native, EPSG:4326, EPSG:3857, and safe EPSG:4326 geography
-GiST expressions for the declared geometry. Clients should use the
+feature-ID index and native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
+EPSG:4326 geography GiST expressions for the declared geometry. Clients should use the
 operation-specific
 `safeState`, prompt the user to review a create/convert-to-view fallback or
 reduce the output, and never silently change kind. Only this storage error may

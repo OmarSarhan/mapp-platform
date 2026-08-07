@@ -10,10 +10,10 @@ XYZ-compatible relation. The service always creates the result in
 | `materialized` | Stored until explicitly refreshed. | Expensive but bounded spatial joins or H3 aggregation that pass both compute and materialization-size probes. |
 
 A materialized view receives a unique index on its declared feature ID and a
-GiST index set for its declared geometry: the native SRID, canonical EPSG:4326
-and EPSG:3857 expressions when they differ, and a safe EPSG:4326 geography
-expression. Projected geometry is transformed to EPSG:4326 before the geography
-cast. Refresh, replacement, and drop are confirmed, scoped, and audited actions.
+GiST index set for its declared geometry: the native SRID, canonical EPSG:4326,
+EPSG:3857, and EPSG:27700 expressions when they differ, and a safe EPSG:4326
+geography expression. Projected geometry is transformed to EPSG:4326 before the
+geography cast. Refresh, replacement, and drop are confirmed, scoped, and audited actions.
 Before any view or materialized view is created or replaced—and before a
 materialized view is refreshed—PostgreSQL plans the exact map-scoped query and
 the service recursively checks its computation budget. A computation failure is
@@ -164,10 +164,11 @@ create, refresh, or drop them. Ordinary views use `security_invoker=true` and
 New bundled volumes receive the roles, schema, H3 extensions, grants, and the
 restricted-path setting required by the H3 PostGIS polygon SQL wrappers
 automatically. Bundled ETL completion also prepares every managed geometry and
-geography source column with native, EPSG:4326, EPSG:3857, and safe cross-cast
-GiST indexes, then refreshes planner statistics. Upgrade an existing bundled
-volume explicitly after rebuilding the database image; the upgrade is
-idempotent and repairs both source and existing materialized spatial indexes:
+geography source column with native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
+cross-cast GiST indexes, then refreshes planner statistics. On an existing
+bundled volume, normal startup runs the same idempotent derived-role/H3 upgrade
+and ensures missing source and materialized spatial indexes before application
+services start. The explicit maintenance equivalent is:
 
 ```sh
 ./bin/mapp upgrade-derived

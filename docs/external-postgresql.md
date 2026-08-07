@@ -237,8 +237,8 @@ functions required by the configured layers and reviewed derived queries.
 Before advertising an external source as ready for derived queries, give every
 persistent query-facing `geometry` or `geography` column a valid native GiST
 index and current planner statistics. Also add expression indexes for the exact
-forms used by derived SQL: canonical EPSG:4326 and EPSG:3857 transforms and the
-corresponding geometry/geography cast. A projected geometry must be transformed
+forms used by derived SQL: canonical EPSG:4326, EPSG:3857, and EPSG:27700
+transforms and the corresponding geometry/geography cast. A projected geometry must be transformed
 to EPSG:4326 before casting to geography; a direct `geometry(…,3857)::geography`
 index is invalid. For example, for `transport.geom geometry(...,4326)`:
 
@@ -247,6 +247,8 @@ CREATE INDEX transport_geom_gix
   ON transport.features USING gist (geom);
 CREATE INDEX transport_geom_3857_gix
   ON transport.features USING gist (public.ST_Transform(geom, 3857));
+CREATE INDEX transport_geom_27700_gix
+  ON transport.features USING gist (public.ST_Transform(geom, 27700));
 CREATE INDEX transport_geog_4326_gix
   ON transport.features USING gist ((geom::public.geography));
 ANALYZE transport.features;
@@ -258,6 +260,11 @@ cast to geography. Index expressions must match submitted query expressions for
 PostgreSQL to use them. Index creation can lock a source relation and increases
 storage and write cost, so external operators should build these before opening
 CLI access and schedule retrofits in a maintenance window.
+
+The automatic first-start upgrade applies only to the bundled database, where
+MAPP owns the administrative role and schemas. External connections remain
+non-mutating at startup; their database administrator must apply this handoff
+before exposing the connection to configuration or derived-layer services.
 
 ## Application configuration
 

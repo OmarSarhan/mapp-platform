@@ -1900,7 +1900,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertEqual(28_800, raised.exception.probe["estimatedBytes"])
         self.assertIn("after population and indexing", str(raised.exception))
 
-    def test_materialized_spatial_indexes_cover_4326_3857_and_geography(self):
+    def test_materialized_spatial_indexes_cover_canonical_projections_and_geography(self):
         cursor = MagicMock()
         definition = validate_definition(self.valid(
             kind="materialized",
@@ -1917,10 +1917,14 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             call.args[0].as_string(None)
             for call in cursor.execute.call_args_list
         ]
-        self.assertEqual(3, len(index_names))
+        self.assertEqual(4, len(index_names))
         self.assertTrue(any('gist ("geom_3857")' in item for item in statements))
         self.assertTrue(any(
             'ST_Transform("geom_3857", 3857)' in item
+            for item in statements
+        ))
+        self.assertTrue(any(
+            'ST_Transform("geom_3857", 27700)' in item
             for item in statements
         ))
         self.assertTrue(any(

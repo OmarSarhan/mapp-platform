@@ -8,6 +8,13 @@ first release.
 
 ### Fixed
 
+- Completed the existing bundled-database upgrade lifecycle: normal startup
+  now applies the idempotent derived-role/H3 upgrade before application
+  services and ensures missing managed spatial indexes without repeatedly
+  analyzing unchanged relations.
+- Prepared EPSG:27700 GiST expression indexes for managed source and
+  materialized geometry so metric area/intersection joins can remain indexed
+  instead of comparing every projected source and generated row.
 - Combined proven literal-generator and scoped H3 row bounds with PostgreSQL
   plan structure so underestimated `ProjectSet`, `Function Scan`, and CTE
   inputs cannot hide over-budget nested-loop pair work. Rejections now carry a
