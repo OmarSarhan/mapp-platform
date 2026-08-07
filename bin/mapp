@@ -140,20 +140,14 @@ reject_database_environment_overrides() {
   done
 }
 
-reject_edge_environment_overrides() {
-  local key configured
+clear_edge_environment_overrides() {
+  local key
   for key in \
     EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE CADDY_EMAIL
   do
     if [[ -v "${key}" ]]; then
-      configured="$(dotenv_value "${key}")"
-      if [[ "${!key}" != "${configured}" ]]; then
-        printf 'Exported %s conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
-          "${key}" "${ENV_FILE}" >&2
-        exit 2
-      fi
-      # Shell values outrank --env-file interpolation in Compose. Remove an
-      # exact duplicate so the reviewed env file remains authoritative.
+      # Shell values outrank --env-file interpolation in Compose. Edge
+      # settings are always sourced from the reviewed env file.
       unset "${key}"
     fi
   done
@@ -328,7 +322,7 @@ fi
 reject_database_environment_overrides
 case "${1:-}" in
   up|serve|config-ui|reset-data|all)
-    reject_edge_environment_overrides
+    clear_edge_environment_overrides
     ;;
 esac
 check_state_owner

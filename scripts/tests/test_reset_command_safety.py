@@ -116,7 +116,7 @@ class ResetCommandSafetyTests(unittest.TestCase):
         )
 
     def test_runtime_start_repairs_stale_edge_port_bindings(self) -> None:
-        self.assertIn("reject_edge_environment_overrides", self.script)
+        self.assertIn("clear_edge_environment_overrides", self.script)
         self.assertIn(
             "EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE CADDY_EMAIL",
             self.script,
