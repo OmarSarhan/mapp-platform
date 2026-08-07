@@ -3984,6 +3984,108 @@ def annotated(errors):
     return output
 
 
+_VISUAL_BACKGROUND_OPERATION = object()
+
+
+def run_visual_background(
+    request_path: str,
+    payload: dict,
+    actor: str,
+    remote: str,
+    authentication: dict,
+    operation_id: str,
+) -> None:
+    """Replay one visual request after returning its durable operation ID."""
+    responses: list[tuple[int, dict]] = []
+    handler = object.__new__(Handler)
+    handler.path = request_path
+    handler._host_allowed = lambda: True
+    handler._authorized = lambda state_change=False: actor
+    handler._authentication = authentication
+    handler._payload = lambda: {
+        **payload,
+        _VISUAL_BACKGROUND_OPERATION: CONTROL.read_operation(operation_id),
+    }
+    handler._remote = lambda: remote
+    handler._json = lambda status, body, headers=None: responses.append(
+        (status, body)
+    )
+    try:
+        handler.do_POST()
+    except Exception as exc:
+        responses.append((HTTPStatus.INTERNAL_SERVER_ERROR, {
+            "error": f"Visual background execution was interrupted: {exc}",
+            "code": "visual.background_interrupted",
+        }))
+
+    operation = CONTROL.read_operation(operation_id)
+    if operation.get("status") != "running":
+        return
+    status, response = responses[-1] if responses else (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        {
+            "error": "Visual background execution recorded no response.",
+            "code": "visual.background_interrupted",
+        },
+    )
+    result = {
+        key: value for key, value in response.items() if key != "operation"
+    }
+    CONTROL.finish_operation(
+        operation_id,
+        status=(
+            "failed"
+            if HTTPStatus.BAD_REQUEST <= status < HTTPStatus.INTERNAL_SERVER_ERROR
+            else "indeterminate"
+        ),
+        result=result,
+        error={
+            "code": response.get("code", "visual.background_interrupted"),
+            "message": response.get(
+                "error", "Visual background execution did not complete."
+            ),
+            "httpStatus": int(status),
+        },
+    )
+
+
+def start_visual_background(
+    request_path: str,
+    payload: dict,
+    actor: str,
+    remote: str,
+    authentication: dict,
+    kind: str,
+    target: dict,
+) -> dict:
+    operation = CONTROL.create_operation(kind, actor, target)
+    try:
+        threading.Thread(
+            target=run_visual_background,
+            args=(
+                request_path,
+                dict(payload),
+                actor,
+                remote,
+                dict(authentication),
+                operation["id"],
+            ),
+            name=f"visual-{operation['id'][:8]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        CONTROL.finish_operation(
+            operation["id"],
+            status="failed",
+            error={
+                "code": "visual.background_start_failed",
+                "message": "The visual background worker could not be started.",
+            },
+        )
+        raise
+    return operation
+
+
 class Handler(SimpleHTTPRequestHandler):
     server_version = "MAPPConfig/1.0"
 
@@ -4963,6 +5065,7 @@ class Handler(SimpleHTTPRequestHandler):
                 required_scope = {
                     "visual.test": "visual",
                     "proposal.visual-test": "visual",
+                    "proposal.screenshot": "visual",
                     "xyz.reload": "reload",
                     "proposal.apply": "apply",
                     "derived-layer.create": "derive",
@@ -5766,6 +5869,61 @@ class Handler(SimpleHTTPRequestHandler):
         derived_failure_phase: str | None = None
         try:
             payload = self._payload()
+            background_operation = payload.pop(
+                _VISUAL_BACKGROUND_OPERATION, None
+            )
+            visual_background_kind = None
+            visual_background_target = None
+            if request_path == "/api/visual-test":
+                visual_background_kind = "visual.test"
+                visual_background_target = {
+                    "source": "live",
+                    "layer": payload.get("layer"),
+                }
+            elif (
+                proposal_visual_path
+                and proposal_visual_path.group(2) in {"visual-test", "screenshot"}
+            ):
+                proposal_id, visual_action = proposal_visual_path.groups()
+                visual_background_kind = (
+                    "proposal.screenshot"
+                    if visual_action == "screenshot"
+                    else "proposal.visual-test"
+                )
+                visual_background_target = {
+                    "source": "candidate",
+                    "proposalId": proposal_id,
+                    "layer": payload.get("layer"),
+                }
+            if visual_background_kind is not None:
+                background = payload.pop("background", False)
+                if not isinstance(background, bool):
+                    raise ValueError("Visual background must be true or false.")
+                if background and background_operation is None:
+                    layer_key = payload.get("layer")
+                    if not isinstance(layer_key, str) or not layer_key.strip():
+                        raise ValueError("Visual requests require a layer key.")
+                    if proposal_visual_path:
+                        proposal = preview_proposal(
+                            proposal_visual_path.group(1)
+                        )
+                        visual_background_target["candidateHash"] = proposal[
+                            "candidateHash"
+                        ]
+                    operation = start_visual_background(
+                        request_path,
+                        payload,
+                        actor,
+                        self._remote(),
+                        getattr(self, "_authentication", {}) or {},
+                        visual_background_kind,
+                        visual_background_target or {},
+                    )
+                    self._json(HTTPStatus.ACCEPTED, {
+                        "operation": operation,
+                        "statusUrl": f"/api/operations/{operation['id']}",
+                    })
+                    return
             if request_path == "/api/derived-layers":
                 derived_failure_phase = "preflight"
                 if not DERIVED:
@@ -6228,7 +6386,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "candidate"
                         ]["expectedText"],
                     }
-                operation = CONTROL.create_operation(
+                operation = background_operation or CONTROL.create_operation(
                     (
                         "proposal.screenshot"
                         if action == "screenshot"
@@ -6762,7 +6920,7 @@ class Handler(SimpleHTTPRequestHandler):
                     plan.get("layers", [layer_key]),
                 )
                 plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
-                operation = CONTROL.create_operation(
+                operation = background_operation or CONTROL.create_operation(
                     "visual.test",
                     actor,
                     {"layer": layer_key, "locale": plan.get("locale")},

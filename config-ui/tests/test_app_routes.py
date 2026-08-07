@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import threading
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPMessage
@@ -4951,6 +4952,63 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "run-failed/report.json",
             retained["visual"]["artifacts"]["report"],
         )
+
+    def test_background_preview_returns_pollable_operation_before_browser_finishes(self):
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/visual-test",
+            {"layer": "Stops", "background": True},
+        )
+        proposal = self.proposal()
+        browser_started = threading.Event()
+        release_browser = threading.Event()
+
+        def run(_layer, _plan, payload, **_kwargs):
+            browser_started.set()
+            self.assertTrue(release_browser.wait(2))
+            return HTTPStatus.OK, {
+                "runId": "run-background",
+                "passed": True,
+                "metadata": payload["metadata"],
+                "artifacts": {"report": "run-background/report.json"},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            with (
+                patch.object(app, "CONTROL", control),
+                patch.object(app, "preview_proposal", return_value=proposal),
+                patch.object(app, "visual_plan", return_value={"centre": [1, 2]}),
+                patch.object(app, "prepare_candidate_preview", return_value={}),
+                patch.object(app, "run_browser_visual", side_effect=run),
+                patch.object(control, "audit"),
+            ):
+                handler.do_POST()
+                self.assertEqual(HTTPStatus.ACCEPTED, responses[0][0])
+                operation_id = responses[0][1]["operation"]["id"]
+                self.assertEqual(
+                    f"/api/operations/{operation_id}",
+                    responses[0][1]["statusUrl"],
+                )
+                self.assertTrue(browser_started.wait(2))
+                self.assertEqual(
+                    "running", control.read_operation(operation_id)["status"]
+                )
+                release_browser.set()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    operation = control.read_operation(operation_id)
+                    if operation["status"] != "running":
+                        break
+                    time.sleep(0.01)
+
+            self.assertEqual("succeeded", operation["status"])
+            self.assertEqual(
+                "run-background/report.json",
+                operation["result"]["visual"]["artifacts"]["report"],
+            )
+            self.assertEqual(
+                operation_id, operation["result"]["operationId"]
+            )
 
     def test_information_screenshot_selects_feature_in_both_comparison_images(self):
         handler, responses = self.handler(

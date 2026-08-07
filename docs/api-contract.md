@@ -800,6 +800,12 @@ the durable `operationId`. Failed operations retain any plan, diagnosis,
 report, and artifact paths produced before failure; a request rejected before
 browser execution returns a structured error and operation without claiming
 artifacts. Only paths for files actually retained by the runner are advertised.
+Visual-test and screenshot requests may set `background: true`. The server
+returns `202 Accepted` with `operation` and `statusUrl`, continues browser work
+independently of that HTTP connection, and atomically writes the complete
+result/error envelope before the operation becomes terminal. A caller whose
+local wait expires can continue polling the same operation without restarting
+Chromium or losing its eventual report.
 Only a pending, integrity-valid proposal whose original
 revision is still current is eligible; declined, applied, conflicted, corrupt,
 or superseded proposals are rejected. The request accepts visual `layer`,

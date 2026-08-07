@@ -555,6 +555,7 @@ def _live_visual_input_schema() -> dict[str, Any]:
                 "maxItems": 2,
             },
             "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+            "background": {"type": "boolean"},
             "hover": {"type": "boolean"},
             "expectedHoverText": {
                 "type": "array",
@@ -1065,6 +1066,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
                     "enum": ["focus", "default"],
@@ -1109,6 +1111,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
                     "enum": ["focus", "default"],
@@ -1226,6 +1229,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
                     "enum": ["focus", "default"],
@@ -1263,7 +1267,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "pathTemplate": "/api/proposals/{proposalId}/screenshot",
         "risk": "visual",
         "scope": "visual",
-        "operationKind": "proposal.visual-test",
+        "operationKind": "proposal.screenshot",
         "inputSchema": {
             "type": "object",
             "required": ["layer"],
@@ -1272,6 +1276,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
                     "enum": ["focus", "default"],

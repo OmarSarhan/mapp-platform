@@ -8,6 +8,9 @@ first release.
 
 ### Fixed
 
+- Moved Chromium visual tests and screenshots onto durable background
+  operations when requested, so browser completion atomically retains reports,
+  artifact references, and explicit failures for operation polling.
 - Replaced blocking derived-mutation advisory-lock admission with a bounded
   non-waiting check. Competing mutations and proven-rollback PostgreSQL lock
   timeouts now return a retryable `derived_layer.database_contention` conflict

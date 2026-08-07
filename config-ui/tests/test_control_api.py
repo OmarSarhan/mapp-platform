@@ -120,7 +120,7 @@ class ControlApiTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "proposal.visual-test",
+            "proposal.screenshot",
             actions["proposals.preview-screenshot"]["operationKind"],
         )
 
@@ -132,6 +132,7 @@ class ControlApiTests(unittest.TestCase):
             screenshot_schema["viewport"]["properties"]["width"]["maximum"],
         )
         self.assertEqual(3, screenshot_schema["deviceScaleFactor"]["maximum"])
+        self.assertEqual({"type": "boolean"}, screenshot_schema["background"])
         self.assertIn("expectedInfoPanelText", screenshot_schema)
         self.assertIn(
             "workspaceFingerprint",
