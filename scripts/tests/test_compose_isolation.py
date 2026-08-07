@@ -201,7 +201,16 @@ class ComposeIsolationTests(unittest.TestCase):
         allowlist = (ROOT / "instance/browser-egress-allowlist.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn(".tile.openstreetmap.org", allowlist.splitlines())
+        allowed_hosts = {
+            line.strip()
+            for line in allowlist.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertIn(".tile.openstreetmap.org", allowed_hosts)
+        self.assertIn("cdn.jsdelivr.net", allowed_hosts)
+        self.assertIn("geolytix.github.io", allowed_hosts)
+        self.assertNotIn(".jsdelivr.net", allowed_hosts)
+        self.assertNotIn(".github.io", allowed_hosts)
 
         squid = (ROOT / "docker/egress-proxy/squid.conf").read_text(
             encoding="utf-8"

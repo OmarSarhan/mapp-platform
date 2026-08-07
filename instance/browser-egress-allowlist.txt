@@ -1,2 +1,6 @@
 # Leading dot includes the exact hostname and its a/b/c tile subdomains.
 .tile.openstreetmap.org
+
+# Exact hosts serving browser assets required by the XYZ preview runtime.
+cdn.jsdelivr.net
+geolytix.github.io
