@@ -33,6 +33,10 @@ function generationMatchesContext(generation, contextOptions) {
   );
 }
 
+function generationAlreadyCurrent(error) {
+  return error?.payload?.code === 'semantic.generation_no_change';
+}
+
 export function semanticProposalPayload(
   asset,
   text,
@@ -558,6 +562,20 @@ export function SemanticCatalog({api, close, identity}) {
     }
   };
 
+  const showCurrentGenerationReview = (target, unchangedFieldIds = []) => {
+    setGeneratedDraft({
+      operations: [],
+      target,
+      model: generationCapability.model,
+      noChange: true,
+      unchangedFieldIds,
+    });
+    setNotice(
+      'Gemini matched the saved semantic value. No proposal is needed.',
+    );
+    setWizardStep(3);
+  };
+
   const generateDraft = async target => {
     if (!selected || !generationAvailable || !generationPermitted) return;
     if (
@@ -615,7 +633,14 @@ export function SemanticCatalog({api, close, identity}) {
       );
       setWizardStep(3);
     } catch (reason) {
-      setError(reason.message);
+      if (generationAlreadyCurrent(reason)) {
+        showCurrentGenerationReview(
+          target,
+          target.kind === 'field' ? [target.fieldId] : [],
+        );
+      } else {
+        setError(reason.message);
+      }
     } finally {
       setGenerating('');
     }
@@ -668,6 +693,16 @@ export function SemanticCatalog({api, close, identity}) {
             throw new Error('Gemini returned an invalid semantic proposal draft.');
           }
           return {draft, generation};
+        } catch (reason) {
+          if (generationAlreadyCurrent(reason)) {
+            return {
+              draft: {operations: []},
+              generation: {model: generationCapability.model},
+              noChange: true,
+              fieldId,
+            };
+          }
+          throw reason;
         } finally {
           completed += 1;
           setGenerationProgress({
@@ -681,10 +716,16 @@ export function SemanticCatalog({api, close, identity}) {
         throw failure.reason;
       }
       const generated = settled.map(result => result.value);
+      const operations = generated.flatMap(item => item.draft.operations);
+      const unchangedFieldIds = generated
+        .filter(item => item.noChange)
+        .map(item => item.fieldId);
       setGeneratedDraft({
-        operations: generated.flatMap(item => item.draft.operations),
+        operations,
         target: {kind: 'fields', fieldIds: generationFieldIds},
         model: generated[0].generation.model,
+        noChange: operations.length === 0,
+        unchangedFieldIds,
       });
       const selectedContext = [
         requestedContext.sampleRows && '5% capped row samples',
@@ -696,9 +737,11 @@ export function SemanticCatalog({api, close, identity}) {
           : `Gemini metadata-only drafts for ${generationFieldIds.length} fields. `)
         + 'Review every generated value before checking or creating a semantic proposal.',
       );
-      setNotice(
-        'Gemini field drafts loaded for review. Check them before creating any proposal.',
-      );
+      setNotice(operations.length === 0
+        ? 'Gemini matched the saved semantic values. No proposal is needed.'
+        : unchangedFieldIds.length > 0
+          ? `Gemini field drafts loaded for review; ${unchangedFieldIds.length} selected field${unchangedFieldIds.length === 1 ? '' : 's'} already matched the saved semantic value.`
+          : 'Gemini field drafts loaded for review. Check them before creating any proposal.');
       setWizardStep(3);
     } catch (reason) {
       setError(reason.message);
@@ -1073,7 +1116,11 @@ export function SemanticCatalog({api, close, identity}) {
               />
             </label>
             {(advanced || wizardStep === 3) && generatedDraft && <section className="semantic-wizard-review">
-              {!review ? <>
+              {generatedDraft.noChange ? <>
+                <h3>Review your draft</h3>
+                <p>Gemini&apos;s result already matches the saved semantic value.</p>
+                <p className="muted">There are no semantic changes to check or propose.</p>
+              </> : !review ? <>
                 <h3>Review your draft</h3>
                 <p className="muted">Check the exact changes before saving a proposal.</p>
                 <pre>{formatJson(generatedDraft.operations)}</pre>

@@ -1008,6 +1008,45 @@ describe('SemanticCatalog', () => {
     ))).toBe(false);
   });
 
+  test('advances to review when a saved field semantic is already current', async () => {
+    const currentAsset = {
+      ...asset,
+      curated: {
+        ...asset.curated,
+        fields: {
+          'field:score': {description: 'Current score'},
+        },
+      },
+    };
+    const noChange = new Error(
+      'Gemini returned the semantic annotation already stored.',
+    );
+    noChange.payload = {code: 'semantic.generation_no_change'};
+    const api = fieldBatchApi(currentAsset, async () => {
+      throw noChange;
+    });
+
+    render(<SemanticCatalog
+      api={api}
+      close={() => {}}
+      identity={{actor: 'admin', scopes: []}}
+    />);
+    await openGenerationStep();
+    fireEvent.click(await screen.findByRole('button', {name: /^Specific fields/}));
+    fireEvent.click(screen.getByRole('checkbox', {name: 'score'}));
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Generate drafts for 1 field',
+    }));
+
+    expect(await screen.findByRole('heading', {name: 'Review your draft'}))
+      .toBeTruthy();
+    expect(screen.getByText(
+      "Gemini's result already matches the saved semantic value.",
+    )).toBeTruthy();
+    expect(screen.queryByText(noChange.message)).toBeNull();
+    expect(screen.queryByRole('button', {name: 'Check proposal'})).toBeNull();
+  });
+
   test('discovers and synchronizes an allowlisted source without row options', async () => {
     vi.stubGlobal('confirm', vi.fn(() => true));
     const calls = [];
