@@ -65,6 +65,34 @@ class DerivedFailureStateTests(unittest.TestCase):
         self.assertTrue(response["rolledBack"])
         self.assertNotIn("indeterminate", response)
 
+    def test_indeterminate_lock_timeout_is_not_retryable(self):
+        failure = app.psycopg.errors.LockNotAvailable(
+            "SECRET commit-time lock context",
+        )
+        response = app.derived_database_error(
+            failure,
+            "create",
+            failure_phase="transaction-commit",
+            state_unchanged=False,
+            indeterminate=True,
+        )
+
+        self.assertEqual("derived_layer.database_error", response["code"])
+        self.assertTrue(response["indeterminate"])
+        self.assertEqual(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            app.derived_failure_http_status(
+                response,
+                app.derived_database_error_status(response),
+            ),
+        )
+        self.assertNotIn("retryable", response)
+        self.assertNotIn("contentionScope", response)
+        self.assertNotIn("stateUnchanged", response)
+        self.assertNotIn("safeState", response)
+        self.assertNotIn("rolledBack", response)
+        self.assertNotIn("SECRET", repr(response))
+
 
 class DerivedSemanticSourcePolicyTests(unittest.TestCase):
     @staticmethod
@@ -1304,6 +1332,37 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual("preflight", body["failurePhase"])
         self.assertNotIn("rolledBack", body)
         self.assertNotIn("indeterminate", body)
+        self.assertNotIn("retryable", body)
+        self.assertNotIn("contentionScope", body)
+
+    def test_synchronous_create_contention_is_retryable_after_rollback(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        failure = app.DerivedLayerContentionError("derived-mutation")
+        failure.failure_phase = "database-transaction"
+        failure.rolled_back = True
+        derived.create.side_effect = failure
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("derived_layer.database_contention", body["code"])
+        self.assertEqual("contention", body["category"])
+        self.assertEqual("derived-mutation", body["contentionScope"])
+        self.assertTrue(body["retryable"])
+        self.assertTrue(body["stateUnchanged"])
+        self.assertTrue(body["rolledBack"])
+        self.assertEqual("No derived layer was created.", body["safeState"])
+        self.assertNotIn("Correct the query", body["suggestedAction"])
 
     def test_unexpected_preflight_failure_reports_unchanged_state(self):
         handler, responses = self.handler(
@@ -1991,6 +2050,72 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         self.assertEqual("database-transaction", error["failurePhase"])
         self.assertNotIn("indeterminate", error)
         self.assertNotIn("SECRET SQL", repr(error))
+        self.assertNotIn("retryable", error)
+        self.assertNotIn("contentionScope", error)
+
+    def test_background_mutation_contention_is_retryable_conflict(self):
+        derived = Mock()
+        derived.create.side_effect = self.failure_state(
+            app.DerivedLayerContentionError("derived-mutation"),
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "2" * 32,
+                "create",
+                {},
+                "admin",
+                "127.0.0.1",
+            )
+
+        call = control.finish_operation.call_args
+        self.assertEqual("failed", call.kwargs["status"])
+        error = call.kwargs["error"]
+        self.assertEqual("derived_layer.database_contention", error["code"])
+        self.assertEqual("contention", error["category"])
+        self.assertEqual("derived-mutation", error["contentionScope"])
+        self.assertEqual(HTTPStatus.CONFLICT, error["status"])
+        self.assertTrue(error["retryable"])
+        self.assertTrue(error["stateUnchanged"])
+        self.assertTrue(error["rolledBack"])
+        self.assertIn("active derived-layer operation", error["suggestedAction"])
+
+    def test_background_postgres_lock_timeout_is_retryable_contention(self):
+        failure = app.psycopg.errors.LockNotAvailable(
+            "SECRET lock holder context",
+        )
+        derived = Mock()
+        derived.create.side_effect = app.DerivedLayerDatabaseOperationError(
+            failure,
+            failure_phase="database-transaction",
+            state_unchanged=True,
+            rolled_back=True,
+        )
+        control = Mock()
+
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "CONTROL", control,
+        ):
+            app.run_derived_background(
+                "3" * 32,
+                "create",
+                {},
+                "admin",
+                "127.0.0.1",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual("derived_layer.database_contention", error["code"])
+        self.assertEqual("postgresql-lock", error["contentionScope"])
+        self.assertEqual(HTTPStatus.CONFLICT, error["status"])
+        self.assertTrue(error["retryable"])
+        self.assertEqual("55P03", error["technicalDetail"]["sqlstate"])
+        self.assertTrue(error["stateUnchanged"])
+        self.assertTrue(error["rolledBack"])
+        self.assertNotIn("SECRET", repr(error))
 
     def test_background_legacy_policy_rejection_keeps_422_status(self):
         derived = Mock()

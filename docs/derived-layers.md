@@ -153,6 +153,16 @@ transaction rollback includes the strongest unchanged-state claim the server
 can make. A commit, rollback-finalization, or result-reporting uncertainty is
 explicitly indeterminate and requires authoritative inspection before retry.
 
+Database lock contention has the separate HTTP `409` code
+`derived_layer.database_contention`, `category: "contention"`, and one of two
+closed scopes. `derived-mutation` means another transaction owns the global
+derived-layer mutation admission lock. `postgresql-lock` means later database
+work encountered a PostgreSQL lock outside that admission boundary and
+exceeded the bounded lock timeout. A proven unchanged result adds
+`retryable: true`; wait for the reported competing operation, source-table
+write, or maintenance transaction to finish before manually retrying the same
+reviewed request. An indeterminate result never advertises retryability.
+
 ## Database boundary
 
 The configuration service uses `DERIVED_DATABASE_URL`, identifying a role
@@ -483,6 +493,15 @@ slots are occupied, a new background request is not queued: it returns HTTP
 `429` with `code: "derived_layer.background_capacity"`, `blocked: true`,
 `retryable: true`, and the active and maximum job counts. Wait for the recorded
 operation to finish and submit the same reviewed request again.
+
+Database-wide serialization also covers synchronous callers and multiple
+configuration-service processes. Mutation admission uses
+`pg_try_advisory_xact_lock` so a competing transaction fails immediately with
+`contentionScope: "derived-mutation"` instead of consuming the five-second
+PostgreSQL relation-lock budget. If no active durable operation explains a
+repeated conflict, a database operator should inspect active derived-owner
+transactions and advisory locks; clients must not receive holder SQL, PIDs, or
+connection details.
 
 For compatibility, callers that omit `background` retain the synchronous
 response. Create, replace, and refresh work remains bounded by a 30-minute

@@ -617,6 +617,15 @@ managed layer, and catalog before retrying. `technicalDetail`, when present on a
 database error directly or under `operation.error`, is diagnostic and must not
 be the primary user notification.
 
+A proven-safe lock conflict uses HTTP or stored status `409`, code
+`derived_layer.database_contention`, `category: "contention"`, and
+`retryable: true`. `contentionScope` is `derived-mutation` when another
+transaction owns database-wide mutation admission, or `postgresql-lock` when a
+PostgreSQL lock outside that admission boundary exceeds the configured timeout.
+Retry only after the blocking operation or transaction clears. Commit or
+rollback uncertainty remains indeterminate, omits `retryable`, and is never
+reclassified merely because its SQLSTATE is `55P03`.
+
 `failurePhase` uses this closed vocabulary:
 
 | Phase | Authoritative meaning |
@@ -648,6 +657,7 @@ query cost:
 | HTTP `400`, `derived_layer.invalid_request` | Correct the named definition/request field. |
 | HTTP `404`/`409`, `derived_layer.not_found`/`derived_layer.already_exists` | List or rename/replace the layer as directed; the response states the preserved operation state. |
 | HTTP `409`, `derived_layer.maintenance` or `derived_layer.in_use` | Wait for maintenance, or resolve the reported PostgreSQL/workspace dependencies. |
+| HTTP `409`, `derived_layer.database_contention` | `contentionScope` distinguishes another derived mutation from a PostgreSQL lock outside mutation admission; a proven-safe result is manually retryable only after the blocker clears. |
 | HTTP `422`/`500`, `derived_layer.database_error` | A preflight or proven rollback response states the preserved state and may be corrected and retried. A commit, rollback-finalization, or reporting uncertainty is explicitly indeterminate and requires reconciliation. Optional `technicalDetail` contains only bounded `sqlstate` and primary `message`, never the SQL, context, detail, or hint. |
 | HTTP `500`, `derived_layer.operation_failed` | `preflight` and proven rollback failures state the preserved target; commit, rollback-finalization, and reporting failures are indeterminate and require authoritative operation/layer/catalog inspection. |
 

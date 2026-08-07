@@ -8,6 +8,11 @@ first release.
 
 ### Fixed
 
+- Replaced blocking derived-mutation advisory-lock admission with a bounded
+  non-waiting check. Competing mutations and proven-rollback PostgreSQL lock
+  timeouts now return a retryable `derived_layer.database_contention` conflict
+  with a closed contention scope and actionable operator guidance, while
+  uncertain outcomes remain non-retryable and fail closed.
 - Compared approved H3 polygon-wrapper `search_path` settings semantically,
   retaining `pg_catalog` precedence and exact authoritative extension-schema
   membership while tolerating harmless quoting, whitespace, and extension

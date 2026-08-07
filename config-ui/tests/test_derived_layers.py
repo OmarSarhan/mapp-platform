@@ -17,6 +17,7 @@ from derived_layers import (
     QUERY_PLAN_MAX_TOTAL_COST,
     DerivedLayerCancellation,
     DerivedLayerCancellationRequested,
+    DerivedLayerContentionError,
     DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
@@ -53,7 +54,15 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         store = DerivedLayerStore("postgresql://database", "mapp_xyz")
         connection = MagicMock()
         connection.__enter__.return_value = connection
-        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        lock_cursor = MagicMock()
+        lock_cursor.fetchone.return_value = {"acquired": True}
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lock_cursor
+        connection.cursor.side_effect = lambda *args, **kwargs: (
+            lock_context if "row_factory" in kwargs else cursor_context
+        )
         store._connect = MagicMock(return_value=connection)
         store._initialize = MagicMock()
         store._catalog_query_probe = MagicMock()
@@ -170,6 +179,44 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         self.assertIn("pg_advisory_xact_lock", events[1])
         self.assertEqual("initialize", events[2])
+
+    def test_mutation_advisory_contention_fails_fast_and_rolls_back(self):
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        connection = MagicMock()
+        mutation_cursor = MagicMock()
+        mutation_context = MagicMock()
+        mutation_context.__enter__.return_value = mutation_cursor
+        lock_cursor = MagicMock()
+        lock_cursor.fetchone.return_value = {"acquired": False}
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lock_cursor
+        connection.cursor.side_effect = [mutation_context, lock_context]
+        store._connect = MagicMock(return_value=connection)
+
+        with self.assertRaises(DerivedLayerContentionError) as raised:
+            store.create(
+                self.valid(spatialScope=self.spatial_scope()),
+                "token:test",
+            )
+
+        statements = "\n".join(
+            str(call.args[0]) for call in lock_cursor.execute.call_args_list
+        )
+        self.assertIn("pg_try_advisory_xact_lock", statements)
+        self.assertNotIn("SELECT pg_advisory_xact_lock", statements)
+        self.assertEqual("derived-mutation", raised.exception.contention_scope)
+        self.assertEqual(
+            "database-transaction",
+            raised.exception.failure_phase,
+        )
+        self.assertTrue(raised.exception.rolled_back)
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+        mutation_statements = "\n".join(
+            str(call.args[0]) for call in mutation_cursor.execute.call_args_list
+        )
+        self.assertNotIn("CREATE VIEW", mutation_statements)
+        self.assertNotIn("CREATE MATERIALIZED VIEW", mutation_statements)
 
     def test_mutation_body_database_failure_reports_proven_rollback(self):
         store = DerivedLayerStore("postgresql://database", "mapp_xyz")
@@ -1234,13 +1281,18 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
 
     def test_materialized_create_probes_scoped_query_and_returns_probe(self):
+        events = []
         cursor = MagicMock()
+        cursor.execute.side_effect = lambda query, *args: events.append(str(query))
         cursor.fetchone.side_effect = [
             None,
             None,
             self.explain_plan(),
         ]
         store = self.store_with_cursor(cursor)
+        store._acquire_mutation_lock = MagicMock(
+            side_effect=lambda _connection: events.append("MUTATION ADMISSION")
+        )
         payload = self.valid(
             kind="materialized",
             spatialScope=self.spatial_scope(),
@@ -1301,6 +1353,13 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertLess(
             statements.index("EXPLAIN (FORMAT JSON)"),
             statements.index("CREATE MATERIALIZED VIEW"),
+        )
+        self.assertLess(
+            events.index("MUTATION ADMISSION"),
+            next(
+                index for index, statement in enumerate(events)
+                if "SET LOCAL lock_timeout = '5s'" in statement
+            ),
         )
         self.assertLess(
             statements.index("CREATE MATERIALIZED VIEW"),

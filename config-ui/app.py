@@ -27,6 +27,7 @@ from derived_layers import (
     SCHEMA as DERIVED_SCHEMA,
     DerivedLayerCancellation,
     DerivedLayerCancellationRequested,
+    DerivedLayerContentionError,
     DerivedLayerDatabaseOperationError,
     DerivedLayerDependencyError,
     DerivedLayerError,
@@ -1445,6 +1446,15 @@ def run_derived_background(
             HTTPStatus.UNPROCESSABLE_ENTITY,
             failure_phase,
         )
+    except DerivedLayerContentionError as exc:
+        finish_derived_background_failure(
+            operation_id,
+            action,
+            exc,
+            derived_contention_error(exc, action),
+            HTTPStatus.CONFLICT,
+            failure_phase,
+        )
     except DerivedLayerMaintenanceError as exc:
         finish_derived_background_failure(
             operation_id,
@@ -1493,19 +1503,20 @@ def run_derived_background(
                 operation_id, action, exc.cause,
             )
         else:
+            response = derived_database_error(
+                exc.cause,
+                action,
+                failure_phase=exc.failure_phase,
+                state_unchanged=exc.state_unchanged,
+                rolled_back=exc.rolled_back,
+                indeterminate=exc.indeterminate,
+            )
             finish_derived_background_failure(
                 operation_id,
                 action,
                 exc,
-                derived_database_error(
-                    exc.cause,
-                    action,
-                    failure_phase=exc.failure_phase,
-                    state_unchanged=exc.state_unchanged,
-                    rolled_back=exc.rolled_back,
-                    indeterminate=exc.indeterminate,
-                ),
-                HTTPStatus.UNPROCESSABLE_ENTITY,
+                response,
+                derived_database_error_status(response),
                 failure_phase,
                 type_exc=exc.cause,
             )
@@ -1662,6 +1673,7 @@ def derived_failure_state(
     unchanged_is_proven = preflight_is_proven or rollback_is_proven
     if indeterminate or not unchanged_is_proven:
         response["indeterminate"] = True
+        response.pop("retryable", None)
         response.pop("stateUnchanged", None)
         response.pop("safeState", None)
         response.pop("rolledBack", None)
@@ -2161,6 +2173,26 @@ def derived_maintenance_error(
     )
 
 
+def derived_contention_error(
+    exc: DerivedLayerContentionError,
+    operation: str | None,
+) -> dict:
+    return derived_blocked_error(
+        code="derived_layer.database_contention",
+        message=str(exc),
+        suggested_action=(
+            "Wait for the active derived-layer operation to finish or cancel "
+            "it, then retry the same reviewed request. If no operation is "
+            "active, ask a database operator to inspect derived-layer lock "
+            "holders before retrying."
+        ),
+        operation=operation,
+        category="contention",
+        contentionScope=exc.contention_scope,
+        retryable=True,
+    )
+
+
 def derived_not_found_error(name: str, operation: str | None) -> dict:
     message = (
         f'The derived layer “{name}” does not exist.'
@@ -2212,27 +2244,57 @@ def derived_database_error(
     rolled_back: bool = False,
     indeterminate: bool = False,
 ) -> dict:
-    message = "The database could not apply this derived-layer change."
     uncertain = indeterminate or not state_unchanged
+    lock_contention = (
+        getattr(exc, "sqlstate", None) == "55P03"
+        and not uncertain
+        and (
+            failure_phase == "preflight"
+            or (failure_phase == "database-transaction" and rolled_back)
+        )
+    )
+    message = (
+        "The database could not acquire a required lock before the "
+        "derived-layer lock timeout."
+        if lock_contention
+        else "The database could not apply this derived-layer change."
+    )
+    if lock_contention:
+        suggested_action = (
+            "Wait for the blocking database transaction or source-table "
+            "maintenance to finish, then retry the same reviewed request. "
+            "If this repeats, ask a database operator to inspect PostgreSQL "
+            "lock holders."
+        )
+    elif uncertain:
+        suggested_action = (
+            "Inspect the operation, managed derived layer, and catalog before "
+            "retrying; the requested change may have committed."
+        )
+    else:
+        suggested_action = (
+            "Correct the query, declared source tables, or selected ID and "
+            "geometry fields, then retry."
+        )
     response = {
         "error": message,
         "message": message,
         "userMessage": message,
-        "suggestedAction": (
-            (
-                "Inspect the operation, managed derived layer, and catalog "
-                "before retrying; the requested change may have committed."
-            )
-            if uncertain
-            else (
-                "Correct the query, declared source tables, or selected ID "
-                "and geometry fields, then retry."
-            )
+        "suggestedAction": suggested_action,
+        "code": (
+            "derived_layer.database_contention"
+            if lock_contention
+            else "derived_layer.database_error"
         ),
-        "code": "derived_layer.database_error",
         "operation": operation,
         "blocked": True,
     }
+    if lock_contention:
+        response.update({
+            "category": "contention",
+            "contentionScope": "postgresql-lock",
+            "retryable": True,
+        })
     technical_detail = sanitized_postgres_detail(exc)
     if technical_detail:
         response["technicalDetail"] = technical_detail
@@ -2242,6 +2304,14 @@ def derived_database_error(
         failure_phase=failure_phase,
         rolled_back=rolled_back,
         indeterminate=indeterminate or not state_unchanged,
+    )
+
+
+def derived_database_error_status(response: dict) -> HTTPStatus:
+    return (
+        HTTPStatus.CONFLICT
+        if response.get("code") == "derived_layer.database_contention"
+        else HTTPStatus.UNPROCESSABLE_ENTITY
     )
 
 
@@ -7178,6 +7248,20 @@ class Handler(SimpleHTTPRequestHandler):
                 derived_failure_http_status(response, HTTPStatus.CONFLICT),
                 response,
             )
+        except DerivedLayerContentionError as exc:
+            derived_operation = derived_request_operation(
+                request_path, derived_action_path,
+            )
+            response = derived_exception_response(
+                derived_contention_error(exc, derived_operation),
+                exc,
+                derived_operation,
+                derived_failure_phase or "preflight",
+            )
+            self._json(
+                derived_failure_http_status(response, HTTPStatus.CONFLICT),
+                response,
+            )
         except DerivedLayerBackgroundCapacityError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
@@ -7261,7 +7345,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 self._json(
                     derived_failure_http_status(
-                        response, HTTPStatus.UNPROCESSABLE_ENTITY,
+                        response, derived_database_error_status(response),
                     ),
                     response,
                 )
@@ -7373,10 +7457,13 @@ class Handler(SimpleHTTPRequestHandler):
                     indeterminate=not state_unchanged,
                 )
                 self._json(
-                    (
-                        HTTPStatus.UNPROCESSABLE_ENTITY
-                        if state_unchanged
-                        else HTTPStatus.INTERNAL_SERVER_ERROR
+                    derived_failure_http_status(
+                        response,
+                        (
+                            derived_database_error_status(response)
+                            if state_unchanged
+                            else HTTPStatus.INTERNAL_SERVER_ERROR
+                        ),
                     ),
                     response,
                 )
