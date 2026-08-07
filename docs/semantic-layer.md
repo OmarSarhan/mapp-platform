@@ -349,7 +349,7 @@ optional `GEMINI_APIKEY` and `GEMINI_MODEL` settings are passed only to
 `config-ui`; they are not present in the browser, CLI, semantic service, XYZ,
 browser runner, or Caddy. Provider requests are one-shot, set `store: false`,
 reject redirects, have bounded request/response sizes and timeouts, and are
-never retried automatically. A batch of up to ten selected fields is submitted
+never retried automatically. A batch of up to 25 selected fields is submitted
 concurrently, progress is reported as requests complete, and the ordered draft
 is shown only after the whole batch succeeds. `store: false` does not override the Gemini
 project's data-use and retention terms; operators must select an appropriate

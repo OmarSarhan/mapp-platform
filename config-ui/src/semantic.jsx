@@ -6,6 +6,7 @@ const emptyContextOptions = () => ({
   statistics: false,
 });
 const PAGE_LIMIT = 100;
+const MAX_GENERATION_FIELDS = 25;
 
 const pagePath = (path, cursor = null) => (
   `${path}?limit=${PAGE_LIMIT}${cursor
@@ -622,8 +623,11 @@ export function SemanticCatalog({api, close, identity}) {
 
   const generateFieldDrafts = async () => {
     if (!selected || !generationAvailable || !generationPermitted) return;
-    if (generationFieldIds.length === 0 || generationFieldIds.length > 10) {
-      setError('Select between one and ten fields with stable semantic IDs.');
+    if (
+      generationFieldIds.length === 0
+      || generationFieldIds.length > MAX_GENERATION_FIELDS
+    ) {
+      setError(`Select between one and ${MAX_GENERATION_FIELDS} fields with stable semantic IDs.`);
       return;
     }
     setGenerating('field');
@@ -918,17 +922,29 @@ export function SemanticCatalog({api, close, identity}) {
                 </div>}
                 {generationMode === 'field' && <div className="semantic-field-picker">
                   <div className="semantic-field-picker-head">
-                    <strong>Choose up to 10 fields</strong>
+                    <strong>Choose up to {MAX_GENERATION_FIELDS} fields</strong>
                     <small>{generationFieldIds.length} selected</small>
                   </div>
                   {fields.length > 0
                     ? <div className="semantic-field-options">
-                      {fields.map(field => {
+                      {fields.map((field, index) => {
                         const checked = generationFieldIds.includes(field.id);
+                        const annotation = selected.curated?.fields?.[field.id];
+                        const hasSavedAnnotation = (
+                          annotation
+                          && typeof annotation === 'object'
+                          && !Array.isArray(annotation)
+                          && Object.keys(annotation).length > 0
+                        );
+                        const statusId = `semantic-field-status-${index}`;
                         return <label key={field.id} className={checked ? 'selected' : ''}>
                           <input
                             type="checkbox"
-                            disabled={busy || generationRunning || (!checked && generationFieldIds.length >= 10)}
+                            aria-describedby={hasSavedAnnotation ? statusId : undefined}
+                            disabled={busy || generationRunning || (
+                              !checked
+                              && generationFieldIds.length >= MAX_GENERATION_FIELDS
+                            )}
                             checked={checked}
                             onChange={() => {
                               const next = checked
@@ -941,6 +957,10 @@ export function SemanticCatalog({api, close, identity}) {
                             }}
                           />
                           <span>{field.name || field.id}</span>
+                          {hasSavedAnnotation && <small
+                            className="semantic-field-status"
+                            id={statusId}
+                          >Saved semantic value</small>}
                         </label>;
                       })}
                     </div>

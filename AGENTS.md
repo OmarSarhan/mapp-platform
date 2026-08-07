@@ -97,7 +97,7 @@ profile.
 Gemini generation is metadata-only by default. Optional 5% sample rows and
 statistics are independent, explicit `semantic:data` opt-ins and must remain
 bounded and advertised through semantic status. The dashboard may submit at
-most ten selected field requests concurrently, retain selection order, and
+most 25 selected field requests concurrently, retain selection order, and
 publish no partial combined draft on failure. Generation never checks, creates,
 approves, or applies a proposal.
 

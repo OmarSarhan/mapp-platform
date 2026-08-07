@@ -734,6 +734,46 @@ describe('SemanticCatalog', () => {
     })).toBeTruthy();
   });
 
+  test('marks saved field semantics and allows selecting up to 25 fields', async () => {
+    const fields = Array.from({length: 26}, (_, index) => ({
+      id: `field:${index + 1}`,
+      name: `field_${index + 1}`,
+      type: 'text',
+    }));
+    const batchAsset = {
+      ...asset,
+      generated: {...asset.generated, fields},
+      curated: {
+        ...asset.curated,
+        fields: {
+          'field:1': {description: 'Existing field description'},
+        },
+      },
+    };
+    const api = fieldBatchApi(batchAsset, vi.fn());
+
+    render(<SemanticCatalog
+      api={api}
+      close={() => {}}
+      identity={{actor: 'admin', scopes: []}}
+    />);
+    await openGenerationStep();
+    fireEvent.click(await screen.findByRole('button', {name: /^Specific fields/}));
+
+    expect(screen.getByText('Choose up to 25 fields')).toBeTruthy();
+    const savedStatus = screen.getByText('Saved semantic value');
+    const savedField = screen.getByRole('checkbox', {name: 'field_1'});
+    expect(savedField.disabled).toBe(false);
+    expect(savedField.getAttribute('aria-describedby')).toBe(savedStatus.id);
+
+    for (const field of fields.slice(0, 25)) {
+      fireEvent.click(screen.getByRole('checkbox', {name: field.name}));
+    }
+    expect(screen.getByText('25 selected')).toBeTruthy();
+    expect(screen.getByRole('checkbox', {name: 'field_26'}).disabled).toBe(true);
+    expect(savedField.checked).toBe(true);
+  });
+
   test('generates selected fields in parallel with completed progress and ordered drafts', async () => {
     const fieldIds = ['field:score', 'field:rank', 'field:notes'];
     const batchAsset = {
