@@ -795,7 +795,12 @@ Each response reports `source: "candidate"`, `proposalId`, and `candidateHash`.
 Visual-plan and visual-test browser evidence preserves that binding. A
 screenshot comparison additionally binds its nested before report to
 `source: "original"` and `originalHash`, while the after report remains bound
-to the candidate. Only a pending, integrity-valid proposal whose original
+to the candidate. Browser executions also bind their report and response to
+the durable `operationId`. Failed operations retain any plan, diagnosis,
+report, and artifact paths produced before failure; a request rejected before
+browser execution returns a structured error and operation without claiming
+artifacts. Only paths for files actually retained by the runner are advertised.
+Only a pending, integrity-valid proposal whose original
 revision is still current is eligible; declined, applied, conflicted, corrupt,
 or superseded proposals are rejected. The request accepts visual `layer`,
 `locale`, bounded centre/zoom overrides, and viewport fields. It never accepts

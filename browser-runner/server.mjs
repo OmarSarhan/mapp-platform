@@ -1,6 +1,6 @@
 import http from "node:http";
 import {randomUUID} from "node:crypto";
-import {chmod, mkdir, readdir, writeFile} from "node:fs/promises";
+import {access, chmod, mkdir, readdir, writeFile} from "node:fs/promises";
 import {chromium} from "playwright";
 
 process.umask(0o077);
@@ -936,33 +936,31 @@ async function runVisual(input) {
                     ? "page"
                     : "unknown",
   };
+  const retainedArtifact = async filename => {
+    try {
+      await access(`${directory}/${filename}`);
+      return `${runId}/${filename}`;
+    } catch {
+      return null;
+    }
+  };
+  report.artifacts = {
+    report: `${runId}/report.json`,
+    page: await retainedArtifact("page.png"),
+    map: await retainedArtifact("map.png"),
+    beforePage: await retainedArtifact("before-page.png"),
+    beforeMap: await retainedArtifact("before-map.png"),
+    afterPage: await retainedArtifact("after-page.png"),
+    afterMap: await retainedArtifact("after-map.png"),
+    infoPanel: await retainedArtifact("info-panel.png"),
+    hoverTooltip: await retainedArtifact("hover-tooltip.png"),
+    filteringPanel: await retainedArtifact("filtering-panel.png"),
+    stylingPanel: await retainedArtifact("styling-panel.png"),
+  };
   await writeFile(`${directory}/report.json`, JSON.stringify(report, null, 2), {
     mode: 0o600,
   });
-  return {
-    ...report,
-    artifacts: {
-      report: `${runId}/report.json`,
-      page: `${runId}/page.png`,
-      map: `${runId}/map.png`,
-      beforePage: `${runId}/before-page.png`,
-      beforeMap: `${runId}/before-map.png`,
-      afterPage: `${runId}/after-page.png`,
-      afterMap: `${runId}/after-map.png`,
-      infoPanel: report.interaction?.infoPanelExpanded
-        ? `${runId}/info-panel.png`
-        : null,
-      hoverTooltip: report.hover?.image
-        ? `${runId}/hover-tooltip.png`
-        : null,
-      filteringPanel: report.panels?.filtering?.captured
-        ? `${runId}/filtering-panel.png`
-        : null,
-      stylingPanel: report.panels?.styling?.captured
-        ? `${runId}/styling-panel.png`
-        : null,
-    },
-  };
+  return report;
 }
 
 await secureArtifactTree();
@@ -978,20 +976,33 @@ http.createServer(async (req, res) => {
   if (req.method !== "POST" || req.url !== "/run") {
     return json(res, 404, {error: "Not found."});
   }
+  let input;
+  try {
+    input = await readJson(req);
+  } catch (error) {
+    const status = error instanceof RequestError ? error.status : 500;
+    return json(res, status, {
+      error: status === 500 ? "Visual runner failed." : error.message,
+    });
+  }
   if (activeRuns >= maxConcurrentRuns) {
     res.setHeader("retry-after", "5");
     return json(res, 429, {
       error: "Visual runner is at its concurrency limit. Retry later.",
+      metadata: input.metadata,
+      state: "rejected",
     });
   }
   activeRuns += 1;
   try {
-    const report = await runVisual(await readJson(req));
+    const report = await runVisual(input);
     return json(res, report.passed ? 200 : 422, report);
   } catch (error) {
     const status = error instanceof RequestError ? error.status : 500;
     return json(res, status, {
       error: status === 500 ? "Visual runner failed." : error.message,
+      metadata: input.metadata,
+      state: "rejected",
     });
   } finally {
     activeRuns -= 1;

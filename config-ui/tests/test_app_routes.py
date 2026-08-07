@@ -4137,6 +4137,10 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         browser_response.__enter__.return_value = io.BytesIO(app.json.dumps({
             "runId": "run-live",
             "passed": True,
+            "metadata": {
+                "source": "live",
+                "operationId": "a" * 32,
+            },
             "interaction": {
                 "infoPanelExpanded": True,
                 "expectedInfoPanelTextFound": {"Source: ONS": True},
@@ -4183,6 +4187,10 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         runner_request = browser.call_args.args[0]
         runner_payload = app.json.loads(runner_request.data)
         interaction = runner_payload["plan"]["interaction"]
+        self.assertEqual(
+            {"source": "live", "operationId": running["id"]},
+            runner_payload["metadata"],
+        )
         self.assertTrue(interaction["requireInfoPanel"])
         self.assertEqual(
             ["Source: ONS"],
@@ -4242,6 +4250,31 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual(2, payload["deviceScaleFactor"])
         self.assertEqual(["Stops", "Rail Stations"], payload["layers"])
         self.assertEqual("focus", payload["viewMode"])
+
+    def test_browser_http_error_preserves_structured_runner_result(self) -> None:
+        expected = {
+            "error": "Visual runner is busy.",
+            "metadata": {"source": "candidate", "operationId": "a" * 32},
+            "state": "rejected",
+        }
+        error = app.HTTPError(
+            "http://browser-runner:8080/run",
+            HTTPStatus.TOO_MANY_REQUESTS,
+            "busy",
+            {},
+            io.BytesIO(app.json.dumps(expected).encode()),
+        )
+
+        with patch.object(app, "urlopen", side_effect=error):
+            status, result = app.run_browser_visual(
+                "Stops",
+                {"centre": [1, 2]},
+                {"metadata": expected["metadata"]},
+                target_url="http://xyz-preview:3000",
+            )
+
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual(expected, result)
 
     def test_browser_request_propagates_default_view_mode(self) -> None:
         response = MagicMock()
@@ -4546,12 +4579,12 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             patch.object(
                 app,
                 "run_browser_visual",
-                return_value=(
+                side_effect=lambda _layer, _plan, request, **_kwargs: (
                     HTTPStatus.OK,
                     {
                         "runId": "run-candidate",
                         "passed": True,
-                        "metadata": binding,
+                        "metadata": request["metadata"],
                     },
                 ),
             ) as runner,
@@ -4646,8 +4679,22 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         ):
             handler.do_POST()
         self.assertEqual("http://xyz-preview:3000", runner.call_args.kwargs["target_url"])
-        self.assertEqual(binding, runner.call_args.args[2]["metadata"])
-        self.assertEqual(original_binding, runner.call_args_list[0].args[2]["metadata"])
+        candidate_metadata = runner.call_args.args[2]["metadata"]
+        original_metadata = runner.call_args_list[0].args[2]["metadata"]
+        self.assertEqual(binding, {
+            key: candidate_metadata[key] for key in binding
+        })
+        self.assertEqual(original_binding, {
+            key: original_metadata[key] for key in original_binding
+        })
+        self.assertEqual(
+            responses[0][1]["operation"]["id"],
+            candidate_metadata["operationId"],
+        )
+        self.assertEqual(
+            candidate_metadata["operationId"],
+            original_metadata["operationId"],
+        )
         self.assertEqual([False, False], lock_observations)
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual(binding["candidateHash"], responses[0][1]["candidateHash"])
@@ -4681,6 +4728,8 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "originalHash": proposal["originalHash"],
         }
         running = {"id": "e" * 32, "status": "running"}
+        binding["operationId"] = running["id"]
+        original_binding["operationId"] = running["id"]
 
         def finish(operation_id, *, status, result=None, error=None):
             return {
@@ -4807,6 +4856,100 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertNotIn(
             "operation",
             responses[0][1]["operation"]["result"],
+        )
+
+    def test_busy_screenshot_is_structured_and_not_a_binding_mismatch(self):
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/screenshot", {"layer": "Stops"}
+        )
+        proposal = self.proposal()
+        running = {"id": "f" * 32, "status": "running"}
+
+        def run(_layer, _plan, _payload, **_kwargs):
+            return HTTPStatus.TOO_MANY_REQUESTS, {
+                "error": "Visual runner is busy.",
+                "state": "rejected",
+            }
+
+        def finish(operation_id, *, status, result=None, error=None):
+            return {
+                **running,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(app, "visual_plan", return_value={"centre": [1, 2]}),
+            patch.object(app, "prepare_original_preview", return_value={}),
+            patch.object(app, "prepare_candidate_preview", return_value={}),
+            patch.object(app, "run_browser_visual", side_effect=run),
+            patch.object(
+                app.CONTROL, "create_operation", return_value=running
+            ),
+            patch.object(
+                app.CONTROL, "finish_operation", side_effect=finish
+            ),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual("visual.busy", body["operation"]["error"]["code"])
+        self.assertNotEqual(
+            "visual.binding_mismatch", body["operation"]["error"]["code"]
+        )
+        self.assertEqual(running["id"], body["operationId"])
+        self.assertEqual(body["visual"], body["operation"]["result"]["visual"])
+
+    def test_failed_preview_retains_bound_report_in_operation(self):
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/visual-test", {"layer": "Stops"}
+        )
+        proposal = self.proposal()
+        running = {"id": "9" * 32, "status": "running"}
+
+        def run(_layer, _plan, payload, **_kwargs):
+            return HTTPStatus.UNPROCESSABLE_ENTITY, {
+                "runId": "run-failed",
+                "passed": False,
+                "metadata": payload["metadata"],
+                "diagnosis": {"outcome": "failed"},
+                "artifacts": {"report": "run-failed/report.json"},
+            }
+
+        def finish(operation_id, *, status, result=None, error=None):
+            return {
+                **running,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(app, "visual_plan", return_value={"centre": [1, 2]}),
+            patch.object(app, "prepare_candidate_preview", return_value={}),
+            patch.object(app, "run_browser_visual", side_effect=run),
+            patch.object(
+                app.CONTROL, "create_operation", return_value=running
+            ),
+            patch.object(
+                app.CONTROL, "finish_operation", side_effect=finish
+            ),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        retained = body["operation"]["result"]
+        self.assertEqual(running["id"], retained["operationId"])
+        self.assertEqual(
+            "run-failed/report.json",
+            retained["visual"]["artifacts"]["report"],
         )
 
     def test_information_screenshot_selects_feature_in_both_comparison_images(self):

@@ -3188,21 +3188,15 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             data=runner_payload,
             headers={"Content-Type": "application/json"},
             method="POST",
-        ), timeout=60) as response:
+        ), timeout=120) as response:
             return HTTPStatus.OK, json.load(response)
     except HTTPError as exc:
         try:
             result = strict_json_loads(exc.read())
         except (OSError, UnicodeError, ValueError):
             result = None
-        if exc.code == HTTPStatus.UNPROCESSABLE_ENTITY and isinstance(result, dict):
-            return HTTPStatus.UNPROCESSABLE_ENTITY, result
-        if exc.code == HTTPStatus.TOO_MANY_REQUESTS:
-            return HTTPStatus.TOO_MANY_REQUESTS, {
-                "error": (
-                    result.get("error") if isinstance(result, dict) else None
-                ) or "Visual runner is busy. Retry later."
-            }
+        if isinstance(result, dict):
+            return exc.code, result
         return HTTPStatus.BAD_GATEWAY, {
             "error": f"Browser validation service returned HTTP {exc.code}."
         }
@@ -3210,6 +3204,25 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
         return HTTPStatus.BAD_GATEWAY, {
             "error": f"Browser validation failed: {exc}"
         }
+
+
+def browser_result_has_evidence(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if isinstance(result.get("runId"), str) and result["runId"]:
+        return True
+    artifacts = result.get("artifacts")
+    return isinstance(artifacts, dict) and any(
+        isinstance(path, str) and path for path in artifacts.values()
+    )
+
+
+def visual_failure_code(status: int) -> str:
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
+        return "visual.busy"
+    if status in {HTTPStatus.GATEWAY_TIMEOUT, HTTPStatus.REQUEST_TIMEOUT}:
+        return "visual.upstream_timeout"
+    return "visual.failed"
 
 
 def visual_panels(payload: dict) -> list[str]:
@@ -6234,6 +6247,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                     },
                 )
+                binding["operationId"] = operation["id"]
                 comparison_binding_valid = True
                 try:
                     # Keep the isolated workspace pinned throughout the
@@ -6252,6 +6266,7 @@ class Handler(SimpleHTTPRequestHandler):
                                 "source": "original",
                                 "proposalId": proposal_id,
                                 "originalHash": proposal["originalHash"],
+                                "operationId": operation["id"],
                             }
                             original_render_payload = {
                                 **render_payload,
@@ -6302,11 +6317,13 @@ class Handler(SimpleHTTPRequestHandler):
                         ):
                             result = None
                         else:
-                            comparison_binding_valid = (
-                                original_result.get("metadata")
-                                == original_binding
-                                and candidate_result.get("metadata") == binding
-                            )
+                            comparison_binding_valid = all((
+                                not browser_result_has_evidence(side_result)
+                                or side_result.get("metadata") == side_binding
+                            ) for side_result, side_binding in (
+                                (original_result, original_binding),
+                                (candidate_result, binding),
+                            ))
                             original_artifacts = original_result.get("artifacts") or {}
                             candidate_artifacts = candidate_result.get("artifacts") or {}
                             original_page_key = (
@@ -6417,6 +6434,14 @@ class Handler(SimpleHTTPRequestHandler):
                                 "runId": candidate_result.get("runId"),
                                 "passed": status == HTTPStatus.OK,
                                 "metadata": binding,
+                                "error": next((
+                                    side_result.get("error")
+                                    for side_result in (
+                                        candidate_result,
+                                        original_result,
+                                    )
+                                    if side_result.get("error")
+                                ), None),
                                 "comparison": {
                                     "before": "original",
                                     "after": "candidate",
@@ -6498,9 +6523,15 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 if not isinstance(result, dict):
+                    partial_response = {
+                        **binding,
+                        "plan": plan,
+                        "preview": preview,
+                    }
                     operation = CONTROL.finish_operation(
                         operation["id"],
                         status="failed",
+                        result=partial_response,
                         error={
                             "code": "visual.invalid_response",
                             "message": (
@@ -6509,29 +6540,36 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     self._json(HTTPStatus.BAD_GATEWAY, {
-                        **binding,
+                        **partial_response,
                         "error": "Browser validation returned an invalid response.",
                         "operation": operation,
                     })
                     return
                 result_binding = result.get("metadata")
                 if (
-                    (result.get("runId") or result.get("artifacts"))
+                    browser_result_has_evidence(result)
                     and (
                         result_binding != binding
                         or not comparison_binding_valid
                     )
                 ):
+                    partial_response = {
+                        **binding,
+                        "plan": plan,
+                        "preview": preview,
+                        "visual": result,
+                    }
                     operation = CONTROL.finish_operation(
                         operation["id"],
                         status="failed",
+                        result=partial_response,
                         error={
                             "code": "visual.binding_mismatch",
                             "message": "Browser artifact binding was not preserved.",
                         },
                     )
                     self._json(HTTPStatus.BAD_GATEWAY, {
-                        **binding,
+                        **partial_response,
                         "error": "Browser artifact binding was not preserved.",
                         "operation": operation,
                     })
@@ -6549,12 +6587,12 @@ class Handler(SimpleHTTPRequestHandler):
                 operation = CONTROL.finish_operation(
                     operation["id"],
                     status="succeeded" if status == HTTPStatus.OK else "failed",
-                    result=response if status == HTTPStatus.OK else None,
+                    result=response,
                     error=(
                         None
                         if status == HTTPStatus.OK
                         else {
-                            "code": "visual.failed",
+                            "code": visual_failure_code(status),
                             "message": response["error"],
                             "diagnosis": result.get("diagnosis"),
                         }
@@ -6724,6 +6762,15 @@ class Handler(SimpleHTTPRequestHandler):
                     plan.get("layers", [layer_key]),
                 )
                 plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
+                operation = CONTROL.create_operation(
+                    "visual.test",
+                    actor,
+                    {"layer": layer_key, "locale": plan.get("locale")},
+                )
+                binding = {
+                    "source": "live",
+                    "operationId": operation["id"],
+                }
                 runner_payload = json.dumps(
                     {
                         "url": os.environ.get(
@@ -6739,24 +6786,46 @@ class Handler(SimpleHTTPRequestHandler):
                         "deviceScaleFactor": payload.get("deviceScaleFactor"),
                         "hover": requested_hover(payload),
                         "expectedHoverText": expected_hover_text(payload),
+                        "metadata": binding,
                     },
                     allow_nan=False,
                 ).encode()
-                operation = CONTROL.create_operation(
-                    "visual.test",
-                    actor,
-                    {"layer": layer_key, "locale": plan.get("locale")},
-                )
                 try:
                     with urlopen(Request(
                         os.environ.get("BROWSER_RUNNER_URL", "http://browser-runner:8080/run"),
                         data=runner_payload,
                         headers={"Content-Type": "application/json"},
                         method="POST",
-                    ), timeout=60) as response:
+                    ), timeout=120) as response:
                         result = json.load(response)
+                    if (
+                        browser_result_has_evidence(result)
+                        and result.get("metadata") != binding
+                    ):
+                        response_payload = {
+                            **binding,
+                            "error": "Browser artifact binding was not preserved.",
+                            "plan": plan,
+                            "visual": result,
+                        }
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            result=response_payload,
+                            error={
+                                "code": "visual.binding_mismatch",
+                                "message": (
+                                    "Browser artifact binding was not preserved."
+                                ),
+                            },
+                        )
+                        self._json(HTTPStatus.BAD_GATEWAY, {
+                            **response_payload,
+                            "operation": operation,
+                        })
+                        return
                     CONTROL.audit("visual.completed", actor=actor, remote=self._remote(), details={"layer": layer_key, "runId": result.get("runId"), "passed": result.get("passed")})
-                    response_payload = {"plan": plan, "visual": result}
+                    response_payload = {**binding, "plan": plan, "visual": result}
                     operation = CONTROL.finish_operation(
                         operation["id"],
                         status="succeeded",
@@ -6768,6 +6837,32 @@ class Handler(SimpleHTTPRequestHandler):
                         result = strict_json_loads(exc.read())
                     except (OSError, UnicodeError, ValueError):
                         result = None
+                    if (
+                        browser_result_has_evidence(result)
+                        and result.get("metadata") != binding
+                    ):
+                        response_payload = {
+                            **binding,
+                            "error": "Browser artifact binding was not preserved.",
+                            "plan": plan,
+                            "visual": result,
+                        }
+                        operation = CONTROL.finish_operation(
+                            operation["id"],
+                            status="failed",
+                            result=response_payload,
+                            error={
+                                "code": "visual.binding_mismatch",
+                                "message": (
+                                    "Browser artifact binding was not preserved."
+                                ),
+                            },
+                        )
+                        self._json(HTTPStatus.BAD_GATEWAY, {
+                            **response_payload,
+                            "operation": operation,
+                        })
+                        return
                     if exc.code == HTTPStatus.UNPROCESSABLE_ENTITY and isinstance(result, dict):
                         CONTROL.audit(
                             "visual.completed",
@@ -6779,9 +6874,16 @@ class Handler(SimpleHTTPRequestHandler):
                                 "passed": False,
                             },
                         )
+                        response_payload = {
+                            **binding,
+                            "error": "Browser validation did not pass.",
+                            "plan": plan,
+                            "visual": result,
+                        }
                         operation = CONTROL.finish_operation(
                             operation["id"],
                             status="failed",
+                            result=response_payload,
                             error={
                                 "code": "visual.failed",
                                 "message": "Browser validation did not pass.",
@@ -6791,34 +6893,52 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json(
                             HTTPStatus.UNPROCESSABLE_ENTITY,
                             {
-                                "error": "Browser validation did not pass.",
-                                "plan": plan,
-                                "visual": result,
+                                **response_payload,
                                 "operation": operation,
                             },
                         )
                     elif exc.code == HTTPStatus.TOO_MANY_REQUESTS:
+                        response_payload = {
+                            **binding,
+                            "error": (
+                                result.get("error")
+                                if isinstance(result, dict)
+                                else None
+                            ) or "Visual runner is busy. Retry later.",
+                            "plan": plan,
+                            **({"visual": result} if isinstance(result, dict) else {}),
+                        }
                         operation = CONTROL.finish_operation(
                             operation["id"],
                             status="failed",
+                            result=response_payload,
                             error={"code": "visual.busy", "message": "Visual runner is busy."},
                         )
                         self._json(
                             HTTPStatus.TOO_MANY_REQUESTS,
                             {
-                                "error": (
-                                    result.get("error")
-                                    if isinstance(result, dict)
-                                    else None
-                                ) or "Visual runner is busy. Retry later.",
-                                "plan": plan,
+                                **response_payload,
                                 "operation": operation,
                             },
                         )
                     else:
+                        response_payload = {
+                            **binding,
+                            "error": (
+                                result.get("error")
+                                if isinstance(result, dict)
+                                else None
+                            ) or (
+                                "Browser validation service returned "
+                                f"HTTP {exc.code}."
+                            ),
+                            "plan": plan,
+                            **({"visual": result} if isinstance(result, dict) else {}),
+                        }
                         operation = CONTROL.finish_operation(
                             operation["id"],
                             status="failed",
+                            result=response_payload,
                             error={
                                 "code": "visual.upstream",
                                 "message": f"Browser runner returned HTTP {exc.code}.",
@@ -6827,26 +6947,27 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json(
                             HTTPStatus.BAD_GATEWAY,
                             {
-                                "error": (
-                                    "Browser validation service returned "
-                                    f"HTTP {exc.code}."
-                                ),
-                                "plan": plan,
+                                **response_payload,
                                 "operation": operation,
                             },
                         )
                 except Exception as exc:
+                    response_payload = {
+                        **binding,
+                        "error": f"Browser validation failed: {exc}",
+                        "plan": plan,
+                    }
                     operation = CONTROL.finish_operation(
                         operation["id"],
                         status="failed",
+                        result=response_payload,
                         error={
                             "code": "visual.upstream",
                             "message": f"Browser validation failed: {exc}",
                         },
                     )
                     self._json(HTTPStatus.BAD_GATEWAY, {
-                        "error": f"Browser validation failed: {exc}",
-                        "plan": plan,
+                        **response_payload,
                         "operation": operation,
                     })
                 return
