@@ -69,6 +69,13 @@ mutation, external semantic generation, semantic proposals, semantic apply,
 and semantic administration are explicit additional grants. Direct workspace saves remain
 full-token/administrator operations. Scope checks are server-enforced; written
 agent instructions remain defence in depth rather than authorization.
+
+A credential with the same `derive + semantic:inspect` authority required to
+create a managed derived layer may request bounded category counts for a stored
+field on an existing database-backed workspace layer. This does not grant
+general `inspect` access or return raw rows: the service accepts one safely
+quoted column, caps the result at 500 values, and applies its read-only
+five-second database timeout.
 Dashboard password changes, token issuance/revocation, and audit access already
 require an administrator session and are not bearer-token capabilities.
 

@@ -133,7 +133,8 @@ clients still use the route and response contract owned by the server.
 | `describe`, `schema`, `rules`, `examples`, `explain-error` | `/api/public/identity`, `/api/contract`, `/api/connect`, `/api/workspace`, `/api/schema`, `/api/rules`, `/api/examples` | — | Public identity is unauthenticated; `inspect` covers workspace and guidance reads |
 | `capabilities list\|show` | `GET /api/capabilities` | Discovery response containing `actions[]` | Any authenticated credential, including a semantic-only token |
 | `plugins list\|show\|validate\|usage` | `GET /api/plugins` | — | `inspect` |
-| `workspace get`, `layers *`, `catalog list`, `icons list`, `sql capabilities` | Workspace, layer, catalog, icon, and SQL capability GET routes | — | `inspect` |
+| `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Workspace, layer, catalog, icon, and SQL capability GET routes | — | `inspect` |
+| `layers values` | `GET /api/layers/{layerKey}/values` | `layers.values` | `derive` + `semantic:inspect`; returns bounded category counts, never raw rows |
 | `validate` | `POST /api/validate` | — | Legacy `full` or administrator session; it never saves |
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |

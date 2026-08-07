@@ -583,6 +583,23 @@ def _live_visual_input_schema() -> dict[str, Any]:
 
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "layers.values": {
+        "method": "GET",
+        "pathTemplate": "/api/layers/{layerKey}/values",
+        "risk": "aggregate-data-read",
+        "scope": "derive",
+        "requiredScopes": ["derive", "semantic:inspect"],
+        "querySchema": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+                "field": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+            "additionalProperties": False,
+        },
+    },
     "semantic.status": {
         "method": "GET",
         "path": "/api/semantic/status",
@@ -1388,7 +1405,7 @@ def contract(instance_id: str) -> dict[str, Any]:
             "describe", "schema", "rules", "examples",
             "plugins list", "plugins show", "plugins validate", "plugins usage",
             "capabilities list", "capabilities show",
-            "workspace get", "layers list", "layers get",
+            "workspace get", "layers list", "layers get", "layers values",
             "layers style-elements", "layers filters", "layers effective",
             "catalog list", "icons list",
             "derived-layers capabilities", "derived-layers list",

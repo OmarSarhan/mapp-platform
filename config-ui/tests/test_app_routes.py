@@ -754,6 +754,90 @@ class LayersRouteTests(unittest.TestCase):
             responses[0],
         )
 
+    def test_layer_values_returns_bounded_category_counts(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            ("text", False),
+            (12, 10, 3),
+        ]
+        cursor.fetchall.return_value = [("red", 6), ("blue", 3)]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect = MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        workspace = {
+            "dbs": "main",
+            "locale": {"layers": {"Areas": {
+                "format": "mvt",
+                "table": "derived_layers.areas",
+                "geom": "geom",
+                "qID": "id",
+            }}},
+        }
+
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"main": "postgresql://db"}),
+            patch.object(app.psycopg, "connect", connect),
+        ):
+            result = app.aggregate_layer_values(
+                workspace, None, "Areas", "category", 2
+            )
+
+        self.assertEqual(12, result["totalCount"])
+        self.assertEqual(2, result["nullCount"])
+        self.assertEqual(3, result["distinctCount"])
+        self.assertEqual(
+            [{"value": "red", "count": 6}, {"value": "blue", "count": 3}],
+            result["values"],
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual((2,), cursor.execute.call_args_list[-1].args[1])
+
+    def test_layer_values_requires_and_accepts_derived_create_scopes(self) -> None:
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/layers/Areas/values?field=category"
+        handler._host_allowed = lambda: True
+        handler._actor = lambda state_change=False: "token:test"
+        handler._authentication = {
+            "actor": "token:test",
+            "scopes": ["derive"],
+        }
+        handler._json = lambda status, payload: responses.append((status, payload))
+
+        handler.do_GET()
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+        self.assertEqual("semantic:inspect", responses[0][1]["requiredScope"])
+        self.assertEqual(
+            "derive",
+            app.Handler._required_scope(
+                "/api/layers/Areas/values", "GET"
+            ),
+        )
+
+        responses.clear()
+        handler._authentication["scopes"].append("semantic:inspect")
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", {"locale": {}}, "revision-1"),
+            ),
+            patch.object(
+                app,
+                "aggregate_layer_values",
+                return_value={"key": "Areas", "field": "category"},
+            ) as aggregate,
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual("revision-1", responses[0][1]["revision"])
+        aggregate.assert_called_once_with(
+            {"locale": {}}, None, "Areas", "category", 100
+        )
+
 
 class DerivedMapExtentRouteTests(unittest.TestCase):
     @staticmethod

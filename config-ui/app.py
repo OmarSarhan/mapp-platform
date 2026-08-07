@@ -16,7 +16,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -97,6 +97,8 @@ DB_CONNECTIONS = {
     for key, value in os.environ.items()
     if key.startswith("DBS_") and value
 }
+LAYER_VALUES_DEFAULT_LIMIT = 100
+LAYER_VALUES_MAX_LIMIT = 500
 SEMANTIC_SOURCE_ALLOWLIST = parse_semantic_source_allowlist(
     os.environ.get(
         "SEMANTIC_SOURCE_ALLOWLIST",
@@ -3504,6 +3506,121 @@ def layer_db(data: dict, layer: dict) -> str | None:
     return layer.get("dbs") or data.get("dbs")
 
 
+def aggregate_layer_values(
+    data: dict,
+    requested_locale: str | None,
+    layer_key: str,
+    field: str,
+    limit: int,
+) -> dict:
+    """Return bounded category counts for one stored layer column."""
+    locale_key, locale = select_locale(data, requested_locale)
+    layer = (locale.get("layers") or {}).get(layer_key)
+    if not isinstance(layer, dict):
+        raise FileNotFoundError(layer_key)
+    if not is_probeable_database_layer(layer):
+        raise ValueError(
+            "The selected layer does not use a queryable database relation."
+        )
+
+    db_name = layer_db(data, layer)
+    database_url = DB_CONNECTIONS.get(db_name)
+    if not database_url:
+        raise ValueError("The selected layer database is not configured.")
+    relation_name = layer.get("table")
+    if (
+        not isinstance(relation_name, str)
+        or not relation_name
+        or relation_name.count(".") > 1
+    ):
+        raise ValueError(
+            "The selected layer does not use a valid database relation."
+        )
+    relation_parts = relation_name.split(".")
+    if len(relation_parts) == 1:
+        relation_parts.insert(0, "public")
+    schema_name, table_name = relation_parts
+    relation = psycopg.sql.SQL("{}.{}").format(
+        psycopg.sql.Identifier(schema_name),
+        psycopg.sql.Identifier(table_name),
+    )
+    column = psycopg.sql.Identifier(field)
+
+    with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SET statement_timeout = '5000ms'")
+            cur.execute("SET LOCAL search_path = pg_catalog, public")
+            cur.execute(
+                """
+                SELECT format_type(attribute.atttypid, attribute.atttypmod),
+                       type.typname = 'geometry'
+                FROM pg_catalog.pg_class AS relation
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = relation.relnamespace
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = relation.oid
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                JOIN pg_catalog.pg_type AS type
+                  ON type.oid = attribute.atttypid
+                WHERE namespace.nspname = %s
+                  AND relation.relname = %s
+                  AND attribute.attname = %s
+                  AND relation.relkind IN ('r', 'p', 'v', 'm')
+                  AND has_schema_privilege(namespace.oid, 'USAGE')
+                  AND has_table_privilege(relation.oid, 'SELECT')
+                """,
+                (schema_name, table_name, field),
+            )
+            field_metadata = cur.fetchone()
+            if not field_metadata:
+                raise ValueError(
+                    f'The field “{field}” is not a selectable column on this layer.'
+                )
+            field_type, is_geometry = field_metadata
+            if is_geometry:
+                raise ValueError(
+                    "Geometry columns cannot be aggregated as style values."
+                )
+
+            cur.execute(
+                psycopg.sql.SQL(
+                    "SELECT count(*)::bigint, count({column})::bigint, "
+                    "count(DISTINCT {column})::bigint FROM {relation}"
+                ).format(column=column, relation=relation)
+            )
+            total_count, non_null_count, distinct_count = cur.fetchone()
+            cur.execute(
+                psycopg.sql.SQL(
+                    "SELECT to_jsonb({column}), count(*)::bigint "
+                    "FROM {relation} WHERE {column} IS NOT NULL "
+                    "GROUP BY {column} "
+                    "ORDER BY count(*) DESC, to_jsonb({column})::text "
+                    "LIMIT %s"
+                ).format(column=column, relation=relation),
+                (limit,),
+            )
+            values = [
+                {"value": value, "count": count}
+                for value, count in cur.fetchall()
+            ]
+
+    return {
+        "locale": locale_key,
+        "key": layer_key,
+        "field": field,
+        "fieldType": field_type,
+        "totalCount": total_count,
+        "nonNullCount": non_null_count,
+        "nullCount": total_count - non_null_count,
+        "distinctCount": distinct_count,
+        "values": values,
+        "limit": limit,
+        "truncated": distinct_count > len(values),
+    }
+
+
 def locale_items(data: dict) -> list[tuple[str, dict]]:
     return [
         (
@@ -4261,6 +4378,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return "semantic:propose"
             return "semantic:admin"
         if method == "GET":
+            if re.fullmatch(r"/api/layers/[^/]+/values", path):
+                return "derive"
             if path.startswith("/api/operations/"):
                 return None
             if path.startswith("/api/artifacts/"):
@@ -4752,6 +4871,64 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        elif layer_values_path := re.fullmatch(
+            r"/api/layers/([^/]+)/values", path
+        ):
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            try:
+                query = parse_qs(
+                    urlparse(self.path).query,
+                    keep_blank_values=True,
+                )
+                if (
+                    set(query) - {"field", "locale", "limit"}
+                    or any(len(values) != 1 for values in query.values())
+                ):
+                    raise ValueError(
+                        "Use one field, optional locale, and optional limit."
+                    )
+                field = query.get("field", [None])[0]
+                if not isinstance(field, str) or not field:
+                    raise ValueError("field is required.")
+                raw_limit = query.get(
+                    "limit", [str(LAYER_VALUES_DEFAULT_LIMIT)]
+                )[0]
+                try:
+                    limit = int(raw_limit)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("limit must be an integer.") from exc
+                if not 1 <= limit <= LAYER_VALUES_MAX_LIMIT:
+                    raise ValueError(
+                        f"limit must be between 1 and {LAYER_VALUES_MAX_LIMIT}."
+                    )
+                _, data, current_revision = read_workspace()
+                result = aggregate_layer_values(
+                    data,
+                    query.get("locale", [None])[0],
+                    unquote(layer_values_path.group(1)),
+                    field,
+                    limit,
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    {"revision": current_revision, **result},
+                )
+            except FileNotFoundError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": f"Unknown layer: {exc}",
+                    "code": "layer.not_found",
+                })
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": str(exc),
+                    "code": "layer.values_invalid",
+                })
+            except psycopg.Error:
+                self._json(HTTPStatus.BAD_GATEWAY, {
+                    "error": "Layer value aggregation is unavailable.",
+                    "code": "layer.values_unavailable",
+                })
         elif path == "/api/layers":
             requested_locale = parse_qs(
                 urlparse(self.path).query,
