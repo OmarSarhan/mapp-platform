@@ -140,6 +140,25 @@ reject_database_environment_overrides() {
   done
 }
 
+reject_edge_environment_overrides() {
+  local key configured
+  for key in \
+    EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE CADDY_EMAIL
+  do
+    if [[ -v "${key}" ]]; then
+      configured="$(dotenv_value "${key}")"
+      if [[ "${!key}" != "${configured}" ]]; then
+        printf 'Exported %s conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
+          "${key}" "${ENV_FILE}" >&2
+        exit 2
+      fi
+      # Shell values outrank --env-file interpolation in Compose. Remove an
+      # exact duplicate so the reviewed env file remains authoritative.
+      unset "${key}"
+    fi
+  done
+}
+
 state_owner_error() {
   local expected_uid="$1"
   local expected_gid="$2"
@@ -307,6 +326,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 2
 fi
 reject_database_environment_overrides
+reject_edge_environment_overrides
 check_state_owner
 init_state
 check_state_owner
