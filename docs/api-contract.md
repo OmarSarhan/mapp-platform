@@ -308,7 +308,7 @@ request as approval.
 | `GET /api/workspace` | Workspace plus bytes-and-file-generation revision |
 | `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
 | `GET /api/catalog` | Database connections and renderable tables offered for new layers; omits the PostgreSQL `public` schema |
-| `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, and materialized-size guard availability |
+| `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, generated-row-aware nested-loop planning, and materialized-size guard availability |
 | `GET /api/derived-layers/map-extent?locale=KEY` | Preview a fixed 1920×1080 workspace extent at one zoom level wider than the selected effective locale |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
 | `GET /api/derived-layers/<name>` | One definition including its SQL |
@@ -568,8 +568,27 @@ polygon wrappers whose exact routine setting is the catalog-derived
 `pg_catalog` plus authoritative allowlisted-extension namespace path. Both the
 routine and implementation must resolve as members of an approved extension;
 same-named custom routines and every other configuration remain prohibited.
-Successful mutations include `queryPlanProbe`. Query guard failures use this
-stable taxonomy:
+Successful mutations include the unchanged `queryPlanProbe` and an additive
+`queryPlanningProbe`. The top-level `queryPlanning` capability is version `1`,
+uses method `postgresql-explain-bounded-generator-pairs`, advertises
+`maxNestedLoopPairRows`, and publishes the closed
+`nested_loop_pair_work` reason code. The corresponding probe contains only the
+same version and method, `maxProvenGeneratedRows`, `nestedLoopCount`,
+`maxEstimatedNestedLoopPairRows`, and `maxAllowedNestedLoopPairRows`.
+
+The server derives the proven maximum from literal `generate_series` and the
+existing scoped/composed H3 estimate. A `ProjectSet` applies the literal series
+bound once per corrected input row; the H3 estimate is already a total scoped
+pipeline bound and is never compounded across project nodes. Conservative
+bounds survive filters, windows, grouped aggregates, grouping, uniqueness,
+other bound-preserving nodes, and materialized CTE scans; only a proven global
+aggregate or exact false one-time filter stops propagation. A nested loop is
+blocked when the product of its two corrected inputs exceeds 100,000,000 rows.
+This rule is query- and predicate-independent: a low-row parameterized index
+inner plan can pass, while an equally risky non-spatial nested loop is rejected;
+hash joins do not accrue nested-loop pair work.
+
+Query guard failures use this stable taxonomy:
 
 | Status and code | Category | Meaning and remediation |
 | --- | --- | --- |
@@ -583,7 +602,11 @@ These responses include `error`, `userMessage`, `suggestedAction`, `code`,
 its own `code`, `message`, and `suggestedAction`; clients should present those
 actions rather than substituting a generic H3 hint. None of these errors may
 include `recommendedKind`: syntax, policy, and compute failures block both
-ordinary and materialized views.
+ordinary and materialized views. A `nested_loop_pair_work` failure also carries
+`queryPlanningProbe` beside the backward-compatible legacy `probe`; clients
+should use it to guide a semantics-preserving rewrite that exposes a selective
+parameterized or indexed inner input and keeps complete-input aggregates or
+windows outside the row-matching path.
 
 For materialized operations, the same plan's final row count and width plus
 conservative storage overhead enforce the separately advertised 1 GiB maximum.

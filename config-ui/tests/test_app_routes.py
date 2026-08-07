@@ -802,6 +802,12 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         capabilities = responses[0][1]
         self.assertFalse(capabilities["h3Available"])
+        self.assertEqual({
+            "version": "1",
+            "method": "postgresql-explain-bounded-generator-pairs",
+            "maxNestedLoopPairRows": 100_000_000,
+            "reasonCodes": ["nested_loop_pair_work"],
+        }, capabilities["queryPlanning"])
         self.assertEqual(
             {
                 "method": "postgresql-catalog-and-execution",
@@ -1035,6 +1041,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertTrue(body["blocked"])
         self.assertEqual("view", body["recommendedKind"])
         self.assertEqual(probe, body["probe"])
+        self.assertNotIn("queryPlanningProbe", body)
         self.assertEqual("estimate", body["probeStage"])
         self.assertNotIn("rolledBack", body)
         self.assertEqual("create", body["operation"])
@@ -1082,6 +1089,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual("No derived layer was created.", body["safeState"])
         self.assertTrue(body["blocked"])
         self.assertEqual(probe, body["probe"])
+        self.assertNotIn("queryPlanningProbe", body)
         self.assertEqual(
             [reason["code"] for reason in reasons],
             [reason["code"] for reason in body["reasons"]],
@@ -1091,6 +1099,58 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         ))
         self.assertNotIn("recommendedKind", body)
         self.assertIn("ordinary view", body["suggestedAction"])
+        start.assert_not_called()
+        derived.create.assert_not_called()
+
+    def test_nested_loop_pair_rejection_preserves_planning_guidance(self):
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            self.definition(kind="view", background=True),
+        )
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        legacy_probe = self.query_plan_probe()
+        planning_probe = {
+            "version": "1",
+            "method": "postgresql-explain-bounded-generator-pairs",
+            "maxProvenGeneratedRows": 240_189,
+            "nestedLoopCount": 1,
+            "maxEstimatedNestedLoopPairRows": 42_898_956_345,
+            "maxAllowedNestedLoopPairRows": 100_000_000,
+        }
+        derived.preflight_definition.side_effect = (
+            app.DerivedLayerQueryTooExpensive(
+                "roads_visible",
+                legacy_probe,
+                [{
+                    "code": "nested_loop_pair_work",
+                    "message": "The nested-loop pair budget is exceeded.",
+                }],
+                query_planning_probe=planning_probe,
+            )
+        )
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "start_derived_background"
+        ) as start:
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("compute", body["category"])
+        self.assertEqual(legacy_probe, body["probe"])
+        self.assertEqual(planning_probe, body["queryPlanningProbe"])
+        self.assertEqual(
+            "nested_loop_pair_work",
+            body["reasons"][0]["code"],
+        )
+        self.assertIn(
+            "selective parameterized or indexed input",
+            body["reasons"][0]["suggestedAction"],
+        )
         start.assert_not_called()
         derived.create.assert_not_called()
 

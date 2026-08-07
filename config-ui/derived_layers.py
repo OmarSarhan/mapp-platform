@@ -45,6 +45,23 @@ QUERY_PLAN_MAX_JOIN_EXPANSION_RATIO = 1_000
 QUERY_PLAN_MAX_NODES = 150
 QUERY_PLAN_MAX_DEPTH = 32
 QUERY_PLAN_MAX_PLANNED_WORKERS = 8
+QUERY_PLANNING_VERSION = "1"
+QUERY_PLANNING_METHOD = "postgresql-explain-bounded-generator-pairs"
+QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS = 100_000_000
+QUERY_PLANNING_BOUND_PROPAGATING_NODES = frozenset({
+    "Aggregate",
+    "Gather",
+    "Gather Merge",
+    "Group",
+    "Incremental Sort",
+    "Materialize",
+    "Memoize",
+    "Result",
+    "Sort",
+    "Subquery Scan",
+    "Unique",
+    "WindowAgg",
+})
 QUERY_SHAPE_MAX_JOINS = 12
 QUERY_SHAPE_MAX_CTES = 12
 QUERY_SHAPE_MAX_SET_OPERATIONS = 8
@@ -229,10 +246,13 @@ class DerivedLayerQueryTooExpensive(DerivedLayerError):
         name: str,
         probe: dict[str, Any],
         reasons: list[dict[str, str]],
+        *,
+        query_planning_probe: dict[str, Any] | None = None,
     ):
         self.name = name
         self.probe = probe
         self.reasons = reasons
+        self.query_planning_probe = query_planning_probe
         super().__init__(
             f"Derived layer {name!r} query is too expensive: "
             + "; ".join(reason["message"] for reason in reasons)
@@ -1566,6 +1586,17 @@ class DerivedLayerStore:
             "maxPlannedWorkers": QUERY_PLAN_MAX_PLANNED_WORKERS,
         }
 
+    @staticmethod
+    def query_planning_capability() -> dict[str, Any]:
+        return {
+            "version": QUERY_PLANNING_VERSION,
+            "method": QUERY_PLANNING_METHOD,
+            "maxNestedLoopPairRows": (
+                QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS
+            ),
+            "reasonCodes": ["nested_loop_pair_work"],
+        }
+
     @classmethod
     def _query_plan_probe_result(
         cls,
@@ -1735,11 +1766,276 @@ class DerivedLayerStore:
             raise DerivedLayerQueryTooExpensive(name, probe, reasons)
         return probe
 
+    @staticmethod
+    def _proven_generated_row_bounds(
+        inspection: QueryAstInspection,
+        h3_expansion: dict[str, Any],
+    ) -> tuple[int, int]:
+        literal_rows_per_input = max(
+            (
+                call.generated_rows
+                for call in inspection.function_calls
+                if (
+                    call.bound_kind == "literal-series"
+                    and call.generated_rows is not None
+                )
+            ),
+            default=0,
+        )
+        h3_rows = h3_expansion.get("estimatedExpandedCells", 0)
+        h3_total_rows = (
+            h3_rows
+            if (
+                not isinstance(h3_rows, bool)
+                and isinstance(h3_rows, int)
+                and h3_rows >= 0
+            )
+            else 0
+        )
+        return literal_rows_per_input, h3_total_rows
+
+    @classmethod
+    def _query_planning_probe_result(
+        cls,
+        name: str,
+        row: Any,
+        inspection: QueryAstInspection,
+        h3_expansion: dict[str, Any],
+        query_plan_probe: dict[str, Any],
+    ) -> dict[str, Any]:
+        plan = row.get("QUERY PLAN") if isinstance(row, dict) else None
+        root = (
+            plan[0].get("Plan")
+            if (
+                isinstance(plan, list)
+                and len(plan) == 1
+                and isinstance(plan[0], dict)
+            )
+            else None
+        )
+        if not isinstance(root, dict):
+            raise DerivedLayerError(
+                "PostgreSQL returned an invalid query planning probe."
+            )
+
+        nodes: list[dict[str, Any]] = []
+        cte_producers: dict[str, dict[str, Any]] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            node_type = node.get("Node Type")
+            rows = node.get("Plan Rows")
+            children = node.get("Plans", [])
+            if (
+                not isinstance(node_type, str)
+                or not node_type
+                or isinstance(rows, bool)
+                or not isinstance(rows, int)
+                or rows < 0
+                or not isinstance(children, list)
+                or any(not isinstance(child, dict) for child in children)
+            ):
+                raise DerivedLayerError(
+                    "PostgreSQL returned an invalid query planning probe."
+                )
+            nodes.append(node)
+            subplan_name = node.get("Subplan Name")
+            if isinstance(subplan_name, str) and subplan_name.startswith("CTE "):
+                cte_producers[subplan_name.removeprefix("CTE ")] = node
+            stack.extend(children)
+
+        (
+            literal_rows_per_input,
+            h3_total_rows,
+        ) = cls._proven_generated_row_bounds(
+            inspection,
+            h3_expansion,
+        )
+        max_proven_generated_rows = max(
+            literal_rows_per_input,
+            h3_total_rows,
+        )
+        effective_rows_cache: dict[int, int] = {}
+        generated_subtree_cache: dict[int, bool] = {}
+
+        def regular_children(node: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
+                child
+                for child in node.get("Plans", [])
+                if child.get("Parent Relationship") not in {
+                    "InitPlan", "SubPlan",
+                }
+            ]
+
+        def has_generated_rows(
+            node: dict[str, Any],
+            resolving: frozenset[int] = frozenset(),
+        ) -> bool:
+            node_id = id(node)
+            if node_id in generated_subtree_cache:
+                return generated_subtree_cache[node_id]
+            if node_id in resolving:
+                return False
+            node_type = node["Node Type"]
+            generated = node_type in {"ProjectSet", "Function Scan"}
+            if node_type == "CTE Scan":
+                cte_name = node.get("CTE Name")
+                producer = (
+                    cte_producers.get(cte_name)
+                    if isinstance(cte_name, str)
+                    else None
+                )
+                if producer is not None:
+                    generated = generated or has_generated_rows(
+                        producer,
+                        resolving | {node_id},
+                    )
+            generated = generated or any(
+                has_generated_rows(child, resolving | {node_id})
+                for child in regular_children(node)
+            )
+            generated_subtree_cache[node_id] = generated
+            return generated
+
+        def effective_rows(
+            node: dict[str, Any],
+            resolving: frozenset[int] = frozenset(),
+        ) -> int:
+            node_id = id(node)
+            if node_id in effective_rows_cache:
+                return effective_rows_cache[node_id]
+            planned_rows = node["Plan Rows"]
+            if node_id in resolving:
+                return planned_rows
+            node_type = node["Node Type"]
+            corrected_rows = planned_rows
+            if node_type == "ProjectSet":
+                children = regular_children(node)
+                input_rows = (
+                    effective_rows(
+                        children[0],
+                        resolving | {node_id},
+                    )
+                    if len(children) == 1
+                    else 1
+                )
+                corrected_rows = max(
+                    corrected_rows,
+                    h3_total_rows,
+                    input_rows * literal_rows_per_input,
+                )
+            elif node_type == "Function Scan":
+                corrected_rows = max(
+                    corrected_rows,
+                    h3_total_rows,
+                    literal_rows_per_input,
+                )
+            elif node_type == "CTE Scan":
+                cte_name = node.get("CTE Name")
+                producer = (
+                    cte_producers.get(cte_name)
+                    if isinstance(cte_name, str)
+                    else None
+                )
+                if producer is not None:
+                    corrected_rows = max(
+                        corrected_rows,
+                        effective_rows(
+                            producer,
+                            resolving | {node_id},
+                        ),
+                    )
+            else:
+                children = regular_children(node)
+                if (
+                    node_type in QUERY_PLANNING_BOUND_PROPAGATING_NODES
+                    and len(children) == 1
+                    and not (
+                        node_type == "Aggregate"
+                        and node.get("Strategy") == "Plain"
+                    )
+                    and node.get("One-Time Filter") != "false"
+                ):
+                    corrected_rows = max(
+                        corrected_rows,
+                        effective_rows(
+                            children[0],
+                            resolving | {node_id},
+                        ),
+                    )
+                elif node_type in {"Append", "Merge Append"} and children:
+                    corrected_rows = max(
+                        corrected_rows,
+                        sum(
+                            (
+                                effective_rows(
+                                    child,
+                                    resolving | {node_id},
+                                )
+                                if has_generated_rows(
+                                    child,
+                                    resolving | {node_id},
+                                )
+                                else child["Plan Rows"]
+                            )
+                            for child in children
+                        ),
+                    )
+            effective_rows_cache[node_id] = corrected_rows
+            return corrected_rows
+
+        nested_loop_count = 0
+        max_nested_loop_pair_rows = 0
+        for node in nodes:
+            if node["Node Type"] != "Nested Loop":
+                continue
+            nested_loop_count += 1
+            children = regular_children(node)
+            if len(children) != 2:
+                continue
+            pair_rows = (
+                effective_rows(children[0])
+                * effective_rows(children[1])
+            )
+            max_nested_loop_pair_rows = max(
+                max_nested_loop_pair_rows,
+                pair_rows,
+            )
+
+        probe = {
+            "version": QUERY_PLANNING_VERSION,
+            "method": QUERY_PLANNING_METHOD,
+            "maxProvenGeneratedRows": max_proven_generated_rows,
+            "nestedLoopCount": nested_loop_count,
+            "maxEstimatedNestedLoopPairRows": max_nested_loop_pair_rows,
+            "maxAllowedNestedLoopPairRows": (
+                QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS
+            ),
+        }
+        if (
+            max_nested_loop_pair_rows
+            > QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS
+        ):
+            raise DerivedLayerQueryTooExpensive(
+                name,
+                query_plan_probe,
+                [_reason(
+                    "nested_loop_pair_work",
+                    "PostgreSQL plans up to "
+                    f"{max_nested_loop_pair_rows:,} nested-loop input row "
+                    "pairs after applying proven generated-row bounds, above "
+                    f"the {QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS:,} "
+                    "pair limit.",
+                )],
+                query_planning_probe=probe,
+            )
+        return probe
+
     def _query_probe(
         self,
         cur,
         definition: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         h3_expansion = _query_shape_guard(definition)
         inspection = validate_query_ast(definition["query"])
         cur.execute("SET LOCAL statement_timeout = '5s'")
@@ -1753,11 +2049,18 @@ class DerivedLayerStore:
         query_plan_probe = self._query_plan_probe_result(
             definition["name"], row, h3_expansion,
         )
+        query_planning_probe = self._query_planning_probe_result(
+            definition["name"],
+            row,
+            inspection,
+            h3_expansion,
+            query_plan_probe,
+        )
         materialization_probe = (
             self._materialization_probe_result(definition["name"], row)
             if definition["kind"] == "materialized" else None
         )
-        return query_plan_probe, materialization_probe
+        return query_plan_probe, query_planning_probe, materialization_probe
 
     @staticmethod
     def _validate_catalog_dependencies(
@@ -1829,10 +2132,17 @@ class DerivedLayerStore:
         definition = validate_definition(payload)
         self._require_resolved_spatial_scope(definition)
         with self._connect() as connection, connection.cursor() as cur:
-            query_plan_probe, materialization_probe = self._query_probe(
+            (
+                query_plan_probe,
+                query_planning_probe,
+                materialization_probe,
+            ) = self._query_probe(
                 cur, definition,
             )
-            result = {"queryPlanProbe": query_plan_probe}
+            result = {
+                "queryPlanProbe": query_plan_probe,
+                "queryPlanningProbe": query_planning_probe,
+            }
             if materialization_probe is not None:
                 result["materializationProbe"] = materialization_probe
             return result
@@ -1847,11 +2157,16 @@ class DerivedLayerStore:
             if definition["kind"] != "materialized":
                 raise DerivedLayerError("Only materialized views can be refreshed.")
             self._require_resolved_spatial_scope(definition)
-            query_plan_probe, materialization_probe = self._query_probe(
+            (
+                query_plan_probe,
+                query_planning_probe,
+                materialization_probe,
+            ) = self._query_probe(
                 cur, definition,
             )
             return {
                 "queryPlanProbe": query_plan_probe,
+                "queryPlanningProbe": query_planning_probe,
                 "materializationProbe": materialization_probe,
             }
 
@@ -1964,7 +2279,11 @@ class DerivedLayerStore:
             ), (definition["name"],))
             if cur.fetchone():
                 raise FileExistsError(definition["name"])
-            query_plan_probe, materialization_probe = self._query_probe(
+            (
+                query_plan_probe,
+                query_planning_probe,
+                materialization_probe,
+            ) = self._query_probe(
                 cur, definition,
             )
             cur.execute("SET LOCAL statement_timeout = '30min'")
@@ -2045,6 +2364,7 @@ class DerivedLayerStore:
             item = self.get_in_transaction(cur, definition["name"])
             item.update(output)
             item["queryPlanProbe"] = query_plan_probe
+            item["queryPlanningProbe"] = query_planning_probe
             if materialization_probe is not None:
                 item["materializationProbe"] = materialization_probe
             self._enqueue_semantic_event(
@@ -2092,7 +2412,11 @@ class DerivedLayerStore:
             if definition["kind"] != "materialized":
                 raise DerivedLayerError("Only materialized views can be refreshed.")
             self._require_resolved_spatial_scope(definition)
-            query_plan_probe, materialization_probe = self._query_probe(
+            (
+                query_plan_probe,
+                query_planning_probe,
+                materialization_probe,
+            ) = self._query_probe(
                 cur, definition,
             )
             cur.execute("SET LOCAL statement_timeout = '30min'")
@@ -2134,6 +2458,7 @@ class DerivedLayerStore:
             """).format(sql.Identifier(SCHEMA)), (name,))
             item = self.get_in_transaction(cur, name)
             item["queryPlanProbe"] = query_plan_probe
+            item["queryPlanningProbe"] = query_planning_probe
             item["materializationProbe"] = materialization_probe
             self._enqueue_semantic_event(
                 cur,
@@ -2164,7 +2489,11 @@ class DerivedLayerStore:
             if not current:
                 raise FileNotFoundError(name)
             self._require_resolved_spatial_scope(definition)
-            query_plan_probe, materialization_probe = self._query_probe(
+            (
+                query_plan_probe,
+                query_planning_probe,
+                materialization_probe,
+            ) = self._query_probe(
                 cur, definition,
             )
             cur.execute("SET LOCAL statement_timeout = '30min'")
@@ -2318,6 +2647,7 @@ class DerivedLayerStore:
             item = self.get_in_transaction(cur, name)
             item.update(output)
             item["queryPlanProbe"] = query_plan_probe
+            item["queryPlanningProbe"] = query_planning_probe
             if materialization_probe is not None:
                 item["materializationProbe"] = materialization_probe
             item["replacedKind"] = current["kind"]
@@ -3339,6 +3669,7 @@ class DerivedLayerStore:
                         },
                     },
                 },
+                "queryPlanning": self.query_planning_capability(),
                 "extensions": extensions,
                 "h3Available": h3_readiness["ready"],
                 "h3Readiness": h3_readiness,

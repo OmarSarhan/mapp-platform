@@ -68,6 +68,7 @@ DERIVED_ERROR_PRESENTATION = {
         "service-recovery",
     ],
     "probeField": "probe",
+    "queryPlanningProbeField": "queryPlanningProbe",
     "queryErrorCodes": {
         "invalid": "derived_layer.query_invalid",
         "policy": "derived_layer.query_not_allowed",
@@ -828,7 +829,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "messageField": "userMessage",
             "nextActionField": "suggestedAction",
             "technicalFields": [
-                "queryPlanProbe", "materializationProbe", "technicalDetail",
+                "queryPlanProbe", "queryPlanningProbe",
+                "materializationProbe", "technicalDetail",
             ],
         },
         "inputSchema": {
@@ -877,7 +879,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "messageField": "userMessage",
             "nextActionField": "suggestedAction",
             "technicalFields": [
-                "queryPlanProbe", "materializationProbe", "technicalDetail",
+                "queryPlanProbe", "queryPlanningProbe",
+                "materializationProbe", "technicalDetail",
             ],
         },
         "inputSchema": {
@@ -903,7 +906,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "nextActionField": "derivedLayer.suggestedAction",
             "technicalFields": [
                 "workspaceReferences", "fieldReferences", "dependents",
-                "queryPlanProbe", "materializationProbe", "technicalDetail",
+                "queryPlanProbe", "queryPlanningProbe",
+                "materializationProbe", "technicalDetail",
             ],
         },
         "inputSchema": {

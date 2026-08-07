@@ -387,10 +387,28 @@ PostgreSQL error text, connection context, secrets, or database-supplied object
 names. `h3Available` is always equal to `h3Readiness.ready`; ordinary non-H3
 derived queries remain available when H3 is not ready.
 
-Successful mutations include `queryPlanProbe`; capabilities advertise the
-ordered AST/catalog/EXPLAIN `stages`, `shapeLimits`, plan `limits`, H3 bounds,
-and `errorCategories` in `queryGuard`. Failures distinguish a malformed query,
-a forbidden query, and an allowed query whose work is too large:
+Successful mutations include the unchanged `queryPlanProbe` plus the additive
+`queryPlanningProbe`. Capabilities advertise the ordered AST/catalog/EXPLAIN
+`stages`, `shapeLimits`, plan `limits`, H3 bounds, and `errorCategories` in
+`queryGuard`. The separate versioned `queryPlanning` capability advertises a
+100,000,000-row nested-loop pair limit and the
+`nested_loop_pair_work` reason code.
+
+The planning probe combines literal `generate_series` bounds and the existing
+scoped, composed H3 estimate with PostgreSQL's plan. A literal series is a
+per-invocation bound, so a `ProjectSet` multiplies it by the corrected input
+rows; the H3 estimate is already the total scoped pipeline bound and is not
+multiplied again. The probe carries those conservative bounds through filters,
+windows, grouped aggregates, grouping, uniqueness, other bound-preserving plan
+nodes, and CTE scans. Only a proven global aggregate or an exact false one-time
+filter stops propagation. For each `Nested Loop`, it then multiplies the two
+input row estimates.
+This is not tied to H3, a spatial predicate, a source table, or a particular SQL
+template. A parameterized index scan whose inner `Plan Rows` is small remains
+admissible, and hash joins are not charged nested-loop pair work.
+
+Failures distinguish a malformed query, a forbidden query, and an allowed
+query whose work is too large:
 
 | HTTP/code | Meaning | Correct response |
 | --- | --- | --- |
@@ -402,7 +420,13 @@ All three responses use `blocked: true`, structured `reasons`, and an
 operation-specific unchanged-state message. Each is forbidden for both
 ordinary and materialized views and none has `recommendedKind`: an ordinary
 view is not a syntax, policy, or computation bypass. A planner rejection also
-includes the closed probe. The server repeats the checks at the database
+includes the closed legacy `probe`. A `nested_loop_pair_work` rejection also
+includes `queryPlanningProbe` beside `probe`, with only its method/version,
+proven generator maximum, nested-loop count, estimated pair maximum, and
+allowed pair maximum. Keep complete-input totals semantically separate from
+the selective row-matching path so PostgreSQL can use a parameterized or
+indexed inner plan; do not push a map predicate into a total that is meant to
+cover the complete source. The server repeats the checks at the database
 mutation boundary so an accepted background request cannot bypass them.
 Planner estimates are a conservative admission guard, not a promise of actual
 runtime resource use; database timeouts remain a second backstop.
@@ -589,7 +613,7 @@ PostgreSQL plan budget still applies after these H3-specific checks.
 
 | Route | Scope | Purpose |
 | --- | --- | --- |
-| `GET /api/derived-layers/capabilities` | `inspect` | Modes, PostGIS/H3 versions, exact-overload catalog and bounded execution readiness, universal query-plan limits, H3 bounds, and the materialized-size limit |
+| `GET /api/derived-layers/capabilities` | `inspect` | Modes, PostGIS/H3 versions, exact-overload catalog and bounded execution readiness, universal query-plan limits, generated-row-aware nested-loop pair planning, H3 bounds, and the materialized-size limit |
 | `GET /api/derived-layers/map-extent?locale=KEY` | `inspect` | Preview the server-resolved fixed workspace map extent |
 | `GET /api/derived-layers` | `inspect` | Definitions without SQL |
 | `GET /api/derived-layers/{name}` | `inspect` | One definition including SQL |

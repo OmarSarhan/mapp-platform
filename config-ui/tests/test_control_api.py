@@ -263,6 +263,10 @@ class ControlApiTests(unittest.TestCase):
                 "queryPlanProbe",
                 presentation["technicalFields"],
             )
+            self.assertIn(
+                "queryPlanningProbe",
+                presentation["technicalFields"],
+            )
             self.assertEqual("reasons", presentation["reasonField"])
             self.assertEqual(
                 "suggestedAction",
@@ -296,6 +300,10 @@ class ControlApiTests(unittest.TestCase):
                 presentation["failurePhases"],
             )
             self.assertEqual("probe", presentation["probeField"])
+            self.assertEqual(
+                "queryPlanningProbe",
+                presentation["queryPlanningProbeField"],
+            )
             self.assertEqual(
                 {
                     "invalid": "derived_layer.query_invalid",

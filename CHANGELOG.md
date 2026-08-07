@@ -8,6 +8,11 @@ first release.
 
 ### Fixed
 
+- Combined proven literal-generator and scoped H3 row bounds with PostgreSQL
+  plan structure so underestimated `ProjectSet`, `Function Scan`, and CTE
+  inputs cannot hide over-budget nested-loop pair work. Rejections now carry a
+  versioned, closed planning probe and general index-preserving rewrite
+  guidance without hard-coding spatial predicates or query templates.
 - Compared approved H3 polygon-wrapper `search_path` settings semantically,
   retaining `pg_catalog` precedence and exact authoritative extension-schema
   membership while tolerating harmless quoting, whitespace, and extension
