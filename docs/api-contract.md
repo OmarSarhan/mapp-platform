@@ -310,7 +310,7 @@ request as approval.
 | `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
 | `GET /api/catalog` | Database connections and renderable tables offered for new layers; omits the PostgreSQL `public` schema |
 | `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, generated-row-aware nested-loop planning, and materialized-size guard availability |
-| `GET /api/derived-layers/map-extent?locale=KEY` | Preview a fixed 1920×1080 workspace extent at one zoom level wider than the selected effective locale |
+| `GET /api/derived-layers/map-extent?locale=KEY` | Preview the selected effective locale's configured north/east/south/west extent, with the legacy view-derived fallback when those bounds are incomplete |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
 | `GET /api/derived-layers/<name>` | One definition including its SQL |
 | `GET /api/semantic/status` | Semantic schema version, catalog revision, and advertised capabilities, including Gemini context limits when configured |

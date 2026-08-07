@@ -1113,10 +1113,17 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         handler._semantic_request = Mock(return_value=self.catalog())
         derived = Mock()
         derived.create.side_effect = lambda payload, _actor: payload
+        workspace = self.workspace()
+        workspace["locale"]["extent"] = {
+            "north": 54,
+            "east": -1.2,
+            "south": 53.65,
+            "west": -1.85,
+        }
         with patch.object(
             app,
             "read_workspace",
-            return_value=(b"{}", self.workspace(), "revision"),
+            return_value=(b"{}", workspace, "revision"),
         ), patch.object(app, "DERIVED", derived), patch.object(
             app, "schedule_semantic_outbox"
         ), patch.object(app, "CONTROL", Mock()):
@@ -1126,6 +1133,10 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         stored = derived.create.call_args.args[0]
         self.assertEqual("locale", stored["spatialScope"]["locale"])
         self.assertEqual(10, stored["spatialScope"]["scopeZoom"])
+        self.assertEqual(
+            [{"west": -1.85, "south": 53.65, "east": -1.2, "north": 54.0}],
+            stored["spatialScope"]["envelopes"],
+        )
         derived.preflight_definition.assert_called_once_with(stored)
 
     def test_oversized_materialization_is_blocked_before_background_create(self):

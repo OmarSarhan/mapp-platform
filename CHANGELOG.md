@@ -8,6 +8,10 @@ first release.
 
 ### Fixed
 
+- Derived-layer create and replace now use the selected effective locale's
+  configured north/east/south/west extent as the output scope instead of a
+  smaller startup-view viewport; older workspaces without all four bounds keep
+  the existing view-derived fallback.
 - Moved Chromium visual tests and screenshots onto durable background
   operations when requested, so browser completion atomically retains reports,
   artifact references, and explicit failures for operation polling.

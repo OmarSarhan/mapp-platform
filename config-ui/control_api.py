@@ -2345,52 +2345,115 @@ def workspace_map_extent(
         )
 
     scope_zoom = max(0.0, zoom - 1.0)
-    world_size = MAP_EXTENT_TILE_SIZE * (2.0 ** scope_zoom)
-    half_longitude_span = (
-        MAP_EXTENT_VIEWPORT_WIDTH / world_size * 360.0 / 2.0
-    )
-
-    projected_latitude = max(
-        -WEB_MERCATOR_MAX_LATITUDE,
-        min(WEB_MERCATOR_MAX_LATITUDE, latitude),
-    )
-    latitude_radians = math.radians(projected_latitude)
-    centre_y = (
-        1.0
-        - math.asinh(math.tan(latitude_radians)) / math.pi
-    ) / 2.0 * world_size
-    north_y = max(0.0, centre_y - MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
-    south_y = min(world_size, centre_y + MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
-
-    def latitude_at(pixel_y: float) -> float:
-        return math.degrees(math.atan(math.sinh(
-            math.pi * (1.0 - 2.0 * pixel_y / world_size)
-        )))
 
     def coordinate(value: float) -> float:
         rounded = round(value, 12)
         return 0.0 if rounded == 0 else rounded
 
-    north = coordinate(latitude_at(north_y))
-    south = coordinate(latitude_at(south_y))
-    longitude_span = half_longitude_span * 2.0
-    if longitude_span >= 360.0:
-        longitude_ranges = [(-180.0, 180.0)]
-    else:
-        west = longitude - half_longitude_span
-        east = longitude + half_longitude_span
-        if west < -180.0:
-            longitude_ranges = [
-                (west + 360.0, 180.0),
-                (-180.0, east),
-            ]
-        elif east > 180.0:
-            longitude_ranges = [
-                (west, 180.0),
-                (-180.0, east - 360.0),
-            ]
-        else:
+    configured_extent = locale.get("extent")
+    extent_keys = ("west", "south", "east", "north")
+    if isinstance(configured_extent, dict) and all(
+        key in configured_extent for key in extent_keys
+    ):
+        extent_values: dict[str, float] = {}
+        for key in extent_keys:
+            value = configured_extent[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(
+                    f"Locale {selected_locale!r} extent.{key} must be a finite "
+                    "number before a workspace map extent can be calculated."
+                )
+            extent_values[key] = float(value)
+        west = extent_values["west"]
+        south = extent_values["south"]
+        east = extent_values["east"]
+        north = extent_values["north"]
+        if (
+            west < -180
+            or west > 180
+            or east < -180
+            or east > 180
+            or west == east
+            or south < -90
+            or north > 90
+            or south >= north
+        ):
+            raise ValueError(
+                f"Locale {selected_locale!r} extent bounds are invalid."
+            )
+        if west < east:
             longitude_ranges = [(west, east)]
+        else:
+            longitude_ranges = []
+            if west < 180:
+                longitude_ranges.append((west, 180.0))
+            if east > -180:
+                longitude_ranges.append((-180.0, east))
+            if not longitude_ranges:
+                raise ValueError(
+                    f"Locale {selected_locale!r} extent bounds are invalid."
+                )
+        envelopes = [
+            {"west": west, "south": south, "east": east, "north": north}
+            for west, east in longitude_ranges
+        ]
+        scope_source = "configured locale extent"
+    else:
+        world_size = MAP_EXTENT_TILE_SIZE * (2.0 ** scope_zoom)
+        half_longitude_span = (
+            MAP_EXTENT_VIEWPORT_WIDTH / world_size * 360.0 / 2.0
+        )
+        projected_latitude = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, latitude),
+        )
+        latitude_radians = math.radians(projected_latitude)
+        centre_y = (
+            1.0
+            - math.asinh(math.tan(latitude_radians)) / math.pi
+        ) / 2.0 * world_size
+        north_y = max(0.0, centre_y - MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
+        south_y = min(world_size, centre_y + MAP_EXTENT_VIEWPORT_HEIGHT / 2.0)
+
+        def latitude_at(pixel_y: float) -> float:
+            return math.degrees(math.atan(math.sinh(
+                math.pi * (1.0 - 2.0 * pixel_y / world_size)
+            )))
+
+        north = coordinate(latitude_at(north_y))
+        south = coordinate(latitude_at(south_y))
+        longitude_span = half_longitude_span * 2.0
+        if longitude_span >= 360.0:
+            longitude_ranges = [(-180.0, 180.0)]
+        else:
+            west = longitude - half_longitude_span
+            east = longitude + half_longitude_span
+            if west < -180.0:
+                longitude_ranges = [
+                    (west + 360.0, 180.0),
+                    (-180.0, east),
+                ]
+            elif east > 180.0:
+                longitude_ranges = [
+                    (west, 180.0),
+                    (-180.0, east - 360.0),
+                ]
+            else:
+                longitude_ranges = [(west, east)]
+        envelopes = [
+            {
+                "west": coordinate(west),
+                "south": south,
+                "east": coordinate(east),
+                "north": north,
+            }
+            for west, east in longitude_ranges
+        ]
+        scope_source = "startup-view fallback envelope"
 
     def json_number(value: float) -> int | float:
         return int(value) if value.is_integer() else value
@@ -2411,20 +2474,13 @@ def workspace_map_extent(
             "tileSize": MAP_EXTENT_TILE_SIZE,
         },
         "crs": "EPSG:4326",
-        "envelopes": [
-            {
-                "west": coordinate(west),
-                "south": south,
-                "east": coordinate(east),
-                "north": north,
-            }
-            for west, east in longitude_ranges
-        ],
+        "envelopes": envelopes,
         "selection": "intersects-output-geometry",
         "clipsGeometry": False,
         "guidance": (
-            "This is an output-row guard only; it keeps complete output "
-            "features intersecting the fixed extent. It is not a security "
+            "This output-row guard uses the selected locale's "
+            f"{scope_source}; it keeps complete output features intersecting "
+            "that fixed extent. It is not a security "
             "boundary and does not scope source-side aggregates, clip "
             "geometry, or follow later map movements. Add the envelope inside "
             "source-side SQL before aggregation when metrics must be map-scoped."

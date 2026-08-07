@@ -1046,6 +1046,26 @@ class ControlApiTests(unittest.TestCase):
         self.assertLess(envelope["south"], 53.8008)
         self.assertGreater(envelope["north"], 53.8008)
 
+    def test_workspace_map_extent_prefers_configured_locale_extent(self):
+        scope = workspace_map_extent({
+            "locale": {
+                "extent": {
+                    "north": 54,
+                    "east": -1.2,
+                    "south": 53.65,
+                    "west": -1.85,
+                    "mask": True,
+                },
+                "view": {"lng": -1.5491, "lat": 53.8008, "z": 11},
+            },
+        })
+
+        self.assertEqual(
+            [{"west": -1.85, "south": 53.65, "east": -1.2, "north": 54.0}],
+            scope["envelopes"],
+        )
+        self.assertIn("configured locale extent", scope["guidance"])
+
     def test_workspace_map_extent_splits_antimeridian_and_covers_world(self):
         wrapped = workspace_map_extent({
             "locale": {

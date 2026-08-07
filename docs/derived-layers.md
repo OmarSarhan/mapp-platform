@@ -260,9 +260,10 @@ service still quotes every identifier when constructing database statements.
 
 ### Fixed workspace map extent
 
-Every create and replace retains only output features that intersect a fixed
-extent around a workspace map centre. Callers may send the following selector
-to choose a named locale; omitting it selects the default effective locale:
+Every create and replace retains only output features that intersect the
+selected effective locale's fixed configured extent. Callers may send the
+following selector to choose a named locale; omitting it selects the default
+effective locale:
 
 ```json
 {
@@ -273,12 +274,13 @@ to choose a named locale; omitting it selects the default effective locale:
 }
 ```
 
-The server reads that locale's effective `view.lng`, `view.lat`, and `view.z`,
-calculates a 1920×1080 Web Mercator viewport at `max(0, view.z - 1)`, and
-records one EPSG:4326 envelope, or two when the viewport crosses the
-antimeridian. Workspace latitudes up to ±90 are accepted and clamped to the
-Web Mercator limit for the calculation. Missing, non-finite, or otherwise
-invalid views fail clearly.
+When the locale has complete `extent.north`, `extent.east`, `extent.south`, and
+`extent.west` values, those exact configured bounds define the EPSG:4326 scope.
+A west value greater than east is split into two envelopes across the
+antimeridian. The optional `extent.mask` rendering flag does not change these
+bounds. For compatibility with older workspaces whose locale lacks one or more
+configured bounds, the server falls back to a 1920×1080 Web Mercator viewport
+at `max(0, view.z - 1)` around `view.lng` and `view.lat`.
 
 Use `GET /api/derived-layers/map-extent?locale=KEY` to preview the resolved
 `spatialScope`; this read does not require derived-database configuration.
