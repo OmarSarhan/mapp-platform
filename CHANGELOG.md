@@ -13,6 +13,18 @@ first release.
   timeouts now return a retryable `derived_layer.database_contention` conflict
   with a closed contention scope and actionable operator guidance, while
   uncertain outcomes remain non-retryable and fail closed.
+- Completed the existing bundled-database upgrade lifecycle: normal startup
+  now applies the idempotent derived-role/H3 upgrade before application
+  services and ensures missing managed spatial indexes without repeatedly
+  analyzing unchanged relations.
+- Prepared EPSG:27700 GiST expression indexes for managed source and
+  materialized geometry so metric area/intersection joins can remain indexed
+  instead of comparing every projected source and generated row.
+- Combined proven literal-generator and scoped H3 row bounds with PostgreSQL
+  plan structure so underestimated `ProjectSet`, `Function Scan`, and CTE
+  inputs cannot hide over-budget nested-loop pair work. Rejections now carry a
+  versioned, closed planning probe and general index-preserving rewrite
+  guidance without hard-coding spatial predicates or query templates.
 - Compared approved H3 polygon-wrapper `search_path` settings semantically,
   retaining `pg_catalog` precedence and exact authoritative extension-schema
   membership while tolerating harmless quoting, whitespace, and extension

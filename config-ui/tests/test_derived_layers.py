@@ -8,13 +8,19 @@ from unittest.mock import MagicMock, patch
 
 import psycopg
 
-from derived_query_guard import GuardReason, QueryGuardViolation
+from derived_query_guard import (
+    GuardReason,
+    QueryGuardViolation,
+    inspect_query_ast,
+)
 from derived_layers import (
     H3_SCOPE_MAX_ESTIMATED_EXPANDED_CELLS,
     H3_SCOPE_MAX_ESTIMATED_CELLS,
     MATERIALIZED_MAX_ESTIMATED_BYTES,
     QUERY_PLAN_MAX_INTERMEDIATE_BYTES,
     QUERY_PLAN_MAX_TOTAL_COST,
+    QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS,
+    QUERY_PLANNING_METHOD,
     DerivedLayerCancellation,
     DerivedLayerCancellationRequested,
     DerivedLayerContentionError,
@@ -90,6 +96,34 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         if workers is not None:
             plan["Workers Planned"] = workers
         return {"QUERY PLAN": [{"Plan": plan}]}
+
+    @staticmethod
+    def plan_node(node_type, rows, *, plans=None, **fields):
+        node = {
+            "Node Type": node_type,
+            "Plan Rows": rows,
+            "Plan Width": 32,
+            "Total Cost": 10.0,
+            **fields,
+        }
+        if plans is not None:
+            node["Plans"] = plans
+        return node
+
+    def query_planning_probe(self, row, query, h3_rows=0):
+        h3_expansion = {"estimatedExpandedCells": h3_rows}
+        query_plan_probe = DerivedLayerStore._query_plan_probe_result(
+            "paths_h3_r9",
+            row,
+            h3_expansion,
+        )
+        return DerivedLayerStore._query_planning_probe_result(
+            "paths_h3_r9",
+            row,
+            inspect_query_ast(query),
+            h3_expansion,
+            query_plan_probe,
+        )
 
     @staticmethod
     def materialization_probe(**updates):
@@ -514,6 +548,274 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             probe["limits"]["maxTotalCost"],
         )
 
+    def test_query_planning_guard_corrects_generated_nested_loop_rows(self):
+        generated = self.plan_node(
+            "ProjectSet",
+            1_000,
+            plans=[self.plan_node("Result", 1)],
+        )
+        generated = self.plan_node(
+            "Subquery Scan",
+            1_000,
+            plans=[self.plan_node("Sort", 1_000, plans=[generated])],
+        )
+        source = self.plan_node(
+            "WindowAgg",
+            178_605,
+            plans=[self.plan_node("Seq Scan", 178_605)],
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1_000,
+                plans=[generated, source],
+            )}],
+        }
+        query = (
+            "SELECT cell FROM _mapp_h3_scope CROSS JOIN LATERAL "
+            "h3_polygon_to_cells(_mapp_h3_scope.geom_4326, 9) AS cell"
+        )
+
+        with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+            self.query_planning_probe(row, query, h3_rows=240_189)
+
+        self.assertEqual(
+            ["nested_loop_pair_work"],
+            [reason["code"] for reason in raised.exception.reasons],
+        )
+        planning = raised.exception.query_planning_probe
+        self.assertEqual(240_189, planning["maxProvenGeneratedRows"])
+        self.assertEqual(1, planning["nestedLoopCount"])
+        self.assertEqual(
+            240_189 * 178_605,
+            planning["maxEstimatedNestedLoopPairRows"],
+        )
+        self.assertEqual(
+            QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS,
+            planning["maxAllowedNestedLoopPairRows"],
+        )
+        self.assertEqual(QUERY_PLANNING_METHOD, planning["method"])
+
+    def test_query_planning_guard_propagates_literal_bound_through_cte(self):
+        producer = self.plan_node(
+            "Function Scan",
+            10,
+            **{
+                "Parent Relationship": "InitPlan",
+                "Subplan Name": "CTE generated_values",
+            },
+        )
+        cte_scan = self.plan_node(
+            "CTE Scan",
+            10,
+            **{"CTE Name": "generated_values"},
+        )
+        source = self.plan_node("Seq Scan", 2_000)
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                100,
+                plans=[cte_scan, source, producer],
+            )}],
+        }
+
+        with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+            self.query_planning_probe(
+                row,
+                "SELECT value FROM generate_series(1, 100000) AS value",
+            )
+
+        planning = raised.exception.query_planning_probe
+        self.assertEqual(100_000, planning["maxProvenGeneratedRows"])
+        self.assertEqual(
+            200_000_000,
+            planning["maxEstimatedNestedLoopPairRows"],
+        )
+
+    def test_query_planning_guard_handles_index_hash_and_small_plans(self):
+        generator = self.plan_node(
+            "ProjectSet",
+            1_000,
+            plans=[self.plan_node("Seq Scan", 2_000)],
+        )
+        indexed = self.plan_node("Index Scan", 1)
+        nested = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1_000,
+                plans=[generator, indexed],
+            )}],
+        }
+        query = (
+            "SELECT cell FROM _mapp_h3_scope CROSS JOIN LATERAL "
+            "h3_polygon_to_cells(_mapp_h3_scope.geom_4326, 9) AS cell"
+        )
+        planning = self.query_planning_probe(
+            nested,
+            query,
+            h3_rows=240_189,
+        )
+        self.assertEqual(
+            240_189,
+            planning["maxEstimatedNestedLoopPairRows"],
+        )
+
+        hashed = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Hash Join",
+                1_000,
+                plans=[generator, self.plan_node("Seq Scan", 178_605)],
+            )}],
+        }
+        planning = self.query_planning_probe(
+            hashed,
+            query,
+            h3_rows=240_189,
+        )
+        self.assertEqual(0, planning["nestedLoopCount"])
+        self.assertEqual(0, planning["maxEstimatedNestedLoopPairRows"])
+
+        small = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                100,
+                plans=[
+                    self.plan_node("Seq Scan", 100),
+                    self.plan_node("Seq Scan", 100),
+                ],
+            )}],
+        }
+        planning = self.query_planning_probe(small, "SELECT 1")
+        self.assertEqual(10_000, planning["maxEstimatedNestedLoopPairRows"])
+
+    def test_query_planning_guard_scales_literal_project_set_per_input(self):
+        generated = self.plan_node(
+            "ProjectSet",
+            1_000,
+            plans=[self.plan_node("Seq Scan", 2_000)],
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1_000,
+                plans=[generated, self.plan_node("Index Scan", 1)],
+            )}],
+        }
+
+        with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+            self.query_planning_probe(
+                row,
+                "SELECT generate_series(1, 100000) FROM leeds.rows",
+            )
+
+        planning = raised.exception.query_planning_probe
+        self.assertEqual(100_000, planning["maxProvenGeneratedRows"])
+        self.assertEqual(
+            200_000_000,
+            planning["maxEstimatedNestedLoopPairRows"],
+        )
+
+    def test_query_planning_guard_rejects_ordinary_pair_work(self):
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1_000,
+                plans=[
+                    self.plan_node("Seq Scan", 200_000),
+                    self.plan_node("Seq Scan", 1_000),
+                ],
+            )}],
+        }
+
+        with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+            self.query_planning_probe(row, "SELECT 1")
+
+        planning = raised.exception.query_planning_probe
+        self.assertEqual(0, planning["maxProvenGeneratedRows"])
+        self.assertEqual(
+            200_000_000,
+            planning["maxEstimatedNestedLoopPairRows"],
+        )
+
+    def test_query_planning_guard_honours_only_proven_hard_reducers(self):
+        generator = self.plan_node("Function Scan", 10)
+        aggregate = self.plan_node(
+            "Aggregate",
+            1,
+            plans=[generator],
+            Strategy="Plain",
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1,
+                plans=[aggregate, self.plan_node("Seq Scan", 2_000)],
+            )}],
+        }
+        planning = self.query_planning_probe(
+            row,
+            "SELECT value FROM generate_series(1, 100000) AS value",
+        )
+        self.assertEqual(2_000, planning["maxEstimatedNestedLoopPairRows"])
+
+        one_time_filtered = self.plan_node(
+            "Result",
+            1,
+            plans=[generator],
+            **{"One-Time Filter": "false"},
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1,
+                plans=[
+                    one_time_filtered,
+                    self.plan_node("Seq Scan", 2_000),
+                ],
+            )}],
+        }
+        planning = self.query_planning_probe(
+            row,
+            "SELECT value FROM generate_series(1, 100000) AS value",
+        )
+        self.assertEqual(2_000, planning["maxEstimatedNestedLoopPairRows"])
+
+        filtered = self.plan_node(
+            "Subquery Scan",
+            1,
+            plans=[generator],
+            Filter="value = 1",
+        )
+        grouped = self.plan_node(
+            "Aggregate",
+            1,
+            plans=[filtered],
+            Strategy="Hashed",
+        )
+        grouped = self.plan_node(
+            "Unique",
+            1,
+            plans=[self.plan_node("Group", 1, plans=[grouped])],
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                1,
+                plans=[grouped, self.plan_node("Seq Scan", 2_000)],
+            )}],
+        }
+        with self.assertRaises(DerivedLayerQueryTooExpensive) as raised:
+            self.query_planning_probe(
+                row,
+                "SELECT value FROM generate_series(1, 100000) AS value",
+            )
+        self.assertEqual(
+            200_000_000,
+            raised.exception.query_planning_probe[
+                "maxEstimatedNestedLoopPairRows"
+            ],
+        )
+
     def test_query_plan_guard_catches_work_hidden_by_small_aggregate(self):
         scan = {
             "Node Type": "Seq Scan",
@@ -712,6 +1014,13 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertLess(
             h3["estimatedScopeCells"], H3_SCOPE_MAX_ESTIMATED_CELLS,
         )
+        planning = result["queryPlanningProbe"]
+        self.assertEqual(
+            h3["estimatedExpandedCells"],
+            planning["maxProvenGeneratedRows"],
+        )
+        self.assertEqual(0, planning["nestedLoopCount"])
+        self.assertEqual(0, planning["maxEstimatedNestedLoopPairRows"])
         executable = cursor.execute.call_args_list[-1].args[0].as_string(None)
         self.assertIn('WITH "_mapp_h3_scope" ("geom_4326")', executable)
 
@@ -934,6 +1243,15 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
 
         capabilities = store.capabilities()
         query_guard = capabilities["queryGuard"]
+
+        self.assertEqual({
+            "version": "1",
+            "method": QUERY_PLANNING_METHOD,
+            "maxNestedLoopPairRows": (
+                QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS
+            ),
+            "reasonCodes": ["nested_loop_pair_work"],
+        }, capabilities["queryPlanning"])
 
         self.assertEqual({
             "method",
@@ -1273,6 +1591,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertEqual(scope, insert.args[1][7].obj)
         self.assertEqual(scope, result["spatialScope"])
         self.assertEqual(250, result["queryPlanProbe"]["estimatedFinalRows"])
+        self.assertIn("queryPlanningProbe", result)
         self.assertIn(
             "EXPLAIN",
             "\n".join(
@@ -1640,7 +1959,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertEqual(28_800, raised.exception.probe["estimatedBytes"])
         self.assertIn("after population and indexing", str(raised.exception))
 
-    def test_materialized_spatial_indexes_cover_4326_3857_and_geography(self):
+    def test_materialized_spatial_indexes_cover_canonical_projections_and_geography(self):
         cursor = MagicMock()
         definition = validate_definition(self.valid(
             kind="materialized",
@@ -1657,10 +1976,14 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             call.args[0].as_string(None)
             for call in cursor.execute.call_args_list
         ]
-        self.assertEqual(3, len(index_names))
+        self.assertEqual(4, len(index_names))
         self.assertTrue(any('gist ("geom_3857")' in item for item in statements))
         self.assertTrue(any(
             'ST_Transform("geom_3857", 3857)' in item
+            for item in statements
+        ))
+        self.assertTrue(any(
+            'ST_Transform("geom_3857", 27700)' in item
             for item in statements
         ))
         self.assertTrue(any(
@@ -1910,6 +2233,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         ))
 
         self.assertEqual(9, result["queryPlanProbe"]["estimatedFinalRows"])
+        self.assertIn("queryPlanningProbe", result)
         self.assertNotIn("materializationProbe", result)
         self.assertIn("EXPLAIN (FORMAT JSON)", str(
             cursor.execute.call_args_list[-1].args[0]
@@ -2207,6 +2531,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
 
         self.assertEqual(480, probe["materializationProbe"]["estimatedBytes"])
         self.assertEqual(10, probe["queryPlanProbe"]["estimatedFinalRows"])
+        self.assertIn("queryPlanningProbe", probe)
         explain = next(
             call for call in cursor.execute.call_args_list
             if "EXPLAIN (FORMAT JSON)" in str(call.args[0])

@@ -142,3 +142,5 @@ ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
 
 COMMIT;
 SQL
+
+sh /usr/local/bin/mapp-prepare-spatial-indexes ensure

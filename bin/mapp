@@ -28,7 +28,7 @@ usage() {
     "  census-etl   load the reviewed England Census 2021 OA dataset" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-data --confirm remove the bundled database and reload configured ETL data" \
-    "  upgrade-derived install H3 and derived-layer roles into an existing bundled database" \
+    "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
     "  all          start bundled mode, load bundled ETL data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
@@ -402,6 +402,15 @@ prepare_spatial_indexes() {
   "${compose[@]}" exec -T db sh /usr/local/bin/mapp-prepare-spatial-indexes
 }
 
+ensure_bundled_database_upgraded() {
+  if [[ "${database_mode}" != "bundled" ]]; then
+    return 0
+  fi
+  run_with_buildkit_lease_retry \
+    "${compose[@]}" up --detach --build --no-deps --wait db
+  "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
+}
+
 run_all_etl() {
   run_sample_etl
   prepare_spatial_indexes
@@ -471,6 +480,7 @@ case "${1:-}" in
   up|serve)
     case "${2:-}" in
       "")
+        ensure_bundled_database_upgraded
         run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
         ;;
       --force-recreate)
@@ -478,6 +488,7 @@ case "${1:-}" in
           printf 'Usage: ./bin/mapp %s [--force-recreate]\n' "$1" >&2
           exit 2
         fi
+        ensure_bundled_database_upgraded
         run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --force-recreate "${runtime_services[@]}"
         ;;
       *)
@@ -488,6 +499,7 @@ case "${1:-}" in
     ensure_caddy_bindings
     ;;
   config-ui)
+    ensure_bundled_database_upgraded
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     ensure_caddy_bindings
     ;;
@@ -503,6 +515,7 @@ case "${1:-}" in
       printf './bin/mapp etl is bundled data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
       exit 2
     fi
+    ensure_bundled_database_upgraded
     if [[ -n "${2:-}" ]]; then
       run_with_buildkit_lease_retry "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
       prepare_spatial_indexes
@@ -519,6 +532,7 @@ case "${1:-}" in
       printf 'Usage: ./bin/mapp census-etl\n' >&2
       exit 2
     fi
+    ensure_bundled_database_upgraded
     run_census_etl
     prepare_spatial_indexes
     ;;
@@ -650,13 +664,13 @@ case "${1:-}" in
     run_with_buildkit_lease_retry "${compose[@]}" build db
     "${compose[@]}" up --detach --no-deps --wait db
     "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
-    prepare_spatial_indexes
     ;;
   all)
     if [[ "${database_mode}" != "bundled" ]]; then
       printf './bin/mapp all includes bundled ETL data and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
       exit 2
     fi
+    ensure_bundled_database_upgraded
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
     run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"

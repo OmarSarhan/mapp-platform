@@ -65,10 +65,14 @@ headroom, and monitor the database volume during the run. Container `/tmp`
 capacity does not replace database-volume capacity.
 
 After bundled ETL publication, MAPP idempotently prepares native, EPSG:4326,
-EPSG:3857, and safe geometry/geography cross-cast GiST indexes and runs
-`ANALYZE`. Include this index set in capacity estimates. Existing bundled
-volumes receive the same preparation through `./bin/mapp upgrade-derived`, and
-`./bin/mapp verify` then audits it without changing database state.
+EPSG:3857, EPSG:27700, and safe geometry/geography cross-cast GiST indexes and
+runs `ANALYZE`. Include this index set in capacity estimates. Existing bundled
+volumes receive the complete idempotent role, H3, and spatial-index upgrade
+automatically before `up`, `serve`, `config-ui`, `etl`, `census-etl`, or `all`
+starts application/database work. The automatic index ensure analyzes a
+relation only when it creates a missing index. `./bin/mapp upgrade-derived`
+remains the explicit maintenance entry point, and `./bin/mapp verify` audits
+the result without changing database state.
 
 The final Census publication is atomic and preserves the stable table OID, but
 it uses `TRUNCATE` and a complete replacement insert while holding an

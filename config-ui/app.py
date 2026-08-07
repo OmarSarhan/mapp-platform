@@ -1605,6 +1605,7 @@ COMPUTE_QUERY_REASON_CODES = frozenset({
     "intermediate_bytes",
     "intermediate_rows",
     "join_expansion",
+    "nested_loop_pair_work",
     "plan_depth",
     "plan_nodes",
     "planned_workers",
@@ -1930,6 +1931,12 @@ def derived_query_reason_action(code: str) -> str:
         return "Rename the reserved query alias, CTE, or relation."
     if code == "natural_join":
         return "Replace NATURAL JOIN with an explicit bounded join condition."
+    if code == "nested_loop_pair_work":
+        return (
+            "Rewrite the join so each outer row reaches a selective "
+            "parameterized or indexed input; keep whole-input aggregates and "
+            "windows outside that row-matching path."
+        )
     return (
         "Reduce output rows, joins, generated rows, and intermediate work; "
         "add selective predicates or source indexes where appropriate."
@@ -1976,6 +1983,7 @@ def derived_query_too_expensive_error(
             "view does not bypass this guard."
         )
     message = lead + (" " + details if details else "")
+    planning_probe = getattr(exc, "query_planning_probe", None)
     return derived_blocked_error(
         code=code,
         message=message,
@@ -1985,6 +1993,11 @@ def derived_query_too_expensive_error(
         name=exc.name,
         probe=exc.probe,
         reasons=reasons,
+        **(
+            {"queryPlanningProbe": planning_probe}
+            if isinstance(planning_probe, dict)
+            else {}
+        ),
     )
 
 
@@ -4665,6 +4678,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "schema": "derived_layers",
                         "kinds": ["view", "materialized"],
                         "spatialScopeTypes": ["workspace-map-extent"],
+                        "queryPlanning": (
+                            DerivedLayerStore.query_planning_capability()
+                        ),
                         "h3Available": False,
                         "h3Readiness": {
                             "method": "postgresql-catalog-and-execution",
