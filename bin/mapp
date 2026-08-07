@@ -389,6 +389,64 @@ run_all_etl() {
   prepare_spatial_indexes
 }
 
+edge_bindings() {
+  local source="$1"
+  python3 -c '
+import json
+import sys
+
+source = sys.argv[1]
+payload = json.load(sys.stdin)
+bindings = []
+if source == "compose":
+    for port in payload["services"]["caddy"].get("ports", []):
+        protocol = port.get("protocol", "tcp")
+        host_ip = port.get("host_ip") or "0.0.0.0"
+        bindings.append(
+            "{}:{}->{}/{}".format(
+                host_ip, port["published"], port["target"], protocol
+            )
+        )
+else:
+    for container in payload:
+        for target, published in container["NetworkSettings"]["Ports"].items():
+            for binding in published or []:
+                bindings.append(
+                    "{}:{}->{}".format(
+                        binding["HostIp"], binding["HostPort"], target
+                    )
+                )
+print("\n".join(sorted(bindings)))
+' "${source}"
+}
+
+ensure_caddy_bindings() {
+  local expected actual container_id
+  expected="$("${compose[@]}" config --format json | edge_bindings compose)"
+  container_id="$("${compose[@]}" ps --quiet caddy)"
+  if [[ -z "${container_id}" ]]; then
+    printf 'Caddy did not start, so its published edge bindings could not be verified.\n' >&2
+    return 1
+  fi
+  actual="$(docker inspect "${container_id}" | edge_bindings inspect)"
+  if [[ "${actual}" == "${expected}" ]]; then
+    return 0
+  fi
+
+  printf '%s\n' \
+    'The running Caddy port bindings differ from the reviewed Compose configuration.' \
+    'Recreating only Caddy to apply the configured edge address and ports.' >&2
+  "${compose[@]}" up --detach --no-deps --force-recreate caddy
+
+  container_id="$("${compose[@]}" ps --quiet caddy)"
+  actual="$(docker inspect "${container_id}" | edge_bindings inspect)"
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'Caddy port bindings still differ after recreation. Expected:\n%s\nActual:\n%s\n' \
+      "${expected}" "${actual}" >&2
+    return 1
+  fi
+}
+
 case "${1:-}" in
   up|serve)
     case "${2:-}" in
@@ -407,9 +465,11 @@ case "${1:-}" in
         exit 2
         ;;
     esac
+    ensure_caddy_bindings
     ;;
   config-ui)
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    ensure_caddy_bindings
     ;;
   config-ui-down)
     "${compose[@]}" rm --stop --force config-ui

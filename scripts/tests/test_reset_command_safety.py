@@ -115,6 +115,22 @@ class ResetCommandSafetyTests(unittest.TestCase):
             self.script,
         )
 
+    def test_runtime_start_repairs_stale_edge_port_bindings(self) -> None:
+        self.assertIn("ensure_caddy_bindings()", self.script)
+        self.assertIn(
+            'config --format json | edge_bindings compose',
+            self.script,
+        )
+        self.assertIn(
+            'up --detach --no-deps --force-recreate caddy',
+            self.script,
+        )
+        self.assertIn(
+            "Caddy port bindings still differ after recreation",
+            self.script,
+        )
+        self.assertGreaterEqual(self.script.count("ensure_caddy_bindings"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
