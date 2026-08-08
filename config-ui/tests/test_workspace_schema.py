@@ -27,6 +27,20 @@ class WorkspaceValidationTests(unittest.TestCase):
     def test_accepts_supported_workspace(self):
         self.assertEqual(validate_workspace(valid_workspace(), {"MAPP"}), [])
 
+    def test_rejects_layer_keys_xyz_cannot_register(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"].pop("Places")
+        data["locale"]["layers"]["Passport holders — United Kingdom"] = layer
+
+        errors = validate_workspace(data, {"MAPP"})
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(
+            errors[0]["path"],
+            "locale.layers.Passport holders — United Kingdom",
+        )
+        self.assertIn("use name for display punctuation", errors[0]["message"])
+
     def test_accepts_native_templates_gazetteer_and_plugins(self):
         data = valid_workspace()
         data["templates"] = {
@@ -92,10 +106,26 @@ class WorkspaceValidationTests(unittest.TestCase):
         self.assertIn("locale.consent.text", paths)
         self.assertIn("locale.link_button.icon_name", paths)
 
-    def test_accepts_non_empty_xyz_layer_group_and_rejects_empty_group(self):
+    def test_validates_xyz_layer_group_and_stylesheet_class_list(self):
         data = valid_workspace()
         data["locale"]["layers"]["Places"]["group"] = "Reference"
+        data["locale"]["layers"]["Places"]["groupClassList"] = "reference-blue"
         self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+        data["locale"]["layers"]["Places"]["groupClassList"] = "#123456"
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.groupClassList", paths)
+
+        data["locale"]["layers"]["Places"]["groupClassList"] = " "
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.groupClassList", paths)
+
+        data["locale"]["layers"]["Places"]["groupClassList"] = "reference-blue"
+        data["locale"]["layers"]["Places"].pop("group")
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.groupClassList", paths)
+
+        data["locale"]["layers"]["Places"].pop("groupClassList")
         data["locale"]["layers"]["Places"]["group"] = " "
         paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
         self.assertIn("locale.layers.Places.group", paths)
@@ -137,6 +167,16 @@ class WorkspaceValidationTests(unittest.TestCase):
             },
         ])
         self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+    def test_validates_string_default_layer_filter_as_read_only_predicate(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["filter"] = {"default": "population_count > 0"}
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+        layer["filter"]["default"] = "true; DELETE FROM public.places"
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.layers.Places.filter.default", paths)
 
     def test_rejects_invalid_filter_type_and_unknown_included_field(self):
         data = valid_workspace()

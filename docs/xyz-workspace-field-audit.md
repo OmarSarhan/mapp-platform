@@ -35,7 +35,7 @@ commit `a6f03c07dd7aaae2e9ab04087143ee0400e15cb9`. The machine-readable result i
 | Themes | basic, categorized, graduated, distributed; fields, categories, category styles/icons, breaks and distributions |
 | Icons | every built-in v4.23.4 SVG symbol, custom URL/SVG/template sources, symbol-specific colours, letter, scale and anchor |
 | Feature information | the complete active and legacy type registry plus field/query/key entries, display/edit flags, groups, JSON extraction, fallback/skip behavior, formatting, dependencies, tooltips, tabs and links |
-| Layer list grouping | per-layer `group`, `groupClassList`, and `groupmeta`; XYZ creates a drawer for each shared `group` value |
+| Layer list grouping | per-layer `group`, `groupClassList`, and `groupmeta`; XYZ creates a drawer for each shared `group` value and copies CSS classes from the first member that creates it |
 
 ## Template and plugin-extension follow-up
 

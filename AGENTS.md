@@ -75,6 +75,12 @@ External browser plugins are trusted, source-controlled deployment inputs under
 isolated candidate-preview evidence. Never import plugin code during discovery
 or offer executable-code upload through the dashboard.
 
+XYZ layer-group colour is a stylesheet concern exposed through the first
+grouped layer's `groupClassList`. Keep the backend schema and rules explicit
+that this is a verified deployed class list, not a literal colour or a
+`groupColor`/`groupColour` workspace property. Operators should apply the same
+class list to every member and verify the drawer in candidate evidence.
+
 ## Semantic invariants
 
 Generated relation and field facts are lifecycle-owned; only curated

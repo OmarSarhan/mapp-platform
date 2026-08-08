@@ -730,6 +730,29 @@ class ControlStore:
             _atomic_json(self.operations / f"{operation_id}.json", operation)
             return operation
 
+    def update_operation_progress(
+        self,
+        operation_id: str,
+        *,
+        stage: str,
+        diagnostics: dict | None = None,
+    ) -> dict:
+        """Persist a heartbeat for running work without changing its outcome."""
+        if not isinstance(stage, str) or not stage:
+            raise ValueError("Operation progress requires a stage.")
+        with self._locked():
+            operation = self.read_operation(operation_id)
+            if operation.get("status") != "running":
+                return operation
+            operation.update({
+                "stage": stage,
+                "updated": iso(),
+            })
+            if diagnostics is not None:
+                operation["diagnostics"] = diagnostics
+            _atomic_json(self.operations / f"{operation_id}.json", operation)
+            return operation
+
     def request_operation_cancellation(self, operation_id: str) -> dict:
         """Record a cancellation request without claiming rollback yet."""
         with self._locked():

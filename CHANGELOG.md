@@ -8,6 +8,24 @@ first release.
 
 ### Fixed
 
+- Visual planning now applies a layer's validated `filter.default` to feature
+  count, extent, representative-feature selection, and focus bounds. Sparse
+  layers therefore focus a feature that XYZ can actually render, while an
+  empty effective dataset returns `visual.no_matching_features` before browser
+  execution.
+- Candidate visual evidence now rejects layer keys that pinned XYZ cannot
+  register and records configured candidate keys, resolved URL keys, group
+  membership, registered drawers, and the final active OpenLayers layer set.
+  A healthy page and canvas no longer pass when an explicitly requested
+  grouped child was omitted or left inactive.
+- Added stage-aware visual worker deadlines from Chromium launch through page
+  readiness, screenshot capture, artifact persistence, and durable result
+  persistence. Timed-out or crashed runs now retain structured diagnostics,
+  leave `running` terminally, release browser capacity, and cannot overwrite a
+  watchdog failure with a late result.
+- Documented and validated XYZ's native `groupClassList` styling contract for
+  layer-group drawers, including first-member precedence and the requirement
+  for a verified deployed stylesheet class rather than a literal colour.
 - Derived-layer create and replace now use the selected effective locale's
   configured north/east/south/west extent as the output scope instead of a
   smaller startup-view viewport; older workspaces without all four bounds keep

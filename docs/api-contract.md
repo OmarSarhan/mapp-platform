@@ -807,11 +807,37 @@ independently of that HTTP connection, and atomically writes the complete
 result/error envelope before the operation becomes terminal. A caller whose
 local wait expires can continue polling the same operation without restarting
 Chromium or losing its eventual report.
+Running visual operations persist stage heartbeats in `stage` and advance
+`updated`. Chromium launch, page readiness, screenshot capture, artifact
+persistence, and the complete background operation have independent bounded
+deadlines. A timeout becomes `failed` with `visual.run_timeout`,
+`visual.artifact_persistence_timeout`, `visual.browser_transport_timeout`, or
+the outer `visual.operation_timeout`; `failedStage`, the effective timeout,
+and bounded browser console/page/request diagnostics are retained when
+available. Browser crashes retain the same stage diagnostics. The runner
+bounds browser shutdown before releasing its concurrency slot, so a failed run
+cannot permanently reject later work. If a worker exits before its atomic
+terminal write is visible, the watchdog records
+`visual.result_persistence_failed`. A late worker completion cannot replace an
+already terminal watchdog result.
+Each browser report includes `activationDiagnostics`: configured candidate and
+server-resolved locale layer keys, URL-resolved keys, configured and rendered
+group membership, registered layer drawers, and the final active OpenLayers
+layer set. In focused mode every requested foreground/background key must be
+registered and active, with no unrequested active layer; otherwise the report
+fails even when the document returned HTTP 200 and contains a canvas.
 Only a pending, integrity-valid proposal whose original
 revision is still current is eligible; declined, applied, conflicted, corrupt,
 or superseded proposals are rejected. The request accepts visual `layer`,
 `locale`, bounded centre/zoom overrides, and viewport fields. It never accepts
 an arbitrary workspace.
+
+Automatic database-backed planning uses the layer's effective rendered
+dataset. Its validated `filter.default` predicate is applied before feature
+count, extent, representative-feature selection, and focus-bound calculation.
+If no matching non-null geometry remains, planning stops before Chromium with
+HTTP 422 and `code: "visual.no_matching_features"`, plus
+`defaultFilterApplied: true` when a fixed predicate was present.
 
 Proposal screenshots default to a square 1080×1080 viewport at 1× device scale
 and capture only that viewport, producing an exact 1080×1080 page image.

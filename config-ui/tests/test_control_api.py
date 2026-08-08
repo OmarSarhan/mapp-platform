@@ -11,6 +11,7 @@ from control_api import (
     CollectionPaginationError,
     RULES,
     VisualPlanningDatabaseError,
+    VisualPlanningNoMatchingFeatures,
     apply_operations,
     apply_visual_override,
     capabilities,
@@ -771,6 +772,17 @@ class ControlApiTests(unittest.TestCase):
         self.assertIn("higher values render above", layer_order["description"])
         self.assertIn("promoteDisplay", layer_order["remediation"])
 
+    def test_layer_group_colour_rule_uses_framework_class_semantics(self):
+        group_colour = next(
+            rule
+            for rule in RULES
+            if rule["id"] == "workspace.layer_group_colour"
+        )
+        self.assertIn("first grouped layer", group_colour["description"])
+        self.assertIn("groupClassList", group_colour["description"])
+        self.assertIn("same verified deployed class", group_colour["remediation"])
+        self.assertIn("hex colour", group_colour["remediation"])
+
     def test_examples_publish_optional_legend_and_viewport_count_operations(self):
         advertised = examples()
         legend = advertised["showLayerLegend"]
@@ -1314,3 +1326,71 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual("representative-feature", error.stage)
         self.assertEqual("centre-feature-selection", error.query_purpose)
         self.assertNotIn("private query detail", str(error))
+
+    def test_visual_plan_applies_default_filter_to_summary_and_feature(self):
+        workspace = self.database_visual_workspace()
+        workspace["locale"]["layers"]["Arrivals 1951-1960"]["filter"] = {
+            "default": "ts005_0017_count > 0",
+        }
+        summary_connection = MagicMock()
+        summary_connection.__enter__.return_value = summary_connection
+        summary_cursor = MagicMock()
+        summary_cursor.__enter__.return_value = summary_cursor
+        summary_cursor.fetchone.return_value = (
+            34, -200000, 7000000, -150000, 7100000, "ST_Polygon",
+        )
+        summary_connection.cursor.return_value = summary_cursor
+        feature_connection = MagicMock()
+        feature_connection.__enter__.return_value = feature_connection
+        feature_cursor = MagicMock()
+        feature_cursor.__enter__.return_value = feature_cursor
+        feature_cursor.fetchone.return_value = (
+            "891942c4313ffff", "ST_Polygon",
+            -180000, 7050000, -179000, 7051000, -1.55, 53.8,
+        )
+        feature_connection.cursor.return_value = feature_cursor
+
+        with patch(
+            "control_api.psycopg.connect",
+            side_effect=[summary_connection, feature_connection],
+        ):
+            plan = visual_plan(
+                workspace,
+                "Arrivals 1951-1960",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+            )
+
+        summary_query, summary_params = summary_cursor.execute.call_args_list[2].args
+        feature_query, feature_params = feature_cursor.execute.call_args_list[2].args
+        self.assertIn("ts005_0017_count > 0", summary_query.as_string(None))
+        self.assertIn("ts005_0017_count > 0", feature_query.as_string(None))
+        self.assertEqual([], summary_params)
+        self.assertEqual((-175000.0, 7050000.0), feature_params)
+        self.assertEqual(34, plan["featureCount"])
+        self.assertEqual("891942c4313ffff", plan["featureId"])
+        self.assertTrue(plan["defaultFilterApplied"])
+
+    def test_visual_plan_reports_no_matching_filtered_features(self):
+        workspace = self.database_visual_workspace()
+        workspace["locale"]["layers"]["Arrivals 1951-1960"]["filter"] = {
+            "default": "ts005_0017_count > 0",
+        }
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = (0, None, None, None, None, None)
+        connection.cursor.return_value = cursor
+
+        with (
+            patch("control_api.psycopg.connect", return_value=connection),
+            self.assertRaises(VisualPlanningNoMatchingFeatures) as raised,
+        ):
+            visual_plan(
+                workspace,
+                "Arrivals 1951-1960",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+            )
+
+        self.assertTrue(raised.exception.filter_applied)
+        self.assertIn("filter.default", str(raised.exception))

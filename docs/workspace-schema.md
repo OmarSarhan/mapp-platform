@@ -41,7 +41,12 @@ This is a flat layer map, not a nested folder structure. The dashboard exposes
 the value as **Layer folder** and groups its own navigation the same way.
 Clearing the field removes `group`. Advanced upstream properties
 `groupClassList` and `groupmeta` are preserved, but remain in Advanced layer
-JSON because they control CSS and trusted HTML respectively.
+JSON because they control CSS and trusted HTML respectively. XYZ copies
+`groupClassList` from the first layer that creates a group drawer. To colour a
+group, use a class already provided by the deployed map stylesheet and set the
+same class list on every member so composition or ordering cannot change the
+result. A hex colour is not a class, and XYZ has no native `groupColor` or
+`groupColour` property.
 
 Folder order is not map drawing order. A `group` only changes layer-list
 navigation; it does not create an OpenLayers group or a shared rendering
@@ -392,8 +397,9 @@ workspace
 | `locale.keyvalue_dictionary`, `layer.keyvalue_dictionary` | array | Native recursive value substitutions keyed by property name and current value, with `default` and language keys. |
 | `locale.svgTemplates` / `svg_templates` | object | SVG source map; the underscored spelling is the supported legacy alias. |
 | `locale.plugins[]`, `syncPlugins[]` | string arrays | Plugin modules to load, and plugin keys that must execute sequentially. |
-| `locale.layers.<key>` | object | Layer key used in URLs, hooks, and queries. |
+| `locale.layers.<key>` | object | Layer key used in URLs, hooks, and queries. The pinned XYZ route accepts only ASCII letters, numbers, spaces, colons, underscores, and hyphens. Put typographic punctuation in `layer.name`; an unsupported key is omitted before browser registration and cannot be activated by `layers=`. |
 | `layer.name` | string | Display label; defaults to the layer key. |
+| `layer.filter.default` | predicate string, filter object, or OR-array | Fixed server-side filter applied by XYZ and by visual planning. Predicate strings are validated as one read-only expression; planning counts, frames, and selects features only from matching rows. |
 
 ### Pinned plugin capabilities
 

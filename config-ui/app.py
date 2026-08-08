@@ -71,6 +71,7 @@ from control_plane import ControlStore, parse_time
 from control_api import (
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
     CollectionPaginationError, VisualPlanningDatabaseError,
+    VisualPlanningNoMatchingFeatures,
     apply_operations, capabilities, contract, examples, plugin_manifest,
     decode_position_cursor,
     effective_locales, enforce_collection_payload, is_probeable_database_layer,
@@ -159,6 +160,23 @@ except ValueError:
     ) from None
 if not 1 <= DERIVED_MAX_BACKGROUND_JOBS <= 4:
     raise RuntimeError("DERIVED_MAX_BACKGROUND_JOBS must be between 1 and 4.")
+try:
+    VISUAL_BROWSER_TIMEOUT_SECONDS = int(
+        os.environ.get("VISUAL_BROWSER_TIMEOUT_SECONDS", "90")
+    )
+    VISUAL_BACKGROUND_TIMEOUT_SECONDS = int(
+        os.environ.get("VISUAL_BACKGROUND_TIMEOUT_SECONDS", "300")
+    )
+except ValueError:
+    raise RuntimeError("Visual timeout settings must be whole seconds.") from None
+if not 10 <= VISUAL_BROWSER_TIMEOUT_SECONDS <= 180:
+    raise RuntimeError(
+        "VISUAL_BROWSER_TIMEOUT_SECONDS must be between 10 and 180."
+    )
+if not 30 <= VISUAL_BACKGROUND_TIMEOUT_SECONDS <= 600:
+    raise RuntimeError(
+        "VISUAL_BACKGROUND_TIMEOUT_SECONDS must be between 30 and 600."
+    )
 SAVE_LOCK = threading.Lock()
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
@@ -3102,6 +3120,12 @@ def proposal_group_preview(
                 )
             ],
             "requestedLayerPresent": requested_present,
+            "configuredLayerKeys": list(layers),
+            "groupMembership": {
+                key: layer.get("group")
+                for key, layer in layers.items()
+                if isinstance(key, str) and isinstance(layer, dict)
+            },
         }
 
     return {
@@ -3162,6 +3186,14 @@ def plugin_preview_checks(workspace: dict, locale_key: str, layers: list[str]) -
 def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
                        target_url: str) -> tuple[int, dict]:
     panels = visual_panels(payload)
+    metadata = payload.get("metadata")
+    operation_id = (
+        metadata.get("operationId")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if isinstance(operation_id, str):
+        update_visual_operation_progress(operation_id, "browser-execution")
     runner_payload = json.dumps(
         {
             "url": target_url,
@@ -3177,8 +3209,9 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             "expectedHoverText": expected_hover_text(payload),
             "panels": panels,
             "expectedPanelText": payload.get("expectedPanelText", []),
-            "metadata": payload.get("metadata"),
+            "metadata": metadata,
             "pluginChecks": plan.get("pluginChecks", []),
+            "runTimeout": VISUAL_BROWSER_TIMEOUT_SECONDS * 1000,
         },
         allow_nan=False,
     ).encode()
@@ -3190,21 +3223,61 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
             data=runner_payload,
             headers={"Content-Type": "application/json"},
             method="POST",
-        ), timeout=120) as response:
-            return HTTPStatus.OK, json.load(response)
+        ), timeout=VISUAL_BROWSER_TIMEOUT_SECONDS + 15) as response:
+            result = json.load(response)
+            if isinstance(operation_id, str):
+                update_visual_operation_progress(
+                    operation_id,
+                    "artifact-binding",
+                    result.get("diagnostics")
+                    if isinstance(result, dict)
+                    else None,
+                )
+            return HTTPStatus.OK, result
     except HTTPError as exc:
         try:
             result = strict_json_loads(exc.read())
         except (OSError, UnicodeError, ValueError):
             result = None
         if isinstance(result, dict):
+            if isinstance(operation_id, str):
+                update_visual_operation_progress(
+                    operation_id,
+                    result.get("failedStage") or "browser-response",
+                    result.get("diagnostics"),
+                )
             return exc.code, result
         return HTTPStatus.BAD_GATEWAY, {
             "error": f"Browser validation service returned HTTP {exc.code}."
         }
+    except TimeoutError as exc:
+        diagnostics = {
+            "exceptionType": type(exc).__name__,
+            "browserRunnerUrl": "configured-internal-runner",
+        }
+        if isinstance(operation_id, str):
+            update_visual_operation_progress(
+                operation_id, "browser-transport", diagnostics
+            )
+        return HTTPStatus.GATEWAY_TIMEOUT, {
+            "error": "Browser validation did not return before its deadline.",
+            "code": "visual.browser_transport_timeout",
+            "failedStage": "browser-transport",
+            "diagnostics": diagnostics,
+            "metadata": metadata,
+        }
     except Exception as exc:
+        diagnostics = {"exceptionType": type(exc).__name__}
+        if isinstance(operation_id, str):
+            update_visual_operation_progress(
+                operation_id, "browser-transport", diagnostics
+            )
         return HTTPStatus.BAD_GATEWAY, {
-            "error": f"Browser validation failed: {exc}"
+            "error": f"Browser validation failed: {exc}",
+            "code": "visual.browser_transport_failed",
+            "failedStage": "browser-transport",
+            "diagnostics": diagnostics,
+            "metadata": metadata,
         }
 
 
@@ -3225,6 +3298,19 @@ def visual_failure_code(status: int) -> str:
     if status in {HTTPStatus.GATEWAY_TIMEOUT, HTTPStatus.REQUEST_TIMEOUT}:
         return "visual.upstream_timeout"
     return "visual.failed"
+
+
+def visual_failure_error(status: int, result: dict, message: str) -> dict:
+    error = {
+        "code": result.get("code") or visual_failure_code(status),
+        "message": message,
+    }
+    for key in ("failedStage", "timeoutMilliseconds", "diagnostics"):
+        if result.get(key) is not None:
+            error[key] = result[key]
+    if result.get("diagnosis") is not None:
+        error["diagnosis"] = result["diagnosis"]
+    return error
 
 
 def visual_panels(payload: dict) -> list[str]:
@@ -4104,6 +4190,108 @@ def annotated(errors):
 _VISUAL_BACKGROUND_OPERATION = object()
 
 
+def update_visual_operation_progress(
+    operation_id: str,
+    stage: str,
+    diagnostics: dict | None = None,
+) -> None:
+    """Best-effort heartbeat for a durable visual operation."""
+    try:
+        CONTROL.update_operation_progress(
+            operation_id,
+            stage=stage,
+            diagnostics=diagnostics,
+        )
+    except (FileNotFoundError, OSError, ValueError):
+        # Progress is advisory. Terminal persistence below remains authoritative.
+        return
+
+
+def finish_visual_operation(
+    operation_id: str,
+    *,
+    status: str,
+    result: dict | None = None,
+    error: dict | None = None,
+) -> dict:
+    """Persist a terminal visual result, retrying transient atomic-write errors."""
+    update_visual_operation_progress(operation_id, "result-persistence")
+    last_error: OSError | None = None
+    for attempt in range(3):
+        try:
+            return CONTROL.finish_operation(
+                operation_id,
+                status=status,
+                result=result,
+                error=error,
+            )
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
+def watch_visual_background(
+    operation_id: str,
+    worker: threading.Thread,
+    timeout_seconds: float,
+) -> None:
+    """Force a durable terminal state if a visual worker misses its deadline."""
+    worker.join(timeout_seconds)
+    timed_out = worker.is_alive()
+    try:
+        operation = CONTROL.read_operation(operation_id)
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    if operation.get("status") != "running":
+        return
+    stage = operation.get("stage") or "background-execution"
+    diagnostics = operation.get("diagnostics")
+    terminal_error = {
+        "code": (
+            "visual.operation_timeout"
+            if timed_out
+            else "visual.result_persistence_failed"
+        ),
+        "message": (
+            (
+                "Visual validation exceeded its end-to-end deadline while "
+                f"running stage '{stage}'."
+            )
+            if timed_out
+            else (
+                "The visual worker exited without persisting a terminal "
+                "result."
+            )
+        ),
+        "failedStage": stage,
+        **({"timeoutSeconds": timeout_seconds} if timed_out else {}),
+        **({"diagnostics": diagnostics} if diagnostics is not None else {}),
+    }
+    try:
+        finish_visual_operation(
+            operation_id,
+            status="failed",
+            result={
+                "operationId": operation_id,
+                "timedOut": timed_out,
+                "failedStage": stage,
+                **(
+                    {"diagnostics": diagnostics}
+                    if diagnostics is not None
+                    else {}
+                ),
+            },
+            error=terminal_error,
+        )
+    except OSError:
+        # A permanently unavailable operation store cannot serve status either;
+        # a transient failure was already retried by finish_visual_operation.
+        return
+
+
 def run_visual_background(
     request_path: str,
     payload: dict,
@@ -4113,6 +4301,7 @@ def run_visual_background(
     operation_id: str,
 ) -> None:
     """Replay one visual request after returning its durable operation ID."""
+    update_visual_operation_progress(operation_id, "request-dispatch")
     responses: list[tuple[int, dict]] = []
     handler = object.__new__(Handler)
     handler.path = request_path
@@ -4148,7 +4337,7 @@ def run_visual_background(
     result = {
         key: value for key, value in response.items() if key != "operation"
     }
-    CONTROL.finish_operation(
+    finish_visual_operation(
         operation_id,
         status=(
             "failed"
@@ -4177,7 +4366,10 @@ def start_visual_background(
 ) -> dict:
     operation = CONTROL.create_operation(kind, actor, target)
     try:
-        threading.Thread(
+        operation = CONTROL.update_operation_progress(
+            operation["id"], stage="accepted"
+        )
+        worker = threading.Thread(
             target=run_visual_background,
             args=(
                 request_path,
@@ -4189,9 +4381,20 @@ def start_visual_background(
             ),
             name=f"visual-{operation['id'][:8]}",
             daemon=True,
+        )
+        worker.start()
+        threading.Thread(
+            target=watch_visual_background,
+            args=(
+                operation["id"],
+                worker,
+                VISUAL_BACKGROUND_TIMEOUT_SECONDS,
+            ),
+            name=f"visual-watchdog-{operation['id'][:8]}",
+            daemon=True,
         ).start()
     except Exception:
-        CONTROL.finish_operation(
+        finish_visual_operation(
             operation["id"],
             status="failed",
             error={
@@ -6425,6 +6628,14 @@ class Handler(SimpleHTTPRequestHandler):
                     "requestedLayerDeleted": not group_preview[
                         "candidate"
                     ]["requestedLayerPresent"],
+                    "candidateLayerDiagnostics": {
+                        "configuredLayerKeys": group_preview[
+                            "candidate"
+                        ]["configuredLayerKeys"],
+                        "groupMembership": group_preview[
+                            "candidate"
+                        ]["groupMembership"],
+                    },
                     "evidenceApplicability": {
                         side: group_preview[side]["requestedLayerPresent"]
                         for side in ("original", "candidate")
@@ -6588,6 +6799,9 @@ class Handler(SimpleHTTPRequestHandler):
                     # Keep the isolated workspace pinned throughout the
                     # original/candidate comparison so another proposal cannot
                     # replace either side while Chromium is rendering it.
+                    update_visual_operation_progress(
+                        operation["id"], "preview-lock"
+                    )
                     with PREVIEW_LOCK:
                         original_status = None
                         original_result = None
@@ -6615,6 +6829,9 @@ class Handler(SimpleHTTPRequestHandler):
                                 and "hover" not in original_render_plan
                             ):
                                 original_render_payload["hover"] = False
+                            update_visual_operation_progress(
+                                operation["id"], "original-page-readiness"
+                            )
                             original_preview = prepare_original_preview(proposal)
                             original_status, original_result = run_browser_visual(
                                 group_preview["original"]["renderLayer"],
@@ -6622,6 +6839,9 @@ class Handler(SimpleHTTPRequestHandler):
                                 original_render_payload,
                                 target_url=target_url,
                             )
+                        update_visual_operation_progress(
+                            operation["id"], "candidate-page-readiness"
+                        )
                         candidate_preview = prepare_candidate_preview(proposal)
                         candidate_render_payload = {
                             **render_payload,
@@ -6742,7 +6962,8 @@ class Handler(SimpleHTTPRequestHandler):
                                         candidate_artifacts.get(key)
                                     ),
                                 })
-                            statuses = {original_status, status}
+                            candidate_status = status
+                            statuses = {original_status, candidate_status}
                             status = (
                                 HTTPStatus.OK
                                 if statuses == {HTTPStatus.OK}
@@ -6765,6 +6986,14 @@ class Handler(SimpleHTTPRequestHandler):
                                 )
                             ):
                                 status = HTTPStatus.UNPROCESSABLE_ENTITY
+                            failure_result = next((
+                                side_result
+                                for side_status, side_result in (
+                                    (candidate_status, candidate_result),
+                                    (original_status, original_result),
+                                )
+                                if side_status != HTTPStatus.OK
+                            ), {})
                             result = {
                                 "runId": candidate_result.get("runId"),
                                 "passed": status == HTTPStatus.OK,
@@ -6777,6 +7006,16 @@ class Handler(SimpleHTTPRequestHandler):
                                     )
                                     if side_result.get("error")
                                 ), None),
+                                **{
+                                    key: failure_result[key]
+                                    for key in (
+                                        "code",
+                                        "failedStage",
+                                        "timeoutMilliseconds",
+                                        "diagnostics",
+                                    )
+                                    if failure_result.get(key) is not None
+                                },
                                 "comparison": {
                                     "before": "original",
                                     "after": "candidate",
@@ -6813,7 +7052,7 @@ class Handler(SimpleHTTPRequestHandler):
                         result = candidate_result
                         preview = candidate_preview
                 except FileExistsError as exc:
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="failed",
                         error={"code": "visual.plugin_catalogue_stale", "message": str(exc)},
@@ -6825,7 +7064,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 except TimeoutError as exc:
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="failed",
                         error={"code": "visual.preview_timeout", "message": str(exc)},
@@ -6837,7 +7076,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 except Exception as exc:
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="indeterminate",
                         error={
@@ -6863,7 +7102,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "plan": plan,
                         "preview": preview,
                     }
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="failed",
                         result=partial_response,
@@ -6894,7 +7133,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "preview": preview,
                         "visual": result,
                     }
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="failed",
                         result=partial_response,
@@ -6919,18 +7158,16 @@ class Handler(SimpleHTTPRequestHandler):
                     response["error"] = "Browser validation did not pass."
                 elif status != HTTPStatus.OK:
                     response["error"] = result.get("error", "Browser validation failed.")
-                operation = CONTROL.finish_operation(
+                operation = finish_visual_operation(
                     operation["id"],
                     status="succeeded" if status == HTTPStatus.OK else "failed",
                     result=response,
                     error=(
                         None
                         if status == HTTPStatus.OK
-                        else {
-                            "code": visual_failure_code(status),
-                            "message": response["error"],
-                            "diagnosis": result.get("diagnosis"),
-                        }
+                        else visual_failure_error(
+                            status, result, response["error"]
+                        )
                     ),
                 )
                 CONTROL.audit(
@@ -7122,16 +7359,20 @@ class Handler(SimpleHTTPRequestHandler):
                         "hover": requested_hover(payload),
                         "expectedHoverText": expected_hover_text(payload),
                         "metadata": binding,
+                        "runTimeout": VISUAL_BROWSER_TIMEOUT_SECONDS * 1000,
                     },
                     allow_nan=False,
                 ).encode()
                 try:
+                    update_visual_operation_progress(
+                        operation["id"], "browser-execution"
+                    )
                     with urlopen(Request(
                         os.environ.get("BROWSER_RUNNER_URL", "http://browser-runner:8080/run"),
                         data=runner_payload,
                         headers={"Content-Type": "application/json"},
                         method="POST",
-                    ), timeout=120) as response:
+                    ), timeout=VISUAL_BROWSER_TIMEOUT_SECONDS + 15) as response:
                         result = json.load(response)
                     if (
                         browser_result_has_evidence(result)
@@ -7143,7 +7384,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "plan": plan,
                             "visual": result,
                         }
-                        operation = CONTROL.finish_operation(
+                        operation = finish_visual_operation(
                             operation["id"],
                             status="failed",
                             result=response_payload,
@@ -7161,7 +7402,7 @@ class Handler(SimpleHTTPRequestHandler):
                         return
                     CONTROL.audit("visual.completed", actor=actor, remote=self._remote(), details={"layer": layer_key, "runId": result.get("runId"), "passed": result.get("passed")})
                     response_payload = {**binding, "plan": plan, "visual": result}
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="succeeded",
                         result=response_payload,
@@ -7182,7 +7423,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "plan": plan,
                             "visual": result,
                         }
-                        operation = CONTROL.finish_operation(
+                        operation = finish_visual_operation(
                             operation["id"],
                             status="failed",
                             result=response_payload,
@@ -7215,15 +7456,15 @@ class Handler(SimpleHTTPRequestHandler):
                             "plan": plan,
                             "visual": result,
                         }
-                        operation = CONTROL.finish_operation(
+                        operation = finish_visual_operation(
                             operation["id"],
                             status="failed",
                             result=response_payload,
-                            error={
-                                "code": "visual.failed",
-                                "message": "Browser validation did not pass.",
-                                "diagnosis": result.get("diagnosis"),
-                            },
+                            error=visual_failure_error(
+                                exc.code,
+                                result,
+                                "Browser validation did not pass.",
+                            ),
                         )
                         self._json(
                             HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -7243,7 +7484,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "plan": plan,
                             **({"visual": result} if isinstance(result, dict) else {}),
                         }
-                        operation = CONTROL.finish_operation(
+                        operation = finish_visual_operation(
                             operation["id"],
                             status="failed",
                             result=response_payload,
@@ -7270,29 +7511,62 @@ class Handler(SimpleHTTPRequestHandler):
                             "plan": plan,
                             **({"visual": result} if isinstance(result, dict) else {}),
                         }
-                        operation = CONTROL.finish_operation(
+                        operation = finish_visual_operation(
                             operation["id"],
                             status="failed",
                             result=response_payload,
-                            error={
-                                "code": "visual.upstream",
-                                "message": f"Browser runner returned HTTP {exc.code}.",
-                            },
+                            error=visual_failure_error(
+                                exc.code,
+                                result if isinstance(result, dict) else {},
+                                response_payload["error"],
+                            ),
                         )
                         self._json(
-                            HTTPStatus.BAD_GATEWAY,
+                            (
+                                HTTPStatus.GATEWAY_TIMEOUT
+                                if exc.code in {
+                                    HTTPStatus.GATEWAY_TIMEOUT,
+                                    HTTPStatus.REQUEST_TIMEOUT,
+                                }
+                                else HTTPStatus.BAD_GATEWAY
+                            ),
                             {
                                 **response_payload,
                                 "operation": operation,
                             },
                         )
+                except TimeoutError as exc:
+                    diagnostics = {"exceptionType": type(exc).__name__}
+                    response_payload = {
+                        **binding,
+                        "error": (
+                            "Browser validation did not return before its "
+                            "deadline."
+                        ),
+                        "plan": plan,
+                    }
+                    operation = finish_visual_operation(
+                        operation["id"],
+                        status="failed",
+                        result=response_payload,
+                        error={
+                            "code": "visual.browser_transport_timeout",
+                            "message": response_payload["error"],
+                            "failedStage": "browser-transport",
+                            "diagnostics": diagnostics,
+                        },
+                    )
+                    self._json(HTTPStatus.GATEWAY_TIMEOUT, {
+                        **response_payload,
+                        "operation": operation,
+                    })
                 except Exception as exc:
                     response_payload = {
                         **binding,
                         "error": f"Browser validation failed: {exc}",
                         "plan": plan,
                     }
-                    operation = CONTROL.finish_operation(
+                    operation = finish_visual_operation(
                         operation["id"],
                         status="failed",
                         result=response_payload,
@@ -7846,6 +8120,14 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             else:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except VisualPlanningNoMatchingFeatures as exc:
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                "error": str(exc),
+                "code": exc.code,
+                "planningStage": "layer-summary",
+                "queryPurpose": "filtered-feature-count-and-extent",
+                "defaultFilterApplied": exc.filter_applied,
+            })
         except ValueError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,

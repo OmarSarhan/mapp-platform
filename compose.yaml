@@ -116,6 +116,8 @@ services:
       BROWSER_RUNNER_URL: http://browser-runner:8080/run
       BROWSER_XYZ_URL: http://caddy:8081
       BROWSER_PREVIEW_XYZ_URL: http://xyz-preview:3000
+      VISUAL_BROWSER_TIMEOUT_SECONDS: ${VISUAL_BROWSER_TIMEOUT_SECONDS:-90}
+      VISUAL_BACKGROUND_TIMEOUT_SECONDS: ${VISUAL_BACKGROUND_TIMEOUT_SECONDS:-300}
       PREVIEW_WORKSPACE_PATH: /preview/workspace.json
       PREVIEW_RELOAD_DIR: /preview-reload
       SEMANTIC_SERVICE_URL: http://semantic-service:8080
@@ -202,6 +204,7 @@ services:
       ALLOWED_ORIGIN: http://caddy:8081
       ALLOWED_ORIGINS: http://caddy:8081,http://xyz-preview:3000
       MAX_CONCURRENT_RUNS: ${BROWSER_MAX_CONCURRENT_RUNS:-1}
+      VISUAL_RUN_TIMEOUT_MS: ${VISUAL_RUN_TIMEOUT_MS:-90000}
       BROWSER_PROXY_SERVER: http://egress-proxy:3128
       BROWSER_PROXY_BYPASS: caddy,xyz-preview,localhost,127.0.0.1
     volumes:

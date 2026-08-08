@@ -23,12 +23,57 @@ const configuredConcurrency = Number(
 const maxConcurrentRuns = Number.isInteger(configuredConcurrency)
   ? Math.min(4, Math.max(1, configuredConcurrency))
   : 1;
+const configuredRunTimeout = Number(process.env.VISUAL_RUN_TIMEOUT_MS || 90_000);
+const defaultRunTimeout = Number.isFinite(configuredRunTimeout)
+  ? Math.min(180_000, Math.max(10_000, configuredRunTimeout))
+  : 90_000;
+const cleanupTimeout = 5_000;
 let activeRuns = 0;
 const safe = value => String(value).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 100);
 const redactUrl = value => value.replace(
   /([?&](?:token|key|authorization|access_token|api_key|apikey|subscription-key)=)[^&]+/ig,
   "$1[redacted]",
 );
+
+class VisualStageTimeout extends Error {
+  constructor(stage, timeoutMilliseconds) {
+    super(`Visual runner timed out during '${stage}'.`);
+    this.code = "visual.run_timeout";
+    this.failedStage = stage;
+    this.status = 504;
+    this.timeoutMilliseconds = timeoutMilliseconds;
+  }
+}
+
+async function boundedStage(stage, timeoutMilliseconds, task) {
+  if (timeoutMilliseconds <= 0) {
+    throw new VisualStageTimeout(stage, 0);
+  }
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(task),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new VisualStageTimeout(stage, timeoutMilliseconds)),
+          timeoutMilliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function browserDiagnostics(report, stage) {
+  return {
+    runId: report.runId,
+    stage,
+    console: report.console.slice(-50),
+    pageErrors: report.pageErrors.slice(-50),
+    failedRequests: report.failedRequests.slice(-50),
+  };
+}
 
 function pngSize(buffer) {
   if (
@@ -607,7 +652,6 @@ async function runVisual(input) {
     : "";
   const runId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${binding}${safe(input.layer || "workspace")}-${randomUUID().slice(0, 8)}`;
   const directory = `${root}/${runId}`;
-  await mkdir(directory, {recursive: false, mode: 0o700});
 
   if (input.plan?.centre?.length === 2) {
     target.searchParams.set("lng", input.plan.centre[0]);
@@ -647,6 +691,17 @@ async function runVisual(input) {
   );
   const fullPage = input.fullPage !== false;
   const timeout = Math.min(60_000, Math.max(5_000, Number(input.timeout) || 45_000));
+  const runTimeout = Math.min(
+    180_000,
+    Math.max(10_000, Number(input.runTimeout) || defaultRunTimeout),
+  );
+  const deadline = Date.now() + runTimeout;
+  let currentStage = "artifact-persistence";
+  const runStage = async (stage, task) => {
+    currentStage = stage;
+    const remaining = deadline - Date.now();
+    return boundedStage(stage, remaining, task);
+  };
   const panels = requestedPanels(input);
   const report = {
     runId,
@@ -665,54 +720,164 @@ async function runVisual(input) {
     failedRequests: [],
     passed: false,
   };
-
-  const browser = await chromium.launch({
-    headless: true,
-    ...(browserProxyServer ? {
-      proxy: {
-        server: browserProxyServer,
-        ...(browserProxyBypass ? {bypass: browserProxyBypass} : {}),
-      },
-    } : {}),
-  });
-  try {
-    const page = await browser.newPage({viewport, deviceScaleFactor});
-    page.on("console", message => report.console.push({
-      type: message.type(),
-      text: message.text(),
-    }));
-    page.on("pageerror", error => report.pageErrors.push(error.message));
-    page.on("requestfailed", request => report.failedRequests.push({
-      url: redactUrl(request.url()),
-      error: request.failure()?.errorText,
-    }));
-    const response = await page.goto(target.toString(), {
-      waitUntil: "networkidle",
-      timeout,
-    });
-    report.httpStatus = response?.status();
-    report.canvasCount = await page.locator("canvas").count();
-    const layerText = input.layerTitle || input.layer;
-    report.layerTextFound = viewMode === "default"
-      ? true
-      : layerText
-      ? await page.getByText(layerText, {exact: false}).count() > 0
-      : true;
-    report.groupTextFound = (
-      await Promise.all(
-        report.groups.map(
-          group => page.getByText(group, {exact: true}).count(),
-        ),
-      )
-    ).every(count => count > 0);
-    if (Array.isArray(input.pluginChecks) && input.pluginChecks.length) {
-      report.pluginNavigation = await expandRequestedLayer(page, input);
+  const recordFailure = error => {
+    const timedOut = (
+      error instanceof VisualStageTimeout
+      || error?.name === "TimeoutError"
+    );
+    report.passed = false;
+    report.error = error?.message || "Visual runner failed.";
+    report.code = error?.code || (
+      timedOut ? "visual.run_timeout" : "visual.browser_stage_failed"
+    );
+    report.failedStage = error?.failedStage || currentStage;
+    if (timedOut) {
+      report.timeoutMilliseconds = (
+        error?.timeoutMilliseconds ?? Math.min(timeout, runTimeout)
+      );
     }
-    report.plugins = await evaluatePluginChecks(page, input.pluginChecks, report);
-    const beforeCapture = await captureMap(page, directory, "before", fullPage);
-    report.hover = await exerciseHover(page, input, directory, timeout);
-    report.interaction = null;
-    if (input.plan?.interaction?.type === "click-centre-feature") {
+    report.diagnostics = {
+      ...browserDiagnostics(report, report.failedStage),
+      exception: {
+        name: error?.name || "Error",
+        message: report.error,
+      },
+    };
+  };
+
+  let browser = null;
+  try {
+    await runStage(
+      "artifact-persistence",
+      () => mkdir(directory, {recursive: false, mode: 0o700}),
+    );
+    browser = await runStage("browser-launch", () => chromium.launch({
+      headless: true,
+      timeout: Math.max(1, deadline - Date.now()),
+      ...(browserProxyServer ? {
+        proxy: {
+          server: browserProxyServer,
+          ...(browserProxyBypass ? {bypass: browserProxyBypass} : {}),
+        },
+      } : {}),
+    }));
+    let page;
+    let response;
+    await runStage("page-readiness", async () => {
+      page = await browser.newPage({viewport, deviceScaleFactor});
+      const configuredLocaleResponses = [];
+      page.on("console", message => report.console.push({
+        type: message.type(),
+        text: message.text(),
+      }));
+      page.on("pageerror", error => report.pageErrors.push(error.message));
+      page.on("requestfailed", request => report.failedRequests.push({
+        url: redactUrl(request.url()),
+        error: request.failure()?.errorText,
+      }));
+      page.on("response", browserResponse => {
+        const responseUrl = new URL(browserResponse.url());
+        if (
+          responseUrl.pathname.endsWith("/api/workspace/locale")
+          && responseUrl.searchParams.get("layers") === "true"
+        ) {
+          configuredLocaleResponses.push(
+            browserResponse.json().catch(() => null),
+          );
+        }
+      });
+      response = await page.goto(target.toString(), {
+        waitUntil: "networkidle",
+        timeout: Math.min(timeout, Math.max(1, deadline - Date.now())),
+      });
+      const configuredLocales = (await Promise.all(configuredLocaleResponses))
+        .filter(locale => locale && Array.isArray(locale.layers));
+      report.httpStatus = response?.status();
+      report.canvasCount = await page.locator("canvas").count();
+      const layerText = input.layerTitle || input.layer;
+      report.layerTextFound = viewMode === "default"
+        ? true
+        : layerText
+        ? await page.getByText(layerText, {exact: false}).count() > 0
+        : true;
+      report.groupTextFound = (
+        await Promise.all(
+          report.groups.map(
+            group => page.getByText(group, {exact: true}).count(),
+          ),
+        )
+      ).every(count => count > 0);
+      const configuredLocale = configuredLocales.at(-1) || null;
+      report.activationDiagnostics = await page.evaluate(({configured, planned}) => {
+        const configuredLayers = Array.isArray(configured?.layers)
+          ? configured.layers
+          : [];
+        const groupMembership = Object.fromEntries(configuredLayers.map(layer => [
+          layer.key,
+          layer.group || null,
+        ]));
+        const registeredLayerKeys = [...document.querySelectorAll(
+          ".drawer.layer-view[data-id]",
+        )].map(element => element.dataset.id);
+        const resolvedUrlLayerKeys = Array.isArray(
+          globalThis.mapp?.hooks?.current?.layers,
+        ) ? [...globalThis.mapp.hooks.current.layers] : [];
+        const registeredGroups = Object.fromEntries(
+          [...document.querySelectorAll(".drawer.layer-group[data-id]")].map(group => [
+            group.dataset.id,
+            [...group.querySelectorAll(".drawer.layer-view[data-id]")]
+              .map(layer => layer.dataset.id),
+          ]),
+        );
+        return {
+          configuredCandidateLayerKeys: Array.isArray(planned?.configuredLayerKeys)
+            ? planned.configuredLayerKeys
+            : configuredLayers.map(layer => layer.key),
+          resolvedLocaleLayerKeys: configuredLayers.map(layer => layer.key),
+          resolvedUrlLayerKeys,
+          groupMembership: planned?.groupMembership || groupMembership,
+          registeredLayerKeys,
+          registeredGroups,
+          finalActiveOpenLayersLayerSet: resolvedUrlLayerKeys.filter(
+            key => registeredLayerKeys.includes(key),
+          ),
+        };
+      }, {
+        configured: configuredLocale,
+        planned: input.plan?.candidateLayerDiagnostics || null,
+      });
+      const requestedSet = new Set(activeLayers);
+      const diagnostics = report.activationDiagnostics;
+      report.activationDiagnostics.requestedLayersRegistered = activeLayers.every(
+        key => diagnostics.registeredLayerKeys.includes(key),
+      );
+      report.activationDiagnostics.requestedLayersActive = activeLayers.every(
+        key => diagnostics.finalActiveOpenLayersLayerSet.includes(key),
+      );
+      report.activationDiagnostics.unexpectedActiveLayers = (
+        diagnostics.finalActiveOpenLayersLayerSet.filter(key => !requestedSet.has(key))
+      );
+      report.activationDiagnostics.activationRequired = (
+        viewMode === "focus" && activeLayers.length > 0
+      );
+      report.activationDiagnostics.activationPassed = (
+        !report.activationDiagnostics.activationRequired
+        || (
+          report.activationDiagnostics.requestedLayersRegistered
+          && report.activationDiagnostics.requestedLayersActive
+          && report.activationDiagnostics.unexpectedActiveLayers.length === 0
+        )
+      );
+    });
+    await runStage("screenshot-capture", async () => {
+      if (Array.isArray(input.pluginChecks) && input.pluginChecks.length) {
+      report.pluginNavigation = await expandRequestedLayer(page, input);
+      }
+      report.plugins = await evaluatePluginChecks(page, input.pluginChecks, report);
+      const beforeCapture = await captureMap(page, directory, "before", fullPage);
+      report.hover = await exerciseHover(page, input, directory, timeout);
+      report.interaction = null;
+      if (input.plan?.interaction?.type === "click-centre-feature") {
       const beforeText = await interactionText(page);
       const mapCanvas = page.locator("canvas").first();
       const box = await mapCanvas.boundingBox();
@@ -797,8 +962,8 @@ async function runVisual(input) {
           && Object.values(expectedInfoPanelTextFound).every(Boolean)
         ),
       };
-    }
-    report.panelNavigation = panels.length
+      }
+      report.panelNavigation = panels.length
       ? await expandRequestedLayer(page, input)
       : null;
     report.panels = {};
@@ -834,21 +999,46 @@ async function runVisual(input) {
     const hoverPassed = report.hover ? report.hover.passed : true;
     const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
     const pluginsPassed = report.plugins.every(plugin => plugin.passed);
-    report.passed = Boolean(
+      report.passed = Boolean(
       response?.ok()
       && report.canvasCount
       && report.layerTextFound
       && report.groupTextFound
+      && report.activationDiagnostics?.activationPassed
       && hoverPassed
       && interactionPassed
       && panelsPassed
       && pluginsPassed
       && !report.pageErrors.length
-    );
+      );
+    });
   } catch (error) {
-    report.error = error.message;
+    recordFailure(error);
   } finally {
-    await browser.close();
+    if (browser) {
+      try {
+        await boundedStage(
+          "browser-close",
+          cleanupTimeout,
+          () => browser.close(),
+        );
+      } catch (error) {
+        if (!report.code) recordFailure(error);
+        report.diagnostics = {
+          ...(report.diagnostics || browserDiagnostics(report, currentStage)),
+          browserCloseError: error.message,
+        };
+      }
+      if (report.diagnostics) {
+        report.diagnostics = {
+          ...browserDiagnostics(report, report.failedStage || currentStage),
+          ...report.diagnostics,
+          console: report.console.slice(-50),
+          pageErrors: report.pageErrors.slice(-50),
+          failedRequests: report.failedRequests.slice(-50),
+        };
+      }
+    }
   }
 
   report.diagnosis = {
@@ -878,6 +1068,11 @@ async function runVisual(input) {
           groups: report.groups,
           found: report.groupTextFound ?? false,
         },
+      },
+      {
+        id: "visual.layer_activation",
+        passed: report.activationDiagnostics?.activationPassed === true,
+        observed: report.activationDiagnostics ?? null,
       },
       {
         id: "visual.page_errors",
@@ -936,30 +1131,52 @@ async function runVisual(input) {
                     ? "page"
                     : "unknown",
   };
-  const retainedArtifact = async filename => {
-    try {
-      await access(`${directory}/${filename}`);
-      return `${runId}/${filename}`;
-    } catch {
-      return null;
-    }
-  };
-  report.artifacts = {
-    report: `${runId}/report.json`,
-    page: await retainedArtifact("page.png"),
-    map: await retainedArtifact("map.png"),
-    beforePage: await retainedArtifact("before-page.png"),
-    beforeMap: await retainedArtifact("before-map.png"),
-    afterPage: await retainedArtifact("after-page.png"),
-    afterMap: await retainedArtifact("after-map.png"),
-    infoPanel: await retainedArtifact("info-panel.png"),
-    hoverTooltip: await retainedArtifact("hover-tooltip.png"),
-    filteringPanel: await retainedArtifact("filtering-panel.png"),
-    stylingPanel: await retainedArtifact("styling-panel.png"),
-  };
-  await writeFile(`${directory}/report.json`, JSON.stringify(report, null, 2), {
-    mode: 0o600,
-  });
+  try {
+    const persistenceTimeout = Math.max(
+      1,
+      report.code === "visual.run_timeout"
+        ? cleanupTimeout
+        : deadline - Date.now(),
+    );
+    await boundedStage("artifact-persistence", persistenceTimeout, async () => {
+      const retainedArtifact = async filename => {
+        try {
+          await access(`${directory}/${filename}`);
+          return `${runId}/${filename}`;
+        } catch {
+          return null;
+        }
+      };
+      report.artifacts = {
+        report: `${runId}/report.json`,
+        page: await retainedArtifact("page.png"),
+        map: await retainedArtifact("map.png"),
+        beforePage: await retainedArtifact("before-page.png"),
+        beforeMap: await retainedArtifact("before-map.png"),
+        afterPage: await retainedArtifact("after-page.png"),
+        afterMap: await retainedArtifact("after-map.png"),
+        infoPanel: await retainedArtifact("info-panel.png"),
+        hoverTooltip: await retainedArtifact("hover-tooltip.png"),
+        filteringPanel: await retainedArtifact("filtering-panel.png"),
+        stylingPanel: await retainedArtifact("styling-panel.png"),
+      };
+      await writeFile(
+        `${directory}/report.json`,
+        JSON.stringify(report, null, 2),
+        {mode: 0o600},
+      );
+    });
+  } catch (error) {
+    report.artifacts = {
+      ...(report.artifacts || {}),
+      report: null,
+    };
+    error.code = error.code === "visual.run_timeout"
+      ? "visual.artifact_persistence_timeout"
+      : "visual.artifact_persistence_failed";
+    error.failedStage = "artifact-persistence";
+    recordFailure(error);
+  }
   return report;
 }
 
@@ -996,7 +1213,15 @@ http.createServer(async (req, res) => {
   activeRuns += 1;
   try {
     const report = await runVisual(input);
-    return json(res, report.passed ? 200 : 422, report);
+    const status = report.code === "visual.run_timeout"
+      || report.code === "visual.artifact_persistence_timeout"
+      ? 504
+      : report.code === "visual.artifact_persistence_failed"
+        ? 500
+        : report.passed
+          ? 200
+          : 422;
+    return json(res, status, report);
   } catch (error) {
     const status = error instanceof RequestError ? error.status : 500;
     return json(res, status, {

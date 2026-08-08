@@ -384,12 +384,26 @@ When browser validation does not pass, the API returns HTTP 422 while
 preserving the plan, failed report, and authenticated artifact paths. Review
 those artifacts as failure evidence.
 
+Background visual operations also publish a current `stage` and refreshed
+`updated` timestamp. Poll until a terminal status; a browser or end-to-end
+deadline returns `failed` with `failedStage` and bounded console, page-error,
+and request-failure diagnostics. Timeouts cover launch, page readiness,
+capture, artifact persistence, and the final atomic operation write. The
+browser slot is released after bounded cleanup, so a later request can run
+without restarting a healthy XYZ service.
+
 The browser runner permits one active test by default. `MAX_CONCURRENT_RUNS`
 is hard-clamped to the range 1–4, and the runner rejects excess internal
 requests with HTTP 429 and a short retry hint rather than launching additional
 Chromium processes. The configuration API propagates that 429 with the selected
 plan. Queue or retry visual work conservatively; this concurrency bound does
 not provide artifact retention or a total-storage quota.
+
+`VISUAL_RUN_TIMEOUT_MS` defaults to 90000 and bounds one browser run end to
+end. The configuration service uses `VISUAL_BROWSER_TIMEOUT_SECONDS` (default
+90) for its runner request and `VISUAL_BACKGROUND_TIMEOUT_SECONDS` (default
+300) for the durable operation, allowing a comparison screenshot to render
+both retained sides while still guaranteeing a terminal status.
 
 Large or outlier-heavy data, external basemaps, unusual zoom rules, themes, and
 custom SVGs may need manual review. External framework and basemap assets use

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
+from workspace_schema import expression_error
 
 try:
     import psycopg
@@ -86,6 +87,7 @@ DERIVED_ERROR_PRESENTATION = {
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect `config-cli schema` and correct the reported path."},
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
+    {"id": "workspace.layer_group_colour", "category": "schema", "description": "XYZ styles a layer-group drawer with the first grouped layer's groupClassList. This is a deployed stylesheet class list, not a literal colour property.", "remediation": "Inspect every member of the exact group and use the same verified deployed class list on each one. Do not invent groupColor/groupColour or put a hex colour in groupClassList."},
     {"id": "workspace.layer_legend", "category": "schema", "description": "An optional basic theme exposes the layer symbology as a legend in XYZ's Styling panel.", "remediation": "Set style.theme to a basic theme whose style matches style.default, and include theme in style.elements when an explicit element list is present."},
     {"id": "workspace.categorized_symbology", "category": "schema", "description": "A categorized theme maps exact values from a feature field to labelled styles in XYZ's data-driven legend.", "remediation": "Set style.theme to a categorized theme with a valid field and category value/style entries; preserve unrelated style.elements and include theme when that array is explicit."},
     {"id": "workspace.theme_semantics", "category": "schema", "description": "Graduated themes require ordered unique numeric breaks; distributed themes require a stable identity field and a non-empty style palette; named and multi-field themes must resolve every referenced field.", "remediation": "Inspect the current layer fields and theme before choosing a corrective mode. Replace invalid references, reorder graduated breaks for the selected comparison, or refresh/reconcile the derived source before proposing the workspace change."},
@@ -411,6 +413,19 @@ class VisualPlanningDatabaseError(RuntimeError):
             else "The database could not prepare this read-only visual check."
         )
         super().__init__(message)
+
+
+class VisualPlanningNoMatchingFeatures(ValueError):
+    """The effective rendered dataset has no usable feature geometry."""
+
+    code = "visual.no_matching_features"
+
+    def __init__(self, *, filter_applied: bool) -> None:
+        self.filter_applied = filter_applied
+        super().__init__(
+            "The layer has no matching features with non-null renderable geometry"
+            + (" after applying filter.default." if filter_applied else ".")
+        )
 
 PLUGIN_MANIFEST: list[dict[str, Any]] = [
     {"key": "admin", "configuration": "object", "execution": "locale", "purpose": "Administrator navigation for authenticated administrators.", "prerequisites": ["standard map button column", "authenticated administrator"]},
@@ -2507,6 +2522,85 @@ def visual_hover_plan(layer: dict) -> dict | None:
     }
 
 
+def _visual_default_filter(layer: dict):
+    """Compile XYZ's validated fixed filter for read-only planning queries."""
+    configured = layer.get("filter")
+    predicate = configured.get("default") if isinstance(configured, dict) else None
+    if predicate is None:
+        return sql.SQL("TRUE"), []
+    if isinstance(predicate, str):
+        error = expression_error(predicate)
+        if error:
+            raise ValueError(f"Invalid layer filter.default: {error}")
+        return sql.SQL("({})").format(sql.SQL(predicate)), []
+
+    def compile_mapping(mapping: dict):
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("Layer filter.default objects must be non-empty.")
+        clauses = []
+        params = []
+        operations = {
+            "eq": "=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+        }
+        for field, tests in mapping.items():
+            if not isinstance(field, str) or not re.fullmatch(r"[A-Za-z_]\w*", field):
+                raise ValueError("Layer filter.default contains an invalid field name.")
+            if not isinstance(tests, dict) or not tests:
+                raise ValueError("Layer filter.default field tests must be non-empty objects.")
+            field_sql = sql.Identifier(field)
+            field_clauses = []
+            for operation, value in tests.items():
+                if operation in operations:
+                    field_clauses.append(sql.SQL("{} {} %s").format(
+                        field_sql, sql.SQL(operations[operation]),
+                    ))
+                    params.append(value)
+                elif operation == "boolean":
+                    field_clauses.append(sql.SQL("{} IS %s").format(field_sql))
+                    params.append(bool(value))
+                elif operation == "null":
+                    field_clauses.append(sql.SQL("{} IS {}NULL").format(
+                        field_sql, sql.SQL("") if value else sql.SQL("NOT "),
+                    ))
+                elif operation in {"in", "ni"}:
+                    values = value if isinstance(value, list) else [value]
+                    comparison = sql.SQL("{} = ANY(%s)").format(field_sql)
+                    field_clauses.append(
+                        comparison if operation == "in"
+                        else sql.SQL("NOT ({})").format(comparison)
+                    )
+                    params.append(values)
+                elif operation == "match":
+                    field_clauses.append(sql.SQL("{}::text = %s").format(field_sql))
+                    params.append(value)
+                elif operation == "like":
+                    values = [item for item in str(value).split(",") if item]
+                    if not values:
+                        raise ValueError("Layer filter.default like values must be non-empty.")
+                    field_clauses.append(sql.SQL("({})").format(sql.SQL(" OR ").join(
+                        sql.SQL("{} ILIKE %s").format(field_sql) for _ in values
+                    )))
+                    params.extend(f"{item}%" for item in values)
+                else:
+                    raise ValueError(
+                        f"Layer filter.default uses unsupported operation: {operation}."
+                    )
+            clauses.append(sql.SQL("({})").format(sql.SQL(" AND ").join(field_clauses)))
+        return sql.SQL("({})").format(sql.SQL(" AND ").join(clauses)), params
+
+    if isinstance(predicate, list):
+        if not predicate:
+            raise ValueError("Layer filter.default arrays must be non-empty.")
+        compiled = [compile_mapping(item) for item in predicate]
+        return (
+            sql.SQL("({})").format(sql.SQL(" OR ").join(item[0] for item in compiled)),
+            [value for item in compiled for value in item[1]],
+        )
+    if isinstance(predicate, dict):
+        return compile_mapping(predicate)
+    raise ValueError("Layer filter.default must be a predicate string, object, or array.")
+
+
 def visual_plan(
     workspace: dict,
     layer_key: str,
@@ -2605,23 +2699,37 @@ def visual_plan(
         raise ValueError("Layer database or relation is unavailable.")
     relation_sql = sql.SQL("{}.{}").format(sql.Identifier(relation[0]), sql.Identifier(relation[1]))
     geom = sql.Identifier(layer["geom"])
+    filter_applied = (
+        isinstance(layer.get("filter"), dict)
+        and layer["filter"].get("default") is not None
+    )
+    default_filter, default_filter_params = _visual_default_filter(layer)
     query = sql.SQL("""
+      WITH rendered AS (
+        SELECT *
+        FROM {relation}
+        WHERE {default_filter}
+      )
       SELECT feature_count,
              ST_XMin(extent), ST_YMin(extent), ST_XMax(extent), ST_YMax(extent),
              sample.geometry_type
       FROM (
         SELECT count(*)::bigint AS feature_count,
                ST_Extent(ST_Transform({geom}, 3857)) AS extent
-        FROM {relation}
+        FROM rendered
         WHERE {geom} IS NOT NULL
       ) bounds
       LEFT JOIN LATERAL (
         SELECT GeometryType({geom}) AS geometry_type
-        FROM {relation}
+        FROM rendered
         WHERE {geom} IS NOT NULL
         LIMIT 1
       ) sample ON TRUE
-    """).format(geom=geom, relation=relation_sql)
+    """).format(
+        geom=geom,
+        relation=relation_sql,
+        default_filter=default_filter,
+    )
     try:
         with psycopg.connect(database_url, connect_timeout=5) as conn:
             with conn.cursor() as cur:
@@ -2630,7 +2738,7 @@ def visual_plan(
                     "SET statement_timeout = "
                     f"'{VISUAL_PLANNING_STATEMENT_TIMEOUT_MS}ms'"
                 )
-                cur.execute(query)
+                cur.execute(query, default_filter_params)
                 count, west, south, east, north, geometry_type = cur.fetchone()
     except psycopg.Error as exc:
         raise VisualPlanningDatabaseError(
@@ -2639,13 +2747,19 @@ def visual_plan(
             timed_out=getattr(exc, "sqlstate", None) == "57014",
         ) from exc
     if not count or None in (west, south, east, north):
-        raise ValueError("Layer has no non-null renderable geometry.")
+        raise VisualPlanningNoMatchingFeatures(
+            filter_applied=filter_applied,
+        )
     centre_x, centre_y = (west + east) / 2, (south + north) / 2
     sample_query = sql.SQL("""
-      WITH candidate AS (
+      WITH rendered AS (
+        SELECT *
+        FROM {relation}
+        WHERE {default_filter}
+      ), candidate AS (
         SELECT {qid} AS feature_id,
                {geom} AS geom
-        FROM {relation}
+        FROM rendered
         WHERE {geom} IS NOT NULL
         ORDER BY ST_Transform({geom}, 3857) <-> ST_SetSRID(ST_MakePoint(%s, %s), 3857)
         LIMIT 1
@@ -2666,6 +2780,7 @@ def visual_plan(
         geom=geom,
         qid=sql.Identifier(layer["qID"]),
         relation=relation_sql,
+        default_filter=default_filter,
     )
     try:
         with psycopg.connect(database_url, connect_timeout=5) as conn:
@@ -2675,7 +2790,10 @@ def visual_plan(
                     "SET statement_timeout = "
                     f"'{VISUAL_PLANNING_STATEMENT_TIMEOUT_MS}ms'"
                 )
-                cur.execute(sample_query, (centre_x, centre_y))
+                cur.execute(
+                    sample_query,
+                    (*default_filter_params, centre_x, centre_y),
+                )
                 sample = cur.fetchone()
     except psycopg.Error as exc:
         raise VisualPlanningDatabaseError(
@@ -2683,6 +2801,8 @@ def visual_plan(
             query_purpose="centre-feature-selection",
             timed_out=getattr(exc, "sqlstate", None) == "57014",
         ) from exc
+    if sample is None:
+        raise VisualPlanningNoMatchingFeatures(filter_applied=filter_applied)
     (
         feature_id,
         sample_geometry_type,
@@ -2722,6 +2842,7 @@ def visual_plan(
         "featureId": feature_id,
         "geometryType": geometry_type,
         "featureCount": count,
+        "defaultFilterApplied": filter_applied,
         "bounds3857": [west, south, east, north],
         "focusBounds3857": [focus_west, focus_south, focus_east, focus_north],
         "centre": [target_lng, target_lat],

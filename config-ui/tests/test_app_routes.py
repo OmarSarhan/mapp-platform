@@ -4223,6 +4223,35 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         browser.assert_not_called()
         create_operation.assert_not_called()
 
+    def test_live_visual_reports_no_matching_filtered_features(self):
+        handler, responses = self.handler(
+            "/api/visual-plan", {"layer": "Stops"}
+        )
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", self.proposal()["candidate"], "revision-1"),
+            ),
+            patch.object(
+                app,
+                "visual_plan",
+                side_effect=app.VisualPlanningNoMatchingFeatures(
+                    filter_applied=True,
+                ),
+            ),
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("visual.no_matching_features", body["code"])
+        self.assertEqual("layer-summary", body["planningStage"])
+        self.assertEqual(
+            "filtered-feature-count-and-extent", body["queryPurpose"]
+        )
+        self.assertTrue(body["defaultFilterApplied"])
+
     def test_live_visual_test_sends_requested_information_evidence(self):
         payload = {
             "layer": "Stops",
@@ -4346,6 +4375,26 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual(2, payload["deviceScaleFactor"])
         self.assertEqual(["Stops", "Rail Stations"], payload["layers"])
         self.assertEqual("focus", payload["viewMode"])
+        self.assertEqual(
+            app.VISUAL_BROWSER_TIMEOUT_SECONDS * 1000,
+            payload["runTimeout"],
+        )
+
+    def test_browser_transport_timeout_is_structured(self) -> None:
+        with patch.object(app, "urlopen", side_effect=TimeoutError("hung")):
+            status, result = app.run_browser_visual(
+                "Stops",
+                {"centre": [1, 2]},
+                {"metadata": {"operationId": "a" * 32}},
+                target_url="http://xyz-preview:3000",
+            )
+
+        self.assertEqual(HTTPStatus.GATEWAY_TIMEOUT, status)
+        self.assertEqual(
+            "visual.browser_transport_timeout", result["code"]
+        )
+        self.assertEqual("browser-transport", result["failedStage"])
+        self.assertEqual("TimeoutError", result["diagnostics"]["exceptionType"])
 
     def test_browser_http_error_preserves_structured_runner_result(self) -> None:
         expected = {
@@ -5104,6 +5153,84 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             self.assertEqual(
                 operation_id, operation["result"]["operationId"]
             )
+
+    def test_visual_watchdog_persists_terminal_stage_diagnostics(self):
+        release_worker = threading.Event()
+        worker = threading.Thread(target=release_worker.wait, daemon=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            operation = control.create_operation(
+                "proposal.visual-test",
+                "token:test",
+                {"proposalId": "proposal-1"},
+            )
+            control.update_operation_progress(
+                operation["id"],
+                stage="screenshot-capture",
+                diagnostics={"pageErrors": ["Chromium exited"]},
+            )
+            worker.start()
+            with patch.object(app, "CONTROL", control):
+                app.watch_visual_background(operation["id"], worker, 0.01)
+
+            terminal = control.read_operation(operation["id"])
+            self.assertEqual("failed", terminal["status"])
+            self.assertEqual(
+                "visual.operation_timeout", terminal["error"]["code"]
+            )
+            self.assertEqual(
+                "screenshot-capture", terminal["error"]["failedStage"]
+            )
+            self.assertEqual(
+                ["Chromium exited"],
+                terminal["error"]["diagnostics"]["pageErrors"],
+            )
+            release_worker.set()
+            worker.join(1)
+
+            abandoned = control.create_operation(
+                "proposal.visual-test",
+                "token:test",
+                {"proposalId": "proposal-2"},
+            )
+            control.update_operation_progress(
+                abandoned["id"], stage="result-persistence"
+            )
+            exited_worker = threading.Thread(target=lambda: None)
+            exited_worker.start()
+            exited_worker.join(1)
+            with patch.object(app, "CONTROL", control):
+                app.watch_visual_background(
+                    abandoned["id"], exited_worker, 0.01
+                )
+            abandoned_terminal = control.read_operation(abandoned["id"])
+            self.assertEqual("failed", abandoned_terminal["status"])
+            self.assertEqual(
+                "visual.result_persistence_failed",
+                abandoned_terminal["error"]["code"],
+            )
+
+    def test_visual_terminal_persistence_retries_transient_write_failure(self):
+        terminal = {"id": "a" * 32, "status": "failed"}
+        control = Mock()
+        control.finish_operation.side_effect = [
+            OSError("temporary write failure"),
+            terminal,
+        ]
+
+        with (
+            patch.object(app, "CONTROL", control),
+            patch.object(app.time, "sleep"),
+        ):
+            result = app.finish_visual_operation(
+                "a" * 32,
+                status="failed",
+                error={"code": "visual.failed"},
+            )
+
+        self.assertEqual(terminal, result)
+        self.assertEqual(2, control.finish_operation.call_count)
 
     def test_information_screenshot_selects_feature_in_both_comparison_images(self):
         handler, responses = self.handler(

@@ -17,6 +17,7 @@ from typing import Any
 from plugin_registry import available_plugins, validate_workspace_plugins
 
 DB_KEY = re.compile(r"^[A-Za-z0-9-]+$")
+XYZ_LAYER_KEY = re.compile(r"^[A-Za-z0-9 :_-]+$")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 RELATION = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?$"
@@ -27,6 +28,9 @@ SUPPORTED_FORMATS = {
 }
 SCALE_UNITS = {"metric", "imperial"}
 COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+CSS_CLASS_LIST = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_-]*(?: +[A-Za-z_][A-Za-z0-9_-]*)*$"
+)
 ICON_TYPES = {
     "dot", "target", "triangle", "square", "diamond", "semiCircle",
     "circle", "markerLetter", "markerColor", "template",
@@ -429,6 +433,12 @@ def _validate_locale(locale, path, errors, available_dbs):
         _error(errors, f"{path}.layers", "Must be an object keyed by layer name.")
         return
     for key, layer in layers.items():
+        if not isinstance(key, str) or not key or not XYZ_LAYER_KEY.fullmatch(key):
+            _error(
+                errors,
+                f"{path}.layers.{key}",
+                "Layer keys may contain only letters, numbers, spaces, colons, underscores, or hyphens; use name for display punctuation.",
+            )
         _validate_layer(key, layer, f"{path}.layers.{key}", errors, available_dbs)
 
 
@@ -571,6 +581,23 @@ def _validate_layer(key, layer, path, errors, available_dbs):
         not isinstance(layer["group"], str) or not layer["group"].strip()
     ):
         _error(errors, f"{path}.group", "Must be a non-empty string when set.")
+    if "groupClassList" in layer and (
+        not isinstance(layer["groupClassList"], str)
+        or not CSS_CLASS_LIST.fullmatch(layer["groupClassList"])
+    ):
+        _error(
+            errors,
+            f"{path}.groupClassList",
+            "Must be one or more space-separated stylesheet class names.",
+        )
+    if "groupClassList" in layer and not (
+        isinstance(layer.get("group"), str) and layer["group"].strip()
+    ):
+        _error(
+            errors,
+            f"{path}.groupClassList",
+            "Requires the layer to belong to a group.",
+        )
     if fmt is None and has_template:
         _validate_style(layer.get("style"), f"{path}.style", errors)
         return
@@ -849,6 +876,20 @@ def _validate_layer_filter(value, path, errors, fields):
             not isinstance(value[key], str) or not value[key].strip()
         ):
             _error(errors, f"{path}.{key}", "Must be a non-empty string.")
+    default = value.get("default")
+    if isinstance(default, str):
+        if not default.strip():
+            _error(errors, f"{path}.default", "Must be a non-empty predicate.")
+        else:
+            error = expression_error(default)
+            if error:
+                _error(errors, f"{path}.default", error)
+    elif default is not None and not isinstance(default, (dict, list)):
+        _error(
+            errors,
+            f"{path}.default",
+            "Must be a predicate string, filter object, or OR-array.",
+        )
     for key in ("include", "exclude"):
         selected = value.get(key)
         if selected is None:

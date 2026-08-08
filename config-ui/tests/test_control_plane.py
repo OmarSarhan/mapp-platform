@@ -335,6 +335,32 @@ class ControlPlaneTests(unittest.TestCase):
                 ),
             )
 
+    def test_running_operation_progress_is_durable_and_terminal_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            operation = store.create_operation(
+                "visual.test", "token:test", {"layer": "Bus Stops"}
+            )
+
+            progress = store.update_operation_progress(
+                operation["id"],
+                stage="page-readiness",
+                diagnostics={"pageErrors": []},
+            )
+
+            self.assertEqual("running", progress["status"])
+            self.assertEqual("page-readiness", progress["stage"])
+            self.assertEqual({"pageErrors": []}, progress["diagnostics"])
+            terminal = store.finish_operation(
+                operation["id"],
+                status="failed",
+                error={"code": "visual.run_timeout"},
+            )
+            unchanged = store.update_operation_progress(
+                operation["id"], stage="late-worker-result"
+            )
+            self.assertEqual(terminal, unchanged)
+
     def test_operation_results_normalize_database_native_values(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))

@@ -271,6 +271,9 @@
         "layers": {
           "type": "object",
           "description": "Map layers keyed by their stable layer key.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9 :_-]+$"
+          },
           "additionalProperties": {
             "$ref": "#/$defs/layer"
           }
@@ -460,7 +463,9 @@
         },
         "groupClassList": {
           "type": "string",
-          "description": "Optional CSS classes applied to the XYZ layer-group drawer."
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]*(?: +[A-Za-z_][A-Za-z0-9_-]*)*$",
+          "description": "Optional deployed stylesheet class list applied to the XYZ layer-group drawer when this layer creates it. XYZ uses the first group member's value, so set the same verified class list on every member. A literal colour is not a class and has no effect."
         },
         "groupmeta": {
           "type": "string",
