@@ -222,6 +222,27 @@ class QueryAstGuardTests(unittest.TestCase):
         self.assertTrue(polygon.bounded_set)
         self.assertEqual("server-scope-polygon", polygon.bound_kind)
 
+        overlapping = inspect_query_ast(
+            "SELECT cell FROM _mapp_h3_scope CROSS JOIN LATERAL "
+            "h3_polygon_to_cells_experimental("
+            "_mapp_h3_scope.geom_4326, 3, 'overlapping') AS cell"
+        ).calls_named({"h3_polygon_to_cells_experimental"})[0]
+        self.assertTrue(overlapping.bounded_set)
+        self.assertEqual("server-scope-polygon", overlapping.bound_kind)
+
+        for mode in ("center", "overlapping_bbox"):
+            with self.subTest(mode=mode):
+                self.assertIn(
+                    "h3_polygon_mode",
+                    self.reason_codes(
+                        "SELECT cell FROM _mapp_h3_scope "
+                        "CROSS JOIN LATERAL "
+                        "h3_polygon_to_cells_experimental("
+                        "_mapp_h3_scope.geom_4326, 3, "
+                        f"'{mode}') AS cell"
+                    ),
+                )
+
         unsafe = (
             "SELECT h3_polygon_to_cells(_mapp_h3_scope.geom_4326, 9) "
             "FROM source.rows",
@@ -638,7 +659,12 @@ class CatalogRoutineGuardTests(unittest.TestCase):
         self.assertIn("extension.extname = 'h3_postgis'", query)
         self.assertIn("extension_membership.deptype = 'e'", query)
         self.assertEqual(
-            (["h3", "h3_postgis", "postgis"],),
+            (
+                ["h3", "h3_postgis", "postgis"],
+                "h3_polygon_to_cells",
+                2,
+                2,
+            ),
             parameters,
         )
 

@@ -256,8 +256,22 @@ Layer-level `filter.include`, `exclude`, and `includeAll` control which
 compatible fields are offered. `filter.hidden` suppresses the drawer;
 `filter.viewport` scopes generated ranges, histograms, and counts to the
 current map view. `filter.default` is a fixed server-side restriction composed
-with interactive filters. Upstream also accepts trusted template SQL strings
-there, so changes require explicit query and data-access review.
+with interactive filters. The backend deeply validates the deterministic
+object and top-level OR-array forms, including operation operands. It rejects
+field-level OR arrays and dynamic request-user operands whose pinned behavior
+cannot be reproduced reliably during planning. Upstream also accepts trusted
+template SQL strings there, so changes require explicit query and data-access
+review.
+
+Use `config-cli layers statistics LAYER FIELD` for a bounded distribution of a
+stored numeric field after the layer's fixed filter and identifier restrictions
+are applied. The response contains no rows: it reports null/finite counts,
+min/max, fixed quantiles, histogram bins, requested threshold counts, and
+candidate class counts with exclusive upper bounds. This is the appropriate
+evidence for deciding whether equal-width classes are useful and whether a
+highest-value boundary needs one increment of headroom. Style and filter on
+the raw numeric field; reserve formatted text for hover and clicked-feature
+information.
 
 XYZ only creates the Filtering drawer, including its count, when at least one
 compatible `infoj` entry is offered by `filter.includeAll`, `filter.include`,
@@ -397,7 +411,7 @@ workspace
 | `locale.keyvalue_dictionary`, `layer.keyvalue_dictionary` | array | Native recursive value substitutions keyed by property name and current value, with `default` and language keys. |
 | `locale.svgTemplates` / `svg_templates` | object | SVG source map; the underscored spelling is the supported legacy alias. |
 | `locale.plugins[]`, `syncPlugins[]` | string arrays | Plugin modules to load, and plugin keys that must execute sequentially. |
-| `locale.layers.<key>` | object | Layer key used in URLs, hooks, and queries. The pinned XYZ route accepts only ASCII letters, numbers, spaces, colons, underscores, and hyphens. Put typographic punctuation in `layer.name`; an unsupported key is omitted before browser registration and cannot be activated by `layers=`. |
+| `locale.layers.<key>` | object | Machine key used in URLs, hooks, and queries. The pinned XYZ route accepts only ASCII letters, numbers, spaces, colons, underscores, and hyphens, but new proposal keys outside `[A-Za-z0-9_]+` receive a strong stability warning. Prefer letters, numbers, and underscores; put spaces, punctuation, and translated wording in `layer.name`. An unsupported key is omitted before browser registration and cannot be activated by `layers=`. |
 | `layer.name` | string | Display label; defaults to the layer key. |
 | `layer.filter.default` | predicate string, filter object, or OR-array | Fixed server-side filter applied by XYZ and by visual planning. Predicate strings are validated as one read-only expression; planning counts, frames, and selects features only from matching rows. |
 

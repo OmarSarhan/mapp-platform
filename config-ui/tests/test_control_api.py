@@ -18,6 +18,7 @@ from control_api import (
     contract,
     decode_position_cursor,
     deep_merge,
+    effective_layer_filter,
     effective_locales,
     enforce_collection_payload,
     examples,
@@ -346,12 +347,47 @@ class ControlApiTests(unittest.TestCase):
             ["derive", "semantic:inspect"],
             actions["derived-layers.replace"]["requiredScopes"],
         )
+        statistics = actions["layers.statistics"]
+        self.assertEqual(
+            "/api/layers/{layerKey}/statistics",
+            statistics["pathTemplate"],
+        )
+        self.assertEqual(
+            ["derive", "semantic:inspect"],
+            statistics["requiredScopes"],
+        )
+        self.assertEqual(
+            50,
+            statistics["querySchema"]["properties"]["bins"]["maximum"],
+        )
+        self.assertEqual(
+            10,
+            statistics["querySchema"]["properties"]["bins"]["default"],
+        )
+        recipe = actions["derived-layers.plan-area-weighted-h3"]
+        self.assertEqual(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            recipe["path"],
+        )
+        self.assertEqual(
+            ["derive", "semantic:inspect"],
+            recipe["requiredScopes"],
+        )
+        self.assertEqual(
+            32,
+            recipe["inputSchema"]["properties"]["measures"]["maxItems"],
+        )
         self.assertIn(
             "semantic catalog history",
             contract("instance")["commands"],
         )
         self.assertIn(
             "derived-layers map-extent",
+            contract("instance")["commands"],
+        )
+        self.assertIn("layers statistics", contract("instance")["commands"])
+        self.assertIn(
+            "derived-layers plan-area-weighted-h3",
             contract("instance")["commands"],
         )
         self.assertIn(
@@ -1142,6 +1178,10 @@ class ControlApiTests(unittest.TestCase):
                         "name": "Friendly external layer",
                         "format": "maplibre",
                         "style": {"URL": "https://tiles.example.invalid/style"},
+                        "filter": {"default": {"status": {"match": "open"}}},
+                        "featureLookup": [],
+                        "qID": "id",
+                        "group": "External data",
                     }
                 }
             }
@@ -1152,6 +1192,17 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual("Friendly external layer", plan["layerTitle"])
         self.assertNotIn("centre", plan)
         self.assertNotIn("zoom", plan)
+        dataset = plan["effectiveDataset"]
+        self.assertEqual(
+            {"status": {"match": "open"}},
+            dataset["effectiveFilter"]["fixedFilter"],
+        )
+        self.assertEqual(
+            ["filter.default", "featureLookup"],
+            dataset["effectiveFilter"]["restrictions"],
+        )
+        self.assertEqual("External data", dataset["activation"]["group"])
+        self.assertTrue(dataset["query"]["skipped"])
         self.assertFalse(
             is_probeable_database_layer(
                 {"template": "OSM"}
@@ -1257,6 +1308,29 @@ class ControlApiTests(unittest.TestCase):
             "hover-centre-feature",
             plan["hover"]["type"],
         )
+
+    def test_explicit_advanced_view_keeps_effective_filter_diagnostics(self):
+        workspace = {"locale": {"layers": {"External": {
+            "name": "External areas",
+            "format": "maplibre",
+            "filter": {"default": {"kind": {"match": "park"}}},
+            "qID": "id",
+        }}}}
+
+        plan = visual_plan(
+            workspace,
+            "External",
+            {},
+            visual_request={"centre": [-1.5, 53.8], "zoom": 12},
+        )
+
+        dataset = plan["effectiveDataset"]
+        self.assertEqual(
+            {"kind": {"match": "park"}},
+            dataset["effectiveFilter"]["fixedFilter"],
+        )
+        self.assertEqual("complete-explicit-view", dataset["query"]["reason"])
+        self.assertIsNone(dataset["filteredFeatureCount"])
 
     @staticmethod
     def failing_visual_connection(error: psycopg.Error) -> MagicMock:
@@ -1364,11 +1438,155 @@ class ControlApiTests(unittest.TestCase):
         feature_query, feature_params = feature_cursor.execute.call_args_list[2].args
         self.assertIn("ts005_0017_count > 0", summary_query.as_string(None))
         self.assertIn("ts005_0017_count > 0", feature_query.as_string(None))
+        self.assertIn("NOT ST_IsEmpty", summary_query.as_string(None))
+        self.assertIn("NOT ST_IsEmpty", feature_query.as_string(None))
+        self.assertIn(
+            'pg_catalog.to_jsonb("oa21cd") AS feature_id',
+            feature_query.as_string(None),
+        )
         self.assertEqual([], summary_params)
         self.assertEqual((-175000.0, 7050000.0), feature_params)
         self.assertEqual(34, plan["featureCount"])
         self.assertEqual("891942c4313ffff", plan["featureId"])
         self.assertTrue(plan["defaultFilterApplied"])
+        self.assertEqual(
+            "ts005_0017_count > 0",
+            plan["effectiveDataset"]["effectiveFilter"]["fixedFilter"],
+        )
+        self.assertEqual(
+            34, plan["effectiveDataset"]["filteredFeatureCount"]
+        )
+        self.assertEqual(
+            "891942c4313ffff",
+            plan["effectiveDataset"]["representativeFeature"]["id"],
+        )
+
+    def test_effective_layer_filter_uses_boolean_literals_and_feature_scope(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["filter"] = {"default": {"published": {"boolean": True}}}
+        layer["featureSet"] = ["cell-1", "cell-2"]
+
+        predicate, params, descriptor = effective_layer_filter(layer)
+
+        rendered = predicate.as_string(None)
+        self.assertIn('"published" IS TRUE', rendered)
+        self.assertIn(
+            'pg_catalog.to_jsonb("oa21cd")', rendered
+        )
+        self.assertEqual(['["cell-1","cell-2"]'], params)
+        self.assertEqual(
+            ["filter.default", "featureSet"], descriptor["restrictions"]
+        )
+
+    def test_effective_layer_filter_safely_encodes_mixed_json_feature_ids(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["featureSet"] = [1, "1", {"unexpected": "object"}]
+
+        predicate, params, descriptor = effective_layer_filter(layer)
+
+        self.assertIn("%s::jsonb @>", predicate.as_string(None))
+        self.assertEqual(['[1,"1"]'], params)
+        self.assertEqual(
+            {
+                "source": "featureSet",
+                "field": "oa21cd",
+                "configuredCount": 3,
+                "comparablePrimitiveCount": 2,
+                "ignoredCount": 1,
+            },
+            descriptor["identifierRestrictions"][0],
+        )
+
+    def test_effective_layer_filter_preserves_xyz_scalar_coercion(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["filter"] = {"default": {
+            "text_code": {"eq": 2},
+            "numeric_code": {"in": ["01", 2, 3.0]},
+            "enabled": {"ni": [True, "false"]},
+            "text_pattern": {"in": ["A%"]},
+        }}
+
+        predicate, params, descriptor = effective_layer_filter(layer)
+
+        rendered = predicate.as_string(None)
+        self.assertIn('"text_code" = %s', rendered)
+        self.assertIn('"numeric_code" = %s', rendered)
+        self.assertIn('NOT (("enabled" = %s', rendered)
+        self.assertEqual(
+            ["2", "01", "2", "3", "true", "false", "A%"], params
+        )
+        self.assertEqual(
+            layer["filter"]["default"], descriptor["fixedFilter"]
+        )
+
+    def test_empty_feature_set_is_inactive_but_empty_lookup_matches_none(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["featureSet"] = []
+
+        predicate, params, descriptor = effective_layer_filter(layer)
+
+        self.assertEqual("TRUE", predicate.as_string(None))
+        self.assertEqual([], params)
+        self.assertEqual([], descriptor["identifierRestrictions"])
+
+        layer["featureLookup"] = []
+        predicate, params, descriptor = effective_layer_filter(layer)
+        self.assertIn("%s::jsonb @>", predicate.as_string(None))
+        self.assertEqual(["[]"], params)
+        self.assertEqual(
+            ["featureLookup"], descriptor["restrictions"]
+        )
+
+    def test_raw_fixed_filter_escapes_psycopg_percent_placeholders(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["filter"] = {
+            "default": "population % 2 = 0 AND name LIKE 'A%'",
+        }
+        layer["featureSet"] = ["cell-1"]
+
+        predicate, params, descriptor = effective_layer_filter(layer)
+
+        rendered = predicate.as_string(None)
+        self.assertIn("population %% 2 = 0", rendered)
+        self.assertIn("name LIKE 'A%%'", rendered)
+        self.assertEqual(['["cell-1"]'], params)
+        self.assertEqual(
+            "population % 2 = 0 AND name LIKE 'A%'",
+            descriptor["fixedFilter"],
+        )
+
+    def test_effective_layer_filter_rejects_unreliable_field_level_or(self):
+        layer = self.database_visual_workspace()["locale"]["layers"][
+            "Arrivals 1951-1960"
+        ]
+        layer["filter"] = {
+            "default": {"score": [{"gte": 1}, {"null": True}]},
+        }
+
+        with self.assertRaisesRegex(ValueError, "field-level OR arrays"):
+            effective_layer_filter(layer)
+
+        layer["filter"] = {"default": {"name": {"like": "%FF"}}}
+        with self.assertRaisesRegex(ValueError, "UTF-8 URL encoding"):
+            effective_layer_filter(layer)
+
+        layer["filter"] = {"default": {"score": {"in": [[1], 2]}}}
+        with self.assertRaisesRegex(ValueError, "finite scalars"):
+            effective_layer_filter(layer)
+
+        layer["filter"] = {"default": {"score": {"gte": "many"}}}
+        with self.assertRaisesRegex(ValueError, "numeric string"):
+            effective_layer_filter(layer)
 
     def test_visual_plan_reports_no_matching_filtered_features(self):
         workspace = self.database_visual_workspace()
@@ -1394,3 +1612,10 @@ class ControlApiTests(unittest.TestCase):
 
         self.assertTrue(raised.exception.filter_applied)
         self.assertIn("filter.default", str(raised.exception))
+        self.assertEqual(
+            0,
+            raised.exception.effective_dataset["filteredFeatureCount"],
+        )
+        self.assertIsNone(
+            raised.exception.effective_dataset["representativeFeature"]
+        )

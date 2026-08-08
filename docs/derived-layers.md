@@ -313,6 +313,79 @@ of **all** points must divide by a count over the complete declared point
 source. Do not reuse a map-filtered or sampled denominator unless the requested
 meaning is explicitly “share of points in this saved map area.”
 
+### Supported area-weighted H3 recipe
+
+Use the read-only recipe planner instead of hand-writing polygon-to-H3
+allocation SQL:
+
+```json
+{
+  "name": "population_h3_r9",
+  "kind": "materialized",
+  "source": {
+    "assetId": "asset-census",
+    "relation": "census.areas",
+    "idColumn": "area_id",
+    "geometryColumn": "source_geom"
+  },
+  "resolution": 9,
+  "measures": [
+    {
+      "sourceColumn": "population",
+      "outputColumn": "population_estimate",
+      "nullHandling": "zero"
+    }
+  ],
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "locale"
+  }
+}
+```
+
+Submit it to
+`POST /api/derived-layers/recipes/area-weighted-h3/plan`, or use
+`config-cli derived-layers plan-area-weighted-h3 --input recipe.json`. The
+caller needs `derive` and `semantic:inspect`. The server requires one exact,
+ready PostgreSQL semantic asset whose binding matches `source.relation`, a
+non-null unique or primary-key ID, Polygon/MultiPolygon geometry with a known
+positive SRID, and one through 32 built-in numeric measures. Output measure
+names use the same lowercase ASCII-safe convention as managed layer names.
+
+The planner resolves the saved workspace scope and returns a replayable
+selector-based `createRequest`, the full `resolvedSpatialScope`, resolved
+source/field metadata, assumptions,
+`queryPlanProbe`, `queryPlanningProbe`, and, for a materialized result,
+`materializationProbe`. It also returns `mutationApplied: false`: inspect the
+meaning, allocation assumptions, scope, and probes, then pass only the reviewed
+`createRequest` to the normal derived-layer create command. Planning never
+creates a relation or changes the workspace. Create deliberately resolves the
+selector and runs preflight again, so a workspace-scope change between review
+and creation cannot silently reuse stale evidence.
+
+The generated query obtains overlap-mode candidate cells only from
+`_mapp_h3_scope`, so coarse cells and cells crossing the scope boundary are not
+silently omitted. It uses the prepared EPSG:27700 metric-area path, bounds
+source polygons in their native SRID by the workspace scope, transforms each
+accepted non-EPSG:27700 geometry once, and computes `ST_Intersection` once per
+accepted polygon/cell pair. The scope chooses source polygons and candidate
+cells; allocation uses each accepted polygon's complete geometry, including
+the part of a boundary cell outside the scope. Each measure is
+allocated as `source value × intersection area ÷ source polygon area`, then
+summed by H3 cell. `nullHandling: "zero"` treats a null measure as zero;
+`"ignore"` excludes that null contribution. Overlapping source polygons
+contribute independently and can double-count overlap, so the returned
+assumptions must remain part of the review evidence. Measure outputs remain
+`double precision` for filtering and symbology; add separately formatted
+feature-information text only at the workspace presentation layer.
+
+This recipe is an ergonomic, guarded construction path, not a guard bypass.
+The same semantic-source, SQL-shape, H3-cell, nested-loop pair, PostgreSQL plan,
+map-scope, geometry, identity, and materialization-size checks used by ordinary
+derived requests run before the planner returns a successful result. Rejected
+plans retain structured reason codes, probe evidence, and reason-specific safe
+rewrite guidance.
+
 ### Query-computation probe
 
 Every create, replace, and materialized refresh first runs non-writing
@@ -566,9 +639,10 @@ declared source relation; it does not estimate metrics from a sampled subset:
 WITH candidate_ids AS (
   SELECT DISTINCT generated.cell AS h3
   FROM _mapp_h3_scope
-  CROSS JOIN LATERAL h3_polygon_to_cells(
+  CROSS JOIN LATERAL h3_polygon_to_cells_experimental(
     _mapp_h3_scope.geom_4326,
-    9
+    9,
+    'overlapping'
   ) AS generated(cell)
 ),
 candidate_cells AS (
@@ -617,8 +691,10 @@ controlled `pg_catalog, public` search path described in provisioning. Qualified
 cast admission does not broaden that path. The explicit typmod remains necessary
 for derived-output validation.
 
-`h3_polygon_to_cells` requires a literal resolution from 0 through 15 and the
-direct `_mapp_h3_scope.geom_4326` argument. The service estimates scope cells
+H3 polygon expansion requires a literal resolution from 0 through 15 and the
+direct `_mapp_h3_scope.geom_4326` argument. The experimental form is admitted
+only with the literal `overlapping` mode, which retains every cell intersecting
+the saved scope. The service estimates scope cells
 from spherical envelope area and H3's average cell area, applies a 1.5 safety
 factor, and blocks estimates above 2,000,000 cells. `h3_grid_disk` and
 `h3_grid_ring` require a literal distance no greater than 25. Non-expanding H3
@@ -639,6 +715,7 @@ PostgreSQL plan budget still applies after these H3-specific checks.
 | `GET /api/derived-layers/map-extent?locale=KEY` | `inspect` | Preview the server-resolved fixed workspace map extent |
 | `GET /api/derived-layers` | `inspect` | Definitions without SQL |
 | `GET /api/derived-layers/{name}` | `inspect` | One definition including SQL |
+| `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derive` + `semantic:inspect` | Resolve, construct, and fully preflight a bounded area-weighted H3 create request without mutating database or workspace state |
 | `POST /api/derived-layers` | `derive` + `semantic:inspect` | Create an automatically map-scoped, compute-probed view or materialized view from ready semantic source profiles; materialized output is also size-probed; accepts optional `background` and locale selector in `spatialScope` |
 | `POST /api/derived-layers/{name}/refresh` | `derive` | Confirmed, compute- and size-probed materialized refresh; accepts optional `background` |
 | `POST /api/derived-layers/{name}/replace` | `derive` + `semantic:inspect` | Confirmed, automatically map-scoped atomic replacement or kind conversion; every query is compute-probed and materialization is size-probed |

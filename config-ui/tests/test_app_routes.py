@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import threading
 import tempfile
 import time
@@ -664,6 +665,32 @@ class LayersRouteTests(unittest.TestCase):
             ["locale.layers.Paths", "locales.cy.layers.Paths"],
         )
 
+    def test_new_noncanonical_layer_key_gets_actionable_warning(self):
+        warnings = app.layer_key_diagnostics(
+            {"locale": {"layers": {"Bus Stops": {"name": "Bus Stops"}}}},
+            {"locale": {"layers": {}}},
+        )
+
+        self.assertEqual(1, len(warnings))
+        self.assertEqual("Bus Stops", warnings[0]["configuredKey"])
+        self.assertEqual("Bus Stops", warnings[0]["resolvedBrowserKey"])
+        self.assertEqual("Bus_Stops", warnings[0]["recommendedKey"])
+        self.assertEqual("warning", app.annotated(warnings)[0]["severity"])
+
+    def test_inherited_noncanonical_layer_key_is_warned_once_at_source(self):
+        candidate = {
+            "locale": {"layers": {"Bus Stops": {"name": "Bus Stops"}}},
+            "locales": {"cy": {"name": "Cymraeg"}},
+        }
+
+        warnings = app.layer_key_diagnostics(
+            candidate,
+            {"locale": {"layers": {}}, "locales": {"cy": {}}},
+        )
+
+        self.assertEqual(1, len(warnings))
+        self.assertEqual("locale.layers.Bus Stops", warnings[0]["path"])
+
     def test_derived_workspace_impact_reports_removed_fields(self):
         workspace = {
             "locale": {"layers": {"Paths": {
@@ -772,6 +799,7 @@ class LayersRouteTests(unittest.TestCase):
                 "table": "derived_layers.areas",
                 "geom": "geom",
                 "qID": "id",
+                "filter": {"default": {"category": {"match": "red"}}},
             }}},
         }
 
@@ -791,7 +819,210 @@ class LayersRouteTests(unittest.TestCase):
             result["values"],
         )
         self.assertTrue(result["truncated"])
-        self.assertEqual((2,), cursor.execute.call_args_list[-1].args[1])
+        self.assertEqual(
+            {"category": {"match": "red"}},
+            result["effectiveDataset"]["effectiveFilter"]["fixedFilter"],
+        )
+        self.assertEqual(
+            ("red", 2),
+            cursor.execute.call_args_list[-1].args[1],
+        )
+
+    def test_layer_statistics_returns_bounded_numeric_distribution(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            ("numeric", "numeric", False),
+            (12, 10, 9, 0.0, 1.0, [0.0, 0.1, 0.5, 0.9, 1.0]),
+            (1, 8, 5, 4),
+        ]
+        cursor.fetchall.return_value = [(1, 4), (2, 5)]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect = MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        workspace = {
+            "dbs": "main",
+            "locale": {"layers": {"Areas": {
+                "format": "mvt",
+                "table": "derived_layers.areas",
+                "geom": "geom",
+                "qID": "id",
+                "filter": {"default": {"percent": {"gte": 0.05}}},
+            }}},
+        }
+
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"main": "postgresql://db"}),
+            patch.object(app.psycopg, "connect", connect),
+        ):
+            result = app.aggregate_layer_statistics(
+                workspace,
+                None,
+                "Areas",
+                "percent",
+                2,
+                [0.05],
+                [0.5],
+            )
+
+        self.assertEqual(12, result["totalCount"])
+        self.assertEqual(2, result["nullCount"])
+        self.assertEqual(9, result["finiteCount"])
+        self.assertEqual(1, result["nonFiniteCount"])
+        self.assertEqual(0.5, result["quantiles"][2]["value"])
+        self.assertEqual([4, 5], [item["count"] for item in result["histogram"]])
+        self.assertEqual(1, result["thresholds"][0]["belowCount"])
+        self.assertEqual([5, 4], [item["count"] for item in result["classes"]])
+        self.assertFalse(result["classes"][0]["upperInclusive"])
+        self.assertEqual(
+            {"percent": {"gte": 0.05}},
+            result["effectiveDataset"]["effectiveFilter"]["fixedFilter"],
+        )
+        summary_query, summary_params = cursor.execute.call_args_list[4].args
+        self.assertIn('"percent" >= %s', summary_query.as_string(None))
+        self.assertIn("percentile_disc", summary_query.as_string(None))
+        self.assertIn(
+            "'1.7976931348623157e308'::numeric",
+            summary_query.as_string(None),
+        )
+        self.assertIn("CASE WHEN", summary_query.as_string(None))
+        self.assertEqual(["0.05"], summary_params)
+
+    def test_layer_statistics_keeps_extreme_histogram_bounds_finite(self) -> None:
+        maximum_float = 1.7976931348623157e308
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            ("double precision", "float8", False),
+            (
+                2,
+                2,
+                2,
+                -maximum_float,
+                maximum_float,
+                [
+                    -maximum_float,
+                    -maximum_float,
+                    -maximum_float,
+                    maximum_float,
+                    maximum_float,
+                ],
+            ),
+        ]
+        cursor.fetchall.return_value = [(1, 1), (2, 1)]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect = MagicMock()
+        connect.return_value.__enter__.return_value = connection
+        workspace = {
+            "dbs": "main",
+            "locale": {"layers": {"Areas": {
+                "format": "mvt",
+                "table": "derived_layers.areas",
+                "geom": "geom",
+                "qID": "id",
+            }}},
+        }
+
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"main": "postgresql://db"}),
+            patch.object(app.psycopg, "connect", connect),
+        ):
+            result = app.aggregate_layer_statistics(
+                workspace, None, "Areas", "percent", 2, [], []
+            )
+
+        bounds = [
+            value
+            for item in result["histogram"]
+            for value in (item["lower"], item["upper"])
+        ]
+        self.assertTrue(all(math.isfinite(value) for value in bounds))
+        self.assertEqual(0.0, result["histogram"][0]["upper"])
+        self.assertTrue(all(
+            math.isfinite(item["value"]) for item in result["quantiles"]
+        ))
+        summary_query = cursor.execute.call_args_list[4].args[0]
+        self.assertIn("percentile_disc", summary_query.as_string(None))
+
+    def test_layer_statistics_route_parses_bounded_thresholds_and_breaks(self):
+        handler, responses = self.handler(
+            "/api/layers/Areas/statistics?field=percent&bins=8"
+            "&threshold=0.05&break=0.5&break=1.0"
+        )
+        handler._authentication = {
+            "actor": "token:test",
+            "scopes": ["derive", "semantic:inspect"],
+        }
+        result = {
+            "locale": "locale",
+            "key": "Areas",
+            "field": "percent",
+        }
+        with (
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", {"locale": {}}, "revision-1"),
+            ),
+            patch.object(
+                app, "aggregate_layer_statistics", return_value=result
+            ) as aggregate,
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual("revision-1", responses[0][1]["revision"])
+        aggregate.assert_called_once_with(
+            {"locale": {}}, None, "Areas", "percent", 8,
+            [0.05], [0.5, 1.0],
+        )
+
+    def test_layer_statistics_handles_an_empty_numeric_distribution(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            ("double precision", "float8", False),
+            (4, 0, 0, None, None, None),
+        ]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        workspace = {
+            "dbs": "main",
+            "locale": {"layers": {"Areas": {
+                "format": "mvt",
+                "table": "derived_layers.areas",
+                "geom": "geom",
+                "qID": "id",
+            }}},
+        }
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"main": "postgresql://db"}),
+            patch.object(app.psycopg, "connect", return_value=connection),
+        ):
+            result = app.aggregate_layer_statistics(
+                workspace, None, "Areas", "percent", 10, [], [],
+            )
+
+        self.assertIsNone(result["min"])
+        self.assertIsNone(result["max"])
+        self.assertEqual([], result["quantiles"])
+        self.assertEqual([], result["histogram"])
+        self.assertEqual(0, result["binsReturned"])
+
+    def test_layer_statistics_route_rejects_nonascending_breaks(self):
+        handler, responses = self.handler(
+            "/api/layers/Areas/statistics?field=percent&break=1&break=1"
+        )
+        handler._authentication = {
+            "actor": "token:test",
+            "scopes": ["derive", "semantic:inspect"],
+        }
+        with patch.object(app, "aggregate_layer_statistics") as aggregate:
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("layer.statistics_invalid", responses[0][1]["code"])
+        aggregate.assert_not_called()
 
     def test_layer_values_requires_and_accepts_derived_create_scopes(self) -> None:
         responses = []
@@ -813,6 +1044,12 @@ class LayersRouteTests(unittest.TestCase):
             "derive",
             app.Handler._required_scope(
                 "/api/layers/Areas/values", "GET"
+            ),
+        )
+        self.assertEqual(
+            "derive",
+            app.Handler._required_scope(
+                "/api/layers/Areas/statistics", "GET"
             ),
         )
 
@@ -879,6 +1116,69 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         }]}
 
     @staticmethod
+    def h3_catalog():
+        return {"assets": [{
+            "id": "asset-census",
+            "version": 7,
+            "status": "ready",
+            "generated": {
+                "qualifiedName": "census.areas",
+                "binding": {
+                    "adapter": "postgresql",
+                    "schema": "census",
+                    "relation": "areas",
+                },
+                "fields": [
+                    {
+                        "id": "field-area-id",
+                        "name": "area_id",
+                        "type": "text",
+                        "nullable": False,
+                        "primaryKey": True,
+                        "unique": True,
+                    },
+                    {
+                        "id": "field-geometry",
+                        "name": "source_geom",
+                        "type": "geometry(MultiPolygon,4326)",
+                        "nullable": False,
+                        "geometryType": "MULTIPOLYGON",
+                        "srid": 4326,
+                    },
+                    {
+                        "id": "field-population",
+                        "name": "population",
+                        "type": "bigint",
+                        "nullable": False,
+                    },
+                ],
+            },
+        }]}
+
+    @staticmethod
+    def h3_recipe():
+        return {
+            "name": "population_h3_r9",
+            "kind": "materialized",
+            "source": {
+                "assetId": "asset-census",
+                "relation": "census.areas",
+                "idColumn": "area_id",
+                "geometryColumn": "source_geom",
+            },
+            "resolution": 9,
+            "measures": [{
+                "sourceColumn": "population",
+                "outputColumn": "population_estimate",
+                "nullHandling": "zero",
+            }],
+            "spatialScope": {
+                "type": "workspace-map-extent",
+                "locale": "city-centre",
+            },
+        }
+
+    @staticmethod
     def materialization_probe(*, estimated_bytes=2 * 1024 ** 3):
         return {
             "method": "postgresql-explain",
@@ -940,6 +1240,13 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 }],
             },
             capabilities["h3Readiness"],
+        )
+        recipe = capabilities["recipes"]["areaWeightedH3"]
+        self.assertFalse(recipe["available"])
+        self.assertFalse(recipe["mutationAppliedByPlan"])
+        self.assertEqual(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            recipe["planPath"],
         )
 
     def test_capabilities_database_error_does_not_expose_raw_context(self):
@@ -1062,6 +1369,128 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "derived_layer.map_extent_unavailable",
             responses[0][1]["code"],
         )
+
+    def test_area_weighted_h3_recipe_is_resolved_and_preflighted_without_mutation(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            self.h3_recipe(),
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value={
+            "asset": self.h3_catalog()["assets"][0],
+        })
+        derived = Mock()
+        derived.preflight_definition.return_value = {
+            "queryPlanProbe": {"method": "postgresql-explain"},
+            "queryPlanningProbe": {"method": "bounded-pairs"},
+            "materializationProbe": {"estimatedBytes": 1024},
+        }
+
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(body["mutationApplied"])
+        plan = body["recipePlan"]
+        self.assertEqual("area-weighted-h3", plan["recipe"]["name"])
+        self.assertEqual(
+            {
+                "type": "workspace-map-extent",
+                "locale": "city-centre",
+            },
+            plan["createRequest"]["spatialScope"],
+        )
+        self.assertIn("envelopes", plan["resolvedSpatialScope"])
+        self.assertEqual(
+            {"method": "postgresql-explain"},
+            plan["queryPlanProbe"],
+        )
+        preflight_request = derived.preflight_definition.call_args.args[0]
+        self.assertEqual(
+            plan["resolvedSpatialScope"],
+            preflight_request["spatialScope"],
+        )
+        self.assertEqual(
+            plan["createRequest"]["query"],
+            preflight_request["query"],
+        )
+        derived.create.assert_not_called()
+        handler._semantic_request.assert_called_once_with(
+            "token:test", "/v1/assets/asset-census"
+        )
+
+    def test_area_weighted_h3_recipe_requires_semantic_inspection_scope(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            self.h3_recipe(),
+        )
+        handler._semantic_request = Mock()
+
+        with patch.object(app, "DERIVED", Mock()):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+        self.assertEqual("semantic:inspect", responses[0][1]["requiredScope"])
+        handler._semantic_request.assert_not_called()
+
+    def test_area_weighted_h3_recipe_reports_missing_semantic_source_without_mutation(self):
+        request = self.h3_recipe()
+        request["source"]["assetId"] = "missing-asset"
+        handler, responses = self.handler(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            request,
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value={
+            "asset": self.h3_catalog()["assets"][0],
+        })
+        derived = Mock()
+
+        with patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("derived_layer.source_profile_required", body["code"])
+        self.assertEqual("plan-area-weighted-h3", body["operation"])
+        self.assertTrue(body["stateUnchanged"])
+        self.assertEqual(
+            "No derived-layer change was applied.",
+            body["safeState"],
+        )
+        derived.preflight_definition.assert_not_called()
+        derived.create.assert_not_called()
+
+    def test_area_weighted_h3_recipe_wraps_semantic_404_as_safe_preflight(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
+            self.h3_recipe(),
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(side_effect=app.SemanticClientError(
+            "asset not found",
+            status=HTTPStatus.NOT_FOUND,
+            payload={"code": "asset_not_found"},
+        ))
+        derived = Mock()
+
+        with patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("derived_layer.source_profile_required", body["code"])
+        self.assertEqual("plan-area-weighted-h3", body["operation"])
+        self.assertEqual("preflight", body["failurePhase"])
+        self.assertTrue(body["stateUnchanged"])
+        self.assertFalse(body["mutationApplied"])
+        derived.preflight_definition.assert_not_called()
+        derived.create.assert_not_called()
 
     def test_synchronous_create_resolves_scope_before_semantics_and_store(self):
         handler, responses = self.handler(
@@ -4194,6 +4623,15 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "zoom": 14,
         }
         handler, responses = self.handler("/api/visual-test", payload)
+        running = {"id": "f" * 32, "status": "running"}
+
+        def finish(operation_id, *, status, result=None, error=None):
+            return {
+                **running,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
 
         with (
             patch.object(
@@ -4207,7 +4645,12 @@ class CandidatePreviewRouteTests(unittest.TestCase):
                 side_effect=self.planning_timeout(),
             ) as visual_plan,
             patch.object(app, "urlopen") as browser,
-            patch.object(app.CONTROL, "create_operation") as create_operation,
+            patch.object(
+                app.CONTROL, "create_operation", return_value=running,
+            ) as create_operation,
+            patch.object(
+                app.CONTROL, "finish_operation", side_effect=finish,
+            ) as finish_operation,
         ):
             handler.do_POST()
 
@@ -4221,7 +4664,16 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertNotIn("technicalDetail", body)
         self.assertEqual(payload, visual_plan.call_args.kwargs["visual_request"])
         browser.assert_not_called()
-        create_operation.assert_not_called()
+        create_operation.assert_called_once()
+        self.assertEqual("failed", body["operation"]["status"])
+        self.assertEqual(
+            "visual.planning_timeout",
+            finish_operation.call_args.kwargs["error"]["code"],
+        )
+        self.assertEqual(
+            "planning",
+            finish_operation.call_args.kwargs["error"]["failedStage"],
+        )
 
     def test_live_visual_reports_no_matching_filtered_features(self):
         handler, responses = self.handler(
@@ -4251,6 +4703,9 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "filtered-feature-count-and-extent", body["queryPurpose"]
         )
         self.assertTrue(body["defaultFilterApplied"])
+        self.assertEqual(0, body["filteredFeatureCount"])
+        self.assertIsNone(body["representativeFeature"])
+        self.assertEqual("no-matching-renderable-geometry", body["reason"])
 
     def test_live_visual_test_sends_requested_information_evidence(self):
         payload = {
@@ -4352,6 +4807,51 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual("feature-count-and-extent", body["queryPurpose"])
         self.assertNotIn("technicalDetail", body)
         self.assertEqual(payload, visual_plan.call_args.kwargs["visual_request"])
+
+    def test_proposal_visual_test_persists_planning_timeout(self):
+        payload = {"layer": "Stops"}
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/visual-test",
+            payload,
+        )
+        proposal = self.proposal()
+        running = {"id": "e" * 32, "status": "running"}
+
+        def finish(operation_id, *, status, result=None, error=None):
+            return {
+                **running,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(
+                app, "visual_plan", side_effect=self.planning_timeout(),
+            ),
+            patch.object(
+                app.CONTROL, "create_operation", return_value=running,
+            ),
+            patch.object(
+                app.CONTROL, "finish_operation", side_effect=finish,
+            ) as finish_operation,
+            patch.object(app, "run_browser_visual") as browser,
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, status)
+        self.assertEqual("failed", body["operation"]["status"])
+        self.assertEqual(
+            "visual.planning_timeout",
+            finish_operation.call_args.kwargs["error"]["code"],
+        )
+        self.assertEqual(
+            "planning",
+            finish_operation.call_args.kwargs["error"]["failedStage"],
+        )
+        browser.assert_not_called()
 
     def test_browser_request_defaults_to_high_resolution_capture(self) -> None:
         response = MagicMock()
@@ -4772,6 +5272,11 @@ class CandidatePreviewRouteTests(unittest.TestCase):
             "/api/proposals/proposal-1/screenshot", {"layer": "Stops"}
         )
         proposal = self.proposal()
+        proposal["original"]["locale"]["layers"]["OriginalOnly"] = {
+            "format": "tiles",
+            "display": True,
+        }
+        proposal["originalHash"] = app.workspace_hash(proposal["original"])
         binding = {
             "source": "candidate",
             "proposalId": "proposal-1",
@@ -4826,6 +5331,26 @@ class CandidatePreviewRouteTests(unittest.TestCase):
         self.assertEqual("http://xyz-preview:3000", runner.call_args.kwargs["target_url"])
         candidate_metadata = runner.call_args.args[2]["metadata"]
         original_metadata = runner.call_args_list[0].args[2]["metadata"]
+        original_diagnostics = runner.call_args_list[0].args[1][
+            "candidateLayerDiagnostics"
+        ]
+        candidate_diagnostics = runner.call_args_list[1].args[1][
+            "candidateLayerDiagnostics"
+        ]
+        self.assertEqual(
+            ["Stops", "OriginalOnly"],
+            original_diagnostics["configuredLayerKeys"],
+        )
+        self.assertEqual(
+            ["Stops"], candidate_diagnostics["configuredLayerKeys"]
+        )
+        self.assertEqual(
+            ["OriginalOnly"],
+            runner.call_args_list[0].args[1]["backgroundLayers"],
+        )
+        self.assertEqual(
+            [], runner.call_args_list[1].args[1]["backgroundLayers"]
+        )
         self.assertEqual(binding, {
             key: candidate_metadata[key] for key in binding
         })

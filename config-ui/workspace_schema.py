@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from plugin_registry import available_plugins, validate_workspace_plugins
 
 DB_KEY = re.compile(r"^[A-Za-z0-9-]+$")
 XYZ_LAYER_KEY = re.compile(r"^[A-Za-z0-9 :_-]+$")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+FIXED_FILTER_NUMBER_RE = re.compile(
+    r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
 RELATION = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?$"
 )
@@ -166,6 +171,24 @@ def expression_error(expression: str) -> str | None:
 
 def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _finite_number_string(value: str) -> bool:
+    if not FIXED_FILTER_NUMBER_RE.fullmatch(value):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except ValueError:
+        return False
+
+
+def _finite_number(value: Any) -> bool:
+    if not _number(value):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _error(errors: list[dict[str, str]], path: str, message: str) -> None:
@@ -884,12 +907,8 @@ def _validate_layer_filter(value, path, errors, fields):
             error = expression_error(default)
             if error:
                 _error(errors, f"{path}.default", error)
-    elif default is not None and not isinstance(default, (dict, list)):
-        _error(
-            errors,
-            f"{path}.default",
-            "Must be a predicate string, filter object, or OR-array.",
-        )
+    elif default is not None:
+        _validate_fixed_layer_filter(default, f"{path}.default", errors)
     for key in ("include", "exclude"):
         selected = value.get(key)
         if selected is None:
@@ -915,6 +934,97 @@ def _validate_layer_filter(value, path, errors, fields):
                     f"{path}.{key}",
                     f"Unknown infoj field: {field}.",
                 )
+
+
+def _validate_fixed_layer_filter(value, path, errors):
+    """Validate the deterministic subset of XYZ's fixed-filter contract."""
+    mappings = value if isinstance(value, list) else [value]
+    if not mappings or not all(isinstance(item, dict) and item for item in mappings):
+        _error(
+            errors,
+            path,
+            "Must be a non-empty filter object or OR-array of filter objects.",
+        )
+        return
+    supported = {
+        "eq", "gt", "gte", "lt", "lte", "boolean", "null", "in", "ni",
+        "like", "match",
+    }
+    for mapping_index, mapping in enumerate(mappings):
+        mapping_path = (
+            f"{path}.{mapping_index}" if isinstance(value, list) else path
+        )
+        for field, tests in mapping.items():
+            field_path = f"{mapping_path}.{field}"
+            if not isinstance(field, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", field
+            ):
+                _error(errors, field_path, "Must use an unquoted field identifier.")
+                continue
+            if not isinstance(tests, dict) or not tests:
+                _error(
+                    errors,
+                    field_path,
+                    "Must be a non-empty object of supported filter operations.",
+                )
+                continue
+            for operation, operand in tests.items():
+                operation_path = f"{field_path}.{operation}"
+                if operation not in supported:
+                    _error(errors, operation_path, "Unsupported fixed-filter operation.")
+                elif operation in {"boolean", "null"} and not isinstance(
+                    operand, bool
+                ):
+                    _error(errors, operation_path, "Must be true or false.")
+                elif operation in {"like", "match"} and (
+                    not isinstance(operand, str) or not operand
+                ):
+                    _error(errors, operation_path, "Must be a non-empty string.")
+                elif operation in {"in", "ni"}:
+                    values = operand if isinstance(operand, list) else [operand]
+                    if not values or any(
+                        item is None
+                        or isinstance(item, (dict, list))
+                        or not isinstance(item, (str, int, float, bool))
+                        or isinstance(item, float) and not math.isfinite(item)
+                        for item in values
+                    ):
+                        _error(
+                            errors,
+                            operation_path,
+                            "Must be a non-empty scalar or array of finite scalars.",
+                        )
+                elif operation in {"eq", "gt", "gte", "lt", "lte"} and (
+                    operand is None
+                    or isinstance(operand, (dict, list, bool))
+                    or not isinstance(operand, (str, int, float))
+                    or isinstance(operand, str) and (
+                        not operand
+                        or operand != operand.strip()
+                        or not _finite_number_string(operand)
+                    )
+                    or isinstance(operand, (int, float))
+                    and not _finite_number(operand)
+                ):
+                    _error(
+                        errors,
+                        operation_path,
+                        "Must be a finite number or numeric string.",
+                    )
+                elif operation == "like":
+                    try:
+                        decoded = unquote(operand, errors="strict")
+                    except UnicodeDecodeError:
+                        decoded = ""
+                    if (
+                        re.search(r"%(?![0-9A-Fa-f]{2})", operand)
+                        or not any(decoded.split(","))
+                    ):
+                        _error(
+                            errors,
+                            operation_path,
+                            "Must contain valid non-empty UTF-8 URL-encoded text.",
+                        )
 
 
 def _validate_style(style, path, errors):

@@ -134,11 +134,13 @@ clients still use the route and response contract owned by the server.
 | `capabilities list\|show` | `GET /api/capabilities` | Discovery response containing `actions[]` | Any authenticated credential, including a semantic-only token |
 | `plugins list\|show\|validate\|usage` | `GET /api/plugins` | — | `inspect` |
 | `workspace get`, `layers list\|get\|style-elements\|filters`, `catalog list`, `icons list`, `sql capabilities` | Workspace, layer, catalog, icon, and SQL capability GET routes | — | `inspect` |
-| `layers values` | `GET /api/layers/{layerKey}/values` | `layers.values` | `derive` + `semantic:inspect`; returns bounded category counts, never raw rows |
+| `layers values` | `GET /api/layers/{layerKey}/values` | `layers.values` | `derive` + `semantic:inspect`; returns bounded category counts from the effective layer restrictions, never raw rows |
+| `layers statistics` | `GET /api/layers/{layerKey}/statistics` | `layers.statistics` | `derive` + `semantic:inspect`; returns bounded numeric aggregates, never raw rows |
 | `validate` | `POST /api/validate` | — | Legacy `full` or administrator session; it never saves |
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
 | `derived-layers capabilities\|list\|show\|map-extent` | `GET /api/derived-layers/*` | `derived-layers.map-extent` for the extent preview | `inspect` |
+| `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Proposal GET routes | — | `inspect` |
@@ -225,6 +227,23 @@ config-cli proposals check \
   --explanation 'Uses ordered numeric score breaks for Bus Stops symbology.'
 ```
 
+`GET /api/layers/{layerKey}/statistics` provides the bounded metadata needed
+to review those breaks. It accepts one stored numeric `field`, `bins` from 1
+through 50, and at most 20 repeated `threshold` and 20 strictly increasing
+`break` values. The read-only five-second queries apply the effective layer's
+fixed filter and identifier restrictions, exclude non-finite values from the
+distribution, and return total/null/finite counts, min/max, fixed
+0/25/50/75/100 discrete percentiles, histogram bins, threshold counts, and exclusive
+upper-bound candidate class counts. Empty distributions return null min/max
+and empty quantile/histogram arrays. Values are aggregates only; no source row
+or field value is returned.
+
+Use a raw numeric field for statistics, filtering, and symbology. A separately
+formatted text field belongs only in hover and feature information. For a
+one-decimal display, a threshold such as `0.05` can be audited directly; a
+final `less_than` break and Filtering maximum should still sit one display
+increment above the observed maximum when the UI boundary is exclusive.
+
 Distributed themes require a stable identity field and at least one usable
 style. XYZ reuses the palette and attempts to avoid equal styles on
 intersecting features:
@@ -309,7 +328,7 @@ request as approval.
 | `GET /api/workspace` | Workspace plus bytes-and-file-generation revision |
 | `GET /api/layers?locale=KEY` | Server-composed effective layers for the selected locale |
 | `GET /api/catalog` | Database connections and renderable tables offered for new layers; omits the PostgreSQL `public` schema |
-| `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, generated-row-aware nested-loop planning, and materialized-size guard availability |
+| `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, supported recipe availability, generated-row-aware nested-loop planning, and materialized-size guard availability |
 | `GET /api/derived-layers/map-extent?locale=KEY` | Preview the selected effective locale's configured north/east/south/west extent, with the legacy view-derived fallback when those bounds are incomplete |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
 | `GET /api/derived-layers/<name>` | One definition including its SQL |
@@ -510,6 +529,17 @@ trust boundaries.
 
 Managed derived-layer database actions are separate from workspace proposals:
 
+- `POST /api/derived-layers/recipes/area-weighted-h3/plan` is the read-only
+  exception in this POST family. It resolves a ready semantic polygon source,
+  constructs the supported scope-bounded EPSG:27700 area-allocation query, and
+  runs the exact create preflight. Its response includes
+  `mutationApplied: false`, resolved source/field metadata, explicit allocation
+  assumptions, a replayable selector-based `createRequest`, the full
+  `resolvedSpatialScope`, and all applicable plan/size probes. Review that
+  evidence, then submit the returned request separately to create; planning
+  itself never creates a database object or workspace change. Create resolves
+  the scope and preflights again so intervening workspace drift remains
+  authoritative.
 - `POST /api/derived-layers` creates a dependency-checked view or materialized
   view with `derive` and `semantic:inspect`; every declared relation source
   must have a ready semantic profile. Database functions, including H3 and
@@ -808,7 +838,10 @@ result/error envelope before the operation becomes terminal. A caller whose
 local wait expires can continue polling the same operation without restarting
 Chromium or losing its eventual report.
 Running visual operations persist stage heartbeats in `stage` and advance
-`updated`. Chromium launch, page readiness, screenshot capture, artifact
+`updated`. Terminal records set `finished` to the same durable timestamp as
+their final `updated`; active records are never removed by bounded history
+pruning. Chromium launch, workspace load, layer registration, interactions,
+screenshot capture, artifact
 persistence, and the complete background operation have independent bounded
 deadlines. A timeout becomes `failed` with `visual.run_timeout`,
 `visual.artifact_persistence_timeout`, `visual.browser_transport_timeout`, or
@@ -822,10 +855,15 @@ terminal write is visible, the watchdog records
 already terminal watchdog result.
 Each browser report includes `activationDiagnostics`: configured candidate and
 server-resolved locale layer keys, URL-resolved keys, configured and rendered
-group membership, registered layer drawers, and the final active OpenLayers
-layer set. In focused mode every requested foreground/background key must be
-registered and active, with no unrequested active layer; otherwise the report
-fails even when the document returned HTTP 200 and contains a canvas.
+group membership, registered layer drawers, and separately labelled URL-hook
+and actual OpenLayers visibility evidence. In focused mode every requested
+foreground/background key receives a `requestedLayerVerdicts` entry covering
+configuration, locale/URL resolution, group, runtime and drawer registration,
+OpenLayers collection membership, visibility, and the final active-and-visible
+decision. An unavailable map inspection fails closed and is reported rather
+than relabelling URL/DOM state as OpenLayers state. Visible layer/group wording
+is always informational because a grouped child can render while XYZ shows
+only its folder label; structural registration drives the verdict.
 Only a pending, integrity-valid proposal whose original
 revision is still current is eligible; declined, applied, conflicted, corrupt,
 or superseded proposals are rejected. The request accepts visual `layer`,
@@ -833,11 +871,20 @@ or superseded proposals are rejected. The request accepts visual `layer`,
 an arbitrary workspace.
 
 Automatic database-backed planning uses the layer's effective rendered
-dataset. Its validated `filter.default` predicate is applied before feature
-count, extent, representative-feature selection, and focus-bound calculation.
+dataset. Its validated `filter.default`, `featureSet`, and `featureLookup`
+restrictions are applied before feature count, extent,
+representative-feature selection, and focus-bound calculation. The plan's
+`effectiveDataset` records the composed locale, source relation, effective
+filter/restriction descriptor, filtered count, and selected representative
+feature. This descriptor is deliberately structured instead of returning
+credentials or executable database text.
 If no matching non-null geometry remains, planning stops before Chromium with
 HTTP 422 and `code: "visual.no_matching_features"`, plus
-`defaultFilterApplied: true` when a fixed predicate was present.
+`filteredFeatureCount: 0`, `representativeFeature: null`, a specific `reason`,
+and the same `effectiveDataset` provenance. Structured fixed filters are
+deeply validated; forms whose pinned XYZ behavior cannot be reproduced
+deterministically are rejected before planning. Trusted predicate strings
+remain subject to the existing read-only expression validation.
 
 Proposal screenshots default to a square 1080×1080 viewport at 1× device scale
 and capture only that viewport, producing an exact 1080×1080 page image.
@@ -900,7 +947,9 @@ timeout returns HTTP 422 with `code: "visual.planning_timeout"`,
 planning failures use `code: "visual.planning_database_error"` with the same
 safe stage and purpose fields. The response does not expose SQL, relation
 names, or raw driver details. These failures happen before Chromium starts, so
-they do not contain a browser report or visual artifacts.
+they do not contain a browser report or visual artifacts. Visual-test and
+screenshot submissions still create and terminalize a durable operation at
+the `planning` stage; metadata-only visual-plan requests do not create one.
 
 When the focused diff changes the selected layer's `infoj` feature-information
 configuration, the runner selects a representative feature, waits for XYZ's
@@ -920,10 +969,12 @@ constant expression such as `'<strong>Source:</strong> ONS'::text`; it never
 evaluates or guesses the result of dynamic SQL. A visual-test or screenshot
 request may add up to 20 bounded candidate assertions with
 `expectedInfoPanelText`. The browser report's `interaction` object returns
-`expectedInfoPanelText`, `expectedInfoPanelTextFound`, `infoPanelExpanded`, a
-panel-only text sample, and the `infoPanel` artifact. A requested evidence item
-that was not captured or found makes the visual result fail rather than being
-reported as a generic render pass.
+`requested`, `attempted`, `opened`, `captured`, `failureReason`, expected-text
+matches, a panel-only text sample, and the `infoPanel` artifact. Success
+requires a concrete planned target, an attempted click, a newly opened stable
+identity-bound panel, expected layer/feature identity, requested text, and a
+retained panel capture. Missing or mismatched evidence fails at
+`information-panel` instead of being reported as a generic render pass.
 
 When a proposal adds, removes, or moves the requested layer in an XYZ `group`,
 the comparison isolates that layer: an addition is off before and alone after,
@@ -1099,7 +1150,8 @@ than replace it with a generic error.
 
 A pre-browser planning `422` instead carries
 `visual.planning_timeout` or `visual.planning_database_error` plus
-`planningStage` and `queryPurpose`. It has no browser artifacts to retain.
+`planningStage`, `queryPurpose`, and the failed durable operation. It has no
+browser artifacts to retain.
 
 The browser runner allows one active test by default and is hard-clamped to
 1–4. When it is full, `/api/visual-test` propagates HTTP 429 with the selected

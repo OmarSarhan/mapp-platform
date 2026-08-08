@@ -485,6 +485,16 @@ def _integer_literal(value: Any) -> int | None:
     return _integer_literal(value.get("arg"))
 
 
+def _text_literal(value: Any) -> str | None:
+    if not isinstance(value, dict) or value.get("@") != "A_Const":
+        return None
+    literal = value.get("val")
+    if not isinstance(literal, dict) or literal.get("@") != "String":
+        return None
+    text = literal.get("sval")
+    return text if isinstance(text, str) else None
+
+
 def _postgis_typmods_are_allowed(type_name: dict[str, Any]) -> bool:
     typmods = tuple(type_name.get("typmods", ()))
     if not typmods:
@@ -698,9 +708,15 @@ def _call_with_bounds(
             bound_kind = "literal-series"
     elif name in H3_POLYGON_FUNCTIONS:
         resolution = (
-            _integer_literal(arguments[1]) if len(arguments) == 2 else None
+            _integer_literal(arguments[1]) if len(arguments) >= 2 else None
         )
-        if len(arguments) != 2 or not _is_scope_column(arguments[0]):
+        expected_arity = (
+            3 if name == "h3_polygon_to_cells_experimental" else 2
+        )
+        if (
+            len(arguments) != expected_arity
+            or not _is_scope_column(arguments[0])
+        ):
             reasons.append(_reason(
                 "h3_unscoped_polygon_expansion",
                 "H3 polygon expansion must read the direct server column "
@@ -717,6 +733,16 @@ def _call_with_bounds(
                 "h3_dynamic_resolution",
                 "H3 polygon expansion resolution must be a literal integer "
                 "between 0 and 15.",
+            ))
+        elif (
+            name == "h3_polygon_to_cells_experimental"
+            and _text_literal(arguments[2]) != "overlapping"
+        ):
+            reasons.append(_reason(
+                "h3_polygon_mode",
+                "Experimental H3 polygon expansion must use the literal "
+                "overlapping containment mode so boundary-intersecting cells "
+                "are not omitted.",
             ))
         else:
             bounded_set = True
@@ -1338,7 +1364,15 @@ def inspect_relation_routines(
 
 def inspect_h3_polygon_wrapper(
     cur,
+    *,
+    experimental: bool = False,
 ) -> tuple[RoutineDependency, str] | None:
+    routine_name = (
+        "h3_polygon_to_cells_experimental"
+        if experimental
+        else "h3_polygon_to_cells"
+    )
+    routine_arity = 3 if experimental else 2
     cur.execute(
         """
         WITH approved_extension_namespaces AS (
@@ -1399,10 +1433,11 @@ def inspect_h3_polygon_wrapper(
           JOIN pg_language AS language
             ON language.oid = routine.prolang
           CROSS JOIN postgis_geometry
-          WHERE routine.proname = 'h3_polygon_to_cells'
-            AND routine.pronargs = 2
+          WHERE routine.proname = %s
+            AND routine.pronargs = %s
             AND routine.proargtypes[0] = postgis_geometry.oid
             AND routine.proargtypes[1] = 'int4'::regtype
+            AND (%s = 2 OR routine.proargtypes[2] = 'text'::regtype)
             AND extension.extname = 'h3_postgis'
             AND extension.extnamespace = routine.pronamespace
         )
@@ -1430,7 +1465,12 @@ def inspect_h3_polygon_wrapper(
         FROM wrapper
         CROSS JOIN approved_extension_path
         """,
-        (sorted(APPROVED_EXTENSIONS),),
+        (
+            sorted(APPROVED_EXTENSIONS),
+            routine_name,
+            routine_arity,
+            routine_arity,
+        ),
     )
     rows = cur.fetchall()
     if len(rows) != 1:

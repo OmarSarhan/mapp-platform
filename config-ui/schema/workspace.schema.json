@@ -1251,6 +1251,59 @@
       ],
       "additionalProperties": true
     },
+    "fixedLayerFilterTests": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "eq": {"$ref": "#/$defs/numericFilterOperand"},
+        "gt": {"$ref": "#/$defs/numericFilterOperand"},
+        "gte": {"$ref": "#/$defs/numericFilterOperand"},
+        "lt": {"$ref": "#/$defs/numericFilterOperand"},
+        "lte": {"$ref": "#/$defs/numericFilterOperand"},
+        "boolean": {"type": "boolean"},
+        "null": {"type": "boolean"},
+        "in": {
+          "oneOf": [
+            {"type": ["string", "number", "boolean"]},
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": ["string", "number", "boolean"]}
+            }
+          ]
+        },
+        "ni": {
+          "oneOf": [
+            {"type": ["string", "number", "boolean"]},
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": ["string", "number", "boolean"]}
+            }
+          ]
+        },
+        "like": {"type": "string", "minLength": 1},
+        "match": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "fixedLayerFilterMapping": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+      "additionalProperties": {
+        "$ref": "#/$defs/fixedLayerFilterTests"
+      }
+    },
+    "numericFilterOperand": {
+      "oneOf": [
+        {"type": "number"},
+        {
+          "type": "string",
+          "pattern": "^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
+        }
+      ]
+    },
     "layerFilter": {
       "type": "object",
       "properties": {
@@ -1268,7 +1321,16 @@
           "uniqueItems": true
         },
         "default": {
-          "description": "Fixed server-side filter composed with interactive filters. XYZ accepts a filter object, OR-array, or trusted template string."
+          "description": "Fixed server-side filter composed with interactive filters. Use the validated deterministic object/OR-array form, or a separately reviewed trusted predicate string.",
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"$ref": "#/$defs/fixedLayerFilterMapping"},
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/$defs/fixedLayerFilterMapping"}
+            }
+          ]
         },
         "drawer": {"type": ["string", "boolean"]},
         "dialog": {"type": ["boolean", "object"]},

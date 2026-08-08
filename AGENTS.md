@@ -81,6 +81,25 @@ that this is a verified deployed class list, not a literal colour or a
 `groupColor`/`groupColour` workspace property. Operators should apply the same
 class list to every member and verify the drawer in candidate evidence.
 
+Visual planning must describe and query the same effective locale-layer
+dataset: fixed default filters plus configured feature-set/lookup restrictions
+apply to counts, extents, representative features, and focus. Keep visible
+layer/group wording informational; browser binding, structural group
+registration, actual map-layer visibility, interaction attempts, and retained
+artifacts are separate evidence.
+
+Numeric distribution inspection is aggregate-only and bounded. Apply the same
+effective layer restrictions, accept only stored numeric columns and finite
+bounded thresholds/breaks, and never return source rows. Raw numeric fields own
+filters and symbology; formatted text fields are display-only.
+
+Supported area-weighted H3 planning is read-only and semantic-profile driven.
+Generate candidates only from the resolved workspace scope, use the prepared
+metric-area path, prefilter source geometries in their native SRID, transform
+accepted non-native source geometries once, and intersect each accepted
+polygon/cell pair once. Return the exact create request,
+assumptions, and normal guard probes; creating it remains a separate action.
+
 ## Semantic invariants
 
 Generated relation and field facts are lifecycle-owned; only curated

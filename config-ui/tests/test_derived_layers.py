@@ -32,6 +32,7 @@ from derived_layers import (
     DerivedLayerQueryTooExpensive,
     DerivedLayerResetOwnershipError,
     DerivedLayerStore,
+    plan_area_weighted_h3_recipe,
     validate_definition,
 )
 
@@ -52,6 +53,385 @@ class DerivedLayerCancellationTests(unittest.TestCase):
         connection.commit.assert_not_called()
         connection.close.assert_called_once_with()
         self.assertFalse(cancellation.request())
+
+
+class AreaWeightedH3RecipeTests(unittest.TestCase):
+    @staticmethod
+    def source_asset(*, srid=4326):
+        return {
+            "id": "asset-census",
+            "version": 7,
+            "status": "ready",
+            "generated": {
+                "qualifiedName": "census.areas",
+                "binding": {
+                    "adapter": "postgresql",
+                    "alias": "MAPP",
+                    "schema": "census",
+                    "relation": "areas",
+                },
+                "fields": [
+                    {
+                        "id": "field-area-id",
+                        "name": "area_id",
+                        "type": "text",
+                        "nullable": False,
+                        "primaryKey": True,
+                        "unique": True,
+                    },
+                    {
+                        "id": "field-geometry",
+                        "name": "source_geom",
+                        "type": f"geometry(MultiPolygon,{srid})",
+                        "nullable": False,
+                        "primaryKey": False,
+                        "unique": False,
+                        "geometryType": "MULTIPOLYGON",
+                        "srid": srid,
+                    },
+                    {
+                        "id": "field-population",
+                        "name": "population",
+                        "type": "bigint",
+                        "nullable": False,
+                        "primaryKey": False,
+                        "unique": False,
+                    },
+                    {
+                        "id": "field-households",
+                        "name": 'house" holds',
+                        "type": "numeric(12, 2)",
+                        "nullable": True,
+                        "primaryKey": False,
+                        "unique": False,
+                    },
+                ],
+            },
+        }
+
+    @staticmethod
+    def request(**updates):
+        value = {
+            "name": "population_h3_r9",
+            "kind": "materialized",
+            "source": {
+                "assetId": "asset-census",
+                "relation": "census.areas",
+                "idColumn": "area_id",
+                "geometryColumn": "source_geom",
+            },
+            "resolution": 9,
+            "measures": [
+                {
+                    "sourceColumn": "population",
+                    "outputColumn": "population_estimate",
+                    "nullHandling": "zero",
+                },
+                {
+                    "sourceColumn": 'house" holds',
+                    "outputColumn": "households_estimate",
+                    "nullHandling": "ignore",
+                },
+            ],
+            "description": "  Area weighted census estimates.  ",
+            "spatialScope": {
+                "type": "workspace-map-extent",
+                "locale": "leeds",
+            },
+        }
+        value.update(updates)
+        return value
+
+    def test_plans_bounded_query_and_resolved_metadata_without_preflight(self):
+        result = plan_area_weighted_h3_recipe(
+            self.request(),
+            self.source_asset(),
+        )
+
+        self.assertEqual({
+            "name": "area-weighted-h3",
+            "version": 1,
+            "areaCrs": "EPSG:27700",
+            "candidateContainment": "overlapping",
+        }, result["recipe"])
+        self.assertEqual(9, result["resolution"])
+        self.assertEqual("transform", result["source"]["metricGeometry"]["mode"])
+        self.assertEqual(
+            "field-population",
+            result["measures"][0]["sourceField"]["id"],
+        )
+        self.assertEqual(
+            "double precision",
+            result["measures"][0]["outputType"],
+        )
+        self.assertGreaterEqual(len(result["assumptions"]), 3)
+
+        create_request = result["createRequest"]
+        self.assertEqual("population_h3_r9", create_request["name"])
+        self.assertEqual("materialized", create_request["kind"])
+        self.assertEqual(["census.areas"], create_request["sources"])
+        self.assertEqual("h3_id", create_request["idColumn"])
+        self.assertEqual("geom_3857", create_request["geometryColumn"])
+        self.assertEqual({
+            "type": "workspace-map-extent",
+            "locale": "leeds",
+        }, create_request["spatialScope"])
+        self.assertEqual(
+            "Area weighted census estimates.",
+            create_request["description"],
+        )
+
+        query = create_request["query"]
+        inspection = inspect_query_ast(query)
+        polygon_calls = inspection.calls_named({
+            "h3_polygon_to_cells_experimental"
+        })
+        self.assertEqual(1, len(polygon_calls))
+        self.assertEqual(9, polygon_calls[0].literal_integers[1])
+        self.assertIn("FROM _mapp_h3_scope", query)
+        self.assertIn(
+            "_mapp_h3_scope.geom_4326,\n            9,"
+            "\n            'overlapping'",
+            query,
+        )
+        self.assertEqual(1, query.lower().count("st_intersection("))
+        self.assertIn("pair_areas AS MATERIALIZED", query)
+        self.assertIn("source_scope AS MATERIALIZED", query)
+        self.assertIn("bounded_sources AS MATERIALIZED", query)
+        self.assertIn("metric_sources AS MATERIALIZED", query)
+        self.assertIn(
+            "SELECT _mapp_h3_scope.geom_4326 AS geom_source",
+            query,
+        )
+        self.assertIn(
+            'WHERE source."source_geom" && source_scope.geom_source',
+            query,
+        )
+        self.assertIn(
+            'public.ST_Intersects(\n                      source."source_geom",'
+            "\n                      source_scope.geom_source",
+            query,
+        )
+        self.assertEqual(
+            1,
+            query.count("public.ST_Transform(source_geom, 27700)"),
+        )
+        self.assertIn(
+            'COALESCE(source."population"::double precision, 0.0)',
+            query,
+        )
+        self.assertIn(
+            'source."house"" holds"::double precision AS "measure_2"',
+            query,
+        )
+        self.assertNotIn(
+            'COALESCE(source."house"" holds"::double precision',
+            query,
+        )
+        resolved_request = {
+            **create_request,
+            "spatialScope": DerivedLayerDefinitionTests.spatial_scope(),
+        }
+        self.assertEqual(
+            query,
+            validate_definition(resolved_request)["query"],
+        )
+
+    def test_prefilters_in_source_srid_then_transforms_once_and_quotes_columns(self):
+        request = self.request()
+        request["source"]["geometryColumn"] = 'source" geom'
+        asset = self.source_asset(srid=3857)
+        asset["generated"]["fields"][1]["name"] = 'source" geom'
+
+        query = plan_area_weighted_h3_recipe(
+            request,
+            asset,
+        )["createRequest"]["query"]
+
+        transformed = "public.ST_Transform(source_geom, 27700)"
+        self.assertEqual(1, query.count(transformed))
+        self.assertIn(
+            "public.ST_Transform(_mapp_h3_scope.geom_4326, 3857) "
+            "AS geom_source",
+            query,
+        )
+        self.assertIn(
+            'WHERE source."source"" geom" && source_scope.geom_source',
+            query,
+        )
+        self.assertIn(
+            'public.ST_Intersects(\n                      source."source"" geom",'
+            "\n                      source_scope.geom_source",
+            query,
+        )
+        self.assertIn("JOIN metric_sources AS source", query)
+        self.assertIn(
+            "ON source.source_geom_27700 && cell.geom_27700",
+            query,
+        )
+
+    def test_uses_native_27700_geometry_for_indexable_join(self):
+        query = plan_area_weighted_h3_recipe(
+            self.request(),
+            self.source_asset(srid=27700),
+        )["createRequest"]["query"]
+
+        self.assertNotIn(
+            'ST_Transform(source."source_geom", 27700)',
+            query,
+        )
+        self.assertIn("bounded_sources AS MATERIALIZED", query)
+        self.assertIn(
+            "public.ST_Transform(_mapp_h3_scope.geom_4326, 27700) "
+            "AS geom_source",
+            query,
+        )
+        self.assertIn(
+            'WHERE source."source_geom" && source_scope.geom_source',
+            query,
+        )
+        self.assertIn(
+            "JOIN bounded_sources AS source",
+            query,
+        )
+        self.assertIn(
+            "source.source_geom AS source_geom_27700",
+            query,
+        )
+        result = plan_area_weighted_h3_recipe(
+            self.request(),
+            self.source_asset(srid=27700),
+        )
+        self.assertEqual("native", result["source"]["metricGeometry"]["mode"])
+
+    def test_rejects_open_recipe_objects_and_invalid_bounds(self):
+        invalid_requests = []
+        request = self.request()
+        request["unexpected"] = True
+        invalid_requests.append(request)
+        request = self.request()
+        request["source"]["unexpected"] = True
+        invalid_requests.append(request)
+        request = self.request()
+        request["measures"][0]["unexpected"] = True
+        invalid_requests.append(request)
+        request = self.request()
+        request["spatialScope"]["envelopes"] = []
+        invalid_requests.append(request)
+        invalid_requests.extend(
+            self.request(resolution=value)
+            for value in (True, -1, 16, 9.0)
+        )
+        invalid_requests.append(self.request(measures=[]))
+        invalid_requests.append(self.request(
+            measures=self.request()["measures"] * 17,
+        ))
+
+        for request in invalid_requests:
+            with self.subTest(request=request):
+                with self.assertRaises(DerivedLayerError):
+                    plan_area_weighted_h3_recipe(
+                        request,
+                        self.source_asset(),
+                    )
+
+    def test_rejects_ambiguous_or_unsafe_measure_definitions(self):
+        invalid_measures = [
+            [
+                {
+                    "sourceColumn": "population",
+                    "outputColumn": "population_estimate",
+                    "nullHandling": "zero",
+                },
+                {
+                    "sourceColumn": "population",
+                    "outputColumn": "population_other",
+                    "nullHandling": "ignore",
+                },
+            ],
+            [
+                {
+                    "sourceColumn": "population",
+                    "outputColumn": "population_estimate",
+                    "nullHandling": "zero",
+                },
+                {
+                    "sourceColumn": 'house" holds',
+                    "outputColumn": "population_estimate",
+                    "nullHandling": "ignore",
+                },
+            ],
+            [{
+                "sourceColumn": "population",
+                "outputColumn": "geom_3857",
+                "nullHandling": "zero",
+            }],
+            [{
+                "sourceColumn": "population",
+                "outputColumn": "Population Estimate",
+                "nullHandling": "zero",
+            }],
+            [{
+                "sourceColumn": "population",
+                "outputColumn": "population_estimate",
+                "nullHandling": "drop",
+            }],
+        ]
+
+        for measures in invalid_measures:
+            with self.subTest(measures=measures):
+                with self.assertRaises(DerivedLayerError):
+                    plan_area_weighted_h3_recipe(
+                        self.request(measures=measures),
+                        self.source_asset(),
+                    )
+
+    def test_rejects_unready_or_mismatched_source_profiles(self):
+        assets = []
+        asset = self.source_asset()
+        asset["status"] = "draft"
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["id"] = "asset-other"
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["binding"]["relation"] = "other_areas"
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["qualifiedName"] = "census.other_areas"
+        assets.append(asset)
+
+        for asset in assets:
+            with self.subTest(asset=asset):
+                with self.assertRaises(DerivedLayerError):
+                    plan_area_weighted_h3_recipe(self.request(), asset)
+
+    def test_rejects_invalid_identity_geometry_and_measure_metadata(self):
+        assets = []
+        asset = self.source_asset()
+        asset["generated"]["fields"][0]["nullable"] = True
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["fields"][0]["primaryKey"] = False
+        asset["generated"]["fields"][0]["unique"] = False
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["fields"][1]["geometryType"] = "POINT"
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["fields"][1]["srid"] = 0
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["fields"][2]["type"] = "text"
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["fields"][2]["nullable"] = None
+        assets.append(asset)
+
+        for asset in assets:
+            with self.subTest(asset=asset):
+                with self.assertRaises(DerivedLayerError):
+                    plan_area_weighted_h3_recipe(self.request(), asset)
 
 
 class DerivedLayerDefinitionTests(unittest.TestCase):
@@ -1216,9 +1596,12 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         wrapper = {
             "kind": "function",
             "object_oid": 100,
-            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "identity": (
+                "public.h3_polygon_to_cells_experimental"
+                "(geometry,integer,text)"
+            ),
             "schema": "public",
-            "name": "h3_polygon_to_cells",
+            "name": "h3_polygon_to_cells_experimental",
             "extension": "h3_postgis",
             "extension_schema": "public",
             "implementation_schema": "public",
@@ -1238,7 +1621,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             "geometry_schema": "public",
         }
         cursor.fetchall.side_effect = [extensions, [wrapper]]
-        cursor.fetchone.return_value = {"cellCount": 0}
+        cursor.fetchone.return_value = {"cellCount": 1}
         store = self.store_with_cursor(cursor)
 
         capabilities = store.capabilities()
@@ -1318,6 +1701,10 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             query_guard["h3"]["maxEstimatedExpandedCells"],
         )
         self.assertTrue(capabilities["h3Available"])
+        recipe = capabilities["recipes"]["areaWeightedH3"]
+        self.assertTrue(recipe["available"])
+        self.assertFalse(recipe["mutationAppliedByPlan"])
+        self.assertEqual(32, recipe["maxMeasures"])
         self.assertEqual(
             {
                 "method": "postgresql-catalog-and-execution",
@@ -1336,9 +1723,12 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         ], [{
             "kind": "function",
             "object_oid": 100,
-            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "identity": (
+                "public.h3_polygon_to_cells_experimental"
+                "(geometry,integer,text)"
+            ),
             "schema": "public",
-            "name": "h3_polygon_to_cells",
+            "name": "h3_polygon_to_cells_experimental",
             "extension": "h3_postgis",
             "extension_schema": "public",
             "implementation_schema": "public",
@@ -1364,6 +1754,9 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         capabilities = store.capabilities()
 
         self.assertFalse(capabilities["h3Available"])
+        self.assertFalse(
+            capabilities["recipes"]["areaWeightedH3"]["available"]
+        )
         self.assertEqual(
             {
                 "method": "postgresql-catalog-and-execution",
@@ -1396,9 +1789,12 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         wrapper = {
             "kind": "function",
             "object_oid": 100,
-            "identity": "public.h3_polygon_to_cells(geometry,integer)",
+            "identity": (
+                "public.h3_polygon_to_cells_experimental"
+                "(geometry,integer,text)"
+            ),
             "schema": "public",
-            "name": "h3_polygon_to_cells",
+            "name": "h3_polygon_to_cells_experimental",
             "extension": "h3_postgis",
             "extension_schema": "public",
             "implementation_schema": "public",
@@ -1914,9 +2310,11 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             statement for statement in statements
             if "USING gist" in statement
         ]
-        self.assertEqual(3, len(spatial_indexes))
+        self.assertEqual(4, len(spatial_indexes))
         self.assertTrue(any('"geom_3857"' in item for item in spatial_indexes))
         self.assertTrue(any("ST_Transform" in item and "4326" in item
+                            for item in spatial_indexes))
+        self.assertTrue(any("ST_Transform" in item and "27700" in item
                             for item in spatial_indexes))
         self.assertTrue(any("geography" in item for item in spatial_indexes))
         self.assertTrue(all(
@@ -2036,7 +2434,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             call.args[0].as_string(None)
             for call in cursor.execute.call_args_list
         ]
-        self.assertEqual(3, len(statements))
+        self.assertEqual(4, len(statements))
         self.assertTrue(all(
             item.startswith('ALTER INDEX "derived_layers".')
             for item in statements

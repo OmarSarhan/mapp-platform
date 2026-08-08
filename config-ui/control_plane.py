@@ -269,9 +269,11 @@ class ControlStore:
                     or operation.get("status") not in {"running", "cancelling"}
                 ):
                     continue
+                finished = iso()
                 operation.update({
                     "status": "indeterminate",
-                    "updated": iso(),
+                    "updated": finished,
+                    "finished": finished,
                     "result": None,
                     "error": {
                         "code": "operation.interrupted",
@@ -689,6 +691,7 @@ class ControlStore:
             "target": target or {},
             "created": iso(),
             "updated": iso(),
+            "finished": None,
             "result": None,
             "error": None,
         }
@@ -700,7 +703,19 @@ class ControlStore:
                 ),
                 key=lambda path: path.stat().st_mtime_ns,
             )
-            for stale in existing[:-499]:
+            removable = []
+            for path in existing:
+                try:
+                    record = _strict_json(path.read_text())
+                except (OSError, TypeError, ValueError):
+                    continue
+                status = record.get("status") if isinstance(record, dict) else None
+                if status in {
+                    "succeeded", "failed", "cancelled", "indeterminate",
+                }:
+                    removable.append(path)
+            excess = max(0, len(existing) - 499)
+            for stale in removable[:excess]:
                 stale.unlink()
             _atomic_json(self.operations / f"{operation['id']}.json", operation)
         return operation
@@ -721,9 +736,11 @@ class ControlStore:
                 "succeeded", "failed", "cancelled", "indeterminate",
             }:
                 return operation
+            finished = iso()
             operation.update({
                 "status": status,
-                "updated": iso(),
+                "updated": finished,
+                "finished": finished,
                 "result": result,
                 "error": error,
             })

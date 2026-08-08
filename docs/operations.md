@@ -369,9 +369,11 @@ before/after hover artifact) is non-null.
 Live visual plans/tests and proposal previews also accept bounded
 `expectedInfoPanelText`. The runner opens clicked-feature information at the
 planned interaction, matches those strings only inside the expanded panel,
-and records the match map, panel sample, and dedicated `infoPanel` artifact.
-Treat the content as evidence only when the interaction passed and that
-artifact is present; a generic page-text match is insufficient.
+and records whether the click was requested, attempted, opened, and captured,
+plus a specific failure reason, identity checks, the match map, panel sample,
+and dedicated `infoPanel` artifact. Treat the content as evidence only when the
+identity-bound interaction passed and that artifact is present; a generic
+page-text change is insufficient.
 
 For add, remove, or move changes involving a grouped layer, the comparison
 switches on only the changed layer: additions appear only after, removals only
@@ -385,7 +387,9 @@ preserving the plan, failed report, and authenticated artifact paths. Review
 those artifacts as failure evidence.
 
 Background visual operations also publish a current `stage` and refreshed
-`updated` timestamp. Poll until a terminal status; a browser or end-to-end
+`updated` timestamp. A terminal transition also records `finished`; active
+operations are never removed when bounded terminal history is pruned. Poll
+until a terminal status; a browser or end-to-end
 deadline returns `failed` with `failedStage` and bounded console, page-error,
 and request-failure diagnostics. Timeouts cover launch, page readiness,
 capture, artifact persistence, and the final atomic operation write. The

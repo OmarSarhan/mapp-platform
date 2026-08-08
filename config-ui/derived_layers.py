@@ -129,6 +129,19 @@ H3_AVERAGE_HEX_AREA_KM2 = (
 )
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 RELATION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+NUMERIC_FIELD_TYPE_RE = re.compile(
+    r"^(?:smallint|integer|bigint|int2|int4|int8|real|float4|float8|"
+    r"double\s+precision|numeric(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?|"
+    r"decimal(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)$",
+    re.IGNORECASE,
+)
+AREA_WEIGHTED_H3_RECIPE_NAME = "area-weighted-h3"
+AREA_WEIGHTED_H3_RECIPE_VERSION = 1
+AREA_WEIGHTED_H3_AREA_SRID = 27700
+AREA_WEIGHTED_H3_MAX_MEASURES = 32
+AREA_WEIGHTED_H3_OUTPUT_COLUMNS = frozenset({
+    "h3_id", "h3_resolution", "geom_3857",
+})
 FORBIDDEN_SQL = re.compile(
     r"\b(?:alter|call|comment|copy|create|delete|do|drop|execute|grant|insert|"
     r"listen|merge|notify|refresh|reset|revoke|set|truncate|update|vacuum)\b",
@@ -314,6 +327,672 @@ def _relation(value: str) -> tuple[str, str]:
             "Source relations must be schema-qualified identifiers."
         )
     return tuple(value.split(".", 1))  # type: ignore[return-value]
+
+
+def _closed_recipe_object(
+    value: Any,
+    *,
+    label: str,
+    required: set[str],
+    optional: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise DerivedLayerError(f"{label} must be an object.")
+    optional = optional or set()
+    missing = sorted(required - set(value))
+    if missing:
+        raise DerivedLayerError(
+            f"{label} is missing required properties: " + ", ".join(missing)
+        )
+    unknown = sorted(set(value) - required - optional)
+    if unknown:
+        raise DerivedLayerError(
+            f"Unknown {label} properties: " + ", ".join(unknown)
+        )
+    return value
+
+
+def _recipe_identifier(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > 63
+    ):
+        raise DerivedLayerError(
+            f"{label} must be a non-empty PostgreSQL identifier of at most "
+            "63 bytes."
+        )
+    return value
+
+
+def _recipe_profile_field(
+    fields_by_name: dict[str, dict[str, Any]],
+    name: Any,
+    label: str,
+) -> dict[str, Any]:
+    name = _recipe_identifier(name, label)
+    field = fields_by_name.get(name)
+    if field is None:
+        raise DerivedLayerError(
+            f"{label} {name!r} is not present in the ready semantic profile."
+        )
+    field_type = field.get("type")
+    if not isinstance(field_type, str) or not field_type.strip():
+        raise DerivedLayerError(f"{label} {name!r} has invalid type metadata.")
+    nullable = field.get("nullable")
+    if not isinstance(nullable, bool):
+        raise DerivedLayerError(
+            f"{label} {name!r} has invalid nullable metadata."
+        )
+    for key in ("primaryKey", "unique"):
+        if key in field and not isinstance(field[key], bool):
+            raise DerivedLayerError(
+                f"{label} {name!r} has invalid {key} metadata."
+            )
+    field_id = field.get("id")
+    if field_id is not None and (
+        not isinstance(field_id, str)
+        or not field_id.strip()
+        or field_id != field_id.strip()
+        or len(field_id) > 200
+    ):
+        raise DerivedLayerError(f"{label} {name!r} has invalid field ID metadata.")
+    return field
+
+
+def _resolved_recipe_field(field: dict[str, Any]) -> dict[str, Any]:
+    resolved = {
+        "name": field["name"],
+        "type": field["type"],
+        "nullable": field["nullable"],
+    }
+    if "id" in field:
+        resolved["id"] = field["id"]
+    for key in ("primaryKey", "unique", "geometryType", "srid"):
+        if key in field:
+            resolved[key] = field[key]
+    return resolved
+
+
+def _area_weighted_h3_query(
+    *,
+    relation: tuple[str, str],
+    geometry_column: str,
+    geometry_srid: int,
+    resolution: int,
+    measures: list[dict[str, str]],
+) -> str:
+    source_geometry = sql.SQL("source.{}").format(
+        sql.Identifier(geometry_column)
+    )
+    measure_projections = []
+    pair_measure_columns = []
+    weighted_aggregates = []
+    final_measure_columns = []
+    for index, measure in enumerate(measures, start=1):
+        internal_name = f"measure_{index}"
+        source_measure = sql.SQL("source.{}::double precision").format(
+            sql.Identifier(measure["sourceColumn"])
+        )
+        if measure["nullHandling"] == "zero":
+            source_measure = sql.SQL("COALESCE({}, 0.0)").format(
+                source_measure
+            )
+        measure_projections.append(
+            sql.SQL("{} AS {}").format(
+                source_measure,
+                sql.Identifier(internal_name),
+            )
+        )
+        pair_measure_columns.append(sql.Identifier(internal_name))
+        weighted_aggregates.append(sql.SQL(
+            "SUM({measure} * intersection_area_m2 / "
+            "NULLIF(source_area_m2, 0.0))::double precision AS {output}"
+        ).format(
+            measure=sql.Identifier(internal_name),
+            output=sql.Identifier(measure["outputColumn"]),
+        ))
+        final_measure_columns.append(
+            sql.Identifier(measure["outputColumn"])
+        )
+
+    source_relation = sql.SQL("{}.{}").format(
+        sql.Identifier(relation[0]),
+        sql.Identifier(relation[1]),
+    )
+    source_scope_geometry = (
+        sql.SQL("_mapp_h3_scope.geom_4326")
+        if geometry_srid == 4326
+        else sql.SQL("public.ST_Transform({}, {})").format(
+            sql.SQL("_mapp_h3_scope.geom_4326"),
+            sql.Literal(geometry_srid),
+        )
+    )
+    bounded_source_preparation = sql.SQL("""
+        source_scope AS MATERIALIZED (
+          SELECT {source_scope_geometry} AS geom_source
+          FROM _mapp_h3_scope
+        ),
+        bounded_sources AS MATERIALIZED (
+          SELECT
+            {measure_projections},
+            {source_geometry} AS source_geom
+          FROM {source_relation} AS source
+          WHERE {source_geometry} IS NOT NULL
+            AND EXISTS (
+              SELECT 1
+              FROM source_scope
+              WHERE {source_geometry} && source_scope.geom_source
+                AND public.ST_Intersects(
+                      {source_geometry},
+                      source_scope.geom_source
+                    )
+            )
+        ),
+    """).format(
+        source_scope_geometry=source_scope_geometry,
+        measure_projections=sql.SQL(",\n            ").join(
+            measure_projections
+        ),
+        source_geometry=source_geometry,
+        source_relation=source_relation,
+    )
+    matched_measure_projections = [
+        sql.SQL("source.{}").format(column)
+        for column in pair_measure_columns
+    ]
+    if geometry_srid == AREA_WEIGHTED_H3_AREA_SRID:
+        source_preparation = bounded_source_preparation
+        matched_source = sql.SQL("bounded_sources")
+        metric_geometry = sql.SQL("source.source_geom")
+    else:
+        source_preparation = bounded_source_preparation + sql.SQL("""
+        metric_sources AS MATERIALIZED (
+          SELECT
+            {pair_measure_columns},
+            public.ST_Transform(source_geom, {area_srid})
+              AS source_geom_27700
+          FROM bounded_sources
+        ),
+        """).format(
+            pair_measure_columns=sql.SQL(",\n            ").join(
+                pair_measure_columns
+            ),
+            area_srid=sql.Literal(AREA_WEIGHTED_H3_AREA_SRID),
+        )
+        matched_source = sql.SQL("metric_sources")
+        metric_geometry = sql.SQL("source.source_geom_27700")
+
+    query = sql.SQL("""
+        WITH candidate_ids AS (
+          SELECT DISTINCT generated.cell AS h3
+          FROM _mapp_h3_scope
+          CROSS JOIN LATERAL h3_polygon_to_cells_experimental(
+            _mapp_h3_scope.geom_4326,
+            {resolution},
+            'overlapping'
+          ) AS generated(cell)
+        ),
+        cells_4326 AS MATERIALIZED (
+          SELECT
+            candidate.h3,
+            h3_cell_to_boundary_geometry(candidate.h3)
+              ::public.geometry(Polygon, 4326) AS geom_4326
+          FROM candidate_ids AS candidate
+        ),
+        cells AS MATERIALIZED (
+          SELECT
+            h3,
+            public.ST_Transform(geom_4326, {area_srid})
+              ::public.geometry(Polygon, 27700) AS geom_27700,
+            public.ST_Transform(geom_4326, 3857)
+              ::public.geometry(Polygon, 3857) AS geom_3857
+          FROM cells_4326
+        ),
+        {source_preparation}
+        matched_pairs AS MATERIALIZED (
+          SELECT
+            cell.h3,
+            cell.geom_27700,
+            cell.geom_3857,
+            {matched_measure_projections},
+            {metric_geometry} AS source_geom_27700
+          FROM cells AS cell
+          JOIN {matched_source} AS source
+            ON {metric_geometry} && cell.geom_27700
+           AND public.ST_Intersects(
+                 {metric_geometry},
+                 cell.geom_27700
+               )
+          WHERE {metric_geometry} IS NOT NULL
+        ),
+        pair_areas AS MATERIALIZED (
+          SELECT
+            h3,
+            geom_3857,
+            {pair_measure_columns},
+            public.ST_Area(source_geom_27700) AS source_area_m2,
+            public.ST_Area(
+              public.ST_Intersection(source_geom_27700, geom_27700)
+            ) AS intersection_area_m2
+          FROM matched_pairs
+        ),
+        weighted_cells AS (
+          SELECT
+            h3,
+            geom_3857,
+            {weighted_aggregates}
+          FROM pair_areas
+          WHERE source_area_m2 > 0.0
+            AND intersection_area_m2 > 0.0
+          GROUP BY h3, geom_3857
+        )
+        SELECT
+          h3::text AS h3_id,
+          {resolution}::smallint AS h3_resolution,
+          {final_measure_columns},
+          geom_3857::public.geometry(Polygon, 3857) AS geom_3857
+        FROM weighted_cells
+    """).format(
+        resolution=sql.Literal(resolution),
+        area_srid=sql.Literal(AREA_WEIGHTED_H3_AREA_SRID),
+        source_preparation=source_preparation,
+        matched_measure_projections=sql.SQL(",\n            ").join(
+            matched_measure_projections
+        ),
+        metric_geometry=metric_geometry,
+        matched_source=matched_source,
+        pair_measure_columns=sql.SQL(",\n            ").join(
+            pair_measure_columns
+        ),
+        weighted_aggregates=sql.SQL(",\n            ").join(
+            weighted_aggregates
+        ),
+        final_measure_columns=sql.SQL(",\n          ").join(
+            final_measure_columns
+        ),
+    )
+    return query.as_string(None).strip()
+
+
+def area_weighted_h3_recipe_capability(*, available: bool) -> dict[str, Any]:
+    return {
+        "name": AREA_WEIGHTED_H3_RECIPE_NAME,
+        "version": AREA_WEIGHTED_H3_RECIPE_VERSION,
+        "available": available,
+        "planPath": "/api/derived-layers/recipes/area-weighted-h3/plan",
+        "maxMeasures": AREA_WEIGHTED_H3_MAX_MEASURES,
+        "resolution": {"minimum": 0, "maximum": 15},
+        "spatialScopeType": "workspace-map-extent",
+        "areaCrs": f"EPSG:{AREA_WEIGHTED_H3_AREA_SRID}",
+        "candidateContainment": "overlapping",
+        "mutationAppliedByPlan": False,
+    }
+
+
+def plan_area_weighted_h3_recipe(
+    payload: dict[str, Any],
+    source_asset: dict[str, Any],
+) -> dict[str, Any]:
+    """Plan a bounded, area-weighted H3 derived layer without database I/O."""
+    request = _closed_recipe_object(
+        payload,
+        label="Area-weighted H3 recipe",
+        required={
+            "name", "kind", "source", "resolution", "measures",
+            "spatialScope",
+        },
+        optional={"description"},
+    )
+    name = request["name"]
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise DerivedLayerError(
+            "Recipe name must start with a lowercase letter and contain only "
+            "lowercase letters, numbers, and underscores."
+        )
+    kind = request["kind"]
+    if not isinstance(kind, str) or kind not in {"view", "materialized"}:
+        raise DerivedLayerError("Recipe kind must be view or materialized.")
+
+    source = _closed_recipe_object(
+        request["source"],
+        label="Recipe source",
+        required={"assetId", "relation", "idColumn", "geometryColumn"},
+    )
+    asset_id = source["assetId"]
+    if (
+        not isinstance(asset_id, str)
+        or not asset_id.strip()
+        or asset_id != asset_id.strip()
+        or len(asset_id) > 200
+    ):
+        raise DerivedLayerError(
+            "Recipe source assetId must be non-empty text of at most 200 "
+            "characters."
+        )
+    relation = _relation(source["relation"])
+    if relation[0] == SCHEMA:
+        raise DerivedLayerError(
+            "An area-weighted recipe cannot depend on another managed "
+            "derived layer."
+        )
+
+    resolution = request["resolution"]
+    if (
+        isinstance(resolution, bool)
+        or not isinstance(resolution, int)
+        or not 0 <= resolution <= 15
+    ):
+        raise DerivedLayerError(
+            "Recipe resolution must be an integer from 0 through 15."
+        )
+
+    requested_measures = request["measures"]
+    if (
+        not isinstance(requested_measures, list)
+        or isinstance(requested_measures, (str, bytes))
+        or not 1 <= len(requested_measures) <= AREA_WEIGHTED_H3_MAX_MEASURES
+    ):
+        raise DerivedLayerError(
+            "Recipe measures must contain between 1 and 32 entries."
+        )
+
+    scope = _closed_recipe_object(
+        request["spatialScope"],
+        label="Recipe spatialScope",
+        required={"type"},
+        optional={"locale"},
+    )
+    if scope["type"] != "workspace-map-extent":
+        raise DerivedLayerError(
+            "Recipe spatialScope.type must be workspace-map-extent."
+        )
+    locale = scope.get("locale")
+    if locale is not None and (
+        not isinstance(locale, str)
+        or not locale
+        or locale != locale.strip()
+        or len(locale) > 200
+    ):
+        raise DerivedLayerError(
+            "Recipe spatialScope.locale must be non-empty text of at most "
+            "200 characters."
+        )
+    canonical_scope = {"type": "workspace-map-extent"}
+    if locale is not None:
+        canonical_scope["locale"] = locale
+
+    description = request.get("description")
+    if description is not None and (
+        not isinstance(description, str) or len(description) > 2000
+    ):
+        raise DerivedLayerError(
+            "Recipe description must be text of at most 2000 characters."
+        )
+    description = description.strip() if description is not None else None
+
+    if not isinstance(source_asset, dict):
+        raise DerivedLayerError("Recipe source asset must be an object.")
+    if source_asset.get("id") != asset_id:
+        raise DerivedLayerError(
+            "Recipe source assetId does not match the semantic asset."
+        )
+    if source_asset.get("status") != "ready":
+        raise DerivedLayerError(
+            "Recipe source asset must have a ready semantic profile."
+        )
+    asset_version = source_asset.get("version")
+    if asset_version is not None and (
+        isinstance(asset_version, bool)
+        or not isinstance(asset_version, int)
+        or asset_version < 1
+    ):
+        raise DerivedLayerError("Recipe source asset version is invalid.")
+    generated = source_asset.get("generated")
+    if not isinstance(generated, dict):
+        raise DerivedLayerError(
+            "Recipe source asset has no generated semantic profile."
+        )
+    binding = generated.get("binding")
+    if not isinstance(binding, dict) or binding.get("adapter") != "postgresql":
+        raise DerivedLayerError(
+            "Recipe source asset must use a PostgreSQL binding."
+        )
+    binding_schema = binding.get("schema")
+    binding_relation = binding.get("relation")
+    if (
+        not isinstance(binding_schema, str)
+        or not isinstance(binding_relation, str)
+        or (binding_schema, binding_relation) != relation
+    ):
+        raise DerivedLayerError(
+            "Recipe source relation does not match the semantic asset binding."
+        )
+    binding_alias = binding.get("alias")
+    if binding_alias is not None and (
+        not isinstance(binding_alias, str)
+        or not binding_alias.strip()
+        or len(binding_alias) > 200
+    ):
+        raise DerivedLayerError(
+            "Recipe source asset has invalid binding alias metadata."
+        )
+    qualified_name = generated.get("qualifiedName")
+    if qualified_name is not None and qualified_name != source["relation"]:
+        raise DerivedLayerError(
+            "Recipe source relation does not match the semantic profile name."
+        )
+
+    fields = generated.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise DerivedLayerError(
+            "Recipe source asset must have generated field metadata."
+        )
+    fields_by_name: dict[str, dict[str, Any]] = {}
+    for field in fields:
+        if not isinstance(field, dict):
+            raise DerivedLayerError(
+                "Recipe source asset contains invalid field metadata."
+            )
+        field_name = _recipe_identifier(
+            field.get("name"),
+            "Semantic profile field name",
+        )
+        if field_name in fields_by_name:
+            raise DerivedLayerError(
+                f"Semantic profile contains duplicate field {field_name!r}."
+            )
+        fields_by_name[field_name] = field
+
+    id_field = _recipe_profile_field(
+        fields_by_name,
+        source["idColumn"],
+        "Recipe ID column",
+    )
+    if id_field.get("nullable") is not False or not (
+        id_field.get("primaryKey") is True or id_field.get("unique") is True
+    ):
+        raise DerivedLayerError(
+            "Recipe ID column must be non-null and primary-key or unique."
+        )
+
+    geometry_field = _recipe_profile_field(
+        fields_by_name,
+        source["geometryColumn"],
+        "Recipe geometry column",
+    )
+    if not re.match(
+        r"^geometry(?:\s*\(|$)",
+        geometry_field["type"].strip(),
+        re.IGNORECASE,
+    ):
+        raise DerivedLayerError(
+            "Recipe geometry column must have PostgreSQL geometry metadata."
+        )
+    geometry_type = geometry_field.get("geometryType")
+    if (
+        not isinstance(geometry_type, str)
+        or geometry_type.upper() not in {"POLYGON", "MULTIPOLYGON"}
+    ):
+        raise DerivedLayerError(
+            "Recipe geometry column must be Polygon or MultiPolygon."
+        )
+    geometry_srid = geometry_field.get("srid")
+    if (
+        isinstance(geometry_srid, bool)
+        or not isinstance(geometry_srid, int)
+        or geometry_srid <= 0
+    ):
+        raise DerivedLayerError(
+            "Recipe geometry column must have a positive integer SRID."
+        )
+
+    measures: list[dict[str, str]] = []
+    resolved_measures = []
+    seen_source_columns = set()
+    seen_output_columns = set()
+    for index, value in enumerate(requested_measures, start=1):
+        measure = _closed_recipe_object(
+            value,
+            label=f"Recipe measure {index}",
+            required={"sourceColumn", "outputColumn", "nullHandling"},
+        )
+        source_column = _recipe_identifier(
+            measure["sourceColumn"],
+            f"Recipe measure {index} sourceColumn",
+        )
+        if source_column in seen_source_columns:
+            raise DerivedLayerError(
+                f"Recipe measure sourceColumn {source_column!r} is duplicated."
+            )
+        seen_source_columns.add(source_column)
+        output_column = measure["outputColumn"]
+        if not isinstance(output_column, str) or not NAME_RE.fullmatch(
+            output_column
+        ):
+            raise DerivedLayerError(
+                f"Recipe measure {index} outputColumn must be an ASCII-safe "
+                "lowercase field name."
+            )
+        if output_column in AREA_WEIGHTED_H3_OUTPUT_COLUMNS:
+            raise DerivedLayerError(
+                f"Recipe measure outputColumn {output_column!r} is reserved."
+            )
+        if output_column in seen_output_columns:
+            raise DerivedLayerError(
+                f"Recipe measure outputColumn {output_column!r} is duplicated."
+            )
+        seen_output_columns.add(output_column)
+        null_handling = measure["nullHandling"]
+        if (
+            not isinstance(null_handling, str)
+            or null_handling not in {"zero", "ignore"}
+        ):
+            raise DerivedLayerError(
+                f"Recipe measure {index} nullHandling must be zero or ignore."
+            )
+        source_field = _recipe_profile_field(
+            fields_by_name,
+            source_column,
+            f"Recipe measure {index} sourceColumn",
+        )
+        if not NUMERIC_FIELD_TYPE_RE.fullmatch(source_field["type"].strip()):
+            raise DerivedLayerError(
+                f"Recipe measure sourceColumn {source_column!r} must have a "
+                "built-in numeric type."
+            )
+        normalized = {
+            "sourceColumn": source_column,
+            "outputColumn": output_column,
+            "nullHandling": null_handling,
+        }
+        measures.append(normalized)
+        resolved_measures.append({
+            **normalized,
+            "sourceField": _resolved_recipe_field(source_field),
+            "outputType": "double precision",
+        })
+
+    query = _area_weighted_h3_query(
+        relation=relation,
+        geometry_column=geometry_field["name"],
+        geometry_srid=geometry_srid,
+        resolution=resolution,
+        measures=measures,
+    )
+    create_request = {
+        "name": name,
+        "kind": kind,
+        "query": query,
+        "sources": [source["relation"]],
+        "idColumn": "h3_id",
+        "geometryColumn": "geom_3857",
+        "spatialScope": canonical_scope,
+    }
+    if description:
+        create_request["description"] = description
+
+    resolved_binding = {
+        "adapter": "postgresql",
+        **(
+            {"alias": binding_alias}
+            if binding_alias is not None
+            else {}
+        ),
+        "schema": binding_schema,
+        "relation": binding_relation,
+    }
+    return {
+        "recipe": {
+            "name": AREA_WEIGHTED_H3_RECIPE_NAME,
+            "version": AREA_WEIGHTED_H3_RECIPE_VERSION,
+            "areaCrs": f"EPSG:{AREA_WEIGHTED_H3_AREA_SRID}",
+            "candidateContainment": "overlapping",
+        },
+        "createRequest": create_request,
+        "source": {
+            "assetId": asset_id,
+            **(
+                {"assetVersion": asset_version}
+                if asset_version is not None
+                else {}
+            ),
+            "relation": source["relation"],
+            "binding": resolved_binding,
+            "idColumn": _resolved_recipe_field(id_field),
+            "geometryColumn": _resolved_recipe_field(geometry_field),
+            "metricGeometry": {
+                "srid": AREA_WEIGHTED_H3_AREA_SRID,
+                "mode": (
+                    "native"
+                    if geometry_srid == AREA_WEIGHTED_H3_AREA_SRID
+                    else "transform"
+                ),
+            },
+        },
+        "resolution": resolution,
+        "measures": resolved_measures,
+        "output": {
+            "idColumn": "h3_id",
+            "resolutionColumn": "h3_resolution",
+            "geometryColumn": "geom_3857",
+            "geometryType": "Polygon",
+            "srid": 3857,
+        },
+        "assumptions": [
+            "Each numeric measure is additive and uniformly distributed "
+            "within its source polygon.",
+            "Only H3 cells intersecting the server-resolved workspace map "
+            "extent are candidates.",
+            "Source polygons must intersect that scope, but allocation uses "
+            "each accepted polygon and boundary cell in full.",
+            "Overlapping source polygons contribute independently and may "
+            "therefore double-count their overlap.",
+            "Null source values follow each measure's explicit nullHandling "
+            "rule.",
+        ],
+    }
 
 
 def validate_spatial_scope(value: Any) -> dict[str, Any] | None:
@@ -3588,19 +4267,26 @@ class DerivedLayerStore:
             return cls._h3_not_ready("version-validation")
         try:
             with connection.transaction():
-                inspected = inspect_h3_polygon_wrapper(cur)
+                inspected = inspect_h3_polygon_wrapper(
+                    cur,
+                    experimental=True,
+                )
         except psycopg.Error:
             return cls._h3_not_ready("catalog-resolution")
         if inspected is None:
             return cls._h3_not_ready("catalog-resolution")
         wrapper, geometry_schema = inspected
-        if not h3_polygon_wrapper_is_approved(wrapper):
+        if (
+            wrapper.name != "h3_polygon_to_cells_experimental"
+            or not h3_polygon_wrapper_is_approved(wrapper)
+        ):
             return cls._h3_not_ready("routine-policy")
         probe = sql.SQL("""
             SELECT pg_catalog.count(*) AS "cellCount"
-            FROM {}.h3_polygon_to_cells(
+            FROM {}.h3_polygon_to_cells_experimental(
               {}.ST_GeomFromText(%s, 4326),
-              0
+              0,
+              'overlapping'
             )
         """).format(
             sql.Identifier(wrapper.schema),
@@ -3628,7 +4314,7 @@ class DerivedLayerStore:
         if (
             not isinstance(cell_count, int)
             or isinstance(cell_count, bool)
-            or cell_count < 0
+            or cell_count < 1
         ):
             return cls._h3_not_ready("result-validation")
         return {
@@ -3704,6 +4390,11 @@ class DerivedLayerStore:
                     },
                 },
                 "queryPlanning": self.query_planning_capability(),
+                "recipes": {
+                    "areaWeightedH3": area_weighted_h3_recipe_capability(
+                        available=h3_readiness["ready"],
+                    ),
+                },
                 "extensions": extensions,
                 "h3Available": h3_readiness["ready"],
                 "h3Readiness": h3_readiness,

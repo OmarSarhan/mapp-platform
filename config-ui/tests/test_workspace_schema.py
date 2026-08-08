@@ -178,6 +178,37 @@ class WorkspaceValidationTests(unittest.TestCase):
         paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
         self.assertIn("locale.layers.Places.filter.default", paths)
 
+    def test_validates_structured_default_layer_filter_deeply(self):
+        data = valid_workspace()
+        layer = data["locale"]["layers"]["Places"]
+        layer["filter"] = {"default": [
+            {"population_count": {"gte": 1, "lt": 10}},
+            {"published": {"boolean": True}},
+        ]}
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+        invalid_defaults = (
+            {"published": {"boolean": "true"}},
+            {"population_count": [{"gte": 1}, {"null": True}]},
+            {"population_count": {"between": [1, 10]}},
+            {"population_count": {"gte": "many"}},
+            {"population$count": {"eq": 1}},
+            {"population_count": {"in": [[1], 2]}},
+            {"name": {"like": "%FF"}},
+            [],
+        )
+        for default in invalid_defaults:
+            with self.subTest(default=default):
+                layer["filter"]["default"] = default
+                paths = {
+                    error["path"]
+                    for error in validate_workspace(data, {"MAPP"})
+                }
+                self.assertTrue(any(
+                    path.startswith("locale.layers.Places.filter.default")
+                    for path in paths
+                ))
+
     def test_rejects_invalid_filter_type_and_unknown_included_field(self):
         data = valid_workspace()
         layer = data["locale"]["layers"]["Places"]

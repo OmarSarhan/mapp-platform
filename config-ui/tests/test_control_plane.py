@@ -328,6 +328,9 @@ class ControlPlaneTests(unittest.TestCase):
                 error={"code": "visual.failed", "message": "No canvas."},
             )
             self.assertEqual("failed", store.read_operation(operation["id"])["status"])
+            self.assertIsNone(operation["finished"])
+            self.assertIsNotNone(terminal["finished"])
+            self.assertEqual(terminal["updated"], terminal["finished"])
             self.assertEqual(
                 0o600,
                 stat.S_IMODE(
@@ -360,6 +363,24 @@ class ControlPlaneTests(unittest.TestCase):
                 operation["id"], stage="late-worker-result"
             )
             self.assertEqual(terminal, unchanged)
+
+    def test_operation_retention_never_prunes_active_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            active = store.create_operation(
+                "visual.test", "token:test", {"layer": "Slow layer"}
+            )
+            for index in range(500):
+                completed = store.create_operation(
+                    "visual.test", "token:test", {"index": index}
+                )
+                store.finish_operation(
+                    completed["id"], status="succeeded", result={"ok": True}
+                )
+
+            preserved = store.read_operation(active["id"])
+            self.assertEqual("running", preserved["status"])
+            self.assertIsNone(preserved["finished"])
 
     def test_operation_results_normalize_database_native_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -450,6 +471,7 @@ class ControlPlaneTests(unittest.TestCase):
             recovered = restarted.read_operation(operation["id"])
 
             self.assertEqual("indeterminate", recovered["status"])
+            self.assertEqual(recovered["updated"], recovered["finished"])
             self.assertEqual("operation.interrupted", recovered["error"]["code"])
             self.assertTrue(recovered["error"]["indeterminate"])
             self.assertEqual(
@@ -474,4 +496,5 @@ class ControlPlaneTests(unittest.TestCase):
             recovered = restarted.read_operation(operation["id"])
 
             self.assertEqual("indeterminate", recovered["status"])
+            self.assertEqual(recovered["updated"], recovered["finished"])
             self.assertEqual("operation.interrupted", recovered["error"]["code"])

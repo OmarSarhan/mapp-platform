@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -37,6 +38,8 @@ from derived_layers import (
     DerivedLayerResetOwnershipError,
     DerivedLayerSourceMismatchError,
     DerivedLayerStore,
+    area_weighted_h3_recipe_capability,
+    plan_area_weighted_h3_recipe,
     validate_definition,
     validate_spatial_scope,
 )
@@ -74,7 +77,8 @@ from control_api import (
     VisualPlanningNoMatchingFeatures,
     apply_operations, capabilities, contract, examples, plugin_manifest,
     decode_position_cursor,
-    effective_locales, enforce_collection_payload, is_probeable_database_layer,
+    effective_layer_filter, effective_locales, enforce_collection_payload,
+    is_probeable_database_layer,
     legacy_collection, paginate_collection, paginate_keyset_page,
     pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
@@ -100,6 +104,9 @@ DB_CONNECTIONS = {
 }
 LAYER_VALUES_DEFAULT_LIMIT = 100
 LAYER_VALUES_MAX_LIMIT = 500
+LAYER_STATISTICS_DEFAULT_BINS = 10
+LAYER_STATISTICS_MAX_BINS = 50
+LAYER_STATISTICS_MAX_THRESHOLDS = 20
 SEMANTIC_SOURCE_ALLOWLIST = parse_semantic_source_allowlist(
     os.environ.get(
         "SEMANTIC_SOURCE_ALLOWLIST",
@@ -1662,6 +1669,8 @@ def derived_operation_safe_state(operation: str | None) -> str:
 
 
 def derived_request_operation(request_path: str, derived_action_path) -> str | None:
+    if request_path == "/api/derived-layers/recipes/area-weighted-h3/plan":
+        return "plan-area-weighted-h3"
     if request_path == "/api/derived-layers":
         return "create"
     if derived_action_path:
@@ -1916,6 +1925,11 @@ def derived_query_reason_action(code: str) -> str:
         return "Resolve a workspace map extent before using H3 polygon expansion."
     if code in {"h3_dynamic_resolution", "h3_dynamic_grid_distance"}:
         return "Use the literal H3 resolution or grid-distance bounds in the reason."
+    if code == "h3_polygon_mode":
+        return (
+            "Use h3_polygon_to_cells_experimental with the literal "
+            "'overlapping' containment mode."
+        )
     if code in {"h3_scope_expansion", "h3_composed_expansion"}:
         return "Use a coarser H3 resolution or a smaller literal traversal distance."
     if code in {"h3_unbounded_expansion", "h3_unbounded_child_expansion"}:
@@ -2124,6 +2138,7 @@ def derived_dependency_error(
 
 def derived_validation_error(exc: Exception, operation: str | None) -> dict:
     message = str(exc)
+    normalized_message = message.lower()
     invalid_query = (
         message == "A SELECT query is required."
         or message == "Derived-layer SQL must be one SELECT query."
@@ -2160,7 +2175,11 @@ def derived_validation_error(exc: Exception, operation: str | None) -> dict:
                 "suggestedAction": suggested_action,
             }],
         )
-    if "ready semantic profiles" in message:
+    if (
+        "semantic profile" in normalized_message
+        or "semantic asset" in normalized_message
+        or "semantic catalog" in normalized_message
+    ):
         code = "derived_layer.source_profile_required"
         suggested_action = (
             "Synchronize every listed source with `semantic source sync`, "
@@ -2432,6 +2451,22 @@ def require_semantic_derived_sources(
             + ". Synchronize each source with `semantic source sync` before "
             "creating or replacing a derived layer."
         )
+
+
+def recipe_source_asset_id(payload: dict) -> str:
+    source = payload.get("source")
+    asset_id = source.get("assetId") if isinstance(source, dict) else None
+    if (
+        not isinstance(asset_id, str)
+        or not asset_id.strip()
+        or asset_id != asset_id.strip()
+        or len(asset_id) > 200
+    ):
+        raise DerivedLayerError(
+            "Recipe source assetId must be non-empty text of at most 200 "
+            "characters."
+        )
+    return asset_id
 
 
 def resolve_derived_spatial_scope(payload: dict) -> dict:
@@ -3631,6 +3666,9 @@ def aggregate_layer_values(
         psycopg.sql.Identifier(table_name),
     )
     column = psycopg.sql.Identifier(field)
+    effective_filter, filter_params, filter_descriptor = (
+        effective_layer_filter(layer)
+    )
 
     with psycopg.connect(database_url, connect_timeout=5) as conn:
         with conn.cursor() as cur:
@@ -3673,19 +3711,30 @@ def aggregate_layer_values(
             cur.execute(
                 psycopg.sql.SQL(
                     "SELECT count(*)::bigint, count({column})::bigint, "
-                    "count(DISTINCT {column})::bigint FROM {relation}"
-                ).format(column=column, relation=relation)
+                    "count(DISTINCT {column})::bigint FROM {relation} "
+                    "WHERE {effective_filter}"
+                ).format(
+                    column=column,
+                    relation=relation,
+                    effective_filter=effective_filter,
+                ),
+                filter_params,
             )
             total_count, non_null_count, distinct_count = cur.fetchone()
             cur.execute(
                 psycopg.sql.SQL(
                     "SELECT to_jsonb({column}), count(*)::bigint "
-                    "FROM {relation} WHERE {column} IS NOT NULL "
+                    "FROM {relation} WHERE {effective_filter} "
+                    "AND {column} IS NOT NULL "
                     "GROUP BY {column} "
                     "ORDER BY count(*) DESC, to_jsonb({column})::text "
                     "LIMIT %s"
-                ).format(column=column, relation=relation),
-                (limit,),
+                ).format(
+                    column=column,
+                    relation=relation,
+                    effective_filter=effective_filter,
+                ),
+                (*filter_params, limit),
             )
             values = [
                 {"value": value, "count": count}
@@ -3697,6 +3746,11 @@ def aggregate_layer_values(
         "key": layer_key,
         "field": field,
         "fieldType": field_type,
+        "effectiveDataset": {
+            "scope": "effective-locale-layer",
+            "relation": relation_name,
+            "effectiveFilter": filter_descriptor,
+        },
         "totalCount": total_count,
         "nonNullCount": non_null_count,
         "nullCount": total_count - non_null_count,
@@ -3704,6 +3758,297 @@ def aggregate_layer_values(
         "values": values,
         "limit": limit,
         "truncated": distinct_count > len(values),
+    }
+
+
+def aggregate_layer_statistics(
+    data: dict,
+    requested_locale: str | None,
+    layer_key: str,
+    field: str,
+    bins: int,
+    thresholds: list[float],
+    breaks: list[float],
+) -> dict:
+    """Return bounded numeric distribution metadata without returning rows."""
+    locale_key, locale = select_locale(data, requested_locale)
+    layer = (locale.get("layers") or {}).get(layer_key)
+    if not isinstance(layer, dict):
+        raise FileNotFoundError(layer_key)
+    if not is_probeable_database_layer(layer):
+        raise ValueError(
+            "The selected layer does not use a queryable database relation."
+        )
+
+    db_name = layer_db(data, layer)
+    database_url = DB_CONNECTIONS.get(db_name)
+    if not database_url:
+        raise ValueError("The selected layer database is not configured.")
+    relation_name = layer.get("table")
+    if (
+        not isinstance(relation_name, str)
+        or not relation_name
+        or relation_name.count(".") > 1
+    ):
+        raise ValueError(
+            "The selected layer does not use a valid database relation."
+        )
+    relation_parts = relation_name.split(".")
+    if len(relation_parts) == 1:
+        relation_parts.insert(0, "public")
+    schema_name, table_name = relation_parts
+    relation = psycopg.sql.SQL("{}.{}").format(
+        psycopg.sql.Identifier(schema_name),
+        psycopg.sql.Identifier(table_name),
+    )
+    column = psycopg.sql.Identifier(field)
+    effective_filter, filter_params, filter_descriptor = (
+        effective_layer_filter(layer)
+    )
+    quantile_probabilities = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+    with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SET statement_timeout = '5000ms'")
+            cur.execute("SET LOCAL search_path = pg_catalog, public")
+            cur.execute(
+                """
+                SELECT format_type(attribute.atttypid, attribute.atttypmod),
+                       type.typname,
+                       type.typname = 'geometry'
+                FROM pg_catalog.pg_class AS relation
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = relation.relnamespace
+                JOIN pg_catalog.pg_attribute AS attribute
+                  ON attribute.attrelid = relation.oid
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                JOIN pg_catalog.pg_type AS type
+                  ON type.oid = attribute.atttypid
+                WHERE namespace.nspname = %s
+                  AND relation.relname = %s
+                  AND attribute.attname = %s
+                  AND relation.relkind IN ('r', 'p', 'v', 'm')
+                  AND has_schema_privilege(namespace.oid, 'USAGE')
+                  AND has_table_privilege(relation.oid, 'SELECT')
+                """,
+                (schema_name, table_name, field),
+            )
+            field_metadata = cur.fetchone()
+            if not field_metadata:
+                raise ValueError(
+                    f'The field “{field}” is not a selectable column on this layer.'
+                )
+            field_type, type_name, is_geometry = field_metadata
+            if is_geometry or type_name not in {
+                "int2", "int4", "int8", "float4", "float8", "numeric",
+            }:
+                raise ValueError(
+                    "Layer statistics require a stored numeric field."
+                )
+            finite_value = (
+                psycopg.sql.SQL(
+                    "{column} BETWEEN "
+                    "'-1.7976931348623157e308'::numeric AND "
+                    "'1.7976931348623157e308'::numeric"
+                ).format(column=column)
+                if type_name == "numeric"
+                else psycopg.sql.SQL(
+                    "{column}::double precision NOT IN "
+                    "('NaN'::double precision, 'Infinity'::double precision, "
+                    "'-Infinity'::double precision)"
+                ).format(column=column)
+            )
+            safe_value = psycopg.sql.SQL(
+                "CASE WHEN {finite} THEN {column}::double precision END"
+            ).format(finite=finite_value, column=column)
+
+            cur.execute(
+                psycopg.sql.SQL(
+                    "SELECT count(*)::bigint, count({column})::bigint, "
+                    "count({column}) FILTER (WHERE {finite}), "
+                    "min({safe_value}), max({safe_value}), "
+                    "percentile_disc(ARRAY[0, 0.25, 0.5, 0.75, 1]"
+                    "::double precision[]) WITHIN GROUP "
+                    "(ORDER BY {safe_value}) "
+                    "FILTER (WHERE {finite}) "
+                    "FROM {relation} WHERE {effective_filter}"
+                ).format(
+                    column=column,
+                    finite=finite_value,
+                    safe_value=safe_value,
+                    relation=relation,
+                    effective_filter=effective_filter,
+                ),
+                filter_params,
+            )
+            (
+                total_count,
+                non_null_count,
+                finite_count,
+                minimum,
+                maximum,
+                quantile_values,
+            ) = cur.fetchone()
+
+            histogram_counts: dict[int, int] = {}
+            if finite_count and minimum != maximum:
+                cur.execute(
+                    psycopg.sql.SQL(
+                        "WITH rendered AS ("
+                        " SELECT {safe_value} AS value"
+                        " FROM {relation}"
+                        " WHERE {effective_filter}"
+                        " AND {column} IS NOT NULL AND {finite}"
+                        ") "
+                        "SELECT LEAST(%s, width_bucket(value, %s, %s, %s)) "
+                        "AS bucket, count(*)::bigint "
+                        "FROM rendered GROUP BY bucket ORDER BY bucket"
+                    ).format(
+                        column=column,
+                        safe_value=safe_value,
+                        relation=relation,
+                        effective_filter=effective_filter,
+                        finite=finite_value,
+                    ),
+                    (*filter_params, bins, minimum, maximum, bins),
+                )
+                histogram_counts = dict(cur.fetchall())
+
+            count_expressions = []
+            count_params: list[float] = []
+            for threshold in thresholds:
+                count_expressions.extend([
+                    psycopg.sql.SQL("count(*) FILTER (WHERE value < %s)"),
+                    psycopg.sql.SQL("count(*) FILTER (WHERE value >= %s)"),
+                ])
+                count_params.extend([threshold, threshold])
+            if breaks:
+                count_expressions.append(
+                    psycopg.sql.SQL("count(*) FILTER (WHERE value < %s)")
+                )
+                count_params.append(breaks[0])
+                for lower, upper in zip(breaks, breaks[1:]):
+                    count_expressions.append(psycopg.sql.SQL(
+                        "count(*) FILTER "
+                        "(WHERE value >= %s AND value < %s)"
+                    ))
+                    count_params.extend([lower, upper])
+                count_expressions.append(
+                    psycopg.sql.SQL("count(*) FILTER (WHERE value >= %s)")
+                )
+                count_params.append(breaks[-1])
+            requested_counts = ()
+            if count_expressions:
+                cur.execute(
+                    psycopg.sql.SQL(
+                        "SELECT {counts} FROM ("
+                        " SELECT {safe_value} AS value"
+                        " FROM {relation}"
+                        " WHERE {effective_filter}"
+                        " AND {column} IS NOT NULL AND {finite}"
+                        ") AS rendered"
+                    ).format(
+                        counts=psycopg.sql.SQL(", ").join(count_expressions),
+                        column=column,
+                        safe_value=safe_value,
+                        relation=relation,
+                        effective_filter=effective_filter,
+                        finite=finite_value,
+                    ),
+                    (*count_params, *filter_params),
+                )
+                requested_counts = cur.fetchone()
+
+    minimum = float(minimum) if minimum is not None else None
+    maximum = float(maximum) if maximum is not None else None
+    quantiles = [] if not finite_count else [
+        {"probability": probability, "value": float(value)}
+        for probability, value in zip(
+            quantile_probabilities, quantile_values or (),
+        )
+    ]
+    if not finite_count:
+        histogram = []
+    elif minimum == maximum:
+        histogram = [{
+            "index": 1,
+            "lower": minimum,
+            "upper": maximum,
+            "count": finite_count,
+            "lowerInclusive": True,
+            "upperInclusive": True,
+        }]
+    else:
+        def boundary(index: int) -> float:
+            if index == 0:
+                return minimum
+            if index == bins:
+                return maximum
+            ratio = index / bins
+            return minimum * (1.0 - ratio) + maximum * ratio
+
+        histogram = [
+            {
+                "index": index,
+                "lower": boundary(index - 1),
+                "upper": boundary(index),
+                "count": histogram_counts.get(index, 0),
+                "lowerInclusive": True,
+                "upperInclusive": index == bins,
+            }
+            for index in range(1, bins + 1)
+        ]
+
+    offset = 0
+    threshold_counts = []
+    for threshold in thresholds:
+        threshold_counts.append({
+            "value": threshold,
+            "belowCount": requested_counts[offset],
+            "atOrAboveCount": requested_counts[offset + 1],
+        })
+        offset += 2
+    classes = []
+    if breaks:
+        class_counts = requested_counts[offset:]
+        bounds = [(None, breaks[0]), *zip(breaks, breaks[1:]), (breaks[-1], None)]
+        classes = [
+            {
+                "index": index,
+                "lower": lower,
+                "upper": upper,
+                "count": class_counts[index],
+                "lowerInclusive": lower is not None,
+                "upperInclusive": False,
+            }
+            for index, (lower, upper) in enumerate(bounds)
+        ]
+
+    return {
+        "locale": locale_key,
+        "key": layer_key,
+        "field": field,
+        "fieldType": field_type,
+        "effectiveDataset": {
+            "scope": "effective-locale-layer",
+            "relation": relation_name,
+            "effectiveFilter": filter_descriptor,
+        },
+        "totalCount": total_count,
+        "nonNullCount": non_null_count,
+        "nullCount": total_count - non_null_count,
+        "finiteCount": finite_count,
+        "nonFiniteCount": non_null_count - finite_count,
+        "min": minimum,
+        "max": maximum,
+        "quantiles": quantiles,
+        "histogram": histogram,
+        "thresholds": threshold_counts,
+        "classes": classes,
+        "binsRequested": bins,
+        "binsReturned": len(histogram),
     }
 
 
@@ -3781,6 +4126,56 @@ def semantic_publication_diagnostics(
         else:
             errors.append(diagnostic)
     return errors, warnings
+
+
+def layer_key_diagnostics(
+    candidate: dict,
+    original: dict | None = None,
+) -> list[dict]:
+    """Warn when an accepted XYZ key is less stable than a machine key."""
+    warnings = []
+    original_locales = dict(locale_items(original or {}))
+
+    configured_locales = []
+    default_locale = candidate.get("locale")
+    if isinstance(default_locale, dict):
+        configured_locales.append(("locale", default_locale))
+    named_locales = candidate.get("locales")
+    if isinstance(named_locales, dict):
+        configured_locales.extend(
+            (f"locales.{key}", locale)
+            for key, locale in named_locales.items()
+            if key != "locale" and isinstance(locale, dict)
+        )
+
+    for locale_path, locale in configured_locales:
+        if not isinstance(locale, dict):
+            continue
+        original_layers = (
+            original_locales.get(locale_path, {}).get("layers") or {}
+        )
+        for key in (locale.get("layers") or {}):
+            if (
+                key in original_layers
+                or not isinstance(key, str)
+                or re.fullmatch(r"[A-Za-z0-9_]+", key)
+            ):
+                continue
+            recommended = re.sub(r"[^A-Za-z0-9_]+", "_", key).strip("_")
+            warnings.append({
+                "path": f"{locale_path}.layers.{key}",
+                "code": "workspace.layer_key_noncanonical",
+                "configuredKey": key,
+                "resolvedBrowserKey": key,
+                "recommendedKey": recommended or "layer",
+                "severity": "warning",
+                "message": (
+                    "This accepted XYZ layer key contains display-oriented "
+                    "characters. Prefer ASCII letters, numbers, and underscores "
+                    "for stable URL activation; keep display wording in name."
+                ),
+            })
+    return warnings
 
 
 def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
@@ -4152,6 +4547,8 @@ def annotated(errors):
         message = error.get("message", "")
         if error.get("code") == "semantic.derived_not_ready":
             rule, phase = "semantic.derived_ready", "semantic"
+        elif error.get("code") == "workspace.layer_key_noncanonical":
+            rule, phase = "workspace.layer_key", "schema"
         elif "fieldfx" in path:
             rule, phase = "sql.scalar_read_only", "security"
         elif ".plugins" in path or "Plugin" in message or "plugin" in message:
@@ -4173,7 +4570,7 @@ def annotated(errors):
             "pointer": pointer,
             "ruleId": rule,
             "phase": phase,
-            "severity": "error",
+            "severity": error.get("severity", "error"),
         }
         type_match = re.search(
             r"XYZ ([A-Za-z]+) entries require (?:a )?([^;]+); PostgreSQL returned ([^.]+)\.?$",
@@ -4231,6 +4628,38 @@ def finish_visual_operation(
                 time.sleep(0.05 * (attempt + 1))
     assert last_error is not None
     raise last_error
+
+
+def visual_planning_failure_response(
+    operation: dict,
+    response: dict,
+) -> dict:
+    """Persist a known pre-browser rejection and return its durable envelope."""
+    result = dict(response)
+    error = {
+        "code": response.get("code", "visual.planning_failed"),
+        "message": response.get("error", "Visual planning failed."),
+        "failedStage": "planning",
+    }
+    diagnostics = {
+        key: response[key]
+        for key in (
+            "planningStage",
+            "queryPurpose",
+            "reason",
+            "timeoutMilliseconds",
+        )
+        if response.get(key) is not None
+    }
+    if diagnostics:
+        error["diagnostics"] = diagnostics
+    terminal = finish_visual_operation(
+        operation["id"],
+        status="failed",
+        result=result,
+        error=error,
+    )
+    return {**result, "operation": terminal}
 
 
 def watch_visual_background(
@@ -4581,7 +5010,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return "semantic:propose"
             return "semantic:admin"
         if method == "GET":
-            if re.fullmatch(r"/api/layers/[^/]+/values", path):
+            if re.fullmatch(r"/api/layers/[^/]+/(values|statistics)", path):
                 return "derive"
             if path.startswith("/api/operations/"):
                 return None
@@ -5074,6 +5503,92 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        elif layer_statistics_path := re.fullmatch(
+            r"/api/layers/([^/]+)/statistics", path
+        ):
+            if not self._scope_granted(actor, "semantic:inspect"):
+                return
+            try:
+                query = parse_qs(
+                    urlparse(self.path).query,
+                    keep_blank_values=True,
+                )
+                if (
+                    set(query) - {"field", "locale", "bins", "threshold", "break"}
+                    or any(
+                        len(query.get(key, [])) != 1
+                        for key in ("field", "locale", "bins")
+                        if key in query
+                    )
+                ):
+                    raise ValueError(
+                        "Use one field, optional locale and bins, and repeated "
+                        "threshold or break values."
+                    )
+                field = query.get("field", [None])[0]
+                if not isinstance(field, str) or not field:
+                    raise ValueError("field is required.")
+                try:
+                    bins = int(query.get(
+                        "bins", [str(LAYER_STATISTICS_DEFAULT_BINS)]
+                    )[0])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("bins must be an integer.") from exc
+                if not 1 <= bins <= LAYER_STATISTICS_MAX_BINS:
+                    raise ValueError(
+                        f"bins must be between 1 and {LAYER_STATISTICS_MAX_BINS}."
+                    )
+
+                def requested_numbers(key: str) -> list[float]:
+                    raw = query.get(key, [])
+                    if len(raw) > LAYER_STATISTICS_MAX_THRESHOLDS:
+                        raise ValueError(
+                            f"At most {LAYER_STATISTICS_MAX_THRESHOLDS} {key} "
+                            "values may be requested."
+                        )
+                    try:
+                        values = [float(value) for value in raw]
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{key} values must be numbers.") from exc
+                    if not all(math.isfinite(value) for value in values):
+                        raise ValueError(f"{key} values must be finite numbers.")
+                    return values
+
+                thresholds = requested_numbers("threshold")
+                breaks = requested_numbers("break")
+                if any(lower >= upper for lower, upper in zip(breaks, breaks[1:])):
+                    raise ValueError(
+                        "break values must be unique and strictly increasing."
+                    )
+                _, data, current_revision = read_workspace()
+                result = aggregate_layer_statistics(
+                    data,
+                    query.get("locale", [None])[0],
+                    unquote(layer_statistics_path.group(1)),
+                    field,
+                    bins,
+                    thresholds,
+                    breaks,
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    {"revision": current_revision, **result},
+                )
+            except FileNotFoundError as exc:
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": f"Unknown layer: {exc}",
+                    "code": "layer.not_found",
+                })
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": str(exc),
+                    "code": "layer.statistics_invalid",
+                })
+            except psycopg.Error:
+                self._json(HTTPStatus.BAD_GATEWAY, {
+                    "error": "Layer statistics are unavailable.",
+                    "code": "layer.statistics_unavailable",
+                })
         elif layer_values_path := re.fullmatch(
             r"/api/layers/([^/]+)/values", path
         ):
@@ -5176,6 +5691,13 @@ class Handler(SimpleHTTPRequestHandler):
                         "queryPlanning": (
                             DerivedLayerStore.query_planning_capability()
                         ),
+                        "recipes": {
+                            "areaWeightedH3": (
+                                area_weighted_h3_recipe_capability(
+                                    available=False,
+                                )
+                            ),
+                        },
                         "h3Available": False,
                         "h3Readiness": {
                             "method": "postgresql-catalog-and-execution",
@@ -6220,6 +6742,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/device-authorizations/approve",
             "/api/sql/test",
             "/api/derived-layers",
+            "/api/derived-layers/recipes/area-weighted-h3/plan",
         }
         derived_action_path = re.fullmatch(
             r"/api/derived-layers/([a-z][a-z0-9_]{0,62})/(refresh|replace|drop)",
@@ -6247,11 +6770,15 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         derived_failure_phase: str | None = None
+        visual_operation: dict | None = None
+        visual_planning_active = False
         try:
             payload = self._payload()
             background_operation = payload.pop(
                 _VISUAL_BACKGROUND_OPERATION, None
             )
+            if isinstance(background_operation, dict):
+                visual_operation = background_operation
             visual_background_kind = None
             visual_background_target = None
             if request_path == "/api/visual-test":
@@ -6304,6 +6831,49 @@ class Handler(SimpleHTTPRequestHandler):
                         "statusUrl": f"/api/operations/{operation['id']}",
                     })
                     return
+            if (
+                request_path
+                == "/api/derived-layers/recipes/area-weighted-h3/plan"
+            ):
+                if not self._scope_granted(actor, "semantic:inspect"):
+                    return
+                derived_failure_phase = "preflight"
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                asset_id = recipe_source_asset_id(payload)
+                asset_response = self._semantic_request(
+                    actor,
+                    f"/v1/assets/{quote(asset_id, safe='')}",
+                )
+                source_asset = asset_response.get("asset")
+                if not isinstance(source_asset, dict):
+                    raise DerivedLayerError(
+                        "Semantic asset lookup returned an invalid source profile."
+                    )
+                recipe_plan = plan_area_weighted_h3_recipe(
+                    payload,
+                    source_asset,
+                )
+                create_request = recipe_plan["createRequest"]
+                resolved_create_request = resolve_derived_spatial_scope(
+                    recipe_plan["createRequest"]
+                )
+                probes = DERIVED.preflight_definition(resolved_create_request)
+                recipe_plan = {
+                    **recipe_plan,
+                    "createRequest": create_request,
+                    "resolvedSpatialScope": resolved_create_request[
+                        "spatialScope"
+                    ],
+                    **probes,
+                }
+                self._json(HTTPStatus.OK, {
+                    "recipePlan": recipe_plan,
+                    "mutationApplied": False,
+                })
+                return
             if request_path == "/api/derived-layers":
                 derived_failure_phase = "preflight"
                 if not DERIVED:
@@ -6605,6 +7175,42 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError(
                         "Visual viewMode must be 'focus' or 'default'."
                     )
+                panels = (
+                    visual_panels(payload) if action == "screenshot" else []
+                )
+                if action != "visual-plan":
+                    visual_operation = (
+                        visual_operation
+                        or CONTROL.create_operation(
+                            (
+                                "proposal.screenshot"
+                                if action == "screenshot"
+                                else "proposal.visual-test"
+                            ),
+                            actor,
+                            {
+                                "source": "candidate",
+                                "proposalId": proposal_id,
+                                "candidateHash": proposal["candidateHash"],
+                                "layer": layer_key,
+                                "groups": group_preview["groups"],
+                                "originalLayers": group_preview[
+                                    "original"
+                                ]["layers"],
+                                "candidateLayers": group_preview[
+                                    "candidate"
+                                ]["layers"],
+                                "panels": panels,
+                                "pluginCatalogueFingerprint": proposal[
+                                    "pluginCatalogueFingerprint"
+                                ],
+                            },
+                        )
+                    )
+                    visual_planning_active = True
+                    update_visual_operation_progress(
+                        visual_operation["id"], "planning"
+                    )
                 plan_source = (
                     "candidate"
                     if group_preview["candidate"]["requestedLayerPresent"]
@@ -6684,13 +7290,23 @@ class Handler(SimpleHTTPRequestHandler):
                         for side in ("original", "candidate")
                     )
                 )
-                panels = visual_panels(payload) if action == "screenshot" else []
                 render_plan = dict(plan)
                 original_render_plan = {
                     **render_plan,
                     "anchorLayer": group_preview["original"]["anchorLayer"],
                     "layers": group_preview["original"]["layers"],
+                    "backgroundLayers": group_preview[
+                        "original"
+                    ]["backgroundLayers"],
                     "activeGroups": group_preview["original"]["groups"],
+                    "candidateLayerDiagnostics": {
+                        "configuredLayerKeys": group_preview[
+                            "original"
+                        ]["configuredLayerKeys"],
+                        "groupMembership": group_preview[
+                            "original"
+                        ]["groupMembership"],
+                    },
                     "pluginChecks": plugin_preview_checks(
                         proposal["original"],
                         group_preview["locale"],
@@ -6701,7 +7317,18 @@ class Handler(SimpleHTTPRequestHandler):
                     **render_plan,
                     "anchorLayer": group_preview["candidate"]["anchorLayer"],
                     "layers": group_preview["candidate"]["layers"],
+                    "backgroundLayers": group_preview[
+                        "candidate"
+                    ]["backgroundLayers"],
                     "activeGroups": group_preview["candidate"]["groups"],
+                    "candidateLayerDiagnostics": {
+                        "configuredLayerKeys": group_preview[
+                            "candidate"
+                        ]["configuredLayerKeys"],
+                        "groupMembership": group_preview[
+                            "candidate"
+                        ]["groupMembership"],
+                    },
                     "pluginChecks": plugin_preview_checks(
                         proposal["candidate"],
                         group_preview["locale"],
@@ -6774,27 +7401,14 @@ class Handler(SimpleHTTPRequestHandler):
                             "candidate"
                         ]["expectedText"],
                     }
-                operation = background_operation or CONTROL.create_operation(
-                    (
-                        "proposal.screenshot"
-                        if action == "screenshot"
-                        else "proposal.visual-test"
-                    ),
-                    actor,
-                    {
-                        **binding,
-                        "layer": layer_key,
-                        "groups": group_preview["groups"],
-                        "originalLayers": group_preview["original"]["layers"],
-                        "candidateLayers": group_preview["candidate"]["layers"],
-                        "featureInfoComparison": feature_info_comparison,
-                        "featureInfoEvidence": feature_info_evidence,
-                        "panels": panels,
-                        "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
-                    },
-                )
+                operation = visual_operation
+                if operation is None:
+                    raise RuntimeError(
+                        "Visual operation was not created before planning."
+                    )
                 binding["operationId"] = operation["id"]
                 comparison_binding_valid = True
+                visual_planning_active = False
                 try:
                     # Keep the isolated workspace pinned throughout the
                     # original/candidate comparison so another proposal cannot
@@ -7319,6 +7933,22 @@ class Handler(SimpleHTTPRequestHandler):
                 if not isinstance(layer_key, str) or not layer_key.strip():
                     raise ValueError("Visual requests require a layer key.")
                 _, current_workspace, _ = read_workspace()
+                visual_operation = (
+                    visual_operation
+                    or CONTROL.create_operation(
+                        "visual.test",
+                        actor,
+                        {
+                            "source": "live",
+                            "layer": layer_key,
+                            "locale": payload.get("locale"),
+                        },
+                    )
+                )
+                visual_planning_active = True
+                update_visual_operation_progress(
+                    visual_operation["id"], "planning"
+                )
                 plan = visual_plan(
                     payload.get("workspace", current_workspace),
                     layer_key,
@@ -7334,11 +7964,7 @@ class Handler(SimpleHTTPRequestHandler):
                     plan.get("layers", [layer_key]),
                 )
                 plan["pluginCatalogueFingerprint"] = plugin_catalogue()["fingerprint"]
-                operation = background_operation or CONTROL.create_operation(
-                    "visual.test",
-                    actor,
-                    {"layer": layer_key, "locale": plan.get("locale")},
-                )
+                operation = visual_operation
                 binding = {
                     "source": "live",
                     "operationId": operation["id"],
@@ -7363,6 +7989,7 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                     allow_nan=False,
                 ).encode()
+                visual_planning_active = False
                 try:
                     update_visual_operation_progress(
                         operation["id"], "browser-execution"
@@ -7643,6 +8270,9 @@ class Handler(SimpleHTTPRequestHandler):
                         candidate,
                         current_workspace,
                     )
+                    warnings.extend(layer_key_diagnostics(
+                        candidate, current_workspace,
+                    ))
                     checked["warnings"] = annotated(warnings)
                     self._json(HTTPStatus.OK, {"check": checked})
                 elif request_path == "/api/proposals":
@@ -7667,6 +8297,9 @@ class Handler(SimpleHTTPRequestHandler):
                         candidate,
                         current_workspace,
                     )
+                    warnings.extend(layer_key_diagnostics(
+                        candidate, current_workspace,
+                    ))
                     proposal["warnings"] = annotated(warnings)
                     proposal_write(CONTROL, proposal)
                     self._json(HTTPStatus.CREATED, {"proposal": proposal})
@@ -8121,13 +8754,30 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except VisualPlanningNoMatchingFeatures as exc:
-            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+            response = {
                 "error": str(exc),
                 "code": exc.code,
-                "planningStage": "layer-summary",
-                "queryPurpose": "filtered-feature-count-and-extent",
+                "planningStage": exc.stage,
+                "queryPurpose": (
+                    "filtered-feature-count-and-extent"
+                    if exc.stage == "layer-summary"
+                    else "representative-feature-selection"
+                ),
                 "defaultFilterApplied": exc.filter_applied,
-            })
+                "filteredFeatureCount": 0,
+                "representativeFeature": None,
+                "reason": exc.reason,
+            }
+            if exc.effective_dataset is not None:
+                response["effectiveDataset"] = exc.effective_dataset
+                response["filteredFeatureCount"] = exc.effective_dataset.get(
+                    "filteredFeatureCount", 0
+                )
+            if visual_planning_active and visual_operation is not None:
+                response = visual_planning_failure_response(
+                    visual_operation, response,
+                )
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, response)
         except ValueError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
@@ -8143,6 +8793,16 @@ class Handler(SimpleHTTPRequestHandler):
                     rolled_back=rolled_back,
                 )
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, response)
+            elif visual_planning_active and visual_operation is not None:
+                response = visual_planning_failure_response(
+                    visual_operation,
+                    {
+                        "error": str(exc),
+                        "code": "visual.planning_invalid",
+                        "planningStage": "request-planning",
+                    },
+                )
+                self._json(HTTPStatus.BAD_REQUEST, response)
             else:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileExistsError as exc:
@@ -8159,6 +8819,16 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                     response,
                 )
+            elif visual_planning_active and visual_operation is not None:
+                response = visual_planning_failure_response(
+                    visual_operation,
+                    {
+                        "error": str(exc),
+                        "code": "visual.planning_conflict",
+                        "planningStage": "request-planning",
+                    },
+                )
+                self._json(HTTPStatus.CONFLICT, response)
             else:
                 self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except FileNotFoundError as exc:
@@ -8193,6 +8863,10 @@ class Handler(SimpleHTTPRequestHandler):
             }
             if exc.timed_out:
                 response["timeoutMilliseconds"] = exc.timeout_milliseconds
+            if visual_planning_active and visual_operation is not None:
+                response = visual_planning_failure_response(
+                    visual_operation, response,
+                )
             self._json(HTTPStatus.UNPROCESSABLE_ENTITY, response)
         except psycopg.Error as exc:
             derived_operation = derived_request_operation(
@@ -8227,7 +8901,39 @@ class Handler(SimpleHTTPRequestHandler):
                     {"error": "The database could not complete the request."},
                 )
         except SemanticClientError as exc:
-            self._semantic_error(exc)
+            if (
+                request_path
+                == "/api/derived-layers/recipes/area-weighted-h3/plan"
+            ):
+                status = exc.status or HTTPStatus.SERVICE_UNAVAILABLE
+                if status < 400 or status > 599:
+                    status = HTTPStatus.BAD_GATEWAY
+                if status == HTTPStatus.UNAUTHORIZED:
+                    status = HTTPStatus.BAD_GATEWAY
+                missing = status == HTTPStatus.NOT_FOUND
+                response = derived_blocked_error(
+                    code=(
+                        "derived_layer.source_profile_required"
+                        if missing
+                        else "derived_layer.source_profile_unavailable"
+                    ),
+                    message=(
+                        "The requested semantic source profile does not exist."
+                        if missing
+                        else "The semantic source profile could not be verified."
+                    ),
+                    suggested_action=(
+                        "Synchronize the source with `semantic source sync`, "
+                        "then retry the recipe plan."
+                        if missing
+                        else "Restore semantic profile access, then retry the recipe plan."
+                    ),
+                    operation="plan-area-weighted-h3",
+                    mutationApplied=False,
+                )
+                self._json(status, response)
+            else:
+                self._semantic_error(exc)
         except Exception as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
@@ -8246,6 +8952,16 @@ class Handler(SimpleHTTPRequestHandler):
                         rolled_back=rolled_back,
                     ),
                 )
+            elif visual_planning_active and visual_operation is not None:
+                response = visual_planning_failure_response(
+                    visual_operation,
+                    {
+                        "error": "Visual planning was interrupted.",
+                        "code": "visual.planning_interrupted",
+                        "planningStage": "request-planning",
+                    },
+                )
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, response)
             else:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 

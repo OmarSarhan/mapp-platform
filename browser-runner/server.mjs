@@ -118,6 +118,181 @@ function requestedPanels(input) {
   )))];
 }
 
+function requestedText(value) {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? [value]
+      : [];
+  return [...new Set(values.filter(item => (
+    typeof item === "string" && item.trim()
+  )).map(item => item.trim()))];
+}
+
+async function visibleTextFound(page, value, exact = false) {
+  return page.getByText(value, {exact}).evaluateAll(elements => elements.some(
+    element => {
+      const style = getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+      return (
+        style.display !== "none"
+        && style.visibility !== "hidden"
+        && box.width > 0
+        && box.height > 0
+      );
+    },
+  )).catch(() => false);
+}
+
+async function installMapviewProbe(page) {
+  await page.addInitScript(() => {
+    if (globalThis.__mappEvidenceMapviews) return;
+    const mapviews = globalThis.__mappEvidenceMapviews = [];
+    const capture = mapview => {
+      if (
+        typeof mapview?.Map?.getLayers === "function"
+        && !mapviews.includes(mapview)
+      ) mapviews.push(mapview);
+    };
+    const instrument = value => {
+      const factory = value?.Mapview;
+      if (typeof factory !== "function" || factory.__mappEvidenceWrapped) return;
+      value.Mapview = function (...args) {
+        const result = Reflect.apply(factory, this, args);
+        if (typeof result?.then === "function") {
+          result.then(capture, () => {});
+        } else {
+          capture(result);
+        }
+        return result;
+      };
+      value.Mapview.__mappEvidenceWrapped = true;
+    };
+    let mappValue = globalThis.mapp;
+    instrument(mappValue);
+    try {
+      Object.defineProperty(globalThis, "mapp", {
+        configurable: true,
+        get: () => mappValue,
+        set: value => {
+          mappValue = value;
+          instrument(value);
+        },
+      });
+    } catch {
+      // A host may expose a non-configurable mapp object. Runtime inspection
+      // below still checks the documented global variants without this probe.
+    }
+  });
+}
+
+async function inspectMapRuntime(page) {
+  return page.evaluate(() => {
+    const mapviews = [...new Set([
+      globalThis.__mappEvidenceMapviews?.at(-1),
+      globalThis.mapview,
+      globalThis.mapView,
+      globalThis.mapp?.mapview,
+      globalThis.mapp?.mapView,
+      globalThis.mapp,
+    ].filter(Boolean))];
+    const maps = [];
+    const registeredLayerKeys = new Set();
+    const layerIdentities = [];
+    const selectedFeatures = [];
+    for (const mapview of mapviews) {
+      for (const [key, layer] of Object.entries(mapview.layers || {})) {
+        if (layer?.L) {
+          registeredLayerKeys.add(key);
+          layerIdentities.push([layer.L, key]);
+        }
+      }
+      const current = mapview.interaction?.current;
+      if (current) {
+        selectedFeatures.push({
+          layerKey: current.layer?.key
+            ?? current.L?.get?.("key")
+            ?? layerIdentities.find(([layer]) => layer === current.L)?.[1]
+            ?? null,
+          featureId: current.id
+            ?? current.F?.get?.("id")
+            ?? current.F?.getId?.()
+            ?? null,
+        });
+      }
+      for (const map of [mapview.Map, mapview.map, mapview]) {
+        if (
+          typeof map?.getLayers === "function"
+          && !maps.includes(map)
+        ) maps.push(map);
+      }
+    }
+
+    const collectionLayers = [];
+    let collectionObserved = false;
+    for (const map of maps) {
+      let roots = null;
+      try {
+        roots = map.getLayers()?.getArray?.();
+      } catch {
+        // Leave this map unavailable if its collection cannot be read.
+      }
+      if (!Array.isArray(roots)) continue;
+      collectionObserved = true;
+      for (const layer of roots) {
+        let key = null;
+        let visible = null;
+        try {
+          key = layer.get?.("key")
+            ?? layerIdentities.find(([candidate]) => candidate === layer)?.[1]
+            ?? null;
+          visible = typeof layer.isVisible === "function"
+            ? layer.isVisible(map.getView?.())
+            : layer.getVisible?.() ?? null;
+        } catch {
+          // Preserve null to distinguish unavailable visibility.
+        }
+        if (typeof key === "string") {
+          collectionLayers.push({
+            key,
+            visible: typeof visible === "boolean" ? visible : null,
+          });
+        }
+      }
+    }
+    const collectionLayerKeys = [...new Set(
+      collectionLayers.map(layer => layer.key),
+    )];
+    const activeVisibleLayerKeys = [...new Set(
+      collectionLayers
+        .filter(layer => layer.visible === true)
+        .map(layer => layer.key),
+    )];
+    return {
+      available: collectionObserved,
+      failureReason: collectionObserved
+        ? null
+        : "openlayers-map-collection-unavailable",
+      collectionLayerKeys,
+      activeVisibleLayerKeys,
+      layerVisibility: Object.fromEntries(
+        collectionLayers.map(layer => [layer.key, layer.visible]),
+      ),
+      runtimeRegisteredLayerKeys: [...registeredLayerKeys],
+      selectedFeatures,
+    };
+  }).catch(error => ({
+    available: false,
+    failureReason: "openlayers-inspection-failed",
+    error: error?.message || "OpenLayers inspection failed.",
+    collectionLayerKeys: [],
+    activeVisibleLayerKeys: [],
+    layerVisibility: {},
+    runtimeRegisteredLayerKeys: [],
+    selectedFeatures: [],
+  }));
+}
+
 async function locatorWithDataId(scope, selector, dataId) {
   if (!dataId) return null;
   const candidates = scope.locator(selector);
@@ -763,8 +938,10 @@ async function runVisual(input) {
     }));
     let page;
     let response;
-    await runStage("page-readiness", async () => {
+    let configuredLocale = null;
+    await runStage("workspace-load", async () => {
       page = await browser.newPage({viewport, deviceScaleFactor});
+      await installMapviewProbe(page);
       const configuredLocaleResponses = [];
       page.on("console", message => report.console.push({
         type: message.type(),
@@ -792,27 +969,39 @@ async function runVisual(input) {
       });
       const configuredLocales = (await Promise.all(configuredLocaleResponses))
         .filter(locale => locale && Array.isArray(locale.layers));
+      configuredLocale = configuredLocales.at(-1) || null;
       report.httpStatus = response?.status();
+    });
+    await runStage("layer-registration", async () => {
       report.canvasCount = await page.locator("canvas").count();
       const layerText = input.layerTitle || input.layer;
-      report.layerTextFound = viewMode === "default"
-        ? true
-        : layerText
-        ? await page.getByText(layerText, {exact: false}).count() > 0
+      report.layerTextFound = layerText
+        ? await visibleTextFound(page, layerText)
         : true;
       report.groupTextFound = (
         await Promise.all(
           report.groups.map(
-            group => page.getByText(group, {exact: true}).count(),
+            group => visibleTextFound(page, group, true),
           ),
         )
-      ).every(count => count > 0);
-      const configuredLocale = configuredLocales.at(-1) || null;
-      report.activationDiagnostics = await page.evaluate(({configured, planned}) => {
+      ).every(Boolean);
+      report.layerTextEvidence = {
+        required: false,
+        informational: true,
+        observedText: layerText || null,
+        observedTextFound: report.layerTextFound,
+      };
+      report.groupTextEvidence = {
+        required: false,
+        informational: true,
+        observedGroups: report.groups,
+        observedTextFound: report.groupTextFound,
+      };
+      const browserBindings = await page.evaluate(({configured, planned}) => {
         const configuredLayers = Array.isArray(configured?.layers)
           ? configured.layers
           : [];
-        const groupMembership = Object.fromEntries(configuredLayers.map(layer => [
+        const resolvedGroupMembership = Object.fromEntries(configuredLayers.map(layer => [
           layer.key,
           layer.group || null,
         ]));
@@ -835,183 +1024,432 @@ async function runVisual(input) {
             : configuredLayers.map(layer => layer.key),
           resolvedLocaleLayerKeys: configuredLayers.map(layer => layer.key),
           resolvedUrlLayerKeys,
-          groupMembership: planned?.groupMembership || groupMembership,
+          resolvedGroupMembership,
+          groupMembership: planned?.groupMembership || resolvedGroupMembership,
+          hiddenDrawerLayerKeys: configuredLayers.filter(layer => (
+            layer.hidden === true || layer.view === null
+          )).map(layer => layer.key),
           registeredLayerKeys,
           registeredGroups,
-          finalActiveOpenLayersLayerSet: resolvedUrlLayerKeys.filter(
-            key => registeredLayerKeys.includes(key),
-          ),
         };
       }, {
         configured: configuredLocale,
         planned: input.plan?.candidateLayerDiagnostics || null,
       });
+      const runtime = await inspectMapRuntime(page);
       const requestedSet = new Set(activeLayers);
-      const diagnostics = report.activationDiagnostics;
-      report.activationDiagnostics.requestedLayersRegistered = activeLayers.every(
-        key => diagnostics.registeredLayerKeys.includes(key),
+      const activeLayerKeys = runtime.available
+        ? runtime.activeVisibleLayerKeys
+        : null;
+      const diagnostics = report.activationDiagnostics = {
+        ...browserBindings,
+        openLayersInspection: runtime,
+        openLayersInspectionAvailable: runtime.available,
+        finalActiveOpenLayersLayerSet: activeLayerKeys,
+      };
+      diagnostics.requestedLayerVerdicts = activeLayers.map(key => {
+        const configured = diagnostics.configuredCandidateLayerKeys.includes(key);
+        const resolved = diagnostics.resolvedLocaleLayerKeys.includes(key);
+        const resolvedBrowserKey = diagnostics.resolvedUrlLayerKeys.includes(key)
+          ? key
+          : null;
+        const registered = runtime.available
+          ? runtime.runtimeRegisteredLayerKeys.includes(key)
+            || runtime.collectionLayerKeys.includes(key)
+          : null;
+        const active = runtime.available
+          ? runtime.collectionLayerKeys.includes(key)
+          : null;
+        const activeAndVisible = runtime.available
+          ? runtime.activeVisibleLayerKeys.includes(key)
+          : null;
+        const drawerRegistered = diagnostics.registeredLayerKeys.includes(key);
+        const drawerIntentionallyHidden = (
+          diagnostics.hiddenDrawerLayerKeys.includes(key)
+        );
+        const activeGroup = diagnostics.resolvedGroupMembership[key] ?? null;
+        const actualGroup = Object.entries(diagnostics.registeredGroups)
+          .find(([, layerKeys]) => layerKeys.includes(key))?.[0] ?? null;
+        const groupRegistrationPassed = drawerRegistered
+          ? actualGroup === activeGroup
+          : drawerIntentionallyHidden;
+        const groupFailureReason = groupRegistrationPassed
+          ? null
+          : !drawerRegistered
+            ? "layer-drawer-not-registered"
+            : "group-membership-mismatch";
+        return {
+          key,
+          configured,
+          resolved,
+          resolvedBrowserKey,
+          activeGroup,
+          registered,
+          drawerRegistered,
+          groupRegistration: {
+            expectedGroup: activeGroup,
+            actualGroup,
+            drawerIntentionallyHidden,
+            passed: groupRegistrationPassed,
+            failureReason: groupFailureReason,
+          },
+          active,
+          visible: active ? runtime.layerVisibility[key] ?? null : null,
+          activeAndVisible,
+          passed: Boolean(
+            configured
+            && resolved
+            && resolvedBrowserKey
+            && registered
+            && activeAndVisible
+            && groupRegistrationPassed
+          ),
+        };
+      });
+      diagnostics.requestedGroupVerdicts = (
+        diagnostics.requestedLayerVerdicts.map(item => ({
+          layer: item.key,
+          ...item.groupRegistration,
+        }))
       );
-      report.activationDiagnostics.requestedLayersActive = activeLayers.every(
-        key => diagnostics.finalActiveOpenLayersLayerSet.includes(key),
+      const failedLayer = diagnostics.requestedLayerVerdicts.find(
+        item => !item.passed,
       );
-      report.activationDiagnostics.unexpectedActiveLayers = (
-        diagnostics.finalActiveOpenLayersLayerSet.filter(key => !requestedSet.has(key))
+      diagnostics.requestedLayersRegistered = (
+        runtime.available
+        && diagnostics.requestedLayerVerdicts.every(item => item.registered)
       );
-      report.activationDiagnostics.activationRequired = (
-        viewMode === "focus" && activeLayers.length > 0
-      );
-      report.activationDiagnostics.activationPassed = (
-        !report.activationDiagnostics.activationRequired
-        || (
-          report.activationDiagnostics.requestedLayersRegistered
-          && report.activationDiagnostics.requestedLayersActive
-          && report.activationDiagnostics.unexpectedActiveLayers.length === 0
+      diagnostics.requestedLayersActive = (
+        runtime.available
+        && diagnostics.requestedLayerVerdicts.every(
+          item => item.activeAndVisible,
         )
       );
+      diagnostics.unexpectedActiveLayers = (activeLayerKeys || []).filter(
+        key => !requestedSet.has(key),
+      );
+      diagnostics.activationRequired = viewMode === "focus"
+        && activeLayers.length > 0;
+      diagnostics.activationPassed = !diagnostics.activationRequired
+        || (
+          !failedLayer
+          && diagnostics.unexpectedActiveLayers.length === 0
+        );
+      diagnostics.failureReason = diagnostics.activationPassed
+        ? null
+        : [
+          [!runtime.available, runtime.failureReason],
+          [failedLayer && !failedLayer.configured, "requested-layer-not-configured"],
+          [failedLayer && !failedLayer.resolved, "requested-layer-not-resolved-from-locale"],
+          [failedLayer && !failedLayer.resolvedBrowserKey, "requested-layer-not-resolved-from-url"],
+          [failedLayer && !failedLayer.registered, "requested-layer-not-registered"],
+          [failedLayer && !failedLayer.activeAndVisible, "requested-layer-not-active-and-visible"],
+          [
+            failedLayer && !failedLayer.groupRegistration.passed,
+            failedLayer?.groupRegistration.failureReason,
+          ],
+        ].find(([failed]) => failed)?.[1] || "unexpected-active-layer";
     });
-    await runStage("screenshot-capture", async () => {
-      if (Array.isArray(input.pluginChecks) && input.pluginChecks.length) {
-      report.pluginNavigation = await expandRequestedLayer(page, input);
-      }
-      report.plugins = await evaluatePluginChecks(page, input.pluginChecks, report);
-      const beforeCapture = await captureMap(page, directory, "before", fullPage);
-      report.hover = await exerciseHover(page, input, directory, timeout);
+    {
+      await runStage("plugin-checks", async () => {
+        if (Array.isArray(input.pluginChecks) && input.pluginChecks.length) {
+          report.pluginNavigation = await expandRequestedLayer(page, input);
+        }
+        report.plugins = await evaluatePluginChecks(
+          page,
+          input.pluginChecks,
+          report,
+        );
+      });
+      const beforeCapture = await runStage(
+        "screenshot",
+        () => captureMap(page, directory, "before", fullPage),
+      );
+      report.hover = await runStage(
+        "hover-target",
+        () => exerciseHover(page, input, directory, timeout),
+      );
       report.interaction = null;
       if (input.plan?.interaction?.type === "click-centre-feature") {
-      const beforeText = await interactionText(page);
-      const mapCanvas = page.locator("canvas").first();
-      const box = await mapCanvas.boundingBox();
-      const clickPoint = {
-        x: Math.round((box?.x ?? 0) + (box?.width ?? viewport.width) / 2),
-        y: Math.round((box?.y ?? 0) + (box?.height ?? viewport.height) / 2),
-      };
-      await page.mouse.click(clickPoint.x, clickPoint.y);
-      await page.waitForLoadState("networkidle", {timeout: Math.min(timeout, 10_000)})
-        .catch(() => {});
-      const infoPanel = page.locator(".location-view.expanded").first();
-      await infoPanel.waitFor({
-        state: "visible",
-        timeout: Math.min(timeout, 10_000),
-      }).catch(() => {});
-      await page.waitForFunction(
-        () => {
-          const panel = document.querySelector(".location-view.expanded");
-          return panel && !panel.classList.contains("loading");
-        },
-        {timeout: Math.min(timeout, 10_000)},
-      ).catch(() => {});
-      await page.waitForTimeout(500);
-      const afterText = await interactionText(page);
-      const expectedLayer = input.plan.interaction.expectedLayerTitle
-        || input.plan.interaction.expectedLayer
-        || input.layerTitle
-        || input.layer
-        || "";
-      const expectedFeatureId = input.plan.interaction.expectedFeatureId;
-      const infoPanelExpanded = await infoPanel.isVisible().catch(() => false);
-      const infoPanelText = infoPanelExpanded
-        ? (await infoPanel.innerText().catch(() => ""))
-          .replace(/\s+/g, " ")
-          .trim()
-        : "";
-      const expectedInfoPanelText = Array.isArray(
-        input.plan.interaction.expectedInfoPanelText,
-      )
-        ? input.plan.interaction.expectedInfoPanelText.filter(
-          value => typeof value === "string" && value,
-        )
-        : [];
-      const expectedInfoPanelTextFound = Object.fromEntries(
-        expectedInfoPanelText.map(value => [
-          value,
-          infoPanelText.toLowerCase().includes(value.toLowerCase()),
-        ]),
-      );
-      let infoPanelImage = null;
-      if (infoPanelExpanded) {
-        infoPanelImage = await infoPanel.screenshot({
-          path: `${directory}/info-panel.png`,
+        await runStage("information-panel", async () => {
+          const interaction = input.plan.interaction;
+          const expectedLayer = interaction.expectedLayer ?? input.layer ?? null;
+          const expectedFeatureId = interaction.expectedFeatureId ?? null;
+          const expectedText = requestedText(
+            interaction.expectedInfoPanelText,
+          );
+          const centre = input.plan?.centre;
+          const targetPlanned = Boolean(
+            Array.isArray(centre)
+            && centre.length === 2
+            && centre.every(value => Number.isFinite(Number(value))),
+          );
+          const result = report.interaction = {
+            type: interaction.type,
+            requested: true,
+            targetPlanned,
+            attempted: false,
+            opened: false,
+            captured: false,
+            panelOpened: false,
+            panelStable: false,
+            artifactCaptured: false,
+            failureReason: null,
+            expectedLayer,
+            expectedFeatureId,
+            expectedLayerFound: expectedLayer == null ? null : false,
+            expectedFeatureIdFound: expectedFeatureId == null ? null : false,
+            expectedInfoPanelText: expectedText,
+            expectedInfoPanelTextFound: Object.fromEntries(
+              expectedText.map(value => [value, false]),
+            ),
+            infoPanelExpanded: false,
+            infoPanelImage: null,
+            passed: false,
+          };
+          if (!targetPlanned) {
+            result.failureReason = "target-plan-missing";
+            return;
+          }
+          const box = await page.locator(".ol-viewport").first()
+            .boundingBox().catch(() => null)
+            || await page.locator("canvas").first().boundingBox()
+              .catch(() => null);
+          if (!box) {
+            result.failureReason = "map-target-unavailable";
+            return;
+          }
+          result.clickPoint = {
+            x: Math.round(box.x + box.width / 2),
+            y: Math.round(box.y + box.height / 2),
+          };
+          const beforeText = await interactionText(page);
+          const visiblePanelIdsBefore = new Set(await page.locator(
+            ".location-view.expanded[data-id]",
+          ).evaluateAll(elements => elements.filter(element => {
+            const style = getComputedStyle(element);
+            const box = element.getBoundingClientRect();
+            return style.display !== "none"
+              && style.visibility !== "hidden"
+              && box.width > 0
+              && box.height > 0;
+          }).map(element => element.dataset.id)).catch(() => []));
+          await page.mouse.move(
+            result.clickPoint.x,
+            result.clickPoint.y,
+            {steps: 12},
+          );
+          result.attempted = true;
+          const clicked = await page.mouse.click(
+            result.clickPoint.x,
+            result.clickPoint.y,
+          ).then(() => true, () => false);
+          if (!clicked) {
+            result.failureReason = "click-failed";
+            return;
+          }
+          const identityDeadline = Date.now() + Math.min(timeout, 3_000);
+          const matchesExpectedIdentity = item => (
+            (expectedLayer == null
+              || String(item.layerKey) === String(expectedLayer))
+            && (expectedFeatureId == null
+              || String(item.featureId) === String(expectedFeatureId))
+          );
+          let selectedFeatures = [];
+          let identity = null;
+          do {
+            await page.waitForTimeout(100);
+            selectedFeatures = (await inspectMapRuntime(page)).selectedFeatures;
+            identity = selectedFeatures.find(matchesExpectedIdentity) || null;
+          } while (!identity && Date.now() < identityDeadline);
+          identity ||= selectedFeatures.find(item => (
+            expectedLayer != null
+            && String(item.layerKey) === String(expectedLayer)
+          )) || selectedFeatures[0] || null;
+          result.observedLayer = identity?.layerKey ?? null;
+          result.observedFeatureId = identity?.featureId ?? null;
+          result.identityObserved = Boolean(
+            result.observedLayer != null && result.observedFeatureId != null,
+          );
+          result.expectedLayerFound = expectedLayer == null
+            ? null
+            : String(result.observedLayer) === String(expectedLayer);
+          result.expectedFeatureIdFound = expectedFeatureId == null
+            ? null
+            : result.expectedLayerFound !== false
+              && String(result.observedFeatureId) === String(expectedFeatureId);
+          const seededPanelId = expectedLayer != null && expectedFeatureId != null
+            ? `location-${expectedLayer}-${expectedFeatureId}`
+            : null;
+          const targetPanelId = result.identityObserved
+            ? `location-${result.observedLayer}-${result.observedFeatureId}`
+            : seededPanelId;
+          const panelWasVisible = visiblePanelIdsBefore.has(targetPanelId);
+          result.panelWasVisibleBefore = panelWasVisible;
+          const selector = ".location-view.expanded";
+          if (targetPanelId) {
+            await page.waitForFunction(({dataId, panelSelector}) => {
+              const panel = [...document.querySelectorAll(panelSelector)]
+                .find(element => element.dataset.id === dataId);
+              const box = panel?.getBoundingClientRect();
+              return Boolean(
+                panel
+                && !panel.classList.contains("loading")
+                && box?.width
+                && box?.height
+              );
+            }, {dataId: targetPanelId, panelSelector: selector}, {
+              timeout: Math.min(timeout, 10_000),
+            }).catch(() => {});
+          }
+          const infoPanel = targetPanelId
+            ? await locatorWithDataId(page, selector, targetPanelId)
+            : null;
+          const visible = Boolean(infoPanel)
+            && await infoPanel.isVisible().catch(() => false);
+          const newlyVisible = visible && !panelWasVisible;
+          result.panelStable = visible && await infoPanel.evaluate(
+            element => !element.classList.contains("loading"),
+          ).catch(() => false);
+          result.panelOpened = newlyVisible && result.panelStable;
+          result.opened = result.panelOpened;
+          result.infoPanelExpanded = result.panelOpened;
+          const panelText = visible
+            ? (await infoPanel.innerText().catch(() => ""))
+              .replace(/\s+/g, " ")
+              .trim()
+            : "";
+          const image = result.panelOpened
+            ? await infoPanel.screenshot({
+              path: `${directory}/info-panel.png`,
+            }).catch(() => null)
+            : null;
+          result.infoPanelImage = image ? pngSize(image) : null;
+          result.artifactCaptured = Boolean(result.infoPanelImage);
+          result.captured = result.artifactCaptured;
+          result.expectedInfoPanelTextFound = Object.fromEntries(
+            expectedText.map(value => [
+              value,
+              panelText.toLowerCase().includes(value.toLowerCase()),
+            ]),
+          );
+          result.infoPanelTextLength = panelText.length;
+          result.infoPanelTextSample = panelText.slice(0, 2000);
+          const afterText = await interactionText(page);
+          result.textChanged = afterText !== beforeText;
+          result.beforeTextLength = beforeText.length;
+          result.afterTextLength = afterText.length;
+          result.afterTextSample = afterText.slice(0, 2000);
+          const textPassed = Object.values(
+            result.expectedInfoPanelTextFound,
+          ).every(Boolean);
+          result.passed = Boolean(
+            result.targetPlanned
+            && result.attempted
+            && result.panelOpened
+            && result.artifactCaptured
+            && textPassed
+            && result.identityObserved
+            && result.expectedLayerFound !== false
+            && result.expectedFeatureIdFound !== false
+          );
+          result.failureReason = result.passed
+            ? null
+            : !result.panelOpened
+              ? panelWasVisible
+                ? "info-panel-already-open"
+                : newlyVisible && !result.panelStable
+                  ? "info-panel-not-stable"
+                  : "info-panel-not-opened"
+              : !result.artifactCaptured
+                ? "info-panel-capture-failed"
+                : !textPassed
+                  ? "expected-info-panel-text-missing"
+                  : !result.identityObserved
+                    ? "feature-identity-unavailable"
+                    : result.expectedLayerFound === false
+                      ? "layer-identity-mismatch"
+                      : "feature-identity-mismatch";
         });
       }
-      report.interaction = {
-        type: input.plan.interaction.type,
-        clickPoint,
-        expectedFeatureId,
-        textChanged: afterText !== beforeText,
-        infoPanelExpanded,
-        infoPanelImage: infoPanelImage ? pngSize(infoPanelImage) : null,
-        expectedInfoPanelText,
-        expectedInfoPanelTextFound,
-        infoPanelTextLength: infoPanelText.length,
-        infoPanelTextSample: infoPanelText.slice(0, 2000),
-        expectedLayerFound: expectedLayer
-          ? afterText.toLowerCase().includes(String(expectedLayer).toLowerCase())
-          : true,
-        expectedFeatureIdFound: expectedFeatureId == null
-          ? null
-          : afterText.includes(String(expectedFeatureId)),
-        beforeTextLength: beforeText.length,
-        afterTextLength: afterText.length,
-        afterTextSample: afterText.slice(0, 2000),
-        passed: (
-          afterText !== beforeText
-          && (
-            !input.plan.interaction.requireInfoPanel
-            || infoPanelExpanded
-          )
-          && Object.values(expectedInfoPanelTextFound).every(Boolean)
-        ),
-      };
+      report.panelNavigation = null;
+      report.panels = {};
+      if (panels.length) {
+        await runStage("panel-open", async () => {
+          report.panelNavigation = await expandRequestedLayer(page, input);
+          for (const panel of panels) {
+            report.panels[panel] = await openPanel(
+              page,
+              panel,
+              input,
+              directory,
+            );
+          }
+        });
       }
-      report.panelNavigation = panels.length
-      ? await expandRequestedLayer(page, input)
-      : null;
-    report.panels = {};
-    for (const panel of panels) {
-      report.panels[panel] = await openPanel(page, panel, input, directory);
-    }
-    const afterCapture = await captureMap(page, directory, "after", fullPage);
-    const pageImage = await page.screenshot({
-      path: `${directory}/page.png`,
-      fullPage,
-    });
-    const canvas = page.locator("canvas").first();
-    let mapImage = null;
-    if (await canvas.count()) {
-      mapImage = await canvas.screenshot({path: `${directory}/map.png`});
-    }
-    report.capture = {
-      viewport,
-      deviceScaleFactor,
-      fullPage,
-      images: {
-        page: pngSize(pageImage),
-        map: mapImage ? pngSize(mapImage) : null,
-        beforePage: beforeCapture.page,
-        beforeMap: beforeCapture.map,
-        afterPage: afterCapture.page,
-        afterMap: afterCapture.map,
-      },
-    };
-    const interactionPassed = report.interaction
-      ? report.interaction.passed
-      : true;
-    const hoverPassed = report.hover ? report.hover.passed : true;
-    const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
-    const pluginsPassed = report.plugins.every(plugin => plugin.passed);
+      await runStage("screenshot", async () => {
+        const afterCapture = await captureMap(
+          page,
+          directory,
+          "after",
+          fullPage,
+        );
+        const pageImage = await page.screenshot({
+          path: `${directory}/page.png`,
+          fullPage,
+        });
+        const canvas = page.locator("canvas").first();
+        let mapImage = null;
+        if (await canvas.count()) {
+          mapImage = await canvas.screenshot({path: `${directory}/map.png`});
+        }
+        report.capture = {
+          viewport,
+          deviceScaleFactor,
+          fullPage,
+          images: {
+            page: pngSize(pageImage),
+            map: mapImage ? pngSize(mapImage) : null,
+            beforePage: beforeCapture.page,
+            beforeMap: beforeCapture.map,
+            afterPage: afterCapture.page,
+            afterMap: afterCapture.map,
+          },
+        };
+      });
+      const interactionPassed = report.interaction
+        ? report.interaction.passed
+        : true;
+      const hoverPassed = report.hover ? report.hover.passed : true;
+      const panelsPassed = panels.every(panel => report.panels?.[panel]?.passed);
+      const pluginsPassed = report.plugins.every(plugin => plugin.passed);
       report.passed = Boolean(
-      response?.ok()
-      && report.canvasCount
-      && report.layerTextFound
-      && report.groupTextFound
-      && report.activationDiagnostics?.activationPassed
-      && hoverPassed
-      && interactionPassed
-      && panelsPassed
-      && pluginsPassed
-      && !report.pageErrors.length
+        response?.ok()
+        && report.canvasCount
+        && report.activationDiagnostics?.activationPassed
+        && hoverPassed
+        && interactionPassed
+        && panelsPassed
+        && pluginsPassed
+        && !report.pageErrors.length
       );
-    });
+      if (!report.passed) {
+        report.failedStage = !response?.ok() || report.pageErrors.length
+          ? "workspace-load"
+          : !report.canvasCount
+            || !report.activationDiagnostics?.activationPassed
+            ? "layer-registration"
+            : !pluginsPassed
+              ? "plugin-checks"
+              : !hoverPassed
+                ? "hover-target"
+                : !interactionPassed
+                  ? "information-panel"
+                  : !panelsPassed
+                    ? "panel-open"
+                    : "screenshot";
+      }
+    }
   } catch (error) {
     recordFailure(error);
   } finally {
@@ -1058,15 +1496,19 @@ async function runVisual(input) {
       },
       {
         id: "visual.layer",
-        passed: report.layerTextFound === true,
+        informational: true,
+        passed: true,
         observed: report.layerTextFound ?? false,
+        evidence: report.layerTextEvidence ?? null,
       },
       {
         id: "visual.groups",
-        passed: report.groupTextFound === true,
+        informational: true,
+        passed: true,
         observed: {
           groups: report.groups,
           found: report.groupTextFound ?? false,
+          evidence: report.groupTextEvidence ?? null,
         },
       },
       {
@@ -1115,21 +1557,19 @@ async function runVisual(input) {
           ? "http"
           : !report.canvasCount
             ? "render"
-            : !report.layerTextFound
-              ? "binding"
-              : !report.groupTextFound
-                ? "group"
-                : report.hover && !report.hover.passed
-                  ? "hover"
-                  : report.interaction && !report.interaction.passed
+            : report.activationDiagnostics?.activationPassed === false
+              ? "activation"
+              : report.hover && !report.hover.passed
+                ? "hover"
+                : report.interaction && !report.interaction.passed
                   ? "feature"
                   : panels.some(panel => !report.panels?.[panel]?.passed)
                     ? "panel"
-                  : (report.plugins || []).some(plugin => !plugin.passed)
-                    ? "plugin"
-                  : report.pageErrors.length
-                    ? "page"
-                    : "unknown",
+                    : (report.plugins || []).some(plugin => !plugin.passed)
+                      ? "plugin"
+                      : report.pageErrors.length
+                        ? "page"
+                        : "unknown",
   };
   try {
     const persistenceTimeout = Math.max(

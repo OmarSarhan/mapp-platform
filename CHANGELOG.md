@@ -6,8 +6,31 @@ first release.
 
 ## Unreleased
 
+### Added
+
+- Added bounded numeric layer statistics with null/non-finite counts, min/max,
+  discrete quantiles, overflow-safe histograms, requested-threshold counts,
+  and candidate exclusive class counts without returning source rows.
+- Added a read-only area-weighted H3 recipe planner that validates one ready
+  semantic polygon source, resolves the saved map scope, generates guarded
+  overlap-mode candidate SQL, prefilters every supported source SRID by the
+  same scope, and returns the exact create request and normal preflight probes
+  without mutating database or workspace state.
+
 ### Fixed
 
+- Effective visual planning now reports its source/filter provenance and also
+  applies configured feature-set/lookup restrictions. Boolean fixed filters
+  use valid PostgreSQL literals, structured scalar filters preserve XYZ's
+  PostgreSQL coercion semantics, raw percent operators remain executable, and
+  unreliable structured forms fail validation. Empty geometries are excluded,
+  JSON-compatible identifiers are retained, and an empty result reports its
+  exact count, stage, and reason. Bounded category aggregation now uses the
+  same restrictions; advanced browser-managed sources still report configured
+  restrictions when database probing is intentionally skipped.
+- Durable operations now record an explicit terminal timestamp and history
+  pruning never removes active work. New noncanonical-but-supported layer keys
+  receive an actionable machine-key warning.
 - Visual planning now applies a layer's validated `filter.default` to feature
   count, extent, representative-feature selection, and focus bounds. Sparse
   layers therefore focus a feature that XYZ can actually render, while an
@@ -15,14 +38,18 @@ first release.
   execution.
 - Candidate visual evidence now rejects layer keys that pinned XYZ cannot
   register and records configured candidate keys, resolved URL keys, group
-  membership, registered drawers, and the final active OpenLayers layer set.
-  A healthy page and canvas no longer pass when an explicitly requested
-  grouped child was omitted or left inactive.
+  membership, registered drawers, and actual OpenLayers collection visibility
+  in a per-requested-layer verdict. UI wording is informational, structural
+  group registration drives the verdict, and unavailable map inspection fails
+  closed instead of being inferred from URLs or DOM text.
 - Added stage-aware visual worker deadlines from Chromium launch through page
   readiness, screenshot capture, artifact persistence, and durable result
   persistence. Timed-out or crashed runs now retain structured diagnostics,
   leave `running` terminally, release browser capacity, and cannot overwrite a
   watchdog failure with a late result.
+- Synchronous visual tests and proposal screenshots now create their durable
+  operation before read-only planning and terminalize pre-browser rejection at
+  the `planning` stage, so every accepted browser submission remains pollable.
 - Documented and validated XYZ's native `groupClassList` styling contract for
   layer-group drawers, including first-member precedence and the requirement
   for a verified deployed stylesheet class rather than a literal colour.
@@ -82,12 +109,14 @@ first release.
   `deliveryBlockersMore` making remaining work explicit.
 - Forwarded live visual-test clicked-feature text assertions into the browser
   interaction plan so `expectedInfoPanelText` produces dedicated, verifiable
-  information-panel evidence instead of being accepted but ignored.
+  information-panel evidence instead of being accepted but ignored. Click
+  evidence now separately records request, attempt, panel opening, capture,
+  identity checks, and a specific failure reason.
 - Archived semantic assets are now omitted from catalog, search, and
   derived-profile collections, including administrator collection reads;
   exact administrator lookups retain their immutable audit history.
-- Made proposal evidence use friendly layer titles for visible-text checks,
-  exact pinned-XYZ drawer hooks for Filtering/Styling capture, deliberate
+- Made proposal evidence report friendly layer titles as informational text,
+  use exact pinned-XYZ drawer hooks for Filtering/Styling capture, deliberate
   hover-tooltip interaction, and per-side clicked-feature capture for added,
   removed, or edited information content.
 - Fixed catalog discovery for PostGIS geometry columns on materialized derived

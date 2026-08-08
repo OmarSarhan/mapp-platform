@@ -17,6 +17,7 @@ import time
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
 from workspace_schema import expression_error
@@ -32,6 +33,9 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
 API_VERSION = "1.4"
 CONTRACT_VERSION = "1.4"
 RULES_VERSION = "1.6"
+FIXED_FILTER_NUMBER_RE = re.compile(
+    r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
+)
 XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -87,6 +91,7 @@ DERIVED_ERROR_PRESENTATION = {
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect `config-cli schema` and correct the reported path."},
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
+    {"id": "workspace.layer_key", "category": "schema", "description": "Layer keys are machine identifiers used in workspace paths and browser activation; display wording belongs in layer.name.", "remediation": "Prefer a stable key containing only ASCII letters, numbers, and underscores. Keep spaces, punctuation, and translated wording in layer.name."},
     {"id": "workspace.layer_group_colour", "category": "schema", "description": "XYZ styles a layer-group drawer with the first grouped layer's groupClassList. This is a deployed stylesheet class list, not a literal colour property.", "remediation": "Inspect every member of the exact group and use the same verified deployed class list on each one. Do not invent groupColor/groupColour or put a hex colour in groupClassList."},
     {"id": "workspace.layer_legend", "category": "schema", "description": "An optional basic theme exposes the layer symbology as a legend in XYZ's Styling panel.", "remediation": "Set style.theme to a basic theme whose style matches style.default, and include theme in style.elements when an explicit element list is present."},
     {"id": "workspace.categorized_symbology", "category": "schema", "description": "A categorized theme maps exact values from a feature field to labelled styles in XYZ's data-driven legend.", "remediation": "Set style.theme to a categorized theme with a valid field and category value/style entries; preserve unrelated style.elements and include theme when that array is explicit."},
@@ -420,8 +425,18 @@ class VisualPlanningNoMatchingFeatures(ValueError):
 
     code = "visual.no_matching_features"
 
-    def __init__(self, *, filter_applied: bool) -> None:
+    def __init__(
+        self,
+        *,
+        filter_applied: bool,
+        effective_dataset: dict | None = None,
+        reason: str = "no-matching-renderable-geometry",
+        stage: str = "layer-summary",
+    ) -> None:
         self.filter_applied = filter_applied
+        self.effective_dataset = effective_dataset
+        self.reason = reason
+        self.stage = stage
         super().__init__(
             "The layer has no matching features with non-null renderable geometry"
             + (" after applying filter.default." if filter_applied else ".")
@@ -611,6 +626,133 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "field": {"type": "string", "minLength": 1},
                 "locale": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "layers.statistics": {
+        "method": "GET",
+        "pathTemplate": "/api/layers/{layerKey}/statistics",
+        "risk": "aggregate-data-read",
+        "scope": "derive",
+        "requiredScopes": ["derive", "semantic:inspect"],
+        "querySchema": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+                "field": {"type": "string", "minLength": 1},
+                "locale": {"type": "string"},
+                "bins": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 10,
+                },
+                "threshold": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "number"},
+                },
+                "break": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {"type": "number"},
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "derived-layers.plan-area-weighted-h3": {
+        "method": "POST",
+        "path": "/api/derived-layers/recipes/area-weighted-h3/plan",
+        "risk": "database-plan",
+        "scope": "derive",
+        "requiredScopes": ["derive", "semantic:inspect"],
+        "presentation": {
+            **DERIVED_ERROR_PRESENTATION,
+            "messageField": "userMessage",
+            "nextActionField": "suggestedAction",
+            "technicalFields": [
+                "queryPlanProbe", "queryPlanningProbe",
+                "materializationProbe", "technicalDetail",
+            ],
+        },
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "name", "kind", "source", "resolution", "measures",
+                "spatialScope",
+            ],
+            "properties": {
+                "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+                "kind": {"enum": ["view", "materialized"]},
+                "source": {
+                    "type": "object",
+                    "required": [
+                        "assetId", "relation", "idColumn", "geometryColumn",
+                    ],
+                    "properties": {
+                        "assetId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200,
+                        },
+                        "relation": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$",
+                        },
+                        "idColumn": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 63,
+                        },
+                        "geometryColumn": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 63,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                "resolution": {"type": "integer", "minimum": 0, "maximum": 15},
+                "measures": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "sourceColumn", "outputColumn", "nullHandling",
+                        ],
+                        "properties": {
+                            "sourceColumn": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 63,
+                            },
+                            "outputColumn": {
+                                "type": "string",
+                                "pattern": "^[a-z][a-z0-9_]{0,62}$",
+                            },
+                            "nullHandling": {"enum": ["zero", "ignore"]},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "description": {"type": "string", "maxLength": 2000},
+                "spatialScope": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"const": "workspace-map-extent"},
+                        "locale": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -1421,10 +1563,12 @@ def contract(instance_id: str) -> dict[str, Any]:
             "plugins list", "plugins show", "plugins validate", "plugins usage",
             "capabilities list", "capabilities show",
             "workspace get", "layers list", "layers get", "layers values",
+            "layers statistics",
             "layers style-elements", "layers filters", "layers effective",
             "catalog list", "icons list",
             "derived-layers capabilities", "derived-layers list",
             "derived-layers show", "derived-layers create",
+            "derived-layers plan-area-weighted-h3",
             "derived-layers map-extent",
             "derived-layers refresh", "derived-layers replace",
             "derived-layers drop",
@@ -2522,83 +2666,274 @@ def visual_hover_plan(layer: dict) -> dict | None:
     }
 
 
-def _visual_default_filter(layer: dict):
-    """Compile XYZ's validated fixed filter for read-only planning queries."""
+def effective_layer_filter_descriptor(layer: dict) -> tuple[dict, list[tuple]]:
+    """Describe configured render restrictions without assuming a SQL source."""
     configured = layer.get("filter")
     predicate = configured.get("default") if isinstance(configured, dict) else None
-    if predicate is None:
-        return sql.SQL("TRUE"), []
-    if isinstance(predicate, str):
-        error = expression_error(predicate)
-        if error:
-            raise ValueError(f"Invalid layer filter.default: {error}")
-        return sql.SQL("({})").format(sql.SQL(predicate)), []
+    qid = layer.get("qID")
+    identifier_sets = []
+
+    def comparable_identifiers(values):
+        return [
+            value for value in values
+            if value is None or isinstance(value, (str, int, float, bool))
+        ]
+
+    feature_set = layer.get("featureSet")
+    # XYZ gates featureSet through Set.size; an explicitly empty array is not
+    # a restriction, while an empty featureLookup array matches no feature.
+    if isinstance(feature_set, list) and feature_set:
+        identifier_sets.append((
+            "featureSet",
+            comparable_identifiers(feature_set),
+            len(feature_set),
+        ))
+    feature_lookup = layer.get("featureLookup")
+    if isinstance(feature_lookup, list):
+        lookup_id = layer.get("featureLookupId") or "id"
+        identifiers = [
+            item[lookup_id]
+            for item in feature_lookup
+            if isinstance(item, dict) and lookup_id in item
+        ]
+        identifier_sets.append((
+            "featureLookup",
+            comparable_identifiers(identifiers),
+            len(feature_lookup),
+        ))
+
+    restrictions = []
+    if predicate is not None:
+        restrictions.append("filter.default")
+    restrictions.extend(source for source, _, _ in identifier_sets)
+    return (
+        {
+            "fixedFilter": copy.deepcopy(predicate),
+            "filterApplied": predicate is not None,
+            "identifierRestrictions": [
+                {
+                    "source": source,
+                    "field": qid,
+                    "configuredCount": configured_count,
+                    "comparablePrimitiveCount": len(identifiers),
+                    "ignoredCount": configured_count - len(identifiers),
+                }
+                for source, identifiers, configured_count in identifier_sets
+            ],
+            "restrictions": restrictions,
+        },
+        identifier_sets,
+    )
+
+
+def effective_layer_filter(layer: dict):
+    """Compile the static restrictions that decide which features can render."""
+    configured = layer.get("filter")
+    predicate = configured.get("default") if isinstance(configured, dict) else None
+    descriptor, identifier_sets = effective_layer_filter_descriptor(layer)
+    clauses = []
+    params = []
 
     def compile_mapping(mapping: dict):
         if not isinstance(mapping, dict) or not mapping:
             raise ValueError("Layer filter.default objects must be non-empty.")
-        clauses = []
-        params = []
+        mapping_clauses = []
+        mapping_params = []
         operations = {
             "eq": "=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
         }
+
+        def xyz_scalar_text(value):
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            if isinstance(value, float) and value.is_integer():
+                return str(int(value))
+            return str(value)
+
         for field, tests in mapping.items():
-            if not isinstance(field, str) or not re.fullmatch(r"[A-Za-z_]\w*", field):
+            if not isinstance(field, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", field
+            ):
                 raise ValueError("Layer filter.default contains an invalid field name.")
+            if isinstance(tests, list):
+                raise ValueError(
+                    "Layer filter.default field-level OR arrays are not supported; "
+                    "use a top-level OR-array or a reviewed predicate string."
+                )
             if not isinstance(tests, dict) or not tests:
                 raise ValueError("Layer filter.default field tests must be non-empty objects.")
+            unsupported = set(tests) - {
+                *operations, "boolean", "null", "in", "ni", "match", "like",
+            }
+            if unsupported:
+                name = sorted(unsupported)[0]
+                raise ValueError(
+                    f"Layer filter.default uses unsupported operation: {name}."
+                )
             field_sql = sql.Identifier(field)
             field_clauses = []
             for operation, value in tests.items():
                 if operation in operations:
+                    try:
+                        numeric_value = float(value)
+                    except (OverflowError, TypeError, ValueError):
+                        numeric_value = math.nan
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (str, int, float))
+                        or isinstance(value, str)
+                        and not FIXED_FILTER_NUMBER_RE.fullmatch(value)
+                        or not math.isfinite(numeric_value)
+                    ):
+                        raise ValueError(
+                            "Layer filter.default comparisons require a "
+                            "finite number or numeric string."
+                        )
                     field_clauses.append(sql.SQL("{} {} %s").format(
-                        field_sql, sql.SQL(operations[operation]),
+                        field_sql,
+                        sql.SQL(operations[operation]),
                     ))
-                    params.append(value)
+                    mapping_params.append(xyz_scalar_text(value))
                 elif operation == "boolean":
-                    field_clauses.append(sql.SQL("{} IS %s").format(field_sql))
-                    params.append(bool(value))
+                    if not isinstance(value, bool):
+                        raise ValueError(
+                            "Layer filter.default boolean values must be true or false."
+                        )
+                    field_clauses.append(sql.SQL("{} IS {}").format(
+                        field_sql,
+                        sql.SQL("TRUE" if value else "FALSE"),
+                    ))
                 elif operation == "null":
+                    if not isinstance(value, bool):
+                        raise ValueError(
+                            "Layer filter.default null values must be true or false."
+                        )
                     field_clauses.append(sql.SQL("{} IS {}NULL").format(
                         field_sql, sql.SQL("") if value else sql.SQL("NOT "),
                     ))
                 elif operation in {"in", "ni"}:
                     values = value if isinstance(value, list) else [value]
-                    comparison = sql.SQL("{} = ANY(%s)").format(field_sql)
+                    if not values or any(
+                        item is None
+                        or isinstance(item, (dict, list))
+                        or not isinstance(item, (str, int, float, bool))
+                        or isinstance(item, float) and not math.isfinite(item)
+                        for item in values
+                    ):
+                        raise ValueError(
+                            "Layer filter.default in/ni values must be a "
+                            "non-empty scalar or array of finite scalars."
+                        )
+                    # XYZ sends a JavaScript array through node-postgres, so
+                    # PostgreSQL coerces each textual array member to the
+                    # compared column type. Expand safe text parameters here
+                    # to preserve that behaviour without asking psycopg to
+                    # adapt a potentially heterogeneous Python array.
+                    comparison = sql.SQL("({})").format(sql.SQL(" OR ").join(
+                        sql.SQL("{} = %s").format(field_sql)
+                        for _ in values
+                    ))
                     field_clauses.append(
                         comparison if operation == "in"
                         else sql.SQL("NOT ({})").format(comparison)
                     )
-                    params.append(values)
+                    mapping_params.extend(
+                        xyz_scalar_text(item) for item in values
+                    )
                 elif operation == "match":
+                    if not isinstance(value, str):
+                        raise ValueError(
+                            "Layer filter.default match values must be strings."
+                        )
                     field_clauses.append(sql.SQL("{}::text = %s").format(field_sql))
-                    params.append(value)
+                    mapping_params.append(value)
                 elif operation == "like":
-                    values = [item for item in str(value).split(",") if item]
+                    if not isinstance(value, str):
+                        raise ValueError(
+                            "Layer filter.default like values must be strings."
+                        )
+                    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+                        raise ValueError(
+                            "Layer filter.default like values contain invalid URL encoding."
+                        )
+                    try:
+                        decoded = unquote(value, errors="strict")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            "Layer filter.default like values contain invalid "
+                            "UTF-8 URL encoding."
+                        ) from exc
+                    values = [item for item in decoded.split(",") if item]
                     if not values:
                         raise ValueError("Layer filter.default like values must be non-empty.")
                     field_clauses.append(sql.SQL("({})").format(sql.SQL(" OR ").join(
                         sql.SQL("{} ILIKE %s").format(field_sql) for _ in values
                     )))
-                    params.extend(f"{item}%" for item in values)
-                else:
-                    raise ValueError(
-                        f"Layer filter.default uses unsupported operation: {operation}."
-                    )
-            clauses.append(sql.SQL("({})").format(sql.SQL(" AND ").join(field_clauses)))
-        return sql.SQL("({})").format(sql.SQL(" AND ").join(clauses)), params
-
-    if isinstance(predicate, list):
-        if not predicate:
-            raise ValueError("Layer filter.default arrays must be non-empty.")
-        compiled = [compile_mapping(item) for item in predicate]
+                    mapping_params.extend(f"{item}%" for item in values)
+            mapping_clauses.append(
+                sql.SQL("({})").format(sql.SQL(" AND ").join(field_clauses))
+            )
         return (
-            sql.SQL("({})").format(sql.SQL(" OR ").join(item[0] for item in compiled)),
-            [value for item in compiled for value in item[1]],
+            sql.SQL("({})").format(sql.SQL(" AND ").join(mapping_clauses)),
+            mapping_params,
         )
-    if isinstance(predicate, dict):
-        return compile_mapping(predicate)
-    raise ValueError("Layer filter.default must be a predicate string, object, or array.")
+
+    if predicate is not None:
+        if isinstance(predicate, str):
+            error = expression_error(predicate)
+            if error:
+                raise ValueError(f"Invalid layer filter.default: {error}")
+            # The predicate is a validated XYZ SQL fragment, but psycopg uses
+            # percent signs for client-side placeholders whenever a parameter
+            # sequence is supplied. Double literal percents so modulo and
+            # LIKE patterns reach PostgreSQL unchanged.
+            clauses.append(sql.SQL("({})").format(
+                sql.SQL(predicate.replace("%", "%%"))
+            ))
+        elif isinstance(predicate, list):
+            if not predicate:
+                raise ValueError("Layer filter.default arrays must be non-empty.")
+            compiled = [compile_mapping(item) for item in predicate]
+            clauses.append(sql.SQL("({})").format(
+                sql.SQL(" OR ").join(item[0] for item in compiled)
+            ))
+            params.extend(value for item in compiled for value in item[1])
+        elif isinstance(predicate, dict):
+            compiled_filter, compiled_params = compile_mapping(predicate)
+            clauses.append(compiled_filter)
+            params.extend(compiled_params)
+        else:
+            raise ValueError(
+                "Layer filter.default must be a predicate string, object, or array."
+            )
+    qid = layer.get("qID")
+    for source, identifiers, _ in identifier_sets:
+        try:
+            encoded_identifiers = json.dumps(
+                identifiers,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Layer {source} must contain valid JSON feature IDs."
+            ) from exc
+        clauses.append(sql.SQL(
+            "%s::jsonb @> pg_catalog.jsonb_build_array("
+            "pg_catalog.to_jsonb({}))"
+        ).format(sql.Identifier(qid)))
+        params.append(encoded_identifiers)
+
+    return (
+        (
+            sql.SQL("({})").format(sql.SQL(" AND ").join(clauses))
+            if clauses
+            else sql.SQL("TRUE")
+        ),
+        params,
+        descriptor,
+    )
 
 
 def visual_plan(
@@ -2630,6 +2965,24 @@ def visual_plan(
     layer_title = layer.get("name") if isinstance(layer.get("name"), str) else layer_key
     layer_title = layer_title.strip() or layer_key
     hover_plan = visual_hover_plan(layer)
+    probeable = is_probeable_database_layer(layer)
+    filter_descriptor, _ = effective_layer_filter_descriptor(layer)
+    activation = {
+        "configuredKey": layer_key,
+        "displayName": layer_title,
+        "group": layer.get("group"),
+        "mode": "focused-url",
+    }
+    dataset_source = (
+        {
+            "database": layer.get("dbs") or workspace.get("dbs"),
+            "relation": layer["table"],
+            "geometryField": layer["geom"],
+            "featureIdField": layer["qID"],
+        }
+        if probeable
+        else {"type": "browser-managed"}
+    )
     if "centre" in override and "zoom" in override:
         plan = {
             "layer": layer_key,
@@ -2643,8 +2996,26 @@ def visual_plan(
                 "The complete explicit view skips database-wide feature-count "
                 "and extent queries; browser interaction targets the map centre."
             ],
+            "effectiveDataset": {
+                "locale": selected_locale,
+                "layerKey": layer_key,
+                "layerName": layer_title,
+                "source": dataset_source,
+                "effectiveFilter": filter_descriptor,
+                "query": {
+                    "scope": "explicit-browser-view",
+                    "skipped": True,
+                    "reason": "complete-explicit-view",
+                },
+                "activation": activation,
+                "filteredFeatureCount": None,
+                "representativeFeature": None,
+            },
         }
-        if is_probeable_database_layer(layer):
+        if probeable:
+            # Keep fixed-filter validation even when an explicit browser view
+            # intentionally skips the database summary query.
+            effective_layer_filter(layer)
             plan.update({
                 "database": layer.get("dbs") or workspace.get("dbs"),
                 "table": layer["table"],
@@ -2659,7 +3030,7 @@ def visual_plan(
         if hover_plan:
             plan["hover"] = hover_plan
         return apply_visual_override(plan, visual_request)
-    if not is_probeable_database_layer(layer):
+    if not probeable:
         view = locale.get("view") or {}
         plan = {
             "layer": layer_key,
@@ -2671,6 +3042,21 @@ def visual_plan(
                 "This layer uses an external or advanced XYZ source, so the "
                 "visual check uses the configured workspace view."
             ],
+            "effectiveDataset": {
+                "locale": selected_locale,
+                "layerKey": layer_key,
+                "layerName": layer_title,
+                "source": dataset_source,
+                "effectiveFilter": filter_descriptor,
+                "query": {
+                    "scope": "browser-runtime",
+                    "skipped": True,
+                    "reason": "non-probeable-layer-source",
+                },
+                "activation": activation,
+                "filteredFeatureCount": None,
+                "representativeFeature": None,
+            },
         }
         if hover_plan:
             plan["hover"] = hover_plan
@@ -2699,11 +3085,33 @@ def visual_plan(
         raise ValueError("Layer database or relation is unavailable.")
     relation_sql = sql.SQL("{}.{}").format(sql.Identifier(relation[0]), sql.Identifier(relation[1]))
     geom = sql.Identifier(layer["geom"])
-    filter_applied = (
-        isinstance(layer.get("filter"), dict)
-        and layer["filter"].get("default") is not None
+    default_filter, default_filter_params, filter_descriptor = (
+        effective_layer_filter(layer)
     )
-    default_filter, default_filter_params = _visual_default_filter(layer)
+    filter_applied = filter_descriptor["filterApplied"]
+    effective_dataset = {
+        "locale": selected_locale,
+        "layerKey": layer_key,
+        "layerName": layer_title,
+        "source": {
+            "database": db_name,
+            "relation": layer["table"],
+            "geometryField": layer["geom"],
+            "featureIdField": layer["qID"],
+        },
+        "effectiveFilter": filter_descriptor,
+        "query": {
+            "scope": "effective-locale-layer",
+            "conditions": [
+                *filter_descriptor["restrictions"],
+                "geometry IS NOT NULL",
+                "geometry IS NOT EMPTY",
+            ],
+            "summary": "filtered-feature-count-and-extent",
+            "representative": "nearest-feature-to-filtered-extent-centre",
+        },
+        "activation": activation,
+    }
     query = sql.SQL("""
       WITH rendered AS (
         SELECT *
@@ -2718,11 +3126,13 @@ def visual_plan(
                ST_Extent(ST_Transform({geom}, 3857)) AS extent
         FROM rendered
         WHERE {geom} IS NOT NULL
+          AND NOT ST_IsEmpty({geom})
       ) bounds
       LEFT JOIN LATERAL (
         SELECT GeometryType({geom}) AS geometry_type
         FROM rendered
         WHERE {geom} IS NOT NULL
+          AND NOT ST_IsEmpty({geom})
         LIMIT 1
       ) sample ON TRUE
     """).format(
@@ -2749,6 +3159,11 @@ def visual_plan(
     if not count or None in (west, south, east, north):
         raise VisualPlanningNoMatchingFeatures(
             filter_applied=filter_applied,
+            effective_dataset={
+                **effective_dataset,
+                "filteredFeatureCount": 0,
+                "representativeFeature": None,
+            },
         )
     centre_x, centre_y = (west + east) / 2, (south + north) / 2
     sample_query = sql.SQL("""
@@ -2757,10 +3172,11 @@ def visual_plan(
         FROM {relation}
         WHERE {default_filter}
       ), candidate AS (
-        SELECT {qid} AS feature_id,
+        SELECT pg_catalog.to_jsonb({qid}) AS feature_id,
                {geom} AS geom
         FROM rendered
         WHERE {geom} IS NOT NULL
+          AND NOT ST_IsEmpty({geom})
         ORDER BY ST_Transform({geom}, 3857) <-> ST_SetSRID(ST_MakePoint(%s, %s), 3857)
         LIMIT 1
       ), prepared AS (
@@ -2802,7 +3218,16 @@ def visual_plan(
             timed_out=getattr(exc, "sqlstate", None) == "57014",
         ) from exc
     if sample is None:
-        raise VisualPlanningNoMatchingFeatures(filter_applied=filter_applied)
+        raise VisualPlanningNoMatchingFeatures(
+            filter_applied=filter_applied,
+            effective_dataset={
+                **effective_dataset,
+                "filteredFeatureCount": count,
+                "representativeFeature": None,
+            },
+            reason="representative-feature-unavailable",
+            stage="representative-feature",
+        )
     (
         feature_id,
         sample_geometry_type,
@@ -2843,6 +3268,18 @@ def visual_plan(
         "geometryType": geometry_type,
         "featureCount": count,
         "defaultFilterApplied": filter_applied,
+        "effectiveDataset": {
+            **effective_dataset,
+            "filteredFeatureCount": count,
+            "representativeFeature": {
+                "id": feature_id,
+                "geometryType": geometry_type,
+                "bounds3857": [
+                    focus_west, focus_south, focus_east, focus_north,
+                ],
+                "target": [target_lng, target_lat],
+            },
+        },
         "bounds3857": [west, south, east, north],
         "focusBounds3857": [focus_west, focus_south, focus_east, focus_north],
         "centre": [target_lng, target_lat],
