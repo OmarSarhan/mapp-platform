@@ -85,9 +85,41 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 start = source.index("reject_database_environment_overrides()")
                 end = source.index("\n}", start)
                 guard = source[start:end]
-                for key in expected:
-                    self.assertIn(key, guard)
+            for key in expected:
+                self.assertIn(key, guard)
                 self.assertIn('unset "${key}"', guard)
+
+    def test_layer_drop_guard_installs_blocking_sql_objects(self) -> None:
+        source = self.normalized("docker/postgis/init/25-platform-layer-drop-guard.sql")
+        for contract in (
+            "CREATE TABLE IF NOT EXISTS public.mapp_platform_layer_dependencies",
+            "CREATE OR REPLACE FUNCTION public.mapp_sync_platform_layer_dependencies",
+            "CREATE OR REPLACE FUNCTION public.mapp_block_platform_layer_drops()",
+            "DROP EVENT TRIGGER IF EXISTS mapp_block_platform_layer_drops",
+            "CREATE EVENT TRIGGER mapp_block_platform_layer_drops",
+            "ERRCODE = '55006'",
+            "DROP TABLE",
+            "DROP VIEW",
+            "DROP MATERIALIZED VIEW",
+            "GRANT EXECUTE ON FUNCTION public.mapp_sync_platform_layer_dependencies",
+            "cmd.schema_name",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
+
+    def test_upgrade_includes_layer_drop_guard_migration(self) -> None:
+        source = self.normalized("docker/postgis/upgrade-derived.sh")
+        for contract in (
+            "public.mapp_platform_layer_dependencies",
+            "public.mapp_sync_platform_layer_dependencies",
+            "mapp_block_platform_layer_drops",
+            "DROP EVENT TRIGGER IF EXISTS mapp_block_platform_layer_drops",
+            "CREATE EVENT TRIGGER mapp_block_platform_layer_drops",
+            "ERRCODE = '55006'",
+            "cmd.schema_name",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
 
     def test_matching_export_cannot_shadow_env_file_interpolation(self) -> None:
         raw_dbs = (
@@ -287,6 +319,10 @@ class DatabaseAccessContractTests(unittest.TestCase):
         compose = (
             ROOT / "compose.bundled-db.yaml"
         ).read_text(encoding="utf-8")
+        self.assertIn(
+            "./docker/postgis/init/25-platform-layer-drop-guard.sql:/docker-entrypoint-initdb.d/85-mapp-platform-layer-drop-guard.sql:ro",
+            compose,
+        )
         wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
         self.assertIn("mapp-prepare-spatial-indexes:ro", compose)
         self.assertIn(
@@ -325,6 +361,21 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
         self.assertNotIn("jq ", source)
+
+    def test_verifier_checks_platform_layer_drop_guard_objects(self) -> None:
+        source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+        for contract in (
+            "Layer dependency guard table public.mapp_platform_layer_dependencies is missing.",
+            "Layer dependency sync function public.mapp_sync_platform_layer_dependencies is missing.",
+            "Layer dependency sync function public.mapp_sync_platform_layer_dependencies(text, jsonb) is missing.",
+            "PUBLIC does not have execute permission on public.mapp_sync_platform_layer_dependencies(text, jsonb).",
+            "Layer drop guard event trigger mapp_block_platform_layer_drops is missing.",
+            "Layer drop guard function public.mapp_block_platform_layer_drops is missing.",
+            "to_regprocedure('public.mapp_sync_platform_layer_dependencies(text, jsonb)')",
+            "pg_event_trigger",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
 
     def test_inline_derived_session_probe_is_valid_python(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")

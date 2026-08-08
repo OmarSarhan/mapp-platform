@@ -163,6 +163,7 @@ class ReloadTests(unittest.TestCase):
                 ),
                 patch("app.wait_reload", side_effect=observe_applied),
                 patch("app.schedule_live_preview_sync") as preview_sync,
+                patch("app.sync_layer_dependency_guard") as sync_dependencies,
             ):
                 applied, reload_result = app.apply_proposal_and_reload(
                     store,
@@ -177,8 +178,31 @@ class ReloadTests(unittest.TestCase):
                 app.strict_json_loads(workspace.read_bytes()),
             )
             self.assertEqual("Approved candidate", saved["title"])
+            sync_dependencies.assert_called_once_with(saved)
             preview_sync.assert_called_once()
             self.assertEqual(workspace.read_bytes(), preview_sync.call_args.args[0])
+
+    def test_save_and_reload_syncs_layer_dependency_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace.json"
+            workspace.write_text('{"key":"demo","locale":{"layers":{}}}\n')
+            candidate = {"key": "demo", "locale": {"layers": {}}}
+            with (
+                patch("app.WORKSPACE", workspace),
+                patch(
+                    "app.save_workspace",
+                    return_value=(app.json.dumps(candidate).encode() + b"\n", "next-revision"),
+                ),
+                patch("app.request_reload", return_value={"requestedGeneration": 4}),
+                patch("app.wait_reload", return_value={"completed": True}),
+                patch("app.sync_layer_dependency_guard") as sync_dependencies,
+            ):
+                _, _, _, _ = app.save_and_reload(
+                    candidate,
+                    "current-revision",
+                )
+
+        sync_dependencies.assert_called_once()
 
     def test_interrupted_proposal_recovers_an_exact_committed_candidate(self):
         with tempfile.TemporaryDirectory() as directory:

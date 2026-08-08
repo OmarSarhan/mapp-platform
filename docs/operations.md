@@ -72,7 +72,10 @@ automatically before `up`, `serve`, `config-ui`, `etl`, `census-etl`, or `all`
 starts application/database work. The automatic index ensure analyzes a
 relation only when it creates a missing index. `./bin/mapp upgrade-derived`
 remains the explicit maintenance entry point, and `./bin/mapp verify` audits
-the result without changing database state.
+the result without changing database state. Verification also checks the
+platform layer-dependency guard table, sync function, public execute grant, and
+drop-blocking event trigger used to protect actively referenced workspace and
+derived-layer relations from manual database drops.
 
 The final Census publication is atomic and preserves the stable table OID, but
 it uses `TRUNCATE` and a complete replacement insert while holding an

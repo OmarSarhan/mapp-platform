@@ -190,8 +190,9 @@ Bundled mode's `all` command loads the full ETL, including Census, before
 verification.
 In external mode, `etl`, `all`, and the local `db` command are disabled;
 `verify` checks the external PostGIS connection and catalog plus the generic
-platform and gateway gates. Complete external acceptance with layer-specific
-visual tests for that workspace.
+platform and gateway gates, including the platform layer-dependency guard
+objects that block manual drops of actively referenced relations. Complete
+external acceptance with layer-specific visual tests for that workspace.
 
 Use `./bin/mapp ps` and `./bin/mapp logs` from the same repository with its
 production `.env` while bringing up the release. Confirm both public hostnames,

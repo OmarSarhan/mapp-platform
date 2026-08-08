@@ -1076,6 +1076,103 @@ class LayersRouteTests(unittest.TestCase):
         )
 
 
+class DependencyRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(
+        path: str,
+    ) -> tuple[app.Handler, list[tuple[HTTPStatus, dict]]]:
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda: "token:test"
+        handler._json = lambda status, payload: responses.append((status, payload))
+        return handler, responses
+
+    def test_dependency_route_returns_configured_references(self):
+        workspace = {
+            "dbs": "MAPP",
+            "locale": {
+                "layers": {
+                    "Stops": {
+                        "format": "mvt",
+                        "table": "leeds.bus_stops",
+                    },
+                },
+            },
+        }
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"MAPP": "postgresql://reader"}),
+            patch.object(app, "DERIVED", None),
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", workspace, "revision"),
+            ),
+        ):
+            handler, responses = self.handler("/api/dependencies")
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual({
+            "dependencies": [{
+                "alias": "MAPP",
+                "relation": "leeds.bus_stops",
+                "workspaceLayers": ["locale:Stops"],
+                "derivedLayers": [],
+            }],
+        }, responses[0][1])
+
+    def test_dependency_route_returns_blocked_status_for_reference(self):
+        workspace = {
+            "dbs": "MAPP",
+            "locale": {
+                "layers": {
+                    "Stops": {
+                        "format": "mvt",
+                        "table": "leeds.bus_stops",
+                    },
+                },
+            },
+        }
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"MAPP": "postgresql://reader"}),
+            patch.object(app, "DERIVED", None),
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", workspace, "revision"),
+            ),
+        ):
+            handler, responses = self.handler(
+                "/api/dependencies?alias=MAPP&schema=leeds&relation=bus_stops",
+            )
+            handler.do_GET()
+
+        status, payload = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(payload["blocked"])
+        self.assertEqual("MAPP", payload["alias"])
+        self.assertEqual("leeds", payload["schema"])
+        self.assertEqual("bus_stops", payload["relation"])
+        self.assertEqual(1, len(payload["matches"]))
+
+    def test_dependency_route_requires_all_query_arguments(self):
+        with (
+            patch.object(app, "DB_CONNECTIONS", {"MAPP": "postgresql://reader"}),
+            patch.object(app, "DERIVED", None),
+            patch.object(
+                app,
+                "read_workspace",
+                return_value=(b"{}", {"dbs": "MAPP", "locale": {}}, "revision"),
+            ),
+        ):
+            handler, responses = self.handler("/api/dependencies?alias=MAPP&schema=leeds")
+        handler.do_GET()
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("dependencies.invalid_query", responses[0][1]["code"])
+
+
 class DerivedMapExtentRouteTests(unittest.TestCase):
     @staticmethod
     def handler(path: str, payload: dict | None = None):

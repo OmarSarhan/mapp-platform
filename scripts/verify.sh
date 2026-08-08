@@ -321,6 +321,71 @@ $$;
 
 DO $$
 DECLARE
+  table_present integer;
+  guard_event_trigger_count integer;
+BEGIN
+  SELECT count(*) INTO table_present
+  FROM pg_catalog.pg_class AS relation
+  JOIN pg_catalog.pg_namespace AS ns
+    ON ns.oid = relation.relnamespace
+  WHERE ns.nspname = 'public'
+    AND relation.relname = 'mapp_platform_layer_dependencies';
+  IF table_present = 0 THEN
+    RAISE EXCEPTION 'Layer dependency guard table public.mapp_platform_layer_dependencies is missing.';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc AS proc
+    JOIN pg_catalog.pg_namespace AS ns
+      ON ns.oid = proc.pronamespace
+    WHERE proc.proname = 'mapp_sync_platform_layer_dependencies'
+      AND ns.nspname = 'public'
+  ) THEN
+    RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies is missing.';
+  END IF;
+
+  IF to_regprocedure('public.mapp_sync_platform_layer_dependencies(text, jsonb)') IS NULL THEN
+    RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies(text, jsonb) is missing.';
+  END IF;
+
+  IF NOT has_function_privilege(
+    'public',
+    'public.mapp_sync_platform_layer_dependencies(text, jsonb)',
+    'execute'
+  ) THEN
+    RAISE EXCEPTION 'PUBLIC does not have execute permission on public.mapp_sync_platform_layer_dependencies(text, jsonb).';
+  END IF;
+
+  SELECT count(*) INTO guard_event_trigger_count
+  FROM pg_catalog.pg_event_trigger AS trigger
+  JOIN pg_catalog.pg_proc AS proc
+    ON proc.oid = trigger.evtfoid
+  JOIN pg_catalog.pg_namespace AS ns
+    ON ns.oid = proc.pronamespace
+  WHERE trigger.evtname = 'mapp_block_platform_layer_drops'
+    AND proc.proname = 'mapp_block_platform_layer_drops'
+    AND ns.nspname = 'public'
+  ;
+  IF guard_event_trigger_count <> 1 THEN
+    RAISE EXCEPTION 'Layer drop guard event trigger mapp_block_platform_layer_drops is missing.';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc AS proc
+    JOIN pg_catalog.pg_namespace AS ns
+      ON ns.oid = proc.pronamespace
+    WHERE proc.proname = 'mapp_block_platform_layer_drops'
+      AND ns.nspname = 'public'
+  ) THEN
+    RAISE EXCEPTION 'Layer drop guard function public.mapp_block_platform_layer_drops is missing.';
+  END IF;
+END
+$$;
+
+DO $$
+DECLARE
   relation text;
   row_total bigint;
   bad_geom bigint;

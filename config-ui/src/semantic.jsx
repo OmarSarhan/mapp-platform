@@ -1105,9 +1105,10 @@ export function SemanticCatalog({api, close, identity}) {
             </label>
             <label hidden={!advanced}>
               <span>Why is this change needed?</span>
-              <input
+              <textarea
                 aria-label="Semantic proposal explanation"
                 disabled={generationRunning}
+                rows="3"
                 value={explanation}
                 onChange={event => {
                   setExplanation(event.target.value);

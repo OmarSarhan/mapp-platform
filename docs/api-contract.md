@@ -570,6 +570,12 @@ Managed derived-layer database actions are separate from workspace proposals:
 - `POST /api/derived-layers/<name>/drop` removes a managed object only with
   `{"confirmed": true}`. Replacement and drop report detected PostgreSQL
   dependents; drop also reports live workspace references and refuses removal.
+- `GET /api/dependencies` lists database relations currently referenced by the
+  effective workspace and managed derived-layer catalog. Supplying `alias`,
+  `schema`, and `relation` together checks one relation and returns
+  `blocked`, `matches`, and an operator-facing `message`. The route is
+  read-only and does not discover external clients that only read from
+  PostgreSQL.
 
 Creating a derived relation never adds it to the workspace or reloads XYZ.
 That remains a separately reviewed, revision-bound workspace proposal.

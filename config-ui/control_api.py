@@ -1562,6 +1562,7 @@ def contract(instance_id: str) -> dict[str, Any]:
             "describe", "schema", "rules", "examples",
             "plugins list", "plugins show", "plugins validate", "plugins usage",
             "capabilities list", "capabilities show",
+            "dependencies list", "dependencies check",
             "workspace get", "layers list", "layers get", "layers values",
             "layers statistics",
             "layers style-elements", "layers filters", "layers effective",

@@ -162,7 +162,8 @@ Putting `pg_catalog` first prevents an identically named function or operator
 in another schema from taking precedence; `public` remains available for
 PostGIS and H3 installations, while `CREATE` on `public` stays revoked. Every
 submitted source relation is schema-qualified, so source lookup never depends
-on this path. `./bin/mapp verify` checks the effective derived-owner setting.
+on this path. `./bin/mapp verify` checks the effective derived-owner setting
+and the platform layer-dependency guard objects installed in `public`.
 
 PostgreSQL replaces that session path with a security-restricted path while it
 refreshes a materialized view. In H3 4.2.3, the PostGIS polygon wrappers are SQL

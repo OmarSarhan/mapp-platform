@@ -24,6 +24,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgis/init/05-h3.sql:/docker-entrypoint-initdb.d/80-mapp-h3.sql:ro
+      - ./docker/postgis/init/25-platform-layer-drop-guard.sql:/docker-entrypoint-initdb.d/85-mapp-platform-layer-drop-guard.sql:ro
       - ./docker/postgis/init/10-roles.sh:/docker-entrypoint-initdb.d/90-mapp-roles.sh:ro
       - ./docker/postgis/init/20-runtime-info.sql:/docker-entrypoint-initdb.d/95-mapp-runtime-info.sql:ro
       - ./docker/postgis/healthcheck.sh:/usr/local/bin/mapp-db-healthcheck:ro

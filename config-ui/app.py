@@ -73,7 +73,7 @@ from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validat
 from control_plane import ControlStore, parse_time
 from control_api import (
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
-    CollectionPaginationError, VisualPlanningDatabaseError,
+    CollectionPaginationError, DATABASE_LAYER_FORMATS, VisualPlanningDatabaseError,
     VisualPlanningNoMatchingFeatures,
     apply_operations, capabilities, contract, examples, plugin_manifest,
     decode_position_cursor,
@@ -1287,6 +1287,147 @@ def derived_workspace_references(name: str) -> list[str]:
             if isinstance(layer, dict) and layer.get("table") == relation:
                 references.append(f"{locale_path}.layers.{layer_key}")
     return references
+
+
+def _normalize_relation(value: object) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    relation = value.strip()
+    if not relation or relation.count(".") > 1:
+        return None
+    if "." in relation:
+        schema, table = relation.split(".", 1)
+    else:
+        schema, table = "public", relation
+    schema = schema.strip()
+    table = table.strip()
+    if not schema or not table:
+        return None
+    return schema, table
+
+
+def _database_layer_relations(layer: dict) -> list[tuple[str, str]]:
+    if (
+        not isinstance(layer, dict)
+        or layer.get("format") not in DATABASE_LAYER_FORMATS
+    ):
+        return []
+    table_map = layer.get("tables")
+    if isinstance(table_map, dict) and table_map:
+        relations = []
+        for relation in table_map.values():
+            normalized = _normalize_relation(relation)
+            if normalized:
+                relations.append(normalized)
+        return relations
+    normalized = _normalize_relation(layer.get("table"))
+    return [normalized] if normalized else []
+
+
+def platform_dependencies(workspace: dict) -> list[dict]:
+    locales = effective_locales(workspace)
+    dependencies: dict[str, dict] = {}
+
+    def add_reference(
+        *,
+        alias: str,
+        schema: str,
+        relation: str,
+        key: str,
+        value: str,
+    ) -> None:
+        compound = f"{alias}:{schema}.{relation}"
+        record = dependencies.get(compound)
+        if record is None:
+            record = {
+                "alias": alias,
+                "relation": f"{schema}.{relation}",
+                "workspace": [],
+                "derived": [],
+            }
+            dependencies[compound] = record
+        record[key].append(value)
+
+    for locale_key, locale in locales.items():
+        if not isinstance(locale, dict):
+            continue
+        for layer_key, layer in (locale.get("layers") or {}).items():
+            if not isinstance(layer_key, str) or not isinstance(layer, dict):
+                continue
+            alias = layer.get("dbs") or workspace.get("dbs")
+            if not isinstance(alias, str) or alias not in DB_CONNECTIONS:
+                continue
+            for schema, relation in _database_layer_relations(layer):
+                add_reference(
+                    alias=alias,
+                    schema=schema,
+                    relation=relation,
+                    key="workspace",
+                    value=f"{locale_key}:{layer_key}",
+                )
+
+    if DERIVED is not None:
+        try:
+            for definition in DERIVED.list():
+                name = definition.get("name")
+                if not name:
+                    continue
+                for source_relation in definition.get("sources", ()):
+                    normalized = _normalize_relation(source_relation)
+                    if not normalized:
+                        continue
+                    schema, table = normalized
+                    add_reference(
+                        alias="derived",
+                        schema=schema,
+                        relation=table,
+                        key="derived",
+                        value=name,
+                    )
+        except (psycopg.Error, DerivedLayerError):
+            # If the derived catalog is unavailable, only workspace references
+            # should be reported.
+            pass
+
+    return sorted(
+        (
+            {
+                "alias": record["alias"],
+                "relation": record["relation"],
+                "workspaceLayers": sorted(set(record["workspace"])),
+                "derivedLayers": sorted(set(record["derived"])),
+            }
+            for record in dependencies.values()
+        ),
+        key=lambda item: (item["alias"], item["relation"]),
+    )
+
+
+def sync_layer_dependency_guard(workspace: dict) -> None:
+    """Sync workspace+derived-layer references into database guard rows.
+
+    The best-effort write keeps per-database protections close to the live
+    workspace configuration. Synchronization failures do not block proposal
+    apply/save operations because platform-level safety is advisory and the
+    manual-drop path must fail open only if explicitly configured for that DB.
+    """
+    grouped: dict[str, set[str]] = {}
+    for item in platform_dependencies(workspace):
+        grouped.setdefault(item["alias"], set()).add(item["relation"])
+
+    for alias, relations in grouped.items():
+        database_url = DB_CONNECTIONS.get(alias)
+        if not database_url:
+            continue
+        try:
+            with psycopg.connect(database_url, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT public.mapp_sync_platform_layer_dependencies(%s, %s)",
+                        [alias, json.dumps(sorted(relations))],
+                    )
+        except Exception:
+            continue
 
 
 def derived_workspace_impact(name: str, affected_columns: list[str]) -> dict:
@@ -2677,6 +2818,7 @@ def save_and_reload(
     # the write and the supervisor fingerprinting it.
     with SAVE_RELOAD_LOCK:
         encoded, next_revision = save_workspace(candidate, expected)
+        sync_layer_dependency_guard(candidate)
         fingerprint = workspace_fingerprint(encoded)
         try:
             reload_result = request_reload(fingerprint)
@@ -3459,6 +3601,7 @@ def apply_proposal_and_reload(
                     candidate,
                     proposal["originalRevision"],
                 )
+                sync_layer_dependency_guard(candidate)
             except FileExistsError:
                 raw, current_workspace, current_revision = read_workspace()
                 if workspace_hash(current_workspace) == candidate_hash:
@@ -5865,6 +6008,76 @@ class Handler(SimpleHTTPRequestHandler):
         elif path == "/api/rules":
             category = parse_qs(urlparse(self.path).query).get("category", [None])[0]
             self._json(HTTPStatus.OK, {"rules": [rule for rule in RULES if not category or rule["category"] == category]})
+        elif path == "/api/dependencies":
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            alias = query.get("alias", [None])[0]
+            schema = query.get("schema", [None])[0]
+            relation = query.get("relation", [None])[0]
+            if any(value is not None and not isinstance(value, str) for value in (alias, schema, relation)):
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": "dependency query values must be strings.",
+                })
+                return
+            if relation is not None or alias is not None or schema is not None:
+                if alias is None or schema is None or relation is None:
+                    self._json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "alias, schema, and relation must be supplied together.",
+                            "code": "dependencies.invalid_query",
+                        },
+                    )
+                    return
+                if alias not in DB_CONNECTIONS and alias != "derived":
+                    self._json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": (
+                                f"Alias {alias!r} is not configured in DBS_ env vars."
+                            ),
+                            "code": "dependencies.invalid_alias",
+                        },
+                    )
+                    return
+            try:
+                dependencies = platform_dependencies((read_workspace())[1])
+            except (ValueError, RuntimeError, FileNotFoundError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {
+                    "error": str(exc),
+                    "code": "dependencies.invalid_workspace",
+                })
+                return
+            if relation is not None and schema is not None and alias is not None:
+                normalized = _normalize_relation(f"{schema}.{relation}")
+                if not normalized:
+                    self._json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": "relation must be schema.table or table.",
+                            "code": "dependencies.invalid_relation",
+                        },
+                    )
+                    return
+                matches = [
+                    item for item in dependencies
+                    if item["alias"] == alias
+                    and item["relation"] == f"{normalized[0]}.{normalized[1]}"
+                ]
+                self._json(HTTPStatus.OK, {
+                    "alias": alias,
+                    "schema": normalized[0],
+                    "relation": normalized[1],
+                    "matches": matches,
+                    "blocked": bool(matches),
+                    "message": (
+                        "Delete is blocked by active platform references."
+                        if matches else
+                        "No active platform references were found for this relation."
+                    ),
+                })
+                return
+            self._json(HTTPStatus.OK, {"dependencies": dependencies})
+            return
         elif path == "/api/examples":
             self._json(HTTPStatus.OK, examples())
         elif path == "/api/sql/capabilities":
