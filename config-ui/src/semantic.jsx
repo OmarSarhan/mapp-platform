@@ -980,31 +980,33 @@ export function SemanticCatalog({api, close, identity}) {
                           && Object.keys(annotation).length > 0
                         );
                         const statusId = `semantic-field-status-${index}`;
-                        return <label key={field.id} className={checked ? 'selected' : ''}>
-                          <input
-                            type="checkbox"
-                            aria-describedby={hasSavedAnnotation ? statusId : undefined}
-                            disabled={busy || generationRunning || (
-                              !checked
-                              && generationFieldIds.length >= MAX_GENERATION_FIELDS
-                            )}
-                            checked={checked}
-                            onChange={() => {
-                              const next = checked
-                                ? generationFieldIds.filter(id => id !== field.id)
-                                : [...generationFieldIds, field.id];
-                              setGenerationFieldIds(next);
-                              setCuratedText('');
-                              setGeneratedDraft(null);
-                              setReview(null);
-                            }}
-                          />
-                          <span>{field.name || field.id}</span>
+                        return <div key={field.id} className={checked ? 'selected' : ''}>
+                          <label>
+                            <input
+                              type="checkbox"
+                              aria-describedby={hasSavedAnnotation ? statusId : undefined}
+                              disabled={busy || generationRunning || (
+                                !checked
+                                && generationFieldIds.length >= MAX_GENERATION_FIELDS
+                              )}
+                              checked={checked}
+                              onChange={() => {
+                                const next = checked
+                                  ? generationFieldIds.filter(id => id !== field.id)
+                                  : [...generationFieldIds, field.id];
+                                setGenerationFieldIds(next);
+                                setCuratedText('');
+                                setGeneratedDraft(null);
+                                setReview(null);
+                              }}
+                            />
+                            <span>{field.name || field.id}</span>
+                          </label>
                           {hasSavedAnnotation && <small
                             className="semantic-field-status"
                             id={statusId}
                           >Saved semantic value</small>}
-                        </label>;
+                        </div>;
                       })}
                     </div>
                     : <p className="muted">This profile has no fields with stable semantic IDs.</p>}
