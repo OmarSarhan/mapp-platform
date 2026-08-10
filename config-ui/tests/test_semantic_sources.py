@@ -194,6 +194,32 @@ class SemanticSourceContractTests(unittest.TestCase):
         self.assertNotIn("secret.people", sql_text)
         self.assertNotIn("SELECT *", sql_text.upper())
 
+    def test_discovery_admits_a_foreign_table(self):
+        cursor = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+            {"schema": "leeds", "relation": "bus_stops", "relation_kind": "f"},
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            discovered = sources.discover()
+
+        self.assertEqual(
+            [
+                ("leeds", "bus_stops", "foreign-table"),
+                ("leeds", "roads", "table"),
+            ],
+            [
+                (item["schema"], item["relation"], item["kind"])
+                for item in discovered
+            ],
+        )
+
     def test_bounded_discovery_filters_before_keyset_limit(self):
         cursor = FakeCursor([
             {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
@@ -419,6 +445,34 @@ class SemanticSourceContractTests(unittest.TestCase):
                 ):
                     pass
         self.assertEqual("semantic.source_metadata_invalid", error.exception.code)
+
+    def test_locked_relation_admits_a_foreign_table(self):
+        cursor = FakeCursor([
+            {
+                "relation_kind": "f",
+                "relation_description": None,
+                "name": "id",
+                "type": "bigint",
+                "description": None,
+                "nullable": False,
+                "geometryType": "",
+                "srid": None,
+                "primaryKey": False,
+                "unique": False,
+            },
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            with sources.locked_relation(
+                "MAPP", "leeds", "bus_stops"
+            ) as relation:
+                self.assertEqual("foreign-table", relation["kind"])
 
     def test_privilege_loss_and_missing_alias_fail_closed(self):
         sources = PostgresSemanticSources(

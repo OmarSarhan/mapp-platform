@@ -3700,7 +3700,7 @@ def discover_connection(db_name: str, database_url: str) -> list[dict]:
                bool_or(i.indisunique AND i.indnkeyatts = 1) AS is_unique
         FROM pg_index i GROUP BY i.indrelid, unnest(i.indkey)
       ) ix ON ix.indrelid = c.oid AND ix.attnum = a.attnum
-      WHERE c.relkind IN ('r', 'p', 'v', 'm')
+      WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
         AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         AND has_schema_privilege(n.oid, 'USAGE')
         AND has_table_privilege(c.oid, 'SELECT')
@@ -3817,7 +3817,7 @@ def aggregate_layer_values(
                 WHERE namespace.nspname = %s
                   AND relation.relname = %s
                   AND attribute.attname = %s
-                  AND relation.relkind IN ('r', 'p', 'v', 'm')
+                  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                   AND has_schema_privilege(namespace.oid, 'USAGE')
                   AND has_table_privilege(relation.oid, 'SELECT')
                 """,
@@ -3949,7 +3949,7 @@ def aggregate_layer_statistics(
                 WHERE namespace.nspname = %s
                   AND relation.relname = %s
                   AND attribute.attname = %s
-                  AND relation.relkind IN ('r', 'p', 'v', 'm')
+                  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                   AND has_schema_privilege(namespace.oid, 'USAGE')
                   AND has_table_privilege(relation.oid, 'SELECT')
                 """,
