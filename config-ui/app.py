@@ -601,7 +601,7 @@ def semantic_generation_optional_context(
                 code="semantic.generation_context_invalid",
             )
         return postgres_generation_context(
-            DB_CONNECTIONS["MAPP"],
+            DERIVED.connection_string,
             **arguments,
         )
     except GeminiClientError:
