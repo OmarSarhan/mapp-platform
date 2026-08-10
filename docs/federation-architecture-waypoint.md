@@ -208,6 +208,20 @@ any externally operated database is registered.
 | `config-ui/semantic_sources.py:602`, `:910` | `LOCK TABLE <source relation> IN ACCESS SHARE MODE` — not a data mutation, but a server-side effect on a source relation |
 | `etl/src/leeds_arcgis_etl/database.py`, `census_database.py` | Legitimately source-owned DDL/DML, but currently executed by MAPP's bundled ETL against the execution database |
 
+**Decided:** every site above except the `LOCK TABLE` read is scoped to run
+only against a MAPP-provisioned **bundled test-source** database — never the
+federation database, and never an externally registered alias — enforced
+structurally, not by operator discipline. `docker/postgis/init/10-roles.sh`,
+`upgrade-derived.sh`, and `prepare-spatial-indexes.sh` become part of the
+bundled test-source provisioning path only, invoked solely when standing up a
+bundled Leeds/Census-style source; nothing in that path is ever invoked
+against the federation database or an externally registered alias.
+`etl/src/leeds_arcgis_etl/database.py` and `census_database.py` target that
+same bundled test-source database exclusively, consistent with the
+ETL-ownership boundary already stated under **Bundled test-data ETL as the
+reference federation**. The `LOCK TABLE ... ACCESS SHARE MODE` site needs no
+change — it is already bounded, non-mutating, and correctly scoped.
+
 ### Federation-owned
 
 | Site | Mutation |
@@ -340,6 +354,25 @@ stays true, but under federation it means RLS is evaluated once, for the mapped
 role, identically for every MAPP user. Any deployment relying on per-user RLS
 at the source must be told this explicitly before it registers an alias.
 
+**Decided:** Discover checks `pg_class.relrowsecurity` and `pg_policies` for
+every allowlisted relation and records what it finds as observation evidence.
+If any allowlisted relation has RLS or a security-barrier view enabled, the
+registering principal must explicitly acknowledge the per-user-RLS loss
+described above — the same acknowledgement pattern already used for
+data-handling classification (see **Source lifecycle > 1. Register**) —
+before Approve exposure can proceed. This is a recorded warning, not a
+block: the platform surfaces the loss rather than silently inheriting it, but
+does not refuse to federate a relation that has RLS.
+
+**Decided (platform scope):** the design assumes self-managed PostgreSQL as
+the baseline for physical-identity evidence and system-catalog access. Managed
+services (RDS/Aurora, Azure Database for PostgreSQL, Cloud SQL) restrict
+catalog and superuser access differently from each other and from a
+self-managed instance; supporting them is explicitly out of scope until a
+deployment actually targets one, at which point that platform's specific
+restrictions need their own evidence pass — this is not assumed solved by the
+self-managed design.
+
 **Planner-estimate admission control weakens across FDW.** The entire
 derived-layer safety model rests on `EXPLAIN` estimates — total cost, node
 rows, plan depth, join fan-out, nested-loop pair work, and materialized size
@@ -350,7 +383,11 @@ foreign table last collected. Neither is as trustworthy as a local relation's
 statistics. The design must therefore state a position, not inherit one
 silently:
 
-- whether `use_remote_estimate` is required per alias, and who pays its latency;
+- **Decided:** `use_remote_estimate` is required for every alias, not optional
+  per alias. A remote planning round trip is a known, bounded latency cost;
+  planning against stale or absent local statistics on a foreign table is an
+  unbounded correctness risk to the entire admission model. The caller (the
+  query planner, at plan time) pays that latency, not the operator;
 - what `fetch_size` and per-alias row ceiling apply;
 - what remote-side `statement_timeout` the mapped role carries, since the local
   timeouts in `docker/postgis/init/10-roles.sh` do not bound remote work.
@@ -505,6 +542,17 @@ source version:        opaque value or null
 The same table name at a new physical database is not the same source unless an
 operator performs an explicit, evidenced rebind.
 
+**Decided:** an explicit rebind carries curated semantic annotations forward
+automatically when the rebound relation's structural fingerprint (see
+**Source relation**) matches what was recorded before the rebind — same
+columns, types, geometry/SRID, and identifiers. When it doesn't match, the
+rebind surfaces semantic drift explicitly and prompts the curator to
+regenerate or re-confirm semantics, rather than silently keeping stale
+curated meaning attached to a structurally different relation. A structural
+fingerprint match is evidence of continuity, not proof of it — it does not
+weaken the requirement that the rebind itself remain an explicit, evidenced
+operator action.
+
 This is the same distinction the semantic layer already draws between
 `generated` and `curated` facts, and it should reuse that machinery rather than
 inventing a second history store. An observation is a source-owned fact; it
@@ -627,6 +675,17 @@ federation the resolved dependency is the **local foreign table**
 be recorded by the provisioner and proved at mutation time, or the declaration
 becomes unverifiable — removing the strongest existing guarantee that a derived
 layer reads only what it declared.
+
+**Decided:** the FDW provisioner writes an explicit binding record — in the
+federation database's control schema (see **Federation database layout >
+Control schema**), not encoded into a naming convention — mapping each
+foreign table to its `(alias, remote schema, remote relation)` at the moment
+the foreign table is created. The four exact-match assertions resolve a
+dependency's local foreign table through this binding record before comparing
+it against `definition["sources"]`, so the declared source stays the remote
+relation identity, never the local FDW object's name. A foreign table with no
+binding record is treated as an unverifiable dependency and rejected, the same
+as a dependency the guard cannot otherwise classify.
 
 There is one encouraging detail: `_dependencies()` at
 `config-ui/derived_layers.py:1667` **already** admits relkind `'f'`, while
@@ -877,6 +936,35 @@ Networking is the cheapest part. Everything database-facing already sits on
 external sources need no new network. `automation`, `semantic-control`, and
 `browser-egress` are unaffected, and `compose.production.yaml` touches no
 database setting.
+
+### Migration path into `federated` mode
+
+**Decided:** switching an existing `bundled`/`external` deployment into
+`federated` mode creates a **new, dedicated federation database** — it does
+not repurpose the existing single database in place. `derived_layers`
+(including its private `_definitions` registry and `_semantic_outbox`) is
+relocated into the new database; the original database is never mutated
+during the migration. This matters for rollback: because the source database
+is untouched throughout, rolling back is simply continuing to use it and
+never cutting `MAPP_DATABASE_MODE` over to `federated` — there is no
+in-place state to unwind. After migration, the original database may
+optionally be registered as an ordinary source alias (its data now reached
+through FDW like any other source) or left alone, entirely at the operator's
+discretion; nothing about the migration requires that decision to be made
+up front.
+
+The migration sequence is: (1) provision the new federation database and its
+control/derived-output schemas; (2) copy — not move — the current
+`derived_layers` state (`_definitions`, `_semantic_outbox`, and existing
+managed relations) into it; (3) verify the copy against the original via the
+existing non-mutating audit machinery (`./bin/mapp verify`); (4) only then
+flip `MAPP_DATABASE_MODE` to `federated` and point the runtime reader and
+derived owner at the new database **in the same step**, per the ordering
+constraint under **Relationship to the current single-database contract**;
+(5) leave the original `derived_layers` state in place, untouched, until the
+new database has been running successfully for an operator-defined
+confirmation period — it is the rollback path, not scratch space to be
+reclaimed early.
 
 ## Source lifecycle
 
@@ -1212,6 +1300,23 @@ record intact. The federation verifier reads at most the exact bounded version
 record needed for the registered dataset; it does not repeatedly hash source
 tables.
 
+**Decided:** the closed contract is exactly one row — the current release —
+with these types and constraints:
+
+| Field | Type | Constraint |
+| --- | --- | --- |
+| `dataset_id` | `text` | not null; matches the registered alias's expected dataset |
+| `release_id` | `text` | not null; unique per publication |
+| `schema_version` | `integer` | not null; monotonically increasing |
+| `source_hash` | `text` | not null; opaque content digest |
+| `published_at` | `timestamptz` | not null |
+| `row_counts` | `jsonb` | not null; `{relation: count}` for every published relation |
+| `geometry_contract_version` | `integer` | not null; monotonically increasing |
+
+The federation verifier reads this single row as the "configured scalar
+publication/version signal" from **Source lifecycle > 2. Discover** and never
+queries anything else in the source schema to establish freshness.
+
 Two existing pieces already do most of this and should be extended rather than
 replaced: the ETL run records `leeds._etl_runs` and `leeds._census_etl_runs`,
 and the pinned manifest `instance/etl/census.json`, whose recorded geometry and
@@ -1290,11 +1395,16 @@ owner-pinned compensation path for an interrupted run. See
 Federation adds cases that machinery has no answer for today, and each needs a
 decision:
 
-- resetting a **source** database while the federation database holds foreign
-  tables pointing at it — the gate lives in the federation database, and
-  nothing currently fences a source-side reset;
-- whether the maintenance gate must be held across **all** databases or only
-  the federation database;
+- **Decided:** the maintenance gate is per-database, never cross-database. A
+  source reset is fenced only by that source's own gate; the federation
+  database's gate fences only federation-side resets. MAPP does not hold a
+  distributed lock over infrastructure it doesn't own — the source-side reset
+  case above is handled entirely by the observation-invalidation decision
+  above, not by extending the gate to span both databases. A source reset
+  proceeds under its own gate regardless of what the federation database is
+  doing at that moment; any inconsistency this briefly exposes is exactly
+  what the connectivity/freshness observation model already exists to
+  surface, not a new failure mode;
 - what a source reset does to semantic assets whose binding names that alias,
   given that archival is deliberately irreversible;
 - how `bin/mapp:584` learns which of several named volumes to remove.
@@ -1336,6 +1446,14 @@ restored to the same release. Startup must re-observe physical identity,
 structure, and configured version signals before declaring live or cached
 outputs current. FDW secrets and user mappings need an explicit secret-store
 restore and rotation procedure.
+
+**Decided:** every materialization's freshness reports `unknown` — not
+`current`, not `stale` — from the moment a federation database restore
+completes until every contributing source has been re-observed at least once.
+`unknown` already exists in the freshness enum (see **Observation versus
+truth**); restore does not need a new state, only a rule requiring it be
+applied to every materialization at restore time, before any request can read
+a freshness label that predates the restore.
 
 Secret retention must be tied to backup retention, not treated separately: a
 secret must not be hard-deleted, nor rotated with destruction of the prior
@@ -1666,8 +1784,11 @@ The next design pass must explicitly resolve, rather than silently assume:
    the fail-open behavior at `config-ui/app.py:1429` is removed outright, not
    made conditional — absence or failure of the guard sync is always
    reported, never swallowed.
-7. How the derived-layer declaration proof is re-established when `pg_depend`
-   resolves a local foreign table rather than the declared remote relation.
+7. **Decided:** the FDW provisioner writes an explicit binding record mapping
+   each foreign table to its `(alias, remote schema, remote relation)`; the
+   exact-match dependency checks resolve a dependency through this record
+   rather than trusting the local foreign table's name. See **The
+   derived-layer query guard and foreign tables**.
 8. **Decided (policy half):** `FORBIDDEN_RELATION_SCHEMAS` inverts to an
    allowlist — only integration/derived and named system schemas are readable
    by a submitted derived query; every `source_<alias>` schema is denied by
@@ -1676,10 +1797,15 @@ The next design pass must explicitly resolve, rather than silently assume:
    `pg_foreign_table`/`pg_foreign_server`, requiring the approved
    `postgres_fdw` handler) — that mechanics work still needs a real foreign
    table to design against.
-9. Whether planner-estimate admission requires `use_remote_estimate` per alias,
-   and what bounds remote work when local timeouts do not apply.
-10. The exact physical database identity evidence available on managed and
-    restricted PostgreSQL services.
+9. **Decided:** `use_remote_estimate` is required for every alias, not
+    optional per alias. See **Non-goals and constraints**. Still open: the
+    exact `fetch_size`, per-alias row ceiling, and remote-side
+    `statement_timeout` values.
+10. **Decided (scope):** the design assumes self-managed PostgreSQL as the
+    baseline for physical-identity evidence. Managed-service-specific
+    restrictions (RDS/Aurora, Azure Database for PostgreSQL, Cloud SQL) are
+    explicitly out of scope until a deployment actually targets one. See
+    **Non-goals and constraints**.
 11. **Decided:** never — integration/derived relations only, from day one.
     See **Federation database layout > Foreign source schemas**.
 12. **Decided:** the reconciled alias pattern is the existing semantic
@@ -1702,8 +1828,12 @@ The next design pass must explicitly resolve, rather than silently assume:
     name requires the explicit **reclaim** action described under **Source
     lifecycle > 8. Drift and retirement**, not an undocumented manual
     intervention.
-13. How source RLS, security-barrier views, and FDW pushdown are verified,
-    given that per-user RLS does not survive a shared user mapping.
+13. **Decided:** Discover checks `pg_class.relrowsecurity`/`pg_policies` for
+    every allowlisted relation and records the result as observation
+    evidence; if any allowlisted relation has RLS or a security-barrier view
+    enabled, the registering principal must explicitly acknowledge the
+    per-user-RLS loss before Approve exposure — a recorded warning, not a
+    block. See **Non-goals and constraints**.
 14. **Decided:** geometry transforms may be pushed down only when the alias's
     observed PROJ version exactly matches the federation database's;
     otherwise they execute locally. Enforced via `postgres_fdw`'s per-server
@@ -1713,22 +1843,43 @@ The next design pass must explicitly resolve, rather than silently assume:
     GEOS alongside PostGIS/PROJ; H3 is not tracked on sources. See **The
     derived-layer query guard and foreign tables** and **Freshness and
     verification**.
-15. The closed contract for publication/version relations and timestamp checks.
-16. How semantic field identity behaves across explicit source rebinds.
-17. How restored materializations are labelled until all contributing sources
-    have been re-observed.
-18. How `reset-data`'s owner-fenced maintenance gate behaves across a source
-    database it does not own.
+15. **Decided:** the closed contract is one row with typed, not-null fields —
+    `dataset_id`, `release_id`, `schema_version`, `source_hash`,
+    `published_at`, `row_counts`, `geometry_contract_version`. See **Bundled
+    test-data ETL as the reference federation > Publication record**.
+16. **Decided:** an explicit rebind carries curated semantic annotations
+    forward automatically when the rebound relation's structural fingerprint
+    matches what was recorded before the rebind; otherwise it surfaces
+    semantic drift explicitly and prompts the curator to regenerate or
+    re-confirm. See **Logical model > Observation versus truth**.
+17. **Decided:** every materialization reports `unknown` freshness — the
+    existing enum value, not a new one — from the moment a federation
+    database restore completes until every contributing source has been
+    re-observed at least once. See **Backup and recovery implications**.
+18. **Decided:** the maintenance gate is per-database, never cross-database. A
+    source reset is fenced only by its own gate; the federation database's
+    gate fences only federation-side resets. The momentary inconsistency this
+    can expose is exactly what the connectivity/freshness observation model
+    already surfaces, not a new failure mode requiring a distributed lock.
+    See **Bundled test-data ETL as the reference federation > Reset
+    semantics**.
 19. **Decided:** one in-process worker, built to the per-source-collector
     interface from day one, so later extraction into N collectors is a
     deployment change rather than a redesign. See **Freshness and
     verification**; [Semantic metadata control plane](semantic-layer.md)
     needs a one-line cross-reference added so the two pages don't read as
     disagreeing.
-20. Which of the source-owned mutation sites listed above are removed, moved to
-    the federation database, or made explicitly opt-in per alias.
-21. The exact migration and rollback path from the current bundled database
-    without claiming that moving definitions also moves or verifies data.
+20. **Decided:** every source-owned mutation site (schema creation and grants,
+    index preparation and `ANALYZE`, the bundled ETL's own DDL/DML) is scoped
+    to run only against a MAPP-provisioned bundled test-source database —
+    never the federation database, never an externally registered alias —
+    enforced structurally, not by operator discipline. See **Classifying
+    current database mutations > Source-owned — but mutated by MAPP today**.
+21. **Decided:** switching an existing deployment into `federated` mode
+    provisions a new, dedicated federation database and relocates
+    `derived_layers` into it; the original database is never mutated during
+    migration, which is also the rollback path. See **Deployment topology and
+    database mode > Migration path into `federated` mode**.
 
 ## Recommended first implementation task
 
