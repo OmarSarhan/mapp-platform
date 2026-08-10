@@ -69,6 +69,7 @@ from gemini_client import (
     GeminiSemanticClient,
 )
 from workspace_schema import expression_function_names, validate_workspace
+from relation_identity import parse_relation
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, parse_time
 from control_api import (
@@ -601,7 +602,7 @@ def semantic_generation_optional_context(
                 code="semantic.generation_context_invalid",
             )
         return postgres_generation_context(
-            DB_CONNECTIONS["MAPP"],
+            DERIVED.connection_string,
             **arguments,
         )
     except GeminiClientError:
@@ -1290,20 +1291,8 @@ def derived_workspace_references(name: str) -> list[str]:
 
 
 def _normalize_relation(value: object) -> tuple[str, str] | None:
-    if not isinstance(value, str):
-        return None
-    relation = value.strip()
-    if not relation or relation.count(".") > 1:
-        return None
-    if "." in relation:
-        schema, table = relation.split(".", 1)
-    else:
-        schema, table = "public", relation
-    schema = schema.strip()
-    table = table.strip()
-    if not schema or not table:
-        return None
-    return schema, table
+    parsed = parse_relation(value, alias=None, default_schema="public")
+    return parsed[1:] if parsed is not None else None
 
 
 def _database_layer_relations(layer: dict) -> list[tuple[str, str]]:
@@ -3792,18 +3781,12 @@ def aggregate_layer_values(
     if not database_url:
         raise ValueError("The selected layer database is not configured.")
     relation_name = layer.get("table")
-    if (
-        not isinstance(relation_name, str)
-        or not relation_name
-        or relation_name.count(".") > 1
-    ):
+    parsed = parse_relation(relation_name, alias=None, default_schema="public")
+    if parsed is None:
         raise ValueError(
             "The selected layer does not use a valid database relation."
         )
-    relation_parts = relation_name.split(".")
-    if len(relation_parts) == 1:
-        relation_parts.insert(0, "public")
-    schema_name, table_name = relation_parts
+    _, schema_name, table_name = parsed
     relation = psycopg.sql.SQL("{}.{}").format(
         psycopg.sql.Identifier(schema_name),
         psycopg.sql.Identifier(table_name),
@@ -3928,18 +3911,12 @@ def aggregate_layer_statistics(
     if not database_url:
         raise ValueError("The selected layer database is not configured.")
     relation_name = layer.get("table")
-    if (
-        not isinstance(relation_name, str)
-        or not relation_name
-        or relation_name.count(".") > 1
-    ):
+    parsed = parse_relation(relation_name, alias=None, default_schema="public")
+    if parsed is None:
         raise ValueError(
             "The selected layer does not use a valid database relation."
         )
-    relation_parts = relation_name.split(".")
-    if len(relation_parts) == 1:
-        relation_parts.insert(0, "public")
-    schema_name, table_name = relation_parts
+    _, schema_name, table_name = parsed
     relation = psycopg.sql.SQL("{}.{}").format(
         psycopg.sql.Identifier(schema_name),
         psycopg.sql.Identifier(table_name),
@@ -4328,9 +4305,24 @@ def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
         if not isinstance(locale, dict):
             continue
         for key, layer in (locale.get("layers") or {}).items():
+            path = f"{locale_path}.layers.{key}"
+            if (
+                isinstance(layer, dict)
+                and layer.get("format") in DATABASE_LAYER_FORMATS
+                and not isinstance(layer.get("template"), str)
+                and not isinstance(layer.get("features"), list)
+                and isinstance(layer.get("tables"), dict)
+            ):
+                db_name = layer_db(data, layer)
+                for zoom, relation in layer["tables"].items():
+                    if relation is not None and not index.get((db_name, relation)):
+                        errors.append({
+                            "path": f"{path}.tables.{zoom}",
+                            "message": "Table is not selectable through the configured read-only connection.",
+                        })
+                continue
             if not is_probeable_database_layer(layer):
                 continue
-            path = f"{locale_path}.layers.{key}"
             table = index.get((layer_db(data, layer), layer.get("table")))
             if not table:
                 errors.append({"path": f"{path}.table", "message": "Table is not selectable through the configured read-only connection."})
@@ -4606,14 +4598,13 @@ def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index
     if not database_url:
         raise ValueError(f"No DBS_{db_name} connection is configured.")
     relation_name = layer.get("table")
-    if not isinstance(relation_name, str) or relation_name.count(".") > 1:
+    parsed = parse_relation(relation_name, alias=None, default_schema="public")
+    if parsed is None:
         raise ValueError("Select a valid database table before testing the expression.")
-    relation_parts = relation_name.split(".")
-    if len(relation_parts) == 1:
-        relation_parts.insert(0, "public")
+    _, schema_name, table_name = parsed
     relation = psycopg.sql.SQL("{}.{}").format(
-        psycopg.sql.Identifier(relation_parts[0]),
-        psycopg.sql.Identifier(relation_parts[1]),
+        psycopg.sql.Identifier(schema_name),
+        psycopg.sql.Identifier(table_name),
     )
     sql_expression = psycopg.sql.SQL(expression)
     with psycopg.connect(database_url, connect_timeout=5) as conn:

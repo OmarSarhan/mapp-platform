@@ -283,6 +283,38 @@ class CatalogSymbologyValidationTests(unittest.TestCase):
 
         self.assertIn("locale.layers.Places.infoj.0.filter", paths)
 
+    def test_zoom_keyed_tables_map_is_checked_against_the_catalog(self):
+        workspace = {"dbs": "MAPP", "locale": {"layers": {"Places": {
+            "format": "mvt",
+            "geom": "geom",
+            "srid": 3857,
+            "qID": "id",
+            "tables": {"0": "public.low", "12": "public.missing"},
+            "style": {"default": {"fillColor": "#eeeeee"}},
+        }}}}
+        tables = [{
+            "dbs": "MAPP",
+            "schema": "public",
+            "table": "low",
+            "columns": [
+                {"name": "id", "geometryType": "", "srid": None},
+                {"name": "geom", "geometryType": "POLYGON", "srid": 3857},
+            ],
+        }]
+
+        errors = app.validate_catalog(workspace, tables)
+
+        self.assertEqual(
+            [{
+                "path": "locale.layers.Places.tables.12",
+                "message": (
+                    "Table is not selectable through the configured "
+                    "read-only connection."
+                ),
+            }],
+            errors,
+        )
+
 
 class JsonResponseTests(unittest.TestCase):
     def test_derived_layer_timestamps_are_serialized_as_iso_8601(self):
@@ -1222,6 +1254,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 "qualifiedName": "census.areas",
                 "binding": {
                     "adapter": "postgresql",
+                    "alias": "MAPP",
                     "schema": "census",
                     "relation": "areas",
                 },

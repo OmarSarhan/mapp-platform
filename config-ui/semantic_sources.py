@@ -17,6 +17,8 @@ from psycopg.rows import dict_row
 
 DEFAULT_ALLOWLIST = "MAPP:leeds.*"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+# Must match DB_KEY in workspace_schema.py and databaseKey in
+# schema/workspace.schema.json — one alias grammar, not three.
 ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 SYSTEM_SCHEMAS = {"information_schema", "derived_layers"}
 SOURCE_NAMESPACE = uuid.UUID("b2228ad9-b2cb-5ed1-a906-901d8bb128bf")

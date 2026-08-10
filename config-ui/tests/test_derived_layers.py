@@ -406,6 +406,39 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
                 with self.assertRaises(DerivedLayerError):
                     plan_area_weighted_h3_recipe(self.request(), asset)
 
+    def test_rejects_a_binding_missing_valid_alias_metadata(self):
+        assets = []
+        asset = self.source_asset()
+        del asset["generated"]["binding"]["alias"]
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["binding"]["alias"] = ""
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["binding"]["alias"] = "a" * 201
+        assets.append(asset)
+        asset = self.source_asset()
+        asset["generated"]["binding"]["alias"] = 7
+        assets.append(asset)
+
+        for asset in assets:
+            with self.subTest(asset=asset):
+                with self.assertRaises(DerivedLayerError):
+                    plan_area_weighted_h3_recipe(self.request(), asset)
+
+    def test_propagates_binding_alias_into_the_resolved_source(self):
+        result = plan_area_weighted_h3_recipe(self.request(), self.source_asset())
+
+        self.assertEqual(
+            {
+                "adapter": "postgresql",
+                "alias": "MAPP",
+                "schema": "census",
+                "relation": "areas",
+            },
+            result["source"]["binding"],
+        )
+
     def test_rejects_invalid_identity_geometry_and_measure_metadata(self):
         assets = []
         asset = self.source_asset()

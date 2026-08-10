@@ -16,6 +16,8 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from relation_identity import parse_relation
+
 from derived_query_guard import (
     H3_GRID_FUNCTIONS,
     H3_POLYGON_FUNCTIONS,
@@ -128,7 +130,7 @@ H3_AVERAGE_HEX_AREA_KM2 = (
     0.000000895,
 )
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
-RELATION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
+IDENTIFIER_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NUMERIC_FIELD_TYPE_RE = re.compile(
     r"^(?:smallint|integer|bigint|int2|int4|int8|real|float4|float8|"
     r"double\s+precision|numeric(?:\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\))?|"
@@ -322,11 +324,14 @@ class DerivedLayerDependencyError(DerivedLayerError):
 
 
 def _relation(value: str) -> tuple[str, str]:
-    if not isinstance(value, str) or not RELATION_RE.fullmatch(value):
+    parsed = parse_relation(
+        value, alias=None, default_schema=None, part_pattern=IDENTIFIER_PART_RE
+    )
+    if parsed is None:
         raise DerivedLayerError(
             "Source relations must be schema-qualified identifiers."
         )
-    return tuple(value.split(".", 1))  # type: ignore[return-value]
+    return parsed[1:]
 
 
 def _closed_recipe_object(
@@ -770,13 +775,13 @@ def plan_area_weighted_h3_recipe(
             "Recipe source relation does not match the semantic asset binding."
         )
     binding_alias = binding.get("alias")
-    if binding_alias is not None and (
+    if (
         not isinstance(binding_alias, str)
         or not binding_alias.strip()
         or len(binding_alias) > 200
     ):
         raise DerivedLayerError(
-            "Recipe source asset has invalid binding alias metadata."
+            "Recipe source asset is missing valid binding alias metadata."
         )
     qualified_name = generated.get("qualifiedName")
     if qualified_name is not None and qualified_name != source["relation"]:
@@ -935,11 +940,7 @@ def plan_area_weighted_h3_recipe(
 
     resolved_binding = {
         "adapter": "postgresql",
-        **(
-            {"alias": binding_alias}
-            if binding_alias is not None
-            else {}
-        ),
+        "alias": binding_alias,
         "schema": binding_schema,
         "relation": binding_relation,
     }

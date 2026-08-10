@@ -382,11 +382,6 @@ class SemanticGenerationRouteTests(unittest.TestCase):
             patch.object(app, "DERIVED", derived),
             patch.object(
                 app,
-                "DB_CONNECTIONS",
-                {"MAPP": "postgresql://runtime-reader"},
-            ),
-            patch.object(
-                app,
                 "postgres_generation_context",
                 return_value=expected,
             ) as reader,
@@ -400,7 +395,7 @@ class SemanticGenerationRouteTests(unittest.TestCase):
         self.assertEqual(expected, context)
         derived.get.assert_called_once_with("roads", include_query=False)
         reader.assert_called_once_with(
-            "postgresql://runtime-reader",
+            "postgresql://derived-owner",
             schema="derived_layers",
             relation="roads",
             fields=current["generated"]["fields"],

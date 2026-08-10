@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
+from relation_identity import parse_relation
 from workspace_schema import expression_error
 
 try:
@@ -3079,12 +3080,11 @@ def visual_plan(
         raise RuntimeError("PostgreSQL support is unavailable.")
     db_name = layer.get("dbs") or workspace.get("dbs")
     database_url = db_connections.get(db_name)
-    relation = str(layer.get("table", "")).split(".")
-    if len(relation) == 1:
-        relation.insert(0, "public")
-    if not database_url or len(relation) != 2:
+    parsed = parse_relation(layer.get("table"), alias=None, default_schema="public")
+    if not database_url or parsed is None:
         raise ValueError("Layer database or relation is unavailable.")
-    relation_sql = sql.SQL("{}.{}").format(sql.Identifier(relation[0]), sql.Identifier(relation[1]))
+    _, schema_name, table_name = parsed
+    relation_sql = sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier(table_name))
     geom = sql.Identifier(layer["geom"])
     default_filter, default_filter_params, filter_descriptor = (
         effective_layer_filter(layer)
