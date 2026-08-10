@@ -775,13 +775,13 @@ def plan_area_weighted_h3_recipe(
             "Recipe source relation does not match the semantic asset binding."
         )
     binding_alias = binding.get("alias")
-    if binding_alias is not None and (
+    if (
         not isinstance(binding_alias, str)
         or not binding_alias.strip()
         or len(binding_alias) > 200
     ):
         raise DerivedLayerError(
-            "Recipe source asset has invalid binding alias metadata."
+            "Recipe source asset is missing valid binding alias metadata."
         )
     qualified_name = generated.get("qualifiedName")
     if qualified_name is not None and qualified_name != source["relation"]:
@@ -940,11 +940,7 @@ def plan_area_weighted_h3_recipe(
 
     resolved_binding = {
         "adapter": "postgresql",
-        **(
-            {"alias": binding_alias}
-            if binding_alias is not None
-            else {}
-        ),
+        "alias": binding_alias,
         "schema": binding_schema,
         "relation": binding_relation,
     }
