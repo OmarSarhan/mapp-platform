@@ -4328,9 +4328,24 @@ def validate_catalog(data: dict, tables: list[dict]) -> list[dict[str, str]]:
         if not isinstance(locale, dict):
             continue
         for key, layer in (locale.get("layers") or {}).items():
+            path = f"{locale_path}.layers.{key}"
+            if (
+                isinstance(layer, dict)
+                and layer.get("format") in DATABASE_LAYER_FORMATS
+                and not isinstance(layer.get("template"), str)
+                and not isinstance(layer.get("features"), list)
+                and isinstance(layer.get("tables"), dict)
+            ):
+                db_name = layer_db(data, layer)
+                for zoom, relation in layer["tables"].items():
+                    if relation is not None and not index.get((db_name, relation)):
+                        errors.append({
+                            "path": f"{path}.tables.{zoom}",
+                            "message": "Table is not selectable through the configured read-only connection.",
+                        })
+                continue
             if not is_probeable_database_layer(layer):
                 continue
-            path = f"{locale_path}.layers.{key}"
             table = index.get((layer_db(data, layer), layer.get("table")))
             if not table:
                 errors.append({"path": f"{path}.table", "message": "Table is not selectable through the configured read-only connection."})
