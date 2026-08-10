@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unittest
 from unittest.mock import patch
 
@@ -734,3 +735,133 @@ class SemanticSourceContractTests(unittest.TestCase):
         sql_text = "\n".join(query for query, _ in cursor.executed)
         self.assertIn("pg_catalog.pg_attribute", sql_text)
         self.assertNotIn("random() < 0.05", sql_text)
+
+
+WRITE_STATEMENT_RE = re.compile(
+    r"^\s*(INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|"
+    r"REVOKE|COPY|CALL|DO)\b",
+    re.IGNORECASE,
+)
+
+
+class NoWriteContractTests(unittest.TestCase):
+    """Discovery and observation must never mutate a source database.
+
+    _begin_read_only() sets a genuinely read-only transaction — PostgreSQL
+    itself rejects any write statement inside it — but that server-side
+    guarantee is only as good as never regressing to a code path that skips
+    it. These tests pin both halves: every statement actually issued is
+    read-only, and the read-only transaction is established before anything
+    else runs.
+    """
+
+    def assert_no_write_statements(self, cursor):
+        self.assertTrue(cursor.executed, "expected at least one statement")
+        self.assertTrue(
+            cursor.executed[0][0].startswith(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            ),
+            "read-only transaction must be established first",
+        )
+        for statement, _ in cursor.executed:
+            self.assertIsNone(
+                WRITE_STATEMENT_RE.match(statement),
+                f"unexpected write statement: {statement!r}",
+            )
+
+    def test_discover_issues_no_write_statements(self):
+        cursor = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+            {"schema": "leeds", "relation": "bus_stops", "relation_kind": "f"},
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            sources.discover()
+        self.assert_no_write_statements(cursor)
+
+    def test_discover_page_issues_no_write_statements(self):
+        cursor = FakeCursor([
+            {"schema": "leeds", "relation": "roads", "relation_kind": "r"},
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            sources.discover_page(after=None, fetch_limit=10)
+        self.assert_no_write_statements(cursor)
+
+    def test_locked_relation_issues_no_write_statements(self):
+        cursor = FakeCursor([
+            {
+                "relation_kind": "f",
+                "relation_description": None,
+                "name": "id",
+                "type": "bigint",
+                "description": None,
+                "nullable": False,
+                "geometryType": "",
+                "srid": None,
+                "primaryKey": False,
+                "unique": False,
+            },
+        ])
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            with sources.locked_relation("MAPP", "leeds", "bus_stops"):
+                pass
+        self.assert_no_write_statements(cursor)
+        # LOCK TABLE IN ACCESS SHARE MODE is a local catalog lock preventing
+        # concurrent DDL during inspection, not a data mutation — PostgreSQL
+        # itself would reject anything stronger inside the read-only
+        # transaction established immediately above.
+        self.assertIn(
+            "LOCK TABLE",
+            "\n".join(query for query, _ in cursor.executed),
+        )
+
+    def test_generation_context_sampling_issues_no_write_statements(self):
+        live_fields = [
+            {"name": "id", "type": "bigint", "baseType": "int8"},
+            {"name": "label", "type": "text", "baseType": "text"},
+        ]
+        sample_rows = [{"id": "1", "label": "City centre"}]
+        cursor = FakeCursor(
+            [],
+            fetchall_results=[live_fields, sample_rows],
+            one={"QUERY PLAN": [{"Plan": {"Plan Rows": 178605}}]},
+        )
+        fields = [
+            {"name": "id", "type": "bigint", "nullable": False},
+            {"name": "label", "type": "text", "nullable": True},
+        ]
+
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            postgres_generation_context(
+                "postgresql://runtime-reader",
+                schema="derived_layers",
+                relation="arrivals",
+                fields=fields,
+                target_kind="table",
+                sample_rows=True,
+                statistics=True,
+            )
+        self.assert_no_write_statements(cursor)
