@@ -65,7 +65,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
 
     def test_wrappers_reject_every_database_environment_override(self) -> None:
         expected = {
-            "DBS_MAPP",
             "ETL_DATABASE_URL",
             "POSTGRES_DB",
             "POSTGRES_USER",
@@ -85,6 +84,12 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 start = source.index("reject_database_environment_overrides()")
                 end = source.index("\n}", start)
                 guard = source[start:end]
+            self.assertIn(
+                '"${!DBS_@}"',
+                guard,
+                "every DBS_<ALIAS> variable must be covered by a prefix rule, "
+                "not a literal DBS_MAPP enumeration",
+            )
             for key in expected:
                 self.assertIn(key, guard)
                 self.assertIn('unset "${key}"', guard)
@@ -151,6 +156,74 @@ class DatabaseAccessContractTests(unittest.TestCase):
                         env={"PATH": os.environ["PATH"], "DBS_MAPP": raw_dbs},
                         capture_output=True,
                         text=True,
+                    )
+
+    def test_prefix_rule_covers_a_second_alias_beyond_dbs_mapp(self) -> None:
+        raw_dbs = "postgresql://leeds-reader@db:5432/leeds"
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(f"DBS_LEEDS={raw_dbs}\n", encoding="utf-8")
+            for relative_path in ("bin/mapp", "scripts/verify.sh"):
+                with self.subTest(path=relative_path):
+                    source = (ROOT / relative_path).read_text(encoding="utf-8")
+                    dotenv_start = source.index("dotenv_value()")
+                    dotenv_end = source.index("\n}", dotenv_start) + 2
+                    guard_start = source.index(
+                        "reject_database_environment_overrides()"
+                    )
+                    guard_end = source.index("\n}", guard_start) + 2
+                    script = "\n".join((
+                        'ENV_FILE="$1"',
+                        source[dotenv_start:dotenv_end],
+                        source[guard_start:guard_end],
+                        "reject_database_environment_overrides",
+                        "[[ ! -v DBS_LEEDS ]]",
+                    ))
+                    subprocess.run(
+                        ["bash", "-c", script, "test", str(env_file)],
+                        check=True,
+                        env={"PATH": os.environ["PATH"], "DBS_LEEDS": raw_dbs},
+                        capture_output=True,
+                        text=True,
+                    )
+
+    def test_prefix_rule_rejects_a_mismatched_second_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "DBS_LEEDS=postgresql://leeds-reader@db:5432/leeds\n",
+                encoding="utf-8",
+            )
+            for relative_path in ("bin/mapp", "scripts/verify.sh"):
+                with self.subTest(path=relative_path):
+                    source = (ROOT / relative_path).read_text(encoding="utf-8")
+                    dotenv_start = source.index("dotenv_value()")
+                    dotenv_end = source.index("\n}", dotenv_start) + 2
+                    guard_start = source.index(
+                        "reject_database_environment_overrides()"
+                    )
+                    guard_end = source.index("\n}", guard_start) + 2
+                    script = "\n".join((
+                        'ENV_FILE="$1"',
+                        source[dotenv_start:dotenv_end],
+                        source[guard_start:guard_end],
+                        "reject_database_environment_overrides",
+                    ))
+                    result = subprocess.run(
+                        ["bash", "-c", script, "test", str(env_file)],
+                        env={
+                            "PATH": os.environ["PATH"],
+                            "DBS_LEEDS": (
+                                "postgresql://someone-else@elsewhere:5432/other"
+                            ),
+                        },
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(2, result.returncode)
+                    self.assertIn("DBS_LEEDS", result.stderr)
+                    self.assertIn(
+                        "conflicts with the authoritative value", result.stderr
                     )
 
     def test_new_database_reader_has_only_table_select_defaults(self) -> None:
