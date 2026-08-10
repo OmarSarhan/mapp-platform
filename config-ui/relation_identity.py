@@ -11,6 +11,12 @@ from __future__ import annotations
 
 import re
 
+# Must match IDENTIFIER_PART_RE in derived_layers.py — one identifier-part
+# grammar, kept in two places deliberately (derived_layers.py predates this
+# module and importing it here would pull in its full psycopg dependency
+# chain for one regex), so do not let the two drift.
+IDENTIFIER_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 def parse_relation(
     value: object,

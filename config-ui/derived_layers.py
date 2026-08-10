@@ -130,6 +130,9 @@ H3_AVERAGE_HEX_AREA_KM2 = (
     0.000000895,
 )
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+# Must match IDENTIFIER_PART_RE in relation_identity.py — one identifier-part
+# grammar. Kept separate rather than imported to avoid this module's psycopg
+# dependency chain leaking into that lightweight, dependency-free module.
 IDENTIFIER_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NUMERIC_FIELD_TYPE_RE = re.compile(
     r"^(?:smallint|integer|bigint|int2|int4|int8|real|float4|float8|"
