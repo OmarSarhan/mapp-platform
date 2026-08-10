@@ -18,7 +18,8 @@ from urllib.parse import unquote
 
 from plugin_registry import available_plugins, validate_workspace_plugins
 
-DB_KEY = re.compile(r"^[A-Za-z0-9-]+$")
+# Must match ALIAS_RE in semantic_sources.py — one alias grammar, not two.
+DB_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 XYZ_LAYER_KEY = re.compile(r"^[A-Za-z0-9 :_-]+$")
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 FIXED_FILTER_NUMBER_RE = re.compile(
@@ -323,7 +324,12 @@ def _validate_dbs(value, path, errors, available_dbs, *, required):
             _error(errors, path, "A database connection name is required.")
         return
     if not isinstance(value, str) or not DB_KEY.fullmatch(value):
-        _error(errors, path, "Must contain only letters, numbers, or hyphens.")
+        _error(
+            errors,
+            path,
+            "Must start with a letter and contain only letters, numbers, "
+            "hyphens, or underscores (63 characters max).",
+        )
     elif available_dbs is not None and value not in available_dbs:
         _error(errors, path, f"No DBS_{value} connection is configured.")
 

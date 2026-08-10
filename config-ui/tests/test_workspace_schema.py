@@ -27,6 +27,31 @@ class WorkspaceValidationTests(unittest.TestCase):
     def test_accepts_supported_workspace(self):
         self.assertEqual(validate_workspace(valid_workspace(), {"MAPP"}), [])
 
+    def test_rejects_a_dbs_key_starting_with_a_digit(self):
+        data = valid_workspace()
+        data["dbs"] = "9council"
+
+        errors = validate_workspace(data, {"9council", "MAPP"})
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["path"], "dbs")
+
+    def test_rejects_a_dbs_key_over_63_characters(self):
+        data = valid_workspace()
+        data["dbs"] = "a" * 64
+
+        errors = validate_workspace(data, {"a" * 64, "MAPP"})
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["path"], "dbs")
+
+    def test_accepts_a_dbs_key_with_an_underscore(self):
+        data = valid_workspace()
+        data["dbs"] = "council_prod"
+        data["locale"]["layers"]["Places"]["dbs"] = "council_prod"
+
+        self.assertEqual(validate_workspace(data, {"council_prod"}), [])
+
     def test_rejects_layer_keys_xyz_cannot_register(self):
         data = valid_workspace()
         layer = data["locale"]["layers"].pop("Places")
