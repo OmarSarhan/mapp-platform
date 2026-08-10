@@ -16,6 +16,11 @@ MAPP Platform owns the live server and its configuration API. The standalone
 `config-cli` is an external client and should be released, installed, and
 secured independently.
 
+The proposed multi-source execution model is recorded separately as the
+[federation architecture waypoint](federation-architecture-waypoint.md). It is
+a north-star development handoff, not part of the currently implemented
+deployment contract described on this page.
+
 ```text
                          public network
                               │
