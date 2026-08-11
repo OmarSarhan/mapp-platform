@@ -104,6 +104,31 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertNotIn("PostGIS_PROJ_Version", executed_sql)
         self.assertNotIn("PostGIS_GEOS_Version", executed_sql)
 
+    def test_reports_schema_changed_when_a_relation_is_missing(self):
+        # A relation that no longer exists (or the reader can no longer
+        # SELECT) must not be silently skipped — the schema Discover
+        # verified no longer matches what was registered.
+        cursor = ScriptedFakeCursor([
+            {"version": "16.2"},
+            {"exists": 1},
+            {"version": "3.4.2"},
+            {"version": "9.3.1"},
+            {"version": "3.12.1"},
+            None,
+        ])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            observation = detect_capability(
+                "postgresql://reader",
+                allowed_relations=("leeds.bus_stops",),
+            )
+
+        self.assertEqual("reachable", observation["connectivity"])
+        self.assertEqual("changed", observation["schema"])
+        self.assertFalse(observation["rowLevelSecurityDetected"])
+
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(extension_and_rls_results(rls=True))
         with patch(

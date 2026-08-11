@@ -820,7 +820,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "alias": {
                     "type": "string",
-                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,55}$",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,55}$",
                 },
                 "schema": {
                     "type": "string",
@@ -1562,7 +1562,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "alias": {
                     "type": "string",
-                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,55}$",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,55}$",
                 },
                 "displayName": {
                     "type": "string", "minLength": 1, "maxLength": 200,

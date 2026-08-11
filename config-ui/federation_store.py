@@ -388,8 +388,14 @@ class FederationAliasStore:
                         sql.Literal(",".join(shippable))
                     )
                 )
+            # Not IF NOT EXISTS: same reasoning as the schema below — a
+            # not-yet-provisioned alias should never legitimately reach a
+            # pre-existing <alias>_srv. Silently reusing one from an
+            # unrelated origin (and possibly a different actual remote
+            # endpoint) would import and grant access to the wrong data
+            # under this alias's name. Fail closed.
             cur.execute(sql.SQL("""
-                CREATE SERVER IF NOT EXISTS {server}
+                CREATE SERVER {server}
                 FOREIGN DATA WRAPPER postgres_fdw
                 OPTIONS ({options})
             """).format(

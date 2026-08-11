@@ -53,8 +53,8 @@
   "$defs": {
     "databaseKey": {
       "type": "string",
-      "description": "Must match ALIAS_RE in config-ui/semantic_sources.py and config-ui/federation_schema.py — one alias grammar, not three. Max length 56, not PostgreSQL's usual 63: a federation alias becomes the schema name source_<alias>, and \"source_\" is 7 bytes.",
-      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,55}$",
+      "description": "Must match ALIAS_RE in config-ui/semantic_sources.py and config-ui/federation_schema.py — one alias grammar, not three. Max length 56, not PostgreSQL's usual 63: a federation alias becomes the schema name source_<alias>, and \"source_\" is 7 bytes. No hyphen: must also be usable, unquoted, as a schema/relation name component elsewhere.",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]{0,55}$",
       "examples": [
         "MAPP"
       ]

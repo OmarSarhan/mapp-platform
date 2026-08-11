@@ -5193,7 +5193,7 @@ class Handler(SimpleHTTPRequestHandler):
             # action is spelled "observe" here) — only alias creation itself
             # is a non-connecting intent record.
             if re.fullmatch(
-                r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_-]{0,55}/"
+                r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_]{0,55}/"
                 r"(observe|provision)",
                 path,
             ):
@@ -7080,7 +7080,7 @@ class Handler(SimpleHTTPRequestHandler):
             request_path,
         )
         federation_alias_action_path = re.fullmatch(
-            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_-]{0,55})/"
+            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_]{0,55})/"
             r"(observe|provision)",
             request_path,
         )
@@ -9157,6 +9157,13 @@ class Handler(SimpleHTTPRequestHandler):
                     visual_operation, response,
                 )
             self._json(HTTPStatus.UNPROCESSABLE_ENTITY, response)
+        except FederationSchemaError as exc:
+            # Must come before except ValueError below — this is a
+            # ValueError subclass, and Python's except clauses match in
+            # order, so listing it after would make this handler
+            # unreachable and lose exc.code/exc.status to the generic
+            # ValueError branch.
+            self._json(exc.status, {"error": str(exc), "code": exc.code})
         except ValueError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
@@ -9313,8 +9320,6 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(status, response)
             else:
                 self._semantic_error(exc)
-        except FederationSchemaError as exc:
-            self._json(exc.status, {"error": str(exc), "code": exc.code})
         except Exception as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,

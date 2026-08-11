@@ -97,9 +97,17 @@ def extension_versions(cursor: Any) -> dict[str, str]:
     return versions
 
 
-def _row_level_security_detected(
+def _verify_allowed_relations(
     cursor: Any, allowed_relations: tuple[str, ...]
-) -> bool:
+) -> tuple[bool, bool]:
+    """Returns (all_present_and_selectable, row_level_security_detected).
+
+    A relation that no longer exists, or that this connection can no
+    longer SELECT, must not be silently skipped — it means the schema
+    Discover verified has changed from what was registered, and the
+    caller must not report it as "current" evidence."""
+    all_present = True
+    rls_detected = False
     for entry in allowed_relations:
         schema, relation = _parsed_schema_relation(entry)
         cursor.execute(
@@ -108,13 +116,17 @@ def _row_level_security_detected(
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
+              AND has_table_privilege(c.oid, 'SELECT')
             """,
             (schema, relation),
         )
         row = cursor.fetchone()
-        if row and row["relrowsecurity"]:
-            return True
-    return False
+        if row is None:
+            all_present = False
+            continue
+        if row["relrowsecurity"]:
+            rls_detected = True
+    return all_present, rls_detected
 
 
 def _version_relation_scalar(
@@ -179,7 +191,7 @@ def detect_capability(
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
                 versions = extension_versions(cursor)
-                rls_detected = _row_level_security_detected(
+                relations_verified, rls_detected = _verify_allowed_relations(
                     cursor, allowed_relations
                 )
                 source_version = (
@@ -199,7 +211,7 @@ def detect_capability(
 
     return validate_observation({
         "connectivity": "reachable",
-        "schema": "current",
+        "schema": "current" if relations_verified else "changed",
         "sourceFreshness": "unknown",
         "lastConnected": _now_iso(),
         "lastSchemaVerified": _now_iso(),

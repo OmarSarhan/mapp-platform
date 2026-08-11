@@ -31,8 +31,13 @@ from relation_identity import IDENTIFIER_PART_RE, parse_relation
 # Max length 56, not PostgreSQL's usual 63: a federation alias becomes the
 # schema name `source_<alias>` (federation_store.py), and "source_" is 7
 # bytes — decision #12's original 63-char bound left no room for that
-# prefix and would silently truncate/collide for longer aliases.
-ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,55}$")
+# prefix and would silently truncate/collide for longer aliases. No hyphen:
+# a federation alias must also be usable, unquoted, as a schema/relation
+# name component elsewhere (semantic_sources.py's IDENTIFIER_RE,
+# derived_layers.py's IDENTIFIER_PART_RE) — those already reject hyphens,
+# so an alias containing one could register and provision but never be
+# synced into the semantic catalog or used as a derived-layer source.
+ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,55}$")
 
 ALIAS_KINDS = frozenset({"postgresql"})
 ALIAS_STATUSES = frozenset({"pending", "active", "unavailable", "retired"})
@@ -119,7 +124,7 @@ def validate_alias(value: Any) -> str:
     if not isinstance(value, str) or not ALIAS_RE.fullmatch(value):
         raise FederationSchemaError(
             "alias must start with a letter and contain only letters, "
-            "numbers, hyphens, or underscores (63 characters max)."
+            "numbers, or underscores (56 characters max)."
         )
     return value
 

@@ -47,6 +47,16 @@ class ValidateAliasTests(unittest.TestCase):
                 with self.assertRaises(FederationSchemaError):
                     validate_alias(invalid)
 
+    def test_rejects_a_hyphen(self):
+        # An alias becomes the schema name source_<alias> and must also be
+        # usable, unquoted, wherever it's referenced as a schema/relation
+        # name component (semantic_sources.py, derived_layers.py) — both
+        # reject hyphens, so a hyphenated alias could register and
+        # provision but never be usable for semantic sync or a derived
+        # layer.
+        with self.assertRaises(FederationSchemaError):
+            validate_alias("leeds-ext")
+
     def test_max_length_leaves_room_for_the_source_schema_prefix(self):
         # federation_store.py generates the schema name source_<alias> —
         # PostgreSQL silently truncates identifiers over 63 bytes, so two
