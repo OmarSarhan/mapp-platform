@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -88,6 +89,8 @@ from control_api import (
     strict_json_loads, wait_reload, workspace_fingerprint, workspace_hash,
     workspace_map_extent,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
@@ -1399,6 +1402,7 @@ def sync_layer_dependency_guard(workspace: dict) -> None:
     workspace configuration. Synchronization failures do not block proposal
     apply/save operations because platform-level safety is advisory and the
     manual-drop path must fail open only if explicitly configured for that DB.
+    A failure is still logged — advisory does not mean invisible.
     """
     grouped: dict[str, set[str]] = {}
     for item in platform_dependencies(workspace):
@@ -1416,6 +1420,11 @@ def sync_layer_dependency_guard(workspace: dict) -> None:
                         [alias, json.dumps(sorted(relations))],
                     )
         except Exception:
+            LOGGER.exception(
+                "layer-drop guard sync failed for %s; platform-level drop "
+                "protection may be stale until the next successful sync",
+                alias,
+            )
             continue
 
 
