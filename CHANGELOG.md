@@ -324,6 +324,14 @@ first release.
   follow-up.
 - Added production validation for distinct public DNS hostnames, direct HTTPS
   on port 443, non-wildcard allowed hosts, and a monitored ACME contact.
+- **Breaking:** reduced the maximum length of a database/federation alias
+  (workspace `dbs`, semantic source allowlist alias, federation alias) from
+  63 to 56 characters. A federation alias becomes the schema name
+  `source_<alias>`; the previous 63-character bound left no room for that
+  7-byte prefix, so an alias longer than 56 characters could silently
+  truncate and collide with another. Any existing workspace or semantic
+  allowlist configuration using a 57-63 character alias will need to be
+  renamed before upgrading.
 
 These entries describe the staged structure and intended invariants. They do
 not claim that final split histories, production deployment, or restore paths

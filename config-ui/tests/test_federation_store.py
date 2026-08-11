@@ -282,7 +282,14 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(any("CREATE EXTENSION IF NOT EXISTS postgres_fdw" in s for s in statements))
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertIn("leeds_ext_srv", create_server)
-        self.assertTrue(any("CREATE USER MAPPING" in s for s in statements))
+        user_mappings = [s for s in statements if "CREATE USER MAPPING" in s]
+        self.assertTrue(any("CURRENT_USER" in s for s in user_mappings))
+        self.assertTrue(any("mapp_xyz" in s for s in user_mappings))
+        create_schema = next(
+            s for s in statements
+            if "CREATE SCHEMA" in s and "source_leeds_ext" in s
+        )
+        self.assertNotIn("IF NOT EXISTS", create_schema)
         self.assertTrue(any("IMPORT FOREIGN SCHEMA" in s and "smoke_control_orders" in s for s in statements))
         self.assertTrue(any("GRANT SELECT ON ALL TABLES IN SCHEMA" in s and "mapp_xyz" in s for s in statements))
         self.assertTrue(any("provisioned_at = clock_timestamp()" in s and "status = 'active'" in s for s in statements))
@@ -410,8 +417,18 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("CREATE SERVER" in s for s in statements))
-        self.assertFalse(any("CREATE USER MAPPING" in s for s in statements))
+        self.assertFalse(any("CREATE SCHEMA" in s for s in statements))
         self.assertFalse(any("IMPORT FOREIGN SCHEMA" in s for s in statements))
+        # The CURRENT_USER mapping is reconciled by ALTER, not repeated —
+        # only the reader mapping's DROP+CREATE reconciliation (always run,
+        # to converge an alias provisioned before that mapping existed)
+        # legitimately issues CREATE USER MAPPING on every reprovision call.
+        self.assertFalse(
+            any(
+                "CREATE USER MAPPING" in s and "CURRENT_USER" in s
+                for s in statements
+            )
+        )
         # Reprovisioning still reconciles connection settings (see below)
         # even when nothing changed — but must never touch the extensions
         # option when it's already correct.
@@ -445,6 +462,51 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("5433", alter_server)
         alter_mapping = next(s for s in statements if "ALTER USER MAPPING" in s)
         self.assertIn("rotated-secret", alter_mapping)
+        # The reader mapping is reconciled by DROP + CREATE, not ALTER (see
+        # test_reprovision_creates_a_missing_reader_mapping for why), but
+        # must still pick up the rotated credential.
+        reader_mapping = next(
+            s for s in statements
+            if "CREATE USER MAPPING" in s and "mapp_xyz" in s
+        )
+        self.assertIn("rotated-secret", reader_mapping)
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_creates_a_missing_reader_mapping(self, mock_versions):
+        # An alias provisioned before the reader-mapping fix existed has no
+        # mapping for mapp_xyz yet — ALTER would fail on it, so this must
+        # be DROP IF EXISTS + CREATE, not ALTER, to converge such an alias
+        # the next time it's reprovisioned.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertTrue(
+            any(
+                "DROP USER MAPPING IF EXISTS" in s and "mapp_xyz" in s
+                for s in statements
+            )
+        )
+        self.assertTrue(
+            any(
+                "CREATE USER MAPPING" in s and "mapp_xyz" in s
+                and "ALTER" not in s
+                for s in statements
+            )
+        )
 
     @patch("federation_store.extension_versions")
     def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions):

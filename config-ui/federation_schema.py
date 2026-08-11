@@ -148,6 +148,20 @@ def _normalized_allowed_relations(value: Any) -> tuple[str, ...]:
         normalized.append(f"{schema}.{relation}")
     if len(set(normalized)) != len(normalized):
         raise FederationSchemaError("allowedRelations must not contain duplicates.")
+    # provision() imports every allowedRelations entry into one local
+    # source_<alias> schema (federation_store.py) — two remote schemas with
+    # a same-named table (e.g. public.orders and archive.orders) would both
+    # resolve to a single local "orders", so the second IMPORT FOREIGN
+    # SCHEMA fails and the alias can never be provisioned. Reject that here,
+    # at registration, instead of surfacing it later as a cryptic
+    # provisioning failure.
+    basenames = [entry.split(".", 1)[1] for entry in normalized]
+    if len(set(basenames)) != len(basenames):
+        raise FederationSchemaError(
+            "allowedRelations must not import two relations with the same "
+            "name from different schemas — each becomes one local table "
+            "under source_<alias>."
+        )
     return tuple(sorted(normalized))
 
 

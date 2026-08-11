@@ -162,6 +162,18 @@ class ValidateRegistrationTests(unittest.TestCase):
                 )
             )
 
+    def test_rejects_allowed_relations_with_colliding_basenames(self):
+        # provision() imports every entry into one local source_<alias>
+        # schema — two different remote schemas with a same-named table
+        # would collide on the second IMPORT FOREIGN SCHEMA and could never
+        # be provisioned, so this must fail at registration instead.
+        with self.assertRaises(FederationSchemaError):
+            validate_registration(
+                valid_registration(
+                    allowedRelations=["public.orders", "archive.orders"]
+                )
+            )
+
     def test_rejects_an_empty_or_overlong_data_handling_classification(self):
         with self.assertRaises(FederationSchemaError):
             validate_registration(valid_registration(dataHandlingClassification=""))

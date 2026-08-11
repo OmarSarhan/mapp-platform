@@ -340,6 +340,26 @@ class FederationAliasStore:
                     user=sql.Literal(user),
                     password=sql.Literal(password),
                 ))
+                # DROP + CREATE, not ALTER: an alias provisioned before the
+                # reader mapping existed has no mapping for self.reader_role
+                # yet to ALTER — this converges it the next time it's
+                # reprovisioned, and is a no-op-then-recreate for one that
+                # already has a mapping.
+                cur.execute(sql.SQL("""
+                    DROP USER MAPPING IF EXISTS FOR {reader} SERVER {server}
+                """).format(
+                    reader=sql.Identifier(self.reader_role),
+                    server=sql.Identifier(server_name),
+                ))
+                cur.execute(sql.SQL("""
+                    CREATE USER MAPPING FOR {reader} SERVER {server}
+                    OPTIONS (user {user}, password {password})
+                """).format(
+                    reader=sql.Identifier(self.reader_role),
+                    server=sql.Identifier(server_name),
+                    user=sql.Literal(user),
+                    password=sql.Literal(password),
+                ))
                 current = self._current_shippable_extensions(cur, server_name)
                 self._apply_shippable_extensions(cur, server_name, current, shippable)
                 return self.get(alias)
@@ -385,8 +405,33 @@ class FederationAliasStore:
                 user=sql.Literal(user),
                 password=sql.Literal(password),
             ))
+            # A security_invoker=true derived VIEW (derived_layers.py) runs
+            # its underlying query as whichever role queries the view — the
+            # runtime reader, not the derived owner — so it needs its own
+            # mapping too, not just CURRENT_USER's. Both mappings use the
+            # same remote credential; there is only one connectionRef per
+            # alias. (A materialized view's REFRESH always runs as the
+            # derived owner, so this isn't needed for that path, but views
+            # are a supported derived-layer kind and must work too.)
+            cur.execute(sql.SQL("""
+                CREATE USER MAPPING IF NOT EXISTS FOR {reader}
+                SERVER {server}
+                OPTIONS (user {user}, password {password})
+            """).format(
+                reader=sql.Identifier(self.reader_role),
+                server=sql.Identifier(server_name),
+                user=sql.Literal(user),
+                password=sql.Literal(password),
+            ))
+            # Not IF NOT EXISTS: an alias's own reprovisioning never reaches
+            # this branch (see already_provisioned above), so the only way
+            # this schema could already exist here is an unrelated object —
+            # e.g. a stray schema an operator created by hand that happens
+            # to collide with source_<alias>. Silently reusing it would
+            # import into and then GRANT SELECT ON ALL TABLES IN that
+            # schema, exposing whatever was already there. Fail closed.
             cur.execute(
-                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.SQL("CREATE SCHEMA {}").format(
                     sql.Identifier(schema_name)
                 )
             )
