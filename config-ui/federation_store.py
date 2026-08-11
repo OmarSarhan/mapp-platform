@@ -29,6 +29,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from federation_capability import extension_versions
 from federation_schema import (
     FederationSchemaError,
     validate_alias,
@@ -192,24 +193,97 @@ class FederationAliasStore:
                     UPDATE {}._aliases
                     SET last_observation = %s, status = %s
                     WHERE alias = %s
-                    RETURNING alias
+                    RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
                 (Jsonb(observation), status, alias),
             )
-            if cur.fetchone() is None:
+            row = cur.fetchone()
+            if row is None:
                 raise FileNotFoundError(alias)
+            # A version drift discovered after provisioning must fail
+            # pushdown closed immediately (docs/federation-architecture-
+            # waypoint.md: "a version drift detected after provisioning
+            # downgrades the alias to pushdown disabled") — re-enabling it
+            # afterward is a deliberate federation:provision-scoped
+            # reprovisioning action, never automatic, so this only ever
+            # drops the option here, never adds it.
+            if row["provisioned_at"] is not None:
+                server_name = f"{alias}_srv"
+                local_versions = extension_versions(cur)
+                remote_versions = observation.get("extensionVersions") or {}
+                shippable = self._shippable_extensions(
+                    local_versions, remote_versions
+                )
+                current = self._current_shippable_extensions(cur, server_name)
+                if current and not shippable:
+                    self._apply_shippable_extensions(
+                        cur, server_name, current, shippable
+                    )
         return self.get(alias)
+
+    # PostGIS/PROJ/GEOS versions may differ between the federation database
+    # and a source — execution happens in the federation database, so a
+    # pushed-down expression (e.g. ST_Transform) can silently return a
+    # different result from the same expression evaluated locally if the
+    # versions disagree. Only ever mark postgis shippable when all three
+    # exactly match the alias's last observation of the remote.
+    _VERSION_MATCH_KEYS = ("postgis", "proj", "geos")
+
+    @staticmethod
+    def _shippable_extensions(
+        local_versions: dict[str, str], remote_versions: dict[str, str]
+    ) -> list[str]:
+        matches = all(
+            local_versions.get(key) and local_versions.get(key) == remote_versions.get(key)
+            for key in FederationAliasStore._VERSION_MATCH_KEYS
+        )
+        return ["postgis"] if matches else []
+
+    @staticmethod
+    def _current_shippable_extensions(cur, server_name: str) -> list[str]:
+        cur.execute(
+            "SELECT srvoptions FROM pg_catalog.pg_foreign_server "
+            "WHERE srvname = %s",
+            (server_name,),
+        )
+        row = cur.fetchone()
+        for option in (row["srvoptions"] if row and row["srvoptions"] else []):
+            key, _, value = option.partition("=")
+            if key == "extensions":
+                return [name for name in value.split(",") if name]
+        return []
+
+    @staticmethod
+    def _apply_shippable_extensions(
+        cur, server_name: str, current: list[str], desired: list[str]
+    ) -> None:
+        if current == desired:
+            return
+        if current:
+            cur.execute(
+                sql.SQL("ALTER SERVER {} OPTIONS (DROP extensions)").format(
+                    sql.Identifier(server_name)
+                )
+            )
+        if desired:
+            cur.execute(
+                sql.SQL("ALTER SERVER {} OPTIONS (ADD extensions {})").format(
+                    sql.Identifier(server_name),
+                    sql.Literal(",".join(desired)),
+                )
+            )
 
     def provision(self, alias: str, connection_url: str) -> dict[str, Any]:
         """Create the real FDW server, user mapping, schema, and foreign
-        tables for exactly this alias's allowedRelations."""
+        tables for this alias's allowedRelations the first time this is
+        called. Callable again afterward as a reprovisioning action (e.g.
+        an admin acting on a drift observation) — a repeat call only
+        re-decides and reconciles the server's `extensions` option; it
+        does not repeat CREATE SERVER/USER MAPPING/IMPORT FOREIGN SCHEMA,
+        which would fail on objects that already exist."""
         alias = validate_alias(alias)
         record = self.get(alias)
-        if record["provisionedAt"] is not None:
-            raise FederationSchemaError(
-                f"Alias {alias!r} is already provisioned.",
-                code="federation.already_provisioned",
-            )
+        already_provisioned = record["provisionedAt"] is not None
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
         host = str(params.get("host", ""))
         port = str(params.get("port", "5432"))
@@ -221,18 +295,49 @@ class FederationAliasStore:
 
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
+
+            # postgres_fdw only ships operators/functions to the remote
+            # side for extensions explicitly marked "shippable" — PostGIS
+            # isn't in its built-in list, so spatial predicates would
+            # otherwise pull the whole remote relation and filter locally.
+            # Only mark it shippable when the federation database's own
+            # PostGIS/PROJ/GEOS versions exactly match this alias's last
+            # observed remote versions (see _shippable_extensions above) —
+            # an unconditional claim would risk a silently wrong pushed-
+            # down result, not just a remote execution error. This is a
+            # same-owner, non-superuser server option; it does not
+            # duplicate any data, it only widens what may cross the wire
+            # as a pushed-down predicate instead of a full relation.
+            local_versions = extension_versions(cur)
+            remote_versions = (
+                record.get("lastObservation") or {}
+            ).get("extensionVersions") or {}
+            shippable = self._shippable_extensions(local_versions, remote_versions)
+
+            if already_provisioned:
+                current = self._current_shippable_extensions(cur, server_name)
+                self._apply_shippable_extensions(cur, server_name, current, shippable)
+                return self.get(alias)
+
+            server_options = [
+                sql.SQL("host {}").format(sql.Literal(host)),
+                sql.SQL("port {}").format(sql.Literal(port)),
+                sql.SQL("dbname {}").format(sql.Literal(dbname)),
+                sql.SQL("use_remote_estimate 'true'"),
+            ]
+            if shippable:
+                server_options.append(
+                    sql.SQL("extensions {}").format(
+                        sql.Literal(",".join(shippable))
+                    )
+                )
             cur.execute(sql.SQL("""
                 CREATE SERVER IF NOT EXISTS {server}
                 FOREIGN DATA WRAPPER postgres_fdw
-                OPTIONS (
-                  host {host}, port {port}, dbname {dbname},
-                  use_remote_estimate 'true'
-                )
+                OPTIONS ({options})
             """).format(
                 server=sql.Identifier(server_name),
-                host=sql.Literal(host),
-                port=sql.Literal(port),
-                dbname=sql.Literal(dbname),
+                options=sql.SQL(", ").join(server_options),
             ))
             cur.execute(sql.SQL("""
                 CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER

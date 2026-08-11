@@ -57,17 +57,32 @@ def _parsed_schema_relation(value: str) -> tuple[str, str]:
     return schema, relation
 
 
-def _extension_versions(cursor: Any) -> dict[str, str]:
+def extension_versions(cursor: Any) -> dict[str, str]:
+    """PostgreSQL/PostGIS/PROJ/GEOS versions visible on `cursor`'s own
+    connection. Used both for a remote alias (Discover/Observe evidence)
+    and for the federation database itself (federation_store.py's
+    version-match gate for postgres_fdw's `extensions` option — see
+    docs/federation-architecture-waypoint.md's "Decided" pushdown-safety
+    rule)."""
     cursor.execute("SELECT current_setting('server_version') AS version")
     versions = {"postgresql": cursor.fetchone()["version"]}
 
-    cursor.execute(
-        "SELECT extversion AS version FROM pg_extension WHERE extname = 'postgis'"
-    )
-    postgis_row = cursor.fetchone()
-    if not postgis_row:
+    cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'postgis'")
+    if not cursor.fetchone():
         return versions
-    versions["postgis"] = postgis_row["version"]
+
+    # PostGIS_Lib_Version() reports the actual linked library — the signal
+    # that governs operator/function *behavior* — not
+    # pg_extension.extversion, which only reflects the installed SQL
+    # extension script and can lag behind a library upgrade until
+    # `ALTER EXTENSION postgis UPDATE` runs (PostGIS_Full_Version()'s own
+    # "[EXTENSION] ... needs upgrade" note is exactly this drift — using
+    # extversion here would compare stale script bookkeeping, not whether
+    # the two sides would actually evaluate an expression identically).
+    cursor.execute("SELECT PostGIS_Lib_Version() AS version")
+    lib_row = cursor.fetchone()
+    if lib_row and lib_row["version"]:
+        versions["postgis"] = lib_row["version"]
 
     cursor.execute("SELECT PostGIS_PROJ_Version() AS version")
     proj_row = cursor.fetchone()
@@ -163,7 +178,7 @@ def detect_capability(
         ) as connection:
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
-                extension_versions = _extension_versions(cursor)
+                versions = extension_versions(cursor)
                 rls_detected = _row_level_security_detected(
                     cursor, allowed_relations
                 )
@@ -189,6 +204,6 @@ def detect_capability(
         "lastConnected": _now_iso(),
         "lastSchemaVerified": _now_iso(),
         "sourceVersion": source_version,
-        "extensionVersions": extension_versions,
+        "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
     })

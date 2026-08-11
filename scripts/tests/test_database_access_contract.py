@@ -377,6 +377,37 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
 
+    def test_derived_owner_schema_exemption_is_name_scoped_not_blanket_ownership(
+        self,
+    ) -> None:
+        # federation_store.py's provision() dynamically creates one
+        # source_<alias> schema per registered alias, owned by the same
+        # derived-owner role as the two fixed schemas (derived_layers,
+        # federation) — a static name allowlist can't enumerate those, but
+        # exempting a schema purely because the role owns it would let an
+        # unexpected schema (e.g. public) silently escape the unsafe-
+        # privilege audit if it ever ended up owned by that role through a
+        # future bug or operator error. The exemption must always require
+        # BOTH ownership AND a name matching this explicit allowlist/
+        # pattern — never ownership alone.
+        source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+        self.assertNotIn("namespace.nspowner <> login_role.oid", source)
+        self.assertNotIn("namespace.nspowner <> reachable_role.oid", source)
+        normalized = self.normalized("scripts/verify.sh")
+        for owner_variable in ("login_role.oid", "reachable_role.oid"):
+            with self.subTest(owner_variable=owner_variable):
+                self.assertIn(
+                    f"namespace.nspowner = {owner_variable}", normalized
+                )
+        self.assertIn(
+            "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
+            normalized,
+        )
+        self.assertIn(
+            "namespace.nspname ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$",
+            normalized,
+        )
+
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(
             "docker/postgis/prepare-spatial-indexes.sh"

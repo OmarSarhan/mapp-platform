@@ -1639,12 +1639,29 @@ with psycopg.connect(
                 $$derived_layers$$,
                 $$CREATE$$
               ) AS "canCreateDerived",
+              -- Schemas the derived owner may legitimately own: the two
+              -- fixed schemas plus one dynamic source_<alias> schema per
+              -- registered federation alias (config-ui/federation_store.py
+              -- provision()). Ownership alone is NOT exempted — only
+              -- ownership of a schema matching this explicit allowlist —
+              -- so an unexpected schema (e.g. public) ending up owned by
+              -- this role, via a future bug or operator error, still trips
+              -- every check below instead of being silently trusted. The
+              -- source_<alias> pattern must stay in sync with ALIAS_RE in
+              -- config-ui/federation_schema.py.
               EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_namespace AS namespace
                 WHERE namespace.nspname !~ $$^pg_$$
                   AND namespace.nspname <> $$information_schema$$
-                  AND namespace.nspowner <> login_role.oid
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND (
+                      namespace.nspname IN ($$derived_layers$$, $$federation$$)
+                      OR namespace.nspname
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                    )
+                  )
                   AND has_schema_privilege(namespace.oid, $$CREATE$$)
               ) AS "canCreateBaseSchema",
               EXISTS (
@@ -1654,7 +1671,14 @@ with psycopg.connect(
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
                   AND namespace.nspname <> $$information_schema$$
-                  AND namespace.nspowner <> login_role.oid
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND (
+                      namespace.nspname IN ($$derived_layers$$, $$federation$$)
+                      OR namespace.nspname
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                    )
+                  )
                   AND relation.relkind IN (
                     $$r$$,
                     $$p$$,
@@ -1690,7 +1714,14 @@ with psycopg.connect(
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
                   AND namespace.nspname <> $$information_schema$$
-                  AND namespace.nspowner <> login_role.oid
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND (
+                      namespace.nspname IN ($$derived_layers$$, $$federation$$)
+                      OR namespace.nspname
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                    )
+                  )
                   AND relation.relkind = $$S$$
                   AND (
                     has_sequence_privilege(relation.oid, $$USAGE$$)
@@ -1728,7 +1759,15 @@ with psycopg.connect(
                       FROM pg_catalog.pg_namespace AS namespace
                       WHERE namespace.nspname !~ $$^pg_$$
                         AND namespace.nspname <> $$information_schema$$
-                        AND namespace.nspowner <> reachable_role.oid
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND (
+                            namespace.nspname
+                              IN ($$derived_layers$$, $$federation$$)
+                            OR namespace.nspname
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                          )
+                        )
                         AND has_schema_privilege(
                           reachable_role.oid,
                           namespace.oid,
@@ -1742,7 +1781,15 @@ with psycopg.connect(
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
                         AND namespace.nspname <> $$information_schema$$
-                        AND namespace.nspowner <> reachable_role.oid
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND (
+                            namespace.nspname
+                              IN ($$derived_layers$$, $$federation$$)
+                            OR namespace.nspname
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                          )
+                        )
                         AND relation.relkind IN (
                           $$r$$,
                           $$p$$,
@@ -1805,7 +1852,15 @@ with psycopg.connect(
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
                         AND namespace.nspname <> $$information_schema$$
-                        AND namespace.nspowner <> reachable_role.oid
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND (
+                            namespace.nspname
+                              IN ($$derived_layers$$, $$federation$$)
+                            OR namespace.nspname
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                          )
+                        )
                         AND relation.relkind = $$S$$
                         AND (
                           has_sequence_privilege(

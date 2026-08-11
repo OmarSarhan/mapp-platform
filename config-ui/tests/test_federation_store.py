@@ -1,12 +1,15 @@
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
+
+MATCHING_VERSIONS = {"postgis": "3.5.7", "proj": "9.8.1", "geos": "3.14.1"}
+DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
 
 
 def valid_registration(**overrides):
@@ -115,7 +118,7 @@ class FederationAliasStoreTests(unittest.TestCase):
     def test_record_observation_marks_alias_active_when_reachable(self):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            {"alias": "leeds_ext"},
+            {"alias": "leeds_ext", "provisioned_at": None},
             alias_row(status="active"),
         ]
         store = self.store_with_cursor(cursor)
@@ -137,7 +140,7 @@ class FederationAliasStoreTests(unittest.TestCase):
     def test_record_observation_marks_alias_unavailable_when_not_reachable(self):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            {"alias": "leeds_ext"},
+            {"alias": "leeds_ext", "provisioned_at": None},
             alias_row(status="unavailable"),
         ]
         store = self.store_with_cursor(cursor)
@@ -168,18 +171,66 @@ class FederationAliasStoreTests(unittest.TestCase):
                 "sourceVersion": None,
             })
 
-    def test_provision_rejects_an_already_provisioned_alias(self):
+    @patch("federation_store.extension_versions")
+    def test_record_observation_auto_disables_pushdown_on_version_drift(self, mock_versions):
+        # Fail-safe direction: once provisioned, a drift away from a
+        # version match must disable pushdown immediately at observe
+        # time — re-enabling it is a deliberate reprovisioning action.
+        mock_versions.return_value = DIFFERENT_VERSIONS
         cursor = MagicMock()
-        cursor.fetchone.return_value = alias_row(
-            provisionedAt="2026-08-11T00:00:00+00:00"
-        )
+        cursor.fetchone.side_effect = [
+            {"alias": "leeds_ext", "provisioned_at": "2026-08-11T00:00:00+00:00"},
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
         store = self.store_with_cursor(cursor)
-        with self.assertRaises(FederationSchemaError):
-            store.provision(
-                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-            )
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "extensionVersions": MATCHING_VERSIONS,
+        }
 
-    def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self):
+        store.record_observation("leeds_ext", observation)
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertTrue(any("ALTER SERVER" in s and "DROP extensions" in s for s in statements))
+        self.assertFalse(any("ADD extensions" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_record_observation_does_not_auto_enable_pushdown(self, mock_versions):
+        # The doc requires re-enabling to go through an explicit
+        # reprovisioning call, never automatically from an observation —
+        # even one that now shows matching versions.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"alias": "leeds_ext", "provisioned_at": "2026-08-11T00:00:00+00:00"},
+            {"srvoptions": ["host=source-db"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "extensionVersions": MATCHING_VERSIONS,
+        }
+
+        store.record_observation("leeds_ext", observation)
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self, mock_versions):
+        mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None),
@@ -194,10 +245,143 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIsNotNone(result["provisionedAt"])
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertTrue(any("CREATE EXTENSION IF NOT EXISTS postgres_fdw" in s for s in statements))
-        self.assertTrue(any("CREATE SERVER" in s and "leeds_ext_srv" in s for s in statements))
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertIn("leeds_ext_srv", create_server)
         self.assertTrue(any("CREATE USER MAPPING" in s for s in statements))
         self.assertTrue(any("IMPORT FOREIGN SCHEMA" in s and "smoke_control_orders" in s for s in statements))
         self.assertTrue(any("GRANT SELECT ON ALL TABLES IN SCHEMA" in s and "mapp_xyz" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_provision_does_not_mark_postgis_shippable_without_a_confirming_observation(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None, lastObservation=None),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertNotIn("extensions", create_server)
+
+    @patch("federation_store.extension_versions")
+    def test_provision_marks_postgis_shippable_when_versions_match(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt=None,
+                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertIn("extensions", create_server)
+        self.assertIn("postgis", create_server)
+
+    @patch("federation_store.extension_versions")
+    def test_provision_does_not_mark_postgis_shippable_when_versions_mismatch(self, mock_versions):
+        # docs/federation-architecture-waypoint.md: pushdown is only safe
+        # when PostGIS/PROJ/GEOS all match the federation database's own
+        # versions — the remote merely *having* postgis is not enough.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt=None,
+                lastObservation={"extensionVersions": DIFFERENT_VERSIONS},
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertNotIn("extensions", create_server)
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_does_not_repeat_create_ddl(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE SERVER" in s for s in statements))
+        self.assertFalse(any("CREATE USER MAPPING" in s for s in statements))
+        self.assertFalse(any("IMPORT FOREIGN SCHEMA" in s for s in statements))
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+            ),
+            {"srvoptions": ["host=source-db"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertTrue(any("ALTER SERVER" in s and "ADD extensions" in s and "postgis" in s for s in statements))
+        self.assertFalse(any("DROP extensions" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_disables_pushdown_when_versions_now_mismatch(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"extensionVersions": DIFFERENT_VERSIONS},
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertTrue(any("ALTER SERVER" in s and "DROP extensions" in s for s in statements))
+        self.assertFalse(any("ADD extensions" in s for s in statements))
 
     def test_affected_derived_layer_names_queries_by_local_fdw_schema(self):
         cursor = MagicMock()

@@ -49,6 +49,7 @@ class ScriptedFakeConnection:
 def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
     results = [{"version": "16.2"}]
     if postgis:
+        results.append({"exists": 1})
         results.append({"version": "3.4.2"})
         results.append({"version": "9.3.1"})
         results.append({"version": "3.12.1"})

@@ -478,6 +478,32 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
                 with self.assertRaises(DerivedLayerError):
                     plan_area_weighted_h3_recipe(self.request(), asset)
 
+    def test_accepts_a_non_unique_id_column_only_for_a_foreign_table_source(self):
+        # Postgres foreign tables can never carry a PRIMARY KEY or UNIQUE
+        # constraint, so semantic sync always reports primaryKey=unique=False
+        # for them. The recipe planner must not reject that combination for
+        # a foreign-table source the way it would for a local relation.
+        asset = self.source_asset()
+        asset["generated"]["kind"] = "foreign-table"
+        asset["generated"]["fields"][0]["primaryKey"] = False
+        asset["generated"]["fields"][0]["unique"] = False
+
+        result = plan_area_weighted_h3_recipe(self.request(), asset)
+
+        self.assertEqual(
+            ["census.areas"], result["createRequest"]["sources"]
+        )
+
+    def test_still_rejects_a_nullable_id_column_for_a_foreign_table_source(self):
+        asset = self.source_asset()
+        asset["generated"]["kind"] = "foreign-table"
+        asset["generated"]["fields"][0]["nullable"] = True
+        asset["generated"]["fields"][0]["primaryKey"] = False
+        asset["generated"]["fields"][0]["unique"] = False
+
+        with self.assertRaises(DerivedLayerError):
+            plan_area_weighted_h3_recipe(self.request(), asset)
+
 
 class DerivedLayerDefinitionTests(unittest.TestCase):
     @staticmethod
