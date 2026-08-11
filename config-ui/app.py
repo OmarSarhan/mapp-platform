@@ -7433,6 +7433,12 @@ class Handler(SimpleHTTPRequestHandler):
                     record["connectionRef"]
                 )
                 if federation_action == "observe":
+                    if payload:
+                        raise FederationSchemaError(
+                            "Unknown observe properties: "
+                            + ", ".join(sorted(payload)),
+                            code="federation.invalid_request",
+                        )
                     observation = detect_capability(
                         connection_url,
                         allowed_relations=tuple(record["allowedRelations"]),

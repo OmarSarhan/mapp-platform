@@ -55,7 +55,7 @@ def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
         results.append({"version": "3.12.1"})
     else:
         results.append(None)
-    results.extend({"relrowsecurity": rls} for _ in range(relation_count))
+    results.extend({"bypasses_per_user_access": rls} for _ in range(relation_count))
     return results
 
 
@@ -141,6 +141,25 @@ class DetectCapabilityTests(unittest.TestCase):
             )
 
         self.assertTrue(observation["rowLevelSecurityDetected"])
+
+    def test_detects_a_security_barrier_view_without_native_rls(self):
+        # docs/federation-architecture-waypoint.md: the same per-user
+        # bypass risk applies to a security-barrier view (a common way to
+        # implement per-user row filtering without native RLS) as to
+        # relrowsecurity — the query combines both signals.
+        cursor = ScriptedFakeCursor(extension_and_rls_results(rls=True))
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            observation = detect_capability(
+                "postgresql://reader",
+                allowed_relations=("leeds.tenant_scoped_view",),
+            )
+
+        self.assertTrue(observation["rowLevelSecurityDetected"])
+        executed_sql = "\n".join(query for query, _ in cursor.executed)
+        self.assertIn("security_barrier", executed_sql)
 
     def test_connectivity_failure_is_reported_not_raised(self):
         with patch(

@@ -105,14 +105,25 @@ def _verify_allowed_relations(
     A relation that no longer exists, or that this connection can no
     longer SELECT, must not be silently skipped — it means the schema
     Discover verified has changed from what was registered, and the
-    caller must not report it as "current" evidence."""
+    caller must not report it as "current" evidence.
+
+    "row_level_security_detected" also covers a security-barrier view
+    (docs/federation-architecture-waypoint.md: "If any allowlisted
+    relation has RLS or a security-barrier view enabled...") — a view
+    marked security_barrier is commonly how per-user row filtering is
+    implemented without native RLS, and the same "every MAPP caller
+    shares one mapped remote user" bypass risk applies to it."""
     all_present = True
     rls_detected = False
     for entry in allowed_relations:
         schema, relation = _parsed_schema_relation(entry)
         cursor.execute(
             """
-            SELECT relrowsecurity
+            SELECT
+              relrowsecurity
+              OR COALESCE(
+                   reloptions && ARRAY['security_barrier=true'], false
+                 ) AS bypasses_per_user_access
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
@@ -124,7 +135,7 @@ def _verify_allowed_relations(
         if row is None:
             all_present = False
             continue
-        if row["relrowsecurity"]:
+        if row["bypasses_per_user_access"]:
             rls_detected = True
     return all_present, rls_detected
 
