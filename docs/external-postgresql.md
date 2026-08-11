@@ -166,10 +166,11 @@ on this path. `./bin/mapp verify` checks the effective derived-owner setting
 and the platform layer-dependency guard objects installed in `public`.
 
 PostgreSQL replaces that session path with a security-restricted path while it
-refreshes a materialized view. In H3 4.2.3, the PostGIS polygon wrappers are SQL
-functions whose delayed body contains unqualified PostGIS calls. If H3-derived
-materialized layers are required, a database administrator must pin the four
-affected extension routines after installing or upgrading `h3_postgis`:
+refreshes a materialized view. In H3 4.2.3, the PostGIS polygon, lat/lng, and
+cell-geometry wrappers are SQL functions whose delayed body contains unqualified
+PostGIS calls. If H3-derived materialized layers are required, a database
+administrator must pin all sixteen affected extension routines after
+installing or upgrading `h3_postgis`:
 
 ```sql
 ALTER FUNCTION public.h3_polygon_to_cells(public.geometry, integer)
@@ -182,6 +183,30 @@ ALTER FUNCTION public.h3_polygon_to_cells_experimental(
 ALTER FUNCTION public.h3_polygon_to_cells_experimental(
   public.geography, integer, text
 ) SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_lat_lng_to_cell(public.geometry, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_lat_lng_to_cell(public.geography, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_latlng_to_cell(public.geometry, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_latlng_to_cell(public.geography, integer)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_geometry(public.h3index)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_geography(public.h3index)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_boundary_geometry(public.h3index)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_boundary_geography(public.h3index)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_boundary_geometry(public.h3index, boolean)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cell_to_boundary_geography(public.h3index, boolean)
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cells_to_multi_polygon_geometry(public.h3index[])
+  SET search_path = pg_catalog, public;
+ALTER FUNCTION public.h3_cells_to_multi_polygon_geography(public.h3index[])
+  SET search_path = pg_catalog, public;
 ```
 
 Before altering them, verify each exact overload through `pg_proc`, `pg_depend`,

@@ -52,6 +52,30 @@ BEGIN
         'public.h3_polygon_to_cells_experimental(public.geometry,pg_catalog.int4,pg_catalog.text)'
           ::pg_catalog.regprocedure,
         'public.h3_polygon_to_cells_experimental(public.geography,pg_catalog.int4,pg_catalog.text)'
+          ::pg_catalog.regprocedure,
+        'public.h3_lat_lng_to_cell(public.geometry,pg_catalog.int4)'
+          ::pg_catalog.regprocedure,
+        'public.h3_lat_lng_to_cell(public.geography,pg_catalog.int4)'
+          ::pg_catalog.regprocedure,
+        'public.h3_latlng_to_cell(public.geometry,pg_catalog.int4)'
+          ::pg_catalog.regprocedure,
+        'public.h3_latlng_to_cell(public.geography,pg_catalog.int4)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_geometry(public.h3index)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_geography(public.h3index)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_boundary_geometry(public.h3index)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_boundary_geography(public.h3index)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_boundary_geometry(public.h3index,pg_catalog.bool)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cell_to_boundary_geography(public.h3index,pg_catalog.bool)'
+          ::pg_catalog.regprocedure,
+        'public.h3_cells_to_multi_polygon_geometry(public.h3index[])'
+          ::pg_catalog.regprocedure,
+        'public.h3_cells_to_multi_polygon_geography(public.h3index[])'
           ::pg_catalog.regprocedure
       ])
   LOOP
@@ -61,9 +85,9 @@ BEGIN
     );
     hardened_count := hardened_count + 1;
   END LOOP;
-  IF hardened_count <> 4 THEN
+  IF hardened_count <> 16 THEN
     RAISE EXCEPTION
-      'Expected four public h3_postgis polygon SQL wrappers, found %',
+      'Expected sixteen public h3_postgis SQL wrappers, found %',
       hardened_count;
   END IF;
 END
