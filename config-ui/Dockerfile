@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --requirement requirements.txt
 
-COPY app.py workspace_schema.py plugin_registry.py svg_icons.py static_files.py infoj_types.py control_plane.py control_api.py config_admin.py derived_layers.py derived_query_guard.py semantic_client.py gemini_client.py semantic_sources.py ./
+COPY app.py workspace_schema.py plugin_registry.py svg_icons.py static_files.py infoj_types.py control_plane.py control_api.py config_admin.py derived_layers.py derived_query_guard.py semantic_client.py gemini_client.py semantic_sources.py relation_identity.py federation_schema.py federation_capability.py ./
 COPY schema ./schema
 COPY --from=web /web/dist ./static
 
