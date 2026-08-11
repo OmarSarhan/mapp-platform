@@ -2343,7 +2343,7 @@ class CatalogDiscoveryTests(unittest.TestCase):
             self.assertEqual([], app.discover_connection("MAPP", "postgresql://db"))
 
         discovery_query = cursor.execute.call_args_list[1].args[0]
-        self.assertIn("c.relkind IN ('r', 'p', 'v', 'm')", discovery_query)
+        self.assertIn("c.relkind IN ('r', 'p', 'v', 'm', 'f')", discovery_query)
         self.assertIn("postgis_typmod_type(a.atttypmod)", discovery_query)
         self.assertNotIn("JOIN geometry_columns", discovery_query)
 

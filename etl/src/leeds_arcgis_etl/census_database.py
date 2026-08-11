@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 DATASET_METADATA_TABLE = "census_datasets"
 VARIABLE_METADATA_TABLE = "census_variables"
+DATASET_PUBLICATION_TABLE = "dataset_publication"
 RUN_TABLE = "_census_etl_runs"
 ABANDONED_RUN_ERROR = (
     "abandoned: previous Census ETL session ended before completion"
@@ -522,6 +523,121 @@ class CensusPostgresStore:
                         sql.Identifier(self.schema),
                         sql.Identifier(RUN_TABLE),
                     )
+                )
+                # Deliberately not underscore-prefixed, unlike RUN_TABLE:
+                # semantic sync excludes "_"-prefixed relations from
+                # discovery, and the federation verifier must be able to
+                # read this record (see
+                # docs/federation-architecture-waypoint.md, "Publication
+                # record"). Exactly one row — the current release —
+                # enforced by the boolean singleton primary key.
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS {}.{} (
+                            singleton boolean PRIMARY KEY DEFAULT true
+                                CHECK (singleton),
+                            dataset_id text NOT NULL,
+                            release_id text NOT NULL UNIQUE,
+                            schema_version integer NOT NULL,
+                            source_hash text NOT NULL,
+                            published_at timestamp with time zone NOT NULL,
+                            row_counts jsonb NOT NULL,
+                            geometry_contract_version integer NOT NULL
+                        )
+                        """
+                    ).format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(DATASET_PUBLICATION_TABLE),
+                    )
+                )
+
+        self._commit_or_rollback(operation)
+
+    def publish_release(
+        self,
+        *,
+        dataset_id: str,
+        release_id: str,
+        schema_version: int,
+        source_hash: str,
+        geometry_contract_version: int,
+    ) -> None:
+        """Atomically publish the dataset_publication record for this schema.
+
+        Call this once, as the last step of a fully successful Census ETL
+        cycle — after publish() has already committed — not per topic or per
+        run. row_counts is computed from the stable target table inside this
+        same transaction, so it can never disagree with what was actually
+        just published; if anything raises, _commit_or_rollback rolls the
+        whole write back and the previous release's record is left intact,
+        per the federation architecture waypoint's atomic ETL boundary.
+        """
+
+        def operation() -> None:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT schema_version, geometry_contract_version "
+                        "FROM {}.{} WHERE singleton"
+                    ).format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(DATASET_PUBLICATION_TABLE),
+                    )
+                )
+                previous = cursor.fetchone()
+                if previous is not None:
+                    previous_schema_version, previous_geometry_version = previous
+                    if schema_version < previous_schema_version:
+                        raise CensusDatabaseError(
+                            "schema_version must not regress: "
+                            f"{schema_version} < {previous_schema_version}"
+                        )
+                    if geometry_contract_version < previous_geometry_version:
+                        raise CensusDatabaseError(
+                            "geometry_contract_version must not regress: "
+                            f"{geometry_contract_version} < "
+                            f"{previous_geometry_version}"
+                        )
+
+                cursor.execute(
+                    sql.SQL("SELECT count(*) FROM {}.{}").format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(self.target_table),
+                    )
+                )
+                row_counts = {self.target_table: cursor.fetchone()[0]}
+
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        INSERT INTO {}.{}
+                            (singleton, dataset_id, release_id, schema_version,
+                             source_hash, published_at, row_counts,
+                             geometry_contract_version)
+                        VALUES (true, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s, %s)
+                        ON CONFLICT (singleton) DO UPDATE SET
+                            dataset_id = EXCLUDED.dataset_id,
+                            release_id = EXCLUDED.release_id,
+                            schema_version = EXCLUDED.schema_version,
+                            source_hash = EXCLUDED.source_hash,
+                            published_at = EXCLUDED.published_at,
+                            row_counts = EXCLUDED.row_counts,
+                            geometry_contract_version =
+                                EXCLUDED.geometry_contract_version
+                        """
+                    ).format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(DATASET_PUBLICATION_TABLE),
+                    ),
+                    (
+                        dataset_id,
+                        release_id,
+                        schema_version,
+                        source_hash,
+                        Jsonb(row_counts),
+                        geometry_contract_version,
+                    ),
                 )
 
         self._commit_or_rollback(operation)

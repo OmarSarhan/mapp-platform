@@ -906,5 +906,90 @@ class CensusGeometryRepairPostGISTests(unittest.TestCase):
         self.assertEqual(rows[other_target_run], ("running", False, None))
 
 
+class CensusDatasetPublicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.connection = FakeConnection()
+        self.store = CensusPostgresStore(
+            self.connection, sample_config()  # type: ignore[arg-type]
+        )
+
+    def rendered_sql(self) -> str:
+        return "\n".join(statement for statement, _ in self.connection.statements)
+
+    def test_ddl_creates_a_singleton_publication_table(self) -> None:
+        self.store.initialize()
+        ddl = self.rendered_sql()
+        self.assertIn("dataset_publication", ddl)
+        self.assertIn("singleton boolean PRIMARY KEY DEFAULT true", ddl)
+        self.assertIn("CHECK (singleton)", ddl)
+        self.assertIn("release_id text NOT NULL UNIQUE", ddl)
+        self.assertNotIn("_dataset_publication", ddl)
+
+    def test_publish_release_computes_row_count_and_commits(self) -> None:
+        self.connection.responses = [None, (250,)]
+
+        self.store.publish_release(
+            dataset_id="census",
+            release_id="release-1",
+            schema_version=1,
+            source_hash="a" * 64,
+            geometry_contract_version=1,
+        )
+
+        self.assertEqual(1, self.connection.commits)
+        self.assertEqual(0, self.connection.rollbacks)
+        insert_statement, params = self.connection.statements[-1]
+        self.assertIn("INSERT INTO", insert_statement)
+        self.assertIn("dataset_publication", insert_statement)
+        self.assertIn("ON CONFLICT (singleton) DO UPDATE", insert_statement)
+        self.assertEqual(
+            {"census_2021_england_oa": 250}, params[4].obj
+        )
+
+    def test_publish_release_rejects_a_schema_version_regression(self) -> None:
+        self.connection.responses = [(5, 2)]
+
+        with self.assertRaises(CensusDatabaseError):
+            self.store.publish_release(
+                dataset_id="census",
+                release_id="release-2",
+                schema_version=4,
+                source_hash="b" * 64,
+                geometry_contract_version=2,
+            )
+        self.assertEqual(0, self.connection.commits)
+        self.assertEqual(1, self.connection.rollbacks)
+
+    def test_publish_release_rejects_a_geometry_contract_version_regression(
+        self,
+    ) -> None:
+        self.connection.responses = [(5, 2)]
+
+        with self.assertRaises(CensusDatabaseError):
+            self.store.publish_release(
+                dataset_id="census",
+                release_id="release-2",
+                schema_version=5,
+                source_hash="b" * 64,
+                geometry_contract_version=1,
+            )
+        self.assertEqual(0, self.connection.commits)
+        self.assertEqual(1, self.connection.rollbacks)
+
+    def test_publish_release_allows_an_unchanged_version_republish(self) -> None:
+        self.connection.responses = [(5, 2), (250,)]
+
+        self.store.publish_release(
+            dataset_id="census",
+            release_id="release-2",
+            schema_version=5,
+            source_hash="c" * 64,
+            geometry_contract_version=2,
+        )
+
+        self.assertEqual(1, self.connection.commits)
+        self.assertEqual(0, self.connection.rollbacks)
+
+
 if __name__ == "__main__":
     unittest.main()

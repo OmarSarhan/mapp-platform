@@ -27,6 +27,7 @@ RELATION_KINDS = {
     "p": "partitioned-table",
     "v": "view",
     "m": "materialized-view",
+    "f": "foreign-table",
 }
 MAX_RELATION_DESCRIPTION = 2000
 MAX_FIELD_DESCRIPTION = 1000
@@ -52,7 +53,7 @@ _GENERATION_FIELDS_SQL = """
       ON base_type.oid = NULLIF(t.typbasetype, 0)
     WHERE n.nspname = %s
       AND c.relname = %s
-      AND c.relkind IN ('r', 'p', 'v', 'm')
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
       AND has_schema_privilege(n.oid, 'USAGE')
       AND has_table_privilege(c.oid, 'SELECT')
     ORDER BY a.attnum
@@ -255,7 +256,7 @@ class PostgresSemanticSources:
                c.relkind AS relation_kind
         FROM pg_catalog.pg_class AS c
         JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND has_schema_privilege(n.oid, 'USAGE')
           AND has_table_privilege(c.oid, 'SELECT')
         ORDER BY n.nspname, c.relname
@@ -301,7 +302,7 @@ class PostgresSemanticSources:
         ) AS ix ON ix.indrelid = c.oid AND ix.attnum = a.attnum
         WHERE n.nspname = %s
           AND c.relname = %s
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND has_schema_privilege(n.oid, 'USAGE')
           AND has_table_privilege(c.oid, 'SELECT')
         ORDER BY a.attnum
@@ -503,7 +504,7 @@ class PostgresSemanticSources:
                    c.relkind AS relation_kind
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p', 'v', 'm')
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
               AND has_schema_privilege(n.oid, 'USAGE')
               AND has_table_privilege(c.oid, 'SELECT')
               AND left(c.relname, 1) <> '_'
