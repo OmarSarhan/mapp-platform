@@ -177,6 +177,29 @@ class PostgresStore:
                         """
                     ).format(sql.Identifier(self.schema))
                 )
+                # Deliberately not underscore-prefixed: semantic sync
+                # excludes "_"-prefixed relations from discovery, and the
+                # federation verifier must be able to read this record (see
+                # docs/federation-architecture-waypoint.md, "Publication
+                # record"). Exactly one row — the current release — enforced
+                # by the boolean singleton primary key.
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS {}.dataset_publication (
+                            singleton boolean PRIMARY KEY DEFAULT true
+                                CHECK (singleton),
+                            dataset_id text NOT NULL,
+                            release_id text NOT NULL UNIQUE,
+                            schema_version integer NOT NULL,
+                            source_hash text NOT NULL,
+                            published_at timestamp with time zone NOT NULL,
+                            row_counts jsonb NOT NULL,
+                            geometry_contract_version integer NOT NULL
+                        )
+                        """
+                    ).format(sql.Identifier(self.schema))
+                )
                 for layer in self.config.layers:
                     self._ensure_layer_table(cursor, layer)
 
@@ -485,3 +508,88 @@ class PostgresStore:
             self._commit_or_rollback(operation)
         except Exception:
             LOGGER.exception("could not record failed ETL run %s", run_id)
+
+    def publish_release(
+        self,
+        *,
+        dataset_id: str,
+        release_id: str,
+        schema_version: int,
+        source_hash: str,
+        geometry_contract_version: int,
+    ) -> None:
+        """Atomically publish the dataset_publication record for this schema.
+
+        Call this once, as the last step of a fully successful ETL run —
+        after every layer's finish_run() has already committed — never per
+        layer. row_counts is computed from every configured layer's target
+        table inside this same transaction, so the published counts can
+        never disagree with the row_counts this call records; if anything
+        raises, _commit_or_rollback rolls the whole write back and the
+        previous release's record is left intact, per the federation
+        architecture waypoint's atomic ETL boundary.
+        """
+
+        def operation() -> None:
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT schema_version, geometry_contract_version "
+                        "FROM {}.dataset_publication WHERE singleton"
+                    ).format(sql.Identifier(self.schema))
+                )
+                previous = cursor.fetchone()
+                if previous is not None:
+                    previous_schema_version, previous_geometry_version = previous
+                    if schema_version < previous_schema_version:
+                        raise DatabaseError(
+                            "schema_version must not regress: "
+                            f"{schema_version} < {previous_schema_version}"
+                        )
+                    if geometry_contract_version < previous_geometry_version:
+                        raise DatabaseError(
+                            "geometry_contract_version must not regress: "
+                            f"{geometry_contract_version} < "
+                            f"{previous_geometry_version}"
+                        )
+
+                row_counts: dict[str, int] = {}
+                for layer in self.config.layers:
+                    cursor.execute(
+                        sql.SQL("SELECT count(*) FROM {}.{}").format(
+                            sql.Identifier(self.schema),
+                            sql.Identifier(layer.target_table),
+                        )
+                    )
+                    row_counts[layer.target_table] = cursor.fetchone()[0]
+
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        INSERT INTO {}.dataset_publication
+                            (singleton, dataset_id, release_id, schema_version,
+                             source_hash, published_at, row_counts,
+                             geometry_contract_version)
+                        VALUES (true, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s, %s)
+                        ON CONFLICT (singleton) DO UPDATE SET
+                            dataset_id = EXCLUDED.dataset_id,
+                            release_id = EXCLUDED.release_id,
+                            schema_version = EXCLUDED.schema_version,
+                            source_hash = EXCLUDED.source_hash,
+                            published_at = EXCLUDED.published_at,
+                            row_counts = EXCLUDED.row_counts,
+                            geometry_contract_version =
+                                EXCLUDED.geometry_contract_version
+                        """
+                    ).format(sql.Identifier(self.schema)),
+                    (
+                        dataset_id,
+                        release_id,
+                        schema_version,
+                        source_hash,
+                        Jsonb(row_counts),
+                        geometry_contract_version,
+                    ),
+                )
+
+        self._commit_or_rollback(operation)
