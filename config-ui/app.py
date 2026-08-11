@@ -7448,7 +7448,27 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                 else:
-                    result = FEDERATION.provision(alias_name, connection_url)
+                    unexpected = sorted(
+                        set(payload) - {"rowLevelSecurityAcknowledged"}
+                    )
+                    if unexpected:
+                        raise FederationSchemaError(
+                            "Unknown provision properties: "
+                            + ", ".join(unexpected),
+                            code="federation.invalid_request",
+                        )
+                    acknowledged = payload.get("rowLevelSecurityAcknowledged")
+                    if acknowledged is not None and acknowledged is not True:
+                        raise FederationSchemaError(
+                            "rowLevelSecurityAcknowledged must be true "
+                            "when present.",
+                            code="federation.invalid_request",
+                        )
+                    result = FEDERATION.provision(
+                        alias_name,
+                        connection_url,
+                        acknowledge_row_level_security=acknowledged is True,
+                    )
                     CONTROL.audit(
                         "federation_alias.provisioned",
                         actor=actor,

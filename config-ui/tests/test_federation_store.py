@@ -263,14 +263,97 @@ class FederationAliasStoreTests(unittest.TestCase):
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))
 
+    def test_provision_rejects_a_missing_or_stale_observation(self):
+        # IMPORT FOREIGN SCHEMA acts on whatever the remote looks like
+        # right now — provisioning against evidence that was never taken,
+        # or that already showed the schema had changed, could silently
+        # produce an incomplete alias.
+        for last_observation in (None, {"schema": "changed"}, {}):
+            with self.subTest(last_observation=last_observation):
+                cursor = MagicMock()
+                cursor.fetchone.return_value = alias_row(
+                    provisionedAt=None, lastObservation=last_observation
+                )
+                store = self.store_with_cursor(cursor)
+                with self.assertRaises(FederationSchemaError):
+                    store.provision(
+                        "leeds_ext",
+                        "postgresql://reader:secret@source-db:5432/sourcedb",
+                    )
+
+    @patch("federation_store.extension_versions")
+    def test_provision_rejects_an_incomplete_import(self, mock_versions):
+        # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever of
+        # the named relations actually exists — it does not error on one
+        # that's missing. An alias must never go active with fewer
+        # foreign tables than its allowedRelations declares.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+            )
+
+    def test_provision_requires_acknowledgement_of_detected_row_level_security(self):
+        # All MAPP callers query through the same mapped remote user —
+        # any per-user row-level security on the source is bypassed
+        # entirely once federated. The registration-time acknowledgement
+        # can't cover this: RLS is only discovered later, by Observe.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = alias_row(
+            provisionedAt=None,
+            lastObservation={
+                "schema": "current",
+                "rowLevelSecurityDetected": True,
+            },
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+            )
+
+    @patch("federation_store.extension_versions")
+    def test_provision_proceeds_once_row_level_security_is_acknowledged(self, mock_versions):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt=None,
+                lastObservation={
+                    "schema": "current",
+                    "rowLevelSecurityDetected": True,
+                },
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        result = store.provision(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            acknowledge_row_level_security=True,
+        )
+
+        self.assertIsNotNone(result["provisionedAt"])
+
     @patch("federation_store.extension_versions")
     def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self, mock_versions):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            alias_row(provisionedAt=None),
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         result = store.provision(
@@ -299,9 +382,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            alias_row(provisionedAt=None),
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         store.provision(
@@ -320,9 +404,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            alias_row(provisionedAt=None),
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         store.provision(
@@ -338,9 +423,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            alias_row(provisionedAt=None, lastObservation=None),
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         store.provision(
@@ -358,10 +444,14 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt=None,
-                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
             ),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         store.provision(
@@ -383,10 +473,14 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt=None,
-                lastObservation={"extensionVersions": DIFFERENT_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": DIFFERENT_VERSIONS,
+                },
             ),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
         store.provision(

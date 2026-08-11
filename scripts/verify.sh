@@ -1659,7 +1659,7 @@ with psycopg.connect(
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
                       OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                     )
                   )
                   AND has_schema_privilege(namespace.oid, $$CREATE$$)
@@ -1676,7 +1676,7 @@ with psycopg.connect(
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
                       OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                     )
                   )
                   AND relation.relkind IN (
@@ -1719,7 +1719,7 @@ with psycopg.connect(
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
                       OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                     )
                   )
                   AND relation.relkind = $$S$$
@@ -1765,7 +1765,7 @@ with psycopg.connect(
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
                             OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                           )
                         )
                         AND has_schema_privilege(
@@ -1787,7 +1787,7 @@ with psycopg.connect(
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
                             OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                           )
                         )
                         AND relation.relkind IN (
@@ -1858,7 +1858,7 @@ with psycopg.connect(
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
                             OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$
+                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
                           )
                         )
                         AND relation.relkind = $$S$$

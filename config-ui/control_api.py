@@ -1606,7 +1606,13 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "pathTemplate": "/api/federation/aliases/{alias}/provision",
         "risk": "federation-provision",
         "scope": "federation:provision",
-        "inputSchema": {"type": "object", "additionalProperties": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rowLevelSecurityAcknowledged": {"const": True},
+            },
+            "additionalProperties": False,
+        },
     },
 }
 

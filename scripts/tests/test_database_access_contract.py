@@ -403,8 +403,11 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
             normalized,
         )
+        # Must stay in sync with ALIAS_RE in config-ui/federation_schema.py
+        # (no hyphen, max 56 characters) — a looser exemption pattern here
+        # would silently trust a schema no real alias could ever produce.
         self.assertIn(
-            "namespace.nspname ~ $$^source_[A-Za-z][A-Za-z0-9_-]{0,62}$$",
+            "namespace.nspname ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$",
             normalized,
         )
 

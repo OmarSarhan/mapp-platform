@@ -276,7 +276,13 @@ class FederationAliasStore:
                 )
             )
 
-    def provision(self, alias: str, connection_url: str) -> dict[str, Any]:
+    def provision(
+        self,
+        alias: str,
+        connection_url: str,
+        *,
+        acknowledge_row_level_security: bool = False,
+    ) -> dict[str, Any]:
         """Create the real FDW server, user mapping, schema, and foreign
         tables for this alias's allowedRelations the first time this is
         called. Callable again afterward as a reprovisioning action (e.g.
@@ -287,6 +293,29 @@ class FederationAliasStore:
         alias = validate_alias(alias)
         record = self.get(alias)
         already_provisioned = record["provisionedAt"] is not None
+        last_observation = record.get("lastObservation") or {}
+        # Every MAPP caller queries a federated source through the same
+        # mapped remote user (there is only one connectionRef per alias),
+        # so any row-level security the source enforces per connecting
+        # user is bypassed entirely once federated — the mapped role's
+        # full row set becomes visible to every runtime caller. The
+        # generic dataHandlingAcknowledged at registration cannot cover
+        # this: RLS is only discovered later, by Observe.
+        if last_observation.get("rowLevelSecurityDetected") and not (
+            acknowledge_row_level_security
+        ):
+            raise FederationSchemaError(
+                f"Alias {alias!r}'s source has row-level security that "
+                "would be bypassed once federated — acknowledge this "
+                "explicitly to provision.",
+                code="federation.row_level_security_not_acknowledged",
+            )
+        if not already_provisioned and last_observation.get("schema") != "current":
+            raise FederationSchemaError(
+                f"Alias {alias!r} has not been observed as current — "
+                "observe it again immediately before provisioning.",
+                code="federation.observation_not_current",
+            )
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
         host = str(params.get("host", ""))
         port = str(params.get("port", "5432"))
@@ -454,6 +483,35 @@ class FederationAliasStore:
                     server=sql.Identifier(server_name),
                     local_schema=sql.Identifier(schema_name),
                 ))
+            # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever
+            # of the named relations actually exists on the remote — it
+            # does not error on one that's missing. Confirm every approved
+            # relation actually landed as a foreign table before marking
+            # the alias active; the whole transaction rolls back otherwise,
+            # rather than leaving an alias active with an incomplete set.
+            cur.execute(
+                sql.SQL("""
+                    SELECT c.relname
+                    FROM pg_catalog.pg_class AS c
+                    JOIN pg_catalog.pg_namespace AS n
+                      ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND c.relkind = 'f'
+                """),
+                (schema_name,),
+            )
+            imported = {row["relname"] for row in cur.fetchall()}
+            expected = {
+                relation.split(".", 1)[1]
+                for relation in record["allowedRelations"]
+            }
+            missing = sorted(expected - imported)
+            if missing:
+                raise FederationSchemaError(
+                    f"Alias {alias!r} provisioning did not import: "
+                    f"{missing} — the source schema may have changed "
+                    "since it was last observed.",
+                    code="federation.import_incomplete",
+                )
             cur.execute(
                 sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
                     sql.Identifier(schema_name), sql.Identifier(self.reader_role)
