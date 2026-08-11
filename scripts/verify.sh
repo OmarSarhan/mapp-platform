@@ -32,7 +32,9 @@ reject_database_environment_overrides() {
     "${!DBS_@}" ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
     ETL_DB_USER ETL_DB_PASSWORD XYZ_DB_USER XYZ_DB_PASSWORD \
     DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL \
-    DERIVED_READER_ROLE
+    DERIVED_READER_ROLE \
+    SOURCE_POSTGRES_DB SOURCE_POSTGRES_USER SOURCE_POSTGRES_PASSWORD \
+    SOURCE_READER_USER SOURCE_READER_PASSWORD
   do
     if [[ -v "${key}" ]]; then
       configured="$(dotenv_value "${key}")"
@@ -1641,10 +1643,8 @@ with psycopg.connect(
                 SELECT 1
                 FROM pg_catalog.pg_namespace AS namespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
-                  )
+                  AND namespace.nspname <> $$information_schema$$
+                  AND namespace.nspowner <> login_role.oid
                   AND has_schema_privilege(namespace.oid, $$CREATE$$)
               ) AS "canCreateBaseSchema",
               EXISTS (
@@ -1653,10 +1653,8 @@ with psycopg.connect(
                 JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
-                  )
+                  AND namespace.nspname <> $$information_schema$$
+                  AND namespace.nspowner <> login_role.oid
                   AND relation.relkind IN (
                     $$r$$,
                     $$p$$,
@@ -1691,10 +1689,8 @@ with psycopg.connect(
                 JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
-                  )
+                  AND namespace.nspname <> $$information_schema$$
+                  AND namespace.nspowner <> login_role.oid
                   AND relation.relkind = $$S$$
                   AND (
                     has_sequence_privilege(relation.oid, $$USAGE$$)
@@ -1731,10 +1727,8 @@ with psycopg.connect(
                       SELECT 1
                       FROM pg_catalog.pg_namespace AS namespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
-                        )
+                        AND namespace.nspname <> $$information_schema$$
+                        AND namespace.nspowner <> reachable_role.oid
                         AND has_schema_privilege(
                           reachable_role.oid,
                           namespace.oid,
@@ -1747,10 +1741,8 @@ with psycopg.connect(
                       JOIN pg_catalog.pg_namespace AS namespace
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
-                        )
+                        AND namespace.nspname <> $$information_schema$$
+                        AND namespace.nspowner <> reachable_role.oid
                         AND relation.relkind IN (
                           $$r$$,
                           $$p$$,
@@ -1812,10 +1804,8 @@ with psycopg.connect(
                       JOIN pg_catalog.pg_namespace AS namespace
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
-                        )
+                        AND namespace.nspname <> $$information_schema$$
+                        AND namespace.nspowner <> reachable_role.oid
                         AND relation.relkind = $$S$$
                         AND (
                           has_sequence_privilege(

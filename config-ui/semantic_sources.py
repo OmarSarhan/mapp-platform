@@ -601,11 +601,25 @@ class PostgresSemanticSources:
             ) as connection:
                 with connection.cursor() as cursor:
                     self._begin_read_only(cursor)
+                    # Foreign tables cannot be locked ("This operation is
+                    # not supported for foreign tables") — skip the lock
+                    # for them. Every other relkind we support still takes
+                    # it; REPEATABLE READ's own snapshot already fixes the
+                    # view for the pair of queries below regardless.
                     cursor.execute(
-                        sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
-                            sql.Identifier(schema, relation)
-                        )
+                        "SELECT c.relkind FROM pg_catalog.pg_class AS c "
+                        "JOIN pg_catalog.pg_namespace AS n "
+                        "ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = %s AND c.relname = %s",
+                        (schema, relation),
                     )
+                    precheck = cursor.fetchone()
+                    if precheck is None or precheck["relkind"] != "f":
+                        cursor.execute(
+                            sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
+                                sql.Identifier(schema, relation)
+                            )
+                        )
                     cursor.execute(self._FIELDS_SQL, (schema, relation))
                     rows = cursor.fetchall()
                     if not rows:

@@ -475,6 +475,79 @@ class SemanticSourceContractTests(unittest.TestCase):
             ) as relation:
                 self.assertEqual("foreign-table", relation["kind"])
 
+    def test_locked_relation_skips_lock_table_for_a_foreign_table(self):
+        # Postgres rejects LOCK TABLE on foreign tables ("This operation is
+        # not supported for foreign tables") — verified against a real FDW
+        # foreign table. The relkind precheck must steer around it.
+        cursor = FakeCursor(
+            [
+                {
+                    "relation_kind": "f",
+                    "relation_description": None,
+                    "name": "id",
+                    "type": "bigint",
+                    "description": None,
+                    "nullable": False,
+                    "geometryType": "",
+                    "srid": None,
+                    "primaryKey": False,
+                    "unique": False,
+                },
+            ],
+            one={"relkind": "f"},
+        )
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            with sources.locked_relation("MAPP", "leeds", "bus_stops"):
+                pass
+        self.assertFalse(
+            any(
+                rendered.startswith("LOCK TABLE")
+                for rendered, _params in cursor.executed
+            )
+        )
+
+    def test_locked_relation_locks_a_plain_table(self):
+        cursor = FakeCursor(
+            [
+                {
+                    "relation_kind": "r",
+                    "relation_description": None,
+                    "name": "id",
+                    "type": "bigint",
+                    "description": None,
+                    "nullable": False,
+                    "geometryType": "",
+                    "srid": None,
+                    "primaryKey": False,
+                    "unique": False,
+                },
+            ],
+            one={"relkind": "r"},
+        )
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:leeds.*"),
+        )
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            with sources.locked_relation("MAPP", "leeds", "smoke_control_orders"):
+                pass
+        self.assertTrue(
+            any(
+                rendered.startswith("LOCK TABLE")
+                for rendered, _params in cursor.executed
+            )
+        )
+
     def test_privilege_loss_and_missing_alias_fail_closed(self):
         sources = PostgresSemanticSources(
             {"MAPP": "postgresql://reader"},

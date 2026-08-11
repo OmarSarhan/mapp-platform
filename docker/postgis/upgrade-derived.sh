@@ -104,6 +104,9 @@ WHERE NOT EXISTS (
 \gexec
 
 ALTER ROLE :"derived_db_user" LOGIN PASSWORD :'derived_db_password';
+
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO :"derived_db_user";
 ALTER ROLE :"etl_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 32;
 ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;
@@ -136,6 +139,8 @@ REVOKE TEMPORARY ON DATABASE :"DBNAME"
 GRANT CONNECT, TEMPORARY ON DATABASE :"DBNAME" TO :"etl_db_user";
 GRANT CONNECT ON DATABASE :"DBNAME"
   TO :"xyz_db_user", :"derived_db_user";
+-- See docker/postgis/init/10-roles.sh for why the derived owner needs this.
+GRANT CREATE ON DATABASE :"DBNAME" TO :"derived_db_user";
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA leeds TO :"xyz_db_user";
 GRANT USAGE ON SCHEMA leeds TO :"derived_db_user";
@@ -156,6 +161,18 @@ WHERE NOT EXISTS (
 ALTER SCHEMA derived_layers OWNER TO :"derived_db_user";
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
 GRANT USAGE ON SCHEMA derived_layers TO :"xyz_db_user";
+
+SELECT format(
+  'CREATE SCHEMA federation AUTHORIZATION %I',
+  :'derived_db_user'
+)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_namespace WHERE nspname = 'federation'
+)
+\gexec
+
+ALTER SCHEMA federation OWNER TO :"derived_db_user";
+REVOKE ALL ON SCHEMA federation FROM PUBLIC;
 
 ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
   GRANT SELECT ON TABLES TO :"xyz_db_user";

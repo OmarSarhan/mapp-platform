@@ -1,0 +1,42 @@
+# Opt-in overlay for federation FDW testing only. Not included in
+# ./bin/mapp's runtime_services and not started by `./bin/mapp serve`.
+# Bring up manually alongside the bundled stack, e.g.:
+#   docker compose --project-directory . --env-file .env \
+#     --file compose.yaml --file compose.bundled-db.yaml \
+#     --file compose.federation-test.yaml up -d source-db
+#   ./docker/source-db/seed.sh
+#
+# Deliberately plain postgis/postgis, not the custom mapp-postgis-h3 image —
+# a real independently-operated external source would not have MAPP's own
+# H3 extension installed (docs/federation-architecture-waypoint.md).
+services:
+  # config-ui only sees DBS_<ALIAS> vars explicitly listed here — Compose's
+  # `environment:` block does not forward arbitrary .env keys automatically.
+  config-ui:
+    environment:
+      DBS_LEEDS_EXT: ${DBS_LEEDS_EXT:?Set DBS_LEEDS_EXT in .env}
+
+  source-db:
+    image: postgis/postgis:17-3.5-alpine@sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB:?Set SOURCE_POSTGRES_DB in .env}
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:?Set SOURCE_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD:?Set SOURCE_POSTGRES_PASSWORD in .env}
+      SOURCE_READER_USER: ${SOURCE_READER_USER:?Set SOURCE_READER_USER in .env}
+      SOURCE_READER_PASSWORD: ${SOURCE_READER_PASSWORD:?Set SOURCE_READER_PASSWORD in .env}
+    volumes:
+      - source_postgres_data:/var/lib/postgresql/data
+      - ./docker/source-db/init/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ${SOURCE_POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - backend
+
+volumes:
+  source_postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_source_postgres_data

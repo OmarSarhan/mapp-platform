@@ -44,6 +44,9 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
+from federation_capability import detect_capability
+from federation_schema import FederationSchemaError
+from federation_store import FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
@@ -217,6 +220,14 @@ CONTROL = ControlStore(
 CONTROL.recover_interrupted_operations()
 DERIVED = (
     DerivedLayerStore(
+        os.environ["DERIVED_DATABASE_URL"],
+        os.environ["DERIVED_READER_ROLE"],
+    )
+    if os.environ.get("DERIVED_DATABASE_URL")
+    else None
+)
+FEDERATION = (
+    FederationAliasStore(
         os.environ["DERIVED_DATABASE_URL"],
         os.environ["DERIVED_READER_ROLE"],
     )
@@ -2643,6 +2654,25 @@ def resolve_derived_spatial_scope(payload: dict) -> dict:
     except ValueError as exc:
         raise DerivedLayerError(str(exc)) from exc
     return resolved
+
+
+def resolve_federation_connection_url(connection_ref: str) -> str:
+    """Resolve a Source alias's connectionRef to a real connection string.
+
+    connectionRef is deliberately just the suffix of an existing
+    `DBS_<NAME>` environment variable rather than a value produced by a
+    dedicated secret-submission endpoint (see federation_store.py's module
+    docstring) — this reuses the same, already override-protected
+    convention `PostgresSemanticSources` uses for every other alias.
+    """
+    connection_url = DB_CONNECTIONS.get(connection_ref)
+    if not connection_url:
+        raise FederationSchemaError(
+            f"connectionRef {connection_ref!r} does not match a configured "
+            "DBS_<NAME> connection.",
+            code="federation.connection_ref_not_found",
+        )
+    return connection_url
 
 
 def archive_excluded_semantic_sources(actor: str) -> list[dict]:
@@ -5152,6 +5182,23 @@ class Handler(SimpleHTTPRequestHandler):
             ):
                 return "semantic:propose"
             return "semantic:admin"
+        if path == "/api/federation/aliases" or path.startswith(
+            "/api/federation/aliases/"
+        ):
+            if method == "GET":
+                return "federation:observe"
+            # A live outbound connection is the platform's most dangerous
+            # capability (architecture waypoint decision: Discover requires
+            # federation:provision, not federation:observe, even though the
+            # action is spelled "observe" here) — only alias creation itself
+            # is a non-connecting intent record.
+            if re.fullmatch(
+                r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_-]{0,62}/"
+                r"(observe|provision)",
+                path,
+            ):
+                return "federation:provision"
+            return "federation:register"
         if method == "GET":
             if re.fullmatch(r"/api/layers/[^/]+/(values|statistics)", path):
                 return "derive"
@@ -5969,6 +6016,64 @@ class Handler(SimpleHTTPRequestHandler):
                         ),
                         exc=exc,
                     ),
+                )
+        elif path == "/api/federation/aliases":
+            try:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                self._json(HTTPStatus.OK, {"aliases": FEDERATION.list()})
+            except (FederationSchemaError, psycopg.Error) as exc:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "The federation alias registry is unavailable.",
+                        "code": "federation.registry_unavailable",
+                        "detail": str(exc),
+                    },
+                )
+        elif path.startswith("/api/federation/aliases/"):
+            try:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                name = path.removeprefix("/api/federation/aliases/")
+                if "/" in name:
+                    raise FileNotFoundError(name)
+                alias = FEDERATION.get(name)
+                affected = FEDERATION.affected_derived_layer_names(name)
+                alias["affectedDerivedLayers"] = [
+                    {
+                        "name": derived_name,
+                        "dependents": (
+                            DERIVED.dependents(derived_name) if DERIVED else []
+                        ),
+                    }
+                    for derived_name in affected
+                ]
+                self._json(HTTPStatus.OK, {"alias": alias})
+            except FileNotFoundError as exc:
+                name = str(exc)
+                message = f'The federation alias “{name}” does not exist.'
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": message,
+                    "message": message,
+                    "userMessage": message,
+                    "code": "federation.alias_not_found",
+                    "name": name,
+                })
+            except (FederationSchemaError, psycopg.Error) as exc:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "The federation alias could not be read.",
+                        "code": "federation.registry_unavailable",
+                        "detail": str(exc),
+                    },
                 )
         elif path == "/api/icons":
             self._json(HTTPStatus.OK, {"icons": discover_icons()})
@@ -6956,6 +7061,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/sql/test",
             "/api/derived-layers",
             "/api/derived-layers/recipes/area-weighted-h3/plan",
+            "/api/federation/aliases",
         }
         derived_action_path = re.fullmatch(
             r"/api/derived-layers/([a-z][a-z0-9_]{0,62})/(refresh|replace|drop)",
@@ -6973,12 +7079,18 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/proposals/([A-Za-z0-9._-]+)/(visual-plan|visual-test|screenshot)",
             request_path,
         )
+        federation_alias_action_path = re.fullmatch(
+            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_-]{0,62})/"
+            r"(observe|provision)",
+            request_path,
+        )
         if (
             request_path not in allowed
             and not proposal_action_path
             and not token_revoke_path
             and not proposal_visual_path
             and not derived_action_path
+            and not federation_alias_action_path
         ):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -7290,6 +7402,60 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 )
                 self._json(HTTPStatus.OK, {"derivedLayer": result})
+                return
+            if request_path == "/api/federation/aliases":
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                result = FEDERATION.register(payload, actor)
+                CONTROL.audit(
+                    "federation_alias.registered",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        "alias": result["alias"],
+                        "connectionRef": result["connectionRef"],
+                    },
+                )
+                self._json(HTTPStatus.CREATED, {"alias": result})
+                return
+            if federation_alias_action_path:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                alias_name, federation_action = federation_alias_action_path.groups()
+                record = FEDERATION.get(alias_name)
+                connection_url = resolve_federation_connection_url(
+                    record["connectionRef"]
+                )
+                if federation_action == "observe":
+                    observation = detect_capability(
+                        connection_url,
+                        allowed_relations=tuple(record["allowedRelations"]),
+                    )
+                    result = FEDERATION.record_observation(alias_name, observation)
+                    CONTROL.audit(
+                        "federation_alias.observed",
+                        actor=actor,
+                        remote=self._remote(),
+                        details={
+                            "alias": alias_name,
+                            "connectivity": observation["connectivity"],
+                        },
+                    )
+                else:
+                    result = FEDERATION.provision(alias_name, connection_url)
+                    CONTROL.audit(
+                        "federation_alias.provisioned",
+                        actor=actor,
+                        remote=self._remote(),
+                        details={"alias": alias_name},
+                    )
+                self._json(HTTPStatus.OK, {"alias": result})
                 return
             if request_path == "/api/auth/logout":
                 CONTROL.logout(self._cookies().get("mapp_session"))
@@ -9147,6 +9313,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(status, response)
             else:
                 self._semantic_error(exc)
+        except FederationSchemaError as exc:
+            self._json(exc.status, {"error": str(exc), "code": exc.code})
         except Exception as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,
