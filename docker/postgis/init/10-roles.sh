@@ -75,6 +75,15 @@ GRANT USAGE ON SCHEMA derived_layers TO :"xyz_db_user";
 CREATE SCHEMA federation AUTHORIZATION :"derived_db_user";
 REVOKE ALL ON SCHEMA federation FROM PUBLIC;
 
+-- Enables cross-database federation testing: one explicit postgres_fdw
+-- source, provisioned on demand by config-ui/federation_store.py's
+-- FederationAliasStore.provision(). Installing the extension and granting
+-- FDW USAGE here is a one-time, superuser-only step; CREATE SERVER/CREATE
+-- USER MAPPING/IMPORT FOREIGN SCHEMA happen later, per alias, under the
+-- derived-owner role.
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO :"derived_db_user";
+
 ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
   GRANT SELECT ON TABLES TO :"xyz_db_user";
 ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds

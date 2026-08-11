@@ -604,6 +604,8 @@ class ControlApiTests(unittest.TestCase):
                 "semantic:generate", "semantic:data",
                 "semantic:propose",
                 "semantic:apply", "semantic:admin",
+                "federation:register", "federation:provision",
+                "federation:observe",
             },
             set(authentication["scopes"]),
         )

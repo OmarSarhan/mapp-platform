@@ -184,18 +184,21 @@ class FederationAliasStore:
     ) -> dict[str, Any]:
         """Persist an already-validated observation (see federation_capability.detect_capability)."""
         alias = validate_alias(alias)
-        status = (
-            "active" if observation["connectivity"] == "reachable" else "unavailable"
-        )
+        reachable = observation["connectivity"] == "reachable"
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
                 sql.SQL("""
                     UPDATE {}._aliases
-                    SET last_observation = %s, status = %s
+                    SET last_observation = %s,
+                        status = CASE
+                          WHEN provisioned_at IS NULL THEN status
+                          WHEN %s THEN 'active'
+                          ELSE 'unavailable'
+                        END
                     WHERE alias = %s
                     RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
-                (Jsonb(observation), status, alias),
+                (Jsonb(observation), reachable, alias),
             )
             row = cur.fetchone()
             if row is None:
@@ -315,6 +318,28 @@ class FederationAliasStore:
             shippable = self._shippable_extensions(local_versions, remote_versions)
 
             if already_provisioned:
+                # A reprovisioning call is also the only place a rotated
+                # connectionRef (new password, host, or database behind the
+                # same alias) ever reaches the live foreign server —
+                # reconcile it every time, not just the extensions option.
+                cur.execute(sql.SQL("""
+                    ALTER SERVER {server} OPTIONS (
+                        SET host {host}, SET port {port}, SET dbname {dbname}
+                    )
+                """).format(
+                    server=sql.Identifier(server_name),
+                    host=sql.Literal(host),
+                    port=sql.Literal(port),
+                    dbname=sql.Literal(dbname),
+                ))
+                cur.execute(sql.SQL("""
+                    ALTER USER MAPPING FOR CURRENT_USER SERVER {server}
+                    OPTIONS (SET user {user}, SET password {password})
+                """).format(
+                    server=sql.Identifier(server_name),
+                    user=sql.Literal(user),
+                    password=sql.Literal(password),
+                ))
                 current = self._current_shippable_extensions(cur, server_name)
                 self._apply_shippable_extensions(cur, server_name, current, shippable)
                 return self.get(alias)
@@ -325,6 +350,18 @@ class FederationAliasStore:
                 sql.SQL("dbname {}").format(sql.Literal(dbname)),
                 sql.SQL("use_remote_estimate 'true'"),
             ]
+            # Forward whatever transport guarantees the operator already put
+            # in the connectionRef's connection string (the repo's existing
+            # sslmode/sslrootcert convention — see .env.example) instead of
+            # letting libpq silently fall back to its own permissive default.
+            for ssl_option in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
+                value = params.get(ssl_option)
+                if value:
+                    server_options.append(
+                        sql.SQL("{} {}").format(
+                            sql.Identifier(ssl_option), sql.Literal(str(value))
+                        )
+                    )
             if shippable:
                 server_options.append(
                     sql.SQL("extensions {}").format(
@@ -378,7 +415,8 @@ class FederationAliasStore:
             )
             cur.execute(
                 sql.SQL("""
-                    UPDATE {}._aliases SET provisioned_at = clock_timestamp()
+                    UPDATE {}._aliases
+                    SET provisioned_at = clock_timestamp(), status = 'active'
                     WHERE alias = %s
                 """).format(sql.Identifier(SCHEMA)),
                 (alias,),

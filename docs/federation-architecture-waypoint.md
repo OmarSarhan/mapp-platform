@@ -1809,13 +1809,16 @@ The next design pass must explicitly resolve, rather than silently assume:
 11. **Decided:** never — integration/derived relations only, from day one.
     See **Federation database layout > Foreign source schemas**.
 12. **Decided:** the reconciled alias pattern is the existing semantic
-    allowlist grammar, `[A-Za-z][A-Za-z0-9_-]{0,62}` — chosen because it
-    already respects the PostgreSQL 63-byte identifier limit that `source_`
-    plus the alias must fit inside. `config-ui/workspace_schema.py:21`
-    (`DB_KEY`) and `databaseKey` in `config-ui/schema/workspace.schema.json`
-    must be tightened to match; any existing alias outside the new pattern
-    needs an explicit migration note in the change that lands this, not a
-    silent validation break. The generated schema name is immutable once
+    allowlist grammar, `[A-Za-z][A-Za-z0-9_-]{0,55}` (max length 56, not the
+    original 63 this decision first specified — 63 was wrong arithmetic:
+    `source_` is 7 bytes, and 7 + 63 exceeds PostgreSQL's 63-byte identifier
+    limit, so a long-enough alias silently truncated and could collide with
+    another; corrected once real federation-alias provisioning surfaced it).
+    `config-ui/workspace_schema.py:21` (`DB_KEY`) and `databaseKey` in
+    `config-ui/schema/workspace.schema.json` must be tightened to match;
+    any existing alias outside the new pattern needs an explicit migration
+    note in the change that lands this, not a silent validation break. The
+    generated schema name is immutable once
     created — renaming an alias means retiring it and registering a new one,
     never an in-place `ALTER SCHEMA`, consistent with how a physical-identity
     change is already handled elsewhere on this page. Ownership belongs

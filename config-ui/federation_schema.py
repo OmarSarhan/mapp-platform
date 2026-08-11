@@ -28,7 +28,11 @@ from relation_identity import IDENTIFIER_PART_RE, parse_relation
 # — one alias grammar, not three (federation architecture waypoint, decision
 # #12). Duplicated rather than imported for the same reason
 # IDENTIFIER_PART_RE is: avoiding a dependency-chain import for one regex.
-ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
+# Max length 56, not PostgreSQL's usual 63: a federation alias becomes the
+# schema name `source_<alias>` (federation_store.py), and "source_" is 7
+# bytes — decision #12's original 63-char bound left no room for that
+# prefix and would silently truncate/collide for longer aliases.
+ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,55}$")
 
 ALIAS_KINDS = frozenset({"postgresql"})
 ALIAS_STATUSES = frozenset({"pending", "active", "unavailable", "retired"})

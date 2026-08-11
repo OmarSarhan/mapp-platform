@@ -115,10 +115,16 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertEqual(2, len(result))
         self.assertEqual("census_ext", result[1]["alias"])
 
-    def test_record_observation_marks_alias_active_when_reachable(self):
+    @patch("federation_store.extension_versions")
+    def test_record_observation_marks_alias_active_when_reachable(self, mock_versions):
+        # Status only ever reflects connectivity once the alias has passed
+        # Approve exposure (provision()) — this fixture is already
+        # provisioned, matching that.
+        mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            {"alias": "leeds_ext", "provisioned_at": None},
+            {"alias": "leeds_ext", "provisioned_at": "2026-08-11T00:00:00+00:00"},
+            {"srvoptions": None},
             alias_row(status="active"),
         ]
         store = self.store_with_cursor(cursor)
@@ -135,12 +141,15 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         self.assertEqual("active", result["status"])
         update = cursor.execute.call_args_list[0]
-        self.assertEqual("active", update.args[1][1])
+        self.assertEqual(True, update.args[1][1])
 
-    def test_record_observation_marks_alias_unavailable_when_not_reachable(self):
+    @patch("federation_store.extension_versions")
+    def test_record_observation_marks_alias_unavailable_when_not_reachable(self, mock_versions):
+        mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
-            {"alias": "leeds_ext", "provisioned_at": None},
+            {"alias": "leeds_ext", "provisioned_at": "2026-08-11T00:00:00+00:00"},
+            {"srvoptions": None},
             alias_row(status="unavailable"),
         ]
         store = self.store_with_cursor(cursor)
@@ -156,6 +165,32 @@ class FederationAliasStoreTests(unittest.TestCase):
         result = store.record_observation("leeds_ext", observation)
 
         self.assertEqual("unavailable", result["status"])
+
+    def test_record_observation_leaves_status_pending_before_provisioning(self):
+        # Discover (observe) is documented to run before Approve exposure
+        # (provision) in the ordinary lifecycle — a reachable, unprovisioned
+        # alias is evidence, not proof of usability, so status must not
+        # jump to "active" just because it's reachable.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="pending"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+        }
+
+        result = store.record_observation("leeds_ext", observation)
+
+        self.assertEqual("pending", result["status"])
+        update = cursor.execute.call_args_list[0]
+        self.assertIn("WHEN provisioned_at IS NULL THEN status", str(update.args[0]))
 
     def test_record_observation_raises_not_found_when_alias_missing(self):
         cursor = MagicMock()
@@ -250,6 +285,46 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(any("CREATE USER MAPPING" in s for s in statements))
         self.assertTrue(any("IMPORT FOREIGN SCHEMA" in s and "smoke_control_orders" in s for s in statements))
         self.assertTrue(any("GRANT SELECT ON ALL TABLES IN SCHEMA" in s and "mapp_xyz" in s for s in statements))
+        self.assertTrue(any("provisioned_at = clock_timestamp()" in s and "status = 'active'" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_provision_forwards_ssl_options_from_the_connection_string(self, mock_versions):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb"
+            "?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca.pem",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertIn("verify-full", create_server)
+        self.assertIn("/etc/ssl/certs/ca.pem", create_server)
+
+    @patch("federation_store.extension_versions")
+    def test_provision_omits_ssl_options_when_the_connection_string_has_none(self, mock_versions):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertNotIn("sslmode", create_server)
 
     @patch("federation_store.extension_versions")
     def test_provision_does_not_mark_postgis_shippable_without_a_confirming_observation(self, mock_versions):
@@ -337,7 +412,39 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertFalse(any("CREATE SERVER" in s for s in statements))
         self.assertFalse(any("CREATE USER MAPPING" in s for s in statements))
         self.assertFalse(any("IMPORT FOREIGN SCHEMA" in s for s in statements))
-        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+        # Reprovisioning still reconciles connection settings (see below)
+        # even when nothing changed — but must never touch the extensions
+        # option when it's already correct.
+        self.assertFalse(any("ADD extensions" in s or "DROP extensions" in s for s in statements))
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_reconciles_rotated_connection_settings(self, mock_versions):
+        # The only reprovisioning path is /provision called again — it must
+        # pick up a rotated password/host/database behind the same
+        # connectionRef, not just re-decide the extensions option.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext",
+            "postgresql://reader:rotated-secret@new-source-db:5433/sourcedb",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        alter_server = next(s for s in statements if "ALTER SERVER" in s and "SET host" in s)
+        self.assertIn("new-source-db", alter_server)
+        self.assertIn("5433", alter_server)
+        alter_mapping = next(s for s in statements if "ALTER USER MAPPING" in s)
+        self.assertIn("rotated-secret", alter_mapping)
 
     @patch("federation_store.extension_versions")
     def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions):

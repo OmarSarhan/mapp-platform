@@ -820,7 +820,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "alias": {
                     "type": "string",
-                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,55}$",
                 },
                 "schema": {
                     "type": "string",
@@ -1535,6 +1535,79 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "federation.aliases.list": {
+        "method": "GET",
+        "path": "/api/federation/aliases",
+        "risk": "inspect",
+        "scope": "federation:observe",
+    },
+    "federation.aliases.show": {
+        "method": "GET",
+        "pathTemplate": "/api/federation/aliases/{alias}",
+        "risk": "inspect",
+        "scope": "federation:observe",
+    },
+    "federation.aliases.register": {
+        "method": "POST",
+        "path": "/api/federation/aliases",
+        "risk": "federation-register",
+        "scope": "federation:register",
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "alias", "displayName", "kind", "connectionRef", "tlsPolicy",
+                "allowedRelations", "dataHandlingClassification",
+                "dataHandlingAcknowledged",
+            ],
+            "properties": {
+                "alias": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,55}$",
+                },
+                "displayName": {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                },
+                "kind": {"const": "postgresql"},
+                "connectionRef": {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                },
+                "tlsPolicy": {"enum": ["require", "verify-ca", "verify-full"]},
+                "allowedRelations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"},
+                },
+                "dataHandlingClassification": {
+                    "type": "string", "minLength": 1, "maxLength": 2000,
+                },
+                "dataHandlingAcknowledged": {"const": True},
+                "freshnessStrategy": {
+                    "enum": [
+                        "manual", "maximumAge", "timestampColumn",
+                        "versionRelation",
+                    ],
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "federation.aliases.observe": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/observe",
+        "risk": "federation-observe",
+        # Not federation:observe — Discover opens a live, credentialed
+        # outbound connection, so it requires the same scope as Approve
+        # exposure (see app.py's _required_scope).
+        "scope": "federation:provision",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    "federation.aliases.provision": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/provision",
+        "risk": "federation-provision",
+        "scope": "federation:provision",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
 }
 
 
@@ -1554,6 +1627,8 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "semantic:generate", "semantic:data",
                 "semantic:propose",
                 "semantic:apply", "semantic:admin",
+                "federation:register", "federation:provision",
+                "federation:observe",
             ],
             "defaultDeviceScopes": [
                 "inspect", "propose", "visual", "semantic:inspect",
@@ -1587,6 +1662,9 @@ def contract(instance_id: str) -> dict[str, Any]:
             "semantic proposals check", "semantic proposals create",
             "semantic proposals list", "semantic proposals show",
             "semantic proposals apply", "semantic proposals decline",
+            "federation aliases list", "federation aliases show",
+            "federation aliases register", "federation aliases observe",
+            "federation aliases provision",
             "validate", "set", "unset", "amend", "sql capabilities", "sql test",
             "visual-plan", "visual-test", "screenshot",
             "proposals preview-plan", "proposals preview-test",

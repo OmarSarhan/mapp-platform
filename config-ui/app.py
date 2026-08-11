@@ -5193,7 +5193,7 @@ class Handler(SimpleHTTPRequestHandler):
             # action is spelled "observe" here) — only alias creation itself
             # is a non-connecting intent record.
             if re.fullmatch(
-                r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_-]{0,62}/"
+                r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_-]{0,55}/"
                 r"(observe|provision)",
                 path,
             ):
@@ -7080,7 +7080,7 @@ class Handler(SimpleHTTPRequestHandler):
             request_path,
         )
         federation_alias_action_path = re.fullmatch(
-            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_-]{0,62})/"
+            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_-]{0,55})/"
             r"(observe|provision)",
             request_path,
         )

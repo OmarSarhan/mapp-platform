@@ -18,8 +18,10 @@ from psycopg.rows import dict_row
 DEFAULT_ALLOWLIST = "MAPP:leeds.*"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # Must match DB_KEY in workspace_schema.py and databaseKey in
-# schema/workspace.schema.json — one alias grammar, not three.
-ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
+# schema/workspace.schema.json — one alias grammar, not three. Max length
+# 56: see federation_schema.py's ALIAS_RE for why (the shared grammar must
+# leave room for the "source_" schema-name prefix federation adds).
+ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,55}$")
 SYSTEM_SCHEMAS = {"information_schema", "derived_layers"}
 SOURCE_NAMESPACE = uuid.UUID("b2228ad9-b2cb-5ed1-a906-901d8bb128bf")
 RELATION_KINDS = {
@@ -113,7 +115,7 @@ def parse_allowlist(value: str) -> tuple[SourcePattern, ...]:
     for raw in value.split(","):
         entry = raw.strip()
         match = re.fullmatch(
-            r"([A-Za-z][A-Za-z0-9_-]{0,62}):"
+            r"([A-Za-z][A-Za-z0-9_-]{0,55}):"
             r"([A-Za-z_][A-Za-z0-9_]{0,62})\."
             r"(\*|[A-Za-z_][A-Za-z0-9_]{0,62})",
             entry,

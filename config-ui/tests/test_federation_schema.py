@@ -47,6 +47,17 @@ class ValidateAliasTests(unittest.TestCase):
                 with self.assertRaises(FederationSchemaError):
                     validate_alias(invalid)
 
+    def test_max_length_leaves_room_for_the_source_schema_prefix(self):
+        # federation_store.py generates the schema name source_<alias> —
+        # PostgreSQL silently truncates identifiers over 63 bytes, so two
+        # long aliases sharing a truncated prefix would collide. The alias
+        # bound must leave exactly enough room for "source_" (7 bytes).
+        max_length_alias = "a" * 56
+        self.assertEqual(max_length_alias, validate_alias(max_length_alias))
+        self.assertLessEqual(len(f"source_{max_length_alias}"), 63)
+        with self.assertRaises(FederationSchemaError):
+            validate_alias("a" * 57)
+
 
 class ValidateRegistrationTests(unittest.TestCase):
     def test_accepts_a_well_formed_registration_and_normalizes_it(self):
