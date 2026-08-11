@@ -545,8 +545,10 @@ def _area_weighted_h3_query(
         cells_4326 AS MATERIALIZED (
           SELECT
             candidate.h3,
-            h3_cell_to_boundary_geometry(candidate.h3)
-              ::public.geometry(Polygon, 4326) AS geom_4326
+            public.ST_SetSRID(
+              public.ST_GeomFromEWKB(h3_cell_to_boundary_wkb(candidate.h3)),
+              4326
+            )::public.geometry(Polygon, 4326) AS geom_4326
           FROM candidate_ids AS candidate
         ),
         cells AS MATERIALIZED (

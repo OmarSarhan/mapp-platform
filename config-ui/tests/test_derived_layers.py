@@ -195,6 +195,18 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
             query,
         )
         self.assertEqual(1, query.lower().count("st_intersection("))
+        # h3_cell_to_boundary_geometry is a LANGUAGE SQL wrapper with an
+        # unqualified ::geometry cast and no SET search_path, so PostgreSQL's
+        # search_path lockdown for REFRESH MATERIALIZED VIEW makes it fail
+        # with "type \"geometry\" does not exist" the moment a materialized
+        # recipe is refreshed (views never hit this, since they run under the
+        # caller's own search_path). Build cell boundaries from the safe,
+        # schema-qualified C function plus ST_GeomFromEWKB instead.
+        self.assertNotIn("h3_cell_to_boundary_geometry", query)
+        self.assertIn(
+            "public.ST_GeomFromEWKB(h3_cell_to_boundary_wkb(candidate.h3))",
+            query,
+        )
         self.assertIn("pair_areas AS MATERIALIZED", query)
         self.assertIn("source_scope AS MATERIALIZED", query)
         self.assertIn("bounded_sources AS MATERIALIZED", query)

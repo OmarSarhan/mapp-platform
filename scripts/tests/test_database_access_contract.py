@@ -52,8 +52,20 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "public.h3_polygon_to_cells(public.geography,pg_catalog.int4)",
             "public.h3_polygon_to_cells_experimental(public.geometry,pg_catalog.int4,pg_catalog.text)",
             "public.h3_polygon_to_cells_experimental(public.geography,pg_catalog.int4,pg_catalog.text)",
+            "public.h3_lat_lng_to_cell(public.geometry,pg_catalog.int4)",
+            "public.h3_lat_lng_to_cell(public.geography,pg_catalog.int4)",
+            "public.h3_latlng_to_cell(public.geometry,pg_catalog.int4)",
+            "public.h3_latlng_to_cell(public.geography,pg_catalog.int4)",
+            "public.h3_cell_to_geometry(public.h3index)",
+            "public.h3_cell_to_geography(public.h3index)",
+            "public.h3_cell_to_boundary_geometry(public.h3index)",
+            "public.h3_cell_to_boundary_geography(public.h3index)",
+            "public.h3_cell_to_boundary_geometry(public.h3index,pg_catalog.bool)",
+            "public.h3_cell_to_boundary_geography(public.h3index,pg_catalog.bool)",
+            "public.h3_cells_to_multi_polygon_geometry(public.h3index[])",
+            "public.h3_cells_to_multi_polygon_geography(public.h3index[])",
             "ALTER FUNCTION %s SET search_path = pg_catalog, public",
-            "IF hardened_count <> 4 THEN",
+            "IF hardened_count <> 16 THEN",
         ):
             with self.subTest(path=relative_path, contract=contract):
                 self.assertIn(contract, source)
