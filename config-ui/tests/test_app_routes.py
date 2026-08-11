@@ -1108,6 +1108,73 @@ class LayersRouteTests(unittest.TestCase):
         )
 
 
+class LayerDependencyGuardSyncTests(unittest.TestCase):
+    def test_syncs_grouped_relations_per_alias(self):
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect = MagicMock()
+        connect.return_value.__enter__.return_value = connection
+
+        with (
+            patch.object(
+                app,
+                "platform_dependencies",
+                return_value=[
+                    {"alias": "MAPP", "relation": "leeds.roads"},
+                    {"alias": "MAPP", "relation": "leeds.bus_stops"},
+                ],
+            ),
+            patch.object(app, "DB_CONNECTIONS", {"MAPP": "postgresql://reader"}),
+            patch.object(app.psycopg, "connect", connect),
+        ):
+            app.sync_layer_dependency_guard({})
+
+        connect.assert_called_once_with(
+            "postgresql://reader", connect_timeout=5
+        )
+        args = cursor.execute.call_args.args
+        self.assertIn("mapp_sync_platform_layer_dependencies", args[0])
+        self.assertEqual(
+            ["MAPP", '["leeds.bus_stops", "leeds.roads"]'],
+            args[1],
+        )
+
+    def test_skips_an_alias_with_no_configured_connection(self):
+        connect = MagicMock()
+
+        with (
+            patch.object(
+                app,
+                "platform_dependencies",
+                return_value=[{"alias": "UNCONFIGURED", "relation": "leeds.roads"}],
+            ),
+            patch.object(app, "DB_CONNECTIONS", {}),
+            patch.object(app.psycopg, "connect", connect),
+        ):
+            app.sync_layer_dependency_guard({})
+
+        connect.assert_not_called()
+
+    def test_a_sync_failure_is_logged_and_does_not_raise(self):
+        with (
+            patch.object(
+                app,
+                "platform_dependencies",
+                return_value=[{"alias": "MAPP", "relation": "leeds.roads"}],
+            ),
+            patch.object(app, "DB_CONNECTIONS", {"MAPP": "postgresql://reader"}),
+            patch.object(
+                app.psycopg, "connect", side_effect=RuntimeError("unreachable")
+            ),
+            self.assertLogs(app.LOGGER, level="ERROR") as logs,
+        ):
+            app.sync_layer_dependency_guard({})  # must not raise
+
+        self.assertIn("MAPP", logs.output[0])
+        self.assertIn("guard sync failed", logs.output[0])
+
+
 class DependencyRouteTests(unittest.TestCase):
     @staticmethod
     def handler(
