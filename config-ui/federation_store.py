@@ -401,28 +401,6 @@ class FederationAliasStore:
         user = str(params.get("user", ""))
         return f"{user}@{host}:{port}/{dbname}"
 
-    def _last_observed_identities(self, alias: str) -> dict[str, str | None]:
-        """The connection identity and physical identity recorded by the
-        last Observe — internal-only, deliberately never exposed through
-        get()/_SELECT_COLUMNS (unlike the rest of the alias record, these
-        are live infrastructure fingerprints, not review-relevant state)."""
-        with self._connect() as connection, connection.cursor() as cur:
-            cur.execute(
-                sql.SQL("""
-                    SELECT last_observed_connection_identity, physical_identity
-                    FROM {}._aliases
-                    WHERE alias = %s
-                """).format(sql.Identifier(SCHEMA)),
-                (alias,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return {
-                    "last_observed_connection_identity": None,
-                    "physical_identity": None,
-                }
-            return dict(row)
-
     def provision(
         self,
         alias: str,
@@ -443,96 +421,121 @@ class FederationAliasStore:
         activation as the docs/federation-architecture-waypoint.md source-
         alias contract's approvedBy/approvedAt consent record."""
         alias = validate_alias(alias)
-        record = self.get(alias)
-        already_provisioned = record["provisionedAt"] is not None
-        last_observation = record.get("lastObservation") or {}
-        # Every MAPP caller queries a federated source through the same
-        # mapped remote user (there is only one connectionRef per alias),
-        # so any row-level security the source enforces per connecting
-        # user is bypassed entirely once federated — the mapped role's
-        # full row set becomes visible to every runtime caller. The
-        # generic dataHandlingAcknowledged at registration cannot cover
-        # this: RLS is only discovered later, by Observe.
-        if last_observation.get("rowLevelSecurityDetected") and not (
-            acknowledge_row_level_security
-        ):
-            raise FederationSchemaError(
-                f"Alias {alias!r}'s source has row-level security that "
-                "would be bypassed once federated — acknowledge this "
-                "explicitly to provision.",
-                code="federation.row_level_security_not_acknowledged",
-            )
-        # Applies to reprovisioning too, not just the first call: the
-        # reprovision branch below never re-verifies or re-imports the
-        # foreign tables, so without this, /provision on an alias whose
-        # latest observation reports "changed" would still reconcile
-        # connection settings and report success — silently implying
-        # the schema drift it never actually addressed was fine.
-        if last_observation.get("schema") != "current":
-            raise FederationSchemaError(
-                f"Alias {alias!r} has not been observed as current — "
-                "observe it again immediately before provisioning.",
-                code="federation.observation_not_current",
-            )
-        # A "current" schema above only proves *some* past Observe call
-        # was current — not that it was taken against the endpoint and
-        # remote role this call is about to provision. If connectionRef's
-        # DBS_<NAME> was rotated to a different host/database, or to a
-        # different remote login role on the same host/database, since
-        # that Observe (e.g. the service restarted with a new value), this
-        # call would otherwise activate identically-named relations, or a
-        # different row set, that were never observed or reviewed under
-        # the role about to be wired up.
-        connection_identity = self._connection_identity(connection_url)
-        last_observed = self._last_observed_identities(alias)
-        if last_observed["last_observed_connection_identity"] != connection_identity:
-            raise FederationSchemaError(
-                f"Alias {alias!r}'s connectionRef now resolves to a "
-                "different endpoint or remote role than its last "
-                "observation was taken against — observe it again before "
-                "provisioning.",
-                code="federation.observation_not_current",
-            )
-        # The registered tlsPolicy is an attestation the operator made at
-        # registration time — without this, nothing ever checked that the
-        # connectionRef this alias actually resolves to delivers it, so a
-        # registered "verify-full" alias could be provisioned over
-        # plaintext without ever being flagged.
-        enforce_tls_policy(record["tlsPolicy"], connection_url)
-        # connection_identity alone can't catch a database dropped,
-        # restored, or replaced in place — that keeps the exact same
-        # host/port/dbname/user (docs/federation-architecture-waypoint.md,
-        # "Drift and retirement": "Different physical database | Raise
-        # identity conflict; require explicit rebind"). Re-fetch the
-        # remote's live physical identity now and compare against what
-        # Observe last recorded.
-        try:
-            current_physical_identity = physical_identity(connection_url)
-        except psycopg.Error as exc:
-            raise FederationSchemaError(
-                f"Alias {alias!r}'s source could not be reached to verify "
-                "its physical identity before provisioning — observe it "
-                "again.",
-                code="federation.observation_not_current",
-            ) from exc
-        if last_observed["physical_identity"] != current_physical_identity:
-            raise FederationSchemaError(
-                f"Alias {alias!r}'s source's physical database identity "
-                "no longer matches its last observation — it may have "
-                "been dropped, restored, or replaced. Observe it again "
-                "and review before provisioning.",
-                code="federation.observation_not_current",
-            )
-        params = psycopg.conninfo.conninfo_to_dict(connection_url)
-        host = str(params.get("host", ""))
-        port = str(params.get("port", "5432"))
-        dbname = str(params.get("dbname", ""))
-        user = str(params.get("user", ""))
-        password = str(params.get("password", ""))
-        server_name = f"{alias}_srv"
-        schema_name = f"source_{alias}"
-
         with self._connect() as connection, connection.cursor() as cur:
+            # Locks the row for the remainder of this call — a concurrent
+            # Observe attempting to record a newer observation on this
+            # same alias blocks until this transaction commits or rolls
+            # back. Without this, a concurrent Observe could commit a
+            # worse observation (schema "changed", or a version drift
+            # that should disable pushdown) after this reads the old
+            # evidence but before the FDW changes below commit, letting
+            # Provision report success — or even re-enable pushdown —
+            # against evidence Observe had already superseded.
+            cur.execute(
+                sql.SQL("""
+                    SELECT {}, last_observed_connection_identity,
+                           physical_identity
+                    FROM {}._aliases
+                    WHERE alias = %s
+                    FOR UPDATE
+                """).format(self._SELECT_COLUMNS, sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise FileNotFoundError(alias)
+            record = dict(row)
+            last_observed_connection_identity = record.pop(
+                "last_observed_connection_identity"
+            )
+            last_observed_physical_identity = record.pop("physical_identity")
+            already_provisioned = record["provisionedAt"] is not None
+            last_observation = record.get("lastObservation") or {}
+            # Every MAPP caller queries a federated source through the same
+            # mapped remote user (there is only one connectionRef per alias),
+            # so any row-level security the source enforces per connecting
+            # user is bypassed entirely once federated — the mapped role's
+            # full row set becomes visible to every runtime caller. The
+            # generic dataHandlingAcknowledged at registration cannot cover
+            # this: RLS is only discovered later, by Observe.
+            if last_observation.get("rowLevelSecurityDetected") and not (
+                acknowledge_row_level_security
+            ):
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source has row-level security that "
+                    "would be bypassed once federated — acknowledge this "
+                    "explicitly to provision.",
+                    code="federation.row_level_security_not_acknowledged",
+                )
+            # Applies to reprovisioning too, not just the first call: the
+            # reprovision branch below never re-verifies or re-imports the
+            # foreign tables, so without this, /provision on an alias whose
+            # latest observation reports "changed" would still reconcile
+            # connection settings and report success — silently implying
+            # the schema drift it never actually addressed was fine.
+            if last_observation.get("schema") != "current":
+                raise FederationSchemaError(
+                    f"Alias {alias!r} has not been observed as current — "
+                    "observe it again immediately before provisioning.",
+                    code="federation.observation_not_current",
+                )
+            # A "current" schema above only proves *some* past Observe call
+            # was current — not that it was taken against the endpoint and
+            # remote role this call is about to provision. If connectionRef's
+            # DBS_<NAME> was rotated to a different host/database, or to a
+            # different remote login role on the same host/database, since
+            # that Observe (e.g. the service restarted with a new value), this
+            # call would otherwise activate identically-named relations, or a
+            # different row set, that were never observed or reviewed under
+            # the role about to be wired up.
+            connection_identity = self._connection_identity(connection_url)
+            if last_observed_connection_identity != connection_identity:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s connectionRef now resolves to a "
+                    "different endpoint or remote role than its last "
+                    "observation was taken against — observe it again before "
+                    "provisioning.",
+                    code="federation.observation_not_current",
+                )
+            # The registered tlsPolicy is an attestation the operator made at
+            # registration time — without this, nothing ever checked that the
+            # connectionRef this alias actually resolves to delivers it, so a
+            # registered "verify-full" alias could be provisioned over
+            # plaintext without ever being flagged.
+            enforce_tls_policy(record["tlsPolicy"], connection_url)
+            # connection_identity alone can't catch a database dropped,
+            # restored, or replaced in place — that keeps the exact same
+            # host/port/dbname/user (docs/federation-architecture-waypoint.md,
+            # "Drift and retirement": "Different physical database | Raise
+            # identity conflict; require explicit rebind"). Re-fetch the
+            # remote's live physical identity now and compare against what
+            # Observe last recorded.
+            try:
+                current_physical_identity = physical_identity(connection_url)
+            except psycopg.Error as exc:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source could not be reached to verify "
+                    "its physical identity before provisioning — observe it "
+                    "again.",
+                    code="federation.observation_not_current",
+                ) from exc
+            if last_observed_physical_identity != current_physical_identity:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source's physical database identity "
+                    "no longer matches its last observation — it may have "
+                    "been dropped, restored, or replaced. Observe it again "
+                    "and review before provisioning.",
+                    code="federation.observation_not_current",
+                )
+            params = psycopg.conninfo.conninfo_to_dict(connection_url)
+            host = str(params.get("host", ""))
+            port = str(params.get("port", "5432"))
+            dbname = str(params.get("dbname", ""))
+            user = str(params.get("user", ""))
+            password = str(params.get("password", ""))
+            server_name = f"{alias}_srv"
+            schema_name = f"source_{alias}"
+
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
 
             # postgres_fdw only ships operators/functions to the remote
@@ -758,6 +761,18 @@ class FederationAliasStore:
         foreign schema (`source_<alias>`) — the impact-visibility query."""
         alias = validate_alias(alias)
         with self._connect() as connection, connection.cursor() as cur:
+            # derived_layers._definitions is created lazily by
+            # DerivedLayerStore._initialize() on first use, not by
+            # database init — a fresh deployment that registered a
+            # federation alias but never called a derived-layer endpoint
+            # has the `derived_layers` schema (init script) but not yet
+            # this table. An absent table has no rows to depend on any
+            # alias, so it's an empty dependency set, not an error.
+            cur.execute(
+                "SELECT to_regclass('derived_layers._definitions') AS oid"
+            )
+            if cur.fetchone()["oid"] is None:
+                return []
             cur.execute(
                 sql.SQL("""
                     SELECT name FROM {}._definitions
