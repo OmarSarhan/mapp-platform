@@ -1,10 +1,10 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import psycopg
 
-from federation_capability import detect_capability, physical_identity
+from federation_capability import detect_capability, verify_remote_state
 from federation_schema import FederationSchemaError
 
 
@@ -47,7 +47,16 @@ class ScriptedFakeConnection:
         return self._cursor
 
 
-def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
+# The mocked reply to detect_capability's first query inside the
+# transaction (SELECT clock_timestamp()) — the moment its REPEATABLE READ
+# snapshot is actually fixed, per federation_capability.detect_capability's
+# docstring.
+CLOCK_TIMESTAMP_RESULT = {
+    "observed_at": datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+}
+
+
+def extension_version_results(*, postgis=True):
     results = [{"version": "16.2"}]
     if postgis:
         results.append({"exists": 1})
@@ -56,6 +65,11 @@ def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
         results.append({"version": "3.12.1"})
     else:
         results.append(None)
+    return results
+
+
+def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
+    results = extension_version_results(postgis=postgis)
     results.extend({"bypasses_per_user_access": rls} for _ in range(relation_count))
     return results
 
@@ -74,7 +88,9 @@ def physical_identity_results(relation_oids=(24601,)):
 class DetectCapabilityTests(unittest.TestCase):
     def test_reports_reachable_with_full_extension_versions(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results() + physical_identity_results()
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results()
+            + physical_identity_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
@@ -86,10 +102,12 @@ class DetectCapabilityTests(unittest.TestCase):
                 tls_policy="require",
             )
 
-        # Captured once the connection succeeds, fixing this probe's
-        # REPEATABLE READ snapshot — not before the connection attempt,
-        # which record_observation()'s race protection depends on.
-        self.assertIsInstance(observed_at, datetime)
+        # The server's own clock, queried as the first statement inside
+        # the transaction — the exact moment the REPEATABLE READ snapshot
+        # is fixed, not a client-side timestamp taken any earlier (which
+        # would leave a scheduling gap between connecting and this query
+        # actually reaching the server).
+        self.assertEqual(CLOCK_TIMESTAMP_RESULT["observed_at"], observed_at)
         self.assertEqual("reachable", observation["connectivity"])
         self.assertEqual("current", observation["schema"])
         self.assertEqual("unknown", observation["sourceFreshness"])
@@ -116,7 +134,9 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_reports_no_postgis_without_probing_proj_or_geos(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(postgis=False) + physical_identity_results()
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(postgis=False)
+            + physical_identity_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
@@ -138,6 +158,7 @@ class DetectCapabilityTests(unittest.TestCase):
         # SELECT) must not be silently skipped — the schema Discover
         # verified no longer matches what was registered.
         cursor = ScriptedFakeCursor([
+            CLOCK_TIMESTAMP_RESULT,
             {"version": "16.2"},
             {"exists": 1},
             {"version": "3.4.2"},
@@ -165,7 +186,9 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(rls=True) + physical_identity_results()
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(rls=True)
+            + physical_identity_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
@@ -185,7 +208,9 @@ class DetectCapabilityTests(unittest.TestCase):
         # implement per-user row filtering without native RLS) as to
         # relrowsecurity — the query combines both signals.
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(rls=True) + physical_identity_results()
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(rls=True)
+            + physical_identity_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
@@ -224,7 +249,9 @@ class DetectCapabilityTests(unittest.TestCase):
             observation,
         )
         # Even a failed probe gets an ordering marker — captured at the
-        # moment the connection was given up as failed.
+        # moment the connection was given up as failed. No server-side
+        # clock is reachable here, so this is the one case where a
+        # client-side timestamp is unavoidable.
         self.assertIsInstance(observed_at, datetime)
         self.assertIsNone(physical_id)
 
@@ -275,7 +302,8 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_reads_a_configured_version_relation_scalar(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(relation_count=2)
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(relation_count=2)
             + physical_identity_results(relation_oids=(24601, 24602)),
             fetchall_results=[[{"release_id": "release-42"}]],
         )
@@ -303,7 +331,7 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_rejects_a_version_relation_returning_more_than_one_row(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(relation_count=2),
+            [CLOCK_TIMESTAMP_RESULT] + extension_and_rls_results(relation_count=2),
             fetchall_results=[[{"release_id": "a"}, {"release_id": "b"}]],
         )
         with patch(
@@ -323,7 +351,7 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_rejects_a_version_relation_returning_more_than_one_column(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(relation_count=2),
+            [CLOCK_TIMESTAMP_RESULT] + extension_and_rls_results(relation_count=2),
             fetchall_results=[[{"release_id": "a", "schema_version": 1}]],
         )
         with patch(
@@ -342,18 +370,32 @@ class DetectCapabilityTests(unittest.TestCase):
                 )
 
 
-class PhysicalIdentityTests(unittest.TestCase):
+class VerifyRemoteStateTests(unittest.TestCase):
+    """Provision's own live re-check — physical identity and extension
+    versions, gathered from the one connection this opens."""
+
     def test_combines_the_cluster_database_and_relation_identity(self):
-        cursor = ScriptedFakeCursor(physical_identity_results())
+        cursor = ScriptedFakeCursor(
+            physical_identity_results() + extension_version_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity(
+            identity, versions = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
         self.assertEqual("7672778953115078690/16384/24601", identity)
+        self.assertEqual(
+            {
+                "postgresql": "16.2",
+                "postgis": "3.4.2",
+                "proj": "9.3.1",
+                "geos": "3.12.1",
+            },
+            versions,
+        )
 
     def test_differs_when_the_database_was_dropped_and_recreated(self):
         # Same cluster (system_identifier unchanged), different database
@@ -362,12 +404,12 @@ class PhysicalIdentityTests(unittest.TestCase):
             {"system_identifier": 7672778953115078690},
             {"oid": 99999},
             {"oid": 24601},
-        ])
+        ] + extension_version_results())
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity(
+            identity, _ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -379,12 +421,15 @@ class PhysicalIdentityTests(unittest.TestCase):
         # neither. Any restore recreating the relation itself (as
         # pg_restore --clean does) gives it a new oid, which this must
         # catch even when nothing at the database level changed.
-        cursor = ScriptedFakeCursor(physical_identity_results(relation_oids=(99999,)))
+        cursor = ScriptedFakeCursor(
+            physical_identity_results(relation_oids=(99999,))
+            + extension_version_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity(
+            identity, _ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -394,12 +439,15 @@ class PhysicalIdentityTests(unittest.TestCase):
         # A relation that's gone entirely must not be silently skipped —
         # fail closed the same direction _verify_allowed_relations already
         # does for a missing/unselectable relation.
-        cursor = ScriptedFakeCursor(physical_identity_results(relation_oids=(None,)))
+        cursor = ScriptedFakeCursor(
+            physical_identity_results(relation_oids=(None,))
+            + extension_version_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity(
+            identity, _ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -408,12 +456,13 @@ class PhysicalIdentityTests(unittest.TestCase):
     def test_orders_multiple_relations_by_the_given_sequence(self):
         cursor = ScriptedFakeCursor(
             physical_identity_results(relation_oids=(111, 222))
+            + extension_version_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity(
+            identity, _ = verify_remote_state(
                 "postgresql://reader",
                 ("leeds.bus_stops", "leeds.roads"),
             )
@@ -426,7 +475,7 @@ class PhysicalIdentityTests(unittest.TestCase):
             side_effect=psycopg.OperationalError("could not connect"),
         ):
             with self.assertRaises(psycopg.Error):
-                physical_identity("postgresql://unreachable", ())
+                verify_remote_state("postgresql://unreachable", ())
 
 
 if __name__ == "__main__":

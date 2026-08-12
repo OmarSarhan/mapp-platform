@@ -245,12 +245,12 @@ def detect_capability(
 
     Returns (observation, observed_at, physical_identity) — observation is
     already validated against `federation_schema.validate_observation()`'s
-    closed contract. observed_at is captured *after* the connection attempt
-    resolves (either once it succeeds, fixing this probe's REPEATABLE READ
-    snapshot, or once it's given up as failed), never before attempting it
-    — a connection that stalls must not make this probe look "older" than a
-    concurrent one that started later but connected faster and is now
-    looking at data this probe will supersede once it finally connects.
+    closed contract. observed_at marks the moment this probe's REPEATABLE
+    READ snapshot was actually fixed (or, on failure, the moment the
+    connection was given up as failed) — a connection that stalls, or a
+    probe descheduled between connecting and its first query, must not
+    make this probe look "older" than a concurrent one that started later
+    but whose snapshot was established first.
     FederationAliasStore.record_observation()'s ordering depends on this:
     it compares observed_at, not call order, to decide which of two
     overlapping Observe calls actually saw the more current state.
@@ -270,9 +270,21 @@ def detect_capability(
             connect_timeout=CONNECT_TIMEOUT_SECONDS,
             row_factory=dict_row,
         ) as connection:
-            observed_at = datetime.now(timezone.utc)
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
+                # REPEATABLE READ fixes its snapshot at the first query
+                # that actually reads data, not at BEGIN and not at
+                # connect() — a client-side datetime.now() taken any
+                # earlier, even right after connect() succeeds, leaves a
+                # scheduling gap (this process descheduled before its
+                # first statement reaches the server) that a concurrent,
+                # faster-scheduled Observe could establish a later
+                # snapshot inside of. Asking the server for its own clock
+                # as literally the first query closes that gap: the
+                # returned value marks the same instant the snapshot was
+                # established, not merely "sometime before it."
+                cursor.execute("SELECT clock_timestamp() AS observed_at")
+                observed_at = cursor.fetchone()["observed_at"]
                 versions = extension_versions(cursor)
                 relations_verified, rls_detected = _verify_allowed_relations(
                     cursor, allowed_relations
@@ -321,18 +333,29 @@ def detect_capability(
     }), observed_at, physical_id
 
 
-def physical_identity(
+def verify_remote_state(
     connection_url: str, allowed_relations: tuple[str, ...]
-) -> str:
-    """Provision's own standalone re-check of `_physical_identity_from_cursor`
-    — deliberately a fresh connection, not shared with any prior Observe,
-    since the whole point is to catch drift that happened *since* Observe's
-    snapshot (docs/federation-architecture-waypoint.md, "Drift and
-    retirement": "Different physical database | Raise identity conflict;
-    require explicit rebind"). A connectionRef's host/port/dbname/user can
-    stay byte-for-byte identical while pointing at a genuinely different
+) -> tuple[str, dict[str, str]]:
+    """Provision's own standalone, live re-check of the remote's physical
+    identity *and* its current extension versions — deliberately a fresh
+    connection, not shared with any prior Observe, since the whole point is
+    to catch drift that happened *since* Observe's snapshot
+    (docs/federation-architecture-waypoint.md, "Drift and retirement":
+    "Different physical database | Raise identity conflict; require
+    explicit rebind"). A connectionRef's host/port/dbname/user can stay
+    byte-for-byte identical while pointing at a genuinely different
     physical database — nothing about the connection string itself would
     ever reveal a same-name replacement.
+
+    Both pieces of evidence are collected from this one connection's
+    snapshot for the same reason `_physical_identity_from_cursor` gives for
+    not being a second connection off of Observe's: an in-place extension
+    upgrade on the remote changes no OID at all, so identity alone can't
+    catch it, and a pushdown-safety decision (federation_store.py's
+    `_shippable_extensions`) made against a version read from a *separate*
+    live connection could itself be stale by the time the identity check
+    (or vice versa) runs — the same class of TOCTOU gap as pairing
+    Observe's schema evidence with a second connection's physical identity.
 
     Raises psycopg.Error on a connection failure — callers already
     reachability-gate this (Observe via detect_capability, Provision via
@@ -345,4 +368,6 @@ def physical_identity(
     ) as connection:
         with connection.cursor() as cursor:
             PostgresSemanticSources._begin_read_only(cursor)
-            return _physical_identity_from_cursor(cursor, allowed_relations)
+            identity = _physical_identity_from_cursor(cursor, allowed_relations)
+            versions = extension_versions(cursor)
+    return identity, versions

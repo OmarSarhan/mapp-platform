@@ -30,7 +30,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from federation_capability import extension_versions, physical_identity
+from federation_capability import extension_versions, verify_remote_state
 from federation_schema import (
     FederationSchemaError,
     enforce_tls_policy,
@@ -260,20 +260,21 @@ class FederationAliasStore:
         observed_at: datetime,
     ) -> dict[str, Any]:
         """Persist an already-validated observation (see
-        federation_capability.detect_capability). `physical_identity` is
-        the remote's live database identity (see
-        federation_capability.physical_identity) — None when connectivity
-        wasn't "reachable", since it can't be fetched from a source that
-        couldn't be reached. `observed_at` is when *this* Observe started
-        its remote probe (captured by the caller before that probe, not
-        when this call happens to reach the database) — two overlapping
-        Observe calls for the same alias can finish and try to write in
-        either order; without comparing this, whichever write simply
-        *commits* last would win even if its own probe was the older,
-        now-superseded one. The WHERE clause below makes a stale write a
-        no-op instead: Postgres serializes concurrent UPDATEs to the same
-        row, and each one re-checks this condition against whatever the
-        other just committed."""
+        federation_capability.detect_capability, which computes both
+        `observation` and `physical_identity` from the same connection's
+        snapshot) — `physical_identity` is None when connectivity wasn't
+        "reachable", since it can't be fetched from a source that couldn't
+        be reached. `observed_at` marks the moment *this* Observe's
+        REPEATABLE READ snapshot was actually fixed (captured by the caller
+        as the first query inside that snapshot, not when this call
+        happens to reach the database) — two overlapping Observe calls for
+        the same alias can finish and try to write in either order; without
+        comparing this, whichever write simply *commits* last would win
+        even if its own probe's snapshot was the older, now-superseded one.
+        The WHERE clause below makes a stale write a no-op instead:
+        Postgres serializes concurrent UPDATEs to the same row, and each
+        one re-checks this condition against whatever the other just
+        committed."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
@@ -606,10 +607,16 @@ class FederationAliasStore:
             # "Drift and retirement": "Different physical database | Raise
             # identity conflict; require explicit rebind"). Re-fetch the
             # remote's live physical identity now and compare against what
-            # Observe last recorded.
+            # Observe last recorded. Its live extension versions are
+            # collected from this same connection too — see
+            # federation_capability.verify_remote_state's docstring for why
+            # the pushdown-safety decision below must not use a version
+            # read from a second, separate connection.
             try:
-                current_physical_identity = physical_identity(
-                    connection_url, tuple(record["allowedRelations"])
+                current_physical_identity, live_remote_versions = (
+                    verify_remote_state(
+                        connection_url, tuple(record["allowedRelations"])
+                    )
                 )
             except psycopg.Error as exc:
                 raise FederationSchemaError(
@@ -642,18 +649,23 @@ class FederationAliasStore:
             # isn't in its built-in list, so spatial predicates would
             # otherwise pull the whole remote relation and filter locally.
             # Only mark it shippable when the federation database's own
-            # PostGIS/PROJ/GEOS versions exactly match this alias's last
-            # observed remote versions (see _shippable_extensions above) —
-            # an unconditional claim would risk a silently wrong pushed-
-            # down result, not just a remote execution error. This is a
-            # same-owner, non-superuser server option; it does not
-            # duplicate any data, it only widens what may cross the wire
-            # as a pushed-down predicate instead of a full relation.
+            # PostGIS/PROJ/GEOS versions exactly match the remote's *live*
+            # versions, just re-verified above — an in-place extension
+            # upgrade on the remote changes no OID at all, so the physical-
+            # identity check above can't catch a version drift since
+            # Observe, and comparing against Observe's stored
+            # lastObservation.extensionVersions instead of this live value
+            # would risk enabling pushdown against a version the remote no
+            # longer actually has. An unconditional claim would risk a
+            # silently wrong pushed-down result, not just a remote
+            # execution error. This is a same-owner, non-superuser server
+            # option; it does not duplicate any data, it only widens what
+            # may cross the wire as a pushed-down predicate instead of a
+            # full relation.
             local_versions = extension_versions(cur)
-            remote_versions = (
-                record.get("lastObservation") or {}
-            ).get("extensionVersions") or {}
-            shippable = self._shippable_extensions(local_versions, remote_versions)
+            shippable = self._shippable_extensions(
+                local_versions, live_remote_versions
+            )
 
             if already_provisioned:
                 # A reprovisioning call is also the only place a rotated

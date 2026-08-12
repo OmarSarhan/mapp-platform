@@ -7454,16 +7454,20 @@ class Handler(SimpleHTTPRequestHandler):
                             + ", ".join(sorted(payload)),
                             code="federation.invalid_request",
                         )
-                    # detect_capability's own observed_at (captured only
-                    # once its connection attempt resolves, not before) is
-                    # the ordering key two overlapping Observe calls for
-                    # the same alias are serialized by
-                    # (FederationAliasStore.record_observation) — a
-                    # timestamp captured here, before the remote probe,
+                    # detect_capability's own observed_at (the server's own
+                    # clock, queried as the first statement inside the
+                    # probe's REPEATABLE READ transaction — the exact
+                    # moment its snapshot is fixed, not merely "sometime
+                    # after this process connected") is the ordering key
+                    # two overlapping Observe calls for the same alias are
+                    # serialized by (FederationAliasStore.record_observation)
+                    # — a timestamp captured here, before the remote probe,
                     # would instead reflect whichever request merely
-                    # *started* first, which a stalled connection can
-                    # decouple entirely from which one actually saw the
-                    # more current state. Its physical identity is likewise
+                    # *started* first, which a stalled connection (or even
+                    # just being descheduled between connecting and its
+                    # first query) can decouple entirely from which one
+                    # actually saw the more current state. Its physical
+                    # identity is likewise
                     # computed from that same connection's snapshot (None
                     # when unreachable) — a second, separate connection here
                     # could observe a relation the remote dropped and
