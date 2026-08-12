@@ -17,6 +17,25 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class FederationEnabledTests(unittest.TestCase):
+    def test_requires_both_a_connection_url_and_bundled_mode(self):
+        self.assertTrue(app.federation_enabled("postgresql://x", "bundled"))
+
+    def test_disabled_without_a_derived_database_url(self):
+        self.assertFalse(app.federation_enabled(None, "bundled"))
+        self.assertFalse(app.federation_enabled("", "bundled"))
+
+    def test_disabled_outside_bundled_mode(self):
+        # The external handoff (docs/external-postgresql.md) grants
+        # ownership of derived_layers alone — not the federation schema,
+        # postgres_fdw, or the database-level CREATE that provisioning
+        # needs, so an external deployment must never see federation
+        # routes enabled even if it happens to set DERIVED_DATABASE_URL.
+        self.assertFalse(app.federation_enabled("postgresql://x", "external"))
+        self.assertFalse(app.federation_enabled("postgresql://x", None))
+        self.assertFalse(app.federation_enabled("postgresql://x", ""))
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")

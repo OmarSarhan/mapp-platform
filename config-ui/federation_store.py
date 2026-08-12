@@ -29,9 +29,10 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from federation_capability import extension_versions
+from federation_capability import extension_versions, physical_identity
 from federation_schema import (
     FederationSchemaError,
+    enforce_tls_policy,
     validate_alias,
     validate_registration,
 )
@@ -105,12 +106,37 @@ class FederationAliasStore:
               registered_at timestamptz NOT NULL DEFAULT clock_timestamp(),
               last_observation jsonb,
               last_observed_connection_identity text,
-              provisioned_at timestamptz
+              tls_policy text NOT NULL DEFAULT 'require'
+                CHECK (tls_policy IN ('require', 'verify-ca', 'verify-full')),
+              provisioned_at timestamptz,
+              approved_by text,
+              approved_at timestamptz,
+              physical_identity text
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "last_observed_connection_identity text"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS approved_by text"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "approved_at timestamptz"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "physical_identity text"
+        ).format(sql.Identifier(SCHEMA)))
+        # DEFAULT backfills any alias registered before tlsPolicy was
+        # persisted with the weakest of the three valid policies — the
+        # conservative choice: it neither claims a stronger guarantee than
+        # was ever actually reviewed, nor breaks a currently-working
+        # connectionRef that only ever supplied sslmode=require.
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "tls_policy text NOT NULL DEFAULT 'require'"
         ).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._aliases FROM PUBLIC"
@@ -125,7 +151,10 @@ class FederationAliasStore:
         registered_by AS "registeredBy",
         registered_at AS "registeredAt",
         last_observation AS "lastObservation",
-        provisioned_at AS "provisionedAt"
+        tls_policy AS "tlsPolicy",
+        provisioned_at AS "provisionedAt",
+        approved_by AS "approvedBy",
+        approved_at AS "approvedAt"
     """)
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -144,8 +173,9 @@ class FederationAliasStore:
                     INSERT INTO {}._aliases
                       (alias, display_name, kind, connection_ref,
                        allowed_relations, status, freshness_strategy,
-                       data_handling_classification, registered_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       data_handling_classification, registered_by,
+                       tls_policy)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """).format(sql.Identifier(SCHEMA)),
                 (
                     record["alias"],
@@ -157,6 +187,7 @@ class FederationAliasStore:
                     record["freshnessStrategy"],
                     record["dataHandlingClassification"],
                     actor,
+                    record["tlsPolicy"],
                 ),
             )
         return self.get(record["alias"])
@@ -185,9 +216,18 @@ class FederationAliasStore:
             return list(cur.fetchall())
 
     def record_observation(
-        self, alias: str, observation: dict[str, Any], connection_url: str
+        self,
+        alias: str,
+        observation: dict[str, Any],
+        connection_url: str,
+        physical_identity: str | None,
     ) -> dict[str, Any]:
-        """Persist an already-validated observation (see federation_capability.detect_capability)."""
+        """Persist an already-validated observation (see
+        federation_capability.detect_capability). `physical_identity` is
+        the remote's live database identity (see
+        federation_capability.physical_identity) — None when connectivity
+        wasn't "reachable", since it can't be fetched from a source that
+        couldn't be reached."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
@@ -197,6 +237,7 @@ class FederationAliasStore:
                     UPDATE {}._aliases
                     SET last_observation = %s,
                         last_observed_connection_identity = %s,
+                        physical_identity = %s,
                         status = CASE
                           WHEN provisioned_at IS NULL THEN status
                           WHEN %s THEN 'active'
@@ -205,7 +246,13 @@ class FederationAliasStore:
                     WHERE alias = %s
                     RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
-                (Jsonb(observation), connection_identity, reachable, alias),
+                (
+                    Jsonb(observation),
+                    connection_identity,
+                    physical_identity,
+                    reachable,
+                    alias,
+                ),
             )
             row = cur.fetchone()
             if row is None:
@@ -354,23 +401,33 @@ class FederationAliasStore:
         user = str(params.get("user", ""))
         return f"{user}@{host}:{port}/{dbname}"
 
-    def _last_observed_connection_identity(self, alias: str) -> str | None:
+    def _last_observed_identities(self, alias: str) -> dict[str, str | None]:
+        """The connection identity and physical identity recorded by the
+        last Observe — internal-only, deliberately never exposed through
+        get()/_SELECT_COLUMNS (unlike the rest of the alias record, these
+        are live infrastructure fingerprints, not review-relevant state)."""
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
                 sql.SQL("""
-                    SELECT last_observed_connection_identity
+                    SELECT last_observed_connection_identity, physical_identity
                     FROM {}._aliases
                     WHERE alias = %s
                 """).format(sql.Identifier(SCHEMA)),
                 (alias,),
             )
             row = cur.fetchone()
-            return row["last_observed_connection_identity"] if row else None
+            if row is None:
+                return {
+                    "last_observed_connection_identity": None,
+                    "physical_identity": None,
+                }
+            return dict(row)
 
     def provision(
         self,
         alias: str,
         connection_url: str,
+        actor: str,
         *,
         acknowledge_row_level_security: bool = False,
     ) -> dict[str, Any]:
@@ -380,7 +437,11 @@ class FederationAliasStore:
         an admin acting on a drift observation) — a repeat call only
         re-decides and reconciles the server's `extensions` option; it
         does not repeat CREATE SERVER/USER MAPPING/IMPORT FOREIGN SCHEMA,
-        which would fail on objects that already exist."""
+        which would fail on objects that already exist. `actor` is the
+        approving principal — every call (initial or reprovisioning) is
+        itself an act of Approve exposure, recorded atomically with
+        activation as the docs/federation-architecture-waypoint.md source-
+        alias contract's approvedBy/approvedAt consent record."""
         alias = validate_alias(alias)
         record = self.get(alias)
         already_provisioned = record["provisionedAt"] is not None
@@ -423,12 +484,43 @@ class FederationAliasStore:
         # different row set, that were never observed or reviewed under
         # the role about to be wired up.
         connection_identity = self._connection_identity(connection_url)
-        if self._last_observed_connection_identity(alias) != connection_identity:
+        last_observed = self._last_observed_identities(alias)
+        if last_observed["last_observed_connection_identity"] != connection_identity:
             raise FederationSchemaError(
                 f"Alias {alias!r}'s connectionRef now resolves to a "
                 "different endpoint or remote role than its last "
                 "observation was taken against — observe it again before "
                 "provisioning.",
+                code="federation.observation_not_current",
+            )
+        # The registered tlsPolicy is an attestation the operator made at
+        # registration time — without this, nothing ever checked that the
+        # connectionRef this alias actually resolves to delivers it, so a
+        # registered "verify-full" alias could be provisioned over
+        # plaintext without ever being flagged.
+        enforce_tls_policy(record["tlsPolicy"], connection_url)
+        # connection_identity alone can't catch a database dropped,
+        # restored, or replaced in place — that keeps the exact same
+        # host/port/dbname/user (docs/federation-architecture-waypoint.md,
+        # "Drift and retirement": "Different physical database | Raise
+        # identity conflict; require explicit rebind"). Re-fetch the
+        # remote's live physical identity now and compare against what
+        # Observe last recorded.
+        try:
+            current_physical_identity = physical_identity(connection_url)
+        except psycopg.Error as exc:
+            raise FederationSchemaError(
+                f"Alias {alias!r}'s source could not be reached to verify "
+                "its physical identity before provisioning — observe it "
+                "again.",
+                code="federation.observation_not_current",
+            ) from exc
+        if last_observed["physical_identity"] != current_physical_identity:
+            raise FederationSchemaError(
+                f"Alias {alias!r}'s source's physical database identity "
+                "no longer matches its last observation — it may have "
+                "been dropped, restored, or replaced. Observe it again "
+                "and review before provisioning.",
                 code="federation.observation_not_current",
             )
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
@@ -512,145 +604,153 @@ class FederationAliasStore:
                 ))
                 current = self._current_shippable_extensions(cur, server_name)
                 self._apply_shippable_extensions(cur, server_name, current, shippable)
-                return self.get(alias)
-
-            server_options = [
-                sql.SQL("host {}").format(sql.Literal(host)),
-                sql.SQL("port {}").format(sql.Literal(port)),
-                sql.SQL("dbname {}").format(sql.Literal(dbname)),
-                sql.SQL("use_remote_estimate 'true'"),
-            ]
-            # Forward whatever transport guarantees the operator already put
-            # in the connectionRef's connection string (the repo's existing
-            # sslmode/sslrootcert convention — see .env.example) instead of
-            # letting libpq silently fall back to its own permissive default.
-            for ssl_option in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
-                value = params.get(ssl_option)
-                if value:
+                cur.execute(
+                    sql.SQL("""
+                        UPDATE {}._aliases
+                        SET approved_by = %s, approved_at = clock_timestamp()
+                        WHERE alias = %s
+                    """).format(sql.Identifier(SCHEMA)),
+                    (actor, alias),
+                )
+            else:
+                server_options = [
+                    sql.SQL("host {}").format(sql.Literal(host)),
+                    sql.SQL("port {}").format(sql.Literal(port)),
+                    sql.SQL("dbname {}").format(sql.Literal(dbname)),
+                    sql.SQL("use_remote_estimate 'true'"),
+                ]
+                # Forward whatever transport guarantees the operator already put
+                # in the connectionRef's connection string (the repo's existing
+                # sslmode/sslrootcert convention — see .env.example) instead of
+                # letting libpq silently fall back to its own permissive default.
+                for ssl_option in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
+                    value = params.get(ssl_option)
+                    if value:
+                        server_options.append(
+                            sql.SQL("{} {}").format(
+                                sql.Identifier(ssl_option), sql.Literal(str(value))
+                            )
+                        )
+                if shippable:
                     server_options.append(
-                        sql.SQL("{} {}").format(
-                            sql.Identifier(ssl_option), sql.Literal(str(value))
+                        sql.SQL("extensions {}").format(
+                            sql.Literal(",".join(shippable))
                         )
                     )
-            if shippable:
-                server_options.append(
-                    sql.SQL("extensions {}").format(
-                        sql.Literal(",".join(shippable))
+                # Not IF NOT EXISTS: same reasoning as the schema below — a
+                # not-yet-provisioned alias should never legitimately reach a
+                # pre-existing <alias>_srv. Silently reusing one from an
+                # unrelated origin (and possibly a different actual remote
+                # endpoint) would import and grant access to the wrong data
+                # under this alias's name. Fail closed.
+                cur.execute(sql.SQL("""
+                    CREATE SERVER {server}
+                    FOREIGN DATA WRAPPER postgres_fdw
+                    OPTIONS ({options})
+                """).format(
+                    server=sql.Identifier(server_name),
+                    options=sql.SQL(", ").join(server_options),
+                ))
+                cur.execute(sql.SQL("""
+                    CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER
+                    SERVER {server}
+                    OPTIONS (user {user}, password {password})
+                """).format(
+                    server=sql.Identifier(server_name),
+                    user=sql.Literal(user),
+                    password=sql.Literal(password),
+                ))
+                # A security_invoker=true derived VIEW (derived_layers.py) runs
+                # its underlying query as whichever role queries the view — the
+                # runtime reader, not the derived owner — so it needs its own
+                # mapping too, not just CURRENT_USER's. Both mappings use the
+                # same remote credential; there is only one connectionRef per
+                # alias. (A materialized view's REFRESH always runs as the
+                # derived owner, so this isn't needed for that path, but views
+                # are a supported derived-layer kind and must work too.)
+                cur.execute(sql.SQL("""
+                    CREATE USER MAPPING IF NOT EXISTS FOR {reader}
+                    SERVER {server}
+                    OPTIONS (user {user}, password {password})
+                """).format(
+                    reader=sql.Identifier(self.reader_role),
+                    server=sql.Identifier(server_name),
+                    user=sql.Literal(user),
+                    password=sql.Literal(password),
+                ))
+                # Not IF NOT EXISTS: an alias's own reprovisioning never reaches
+                # this branch (see already_provisioned above), so the only way
+                # this schema could already exist here is an unrelated object —
+                # e.g. a stray schema an operator created by hand that happens
+                # to collide with source_<alias>. Silently reusing it would
+                # import into and then GRANT SELECT ON ALL TABLES IN that
+                # schema, exposing whatever was already there. Fail closed.
+                cur.execute(
+                    sql.SQL("CREATE SCHEMA {}").format(
+                        sql.Identifier(schema_name)
                     )
                 )
-            # Not IF NOT EXISTS: same reasoning as the schema below — a
-            # not-yet-provisioned alias should never legitimately reach a
-            # pre-existing <alias>_srv. Silently reusing one from an
-            # unrelated origin (and possibly a different actual remote
-            # endpoint) would import and grant access to the wrong data
-            # under this alias's name. Fail closed.
-            cur.execute(sql.SQL("""
-                CREATE SERVER {server}
-                FOREIGN DATA WRAPPER postgres_fdw
-                OPTIONS ({options})
-            """).format(
-                server=sql.Identifier(server_name),
-                options=sql.SQL(", ").join(server_options),
-            ))
-            cur.execute(sql.SQL("""
-                CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER
-                SERVER {server}
-                OPTIONS (user {user}, password {password})
-            """).format(
-                server=sql.Identifier(server_name),
-                user=sql.Literal(user),
-                password=sql.Literal(password),
-            ))
-            # A security_invoker=true derived VIEW (derived_layers.py) runs
-            # its underlying query as whichever role queries the view — the
-            # runtime reader, not the derived owner — so it needs its own
-            # mapping too, not just CURRENT_USER's. Both mappings use the
-            # same remote credential; there is only one connectionRef per
-            # alias. (A materialized view's REFRESH always runs as the
-            # derived owner, so this isn't needed for that path, but views
-            # are a supported derived-layer kind and must work too.)
-            cur.execute(sql.SQL("""
-                CREATE USER MAPPING IF NOT EXISTS FOR {reader}
-                SERVER {server}
-                OPTIONS (user {user}, password {password})
-            """).format(
-                reader=sql.Identifier(self.reader_role),
-                server=sql.Identifier(server_name),
-                user=sql.Literal(user),
-                password=sql.Literal(password),
-            ))
-            # Not IF NOT EXISTS: an alias's own reprovisioning never reaches
-            # this branch (see already_provisioned above), so the only way
-            # this schema could already exist here is an unrelated object —
-            # e.g. a stray schema an operator created by hand that happens
-            # to collide with source_<alias>. Silently reusing it would
-            # import into and then GRANT SELECT ON ALL TABLES IN that
-            # schema, exposing whatever was already there. Fail closed.
-            cur.execute(
-                sql.SQL("CREATE SCHEMA {}").format(
-                    sql.Identifier(schema_name)
+                for relation in record["allowedRelations"]:
+                    remote_schema, remote_table = relation.split(".", 1)
+                    cur.execute(sql.SQL("""
+                        IMPORT FOREIGN SCHEMA {remote_schema}
+                        LIMIT TO ({table})
+                        FROM SERVER {server}
+                        INTO {local_schema}
+                    """).format(
+                        remote_schema=sql.Identifier(remote_schema),
+                        table=sql.Identifier(remote_table),
+                        server=sql.Identifier(server_name),
+                        local_schema=sql.Identifier(schema_name),
+                    ))
+                # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever
+                # of the named relations actually exists on the remote — it
+                # does not error on one that's missing. Confirm every approved
+                # relation actually landed as a foreign table before marking
+                # the alias active; the whole transaction rolls back otherwise,
+                # rather than leaving an alias active with an incomplete set.
+                cur.execute(
+                    sql.SQL("""
+                        SELECT c.relname
+                        FROM pg_catalog.pg_class AS c
+                        JOIN pg_catalog.pg_namespace AS n
+                          ON n.oid = c.relnamespace
+                        WHERE n.nspname = %s AND c.relkind = 'f'
+                    """),
+                    (schema_name,),
                 )
-            )
-            for relation in record["allowedRelations"]:
-                remote_schema, remote_table = relation.split(".", 1)
-                cur.execute(sql.SQL("""
-                    IMPORT FOREIGN SCHEMA {remote_schema}
-                    LIMIT TO ({table})
-                    FROM SERVER {server}
-                    INTO {local_schema}
-                """).format(
-                    remote_schema=sql.Identifier(remote_schema),
-                    table=sql.Identifier(remote_table),
-                    server=sql.Identifier(server_name),
-                    local_schema=sql.Identifier(schema_name),
-                ))
-            # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever
-            # of the named relations actually exists on the remote — it
-            # does not error on one that's missing. Confirm every approved
-            # relation actually landed as a foreign table before marking
-            # the alias active; the whole transaction rolls back otherwise,
-            # rather than leaving an alias active with an incomplete set.
-            cur.execute(
-                sql.SQL("""
-                    SELECT c.relname
-                    FROM pg_catalog.pg_class AS c
-                    JOIN pg_catalog.pg_namespace AS n
-                      ON n.oid = c.relnamespace
-                    WHERE n.nspname = %s AND c.relkind = 'f'
-                """),
-                (schema_name,),
-            )
-            imported = {row["relname"] for row in cur.fetchall()}
-            expected = {
-                relation.split(".", 1)[1]
-                for relation in record["allowedRelations"]
-            }
-            missing = sorted(expected - imported)
-            if missing:
-                raise FederationSchemaError(
-                    f"Alias {alias!r} provisioning did not import: "
-                    f"{missing} — the source schema may have changed "
-                    "since it was last observed.",
-                    code="federation.import_incomplete",
+                imported = {row["relname"] for row in cur.fetchall()}
+                expected = {
+                    relation.split(".", 1)[1]
+                    for relation in record["allowedRelations"]
+                }
+                missing = sorted(expected - imported)
+                if missing:
+                    raise FederationSchemaError(
+                        f"Alias {alias!r} provisioning did not import: "
+                        f"{missing} — the source schema may have changed "
+                        "since it was last observed.",
+                        code="federation.import_incomplete",
+                    )
+                cur.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(self.reader_role)
+                    )
                 )
-            cur.execute(
-                sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                    sql.Identifier(schema_name), sql.Identifier(self.reader_role)
+                cur.execute(
+                    sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(self.reader_role)
+                    )
                 )
-            )
-            cur.execute(
-                sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
-                    sql.Identifier(schema_name), sql.Identifier(self.reader_role)
+                cur.execute(
+                    sql.SQL("""
+                        UPDATE {}._aliases
+                        SET provisioned_at = clock_timestamp(), status = 'active',
+                            approved_by = %s, approved_at = clock_timestamp()
+                        WHERE alias = %s
+                    """).format(sql.Identifier(SCHEMA)),
+                    (actor, alias),
                 )
-            )
-            cur.execute(
-                sql.SQL("""
-                    UPDATE {}._aliases
-                    SET provisioned_at = clock_timestamp(), status = 'active'
-                    WHERE alias = %s
-                """).format(sql.Identifier(SCHEMA)),
-                (alias,),
-            )
         return self.get(alias)
 
     def affected_derived_layer_names(self, alias: str) -> list[str]:

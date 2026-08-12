@@ -44,7 +44,7 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_capability import detect_capability
+from federation_capability import detect_capability, physical_identity
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
 from static_files import safe_static_path
@@ -226,12 +226,27 @@ DERIVED = (
     if os.environ.get("DERIVED_DATABASE_URL")
     else None
 )
+def federation_enabled(derived_database_url, database_mode) -> bool:
+    """Federation provisions a `federation` schema, postgres_fdw, and a
+    database-level CREATE grant (config-ui/federation_store.py) that only
+    bundled mode's upgrade-derived actually sets up — the external handoff
+    (docs/external-postgresql.md) grants ownership of derived_layers alone.
+    An external deployment that set DERIVED_DATABASE_URL would otherwise see
+    every federation route enabled but fail confusingly on first use, rather
+    than the clean "not configured" response every other missing-
+    prerequisite case already returns."""
+    return bool(derived_database_url) and database_mode == "bundled"
+
+
 FEDERATION = (
     FederationAliasStore(
         os.environ["DERIVED_DATABASE_URL"],
         os.environ["DERIVED_READER_ROLE"],
     )
-    if os.environ.get("DERIVED_DATABASE_URL")
+    if federation_enabled(
+        os.environ.get("DERIVED_DATABASE_URL"),
+        os.environ.get("MAPP_DATABASE_MODE"),
+    )
     else None
 )
 
@@ -7442,9 +7457,24 @@ class Handler(SimpleHTTPRequestHandler):
                     observation = detect_capability(
                         connection_url,
                         allowed_relations=tuple(record["allowedRelations"]),
+                        tls_policy=record["tlsPolicy"],
+                    )
+                    # Only fetchable from a source that was actually
+                    # reachable just now — Provision re-fetches and
+                    # compares this same value live, so a stale None here
+                    # simply means the next Provision attempt will need a
+                    # fresh Observe first, same as any other "not current"
+                    # observation.
+                    observed_physical_identity = (
+                        physical_identity(connection_url)
+                        if observation["connectivity"] == "reachable"
+                        else None
                     )
                     result = FEDERATION.record_observation(
-                        alias_name, observation, connection_url
+                        alias_name,
+                        observation,
+                        connection_url,
+                        observed_physical_identity,
                     )
                     CONTROL.audit(
                         "federation_alias.observed",
@@ -7475,6 +7505,7 @@ class Handler(SimpleHTTPRequestHandler):
                     result = FEDERATION.provision(
                         alias_name,
                         connection_url,
+                        actor,
                         acknowledge_row_level_security=acknowledged is True,
                     )
                     CONTROL.audit(

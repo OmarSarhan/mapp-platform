@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import psycopg
 
-from federation_capability import detect_capability
+from federation_capability import detect_capability, physical_identity
 from federation_schema import FederationSchemaError
 
 
@@ -67,8 +67,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertEqual("reachable", observation["connectivity"])
@@ -95,8 +96,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertEqual({"postgresql": "16.2"}, observation["extensionVersions"])
@@ -121,8 +123,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertEqual("reachable", observation["connectivity"])
@@ -136,8 +139,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertTrue(observation["rowLevelSecurityDetected"])
@@ -153,8 +157,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.tenant_scoped_view",),
+                tls_policy="require",
             )
 
         self.assertTrue(observation["rowLevelSecurityDetected"])
@@ -167,8 +172,9 @@ class DetectCapabilityTests(unittest.TestCase):
             side_effect=psycopg.OperationalError("could not connect"),
         ):
             observation = detect_capability(
-                "postgresql://unreachable",
+                "postgresql://unreachable?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertEqual(
@@ -199,8 +205,9 @@ class DetectCapabilityTests(unittest.TestCase):
             ),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
             )
 
         self.assertEqual(
@@ -215,6 +222,18 @@ class DetectCapabilityTests(unittest.TestCase):
             observation,
         )
 
+    def test_rejects_a_connection_weaker_than_the_registered_tls_policy(self):
+        # Enforced before ever connecting — a weak connectionRef must not
+        # even attempt to Observe, matching Provision's enforcement.
+        with patch("federation_capability.psycopg.connect") as mock_connect:
+            with self.assertRaises(FederationSchemaError):
+                detect_capability(
+                    "postgresql://reader?sslmode=disable",
+                    allowed_relations=("leeds.bus_stops",),
+                    tls_policy="verify-full",
+                )
+        mock_connect.assert_not_called()
+
     def test_reads_a_configured_version_relation_scalar(self):
         cursor = ScriptedFakeCursor(
             extension_and_rls_results(relation_count=2),
@@ -225,8 +244,9 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation = detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops", "leeds.dataset_publication"),
+                tls_policy="require",
                 version_relation="leeds.dataset_publication",
             )
 
@@ -235,8 +255,9 @@ class DetectCapabilityTests(unittest.TestCase):
     def test_rejects_a_version_relation_not_on_the_allowlist(self):
         with self.assertRaises(FederationSchemaError):
             detect_capability(
-                "postgresql://reader",
+                "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
                 version_relation="leeds.dataset_publication",
             )
 
@@ -251,11 +272,12 @@ class DetectCapabilityTests(unittest.TestCase):
         ):
             with self.assertRaises(FederationSchemaError):
                 detect_capability(
-                    "postgresql://reader",
+                    "postgresql://reader?sslmode=require",
                     allowed_relations=(
                         "leeds.bus_stops",
                         "leeds.dataset_publication",
                     ),
+                    tls_policy="require",
                     version_relation="leeds.dataset_publication",
                 )
 
@@ -270,13 +292,46 @@ class DetectCapabilityTests(unittest.TestCase):
         ):
             with self.assertRaises(FederationSchemaError):
                 detect_capability(
-                    "postgresql://reader",
+                    "postgresql://reader?sslmode=require",
                     allowed_relations=(
                         "leeds.bus_stops",
                         "leeds.dataset_publication",
                     ),
+                    tls_policy="require",
                     version_relation="leeds.dataset_publication",
                 )
+
+
+class PhysicalIdentityTests(unittest.TestCase):
+    def test_combines_the_cluster_and_database_identity(self):
+        cursor = ScriptedFakeCursor([(7672778953115078690,), (16384,)])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            identity = physical_identity("postgresql://reader")
+
+        self.assertEqual("7672778953115078690/16384", identity)
+
+    def test_differs_when_the_database_was_dropped_and_recreated(self):
+        # Same cluster (system_identifier unchanged), different database
+        # oid — a DROP DATABASE + CREATE DATABASE within the same cluster.
+        cursor = ScriptedFakeCursor([(7672778953115078690,), (99999,)])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            identity = physical_identity("postgresql://reader")
+
+        self.assertNotEqual("7672778953115078690/16384", identity)
+
+    def test_propagates_a_connection_failure(self):
+        with patch(
+            "federation_capability.psycopg.connect",
+            side_effect=psycopg.OperationalError("could not connect"),
+        ):
+            with self.assertRaises(psycopg.Error):
+                physical_identity("postgresql://unreachable")
 
 
 if __name__ == "__main__":

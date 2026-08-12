@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import federation_store
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
 
@@ -14,8 +15,12 @@ DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
 # Matches _connection_identity() of "postgresql://reader:secret@source-db
 # :5432/sourcedb" — the connection_url every provision()-related fixture
 # below uses unless it's specifically exercising a rotated endpoint.
+# physical_identity matches SOURCE_DB_PHYSICAL_IDENTITY, the value every
+# @patch("federation_store.physical_identity") below returns.
+SOURCE_DB_PHYSICAL_IDENTITY = "7672778953115078690/16384"
 SOURCE_DB_CONNECTION_IDENTITY = {
-    "last_observed_connection_identity": "reader@source-db:5432/sourcedb"
+    "last_observed_connection_identity": "reader@source-db:5432/sourcedb",
+    "physical_identity": SOURCE_DB_PHYSICAL_IDENTITY,
 }
 
 
@@ -47,10 +52,19 @@ def alias_row(**overrides):
         "registeredBy": "admin",
         "registeredAt": "2026-08-11T00:00:00+00:00",
         "lastObservation": None,
+        "tlsPolicy": "require",
         "provisionedAt": None,
+        "approvedBy": None,
+        "approvedAt": None,
     }
     row.update(overrides)
     return row
+
+
+# Every provision()-related fixture below uses this as its connectionRef,
+# satisfying alias_row()'s default tlsPolicy="require" — sslmode=require
+# is the floor of federation_schema.TLS_POLICIES.
+SOURCE_DB_URL = "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require"
 
 
 class FederationAliasStoreTests(unittest.TestCase):
@@ -94,7 +108,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             (
                 "leeds_ext", "Leeds (external copy)", "postgresql", "LEEDS_EXT",
                 ["leeds.smoke_control_orders"], "pending", "manual",
-                "Public council open data.", "admin",
+                "Public council open data.", "admin", "require",
             ),
             insert.args[1],
         )
@@ -145,13 +159,17 @@ class FederationAliasStoreTests(unittest.TestCase):
         }
 
         result = store.record_observation(
-            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
         )
 
         self.assertEqual("active", result["status"])
         update = cursor.execute.call_args_list[0]
         self.assertEqual("reader@source-db:5432/sourcedb", update.args[1][1])
-        self.assertEqual(True, update.args[1][2])
+        self.assertEqual(SOURCE_DB_PHYSICAL_IDENTITY, update.args[1][2])
+        self.assertEqual(True, update.args[1][3])
 
     @patch("federation_store.extension_versions")
     def test_record_observation_marks_alias_unavailable_when_not_reachable(self, mock_versions):
@@ -173,7 +191,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         }
 
         result = store.record_observation(
-            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            None,
         )
 
         self.assertEqual("unavailable", result["status"])
@@ -199,7 +220,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         }
 
         result = store.record_observation(
-            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
         )
 
         self.assertEqual("pending", result["status"])
@@ -222,6 +246,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "sourceVersion": None,
                 },
                 "postgresql://reader:secret@source-db:5432/sourcedb",
+                None,
             )
 
     @patch("federation_store.extension_versions")
@@ -248,7 +273,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         }
 
         store.record_observation(
-            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -279,7 +307,10 @@ class FederationAliasStoreTests(unittest.TestCase):
         }
 
         store.record_observation(
-            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -300,7 +331,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                 with self.assertRaises(FederationSchemaError):
                     store.provision(
                         "leeds_ext",
-                        "postgresql://reader:secret@source-db:5432/sourcedb",
+                        "postgresql://reader:secret@source-db:5432/sourcedb", "admin",
                     )
 
     def test_reprovision_also_rejects_a_stale_observation(self):
@@ -317,10 +348,16 @@ class FederationAliasStoreTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             store.provision(
                 "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-            )
+            ,
+                    "admin",
+                )
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_rejects_an_incomplete_import(self, mock_versions):
+    def test_provision_rejects_an_incomplete_import(self, mock_versions, mock_physical_identity):
         # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever of
         # the named relations actually exists — it does not error on one
         # that's missing. An alias must never go active with fewer
@@ -335,9 +372,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         store = self.store_with_cursor(cursor)
 
         with self.assertRaises(FederationSchemaError):
-            store.provision(
-                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-            )
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
     def test_provision_requires_acknowledgement_of_detected_row_level_security(self):
         # All MAPP callers query through the same mapped remote user —
@@ -357,10 +392,16 @@ class FederationAliasStoreTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             store.provision(
                 "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-            )
+            ,
+                    "admin",
+                )
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_proceeds_once_row_level_security_is_acknowledged(self, mock_versions):
+    def test_provision_proceeds_once_row_level_security_is_acknowledged(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -379,14 +420,18 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         result = store.provision(
             "leeds_ext",
-            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_URL, "admin",
             acknowledge_row_level_security=True,
         )
 
         self.assertIsNotNone(result["provisionedAt"])
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self, mock_versions):
+    def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -397,9 +442,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
-        result = store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        result = store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         self.assertIsNotNone(result["provisionedAt"])
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -416,10 +459,65 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertNotIn("IF NOT EXISTS", create_schema)
         self.assertTrue(any("IMPORT FOREIGN SCHEMA" in s and "smoke_control_orders" in s for s in statements))
         self.assertTrue(any("GRANT SELECT ON ALL TABLES IN SCHEMA" in s and "mapp_xyz" in s for s in statements))
-        self.assertTrue(any("provisioned_at = clock_timestamp()" in s and "status = 'active'" in s for s in statements))
+        activation = next(
+            call for call in cursor.execute.call_args_list
+            if "provisioned_at = clock_timestamp()" in str(call.args[0])
+            and "status = 'active'" in str(call.args[0])
+        )
+        # Recorded atomically with activation, not as a separate write —
+        # a crash or audit failure must never leave an exposed source
+        # without durable approval attribution.
+        self.assertIn("approved_by = %s", str(activation.args[0]))
+        self.assertIn("approved_at = clock_timestamp()", str(activation.args[0]))
+        self.assertEqual(("admin", "leeds_ext"), activation.args[1])
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_forwards_ssl_options_from_the_connection_string(self, mock_versions):
+    def test_reprovision_records_the_approving_principal(self, mock_versions, mock_physical_identity):
+        # Reprovisioning is itself an act of Approve exposure — an admin
+        # explicitly re-approved by calling /provision again — so it must
+        # record a fresh approvedBy/approvedAt too, not just the original
+        # provision() call's.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
+            ),
+            SOURCE_DB_CONNECTION_IDENTITY,
+            {"srvoptions": ["host=source-db"]},
+            {"srvoptions": ["host=source-db"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision("leeds_ext", SOURCE_DB_URL, "reviewer")
+
+        approval = next(
+            call for call in cursor.execute.call_args_list
+            if "approved_by = %s" in str(call.args[0])
+        )
+        self.assertEqual(("reviewer", "leeds_ext"), approval.args[1])
+        # provisioned_at is when the alias was first activated — untouched
+        # on reprovision, unlike approved_by/approved_at.
+        self.assertNotIn(
+            "provisioned_at",
+            str(approval.args[0]),
+        )
+
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_forwards_ssl_options_from_the_connection_string(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -433,7 +531,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         store.provision(
             "leeds_ext",
             "postgresql://reader:secret@source-db:5432/sourcedb"
-            "?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca.pem",
+            "?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca.pem", "admin",
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -441,8 +539,16 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("verify-full", create_server)
         self.assertIn("/etc/ssl/certs/ca.pem", create_server)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_omits_ssl_options_when_the_connection_string_has_none(self, mock_versions):
+    def test_provision_omits_optional_ssl_options_when_absent(self, mock_versions, mock_physical_identity):
+        # sslmode itself is always present once tlsPolicy is enforced (see
+        # enforce_tls_policy below) — this covers the independently
+        # optional sslrootcert/sslcert/sslkey, which forward only when the
+        # connectionRef actually supplies them.
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -453,16 +559,21 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         create_server = next(s for s in statements if "CREATE SERVER" in s)
-        self.assertNotIn("sslmode", create_server)
+        self.assertIn("sslmode", create_server)
+        self.assertNotIn("sslrootcert", create_server)
+        self.assertNotIn("sslcert", create_server)
+        self.assertNotIn("sslkey", create_server)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_does_not_mark_postgis_shippable_without_a_confirming_observation(self, mock_versions):
+    def test_provision_does_not_mark_postgis_shippable_without_a_confirming_observation(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -473,16 +584,18 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertNotIn("extensions", create_server)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_marks_postgis_shippable_when_versions_match(self, mock_versions):
+    def test_provision_marks_postgis_shippable_when_versions_match(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -499,17 +612,19 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertIn("extensions", create_server)
         self.assertIn("postgis", create_server)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_provision_does_not_mark_postgis_shippable_when_versions_mismatch(self, mock_versions):
+    def test_provision_does_not_mark_postgis_shippable_when_versions_mismatch(self, mock_versions, mock_physical_identity):
         # docs/federation-architecture-waypoint.md: pushdown is only safe
         # when PostGIS/PROJ/GEOS all match the federation database's own
         # versions — the remote merely *having* postgis is not enough.
@@ -529,16 +644,18 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertNotIn("extensions", create_server)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_does_not_repeat_create_ddl(self, mock_versions):
+    def test_reprovision_does_not_repeat_create_ddl(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -556,9 +673,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         ]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("CREATE SERVER" in s for s in statements))
@@ -579,8 +694,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         # option when it's already correct.
         self.assertFalse(any("ADD extensions" in s or "DROP extensions" in s for s in statements))
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_reconciles_rotated_connection_settings(self, mock_versions):
+    def test_reprovision_reconciles_rotated_connection_settings(self, mock_versions, mock_physical_identity):
         # The only reprovisioning path is /provision called again — it must
         # pick up a rotated password/host/database behind the same
         # connectionRef, not just re-decide the extensions option.
@@ -597,7 +716,10 @@ class FederationAliasStoreTests(unittest.TestCase):
             # The rotation itself was already observed — this identity
             # matches the *new* endpoint, standing in for an Observe call
             # already made against it before this reprovision.
-            {"last_observed_connection_identity": "reader@new-source-db:5433/sourcedb"},
+            {
+                "last_observed_connection_identity": "reader@new-source-db:5433/sourcedb",
+                "physical_identity": SOURCE_DB_PHYSICAL_IDENTITY,
+            },
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -606,7 +728,8 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         store.provision(
             "leeds_ext",
-            "postgresql://reader:rotated-secret@new-source-db:5433/sourcedb",
+            "postgresql://reader:rotated-secret@new-source-db:5433/sourcedb"
+            "?sslmode=require", "admin",
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -641,7 +764,9 @@ class FederationAliasStoreTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             store.provision(
                 "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-            )
+            ,
+                    "admin",
+                )
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
 
@@ -664,7 +789,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             store.provision(
                 "leeds_ext",
-                "postgresql://reader:secret@new-source-db:5433/sourcedb",
+                "postgresql://reader:secret@new-source-db:5433/sourcedb", "admin",
             )
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))
@@ -688,13 +813,110 @@ class FederationAliasStoreTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             store.provision(
                 "leeds_ext",
-                "postgresql://admin:secret@source-db:5432/sourcedb",
+                "postgresql://admin:secret@source-db:5432/sourcedb", "admin",
             )
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))
 
+    def test_provision_rejects_a_connection_weaker_than_the_registered_tls_policy(self):
+        # tlsPolicy is validated at registration but was never enforced —
+        # a registered "verify-full" alias could be provisioned over a
+        # sslmode=disable connectionRef without ever being flagged.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt=None,
+                lastObservation={"schema": "current"},
+                tlsPolicy="verify-full",
+            ),
+            SOURCE_DB_CONNECTION_IDENTITY,
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext",
+                "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require", "admin",
+            )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    def test_reprovision_rejects_a_connection_weaker_than_the_registered_tls_policy(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current"},
+                tlsPolicy="verify-full",
+            ),
+            SOURCE_DB_CONNECTION_IDENTITY,
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    @patch("federation_store.physical_identity", return_value="different-system-id/99999")
+    def test_provision_rejects_a_replaced_physical_database(self, mock_physical_identity):
+        # connection_identity (host/port/dbname/user) alone can't catch a
+        # database dropped, restored, or replaced in place — the string
+        # stays identical. This is the live re-fetch that closes that gap.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    @patch("federation_store.physical_identity", return_value="different-system-id/99999")
+    def test_reprovision_rejects_a_replaced_physical_database(self, mock_physical_identity):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current"},
+            ),
+            SOURCE_DB_CONNECTION_IDENTITY,
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    def test_provision_wraps_a_physical_identity_connection_failure(self):
+        # A source that goes unreachable in the narrow window between the
+        # connection-identity check and this live re-fetch must fail
+        # closed with a clear, actionable error — not a raw psycopg
+        # exception leaking out of the store.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with patch(
+            "federation_store.physical_identity",
+            side_effect=federation_store.psycopg.OperationalError("connection refused"),
+        ):
+            with self.assertRaises(FederationSchemaError):
+                store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_adds_a_newly_configured_ssl_option(self, mock_versions):
+    def test_reprovision_adds_a_newly_configured_ssl_option(self, mock_versions, mock_physical_identity):
         # An operator tightening sslmode from disable to require/verify-
         # full behind the same connectionRef must reach the live server,
         # not just host/port/dbname/credentials.
@@ -717,7 +939,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         store.provision(
             "leeds_ext",
-            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full",
+            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full", "admin",
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -725,8 +947,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("ADD", ssl_alter)
         self.assertIn("verify-full", ssl_alter)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_updates_a_changed_ssl_option(self, mock_versions):
+    def test_reprovision_updates_a_changed_ssl_option(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -746,7 +972,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         store.provision(
             "leeds_ext",
-            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full",
+            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full", "admin",
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -754,8 +980,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("SET", ssl_alter)
         self.assertIn("verify-full", ssl_alter)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_drops_a_removed_ssl_option(self, mock_versions):
+    def test_reprovision_drops_a_removed_ssl_option(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -773,16 +1003,18 @@ class FederationAliasStoreTests(unittest.TestCase):
         ]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         ssl_alter = next(s for s in statements if "ALTER SERVER" in s and "sslrootcert" in s)
         self.assertIn("DROP", ssl_alter)
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_creates_a_missing_reader_mapping(self, mock_versions):
+    def test_reprovision_creates_a_missing_reader_mapping(self, mock_versions, mock_physical_identity):
         # An alias provisioned before the reader-mapping fix existed has no
         # mapping for mapp_xyz yet — ALTER would fail on it, so this must
         # be DROP IF EXISTS + CREATE, not ALTER, to converge such an alias
@@ -804,9 +1036,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         ]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertTrue(
@@ -823,8 +1053,12 @@ class FederationAliasStoreTests(unittest.TestCase):
             )
         )
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions):
+    def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -842,16 +1076,18 @@ class FederationAliasStoreTests(unittest.TestCase):
         ]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertTrue(any("ALTER SERVER" in s and "ADD extensions" in s and "postgis" in s for s in statements))
         self.assertFalse(any("DROP extensions" in s for s in statements))
 
+    @patch(
+        "federation_store.physical_identity",
+        return_value=SOURCE_DB_PHYSICAL_IDENTITY,
+    )
     @patch("federation_store.extension_versions")
-    def test_reprovision_disables_pushdown_when_versions_now_mismatch(self, mock_versions):
+    def test_reprovision_disables_pushdown_when_versions_now_mismatch(self, mock_versions, mock_physical_identity):
         mock_versions.return_value = MATCHING_VERSIONS
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
@@ -869,9 +1105,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         ]
         store = self.store_with_cursor(cursor)
 
-        store.provision(
-            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
-        )
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertTrue(any("ALTER SERVER" in s and "DROP extensions" in s for s in statements))

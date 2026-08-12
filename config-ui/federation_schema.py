@@ -21,6 +21,8 @@ import re
 from http import HTTPStatus
 from typing import Any
 
+import psycopg
+
 from control_plane import parse_time
 from relation_identity import IDENTIFIER_PART_RE, parse_relation
 
@@ -341,3 +343,37 @@ def validate_observation(payload: Any) -> dict[str, Any]:
         result["rowLevelSecurityDetected"] = rls_detected
 
     return result
+
+
+# libpq sslmode values in increasing strictness. Only require/verify-ca/
+# verify-full are valid tlsPolicy values (TLS_POLICIES above) — disable/
+# allow/prefer aren't meaningful things to *require*.
+_SSLMODE_STRENGTH = {
+    "disable": 0,
+    "allow": 1,
+    "prefer": 2,
+    "require": 3,
+    "verify-ca": 4,
+    "verify-full": 5,
+}
+
+
+def enforce_tls_policy(tls_policy: str, connection_url: str) -> None:
+    """Reject a connectionRef whose actual sslmode is weaker than the
+    alias's registered tlsPolicy. Registration validates tlsPolicy as an
+    attestation of what the operator requires, but nothing previously
+    checked the DBS_<NAME> connection string actually delivers it — a
+    registered "verify-full" alias could observe and provision over
+    plaintext (sslmode=disable) without ever being flagged."""
+    params = psycopg.conninfo.conninfo_to_dict(connection_url)
+    # libpq's own default for a TCP host connection when sslmode is
+    # unset — a federation connectionRef is always host=..., never a
+    # Unix-socket connection (whose default would be "prefer" too, so
+    # this default is correct either way).
+    sslmode = str(params.get("sslmode", "prefer"))
+    if _SSLMODE_STRENGTH.get(sslmode, -1) < _SSLMODE_STRENGTH[tls_policy]:
+        raise FederationSchemaError(
+            f"This connectionRef's sslmode {sslmode!r} does not meet the "
+            f"registered tlsPolicy {tls_policy!r}.",
+            code="federation.tls_policy_not_met",
+        )

@@ -35,7 +35,11 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from federation_schema import FederationSchemaError, validate_observation
+from federation_schema import (
+    FederationSchemaError,
+    enforce_tls_policy,
+    validate_observation,
+)
 from relation_identity import IDENTIFIER_PART_RE, parse_relation
 from semantic_sources import PostgresSemanticSources
 
@@ -173,16 +177,21 @@ def detect_capability(
     connection_url: str,
     *,
     allowed_relations: tuple[str, ...],
+    tls_policy: str,
     version_relation: str | None = None,
 ) -> dict[str, Any]:
     """Bounded, read-only capability and connectivity detection.
 
     `allowed_relations` are normalized "schema.relation" strings, matching
-    `federation_schema.validate_registration()`'s output. `version_relation`,
-    if given, must be one of `allowed_relations` — its single scalar column
-    is read as the observation's `sourceVersion`, implementing the
-    freshnessStrategy "versionRelation" evidence collection Discover calls
-    for. Never reads anything not on the allowlist.
+    `federation_schema.validate_registration()`'s output. `tls_policy` is
+    the alias's registered requirement — enforced against the connection
+    string's actual sslmode before connecting, the same as Provision, so a
+    weak connectionRef is never even Observed successfully.
+    `version_relation`, if given, must be one of `allowed_relations` — its
+    single scalar column is read as the observation's `sourceVersion`,
+    implementing the freshnessStrategy "versionRelation" evidence
+    collection Discover calls for. Never reads anything not on the
+    allowlist.
 
     Always returns a dict already validated against
     `federation_schema.validate_observation()`'s closed contract.
@@ -192,6 +201,7 @@ def detect_capability(
             f"version_relation {version_relation!r} must be one of the "
             "registered allowedRelations."
         )
+    enforce_tls_policy(tls_policy, connection_url)
 
     try:
         with psycopg.connect(
@@ -244,3 +254,37 @@ def detect_capability(
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
     })
+
+
+def physical_identity(connection_url: str) -> str:
+    """The remote's actual physical database identity — the cluster's
+    system_identifier (changes if the whole cluster was rebuilt or
+    restored from scratch onto the same connection parameters) combined
+    with the connected database's own oid (changes if just this database
+    was dropped and recreated within an otherwise-unchanged cluster).
+
+    A connectionRef's host/port/dbname/user can stay byte-for-byte
+    identical while pointing at a genuinely different physical database
+    — nothing about the connection string itself would ever reveal a
+    same-name replacement. Observe records this; Provision re-fetches it
+    live and compares, matching docs/federation-architecture-waypoint.md's
+    "Different physical database | Raise identity conflict; require
+    explicit rebind" requirement.
+
+    Raises psycopg.Error on a connection failure — callers already
+    reachability-gate this (Observe via detect_capability, Provision via
+    its own preceding checks), so a failure here is never the first
+    sign of an unreachable source."""
+    with psycopg.connect(
+        connection_url, connect_timeout=CONNECT_TIMEOUT_SECONDS
+    ) as connection:
+        with connection.cursor() as cursor:
+            PostgresSemanticSources._begin_read_only(cursor)
+            cursor.execute("SELECT system_identifier FROM pg_control_system()")
+            (system_identifier,) = cursor.fetchone()
+            cursor.execute(
+                "SELECT oid FROM pg_catalog.pg_database "
+                "WHERE datname = current_database()"
+            )
+            (database_oid,) = cursor.fetchone()
+    return f"{system_identifier}/{database_oid}"

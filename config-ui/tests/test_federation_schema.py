@@ -2,6 +2,7 @@ import unittest
 
 from federation_schema import (
     FederationSchemaError,
+    enforce_tls_policy,
     validate_alias,
     validate_observation,
     validate_registration,
@@ -300,6 +301,39 @@ class ValidateObservationTests(unittest.TestCase):
     def test_rejects_a_non_boolean_rls_flag(self):
         with self.assertRaises(FederationSchemaError):
             validate_observation(valid_observation(rowLevelSecurityDetected="yes"))
+
+
+class EnforceTlsPolicyTests(unittest.TestCase):
+    def test_accepts_a_connection_meeting_the_policy(self):
+        enforce_tls_policy("require", "postgresql://reader@host/db?sslmode=require")
+        enforce_tls_policy(
+            "require", "postgresql://reader@host/db?sslmode=verify-full"
+        )
+        enforce_tls_policy(
+            "verify-full", "postgresql://reader@host/db?sslmode=verify-full"
+        )
+
+    def test_rejects_a_connection_weaker_than_the_policy(self):
+        with self.assertRaises(FederationSchemaError):
+            enforce_tls_policy(
+                "require", "postgresql://reader@host/db?sslmode=disable"
+            )
+        with self.assertRaises(FederationSchemaError):
+            enforce_tls_policy(
+                "verify-full", "postgresql://reader@host/db?sslmode=require"
+            )
+
+    def test_rejects_an_unset_sslmode_against_any_policy(self):
+        # libpq's own default for a TCP host connection is "prefer", which
+        # meets none of the three valid tlsPolicy values.
+        with self.assertRaises(FederationSchemaError):
+            enforce_tls_policy("require", "postgresql://reader@host/db")
+
+    def test_rejects_an_unrecognized_sslmode(self):
+        with self.assertRaises(FederationSchemaError):
+            enforce_tls_policy(
+                "require", "postgresql://reader@host/db?sslmode=typo"
+            )
 
 
 if __name__ == "__main__":
