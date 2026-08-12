@@ -1641,14 +1641,19 @@ with psycopg.connect(
               ) AS "canCreateDerived",
               -- Schemas the derived owner may legitimately own: the two
               -- fixed schemas plus one dynamic source_<alias> schema per
-              -- registered federation alias (config-ui/federation_store.py
-              -- provision()). Ownership alone is NOT exempted — only
-              -- ownership of a schema matching this explicit allowlist —
-              -- so an unexpected schema (e.g. public) ending up owned by
-              -- this role, via a future bug or operator error, still trips
-              -- every check below instead of being silently trusted. The
-              -- source_<alias> pattern must stay in sync with ALIAS_RE in
-              -- config-ui/federation_schema.py.
+              -- registered, provisioned federation alias
+              -- (config-ui/federation_store.py provision()). Ownership
+              -- alone is NOT exempted, and a source_<alias>-shaped name
+              -- alone is not either: the derived owner has database-level
+              -- CREATE (needed for provision() to work at all), so it
+              -- could create a same-shaped schema itself without ever
+              -- going through the federation API. Exemption requires
+              -- ownership AND (one of the two fixed names OR a row in
+              -- federation._aliases naming this exact schema, provisioned)
+              -- — so an unexpected schema (e.g. public, or a same-pattern
+              -- schema with no matching registry entry) ending up owned by
+              -- this role still trips every check below instead of being
+              -- silently trusted.
               EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_namespace AS namespace
@@ -1658,8 +1663,12 @@ with psycopg.connect(
                     namespace.nspowner = login_role.oid
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
-                      OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                      OR EXISTS (
+                        SELECT 1 FROM federation._aliases AS fed_alias
+                        WHERE namespace.nspname
+                                = ($$source_$$ || fed_alias.alias)
+                          AND fed_alias.provisioned_at IS NOT NULL
+                      )
                     )
                   )
                   AND has_schema_privilege(namespace.oid, $$CREATE$$)
@@ -1675,8 +1684,12 @@ with psycopg.connect(
                     namespace.nspowner = login_role.oid
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
-                      OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                      OR EXISTS (
+                        SELECT 1 FROM federation._aliases AS fed_alias
+                        WHERE namespace.nspname
+                                = ($$source_$$ || fed_alias.alias)
+                          AND fed_alias.provisioned_at IS NOT NULL
+                      )
                     )
                   )
                   AND relation.relkind IN (
@@ -1718,8 +1731,12 @@ with psycopg.connect(
                     namespace.nspowner = login_role.oid
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
-                      OR namespace.nspname
-                        ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                      OR EXISTS (
+                        SELECT 1 FROM federation._aliases AS fed_alias
+                        WHERE namespace.nspname
+                                = ($$source_$$ || fed_alias.alias)
+                          AND fed_alias.provisioned_at IS NOT NULL
+                      )
                     )
                   )
                   AND relation.relkind = $$S$$
@@ -1764,8 +1781,13 @@ with psycopg.connect(
                           AND (
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
-                            OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                            OR EXISTS (
+                              SELECT 1 FROM federation._aliases
+                                AS fed_alias
+                              WHERE namespace.nspname
+                                      = ($$source_$$ || fed_alias.alias)
+                                AND fed_alias.provisioned_at IS NOT NULL
+                            )
                           )
                         )
                         AND has_schema_privilege(
@@ -1786,8 +1808,13 @@ with psycopg.connect(
                           AND (
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
-                            OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                            OR EXISTS (
+                              SELECT 1 FROM federation._aliases
+                                AS fed_alias
+                              WHERE namespace.nspname
+                                      = ($$source_$$ || fed_alias.alias)
+                                AND fed_alias.provisioned_at IS NOT NULL
+                            )
                           )
                         )
                         AND relation.relkind IN (
@@ -1857,8 +1884,13 @@ with psycopg.connect(
                           AND (
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
-                            OR namespace.nspname
-                              ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$
+                            OR EXISTS (
+                              SELECT 1 FROM federation._aliases
+                                AS fed_alias
+                              WHERE namespace.nspname
+                                      = ($$source_$$ || fed_alias.alias)
+                                AND fed_alias.provisioned_at IS NOT NULL
+                            )
                           )
                         )
                         AND relation.relkind = $$S$$

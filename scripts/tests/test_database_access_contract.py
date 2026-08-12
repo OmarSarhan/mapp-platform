@@ -388,8 +388,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         # unexpected schema (e.g. public) silently escape the unsafe-
         # privilege audit if it ever ended up owned by that role through a
         # future bug or operator error. The exemption must always require
-        # BOTH ownership AND a name matching this explicit allowlist/
-        # pattern — never ownership alone.
+        # BOTH ownership AND (one of the two fixed names OR a real
+        # registered, provisioned alias) — never ownership alone.
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
         self.assertNotIn("namespace.nspowner <> login_role.oid", source)
         self.assertNotIn("namespace.nspowner <> reachable_role.oid", source)
@@ -403,12 +403,18 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
             normalized,
         )
-        # Must stay in sync with ALIAS_RE in config-ui/federation_schema.py
-        # (no hyphen, max 56 characters) — a looser exemption pattern here
-        # would silently trust a schema no real alias could ever produce.
+        # A name/pattern match alone is not enough: the derived owner has
+        # database-level CREATE (needed for provision() itself), so it
+        # could create a same-shaped schema (e.g. source_fake) without
+        # ever registering a real alias. The exemption must join against
+        # the actual registry, not just recognize the naming convention.
+        self.assertIn("FROM federation._aliases AS fed_alias", normalized)
         self.assertIn(
-            "namespace.nspname ~ $$^source_[A-Za-z][A-Za-z0-9_]{0,55}$$",
+            "namespace.nspname = ($$source_$$ || fed_alias.alias)",
             normalized,
+        )
+        self.assertIn(
+            "fed_alias.provisioned_at IS NOT NULL", normalized
         )
 
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:

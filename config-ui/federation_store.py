@@ -276,6 +276,55 @@ class FederationAliasStore:
                 )
             )
 
+    _SSL_OPTIONS = ("sslmode", "sslrootcert", "sslcert", "sslkey")
+
+    @staticmethod
+    def _current_server_options(cur, server_name: str) -> dict[str, str]:
+        cur.execute(
+            "SELECT srvoptions FROM pg_catalog.pg_foreign_server "
+            "WHERE srvname = %s",
+            (server_name,),
+        )
+        row = cur.fetchone()
+        options: dict[str, str] = {}
+        for option in (row["srvoptions"] if row and row["srvoptions"] else []):
+            key, _, value = option.partition("=")
+            options[key] = value
+        return options
+
+    @classmethod
+    def _reconcile_ssl_options(
+        cls, cur, server_name: str, current: dict[str, str], params
+    ) -> None:
+        """Reconcile sslmode/sslrootcert/sslcert/sslkey to match the
+        connectionRef's current connection string — a rotated SSL setting
+        (e.g. require -> verify-full, a renewed CA/client certificate, or
+        one removed outright) must reach the live server the same way a
+        rotated host/password does, or foreign-table queries keep using
+        stale, possibly weaker, transport settings."""
+        actions = []
+        for ssl_option in cls._SSL_OPTIONS:
+            value = params.get(ssl_option)
+            if value:
+                verb = "SET" if ssl_option in current else "ADD"
+                actions.append(
+                    sql.SQL("{} {} {}").format(
+                        sql.SQL(verb),
+                        sql.Identifier(ssl_option),
+                        sql.Literal(str(value)),
+                    )
+                )
+            elif ssl_option in current:
+                actions.append(
+                    sql.SQL("DROP {}").format(sql.Identifier(ssl_option))
+                )
+        if actions:
+            cur.execute(
+                sql.SQL("ALTER SERVER {} OPTIONS ({})").format(
+                    sql.Identifier(server_name), sql.SQL(", ").join(actions)
+                )
+            )
+
     def provision(
         self,
         alias: str,
@@ -310,7 +359,13 @@ class FederationAliasStore:
                 "explicitly to provision.",
                 code="federation.row_level_security_not_acknowledged",
             )
-        if not already_provisioned and last_observation.get("schema") != "current":
+        # Applies to reprovisioning too, not just the first call: the
+        # reprovision branch below never re-verifies or re-imports the
+        # foreign tables, so without this, /provision on an alias whose
+        # latest observation reports "changed" would still reconcile
+        # connection settings and report success — silently implying
+        # the schema drift it never actually addressed was fine.
+        if last_observation.get("schema") != "current":
             raise FederationSchemaError(
                 f"Alias {alias!r} has not been observed as current — "
                 "observe it again immediately before provisioning.",
@@ -361,6 +416,12 @@ class FederationAliasStore:
                     port=sql.Literal(port),
                     dbname=sql.Literal(dbname),
                 ))
+                current_server_options = self._current_server_options(
+                    cur, server_name
+                )
+                self._reconcile_ssl_options(
+                    cur, server_name, current_server_options, params
+                )
                 cur.execute(sql.SQL("""
                     ALTER USER MAPPING FOR CURRENT_USER SERVER {server}
                     OPTIONS (SET user {user}, SET password {password})

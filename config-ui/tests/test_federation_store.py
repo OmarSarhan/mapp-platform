@@ -281,6 +281,22 @@ class FederationAliasStoreTests(unittest.TestCase):
                         "postgresql://reader:secret@source-db:5432/sourcedb",
                     )
 
+    def test_reprovision_also_rejects_a_stale_observation(self):
+        # The reprovision branch never re-verifies or re-imports foreign
+        # tables — without this, reprovisioning an alias whose latest
+        # observation shows "changed" would still reconcile connection
+        # settings and report success, silently ignoring the drift.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = alias_row(
+            provisionedAt="2026-08-11T00:00:00+00:00",
+            lastObservation={"schema": "changed"},
+        )
+        store = self.store_with_cursor(cursor)
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+            )
+
     @patch("federation_store.extension_versions")
     def test_provision_rejects_an_incomplete_import(self, mock_versions):
         # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever of
@@ -498,8 +514,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt="2026-08-11T00:00:00+00:00",
-                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
             ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
@@ -538,8 +558,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt="2026-08-11T00:00:00+00:00",
-                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
             ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
@@ -566,6 +590,91 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("rotated-secret", reader_mapping)
 
     @patch("federation_store.extension_versions")
+    def test_reprovision_adds_a_newly_configured_ssl_option(self, mock_versions):
+        # An operator tightening sslmode from disable to require/verify-
+        # full behind the same connectionRef must reach the live server,
+        # not just host/port/dbname/credentials.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
+            ),
+            {"srvoptions": ["host=source-db"]},
+            {"srvoptions": ["host=source-db"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        ssl_alter = next(s for s in statements if "ALTER SERVER" in s and "sslmode" in s)
+        self.assertIn("ADD", ssl_alter)
+        self.assertIn("verify-full", ssl_alter)
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_updates_a_changed_ssl_option(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
+            ),
+            {"srvoptions": ["host=source-db", "sslmode=require"]},
+            {"srvoptions": ["host=source-db", "sslmode=require"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=verify-full",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        ssl_alter = next(s for s in statements if "ALTER SERVER" in s and "sslmode" in s)
+        self.assertIn("SET", ssl_alter)
+        self.assertIn("verify-full", ssl_alter)
+
+    @patch("federation_store.extension_versions")
+    def test_reprovision_drops_a_removed_ssl_option(self, mock_versions):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
+            ),
+            {"srvoptions": ["host=source-db", "sslrootcert=/etc/ssl/old-ca.pem"]},
+            {"srvoptions": ["host=source-db", "sslrootcert=/etc/ssl/old-ca.pem"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        ssl_alter = next(s for s in statements if "ALTER SERVER" in s and "sslrootcert" in s)
+        self.assertIn("DROP", ssl_alter)
+
+    @patch("federation_store.extension_versions")
     def test_reprovision_creates_a_missing_reader_mapping(self, mock_versions):
         # An alias provisioned before the reader-mapping fix existed has no
         # mapping for mapp_xyz yet — ALTER would fail on it, so this must
@@ -576,8 +685,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt="2026-08-11T00:00:00+00:00",
-                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
             ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
@@ -609,8 +722,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt="2026-08-11T00:00:00+00:00",
-                lastObservation={"extensionVersions": MATCHING_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
             ),
+            {"srvoptions": ["host=source-db"]},
             {"srvoptions": ["host=source-db"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
@@ -631,8 +748,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             alias_row(
                 provisionedAt="2026-08-11T00:00:00+00:00",
-                lastObservation={"extensionVersions": DIFFERENT_VERSIONS},
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": DIFFERENT_VERSIONS,
+                },
             ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
