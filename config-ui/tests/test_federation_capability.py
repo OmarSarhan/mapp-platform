@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import psycopg
@@ -66,12 +67,16 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, observed_at = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
 
+        # Captured once the connection succeeds, fixing this probe's
+        # REPEATABLE READ snapshot — not before the connection attempt,
+        # which record_observation()'s race protection depends on.
+        self.assertIsInstance(observed_at, datetime)
         self.assertEqual("reachable", observation["connectivity"])
         self.assertEqual("current", observation["schema"])
         self.assertEqual("unknown", observation["sourceFreshness"])
@@ -95,7 +100,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -122,7 +127,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -138,7 +143,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -156,7 +161,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.tenant_scoped_view",),
                 tls_policy="require",
@@ -171,7 +176,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             side_effect=psycopg.OperationalError("could not connect"),
         ):
-            observation = detect_capability(
+            observation, observed_at = detect_capability(
                 "postgresql://unreachable?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -188,6 +193,9 @@ class DetectCapabilityTests(unittest.TestCase):
             },
             observation,
         )
+        # Even a failed probe gets an ordering marker — captured at the
+        # moment the connection was given up as failed.
+        self.assertIsInstance(observed_at, datetime)
 
     def test_authentication_failure_is_reported_distinctly_from_an_outage(self):
         # A rejected credential needs MAPP-side secret rotation, not a
@@ -204,7 +212,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 'for user "reader"'
             ),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -243,7 +251,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation = detect_capability(
+            observation, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops", "leeds.dataset_publication"),
                 tls_policy="require",

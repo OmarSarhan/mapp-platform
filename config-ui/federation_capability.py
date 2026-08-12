@@ -179,7 +179,7 @@ def detect_capability(
     allowed_relations: tuple[str, ...],
     tls_policy: str,
     version_relation: str | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], datetime]:
     """Bounded, read-only capability and connectivity detection.
 
     `allowed_relations` are normalized "schema.relation" strings, matching
@@ -193,9 +193,17 @@ def detect_capability(
     collection Discover calls for. Never reads anything not on the
     allowlist.
 
-    Always returns a dict already validated against
-    `federation_schema.validate_observation()`'s closed contract.
-    """
+    Returns (observation, observed_at) — observation is already validated
+    against `federation_schema.validate_observation()`'s closed contract.
+    observed_at is captured *after* the connection attempt resolves (either
+    once it succeeds, fixing this probe's REPEATABLE READ snapshot, or once
+    it's given up as failed), never before attempting it — a connection
+    that stalls must not make this probe look "older" than a concurrent one
+    that started later but connected faster and is now looking at data
+    this probe will supersede once it finally connects.
+    FederationAliasStore.record_observation()'s ordering depends on this:
+    it compares observed_at, not call order, to decide which of two
+    overlapping Observe calls actually saw the more current state."""
     if version_relation is not None and version_relation not in allowed_relations:
         raise FederationSchemaError(
             f"version_relation {version_relation!r} must be one of the "
@@ -209,6 +217,7 @@ def detect_capability(
             connect_timeout=CONNECT_TIMEOUT_SECONDS,
             row_factory=dict_row,
         ) as connection:
+            observed_at = datetime.now(timezone.utc)
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
                 versions = extension_versions(cursor)
@@ -242,7 +251,7 @@ def detect_capability(
             "lastConnected": None,
             "lastSchemaVerified": None,
             "sourceVersion": None,
-        })
+        }), datetime.now(timezone.utc)
 
     return validate_observation({
         "connectivity": "reachable",
@@ -253,7 +262,7 @@ def detect_capability(
         "sourceVersion": source_version,
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
-    })
+    }), observed_at
 
 
 def physical_identity(

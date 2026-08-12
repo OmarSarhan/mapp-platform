@@ -58,6 +58,7 @@ def alias_row(**overrides):
         "provisionedAt": None,
         "approvedBy": None,
         "approvedAt": None,
+        "rowLevelSecurityAcknowledged": False,
     }
     row.update(overrides)
     return row
@@ -513,6 +514,14 @@ class FederationAliasStoreTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(result["provisionedAt"])
+        # A durable record that this approval specifically accepted a
+        # known RLS bypass — not just a transient gate that leaves no
+        # trace once a later Observe replaces last_observation.
+        activation = next(
+            call for call in cursor.execute.call_args_list
+            if "provisioned_at = clock_timestamp()" in str(call.args[0])
+        )
+        self.assertEqual(("admin", True, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.physical_identity",
@@ -564,7 +573,9 @@ class FederationAliasStoreTests(unittest.TestCase):
         # without durable approval attribution.
         self.assertIn("approved_by = %s", str(activation.args[0]))
         self.assertIn("approved_at = clock_timestamp()", str(activation.args[0]))
-        self.assertEqual(("admin", "leeds_ext"), activation.args[1])
+        # No RLS was detected in this fixture's observation, so nothing
+        # was there to acknowledge.
+        self.assertEqual(("admin", False, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.physical_identity",
@@ -598,7 +609,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             call for call in cursor.execute.call_args_list
             if "approved_by = %s" in str(call.args[0])
         )
-        self.assertEqual(("reviewer", "leeds_ext"), approval.args[1])
+        self.assertEqual(("reviewer", False, "leeds_ext"), approval.args[1])
         # provisioned_at is when the alias was first activated — untouched
         # on reprovision, unlike approved_by/approved_at.
         self.assertNotIn(

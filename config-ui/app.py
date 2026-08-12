@@ -7454,12 +7454,17 @@ class Handler(SimpleHTTPRequestHandler):
                             + ", ".join(sorted(payload)),
                             code="federation.invalid_request",
                         )
-                    # Captured before the remote probe, not after — this is
-                    # the ordering key two overlapping Observe calls for the
-                    # same alias are serialized by (FederationAliasStore.
-                    # record_observation), not when either happens to finish.
-                    observed_at = datetime.now(timezone.utc)
-                    observation = detect_capability(
+                    # detect_capability's own observed_at (captured only
+                    # once its connection attempt resolves, not before) is
+                    # the ordering key two overlapping Observe calls for
+                    # the same alias are serialized by
+                    # (FederationAliasStore.record_observation) — a
+                    # timestamp captured here, before the remote probe,
+                    # would instead reflect whichever request merely
+                    # *started* first, which a stalled connection can
+                    # decouple entirely from which one actually saw the
+                    # more current state.
+                    observation, observed_at = detect_capability(
                         connection_url,
                         allowed_relations=tuple(record["allowedRelations"]),
                         tls_policy=record["tlsPolicy"],

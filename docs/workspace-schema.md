@@ -395,7 +395,7 @@ workspace
 | Path | Type/options | Meaning |
 | --- | --- | --- |
 | `key` | non-empty string | Stable workspace identifier. |
-| `dbs` | letters, numbers, hyphens | Default connection; `MAPP` resolves from `DBS_MAPP`. |
+| `dbs` | letters, numbers, underscores (56 char max) | Default connection; `MAPP` resolves from `DBS_MAPP`. |
 | `locale.name` | string | Human-readable locale title. |
 | `locale.extent.north/south` | number, `-90..90` | Latitude bounds. North must be at least south. |
 | `locale.extent.east/west` | number, `-180..180` | Longitude bounds. XYZ v4.23.4 expects east to be at least west. |

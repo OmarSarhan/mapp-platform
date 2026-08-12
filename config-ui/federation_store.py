@@ -113,7 +113,8 @@ class FederationAliasStore:
               approved_by text,
               approved_at timestamptz,
               physical_identity text,
-              observed_at timestamptz
+              observed_at timestamptz,
+              row_level_security_acknowledged boolean NOT NULL DEFAULT false
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
@@ -134,6 +135,10 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "observed_at timestamptz"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "row_level_security_acknowledged boolean NOT NULL DEFAULT false"
         ).format(sql.Identifier(SCHEMA)))
         # DEFAULT backfills any alias registered before tlsPolicy was
         # persisted with the weakest of the three valid policies — the
@@ -184,7 +189,8 @@ class FederationAliasStore:
         tls_policy AS "tlsPolicy",
         provisioned_at AS "provisionedAt",
         approved_by AS "approvedBy",
-        approved_at AS "approvedAt"
+        approved_at AS "approvedAt",
+        row_level_security_acknowledged AS "rowLevelSecurityAcknowledged"
     """)
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -549,6 +555,15 @@ class FederationAliasStore:
                     "explicitly to provision.",
                     code="federation.row_level_security_not_acknowledged",
                 )
+            # Persisted atomically with approval below — a durable record
+            # that the approving principal explicitly accepted the
+            # per-user-RLS bypass this source has, not just a transient
+            # gate that leaves no trace once a later Observe replaces
+            # last_observation (the append-only _observations table
+            # records what was detected, but not that it was accepted).
+            rls_bypass_acknowledged = bool(
+                last_observation.get("rowLevelSecurityDetected")
+            ) and acknowledge_row_level_security
             # Applies to reprovisioning too, not just the first call: the
             # reprovision branch below never re-verifies or re-imports the
             # foreign tables, so without this, /provision on an alias whose
@@ -694,10 +709,11 @@ class FederationAliasStore:
                 cur.execute(
                     sql.SQL("""
                         UPDATE {}._aliases
-                        SET approved_by = %s, approved_at = clock_timestamp()
+                        SET approved_by = %s, approved_at = clock_timestamp(),
+                            row_level_security_acknowledged = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
-                    (actor, alias),
+                    (actor, rls_bypass_acknowledged, alias),
                 )
             else:
                 server_options = [
@@ -833,10 +849,11 @@ class FederationAliasStore:
                     sql.SQL("""
                         UPDATE {}._aliases
                         SET provisioned_at = clock_timestamp(), status = 'active',
-                            approved_by = %s, approved_at = clock_timestamp()
+                            approved_by = %s, approved_at = clock_timestamp(),
+                            row_level_security_acknowledged = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
-                    (actor, alias),
+                    (actor, rls_bypass_acknowledged, alias),
                 )
         return self.get(alias)
 
