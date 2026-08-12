@@ -1576,7 +1576,23 @@ with psycopg.connect(
     row_factory=dict_row,
 ) as connection:
     with connection.cursor() as cursor:
-        cursor.execute("""
+        # federation._aliases is created lazily by
+        # FederationAliasStore._initialize() on first use, not by database
+        # init/upgrade — a fresh deployment that has never taken a
+        # federation API call has the `federation` schema (init script) but
+        # not yet this table. Referencing it unconditionally below would
+        # abort this entire audit with UndefinedTable. Provisioning always
+        # goes through that same store, so an absent table also means no
+        # alias could ever have been provisioned — substitute an always-
+        # empty stand-in rather than the real table in that case.
+        cursor.execute("SELECT to_regclass($$federation._aliases$$) AS oid")
+        federation_registry_source = (
+            "federation._aliases"
+            if cursor.fetchone()["oid"] is not None
+            else "(SELECT NULL::text AS alias, "
+            "NULL::timestamptz AS provisioned_at WHERE FALSE)"
+        )
+        audit_sql = """
             SELECT
               current_database() AS "databaseName",
               current_user::text AS "currentUser",
@@ -1947,7 +1963,10 @@ with psycopg.connect(
               )
             ) AS settings
             WHERE login_role.rolname = current_user
-        """)
+        """
+        cursor.execute(
+            audit_sql.replace("federation._aliases", federation_registry_source)
+        )
         audit = cursor.fetchone()
         if audit and audit["searchPath"] != "pg_catalog, public":
             fail(

@@ -7443,7 +7443,9 @@ class Handler(SimpleHTTPRequestHandler):
                         connection_url,
                         allowed_relations=tuple(record["allowedRelations"]),
                     )
-                    result = FEDERATION.record_observation(alias_name, observation)
+                    result = FEDERATION.record_observation(
+                        alias_name, observation, connection_url
+                    )
                     CONTROL.audit(
                         "federation_alias.observed",
                         actor=actor,

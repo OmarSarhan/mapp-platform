@@ -104,9 +104,14 @@ class FederationAliasStore:
               registered_by text NOT NULL,
               registered_at timestamptz NOT NULL DEFAULT clock_timestamp(),
               last_observation jsonb,
+              last_observed_connection_identity text,
               provisioned_at timestamptz
             )
         """).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "last_observed_connection_identity text"
+        ).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._aliases FROM PUBLIC"
         ).format(sql.Identifier(SCHEMA)))
@@ -180,16 +185,18 @@ class FederationAliasStore:
             return list(cur.fetchall())
 
     def record_observation(
-        self, alias: str, observation: dict[str, Any]
+        self, alias: str, observation: dict[str, Any], connection_url: str
     ) -> dict[str, Any]:
         """Persist an already-validated observation (see federation_capability.detect_capability)."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
+        connection_identity = self._connection_identity(connection_url)
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
                 sql.SQL("""
                     UPDATE {}._aliases
                     SET last_observation = %s,
+                        last_observed_connection_identity = %s,
                         status = CASE
                           WHEN provisioned_at IS NULL THEN status
                           WHEN %s THEN 'active'
@@ -198,7 +205,7 @@ class FederationAliasStore:
                     WHERE alias = %s
                     RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
-                (Jsonb(observation), reachable, alias),
+                (Jsonb(observation), connection_identity, reachable, alias),
             )
             row = cur.fetchone()
             if row is None:
@@ -325,6 +332,35 @@ class FederationAliasStore:
                 )
             )
 
+    @staticmethod
+    def _connection_identity(connection_url: str) -> str:
+        """The physical endpoint a connectionRef currently resolves to
+        (host/port/dbname — deliberately not user/password). Observe and
+        Provision each resolve connectionRef independently, at their own
+        call time (app.py's resolve_federation_connection_url); binding
+        every observation to the endpoint it actually reached lets
+        Provision detect a connectionRef rotated to a different endpoint
+        since the last Observe, rather than trusting a "current" schema
+        flag that only proves some past endpoint was current."""
+        params = psycopg.conninfo.conninfo_to_dict(connection_url)
+        host = str(params.get("host", ""))
+        port = str(params.get("port", "5432"))
+        dbname = str(params.get("dbname", ""))
+        return f"{host}:{port}/{dbname}"
+
+    def _last_observed_connection_identity(self, alias: str) -> str | None:
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                sql.SQL("""
+                    SELECT last_observed_connection_identity
+                    FROM {}._aliases
+                    WHERE alias = %s
+                """).format(sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            row = cur.fetchone()
+            return row["last_observed_connection_identity"] if row else None
+
     def provision(
         self,
         alias: str,
@@ -369,6 +405,21 @@ class FederationAliasStore:
             raise FederationSchemaError(
                 f"Alias {alias!r} has not been observed as current — "
                 "observe it again immediately before provisioning.",
+                code="federation.observation_not_current",
+            )
+        # A "current" schema above only proves *some* past Observe call
+        # was current — not that it was taken against the endpoint this
+        # call is about to provision. If connectionRef's DBS_<NAME> was
+        # rotated to a different host/database since that Observe (e.g.
+        # the service restarted with a new value), this call would
+        # otherwise activate identically-named relations on an endpoint
+        # that was never observed or reviewed.
+        connection_identity = self._connection_identity(connection_url)
+        if self._last_observed_connection_identity(alias) != connection_identity:
+            raise FederationSchemaError(
+                f"Alias {alias!r}'s connectionRef now resolves to a "
+                "different endpoint than its last observation was taken "
+                "against — observe it again before provisioning.",
                 code="federation.observation_not_current",
             )
         params = psycopg.conninfo.conninfo_to_dict(connection_url)

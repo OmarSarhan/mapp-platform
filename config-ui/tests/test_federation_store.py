@@ -11,6 +11,13 @@ from federation_store import FederationAliasStore
 MATCHING_VERSIONS = {"postgis": "3.5.7", "proj": "9.8.1", "geos": "3.14.1"}
 DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
 
+# Matches _connection_identity() of "postgresql://reader:secret@source-db
+# :5432/sourcedb" — the connection_url every provision()-related fixture
+# below uses unless it's specifically exercising a rotated endpoint.
+SOURCE_DB_CONNECTION_IDENTITY = {
+    "last_observed_connection_identity": "source-db:5432/sourcedb"
+}
+
 
 def valid_registration(**overrides):
     value = {
@@ -137,11 +144,14 @@ class FederationAliasStoreTests(unittest.TestCase):
             "sourceVersion": None,
         }
 
-        result = store.record_observation("leeds_ext", observation)
+        result = store.record_observation(
+            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
 
         self.assertEqual("active", result["status"])
         update = cursor.execute.call_args_list[0]
-        self.assertEqual(True, update.args[1][1])
+        self.assertEqual("source-db:5432/sourcedb", update.args[1][1])
+        self.assertEqual(True, update.args[1][2])
 
     @patch("federation_store.extension_versions")
     def test_record_observation_marks_alias_unavailable_when_not_reachable(self, mock_versions):
@@ -162,7 +172,9 @@ class FederationAliasStoreTests(unittest.TestCase):
             "sourceVersion": None,
         }
 
-        result = store.record_observation("leeds_ext", observation)
+        result = store.record_observation(
+            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
 
         self.assertEqual("unavailable", result["status"])
 
@@ -186,7 +198,9 @@ class FederationAliasStoreTests(unittest.TestCase):
             "sourceVersion": None,
         }
 
-        result = store.record_observation("leeds_ext", observation)
+        result = store.record_observation(
+            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
 
         self.assertEqual("pending", result["status"])
         update = cursor.execute.call_args_list[0]
@@ -197,14 +211,18 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.return_value = None
         store = self.store_with_cursor(cursor)
         with self.assertRaises(FileNotFoundError):
-            store.record_observation("leeds_ext", {
-                "connectivity": "unavailable",
-                "schema": "unknown",
-                "sourceFreshness": "unknown",
-                "lastConnected": None,
-                "lastSchemaVerified": None,
-                "sourceVersion": None,
-            })
+            store.record_observation(
+                "leeds_ext",
+                {
+                    "connectivity": "unavailable",
+                    "schema": "unknown",
+                    "sourceFreshness": "unknown",
+                    "lastConnected": None,
+                    "lastSchemaVerified": None,
+                    "sourceVersion": None,
+                },
+                "postgresql://reader:secret@source-db:5432/sourcedb",
+            )
 
     @patch("federation_store.extension_versions")
     def test_record_observation_auto_disables_pushdown_on_version_drift(self, mock_versions):
@@ -229,7 +247,9 @@ class FederationAliasStoreTests(unittest.TestCase):
             "extensionVersions": MATCHING_VERSIONS,
         }
 
-        store.record_observation("leeds_ext", observation)
+        store.record_observation(
+            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertTrue(any("ALTER SERVER" in s and "DROP extensions" in s for s in statements))
@@ -258,7 +278,9 @@ class FederationAliasStoreTests(unittest.TestCase):
             "extensionVersions": MATCHING_VERSIONS,
         }
 
-        store.record_observation("leeds_ext", observation)
+        store.record_observation(
+            "leeds_ext", observation, "postgresql://reader:secret@source-db:5432/sourcedb"
+        )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))
@@ -307,6 +329,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
         ]
         cursor.fetchall.return_value = []
         store = self.store_with_cursor(cursor)
@@ -348,6 +371,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "rowLevelSecurityDetected": True,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -367,6 +391,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -399,6 +424,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -421,6 +447,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -440,6 +467,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -465,6 +493,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -494,6 +523,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": DIFFERENT_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
         ]
         cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
@@ -519,6 +549,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -563,6 +594,10 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            # The rotation itself was already observed — this identity
+            # matches the *new* endpoint, standing in for an Observe call
+            # already made against it before this reprovision.
+            {"last_observed_connection_identity": "new-source-db:5433/sourcedb"},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -589,6 +624,51 @@ class FederationAliasStoreTests(unittest.TestCase):
         )
         self.assertIn("rotated-secret", reader_mapping)
 
+    def test_provision_rejects_an_observation_from_a_different_connection_target(self):
+        # A "current" schema only proves *some* past Observe call was
+        # current — not that it was taken against the endpoint this call
+        # is about to provision. If the service restarted with connectionRef
+        # rotated to a different host/database since that Observe, this
+        # must not activate identically-named relations on an endpoint that
+        # was never observed.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
+            {"last_observed_connection_identity": "old-source-db:5432/sourcedb"},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext", "postgresql://reader:secret@source-db:5432/sourcedb"
+            )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    def test_reprovision_rejects_an_observation_from_a_different_connection_target(self):
+        # The reprovision branch reconciles ALTER SERVER host/port/dbname
+        # from whatever connectionRef resolves to right now — without this
+        # check, reprovisioning right after a rotation would wire the live
+        # FDW server up to a new endpoint using allowedRelations that were
+        # only ever verified against the old one.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current"},
+            ),
+            {"last_observed_connection_identity": "source-db:5432/sourcedb"},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext",
+                "postgresql://reader:secret@new-source-db:5433/sourcedb",
+            )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
     @patch("federation_store.extension_versions")
     def test_reprovision_adds_a_newly_configured_ssl_option(self, mock_versions):
         # An operator tightening sslmode from disable to require/verify-
@@ -604,6 +684,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db"]},
             {"srvoptions": ["host=source-db"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -632,6 +713,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db", "sslmode=require"]},
             {"srvoptions": ["host=source-db", "sslmode=require"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -660,6 +742,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db", "sslrootcert=/etc/ssl/old-ca.pem"]},
             {"srvoptions": ["host=source-db", "sslrootcert=/etc/ssl/old-ca.pem"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -690,6 +773,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -727,6 +811,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": MATCHING_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db"]},
             {"srvoptions": ["host=source-db"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -753,6 +838,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     "extensionVersions": DIFFERENT_VERSIONS,
                 },
             ),
+            SOURCE_DB_CONNECTION_IDENTITY,
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
