@@ -210,9 +210,23 @@ def detect_capability(
                     if version_relation is not None
                     else None
                 )
-    except psycopg.Error:
+    except psycopg.Error as exc:
+        # A rejected credential needs MAPP-side secret rotation, not a
+        # wait — the architecture doc requires reporting it distinctly
+        # from an outage (docs/federation-architecture-waypoint.md,
+        # "Drift and retirement"). psycopg surfaces a connection-phase
+        # auth rejection as a bare OperationalError with no SQLSTATE or
+        # diagnostics (unlike a query-time error), so the server's FATAL
+        # message text is the only signal available. Postgres
+        # deliberately uses this same message for both a wrong password
+        # and a nonexistent role, to avoid confirming which usernames
+        # exist — either way, the remote credential needs attention.
         return validate_observation({
-            "connectivity": "unavailable",
+            "connectivity": (
+                "unauthorized"
+                if "password authentication failed" in str(exc)
+                else "unavailable"
+            ),
             "schema": "unknown",
             "sourceFreshness": "unknown",
             "lastConnected": None,

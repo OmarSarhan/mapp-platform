@@ -46,7 +46,9 @@ FRESHNESS_STRATEGIES = frozenset(
 )
 TLS_POLICIES = frozenset({"require", "verify-ca", "verify-full"})
 
-CONNECTIVITY_STATES = frozenset({"reachable", "unavailable", "unknown"})
+CONNECTIVITY_STATES = frozenset(
+    {"reachable", "unavailable", "unauthorized", "unknown"}
+)
 SCHEMA_STATES = frozenset({"current", "changed", "unknown"})
 SOURCE_FRESHNESS_STATES = frozenset(
     {"current", "possibly_stale", "stale", "unknown"}

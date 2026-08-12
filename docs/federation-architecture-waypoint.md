@@ -534,7 +534,7 @@ and UI must report connectivity, schema compatibility, data-version evidence,
 and materialization age independently.
 
 ```text
-connectivity:          reachable | unavailable | unknown
+connectivity:          reachable | unavailable | unauthorized | unknown
 schema:                current | changed | unknown
 source freshness:      current | possibly_stale | stale | unknown
 last connected:        timestamp or null

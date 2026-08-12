@@ -183,6 +183,38 @@ class DetectCapabilityTests(unittest.TestCase):
             observation,
         )
 
+    def test_authentication_failure_is_reported_distinctly_from_an_outage(self):
+        # A rejected credential needs MAPP-side secret rotation, not a
+        # wait, and must never be conflated with "unreachable" (docs/
+        # federation-architecture-waypoint.md, "Drift and retirement").
+        # Postgres uses the exact same FATAL message for a wrong password
+        # and for a nonexistent role, to avoid confirming which usernames
+        # exist — both cases are "unauthorized" here.
+        with patch(
+            "federation_capability.psycopg.connect",
+            side_effect=psycopg.OperationalError(
+                'connection failed: connection to server at "10.0.0.5", '
+                'port 5432 failed: FATAL:  password authentication failed '
+                'for user "reader"'
+            ),
+        ):
+            observation = detect_capability(
+                "postgresql://reader",
+                allowed_relations=("leeds.bus_stops",),
+            )
+
+        self.assertEqual(
+            {
+                "connectivity": "unauthorized",
+                "schema": "unknown",
+                "sourceFreshness": "unknown",
+                "lastConnected": None,
+                "lastSchemaVerified": None,
+                "sourceVersion": None,
+            },
+            observation,
+        )
+
     def test_reads_a_configured_version_relation_scalar(self):
         cursor = ScriptedFakeCursor(
             extension_and_rls_results(relation_count=2),
