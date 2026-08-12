@@ -256,12 +256,26 @@ def detect_capability(
     })
 
 
-def physical_identity(connection_url: str) -> str:
+def physical_identity(
+    connection_url: str, allowed_relations: tuple[str, ...]
+) -> str:
     """The remote's actual physical database identity — the cluster's
-    system_identifier (changes if the whole cluster was rebuilt or
-    restored from scratch onto the same connection parameters) combined
-    with the connected database's own oid (changes if just this database
-    was dropped and recreated within an otherwise-unchanged cluster).
+    system_identifier, the connected database's own oid, and each
+    allowed relation's own oid, joined together.
+
+    system_identifier changes if the whole cluster was rebuilt or
+    restored from scratch onto the same connection parameters; the
+    database oid changes if just this database was dropped and
+    recreated within an otherwise-unchanged cluster. Neither changes
+    across a physical/PITR restore or an in-place logical restore that
+    never drops the database — both replace the source's actual
+    contents while preserving every cluster/database-level marker. Each
+    relation's own oid does change whenever it's recreated (as any
+    `pg_restore --clean`-style restore does to every object it
+    restores), so tracking it closes that gap; a relation that's gone
+    missing entirely also changes the identity rather than being
+    silently skipped, which is the same fail-closed direction
+    `federation_capability._verify_allowed_relations` already takes.
 
     A connectionRef's host/port/dbname/user can stay byte-for-byte
     identical while pointing at a genuinely different physical database
@@ -287,4 +301,16 @@ def physical_identity(connection_url: str) -> str:
                 "WHERE datname = current_database()"
             )
             (database_oid,) = cursor.fetchone()
-    return f"{system_identifier}/{database_oid}"
+            relation_oids = []
+            for entry in allowed_relations:
+                schema, relation = _parsed_schema_relation(entry)
+                cursor.execute(
+                    "SELECT c.oid FROM pg_catalog.pg_class AS c "
+                    "JOIN pg_catalog.pg_namespace AS n "
+                    "ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s",
+                    (schema, relation),
+                )
+                row = cursor.fetchone()
+                relation_oids.append(str(row[0]) if row else "missing")
+    return f"{system_identifier}/{database_oid}/{','.join(relation_oids)}"

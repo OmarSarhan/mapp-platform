@@ -7454,6 +7454,11 @@ class Handler(SimpleHTTPRequestHandler):
                             + ", ".join(sorted(payload)),
                             code="federation.invalid_request",
                         )
+                    # Captured before the remote probe, not after — this is
+                    # the ordering key two overlapping Observe calls for the
+                    # same alias are serialized by (FederationAliasStore.
+                    # record_observation), not when either happens to finish.
+                    observed_at = datetime.now(timezone.utc)
                     observation = detect_capability(
                         connection_url,
                         allowed_relations=tuple(record["allowedRelations"]),
@@ -7466,7 +7471,9 @@ class Handler(SimpleHTTPRequestHandler):
                     # fresh Observe first, same as any other "not current"
                     # observation.
                     observed_physical_identity = (
-                        physical_identity(connection_url)
+                        physical_identity(
+                            connection_url, tuple(record["allowedRelations"])
+                        )
                         if observation["connectivity"] == "reachable"
                         else None
                     )
@@ -7475,6 +7482,7 @@ class Handler(SimpleHTTPRequestHandler):
                         observation,
                         connection_url,
                         observed_physical_identity,
+                        observed_at,
                     )
                     CONTROL.audit(
                         "federation_alias.observed",

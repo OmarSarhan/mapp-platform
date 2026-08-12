@@ -22,6 +22,7 @@ silent break.
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -111,7 +112,8 @@ class FederationAliasStore:
               provisioned_at timestamptz,
               approved_by text,
               approved_at timestamptz,
-              physical_identity text
+              physical_identity text,
+              observed_at timestamptz
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
@@ -129,6 +131,10 @@ class FederationAliasStore:
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "physical_identity text"
         ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "observed_at timestamptz"
+        ).format(sql.Identifier(SCHEMA)))
         # DEFAULT backfills any alias registered before tlsPolicy was
         # persisted with the weakest of the three valid policies — the
         # conservative choice: it neither claims a stronger guarantee than
@@ -140,6 +146,30 @@ class FederationAliasStore:
         ).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._aliases FROM PUBLIC"
+        ).format(sql.Identifier(SCHEMA)))
+        # Every subsequent Observe replaces _aliases.last_observation, so a
+        # network outage, credential rejection, or schema drift permanently
+        # destroyed the preceding evidence — nothing could explain drift or
+        # an outage after the fact. This is the append-only counterpart:
+        # every observation ever taken, kept regardless of whether it went
+        # on to win record_observation()'s latest-observation race.
+        cur.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {}._observations (
+              id bigserial PRIMARY KEY,
+              alias text NOT NULL REFERENCES {}._aliases (alias),
+              observation jsonb NOT NULL,
+              connection_identity text,
+              physical_identity text,
+              observed_at timestamptz NOT NULL,
+              recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+        """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "CREATE INDEX IF NOT EXISTS _observations_alias_observed_at_idx "
+            "ON {}._observations (alias, observed_at DESC)"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "REVOKE ALL ON {}._observations FROM PUBLIC"
         ).format(sql.Identifier(SCHEMA)))
 
     _SELECT_COLUMNS = sql.SQL("""
@@ -221,42 +251,94 @@ class FederationAliasStore:
         observation: dict[str, Any],
         connection_url: str,
         physical_identity: str | None,
+        observed_at: datetime,
     ) -> dict[str, Any]:
         """Persist an already-validated observation (see
         federation_capability.detect_capability). `physical_identity` is
         the remote's live database identity (see
         federation_capability.physical_identity) — None when connectivity
         wasn't "reachable", since it can't be fetched from a source that
-        couldn't be reached."""
+        couldn't be reached. `observed_at` is when *this* Observe started
+        its remote probe (captured by the caller before that probe, not
+        when this call happens to reach the database) — two overlapping
+        Observe calls for the same alias can finish and try to write in
+        either order; without comparing this, whichever write simply
+        *commits* last would win even if its own probe was the older,
+        now-superseded one. The WHERE clause below makes a stale write a
+        no-op instead: Postgres serializes concurrent UPDATEs to the same
+        row, and each one re-checks this condition against whatever the
+        other just committed."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
         with self._connect() as connection, connection.cursor() as cur:
+            # Appended unconditionally, regardless of whether this
+            # observation goes on to win the latest-observation race below
+            # — a lost race is still a real fact about what this probe saw
+            # and when. The WHERE EXISTS guard makes this a silent no-op
+            # for a nonexistent alias rather than a foreign-key violation;
+            # the conditional UPDATE below still raises FileNotFoundError.
+            cur.execute(
+                sql.SQL("""
+                    INSERT INTO {}._observations
+                      (alias, observation, connection_identity,
+                       physical_identity, observed_at)
+                    SELECT %s, %s, %s, %s, %s
+                    WHERE EXISTS (
+                      SELECT 1 FROM {}._aliases WHERE alias = %s
+                    )
+                """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)),
+                (
+                    alias,
+                    Jsonb(observation),
+                    connection_identity,
+                    physical_identity,
+                    observed_at,
+                    alias,
+                ),
+            )
             cur.execute(
                 sql.SQL("""
                     UPDATE {}._aliases
                     SET last_observation = %s,
                         last_observed_connection_identity = %s,
                         physical_identity = %s,
+                        observed_at = %s,
                         status = CASE
                           WHEN provisioned_at IS NULL THEN status
                           WHEN %s THEN 'active'
                           ELSE 'unavailable'
                         END
                     WHERE alias = %s
+                      AND (observed_at IS NULL OR observed_at < %s)
                     RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
                 (
                     Jsonb(observation),
                     connection_identity,
                     physical_identity,
+                    observed_at,
                     reachable,
                     alias,
+                    observed_at,
                 ),
             )
             row = cur.fetchone()
             if row is None:
-                raise FileNotFoundError(alias)
+                # Either this alias doesn't exist, or a newer Observe
+                # already committed while this one's remote probe was
+                # still running. The latter isn't a failure — the row
+                # already holds the fresher result — so only raise once
+                # non-existence is confirmed.
+                cur.execute(
+                    sql.SQL("SELECT 1 FROM {}._aliases WHERE alias = %s").format(
+                        sql.Identifier(SCHEMA)
+                    ),
+                    (alias,),
+                )
+                if cur.fetchone() is None:
+                    raise FileNotFoundError(alias)
+                return self.get(alias)
             # A version drift discovered after provisioning must fail
             # pushdown closed immediately (docs/federation-architecture-
             # waypoint.md: "a version drift detected after provisioning
@@ -511,7 +593,9 @@ class FederationAliasStore:
             # remote's live physical identity now and compare against what
             # Observe last recorded.
             try:
-                current_physical_identity = physical_identity(connection_url)
+                current_physical_identity = physical_identity(
+                    connection_url, tuple(record["allowedRelations"])
+                )
             except psycopg.Error as exc:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source could not be reached to verify "

@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from federation_store import FederationAliasStore
 
 MATCHING_VERSIONS = {"postgis": "3.5.7", "proj": "9.8.1", "geos": "3.14.1"}
 DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
+OBSERVED_AT = datetime(2026, 8, 11, 0, 0, 0, tzinfo=timezone.utc)
 
 # Matches _connection_identity() of "postgresql://reader:secret@source-db
 # :5432/sourcedb" — the connection_url every provision()-related fixture
@@ -188,13 +190,30 @@ class FederationAliasStoreTests(unittest.TestCase):
             observation,
             "postgresql://reader:secret@source-db:5432/sourcedb",
             SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
         )
 
         self.assertEqual("active", result["status"])
-        update = cursor.execute.call_args_list[0]
+        history_insert = cursor.execute.call_args_list[0]
+        self.assertIn("INSERT INTO", str(history_insert.args[0]))
+        self.assertIn("_observations", str(history_insert.args[0]))
+        history_params = history_insert.args[1]
+        self.assertEqual("leeds_ext", history_params[0])
+        self.assertEqual(observation, history_params[1].obj)  # unwrap Jsonb
+        self.assertEqual(
+            (
+                "reader@source-db:5432/sourcedb",
+                SOURCE_DB_PHYSICAL_IDENTITY,
+                OBSERVED_AT,
+                "leeds_ext",
+            ),
+            history_params[2:],
+        )
+        update = cursor.execute.call_args_list[1]
         self.assertEqual("reader@source-db:5432/sourcedb", update.args[1][1])
         self.assertEqual(SOURCE_DB_PHYSICAL_IDENTITY, update.args[1][2])
-        self.assertEqual(True, update.args[1][3])
+        self.assertEqual(OBSERVED_AT, update.args[1][3])
+        self.assertEqual(True, update.args[1][4])
 
     @patch("federation_store.extension_versions")
     def test_record_observation_marks_alias_unavailable_when_not_reachable(self, mock_versions):
@@ -220,6 +239,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             observation,
             "postgresql://reader:secret@source-db:5432/sourcedb",
             None,
+            OBSERVED_AT,
         )
 
         self.assertEqual("unavailable", result["status"])
@@ -249,11 +269,50 @@ class FederationAliasStoreTests(unittest.TestCase):
             observation,
             "postgresql://reader:secret@source-db:5432/sourcedb",
             SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
         )
 
         self.assertEqual("pending", result["status"])
-        update = cursor.execute.call_args_list[0]
+        update = cursor.execute.call_args_list[1]
         self.assertIn("WHEN provisioned_at IS NULL THEN status", str(update.args[0]))
+
+    def test_record_observation_rejects_a_superseded_probe_as_a_no_op(self):
+        # Two overlapping Observe calls can finish in either order — this
+        # one's own probe (observed_at) is older than what's already
+        # stored, meaning a newer Observe already committed while this
+        # one's remote probe was still running. The conditional UPDATE's
+        # WHERE clause matches no row (Postgres serializes concurrent
+        # UPDATEs to the same row, so this always sees the fresher one
+        # once it commits) — silently keep the fresher result rather than
+        # overwrite it with this stale one.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            None,  # the conditional UPDATE matches no row (stale probe)
+            {"exists": 1},  # the alias does exist
+            alias_row(status="active"),  # self.get(alias)'s fresh read
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+        }
+
+        result = store.record_observation(
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
+        )
+
+        # No exception — the alias's already-fresher state is returned.
+        self.assertEqual("active", result["status"])
+        update = cursor.execute.call_args_list[1]
+        self.assertIn("observed_at IS NULL OR observed_at <", str(update.args[0]))
 
     def test_record_observation_raises_not_found_when_alias_missing(self):
         cursor = MagicMock()
@@ -272,6 +331,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                 },
                 "postgresql://reader:secret@source-db:5432/sourcedb",
                 None,
+                OBSERVED_AT,
             )
 
     @patch("federation_store.extension_versions")
@@ -302,6 +362,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             observation,
             "postgresql://reader:secret@source-db:5432/sourcedb",
             SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
@@ -336,6 +397,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             observation,
             "postgresql://reader:secret@source-db:5432/sourcedb",
             SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]

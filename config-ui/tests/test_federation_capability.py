@@ -303,27 +303,86 @@ class DetectCapabilityTests(unittest.TestCase):
 
 
 class PhysicalIdentityTests(unittest.TestCase):
-    def test_combines_the_cluster_and_database_identity(self):
-        cursor = ScriptedFakeCursor([(7672778953115078690,), (16384,)])
+    def test_combines_the_cluster_database_and_relation_identity(self):
+        cursor = ScriptedFakeCursor([
+            (7672778953115078690,), (16384,), (24601,),
+        ])
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity("postgresql://reader")
+            identity = physical_identity(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
 
-        self.assertEqual("7672778953115078690/16384", identity)
+        self.assertEqual("7672778953115078690/16384/24601", identity)
 
     def test_differs_when_the_database_was_dropped_and_recreated(self):
         # Same cluster (system_identifier unchanged), different database
         # oid — a DROP DATABASE + CREATE DATABASE within the same cluster.
-        cursor = ScriptedFakeCursor([(7672778953115078690,), (99999,)])
+        cursor = ScriptedFakeCursor([
+            (7672778953115078690,), (99999,), (24601,),
+        ])
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity = physical_identity("postgresql://reader")
+            identity = physical_identity(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
 
-        self.assertNotEqual("7672778953115078690/16384", identity)
+        self.assertNotEqual("7672778953115078690/16384/24601", identity)
+
+    def test_differs_when_a_relation_was_recreated(self):
+        # Same cluster and database — a physical/PITR restore, or an
+        # in-place logical restore that never drops the database, changes
+        # neither. Any restore recreating the relation itself (as
+        # pg_restore --clean does) gives it a new oid, which this must
+        # catch even when nothing at the database level changed.
+        cursor = ScriptedFakeCursor([
+            (7672778953115078690,), (16384,), (99999,),
+        ])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            identity = physical_identity(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
+
+        self.assertNotEqual("7672778953115078690/16384/24601", identity)
+
+    def test_treats_a_missing_relation_as_a_changed_identity(self):
+        # A relation that's gone entirely must not be silently skipped —
+        # fail closed the same direction _verify_allowed_relations already
+        # does for a missing/unselectable relation.
+        cursor = ScriptedFakeCursor([
+            (7672778953115078690,), (16384,), None,
+        ])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            identity = physical_identity(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
+
+        self.assertEqual("7672778953115078690/16384/missing", identity)
+
+    def test_orders_multiple_relations_by_the_given_sequence(self):
+        cursor = ScriptedFakeCursor([
+            (7672778953115078690,), (16384,), (111,), (222,),
+        ])
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            identity = physical_identity(
+                "postgresql://reader",
+                ("leeds.bus_stops", "leeds.roads"),
+            )
+
+        self.assertEqual("7672778953115078690/16384/111,222", identity)
 
     def test_propagates_a_connection_failure(self):
         with patch(
@@ -331,7 +390,7 @@ class PhysicalIdentityTests(unittest.TestCase):
             side_effect=psycopg.OperationalError("could not connect"),
         ):
             with self.assertRaises(psycopg.Error):
-                physical_identity("postgresql://unreachable")
+                physical_identity("postgresql://unreachable", ())
 
 
 if __name__ == "__main__":
