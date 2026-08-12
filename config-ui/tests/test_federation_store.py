@@ -15,7 +15,7 @@ DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
 # :5432/sourcedb" — the connection_url every provision()-related fixture
 # below uses unless it's specifically exercising a rotated endpoint.
 SOURCE_DB_CONNECTION_IDENTITY = {
-    "last_observed_connection_identity": "source-db:5432/sourcedb"
+    "last_observed_connection_identity": "reader@source-db:5432/sourcedb"
 }
 
 
@@ -150,7 +150,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         self.assertEqual("active", result["status"])
         update = cursor.execute.call_args_list[0]
-        self.assertEqual("source-db:5432/sourcedb", update.args[1][1])
+        self.assertEqual("reader@source-db:5432/sourcedb", update.args[1][1])
         self.assertEqual(True, update.args[1][2])
 
     @patch("federation_store.extension_versions")
@@ -597,7 +597,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             # The rotation itself was already observed — this identity
             # matches the *new* endpoint, standing in for an Observe call
             # already made against it before this reprovision.
-            {"last_observed_connection_identity": "new-source-db:5433/sourcedb"},
+            {"last_observed_connection_identity": "reader@new-source-db:5433/sourcedb"},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             {"srvoptions": ["host=source-db", "extensions=postgis"]},
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -634,7 +634,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             alias_row(provisionedAt=None, lastObservation={"schema": "current"}),
-            {"last_observed_connection_identity": "old-source-db:5432/sourcedb"},
+            {"last_observed_connection_identity": "reader@old-source-db:5432/sourcedb"},
         ]
         store = self.store_with_cursor(cursor)
 
@@ -657,7 +657,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                 provisionedAt="2026-08-11T00:00:00+00:00",
                 lastObservation={"schema": "current"},
             ),
-            {"last_observed_connection_identity": "source-db:5432/sourcedb"},
+            {"last_observed_connection_identity": "reader@source-db:5432/sourcedb"},
         ]
         store = self.store_with_cursor(cursor)
 
@@ -665,6 +665,30 @@ class FederationAliasStoreTests(unittest.TestCase):
             store.provision(
                 "leeds_ext",
                 "postgresql://reader:secret@new-source-db:5433/sourcedb",
+            )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    def test_reprovision_rejects_an_observation_from_a_different_remote_role(self):
+        # has_table_privilege and any row-level security the source
+        # enforces are evaluated per connecting role — a connectionRef
+        # rotated to a different remote username on the same host/port/
+        # dbname is just as much a change of "what was actually observed"
+        # as a host rotation, even though the endpoint string is identical.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            alias_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current"},
+            ),
+            {"last_observed_connection_identity": "reader@source-db:5432/sourcedb"},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError):
+            store.provision(
+                "leeds_ext",
+                "postgresql://admin:secret@source-db:5432/sourcedb",
             )
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))

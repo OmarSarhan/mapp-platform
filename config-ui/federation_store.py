@@ -334,19 +334,25 @@ class FederationAliasStore:
 
     @staticmethod
     def _connection_identity(connection_url: str) -> str:
-        """The physical endpoint a connectionRef currently resolves to
-        (host/port/dbname — deliberately not user/password). Observe and
-        Provision each resolve connectionRef independently, at their own
-        call time (app.py's resolve_federation_connection_url); binding
-        every observation to the endpoint it actually reached lets
-        Provision detect a connectionRef rotated to a different endpoint
-        since the last Observe, rather than trusting a "current" schema
-        flag that only proves some past endpoint was current."""
+        """The remote endpoint and login role a connectionRef currently
+        resolves to (host/port/dbname/user — deliberately not password,
+        a credential rather than an identity: re-authenticating the same
+        role is already reconciled on every provision/reprovision call
+        regardless of this check). Observe and Provision each resolve
+        connectionRef independently, at their own call time (app.py's
+        resolve_federation_connection_url); binding every observation to
+        the endpoint and role it actually reached lets Provision detect a
+        connectionRef rotated to a different endpoint OR a different
+        remote user since the last Observe — has_table_privilege and any
+        row-level security the source enforces are evaluated per-role, so
+        a role change alone can invalidate a "current" schema flag just as
+        much as a host change can."""
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
         host = str(params.get("host", ""))
         port = str(params.get("port", "5432"))
         dbname = str(params.get("dbname", ""))
-        return f"{host}:{port}/{dbname}"
+        user = str(params.get("user", ""))
+        return f"{user}@{host}:{port}/{dbname}"
 
     def _last_observed_connection_identity(self, alias: str) -> str | None:
         with self._connect() as connection, connection.cursor() as cur:
@@ -408,18 +414,21 @@ class FederationAliasStore:
                 code="federation.observation_not_current",
             )
         # A "current" schema above only proves *some* past Observe call
-        # was current — not that it was taken against the endpoint this
-        # call is about to provision. If connectionRef's DBS_<NAME> was
-        # rotated to a different host/database since that Observe (e.g.
-        # the service restarted with a new value), this call would
-        # otherwise activate identically-named relations on an endpoint
-        # that was never observed or reviewed.
+        # was current — not that it was taken against the endpoint and
+        # remote role this call is about to provision. If connectionRef's
+        # DBS_<NAME> was rotated to a different host/database, or to a
+        # different remote login role on the same host/database, since
+        # that Observe (e.g. the service restarted with a new value), this
+        # call would otherwise activate identically-named relations, or a
+        # different row set, that were never observed or reviewed under
+        # the role about to be wired up.
         connection_identity = self._connection_identity(connection_url)
         if self._last_observed_connection_identity(alias) != connection_identity:
             raise FederationSchemaError(
                 f"Alias {alias!r}'s connectionRef now resolves to a "
-                "different endpoint than its last observation was taken "
-                "against — observe it again before provisioning.",
+                "different endpoint or remote role than its last "
+                "observation was taken against — observe it again before "
+                "provisioning.",
                 code="federation.observation_not_current",
             )
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
