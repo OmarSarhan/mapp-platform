@@ -225,6 +225,21 @@ def validate_registration(payload: Any) -> dict[str, Any]:
         label="freshnessStrategy",
         allowed=FRESHNESS_STRATEGIES,
     )
+    # maximumAge/timestampColumn/versionRelation are a documented part of
+    # this contract (docs/federation-architecture-waypoint.md, Freshness
+    # and verification) but no evidence-collection exists for any of them
+    # yet — detect_capability() always reports sourceFreshness as
+    # "unknown" regardless of strategy, and nothing lets an operator
+    # configure which relation/column a non-manual strategy would even
+    # read. Accepting one of these here would silently promise freshness
+    # evidence the platform can never produce. Reject until implemented.
+    if freshness_strategy != "manual":
+        raise FederationSchemaError(
+            f"freshnessStrategy {freshness_strategy!r} is not yet "
+            "implemented. Register with 'manual' until "
+            "maximumAge/timestampColumn/versionRelation evidence "
+            "collection lands."
+        )
 
     return {
         "alias": alias,

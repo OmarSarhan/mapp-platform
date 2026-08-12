@@ -95,11 +95,23 @@ class ValidateRegistrationTests(unittest.TestCase):
         result = validate_registration(valid_registration())
         self.assertEqual("manual", result["freshnessStrategy"])
 
-    def test_accepts_an_explicit_freshness_strategy(self):
+    def test_accepts_the_only_currently_implemented_freshness_strategy(self):
         result = validate_registration(
-            valid_registration(freshnessStrategy="versionRelation")
+            valid_registration(freshnessStrategy="manual")
         )
-        self.assertEqual("versionRelation", result["freshnessStrategy"])
+        self.assertEqual("manual", result["freshnessStrategy"])
+
+    def test_rejects_freshness_strategies_with_no_evidence_collection_yet(self):
+        # maximumAge/timestampColumn/versionRelation are documented, but
+        # detect_capability() has no evidence-collection for any of them —
+        # accepting one would silently promise freshness evidence the
+        # platform can never produce.
+        for strategy in ("maximumAge", "timestampColumn", "versionRelation"):
+            with self.subTest(strategy=strategy):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(freshnessStrategy=strategy)
+                    )
 
     def test_rejects_missing_required_fields(self):
         for field in (

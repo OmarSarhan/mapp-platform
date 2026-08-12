@@ -1582,10 +1582,13 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "dataHandlingAcknowledged": {"const": True},
                 "freshnessStrategy": {
-                    "enum": [
-                        "manual", "maximumAge", "timestampColumn",
-                        "versionRelation",
-                    ],
+                    # maximumAge/timestampColumn/versionRelation are a
+                    # documented part of the architecture but have no
+                    # evidence-collection implementation yet — see
+                    # federation_schema.py's validate_registration(). The
+                    # contract must not advertise support the server
+                    # rejects.
+                    "enum": ["manual"],
                 },
             },
             "additionalProperties": False,

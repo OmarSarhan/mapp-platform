@@ -449,13 +449,16 @@ generated PostgreSQL schema name — and the unbounded `DB_KEY` length is the
 sharper problem, since `source_` plus an alias must stay within PostgreSQL's
 63-byte identifier limit.
 
-**Decided:** the semantic allowlist pattern (`[A-Za-z][A-Za-z0-9_-]{0,62}`)
-becomes the single alias grammar. `DB_KEY` at `config-ui/workspace_schema.py:21`
-and `workspace.schema.json`'s `databaseKey` must be tightened to match — this
-narrows what a workspace `dbs` key may be, so any existing deployment with an
-alias outside the new pattern (leading digit, over 63 characters) needs an
-explicit migration note in the change that lands this, not a silent
-validation break.
+**Decided:** the semantic allowlist pattern becomes the single alias
+grammar — `[A-Za-z][A-Za-z0-9_]{0,55}` (see decision #12 below for the
+final length and hyphen corrections made once real federation-alias
+provisioning surfaced why 63 characters and hyphens don't work).
+`DB_KEY` at `config-ui/workspace_schema.py:21` and
+`workspace.schema.json`'s `databaseKey` must be tightened to match — this
+narrows what a workspace `dbs` key may be, so any existing deployment with
+an alias outside the new pattern (leading digit, a hyphen, or over 56
+characters) needs an explicit migration note in the change that lands
+this, not a silent validation break.
 
 Aliases must also not expose credentials, hostnames, or tenant-sensitive values
 in generated schema names.
@@ -1809,11 +1812,14 @@ The next design pass must explicitly resolve, rather than silently assume:
 11. **Decided:** never — integration/derived relations only, from day one.
     See **Federation database layout > Foreign source schemas**.
 12. **Decided:** the reconciled alias pattern is the existing semantic
-    allowlist grammar, `[A-Za-z][A-Za-z0-9_-]{0,55}` (max length 56, not the
+    allowlist grammar, `[A-Za-z][A-Za-z0-9_]{0,55}` (max length 56, not the
     original 63 this decision first specified — 63 was wrong arithmetic:
     `source_` is 7 bytes, and 7 + 63 exceeds PostgreSQL's 63-byte identifier
     limit, so a long-enough alias silently truncated and could collide with
-    another; corrected once real federation-alias provisioning surfaced it).
+    another; corrected once real federation-alias provisioning surfaced it.
+    No hyphen, also corrected later: `source_<alias>` must be usable,
+    unquoted, as a schema/relation name component elsewhere, and those
+    grammars already reject hyphens).
     `config-ui/workspace_schema.py:21` (`DB_KEY`) and `databaseKey` in
     `config-ui/schema/workspace.schema.json` must be tightened to match;
     any existing alias outside the new pattern needs an explicit migration
