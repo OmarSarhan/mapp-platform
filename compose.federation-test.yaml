@@ -3,8 +3,14 @@
 # Bring up manually alongside the bundled stack, e.g.:
 #   docker compose --project-directory . --env-file .env \
 #     --file compose.yaml --file compose.bundled-db.yaml \
-#     --file compose.federation-test.yaml up -d source-db
+#     --file compose.federation-test.yaml up -d source-db config-ui
 #   ./docker/source-db/seed.sh
+#
+# config-ui must be named alongside source-db here even if it's already
+# running from the base stack — `up -d <service>` only starts/recreates
+# the services it's given, so an already-running config-ui started without
+# this overlay never picks up the DBS_LEEDS_EXT entry below, and Observe
+# fails with federation.connection_ref_not_found.
 #
 # Deliberately plain postgis/postgis, not the custom mapp-postgis-h3 image —
 # a real independently-operated external source would not have MAPP's own

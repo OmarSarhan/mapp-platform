@@ -60,14 +60,27 @@ def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
     return results
 
 
+def physical_identity_results(relation_oids=(24601,)):
+    results = [
+        {"system_identifier": 7672778953115078690},
+        {"oid": 16384},
+    ]
+    results.extend(
+        ({"oid": oid} if oid is not None else None) for oid in relation_oids
+    )
+    return results
+
+
 class DetectCapabilityTests(unittest.TestCase):
     def test_reports_reachable_with_full_extension_versions(self):
-        cursor = ScriptedFakeCursor(extension_and_rls_results())
+        cursor = ScriptedFakeCursor(
+            extension_and_rls_results() + physical_identity_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
-        ):
-            observation, observed_at = detect_capability(
+        ) as mock_connect:
+            observation, observed_at, physical_id = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -93,14 +106,23 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertFalse(observation["rowLevelSecurityDetected"])
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNotNone(observation["lastSchemaVerified"])
+        # The physical identity must come from this same probe's snapshot,
+        # not a second connection — a relation dropped and recreated
+        # between two separate connections would let a physical identity
+        # for the *new* relation get paired with schema evidence that only
+        # ever verified the *old* one.
+        self.assertEqual("7672778953115078690/16384/24601", physical_id)
+        self.assertEqual(1, mock_connect.call_count)
 
     def test_reports_no_postgis_without_probing_proj_or_geos(self):
-        cursor = ScriptedFakeCursor(extension_and_rls_results(postgis=False))
+        cursor = ScriptedFakeCursor(
+            extension_and_rls_results(postgis=False) + physical_identity_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _ = detect_capability(
+            observation, _, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -122,12 +144,12 @@ class DetectCapabilityTests(unittest.TestCase):
             {"version": "9.3.1"},
             {"version": "3.12.1"},
             None,
-        ])
+        ] + physical_identity_results(relation_oids=(None,)))
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _ = detect_capability(
+            observation, _, physical_id = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -136,14 +158,20 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertEqual("reachable", observation["connectivity"])
         self.assertEqual("changed", observation["schema"])
         self.assertFalse(observation["rowLevelSecurityDetected"])
+        # Physical identity is still collected even when the schema check
+        # itself found the relation missing — the identity's own "missing"
+        # marker is what carries that fact forward, not a skipped call.
+        self.assertEqual("7672778953115078690/16384/missing", physical_id)
 
     def test_detects_row_level_security(self):
-        cursor = ScriptedFakeCursor(extension_and_rls_results(rls=True))
+        cursor = ScriptedFakeCursor(
+            extension_and_rls_results(rls=True) + physical_identity_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _ = detect_capability(
+            observation, _, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -156,12 +184,14 @@ class DetectCapabilityTests(unittest.TestCase):
         # bypass risk applies to a security-barrier view (a common way to
         # implement per-user row filtering without native RLS) as to
         # relrowsecurity — the query combines both signals.
-        cursor = ScriptedFakeCursor(extension_and_rls_results(rls=True))
+        cursor = ScriptedFakeCursor(
+            extension_and_rls_results(rls=True) + physical_identity_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _ = detect_capability(
+            observation, _, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.tenant_scoped_view",),
                 tls_policy="require",
@@ -176,7 +206,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             side_effect=psycopg.OperationalError("could not connect"),
         ):
-            observation, observed_at = detect_capability(
+            observation, observed_at, physical_id = detect_capability(
                 "postgresql://unreachable?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -196,6 +226,7 @@ class DetectCapabilityTests(unittest.TestCase):
         # Even a failed probe gets an ordering marker — captured at the
         # moment the connection was given up as failed.
         self.assertIsInstance(observed_at, datetime)
+        self.assertIsNone(physical_id)
 
     def test_authentication_failure_is_reported_distinctly_from_an_outage(self):
         # A rejected credential needs MAPP-side secret rotation, not a
@@ -212,7 +243,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 'for user "reader"'
             ),
         ):
-            observation, _ = detect_capability(
+            observation, _, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -244,14 +275,15 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_reads_a_configured_version_relation_scalar(self):
         cursor = ScriptedFakeCursor(
-            extension_and_rls_results(relation_count=2),
+            extension_and_rls_results(relation_count=2)
+            + physical_identity_results(relation_oids=(24601, 24602)),
             fetchall_results=[[{"release_id": "release-42"}]],
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _ = detect_capability(
+            observation, _, _ = detect_capability(
                 "postgresql://reader?sslmode=require",
                 allowed_relations=("leeds.bus_stops", "leeds.dataset_publication"),
                 tls_policy="require",
@@ -312,9 +344,7 @@ class DetectCapabilityTests(unittest.TestCase):
 
 class PhysicalIdentityTests(unittest.TestCase):
     def test_combines_the_cluster_database_and_relation_identity(self):
-        cursor = ScriptedFakeCursor([
-            (7672778953115078690,), (16384,), (24601,),
-        ])
+        cursor = ScriptedFakeCursor(physical_identity_results())
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
@@ -329,7 +359,9 @@ class PhysicalIdentityTests(unittest.TestCase):
         # Same cluster (system_identifier unchanged), different database
         # oid — a DROP DATABASE + CREATE DATABASE within the same cluster.
         cursor = ScriptedFakeCursor([
-            (7672778953115078690,), (99999,), (24601,),
+            {"system_identifier": 7672778953115078690},
+            {"oid": 99999},
+            {"oid": 24601},
         ])
         with patch(
             "federation_capability.psycopg.connect",
@@ -347,9 +379,7 @@ class PhysicalIdentityTests(unittest.TestCase):
         # neither. Any restore recreating the relation itself (as
         # pg_restore --clean does) gives it a new oid, which this must
         # catch even when nothing at the database level changed.
-        cursor = ScriptedFakeCursor([
-            (7672778953115078690,), (16384,), (99999,),
-        ])
+        cursor = ScriptedFakeCursor(physical_identity_results(relation_oids=(99999,)))
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
@@ -364,9 +394,7 @@ class PhysicalIdentityTests(unittest.TestCase):
         # A relation that's gone entirely must not be silently skipped —
         # fail closed the same direction _verify_allowed_relations already
         # does for a missing/unselectable relation.
-        cursor = ScriptedFakeCursor([
-            (7672778953115078690,), (16384,), None,
-        ])
+        cursor = ScriptedFakeCursor(physical_identity_results(relation_oids=(None,)))
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
@@ -378,9 +406,9 @@ class PhysicalIdentityTests(unittest.TestCase):
         self.assertEqual("7672778953115078690/16384/missing", identity)
 
     def test_orders_multiple_relations_by_the_given_sequence(self):
-        cursor = ScriptedFakeCursor([
-            (7672778953115078690,), (16384,), (111,), (222,),
-        ])
+        cursor = ScriptedFakeCursor(
+            physical_identity_results(relation_oids=(111, 222))
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),

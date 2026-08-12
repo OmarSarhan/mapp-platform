@@ -173,13 +173,63 @@ def _version_relation_scalar(
     return value
 
 
+def _physical_identity_from_cursor(
+    cursor: Any, allowed_relations: tuple[str, ...]
+) -> str:
+    """The remote's actual physical database identity — the cluster's
+    system_identifier, the connected database's own oid, and each
+    allowed relation's own oid, joined together.
+
+    system_identifier changes if the whole cluster was rebuilt or
+    restored from scratch onto the same connection parameters; the
+    database oid changes if just this database was dropped and
+    recreated within an otherwise-unchanged cluster. Neither changes
+    across a physical/PITR restore or an in-place logical restore that
+    never drops the database — both replace the source's actual
+    contents while preserving every cluster/database-level marker. Each
+    relation's own oid does change whenever it's recreated (as any
+    `pg_restore --clean`-style restore does to every object it
+    restores), so tracking it closes that gap; a relation that's gone
+    missing entirely also changes the identity rather than being
+    silently skipped, which is the same fail-closed direction
+    `federation_capability._verify_allowed_relations` already takes.
+
+    Takes an already-open, already-`_begin_read_only`'d cursor rather than
+    opening its own connection: computing this from a *separate* connection
+    than whatever verified `allowed_relations`' schema would let the remote
+    drop and recreate a relation in between, pairing a physical identity for
+    the *new* relation with schema evidence that only ever inspected the
+    *old* one — Provision would then see that new identity still match and
+    import the replacement relation without it ever having been verified."""
+    cursor.execute("SELECT system_identifier FROM pg_control_system()")
+    system_identifier = cursor.fetchone()["system_identifier"]
+    cursor.execute(
+        "SELECT oid FROM pg_catalog.pg_database "
+        "WHERE datname = current_database()"
+    )
+    database_oid = cursor.fetchone()["oid"]
+    relation_oids = []
+    for entry in allowed_relations:
+        schema, relation = _parsed_schema_relation(entry)
+        cursor.execute(
+            "SELECT c.oid FROM pg_catalog.pg_class AS c "
+            "JOIN pg_catalog.pg_namespace AS n "
+            "ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s",
+            (schema, relation),
+        )
+        row = cursor.fetchone()
+        relation_oids.append(str(row["oid"]) if row else "missing")
+    return f"{system_identifier}/{database_oid}/{','.join(relation_oids)}"
+
+
 def detect_capability(
     connection_url: str,
     *,
     allowed_relations: tuple[str, ...],
     tls_policy: str,
     version_relation: str | None = None,
-) -> tuple[dict[str, Any], datetime]:
+) -> tuple[dict[str, Any], datetime, str | None]:
     """Bounded, read-only capability and connectivity detection.
 
     `allowed_relations` are normalized "schema.relation" strings, matching
@@ -193,17 +243,20 @@ def detect_capability(
     collection Discover calls for. Never reads anything not on the
     allowlist.
 
-    Returns (observation, observed_at) — observation is already validated
-    against `federation_schema.validate_observation()`'s closed contract.
-    observed_at is captured *after* the connection attempt resolves (either
-    once it succeeds, fixing this probe's REPEATABLE READ snapshot, or once
-    it's given up as failed), never before attempting it — a connection
-    that stalls must not make this probe look "older" than a concurrent one
-    that started later but connected faster and is now looking at data
-    this probe will supersede once it finally connects.
+    Returns (observation, observed_at, physical_identity) — observation is
+    already validated against `federation_schema.validate_observation()`'s
+    closed contract. observed_at is captured *after* the connection attempt
+    resolves (either once it succeeds, fixing this probe's REPEATABLE READ
+    snapshot, or once it's given up as failed), never before attempting it
+    — a connection that stalls must not make this probe look "older" than a
+    concurrent one that started later but connected faster and is now
+    looking at data this probe will supersede once it finally connects.
     FederationAliasStore.record_observation()'s ordering depends on this:
     it compares observed_at, not call order, to decide which of two
-    overlapping Observe calls actually saw the more current state."""
+    overlapping Observe calls actually saw the more current state.
+    physical_identity is computed from this same connection's snapshot when
+    reachable (None otherwise) — see _physical_identity_from_cursor for why
+    it must not be a second, separate connection."""
     if version_relation is not None and version_relation not in allowed_relations:
         raise FederationSchemaError(
             f"version_relation {version_relation!r} must be one of the "
@@ -229,6 +282,9 @@ def detect_capability(
                     if version_relation is not None
                     else None
                 )
+                physical_id = _physical_identity_from_cursor(
+                    cursor, allowed_relations
+                )
     except psycopg.Error as exc:
         # A rejected credential needs MAPP-side secret rotation, not a
         # wait — the architecture doc requires reporting it distinctly
@@ -251,7 +307,7 @@ def detect_capability(
             "lastConnected": None,
             "lastSchemaVerified": None,
             "sourceVersion": None,
-        }), datetime.now(timezone.utc)
+        }), datetime.now(timezone.utc), None
 
     return validate_observation({
         "connectivity": "reachable",
@@ -262,64 +318,31 @@ def detect_capability(
         "sourceVersion": source_version,
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
-    }), observed_at
+    }), observed_at, physical_id
 
 
 def physical_identity(
     connection_url: str, allowed_relations: tuple[str, ...]
 ) -> str:
-    """The remote's actual physical database identity — the cluster's
-    system_identifier, the connected database's own oid, and each
-    allowed relation's own oid, joined together.
-
-    system_identifier changes if the whole cluster was rebuilt or
-    restored from scratch onto the same connection parameters; the
-    database oid changes if just this database was dropped and
-    recreated within an otherwise-unchanged cluster. Neither changes
-    across a physical/PITR restore or an in-place logical restore that
-    never drops the database — both replace the source's actual
-    contents while preserving every cluster/database-level marker. Each
-    relation's own oid does change whenever it's recreated (as any
-    `pg_restore --clean`-style restore does to every object it
-    restores), so tracking it closes that gap; a relation that's gone
-    missing entirely also changes the identity rather than being
-    silently skipped, which is the same fail-closed direction
-    `federation_capability._verify_allowed_relations` already takes.
-
-    A connectionRef's host/port/dbname/user can stay byte-for-byte
-    identical while pointing at a genuinely different physical database
-    — nothing about the connection string itself would ever reveal a
-    same-name replacement. Observe records this; Provision re-fetches it
-    live and compares, matching docs/federation-architecture-waypoint.md's
-    "Different physical database | Raise identity conflict; require
-    explicit rebind" requirement.
+    """Provision's own standalone re-check of `_physical_identity_from_cursor`
+    — deliberately a fresh connection, not shared with any prior Observe,
+    since the whole point is to catch drift that happened *since* Observe's
+    snapshot (docs/federation-architecture-waypoint.md, "Drift and
+    retirement": "Different physical database | Raise identity conflict;
+    require explicit rebind"). A connectionRef's host/port/dbname/user can
+    stay byte-for-byte identical while pointing at a genuinely different
+    physical database — nothing about the connection string itself would
+    ever reveal a same-name replacement.
 
     Raises psycopg.Error on a connection failure — callers already
     reachability-gate this (Observe via detect_capability, Provision via
     its own preceding checks), so a failure here is never the first
     sign of an unreachable source."""
     with psycopg.connect(
-        connection_url, connect_timeout=CONNECT_TIMEOUT_SECONDS
+        connection_url,
+        connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        row_factory=dict_row,
     ) as connection:
         with connection.cursor() as cursor:
             PostgresSemanticSources._begin_read_only(cursor)
-            cursor.execute("SELECT system_identifier FROM pg_control_system()")
-            (system_identifier,) = cursor.fetchone()
-            cursor.execute(
-                "SELECT oid FROM pg_catalog.pg_database "
-                "WHERE datname = current_database()"
-            )
-            (database_oid,) = cursor.fetchone()
-            relation_oids = []
-            for entry in allowed_relations:
-                schema, relation = _parsed_schema_relation(entry)
-                cursor.execute(
-                    "SELECT c.oid FROM pg_catalog.pg_class AS c "
-                    "JOIN pg_catalog.pg_namespace AS n "
-                    "ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = %s AND c.relname = %s",
-                    (schema, relation),
-                )
-                row = cursor.fetchone()
-                relation_oids.append(str(row[0]) if row else "missing")
-    return f"{system_identifier}/{database_oid}/{','.join(relation_oids)}"
+            return _physical_identity_from_cursor(cursor, allowed_relations)

@@ -44,7 +44,7 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_capability import detect_capability, physical_identity
+from federation_capability import detect_capability
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
 from static_files import safe_static_path
@@ -7463,24 +7463,22 @@ class Handler(SimpleHTTPRequestHandler):
                     # would instead reflect whichever request merely
                     # *started* first, which a stalled connection can
                     # decouple entirely from which one actually saw the
-                    # more current state.
-                    observation, observed_at = detect_capability(
-                        connection_url,
-                        allowed_relations=tuple(record["allowedRelations"]),
-                        tls_policy=record["tlsPolicy"],
-                    )
-                    # Only fetchable from a source that was actually
-                    # reachable just now — Provision re-fetches and
-                    # compares this same value live, so a stale None here
-                    # simply means the next Provision attempt will need a
-                    # fresh Observe first, same as any other "not current"
-                    # observation.
-                    observed_physical_identity = (
-                        physical_identity(
-                            connection_url, tuple(record["allowedRelations"])
+                    # more current state. Its physical identity is likewise
+                    # computed from that same connection's snapshot (None
+                    # when unreachable) — a second, separate connection here
+                    # could observe a relation the remote dropped and
+                    # recreated in between, see federation_capability's
+                    # _physical_identity_from_cursor for why that matters.
+                    # Provision re-fetches and compares this same value
+                    # live, so a stale None here simply means the next
+                    # Provision attempt will need a fresh Observe first,
+                    # same as any other "not current" observation.
+                    observation, observed_at, observed_physical_identity = (
+                        detect_capability(
+                            connection_url,
+                            allowed_relations=tuple(record["allowedRelations"]),
+                            tls_policy=record["tlsPolicy"],
                         )
-                        if observation["connectivity"] == "reachable"
-                        else None
                     )
                     result = FEDERATION.record_observation(
                         alias_name,
