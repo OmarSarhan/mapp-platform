@@ -114,7 +114,8 @@ class FederationAliasStore:
               approved_at timestamptz,
               physical_identity text,
               observed_at timestamptz,
-              row_level_security_acknowledged boolean NOT NULL DEFAULT false
+              row_level_security_acknowledged boolean NOT NULL DEFAULT false,
+              accepted_schema_fingerprint text
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
@@ -139,6 +140,15 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "row_level_security_acknowledged boolean NOT NULL DEFAULT false"
+        ).format(sql.Identifier(SCHEMA)))
+        # NULL until a successful provision() explicitly accepts a live
+        # schema_fingerprint (see provision()'s docstring) — deliberately
+        # not backfilled from last_observation, which reflects whatever
+        # the most recent Observe merely *saw*, not what a human actually
+        # reviewed and accepted.
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "accepted_schema_fingerprint text"
         ).format(sql.Identifier(SCHEMA)))
         # DEFAULT backfills any alias registered before tlsPolicy was
         # persisted with the weakest of the three valid policies — the
@@ -292,42 +302,19 @@ class FederationAliasStore:
         clock domain's timestamp.
 
         `observation["schema"]` as computed by detect_capability() only
-        reflects relation existence/selectability — it has no access to
-        what a *previous* Observe accepted, so it cannot by itself detect
-        an already-present, still-selectable relation whose columns or
-        view definition changed since then. Left uncorrected, that drift
-        would be silently adopted as the new "current" baseline the
-        moment an operator does exactly what a rejected Provision call
-        tells them to do (observe again) — nobody ever sees "changed".
-        Comparing the incoming schemaFingerprint against the alias's
-        currently-stored one here, before persisting, closes that: a
-        drifted fingerprint overrides schema to "changed" even though
-        every relation is still present and selectable, so provision()'s
-        existing "schema must be current" gate catches it same as any
-        other unreviewed drift."""
+        reflects relation existence/selectability, not whether the
+        column list or view definition changed since some prior Observe —
+        this function does not attempt that comparison (an earlier version
+        did, comparing against last_observation, but last_observation is
+        exactly what every Observe overwrites, including this one, so it
+        self-healed the moment anyone observed twice — see provision()'s
+        accepted_schema_fingerprint column and docstring for where that
+        comparison correctly lives instead: against a value only a
+        successful Provision call ever changes)."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
         with self._connect() as connection, connection.cursor() as cur:
-            incoming_fingerprint = observation.get("schemaFingerprint")
-            if incoming_fingerprint is not None:
-                cur.execute(
-                    sql.SQL("""
-                        SELECT last_observation ->> 'schemaFingerprint'
-                          AS schema_fingerprint
-                        FROM {}._aliases WHERE alias = %s
-                    """).format(sql.Identifier(SCHEMA)),
-                    (alias,),
-                )
-                existing = cur.fetchone()
-                stored_fingerprint = (
-                    existing["schema_fingerprint"] if existing else None
-                )
-                if (
-                    stored_fingerprint is not None
-                    and stored_fingerprint != incoming_fingerprint
-                ):
-                    observation = {**observation, "schema": "changed"}
             # Appended unconditionally, regardless of whether this
             # observation goes on to win the latest-observation race below
             # — a lost race is still a real fact about what this probe saw
@@ -552,6 +539,7 @@ class FederationAliasStore:
         actor: str,
         *,
         acknowledge_row_level_security: bool = False,
+        acknowledge_schema_change: bool = False,
     ) -> dict[str, Any]:
         """Create the real FDW server, user mapping, schema, and foreign
         tables for this alias's allowedRelations the first time this is
@@ -563,7 +551,20 @@ class FederationAliasStore:
         approving principal — every call (initial or reprovisioning) is
         itself an act of Approve exposure, recorded atomically with
         activation as the docs/federation-architecture-waypoint.md source-
-        alias contract's approvedBy/approvedAt consent record."""
+        alias contract's approvedBy/approvedAt consent record.
+
+        `acknowledge_schema_change` mirrors `acknowledge_row_level_security`
+        exactly, for the same reason: `accepted_schema_fingerprint` is a
+        durable column this method alone ever writes (never Observe), so a
+        live fingerprint that no longer matches it means the source's
+        columns or view definition changed since the *last explicit
+        acceptance* — not merely since the last Observe, which self-heals
+        the comparison the moment anyone observes twice with no further
+        changes (see record_observation()'s docstring). A caller must
+        explicitly accept that change to proceed, exactly as with RLS;
+        every successful call, whether or not acknowledgement was needed
+        this time, re-persists accepted_schema_fingerprint as the new
+        baseline."""
         alias = validate_alias(alias)
         with self._connect() as connection, connection.cursor() as cur:
             # Locks the row for the remainder of this call — a concurrent
@@ -578,7 +579,7 @@ class FederationAliasStore:
             cur.execute(
                 sql.SQL("""
                     SELECT {}, last_observed_connection_identity,
-                           physical_identity
+                           physical_identity, accepted_schema_fingerprint
                     FROM {}._aliases
                     WHERE alias = %s
                     FOR UPDATE
@@ -593,6 +594,7 @@ class FederationAliasStore:
                 "last_observed_connection_identity"
             )
             last_observed_physical_identity = record.pop("physical_identity")
+            accepted_schema_fingerprint = record.pop("accepted_schema_fingerprint")
             already_provisioned = record["provisionedAt"] is not None
             last_observation = record.get("lastObservation") or {}
             # Every MAPP caller queries a federated source through the same
@@ -732,14 +734,25 @@ class FederationAliasStore:
             # neither a relation's oid nor its RLS flags, so without this,
             # either could silently reach every runtime caller through the
             # blanket GRANT SELECT below, never having been reviewed.
-            last_schema_fingerprint = last_observation.get("schemaFingerprint")
-            if last_schema_fingerprint != current_schema_fingerprint:
+            # Compared against accepted_schema_fingerprint (durable, set
+            # only by a prior successful provision() below), not against
+            # last_observation — the latter is exactly what every Observe
+            # overwrites, including one that itself reports the drift, so
+            # comparing against it would self-heal the moment anyone
+            # observes twice with nothing further changed. None means
+            # nothing has been accepted yet (this alias's first
+            # provisioning), which always proceeds.
+            schema_fingerprint_changed = (
+                accepted_schema_fingerprint is not None
+                and accepted_schema_fingerprint != current_schema_fingerprint
+            )
+            if schema_fingerprint_changed and not acknowledge_schema_change:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's relation definitions "
-                    "(columns or view query) no longer match its last "
-                    "observation — observe it again and review before "
-                    "provisioning.",
-                    code="federation.observation_not_current",
+                    "(columns or view query) no longer match what was "
+                    "last explicitly accepted — acknowledge this "
+                    "explicitly to provision.",
+                    code="federation.schema_change_not_acknowledged",
                 )
             params = psycopg.conninfo.conninfo_to_dict(connection_url)
             host = str(params.get("host", ""))
@@ -830,10 +843,16 @@ class FederationAliasStore:
                     sql.SQL("""
                         UPDATE {}._aliases
                         SET approved_by = %s, approved_at = clock_timestamp(),
-                            row_level_security_acknowledged = %s
+                            row_level_security_acknowledged = %s,
+                            accepted_schema_fingerprint = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
-                    (actor, rls_bypass_acknowledged, alias),
+                    (
+                        actor,
+                        rls_bypass_acknowledged,
+                        current_schema_fingerprint,
+                        alias,
+                    ),
                 )
             else:
                 server_options = [
@@ -981,10 +1000,16 @@ class FederationAliasStore:
                         UPDATE {}._aliases
                         SET provisioned_at = clock_timestamp(), status = 'active',
                             approved_by = %s, approved_at = clock_timestamp(),
-                            row_level_security_acknowledged = %s
+                            row_level_security_acknowledged = %s,
+                            accepted_schema_fingerprint = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
-                    (actor, rls_bypass_acknowledged, alias),
+                    (
+                        actor,
+                        rls_bypass_acknowledged,
+                        current_schema_fingerprint,
+                        alias,
+                    ),
                 )
         return self.get(alias)
 

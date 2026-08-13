@@ -7541,7 +7541,11 @@ class Handler(SimpleHTTPRequestHandler):
                         )
                     else:
                         unexpected = sorted(
-                            set(payload) - {"rowLevelSecurityAcknowledged"}
+                            set(payload)
+                            - {
+                                "rowLevelSecurityAcknowledged",
+                                "schemaChangeAcknowledged",
+                            }
                         )
                         if unexpected:
                             raise FederationSchemaError(
@@ -7556,11 +7560,26 @@ class Handler(SimpleHTTPRequestHandler):
                                 "when present.",
                                 code="federation.invalid_request",
                             )
+                        schema_change_acknowledged = payload.get(
+                            "schemaChangeAcknowledged"
+                        )
+                        if (
+                            schema_change_acknowledged is not None
+                            and schema_change_acknowledged is not True
+                        ):
+                            raise FederationSchemaError(
+                                "schemaChangeAcknowledged must be true "
+                                "when present.",
+                                code="federation.invalid_request",
+                            )
                         result = FEDERATION.provision(
                             alias_name,
                             connection_url,
                             actor,
                             acknowledge_row_level_security=acknowledged is True,
+                            acknowledge_schema_change=(
+                                schema_change_acknowledged is True
+                            ),
                         )
                         CONTROL.audit(
                             "federation_alias.provisioned",
