@@ -385,6 +385,101 @@ class FederationAliasStoreTests(unittest.TestCase):
                 OBSERVED_AT,
             )
 
+    def test_record_observation_does_not_flag_drift_on_first_ever_observation(self):
+        # No prior last_observation to compare against — a first Observe
+        # must not be spuriously flagged as "changed" against nothing.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"schema_fingerprint": None},  # no stored fingerprint yet
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "schemaFingerprint": "fp-1",
+        }
+
+        store.record_observation(
+            "leeds_ext", observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY, OBSERVED_AT,
+        )
+
+        insert = cursor.execute.call_args_list[1]
+        self.assertEqual("current", insert.args[1][1].obj["schema"])
+
+    def test_record_observation_does_not_flag_drift_when_fingerprint_matches(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"schema_fingerprint": "fp-1"},
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "schemaFingerprint": "fp-1",
+        }
+
+        store.record_observation(
+            "leeds_ext", observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY, OBSERVED_AT,
+        )
+
+        insert = cursor.execute.call_args_list[1]
+        self.assertEqual("current", insert.args[1][1].obj["schema"])
+
+    def test_record_observation_flags_drift_when_the_fingerprint_has_changed(self):
+        # The relation is still present and selectable (detect_capability
+        # itself reported "current"), but its column list or view
+        # definition drifted since the last accepted observation — this
+        # must override to "changed" so nobody silently adopts unreviewed
+        # drift as the new baseline just by observing again.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"schema_fingerprint": "fp-old"},
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "schemaFingerprint": "fp-new",
+        }
+
+        store.record_observation(
+            "leeds_ext", observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY, OBSERVED_AT,
+        )
+
+        insert = cursor.execute.call_args_list[1]
+        persisted = insert.args[1][1].obj
+        self.assertEqual("changed", persisted["schema"])
+        self.assertEqual("fp-new", persisted["schemaFingerprint"])
+        # The original observation dict the caller passed in must be
+        # left untouched — record_observation must not mutate it in place.
+        self.assertEqual("current", observation["schema"])
+        update = cursor.execute.call_args_list[2]
+        self.assertEqual("changed", update.args[1][0].obj["schema"])
+
     @patch("federation_store.extension_versions")
     def test_record_observation_auto_disables_pushdown_on_version_drift(self, mock_versions):
         # Fail-safe direction: once provisioned, a drift away from a

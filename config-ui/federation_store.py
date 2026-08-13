@@ -289,11 +289,45 @@ class FederationAliasStore:
         reachability *transition* is instead accepted unconditionally: it
         is new information last_observation doesn't reflect at all, so
         there is no coherent basis to call it "stale" against a different
-        clock domain's timestamp."""
+        clock domain's timestamp.
+
+        `observation["schema"]` as computed by detect_capability() only
+        reflects relation existence/selectability — it has no access to
+        what a *previous* Observe accepted, so it cannot by itself detect
+        an already-present, still-selectable relation whose columns or
+        view definition changed since then. Left uncorrected, that drift
+        would be silently adopted as the new "current" baseline the
+        moment an operator does exactly what a rejected Provision call
+        tells them to do (observe again) — nobody ever sees "changed".
+        Comparing the incoming schemaFingerprint against the alias's
+        currently-stored one here, before persisting, closes that: a
+        drifted fingerprint overrides schema to "changed" even though
+        every relation is still present and selectable, so provision()'s
+        existing "schema must be current" gate catches it same as any
+        other unreviewed drift."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
         with self._connect() as connection, connection.cursor() as cur:
+            incoming_fingerprint = observation.get("schemaFingerprint")
+            if incoming_fingerprint is not None:
+                cur.execute(
+                    sql.SQL("""
+                        SELECT last_observation ->> 'schemaFingerprint'
+                          AS schema_fingerprint
+                        FROM {}._aliases WHERE alias = %s
+                    """).format(sql.Identifier(SCHEMA)),
+                    (alias,),
+                )
+                existing = cur.fetchone()
+                stored_fingerprint = (
+                    existing["schema_fingerprint"] if existing else None
+                )
+                if (
+                    stored_fingerprint is not None
+                    and stored_fingerprint != incoming_fingerprint
+                ):
+                    observation = {**observation, "schema": "changed"}
             # Appended unconditionally, regardless of whether this
             # observation goes on to win the latest-observation race below
             # — a lost race is still a real fact about what this probe saw
@@ -879,6 +913,17 @@ class FederationAliasStore:
                         sql.Identifier(schema_name)
                     )
                 )
+                # KNOWN GAP, deliberately not closed here (PR #25 review,
+                # round 20): verify_remote_state() above closes its own
+                # connection before this IMPORT FOREIGN SCHEMA runs, which
+                # opens a separate FDW-managed connection to the remote —
+                # DDL between the two could let this bind a replacement or
+                # altered relation that the live verification above never
+                # actually saw. Closing it would mean re-verifying physical
+                # identity and schema fingerprint again after import,
+                # before this transaction commits. Judged not worth the
+                # added complexity for this test slice; revisit if this
+                # module moves beyond a test slice.
                 for relation in record["allowedRelations"]:
                     remote_schema, remote_table = relation.split(".", 1)
                     cur.execute(sql.SQL("""

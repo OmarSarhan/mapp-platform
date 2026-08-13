@@ -132,6 +132,12 @@ class DetectCapabilityTests(unittest.TestCase):
         )
         self.assertFalse(observation["rowLevelSecurityDetected"])
         self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
+        # format_type(atttypid, atttypmod), not atttypid alone — a bare
+        # type oid is unchanged by a type-modifier-only edit (e.g. a
+        # PostGIS geometry column's subtype/SRID), so the fingerprint
+        # would silently miss exactly that class of drift without it.
+        executed_sql = "\n".join(query for query, _ in cursor.executed)
+        self.assertIn("format_type(a.atttypid, a.atttypmod)", executed_sql)
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNotNone(observation["lastSchemaVerified"])
         # The physical identity must come from this same probe's snapshot,

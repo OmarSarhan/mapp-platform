@@ -128,16 +128,22 @@ def _verify_allowed_relations(
     shares one mapped remote user" bypass risk applies to it.
 
     "schema_fingerprint" combines each allowed relation's column list
-    (name/type/nullability, in ordinal position) with, for a view, its
-    actual defining query text — closing a gap physical_identity can't:
-    an ADD COLUMN on an already-allowlisted table, or a CREATE OR REPLACE
-    VIEW that narrows or drops a row-filtering predicate while keeping
-    the same output columns, changes neither the relation's own oid nor
-    its RLS/security-barrier flags, so it would otherwise be invisible to
-    every other check this module runs. A relation gone missing gets the
-    literal string "missing" here too — its absence must change the
-    fingerprint, not be silently skipped, for the same fail-closed reason
-    as all_present above."""
+    (name/full type including modifiers/nullability, in ordinal position)
+    with, for a view, its actual defining query text — closing a gap
+    physical_identity can't: an ADD COLUMN on an already-allowlisted
+    table, or a CREATE OR REPLACE VIEW that narrows or drops a row-
+    filtering predicate while keeping the same output columns, changes
+    neither the relation's own oid nor its RLS/security-barrier flags, so
+    it would otherwise be invisible to every other check this module
+    runs. The type is captured via format_type(atttypid, atttypmod), not
+    atttypid alone — a bare type oid is unchanged by a type-modifier-only
+    edit (varchar length, numeric precision/scale, or — most importantly
+    on a platform built around spatial data — a PostGIS geometry column's
+    subtype/SRID, both encoded entirely in the typmod), so atttypid alone
+    would let exactly that class of edit through unreviewed. A relation
+    gone missing gets the literal string "missing" here too — its absence
+    must change the fingerprint, not be silently skipped, for the same
+    fail-closed reason as all_present above."""
     all_present = True
     rls_detected = False
     fingerprints = []
@@ -154,7 +160,8 @@ def _verify_allowed_relations(
                 COALESCE(
                   (
                     SELECT string_agg(
-                      a.attname || ':' || a.atttypid::text
+                      a.attname || ':'
+                        || format_type(a.atttypid, a.atttypmod)
                         || ':' || a.attnotnull::text,
                       ',' ORDER BY a.attnum
                     )
