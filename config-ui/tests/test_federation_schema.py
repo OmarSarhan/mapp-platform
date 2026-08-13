@@ -302,6 +302,27 @@ class ValidateObservationTests(unittest.TestCase):
         with self.assertRaises(FederationSchemaError):
             validate_observation(valid_observation(rowLevelSecurityDetected="yes"))
 
+    def test_accepts_an_optional_schema_fingerprint(self):
+        result = validate_observation(
+            valid_observation(schemaFingerprint="abc123|def456")
+        )
+        self.assertEqual("abc123|def456", result["schemaFingerprint"])
+
+    def test_omitted_schema_fingerprint_still_validates(self):
+        # A pre-Discover, connectivity-only observation must still
+        # validate — schemaFingerprint is only ever collected alongside
+        # the RLS/extension-version evidence.
+        result = validate_observation(valid_observation())
+        self.assertNotIn("schemaFingerprint", result)
+
+    def test_rejects_an_empty_schema_fingerprint(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_observation(valid_observation(schemaFingerprint=""))
+
+    def test_rejects_a_non_string_schema_fingerprint(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_observation(valid_observation(schemaFingerprint=123))
+
 
 class EnforceTlsPolicyTests(unittest.TestCase):
     def test_accepts_a_connection_meeting_the_policy(self):

@@ -313,7 +313,57 @@ class FederationAliasStoreTests(unittest.TestCase):
         # No exception — the alias's already-fresher state is returned.
         self.assertEqual("active", result["status"])
         update = cursor.execute.call_args_list[1]
-        self.assertIn("observed_at IS NULL OR observed_at <", str(update.args[0]))
+        rendered_update = str(update.args[0])
+        self.assertIn("observed_at IS NULL", rendered_update)
+        self.assertIn(
+            "last_observation ->> 'connectivity' = 'reachable'", rendered_update
+        )
+        self.assertIn("observed_at <", rendered_update)
+        # reachable is bound twice now: once for the status CASE, once
+        # for the new connectivity-transition branch.
+        self.assertEqual(2, update.args[1].count(True))
+
+    def test_record_observation_binds_reachable_for_both_the_status_case_and_the_transition_guard(
+        self,
+    ):
+        # A pure mock cannot prove Postgres evaluates the new WHERE-clause
+        # boolean expression correctly (that requires a real database —
+        # verified live separately) — but it can prove the Python side
+        # binds the right values in the right positions, which is exactly
+        # where a copy-paste slip (e.g. binding `reachable` only once, or
+        # in the wrong slot) would hide from a passing test otherwise.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+        }
+
+        store.record_observation(
+            "leeds_ext",
+            observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY,
+            OBSERVED_AT,
+        )
+
+        update = cursor.execute.call_args_list[1]
+        params = update.args[1]
+        # (observation, connection_identity, physical_identity,
+        #  observed_at, reachable, alias, reachable, observed_at)
+        self.assertEqual(8, len(params))
+        self.assertIs(True, params[4])
+        self.assertEqual("leeds_ext", params[5])
+        self.assertIs(True, params[6])
+        self.assertEqual(OBSERVED_AT, params[7])
 
     def test_record_observation_raises_not_found_when_alias_missing(self):
         cursor = MagicMock()
@@ -447,7 +497,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_rejects_an_incomplete_import(self, mock_versions, mock_physical_identity):
@@ -487,8 +537,127 @@ class FederationAliasStoreTests(unittest.TestCase):
             )
 
     @patch(
+        # The stale lastObservation shows no RLS at all — only the LIVE
+        # re-check (rls_detected=True) reveals it. This proves the
+        # authoritative gate: RLS enabled on the remote *after* Observe
+        # but *before* Provision must still be caught, not just RLS that
+        # was already visible in the last Observe.
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, True, None),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_requires_acknowledgement_of_live_detected_row_level_security(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            provisionedAt=None,
+            lastObservation={"schema": "current"},
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        self.assertEqual(
+            "federation.row_level_security_not_acknowledged",
+            raised.exception.code,
+        )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, False, False, None),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_rejects_when_a_relation_is_no_longer_present_or_selectable(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # Neither physical_identity (oid-only) nor the stored "schema":
+        # "current" flag can detect a relation dropped, or a SELECT
+        # revoked, since the last Observe — only a live re-check of
+        # existence/selectability can.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            provisionedAt=None,
+            lastObservation={"schema": "current"},
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        self.assertEqual(
+            "federation.observation_not_current", raised.exception.code
+        )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    @patch(
+        # The live schema fingerprint ("fp-live") differs from what was
+        # stored at Observe time ("fp-observed") — an ADD COLUMN or a
+        # CREATE OR REPLACE VIEW changes neither a relation's oid nor its
+        # RLS flags, so only this comparison catches it.
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-live"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_rejects_when_the_schema_fingerprint_has_drifted(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            provisionedAt=None,
+            lastObservation={
+                "schema": "current",
+                "schemaFingerprint": "fp-observed",
+            },
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+        self.assertEqual(
+            "federation.observation_not_current", raised.exception.code
+        )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("CREATE EXTENSION" in s for s in statements))
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-matches"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_proceeds_when_the_schema_fingerprint_still_matches(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt=None,
+                lastObservation={
+                    "schema": "current",
+                    "schemaFingerprint": "fp-matches",
+                },
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        result = store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+        self.assertIsNotNone(result["provisionedAt"])
+
+    @patch(
+        # rls_detected=True here — the live re-check must confirm RLS is
+        # still actually present for the acknowledgement to be persisted
+        # as True; a stale lastObservation claim alone is not enough.
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, True, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_proceeds_once_row_level_security_is_acknowledged(self, mock_versions, mock_physical_identity):
@@ -525,7 +694,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_issues_the_expected_fdw_ddl_and_marks_provisioned(self, mock_versions, mock_physical_identity):
@@ -579,7 +748,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_records_the_approving_principal(self, mock_versions, mock_physical_identity):
@@ -619,7 +788,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_forwards_ssl_options_from_the_connection_string(self, mock_versions, mock_physical_identity):
@@ -645,7 +814,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_omits_optional_ssl_options_when_absent(self, mock_versions, mock_physical_identity):
@@ -673,7 +842,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_does_not_mark_postgis_shippable_without_a_confirming_observation(self, mock_versions, mock_physical_identity):
@@ -694,7 +863,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_marks_postgis_shippable_when_versions_match(self, mock_versions, mock_physical_identity):
@@ -726,7 +895,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, DIFFERENT_VERSIONS),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, DIFFERENT_VERSIONS, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_provision_does_not_mark_postgis_shippable_when_versions_mismatch(self, mock_versions, mock_physical_identity):
@@ -762,7 +931,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_does_not_repeat_create_ddl(self, mock_versions, mock_physical_identity):
@@ -802,7 +971,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_reconciles_rotated_connection_settings(self, mock_versions, mock_physical_identity):
@@ -962,7 +1131,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=("different-system-id/99999", {}),
+        return_value=("different-system-id/99999", {}, True, False, None),
     )
     def test_provision_rejects_a_replaced_physical_database(self, mock_physical_identity):
         # connection_identity (host/port/dbname/user) alone can't catch a
@@ -981,7 +1150,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=("different-system-id/99999", {}),
+        return_value=("different-system-id/99999", {}, True, False, None),
     )
     def test_reprovision_rejects_a_replaced_physical_database(self, mock_physical_identity):
         cursor = MagicMock()
@@ -1018,7 +1187,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_adds_a_newly_configured_ssl_option(self, mock_versions, mock_physical_identity):
@@ -1053,7 +1222,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_updates_a_changed_ssl_option(self, mock_versions, mock_physical_identity):
@@ -1085,7 +1254,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_drops_a_removed_ssl_option(self, mock_versions, mock_physical_identity):
@@ -1113,7 +1282,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_creates_a_missing_reader_mapping(self, mock_versions, mock_physical_identity):
@@ -1156,7 +1325,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_enables_pushdown_once_versions_now_match(self, mock_versions, mock_physical_identity):
@@ -1189,7 +1358,7 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, DIFFERENT_VERSIONS),
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, DIFFERENT_VERSIONS, True, False, None),
     )
     @patch("federation_store.extension_versions")
     def test_reprovision_disables_pushdown_when_versions_now_mismatch(self, mock_versions, mock_physical_identity):

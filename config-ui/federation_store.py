@@ -265,16 +265,31 @@ class FederationAliasStore:
         snapshot) — `physical_identity` is None when connectivity wasn't
         "reachable", since it can't be fetched from a source that couldn't
         be reached. `observed_at` marks the moment *this* Observe's
-        REPEATABLE READ snapshot was actually fixed (captured by the caller
-        as the first query inside that snapshot, not when this call
-        happens to reach the database) — two overlapping Observe calls for
-        the same alias can finish and try to write in either order; without
-        comparing this, whichever write simply *commits* last would win
-        even if its own probe's snapshot was the older, now-superseded one.
-        The WHERE clause below makes a stale write a no-op instead:
-        Postgres serializes concurrent UPDATEs to the same row, and each
-        one re-checks this condition against whatever the other just
-        committed."""
+        REPEATABLE READ snapshot was actually fixed on the *remote* (via its
+        own clock_timestamp(), captured by the caller as the first query
+        inside that snapshot) when reachable, or the moment the connection
+        attempt was given up as failed, on this *local* process's clock,
+        when not — two different clock domains. Two overlapping Observe
+        calls for the same alias can finish and try to write in either
+        order; without comparing something, whichever write simply
+        *commits* last would win even if its own probe's snapshot was the
+        older, now-superseded one. The WHERE clause below compares
+        observed_at only between two observations of the *same*
+        reachability (both remote-clock, or both local-clock — a single,
+        internally consistent domain either way) and makes a same-domain
+        stale write a no-op: Postgres serializes concurrent UPDATEs to the
+        same row, and each one re-checks this condition against whatever
+        the other just committed. When the incoming observation's
+        reachability *differs* from what's currently stored, there is no
+        shared clock to compare on — comparing a remote timestamp against a
+        local one directly would let ordinary clock drift between the two
+        hosts discard a genuinely later connectivity-state change (e.g. a
+        real, more-recent outage silently losing to an earlier success
+        whose remote clock merely happened to run ahead) — so a
+        reachability *transition* is instead accepted unconditionally: it
+        is new information last_observation doesn't reflect at all, so
+        there is no coherent basis to call it "stale" against a different
+        clock domain's timestamp."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
@@ -317,7 +332,12 @@ class FederationAliasStore:
                           ELSE 'unavailable'
                         END
                     WHERE alias = %s
-                      AND (observed_at IS NULL OR observed_at < %s)
+                      AND (
+                        observed_at IS NULL
+                        OR (last_observation ->> 'connectivity' = 'reachable')
+                             <> %s
+                        OR observed_at < %s
+                      )
                     RETURNING alias, provisioned_at
                 """).format(sql.Identifier(SCHEMA)),
                 (
@@ -327,6 +347,7 @@ class FederationAliasStore:
                     observed_at,
                     reachable,
                     alias,
+                    reachable,
                     observed_at,
                 ),
             )
@@ -546,7 +567,13 @@ class FederationAliasStore:
             # user is bypassed entirely once federated — the mapped role's
             # full row set becomes visible to every runtime caller. The
             # generic dataHandlingAcknowledged at registration cannot cover
-            # this: RLS is only discovered later, by Observe.
+            # this: RLS is only discovered later, by Observe. This is a
+            # fast-fail using the *stored* evidence only — it saves a live
+            # remote round-trip in the common case where the last Observe
+            # already showed RLS and nothing acknowledged it since; it is
+            # NOT the authoritative gate (verify_remote_state's live re-check
+            # below is — RLS could just as easily have been enabled *after*
+            # this Observe, which this check alone could never catch).
             if last_observation.get("rowLevelSecurityDetected") and not (
                 acknowledge_row_level_security
             ):
@@ -556,15 +583,6 @@ class FederationAliasStore:
                     "explicitly to provision.",
                     code="federation.row_level_security_not_acknowledged",
                 )
-            # Persisted atomically with approval below — a durable record
-            # that the approving principal explicitly accepted the
-            # per-user-RLS bypass this source has, not just a transient
-            # gate that leaves no trace once a later Observe replaces
-            # last_observation (the append-only _observations table
-            # records what was detected, but not that it was accepted).
-            rls_bypass_acknowledged = bool(
-                last_observation.get("rowLevelSecurityDetected")
-            ) and acknowledge_row_level_security
             # Applies to reprovisioning too, not just the first call: the
             # reprovision branch below never re-verifies or re-imports the
             # foreign tables, so without this, /provision on an alias whose
@@ -606,17 +624,22 @@ class FederationAliasStore:
             # host/port/dbname/user (docs/federation-architecture-waypoint.md,
             # "Drift and retirement": "Different physical database | Raise
             # identity conflict; require explicit rebind"). Re-fetch the
-            # remote's live physical identity now and compare against what
-            # Observe last recorded. Its live extension versions are
-            # collected from this same connection too — see
-            # federation_capability.verify_remote_state's docstring for why
-            # the pushdown-safety decision below must not use a version
-            # read from a second, separate connection.
+            # remote's live physical identity, extension versions, relation
+            # existence/selectability, RLS/security-barrier exposure, and
+            # column/view-definition fingerprint now, all from this one
+            # connection — see federation_capability.verify_remote_state's
+            # docstring for why every decision below must use evidence from
+            # this single live snapshot, never a stored value or a second,
+            # separate connection.
             try:
-                current_physical_identity, live_remote_versions = (
-                    verify_remote_state(
-                        connection_url, tuple(record["allowedRelations"])
-                    )
+                (
+                    current_physical_identity,
+                    live_remote_versions,
+                    relations_verified,
+                    rls_detected,
+                    current_schema_fingerprint,
+                ) = verify_remote_state(
+                    connection_url, tuple(record["allowedRelations"])
                 )
             except psycopg.Error as exc:
                 raise FederationSchemaError(
@@ -625,12 +648,63 @@ class FederationAliasStore:
                     "again.",
                     code="federation.observation_not_current",
                 ) from exc
+            # The stored last_observation.schema == "current" check above
+            # only proves this was true as of the last Observe — none of
+            # Observe's own evidence-collecting checks (existence,
+            # selectability, RLS/security-barrier, or column/view
+            # definition) are re-verified anywhere else, so without this,
+            # a relation dropped, a SELECT revoked, RLS newly enabled, or a
+            # column added / view redefined since that Observe would all be
+            # silently invisible to Provision (physical_identity alone
+            # covers none of them — none change a relation's own oid).
+            if not relations_verified:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source's allowed relations are no "
+                    "longer all present and selectable by the connecting "
+                    "role — observe it again and review before "
+                    "provisioning.",
+                    code="federation.observation_not_current",
+                )
+            # The authoritative RLS gate — unlike the stored-evidence fast-
+            # fail above, this catches RLS/security-barrier exposure
+            # enabled on the remote at any point up to this live snapshot,
+            # not just what the last Observe happened to see.
+            if rls_detected and not acknowledge_row_level_security:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source has row-level security that "
+                    "would be bypassed once federated — acknowledge this "
+                    "explicitly to provision.",
+                    code="federation.row_level_security_not_acknowledged",
+                )
+            # Persisted atomically with approval below — a durable record
+            # that the approving principal explicitly accepted the
+            # per-user-RLS bypass this source has *as of this live check*,
+            # not just a transient gate that leaves no trace once a later
+            # Observe replaces last_observation (the append-only
+            # _observations table records what was detected, but not that
+            # it was accepted).
+            rls_bypass_acknowledged = rls_detected and acknowledge_row_level_security
             if last_observed_physical_identity != current_physical_identity:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's physical database identity "
                     "no longer matches its last observation — it may have "
                     "been dropped, restored, or replaced. Observe it again "
                     "and review before provisioning.",
+                    code="federation.observation_not_current",
+                )
+            # physical_identity only proves the relation itself wasn't
+            # dropped/recreated — an ADD COLUMN or a CREATE OR REPLACE VIEW
+            # that narrows or drops a row-filtering predicate changes
+            # neither a relation's oid nor its RLS flags, so without this,
+            # either could silently reach every runtime caller through the
+            # blanket GRANT SELECT below, never having been reviewed.
+            last_schema_fingerprint = last_observation.get("schemaFingerprint")
+            if last_schema_fingerprint != current_schema_fingerprint:
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source's relation definitions "
+                    "(columns or view query) no longer match its last "
+                    "observation — observe it again and review before "
+                    "provisioning.",
                     code="federation.observation_not_current",
                 )
             params = psycopg.conninfo.conninfo_to_dict(connection_url)

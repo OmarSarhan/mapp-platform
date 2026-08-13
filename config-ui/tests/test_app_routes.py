@@ -36,6 +36,90 @@ class FederationEnabledTests(unittest.TestCase):
         self.assertFalse(app.federation_enabled("postgresql://x", ""))
 
 
+class FederationAliasActionRouteTests(unittest.TestCase):
+    """POST /api/federation/aliases/<alias>/(observe|provision) must
+    translate a raw local-database failure into the same
+    "federation.registry_unavailable" 502 the sibling GET federation routes
+    already use — not fall through to the generic, code-less 422
+    psycopg.Error handler. FederationSchemaError is deliberately NOT
+    caught here: it already carries its own status/code, correctly routed
+    by the outer handler chain, and must keep passing through untouched."""
+
+    @staticmethod
+    def handler(action, *, actor="admin"):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = f"/api/federation/aliases/leeds_ext/{action}"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_observe_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_provision_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("provision")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_a_federation_schema_error_still_carries_its_own_status_and_code(
+        self,
+    ):
+        # Confirms the new try/except wraps only psycopg.Error — a
+        # validation-style FederationSchemaError (e.g. alias not found)
+        # must still be handled by the existing, unrelated
+        # FederationSchemaError chain, not swallowed into a 502.
+        from federation_schema import FederationSchemaError
+
+        federation = MagicMock()
+        federation.get.side_effect = FederationSchemaError(
+            "boom", code="federation.some_validation_error", status=HTTPStatus.CONFLICT
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.some_validation_error", body["code"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")

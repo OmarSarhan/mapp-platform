@@ -68,10 +68,19 @@ def extension_version_results(*, postgis=True):
     return results
 
 
-def extension_and_rls_results(*, postgis=True, rls=False, relation_count=1):
-    results = extension_version_results(postgis=postgis)
-    results.extend({"bypasses_per_user_access": rls} for _ in range(relation_count))
-    return results
+def relation_check_results(*, rls=False, fingerprints=("fp-bus-stops",)):
+    return [
+        {"bypasses_per_user_access": rls, "definition_fingerprint": fp}
+        for fp in fingerprints
+    ]
+
+
+def extension_and_rls_results(
+    *, postgis=True, rls=False, fingerprints=("fp-bus-stops",)
+):
+    return extension_version_results(postgis=postgis) + relation_check_results(
+        rls=rls, fingerprints=fingerprints
+    )
 
 
 def physical_identity_results(relation_oids=(24601,)):
@@ -122,6 +131,7 @@ class DetectCapabilityTests(unittest.TestCase):
             observation["extensionVersions"],
         )
         self.assertFalse(observation["rowLevelSecurityDetected"])
+        self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNotNone(observation["lastSchemaVerified"])
         # The physical identity must come from this same probe's snapshot,
@@ -179,6 +189,9 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertEqual("reachable", observation["connectivity"])
         self.assertEqual("changed", observation["schema"])
         self.assertFalse(observation["rowLevelSecurityDetected"])
+        # A relation gone missing must change the fingerprint too, not be
+        # silently skipped — the same fail-closed direction as all_present.
+        self.assertEqual("missing", observation["schemaFingerprint"])
         # Physical identity is still collected even when the schema check
         # itself found the relation missing — the identity's own "missing"
         # marker is what carries that fact forward, not a skipped call.
@@ -225,6 +238,26 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertTrue(observation["rowLevelSecurityDetected"])
         executed_sql = "\n".join(query for query, _ in cursor.executed)
         self.assertIn("security_barrier", executed_sql)
+
+    def test_combines_multiple_relations_into_one_ordered_fingerprint(self):
+        cursor = ScriptedFakeCursor(
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(fingerprints=("fp-a", "fp-b"))
+            + physical_identity_results(relation_oids=(24601, 24602)),
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            observation, _, _ = detect_capability(
+                "postgresql://reader?sslmode=require",
+                allowed_relations=("leeds.bus_stops", "leeds.roads"),
+                tls_policy="require",
+            )
+
+        # Ordered by the given allowed_relations sequence, matching
+        # physical_identity's own ordering convention.
+        self.assertEqual("fp-a|fp-b", observation["schemaFingerprint"])
 
     def test_connectivity_failure_is_reported_not_raised(self):
         with patch(
@@ -303,7 +336,7 @@ class DetectCapabilityTests(unittest.TestCase):
     def test_reads_a_configured_version_relation_scalar(self):
         cursor = ScriptedFakeCursor(
             [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(relation_count=2)
+            + extension_and_rls_results(fingerprints=("fp-a", "fp-b"))
             + physical_identity_results(relation_oids=(24601, 24602)),
             fetchall_results=[[{"release_id": "release-42"}]],
         )
@@ -331,7 +364,8 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_rejects_a_version_relation_returning_more_than_one_row(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT] + extension_and_rls_results(relation_count=2),
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(fingerprints=("fp-a", "fp-b")),
             fetchall_results=[[{"release_id": "a"}, {"release_id": "b"}]],
         )
         with patch(
@@ -351,7 +385,8 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_rejects_a_version_relation_returning_more_than_one_column(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT] + extension_and_rls_results(relation_count=2),
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results(fingerprints=("fp-a", "fp-b")),
             fetchall_results=[[{"release_id": "a", "schema_version": 1}]],
         )
         with patch(
@@ -371,20 +406,28 @@ class DetectCapabilityTests(unittest.TestCase):
 
 
 class VerifyRemoteStateTests(unittest.TestCase):
-    """Provision's own live re-check — physical identity and extension
-    versions, gathered from the one connection this opens."""
+    """Provision's own live re-check — physical identity, extension
+    versions, relation existence/selectability, RLS/security-barrier
+    exposure, and schema fingerprint, all gathered from the one connection
+    this opens."""
 
     def test_combines_the_cluster_database_and_relation_identity(self):
         cursor = ScriptedFakeCursor(
-            physical_identity_results() + extension_version_results()
+            physical_identity_results()
+            + extension_version_results()
+            + relation_check_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity, versions = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
-            )
+            (
+                identity,
+                versions,
+                relations_verified,
+                rls_detected,
+                schema_fingerprint,
+            ) = verify_remote_state("postgresql://reader", ("leeds.bus_stops",))
 
         self.assertEqual("7672778953115078690/16384/24601", identity)
         self.assertEqual(
@@ -396,20 +439,27 @@ class VerifyRemoteStateTests(unittest.TestCase):
             },
             versions,
         )
+        self.assertTrue(relations_verified)
+        self.assertFalse(rls_detected)
+        self.assertEqual("fp-bus-stops", schema_fingerprint)
 
     def test_differs_when_the_database_was_dropped_and_recreated(self):
         # Same cluster (system_identifier unchanged), different database
         # oid — a DROP DATABASE + CREATE DATABASE within the same cluster.
-        cursor = ScriptedFakeCursor([
-            {"system_identifier": 7672778953115078690},
-            {"oid": 99999},
-            {"oid": 24601},
-        ] + extension_version_results())
+        cursor = ScriptedFakeCursor(
+            [
+                {"system_identifier": 7672778953115078690},
+                {"oid": 99999},
+                {"oid": 24601},
+            ]
+            + extension_version_results()
+            + relation_check_results()
+        )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity, _ = verify_remote_state(
+            identity, *_ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -424,12 +474,13 @@ class VerifyRemoteStateTests(unittest.TestCase):
         cursor = ScriptedFakeCursor(
             physical_identity_results(relation_oids=(99999,))
             + extension_version_results()
+            + relation_check_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity, _ = verify_remote_state(
+            identity, *_ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -442,12 +493,13 @@ class VerifyRemoteStateTests(unittest.TestCase):
         cursor = ScriptedFakeCursor(
             physical_identity_results(relation_oids=(None,))
             + extension_version_results()
+            + relation_check_results()
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity, _ = verify_remote_state(
+            identity, *_ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
@@ -457,17 +509,51 @@ class VerifyRemoteStateTests(unittest.TestCase):
         cursor = ScriptedFakeCursor(
             physical_identity_results(relation_oids=(111, 222))
             + extension_version_results()
+            + relation_check_results(fingerprints=("fp-a", "fp-b"))
         )
         with patch(
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            identity, _ = verify_remote_state(
+            identity, *_ = verify_remote_state(
                 "postgresql://reader",
                 ("leeds.bus_stops", "leeds.roads"),
             )
 
         self.assertEqual("7672778953115078690/16384/111,222", identity)
+
+    def test_reports_relations_not_verified_when_one_is_missing_or_unselectable(self):
+        cursor = ScriptedFakeCursor(
+            physical_identity_results()
+            + extension_version_results()
+            + [None]
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            _, _, relations_verified, _, schema_fingerprint = verify_remote_state(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
+
+        self.assertFalse(relations_verified)
+        self.assertEqual("missing", schema_fingerprint)
+
+    def test_reports_row_level_security_detection(self):
+        cursor = ScriptedFakeCursor(
+            physical_identity_results()
+            + extension_version_results()
+            + relation_check_results(rls=True)
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            *_, rls_detected, _ = verify_remote_state(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
+
+        self.assertTrue(rls_detected)
 
     def test_propagates_a_connection_failure(self):
         with patch(

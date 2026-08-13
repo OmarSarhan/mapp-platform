@@ -263,10 +263,10 @@ def validate_observation(payload: Any) -> dict[str, Any]:
     """Validate an Observe-step (lifecycle step 7) observation record.
 
     Covers exactly the freshness enum block from "Observation versus truth",
-    plus the extension-version and row-level-security evidence Discover
-    (step 2) also records. `extensionVersions` and `rowLevelSecurityDetected`
-    are optional so a pre-Discover observation (connectivity-only) can still
-    validate.
+    plus the extension-version, row-level-security, and schema-fingerprint
+    evidence Discover (step 2) also records. `extensionVersions`,
+    `rowLevelSecurityDetected`, and `schemaFingerprint` are optional so a
+    pre-Discover observation (connectivity-only) can still validate.
     """
     fields = _closed_object(
         payload,
@@ -279,7 +279,9 @@ def validate_observation(payload: Any) -> dict[str, Any]:
             "lastSchemaVerified",
             "sourceVersion",
         }),
-        optional=frozenset({"extensionVersions", "rowLevelSecurityDetected"}),
+        optional=frozenset({
+            "extensionVersions", "rowLevelSecurityDetected", "schemaFingerprint",
+        }),
     )
 
     connectivity = _enum(
@@ -341,6 +343,14 @@ def validate_observation(payload: Any) -> dict[str, Any]:
                 "rowLevelSecurityDetected must be a boolean or omitted."
             )
         result["rowLevelSecurityDetected"] = rls_detected
+
+    schema_fingerprint = fields.get("schemaFingerprint")
+    if schema_fingerprint is not None:
+        if not isinstance(schema_fingerprint, str) or not schema_fingerprint:
+            raise FederationSchemaError(
+                "schemaFingerprint must be non-empty text or omitted."
+            )
+        result["schemaFingerprint"] = schema_fingerprint
 
     return result
 

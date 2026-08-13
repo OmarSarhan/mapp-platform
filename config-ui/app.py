@@ -7424,7 +7424,26 @@ class Handler(SimpleHTTPRequestHandler):
                         "Federation alias registry is not configured.",
                         code="federation.not_configured",
                     )
-                result = FEDERATION.register(payload, actor)
+                # Only psycopg.Error, not FederationSchemaError — the latter
+                # already carries its own status/code (validation, RLS-not-
+                # acknowledged, etc.) that the outer handler chain routes
+                # correctly; only a raw local-database failure needs
+                # translating here, matching the GET federation routes'
+                # existing "federation.registry_unavailable" pattern instead
+                # of falling through to the generic 422 psycopg.Error
+                # handler with no federation-specific code at all.
+                try:
+                    result = FEDERATION.register(payload, actor)
+                except psycopg.Error as exc:
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": "The federation alias registry is unavailable.",
+                            "code": "federation.registry_unavailable",
+                            "detail": str(exc),
+                        },
+                    )
+                    return
                 CONTROL.audit(
                     "federation_alias.registered",
                     actor=actor,
@@ -7443,92 +7462,122 @@ class Handler(SimpleHTTPRequestHandler):
                         code="federation.not_configured",
                     )
                 alias_name, federation_action = federation_alias_action_path.groups()
-                record = FEDERATION.get(alias_name)
-                connection_url = resolve_federation_connection_url(
-                    record["connectionRef"]
-                )
-                if federation_action == "observe":
-                    if payload:
-                        raise FederationSchemaError(
-                            "Unknown observe properties: "
-                            + ", ".join(sorted(payload)),
-                            code="federation.invalid_request",
+                # Only psycopg.Error, not FederationSchemaError — the
+                # latter's status/code (validation, RLS-not-acknowledged,
+                # observation-not-current, etc.) is already routed correctly
+                # by the outer handler chain; only a raw local-database
+                # failure (FEDERATION.get/record_observation/provision all
+                # touch the local federation database, independent of the
+                # remote source's own reachability, which detect_capability
+                # already reports as a normal observation rather than
+                # raising) needs translating here, matching the GET
+                # federation routes' existing "federation.registry_unavailable"
+                # pattern instead of falling through to the generic 422
+                # psycopg.Error handler with no federation-specific code.
+                try:
+                    record = FEDERATION.get(alias_name)
+                    connection_url = resolve_federation_connection_url(
+                        record["connectionRef"]
+                    )
+                    if federation_action == "observe":
+                        if payload:
+                            raise FederationSchemaError(
+                                "Unknown observe properties: "
+                                + ", ".join(sorted(payload)),
+                                code="federation.invalid_request",
+                            )
+                        # detect_capability's own observed_at (the server's own
+                        # clock, queried as the first statement inside the
+                        # probe's REPEATABLE READ transaction — the exact
+                        # moment its snapshot is fixed, not merely "sometime
+                        # after this process connected") is the ordering key
+                        # two overlapping Observe calls for the same alias are
+                        # serialized by (FederationAliasStore.record_observation)
+                        # — a timestamp captured here, before the remote probe,
+                        # would instead reflect whichever request merely
+                        # *started* first, which a stalled connection (or even
+                        # just being descheduled between connecting and its
+                        # first query) can decouple entirely from which one
+                        # actually saw the more current state. record_observation's
+                        # guard is also reachability-aware — it only ever compares
+                        # this timestamp between two observations of the same
+                        # connectivity, since a reachable probe's observed_at is
+                        # the *remote's* clock while an unreachable one's is this
+                        # process's own, and comparing across those two clock
+                        # domains directly would let ordinary drift between the
+                        # two hosts discard a genuinely later connectivity change.
+                        # Its physical identity is likewise
+                        # computed from that same connection's snapshot (None
+                        # when unreachable) — a second, separate connection here
+                        # could observe a relation the remote dropped and
+                        # recreated in between, see federation_capability's
+                        # _physical_identity_from_cursor for why that matters.
+                        # Provision re-fetches and compares this same value
+                        # live, so a stale None here simply means the next
+                        # Provision attempt will need a fresh Observe first,
+                        # same as any other "not current" observation.
+                        observation, observed_at, observed_physical_identity = (
+                            detect_capability(
+                                connection_url,
+                                allowed_relations=tuple(record["allowedRelations"]),
+                                tls_policy=record["tlsPolicy"],
+                            )
                         )
-                    # detect_capability's own observed_at (the server's own
-                    # clock, queried as the first statement inside the
-                    # probe's REPEATABLE READ transaction — the exact
-                    # moment its snapshot is fixed, not merely "sometime
-                    # after this process connected") is the ordering key
-                    # two overlapping Observe calls for the same alias are
-                    # serialized by (FederationAliasStore.record_observation)
-                    # — a timestamp captured here, before the remote probe,
-                    # would instead reflect whichever request merely
-                    # *started* first, which a stalled connection (or even
-                    # just being descheduled between connecting and its
-                    # first query) can decouple entirely from which one
-                    # actually saw the more current state. Its physical
-                    # identity is likewise
-                    # computed from that same connection's snapshot (None
-                    # when unreachable) — a second, separate connection here
-                    # could observe a relation the remote dropped and
-                    # recreated in between, see federation_capability's
-                    # _physical_identity_from_cursor for why that matters.
-                    # Provision re-fetches and compares this same value
-                    # live, so a stale None here simply means the next
-                    # Provision attempt will need a fresh Observe first,
-                    # same as any other "not current" observation.
-                    observation, observed_at, observed_physical_identity = (
-                        detect_capability(
+                        result = FEDERATION.record_observation(
+                            alias_name,
+                            observation,
                             connection_url,
-                            allowed_relations=tuple(record["allowedRelations"]),
-                            tls_policy=record["tlsPolicy"],
+                            observed_physical_identity,
+                            observed_at,
                         )
-                    )
-                    result = FEDERATION.record_observation(
-                        alias_name,
-                        observation,
-                        connection_url,
-                        observed_physical_identity,
-                        observed_at,
-                    )
-                    CONTROL.audit(
-                        "federation_alias.observed",
-                        actor=actor,
-                        remote=self._remote(),
-                        details={
-                            "alias": alias_name,
-                            "connectivity": observation["connectivity"],
+                        CONTROL.audit(
+                            "federation_alias.observed",
+                            actor=actor,
+                            remote=self._remote(),
+                            details={
+                                "alias": alias_name,
+                                "connectivity": observation["connectivity"],
+                            },
+                        )
+                    else:
+                        unexpected = sorted(
+                            set(payload) - {"rowLevelSecurityAcknowledged"}
+                        )
+                        if unexpected:
+                            raise FederationSchemaError(
+                                "Unknown provision properties: "
+                                + ", ".join(unexpected),
+                                code="federation.invalid_request",
+                            )
+                        acknowledged = payload.get("rowLevelSecurityAcknowledged")
+                        if acknowledged is not None and acknowledged is not True:
+                            raise FederationSchemaError(
+                                "rowLevelSecurityAcknowledged must be true "
+                                "when present.",
+                                code="federation.invalid_request",
+                            )
+                        result = FEDERATION.provision(
+                            alias_name,
+                            connection_url,
+                            actor,
+                            acknowledge_row_level_security=acknowledged is True,
+                        )
+                        CONTROL.audit(
+                            "federation_alias.provisioned",
+                            actor=actor,
+                            remote=self._remote(),
+                            details={"alias": alias_name},
+                        )
+                except psycopg.Error as exc:
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": "The federation alias registry is unavailable.",
+                            "code": "federation.registry_unavailable",
+                            "detail": str(exc),
                         },
                     )
-                else:
-                    unexpected = sorted(
-                        set(payload) - {"rowLevelSecurityAcknowledged"}
-                    )
-                    if unexpected:
-                        raise FederationSchemaError(
-                            "Unknown provision properties: "
-                            + ", ".join(unexpected),
-                            code="federation.invalid_request",
-                        )
-                    acknowledged = payload.get("rowLevelSecurityAcknowledged")
-                    if acknowledged is not None and acknowledged is not True:
-                        raise FederationSchemaError(
-                            "rowLevelSecurityAcknowledged must be true "
-                            "when present.",
-                            code="federation.invalid_request",
-                        )
-                    result = FEDERATION.provision(
-                        alias_name,
-                        connection_url,
-                        actor,
-                        acknowledge_row_level_security=acknowledged is True,
-                    )
-                    CONTROL.audit(
-                        "federation_alias.provisioned",
-                        actor=actor,
-                        remote=self._remote(),
-                        details={"alias": alias_name},
-                    )
+                    return
                 self._json(HTTPStatus.OK, {"alias": result})
                 return
             if request_path == "/api/auth/logout":

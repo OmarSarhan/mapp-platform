@@ -1701,10 +1701,25 @@ with psycopg.connect(
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
                       OR EXISTS (
-                        SELECT 1 FROM federation._aliases AS fed_alias
+                        SELECT 1
+                        FROM federation._aliases AS fed_alias
                         WHERE namespace.nspname
                                 = ($$source_$$ || fed_alias.alias)
                           AND fed_alias.provisioned_at IS NOT NULL
+                          AND relation.relkind = $$f$$
+                          AND EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_foreign_table AS foreign_table
+                            JOIN pg_catalog.pg_foreign_server AS foreign_server
+                              ON foreign_server.oid = foreign_table.ftserver
+                            WHERE foreign_table.ftrelid = relation.oid
+                              AND foreign_server.srvname
+                                    = (fed_alias.alias || $$_srv$$)
+                          )
+                          AND relation.relname IN (
+                            SELECT split_part(allowed_relation, $$.$$, 2)
+                            FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                          )
                       )
                     )
                   )
@@ -1748,10 +1763,25 @@ with psycopg.connect(
                     AND (
                       namespace.nspname IN ($$derived_layers$$, $$federation$$)
                       OR EXISTS (
-                        SELECT 1 FROM federation._aliases AS fed_alias
+                        SELECT 1
+                        FROM federation._aliases AS fed_alias
                         WHERE namespace.nspname
                                 = ($$source_$$ || fed_alias.alias)
                           AND fed_alias.provisioned_at IS NOT NULL
+                          AND relation.relkind = $$f$$
+                          AND EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_foreign_table AS foreign_table
+                            JOIN pg_catalog.pg_foreign_server AS foreign_server
+                              ON foreign_server.oid = foreign_table.ftserver
+                            WHERE foreign_table.ftrelid = relation.oid
+                              AND foreign_server.srvname
+                                    = (fed_alias.alias || $$_srv$$)
+                          )
+                          AND relation.relname IN (
+                            SELECT split_part(allowed_relation, $$.$$, 2)
+                            FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                          )
                       )
                     )
                   )
@@ -1825,11 +1855,25 @@ with psycopg.connect(
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
                             OR EXISTS (
-                              SELECT 1 FROM federation._aliases
-                                AS fed_alias
+                              SELECT 1
+                              FROM federation._aliases AS fed_alias
                               WHERE namespace.nspname
                                       = ($$source_$$ || fed_alias.alias)
                                 AND fed_alias.provisioned_at IS NOT NULL
+                                AND relation.relkind = $$f$$
+                                AND EXISTS (
+                                  SELECT 1
+                                  FROM pg_catalog.pg_foreign_table AS foreign_table
+                                  JOIN pg_catalog.pg_foreign_server AS foreign_server
+                                    ON foreign_server.oid = foreign_table.ftserver
+                                  WHERE foreign_table.ftrelid = relation.oid
+                                    AND foreign_server.srvname
+                                          = (fed_alias.alias || $$_srv$$)
+                                )
+                                AND relation.relname IN (
+                                  SELECT split_part(allowed_relation, $$.$$, 2)
+                                  FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                                )
                             )
                           )
                         )
@@ -1901,11 +1945,25 @@ with psycopg.connect(
                             namespace.nspname
                               IN ($$derived_layers$$, $$federation$$)
                             OR EXISTS (
-                              SELECT 1 FROM federation._aliases
-                                AS fed_alias
+                              SELECT 1
+                              FROM federation._aliases AS fed_alias
                               WHERE namespace.nspname
                                       = ($$source_$$ || fed_alias.alias)
                                 AND fed_alias.provisioned_at IS NOT NULL
+                                AND relation.relkind = $$f$$
+                                AND EXISTS (
+                                  SELECT 1
+                                  FROM pg_catalog.pg_foreign_table AS foreign_table
+                                  JOIN pg_catalog.pg_foreign_server AS foreign_server
+                                    ON foreign_server.oid = foreign_table.ftserver
+                                  WHERE foreign_table.ftrelid = relation.oid
+                                    AND foreign_server.srvname
+                                          = (fed_alias.alias || $$_srv$$)
+                                )
+                                AND relation.relname IN (
+                                  SELECT split_part(allowed_relation, $$.$$, 2)
+                                  FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                                )
                             )
                           )
                         )

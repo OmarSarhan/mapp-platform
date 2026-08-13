@@ -44,7 +44,15 @@ from relation_identity import IDENTIFIER_PART_RE, parse_relation
 from semantic_sources import PostgresSemanticSources
 
 CONNECT_TIMEOUT_SECONDS = 5
-STATEMENT_TIMEOUT_MS = 5000
+# The statement timeout for every read-only probe in this file comes from
+# PostgresSemanticSources._begin_read_only's own SET LOCAL statement_timeout
+# (semantic_sources.py) — there used to be a STATEMENT_TIMEOUT_MS constant
+# here too, but nothing ever wired it to that (or any) timeout, so editing
+# it silently had no effect. Removed rather than wired up: this module
+# deliberately reuses the same bounded transaction semantic_sources.py
+# already established (see this file's own module docstring), so its
+# timeout should stay a single source of truth there, not be duplicated
+# here as a second, easily-desynchronized constant.
 
 
 def _now_iso() -> str:
@@ -103,8 +111,9 @@ def extension_versions(cursor: Any) -> dict[str, str]:
 
 def _verify_allowed_relations(
     cursor: Any, allowed_relations: tuple[str, ...]
-) -> tuple[bool, bool]:
-    """Returns (all_present_and_selectable, row_level_security_detected).
+) -> tuple[bool, bool, str]:
+    """Returns (all_present_and_selectable, row_level_security_detected,
+    schema_fingerprint).
 
     A relation that no longer exists, or that this connection can no
     longer SELECT, must not be silently skipped — it means the schema
@@ -116,9 +125,22 @@ def _verify_allowed_relations(
     relation has RLS or a security-barrier view enabled...") — a view
     marked security_barrier is commonly how per-user row filtering is
     implemented without native RLS, and the same "every MAPP caller
-    shares one mapped remote user" bypass risk applies to it."""
+    shares one mapped remote user" bypass risk applies to it.
+
+    "schema_fingerprint" combines each allowed relation's column list
+    (name/type/nullability, in ordinal position) with, for a view, its
+    actual defining query text — closing a gap physical_identity can't:
+    an ADD COLUMN on an already-allowlisted table, or a CREATE OR REPLACE
+    VIEW that narrows or drops a row-filtering predicate while keeping
+    the same output columns, changes neither the relation's own oid nor
+    its RLS/security-barrier flags, so it would otherwise be invisible to
+    every other check this module runs. A relation gone missing gets the
+    literal string "missing" here too — its absence must change the
+    fingerprint, not be silently skipped, for the same fail-closed reason
+    as all_present above."""
     all_present = True
     rls_detected = False
+    fingerprints = []
     for entry in allowed_relations:
         schema, relation = _parsed_schema_relation(entry)
         cursor.execute(
@@ -127,7 +149,30 @@ def _verify_allowed_relations(
               relrowsecurity
               OR COALESCE(
                    reloptions && ARRAY['security_barrier=true'], false
-                 ) AS bypasses_per_user_access
+                 ) AS bypasses_per_user_access,
+              md5(
+                COALESCE(
+                  (
+                    SELECT string_agg(
+                      a.attname || ':' || a.atttypid::text
+                        || ':' || a.attnotnull::text,
+                      ',' ORDER BY a.attnum
+                    )
+                    FROM pg_catalog.pg_attribute AS a
+                    WHERE a.attrelid = c.oid
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                  ),
+                  ''
+                )
+                || '|' ||
+                COALESCE(
+                  CASE WHEN c.relkind = 'v'
+                    THEN pg_get_viewdef(c.oid, true)
+                  END,
+                  ''
+                )
+              ) AS definition_fingerprint
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
@@ -138,10 +183,12 @@ def _verify_allowed_relations(
         row = cursor.fetchone()
         if row is None:
             all_present = False
+            fingerprints.append("missing")
             continue
         if row["bypasses_per_user_access"]:
             rls_detected = True
-    return all_present, rls_detected
+        fingerprints.append(row["definition_fingerprint"])
+    return all_present, rls_detected, "|".join(fingerprints)
 
 
 def _version_relation_scalar(
@@ -286,8 +333,8 @@ def detect_capability(
                 cursor.execute("SELECT clock_timestamp() AS observed_at")
                 observed_at = cursor.fetchone()["observed_at"]
                 versions = extension_versions(cursor)
-                relations_verified, rls_detected = _verify_allowed_relations(
-                    cursor, allowed_relations
+                relations_verified, rls_detected, schema_fingerprint = (
+                    _verify_allowed_relations(cursor, allowed_relations)
                 )
                 source_version = (
                     _version_relation_scalar(cursor, version_relation)
@@ -330,32 +377,39 @@ def detect_capability(
         "sourceVersion": source_version,
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
+        "schemaFingerprint": schema_fingerprint,
     }), observed_at, physical_id
 
 
 def verify_remote_state(
     connection_url: str, allowed_relations: tuple[str, ...]
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, str], bool, bool, str]:
     """Provision's own standalone, live re-check of the remote's physical
-    identity *and* its current extension versions — deliberately a fresh
-    connection, not shared with any prior Observe, since the whole point is
-    to catch drift that happened *since* Observe's snapshot
-    (docs/federation-architecture-waypoint.md, "Drift and retirement":
-    "Different physical database | Raise identity conflict; require
-    explicit rebind"). A connectionRef's host/port/dbname/user can stay
-    byte-for-byte identical while pointing at a genuinely different
+    identity, current extension versions, relation existence/selectability,
+    RLS/security-barrier exposure, and column/view-definition fingerprint —
+    deliberately a fresh connection, not shared with any prior Observe,
+    since the whole point is to catch drift that happened *since* Observe's
+    snapshot (docs/federation-architecture-waypoint.md, "Drift and
+    retirement": "Different physical database | Raise identity conflict;
+    require explicit rebind"). A connectionRef's host/port/dbname/user can
+    stay byte-for-byte identical while pointing at a genuinely different
     physical database — nothing about the connection string itself would
     ever reveal a same-name replacement.
 
-    Both pieces of evidence are collected from this one connection's
-    snapshot for the same reason `_physical_identity_from_cursor` gives for
-    not being a second connection off of Observe's: an in-place extension
-    upgrade on the remote changes no OID at all, so identity alone can't
-    catch it, and a pushdown-safety decision (federation_store.py's
-    `_shippable_extensions`) made against a version read from a *separate*
-    live connection could itself be stale by the time the identity check
-    (or vice versa) runs — the same class of TOCTOU gap as pairing
-    Observe's schema evidence with a second connection's physical identity.
+    Returns (physical_identity, extension_versions, relations_verified,
+    row_level_security_detected, schema_fingerprint) — all five collected
+    from this one connection's snapshot for the same reason
+    `_physical_identity_from_cursor` gives for not being a second connection
+    off of Observe's: an in-place extension upgrade, a newly-enabled RLS
+    policy, an added column, or a redefined view all change no OID at all,
+    so identity alone can't catch any of them, and a decision (pushdown
+    safety, the row_level_security_acknowledged gate, or schema currency)
+    made against evidence read from a *separate* live connection could
+    itself be stale by the time another one of these checks runs — the same
+    class of TOCTOU gap as pairing Observe's schema evidence with a second
+    connection's physical identity. Provision must not trust
+    last_observation's stored rowLevelSecurityDetected/schemaFingerprint any
+    more than it trusts a stored physical identity or extension-version set.
 
     Raises psycopg.Error on a connection failure — callers already
     reachability-gate this (Observe via detect_capability, Provision via
@@ -370,4 +424,13 @@ def verify_remote_state(
             PostgresSemanticSources._begin_read_only(cursor)
             identity = _physical_identity_from_cursor(cursor, allowed_relations)
             versions = extension_versions(cursor)
-    return identity, versions
+            relations_verified, rls_detected, schema_fingerprint = (
+                _verify_allowed_relations(cursor, allowed_relations)
+            )
+    return (
+        identity,
+        versions,
+        relations_verified,
+        rls_detected,
+        schema_fingerprint,
+    )

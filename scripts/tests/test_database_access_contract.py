@@ -417,6 +417,90 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "fed_alias.provisioned_at IS NOT NULL", normalized
         )
 
+    def test_source_schema_exemption_requires_the_managed_foreign_table_itself(
+        self,
+    ) -> None:
+        # A source_<alias> schema match plus provisioned_at IS NOT NULL
+        # (the previous test) still only proves the SCHEMA is legitimate —
+        # the derived-owner role owns that schema (needed for IMPORT
+        # FOREIGN SCHEMA to work), so it could create an ordinary local
+        # table/view/sequence there, or a foreign table bound to a
+        # DIFFERENT server, and either would still be silently exempted
+        # without this. The relation/sequence-level unsafe-privilege
+        # checks (not the schema-level CREATE-privilege checks, which
+        # legitimately stay schema-scoped) must additionally require the
+        # specific object to be a foreign table (relkind='f') bound to
+        # this exact alias's own server, importing one of its registered
+        # allowedRelations — never membership in the schema alone.
+        normalized = self.normalized("scripts/verify.sh")
+        self.assertEqual(
+            6, normalized.count("fed_alias.provisioned_at IS NOT NULL"),
+            "expected exactly 6 fed_alias exemption blocks (3 checks x "
+            "login_role/reachable_role) — a count drift here means a "
+            "check was added, removed, or merged without updating this "
+            "test.",
+        )
+        # Exactly 4 of the 6 are relation/sequence-level and must be
+        # tightened; the other 2 are schema-level CREATE-privilege checks
+        # and must NOT reference foreign-table binding at all.
+        self.assertEqual(4, normalized.count("relation.relkind = $$f$$"))
+        self.assertEqual(
+            4, normalized.count("FROM pg_catalog.pg_foreign_table")
+        )
+        self.assertEqual(
+            4, normalized.count("JOIN pg_catalog.pg_foreign_server")
+        )
+        self.assertEqual(
+            4, normalized.count("foreign_server.srvname = (fed_alias.alias || $$_srv$$)")
+        )
+        self.assertEqual(
+            4,
+            normalized.count(
+                "FROM unnest(fed_alias.allowed_relations) AS allowed_relation"
+            ),
+        )
+        self.assertIn("foreign_table.ftrelid = relation.oid", normalized)
+        self.assertIn(
+            "ON foreign_server.oid = foreign_table.ftserver", normalized
+        )
+        self.assertIn(
+            "SELECT split_part(allowed_relation, $$.$$, 2)", normalized
+        )
+        # The two schema-level checks (canCreateBaseSchema and its
+        # reachable_role mirror) must stay untouched — a provisioned
+        # alias's owner legitimately needs CREATE on the whole schema, so
+        # nothing between each of those two fed_alias blocks and their own
+        # has_schema_privilege call should reference foreign-table binding
+        # at all.
+        for marker in (
+            'has_schema_privilege(namespace.oid, $$CREATE$$) ) AS '
+            '"canCreateBaseSchema"',
+            "has_schema_privilege( reachable_role.oid, namespace.oid, "
+            "$$CREATE$$",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, normalized)
+        # has_schema_privilege( reachable_role.oid, ... $$CREATE$$ also
+        # appears once earlier for the two pre-existing, non-federation
+        # schemas — search only from the federation section onward so
+        # this test locates the federation-specific occurrence, not that
+        # unrelated one.
+        federation_section_start = normalized.index("federation._aliases")
+        schema_level_windows = 0
+        for marker in (
+            'AS "canCreateBaseSchema"',
+            "has_schema_privilege( reachable_role.oid, namespace.oid, "
+            "$$CREATE$$",
+        ):
+            end = normalized.index(marker, federation_section_start)
+            start = normalized.rindex("OR EXISTS (", 0, end)
+            window = normalized[start:end]
+            self.assertIn("federation._aliases", window)
+            self.assertNotIn("pg_foreign_table", window)
+            self.assertNotIn("allowed_relations", window)
+            schema_level_windows += 1
+        self.assertEqual(2, schema_level_windows)
+
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(
             "docker/postgis/prepare-spatial-indexes.sh"
