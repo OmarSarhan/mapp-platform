@@ -1713,12 +1713,20 @@ with psycopg.connect(
                             JOIN pg_catalog.pg_foreign_server AS foreign_server
                               ON foreign_server.oid = foreign_table.ftserver
                             WHERE foreign_table.ftrelid = relation.oid
-                              AND foreign_server.srvname
-                                    = (fed_alias.alias || $$_srv$$)
-                          )
-                          AND relation.relname IN (
-                            SELECT split_part(allowed_relation, $$.$$, 2)
-                            FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                              AND foreign_server.srvname = (fed_alias.alias || $$_srv$$)
+                              AND (
+                                (
+                                  SELECT split_part(option, $$=$$, 2)
+                                  FROM unnest(foreign_table.ftoptions) AS option
+                                  WHERE option LIKE $$schema_name=%$$
+                                )
+                                || $$.$$ ||
+                                (
+                                  SELECT split_part(option, $$=$$, 2)
+                                  FROM unnest(foreign_table.ftoptions) AS option
+                                  WHERE option LIKE $$table_name=%$$
+                                )
+                              ) = ANY(fed_alias.allowed_relations)
                           )
                       )
                     )
@@ -1775,12 +1783,20 @@ with psycopg.connect(
                             JOIN pg_catalog.pg_foreign_server AS foreign_server
                               ON foreign_server.oid = foreign_table.ftserver
                             WHERE foreign_table.ftrelid = relation.oid
-                              AND foreign_server.srvname
-                                    = (fed_alias.alias || $$_srv$$)
-                          )
-                          AND relation.relname IN (
-                            SELECT split_part(allowed_relation, $$.$$, 2)
-                            FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                              AND foreign_server.srvname = (fed_alias.alias || $$_srv$$)
+                              AND (
+                                (
+                                  SELECT split_part(option, $$=$$, 2)
+                                  FROM unnest(foreign_table.ftoptions) AS option
+                                  WHERE option LIKE $$schema_name=%$$
+                                )
+                                || $$.$$ ||
+                                (
+                                  SELECT split_part(option, $$=$$, 2)
+                                  FROM unnest(foreign_table.ftoptions) AS option
+                                  WHERE option LIKE $$table_name=%$$
+                                )
+                              ) = ANY(fed_alias.allowed_relations)
                           )
                       )
                     )
@@ -1867,12 +1883,20 @@ with psycopg.connect(
                                   JOIN pg_catalog.pg_foreign_server AS foreign_server
                                     ON foreign_server.oid = foreign_table.ftserver
                                   WHERE foreign_table.ftrelid = relation.oid
-                                    AND foreign_server.srvname
-                                          = (fed_alias.alias || $$_srv$$)
-                                )
-                                AND relation.relname IN (
-                                  SELECT split_part(allowed_relation, $$.$$, 2)
-                                  FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                                    AND foreign_server.srvname = (fed_alias.alias || $$_srv$$)
+                                    AND (
+                                      (
+                                        SELECT split_part(option, $$=$$, 2)
+                                        FROM unnest(foreign_table.ftoptions) AS option
+                                        WHERE option LIKE $$schema_name=%$$
+                                      )
+                                      || $$.$$ ||
+                                      (
+                                        SELECT split_part(option, $$=$$, 2)
+                                        FROM unnest(foreign_table.ftoptions) AS option
+                                        WHERE option LIKE $$table_name=%$$
+                                      )
+                                    ) = ANY(fed_alias.allowed_relations)
                                 )
                             )
                           )
@@ -1957,12 +1981,20 @@ with psycopg.connect(
                                   JOIN pg_catalog.pg_foreign_server AS foreign_server
                                     ON foreign_server.oid = foreign_table.ftserver
                                   WHERE foreign_table.ftrelid = relation.oid
-                                    AND foreign_server.srvname
-                                          = (fed_alias.alias || $$_srv$$)
-                                )
-                                AND relation.relname IN (
-                                  SELECT split_part(allowed_relation, $$.$$, 2)
-                                  FROM unnest(fed_alias.allowed_relations) AS allowed_relation
+                                    AND foreign_server.srvname = (fed_alias.alias || $$_srv$$)
+                                    AND (
+                                      (
+                                        SELECT split_part(option, $$=$$, 2)
+                                        FROM unnest(foreign_table.ftoptions) AS option
+                                        WHERE option LIKE $$schema_name=%$$
+                                      )
+                                      || $$.$$ ||
+                                      (
+                                        SELECT split_part(option, $$=$$, 2)
+                                        FROM unnest(foreign_table.ftoptions) AS option
+                                        WHERE option LIKE $$table_name=%$$
+                                      )
+                                    ) = ANY(fed_alias.allowed_relations)
                                 )
                             )
                           )

@@ -426,12 +426,16 @@ class DatabaseAccessContractTests(unittest.TestCase):
         # FOREIGN SCHEMA to work), so it could create an ordinary local
         # table/view/sequence there, or a foreign table bound to a
         # DIFFERENT server, and either would still be silently exempted
-        # without this. The relation/sequence-level unsafe-privilege
+        # without this. Nor is being a foreign table bound to the right
+        # server enough on its own: `ALTER FOREIGN TABLE ... OPTIONS (SET
+        # schema_name/table_name ...)` can retarget which *remote*
+        # relation it actually queries without changing its local name,
+        # relkind, or server. The relation/sequence-level unsafe-privilege
         # checks (not the schema-level CREATE-privilege checks, which
         # legitimately stay schema-scoped) must additionally require the
-        # specific object to be a foreign table (relkind='f') bound to
-        # this exact alias's own server, importing one of its registered
-        # allowedRelations — never membership in the schema alone.
+        # foreign table's own schema_name/table_name options — the actual
+        # remote binding postgres_fdw uses, not just local naming — to
+        # match one of the alias's registered allowedRelations.
         normalized = self.normalized("scripts/verify.sh")
         self.assertEqual(
             6, normalized.count("fed_alias.provisioned_at IS NOT NULL"),
@@ -453,19 +457,27 @@ class DatabaseAccessContractTests(unittest.TestCase):
         self.assertEqual(
             4, normalized.count("foreign_server.srvname = (fed_alias.alias || $$_srv$$)")
         )
+        # The foreign table's actual remote binding (schema_name +
+        # table_name options — always set explicitly by IMPORT FOREIGN
+        # SCHEMA) must match one of the alias's registered
+        # allowedRelations, not just its local name.
         self.assertEqual(
-            4,
-            normalized.count(
-                "FROM unnest(fed_alias.allowed_relations) AS allowed_relation"
-            ),
+            8, normalized.count("FROM unnest(foreign_table.ftoptions) AS option")
+        )
+        self.assertEqual(
+            4, normalized.count("WHERE option LIKE $$schema_name=%$$")
+        )
+        self.assertEqual(
+            4, normalized.count("WHERE option LIKE $$table_name=%$$")
+        )
+        self.assertEqual(
+            4, normalized.count("= ANY(fed_alias.allowed_relations)")
         )
         self.assertIn("foreign_table.ftrelid = relation.oid", normalized)
         self.assertIn(
             "ON foreign_server.oid = foreign_table.ftserver", normalized
         )
-        self.assertIn(
-            "SELECT split_part(allowed_relation, $$.$$, 2)", normalized
-        )
+        self.assertNotIn("relation.relname IN (", normalized)
         # The two schema-level checks (canCreateBaseSchema and its
         # reachable_role mirror) must stay untouched — a provisioned
         # alias's owner legitimately needs CREATE on the whole schema, so
