@@ -513,6 +513,29 @@ class DatabaseAccessContractTests(unittest.TestCase):
             schema_level_windows += 1
         self.assertEqual(2, schema_level_windows)
 
+    def test_federation_registry_stand_in_declares_every_referenced_column(
+        self,
+    ) -> None:
+        # federation._aliases is created lazily
+        # (FederationAliasStore._initialize() on first use), so a fresh
+        # deployment that has never taken a federation API call substitutes
+        # an always-empty stand-in rather than aborting this whole audit
+        # with UndefinedTable. PostgreSQL still resolves every fed_alias.*
+        # column reference against that stand-in even though it's always
+        # empty, so a column referenced elsewhere but missing here aborts
+        # with UndefinedColumn instead of performing the audit (round 23
+        # finding — the stand-in was never updated when allowed_relations
+        # was added to the audit query in an earlier round).
+        normalized = self.normalized("scripts/verify.sh")
+        referenced_columns = set(re.findall(r"fed_alias\.([a-z_]+)", normalized))
+        self.assertTrue(referenced_columns)
+        stand_in_start = normalized.index('else "(SELECT NULL::text AS alias')
+        stand_in_end = normalized.index("WHERE FALSE)", stand_in_start)
+        stand_in = normalized[stand_in_start:stand_in_end]
+        for column in sorted(referenced_columns):
+            with self.subTest(column=column):
+                self.assertIn(f"AS {column}", stand_in)
+
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(
             "docker/postgis/prepare-spatial-indexes.sh"

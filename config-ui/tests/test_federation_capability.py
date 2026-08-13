@@ -1,9 +1,10 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import psycopg
 
+import federation_capability
 from federation_capability import detect_capability, verify_remote_state
 from federation_schema import FederationSchemaError
 
@@ -545,6 +546,33 @@ class VerifyRemoteStateTests(unittest.TestCase):
         self.assertFalse(relations_verified)
         self.assertEqual("missing", schema_fingerprint)
 
+    def test_reports_relations_not_verified_when_a_present_relation_is_unselectable(self):
+        # The relation exists in pg_class (a real row is returned, unlike
+        # the "missing" case above) but _selectable()'s actual SELECT
+        # fails — e.g. a security_invoker view whose underlying relation
+        # the connecting role can't read. Patching _selectable() directly
+        # (rather than re-deriving its SAVEPOINT mechanics here) proves
+        # _verify_allowed_relations() actually wires its result into the
+        # overall verdict, not just that _selectable() itself works in
+        # isolation (see SelectableTests).
+        cursor = ScriptedFakeCursor(
+            physical_identity_results()
+            + extension_version_results()
+            + relation_check_results()
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ), patch(
+            "federation_capability._selectable", return_value=False
+        ):
+            _, _, relations_verified, _, schema_fingerprint = verify_remote_state(
+                "postgresql://reader", ("leeds.bus_stops",)
+            )
+
+        self.assertFalse(relations_verified)
+        self.assertEqual("missing", schema_fingerprint)
+
     def test_reports_row_level_security_detection(self):
         cursor = ScriptedFakeCursor(
             physical_identity_results()
@@ -568,6 +596,42 @@ class VerifyRemoteStateTests(unittest.TestCase):
         ):
             with self.assertRaises(psycopg.Error):
                 verify_remote_state("postgresql://unreachable", ())
+
+
+class SelectableTests(unittest.TestCase):
+    # has_table_privilege() alone is fooled by a PostgreSQL 15+
+    # security_invoker view whose underlying relation the connecting role
+    # can't read (verified live against the real FDW rig) — _selectable()
+    # must attempt a real SELECT instead, and must never leave the
+    # surrounding transaction aborted when that SELECT fails.
+
+    def test_returns_true_when_the_select_succeeds(self):
+        cursor = MagicMock()
+        self.assertTrue(
+            federation_capability._selectable(cursor, "leeds", "bus_stops")
+        )
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertEqual("SAVEPOINT relation_selectable", statements[0])
+        self.assertIn("SELECT 1 FROM", str(statements[1]))
+        self.assertEqual("ROLLBACK TO SAVEPOINT relation_selectable", statements[-1])
+
+    def test_returns_false_and_still_rolls_back_when_the_select_is_denied(self):
+        cursor = MagicMock()
+
+        def execute(statement, *args, **kwargs):
+            if "SELECT 1 FROM" in str(statement):
+                raise psycopg.errors.InsufficientPrivilege(
+                    "permission denied for table bus_stops"
+                )
+
+        cursor.execute.side_effect = execute
+
+        self.assertFalse(
+            federation_capability._selectable(cursor, "leeds", "bus_stops")
+        )
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertEqual("SAVEPOINT relation_selectable", statements[0])
+        self.assertEqual("ROLLBACK TO SAVEPOINT relation_selectable", statements[-1])
 
 
 if __name__ == "__main__":

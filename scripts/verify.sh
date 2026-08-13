@@ -1590,7 +1590,8 @@ with psycopg.connect(
             "federation._aliases"
             if cursor.fetchone()["oid"] is not None
             else "(SELECT NULL::text AS alias, "
-            "NULL::timestamptz AS provisioned_at WHERE FALSE)"
+            "NULL::timestamptz AS provisioned_at, "
+            "NULL::text[] AS allowed_relations WHERE FALSE)"
         )
         audit_sql = """
             SELECT

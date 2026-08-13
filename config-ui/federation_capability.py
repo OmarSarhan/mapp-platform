@@ -183,12 +183,11 @@ def _verify_allowed_relations(
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
-              AND has_table_privilege(c.oid, 'SELECT')
             """,
             (schema, relation),
         )
         row = cursor.fetchone()
-        if row is None:
+        if row is None or not _selectable(cursor, schema, relation):
             all_present = False
             fingerprints.append("missing")
             continue
@@ -196,6 +195,37 @@ def _verify_allowed_relations(
             rls_detected = True
         fingerprints.append(row["definition_fingerprint"])
     return all_present, rls_detected, "|".join(fingerprints)
+
+
+def _selectable(cursor: Any, schema: str, relation: str) -> bool:
+    """Actually attempt a bounded, zero-row SELECT rather than trusting
+    has_table_privilege() alone — a PostgreSQL 15+ security_invoker view
+    evaluates privilege on its *underlying* relations using the calling
+    role, so has_table_privilege() on the view itself can be true while
+    selecting it fails in practice (verified live: a reader granted
+    SELECT only on such a view, not its base table, is reported
+    privileged but gets "permission denied" on an actual SELECT).
+
+    A permission failure aborts the surrounding transaction unless
+    contained — this only ever runs inside detect_capability()'s single
+    bounded read-only transaction, which must keep working for whatever
+    allowed_relations entry comes next and for the physical-identity read
+    afterward. SAVEPOINT/ROLLBACK TO SAVEPOINT contains the failure to
+    just this probe, same as a plain ROLLBACK would for the whole
+    transaction; the same savepoint name is safely reused across loop
+    iterations since it never survives past its own rollback."""
+    cursor.execute("SAVEPOINT relation_selectable")
+    try:
+        cursor.execute(
+            sql.SQL("SELECT 1 FROM {}.{} WHERE FALSE").format(
+                sql.Identifier(schema), sql.Identifier(relation)
+            )
+        )
+        return True
+    except psycopg.Error:
+        return False
+    finally:
+        cursor.execute("ROLLBACK TO SAVEPOINT relation_selectable")
 
 
 def _version_relation_scalar(
