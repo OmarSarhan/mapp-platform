@@ -157,6 +157,84 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual("federation.some_validation_error", body["code"])
 
 
+class FederationAliasReadRouteTests(unittest.TestCase):
+    """GET /api/federation/aliases(/<alias>) must preserve a
+    FederationSchemaError's own status/code (round 26 finding) — e.g.
+    federation.not_configured, a permanent configuration fact when
+    FEDERATION is unset outside bundled mode, must never be folded into
+    the generic 502 federation.registry_unavailable a real psycopg.Error
+    still gets, or a contract-driven client would retry a deployment mode
+    that will never become available."""
+
+    @staticmethod
+    def handler(path, *, actor="admin"):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_list_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_list_still_reports_a_real_database_failure_as_unavailable(self):
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_get_by_name_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_get_by_name_still_reports_a_real_database_failure_as_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")

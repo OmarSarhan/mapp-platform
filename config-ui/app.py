@@ -6039,7 +6039,16 @@ class Handler(SimpleHTTPRequestHandler):
                         code="federation.not_configured",
                     )
                 self._json(HTTPStatus.OK, {"aliases": FEDERATION.list()})
-            except (FederationSchemaError, psycopg.Error) as exc:
+            except FederationSchemaError as exc:
+                # Must come before except psycopg.Error below — e.g. an
+                # intentionally-disabled deployment (FEDERATION is None
+                # outside bundled mode) raises federation.not_configured
+                # here, a permanent configuration fact, not a transient
+                # outage; folding it into the generic 502 below would
+                # make a contract-driven client retry a mode that will
+                # never become available and lose the actionable code.
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {
@@ -6080,7 +6089,14 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "federation.alias_not_found",
                     "name": name,
                 })
-            except (FederationSchemaError, psycopg.Error) as exc:
+            except FederationSchemaError as exc:
+                # Must come before except psycopg.Error below — see the
+                # sibling list route above for why federation.not_configured
+                # (and any other FederationSchemaError code) must keep its
+                # own status/code rather than being folded into a generic
+                # 502 registry_unavailable.
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {

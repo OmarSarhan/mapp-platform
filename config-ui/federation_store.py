@@ -539,9 +539,16 @@ class FederationAliasStore:
     # and a source — execution happens in the federation database, so a
     # pushed-down expression (e.g. ST_Transform) can silently return a
     # different result from the same expression evaluated locally if the
-    # versions disagree. Only ever mark postgis shippable when all three
-    # exactly match the alias's last observation of the remote.
-    _VERSION_MATCH_KEYS = ("postgis", "proj", "geos")
+    # versions disagree. postgisExtversion is a separate, additional
+    # requirement, not a replacement for the library-version check above:
+    # a same-library, different-extversion pair still evaluates shared
+    # expressions identically, but the older SQL script on one side may be
+    # missing a function or operator the newer one added — pushing down an
+    # expression that uses it would fail at the SQL level rather than
+    # merely evaluate differently (see extension_versions()'s docstring).
+    # Only ever mark postgis shippable when every one of these exactly
+    # matches the alias's last observation of the remote.
+    _VERSION_MATCH_KEYS = ("postgis", "postgisExtversion", "proj", "geos")
 
     @staticmethod
     def _shippable_extensions(

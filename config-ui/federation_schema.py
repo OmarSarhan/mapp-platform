@@ -327,7 +327,9 @@ def validate_observation(payload: Any) -> dict[str, Any]:
             extension_versions,
             label="extensionVersions",
             required=frozenset(),
-            optional=frozenset({"postgresql", "postgis", "proj", "geos"}),
+            optional=frozenset(
+                {"postgresql", "postgis", "postgisExtversion", "proj", "geos"}
+            ),
         )
         for name, version in versions.items():
             if not isinstance(version, str) or not version.strip():

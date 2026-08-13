@@ -60,7 +60,7 @@ CLOCK_TIMESTAMP_RESULT = {
 def extension_version_results(*, postgis=True):
     results = [{"version": "16.2"}]
     if postgis:
-        results.append({"exists": 1})
+        results.append({"extversion": "3.4.2"})
         results.append({"version": "3.4.2"})
         results.append({"version": "9.3.1"})
         results.append({"version": "3.12.1"})
@@ -126,6 +126,7 @@ class DetectCapabilityTests(unittest.TestCase):
             {
                 "postgresql": "16.2",
                 "postgis": "3.4.2",
+                "postgisExtversion": "3.4.2",
                 "proj": "9.3.1",
                 "geos": "3.12.1",
             },
@@ -177,7 +178,7 @@ class DetectCapabilityTests(unittest.TestCase):
         cursor = ScriptedFakeCursor([
             CLOCK_TIMESTAMP_RESULT,
             {"version": "16.2"},
-            {"exists": 1},
+            {"extversion": "3.4.2"},
             {"version": "3.4.2"},
             {"version": "9.3.1"},
             {"version": "3.12.1"},
@@ -245,6 +246,41 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertTrue(observation["rowLevelSecurityDetected"])
         executed_sql = "\n".join(query for query, _ in cursor.executed)
         self.assertIn("security_barrier", executed_sql)
+
+    def test_fingerprint_query_captures_the_security_invoker_reloption(self):
+        # round 26 finding: ALTER VIEW ... SET (security_invoker=...)
+        # changes neither a view's query text (pg_get_viewdef() returns
+        # byte-identical text across the flip, verified live) nor its
+        # oid, yet flips whether its underlying relations are evaluated
+        # under the connecting role or the view owner — a definer-
+        # semantics view can surface rows RLS on an underlying table
+        # would otherwise have filtered. Must be part of the fingerprint
+        # so a flip is never silently accepted.
+        cursor = ScriptedFakeCursor(
+            [CLOCK_TIMESTAMP_RESULT]
+            + extension_and_rls_results()
+            + physical_identity_results()
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            detect_capability(
+                "postgresql://reader?sslmode=require",
+                allowed_relations=("leeds.tenant_scoped_view",),
+                tls_policy="require",
+            )
+
+        executed_sql = "\n".join(query for query, _ in cursor.executed)
+        self.assertIn("security_invoker", executed_sql)
+        # This query is called with bound (schema, relation) parameters
+        # (%s placeholders), so a literal % anywhere else in the same
+        # string must be escaped as %% or psycopg's placeholder scanner
+        # raises ProgrammingError before the query ever reaches Postgres
+        # — caught live against the real rig, not by any mock, since
+        # ScriptedFakeCursor never performs real placeholder substitution.
+        self.assertIn("security_invoker=%%", executed_sql)
+        self.assertNotIn("security_invoker=%'", executed_sql)
 
     def test_combines_multiple_relations_into_one_ordered_fingerprint(self):
         cursor = ScriptedFakeCursor(
@@ -441,6 +477,7 @@ class VerifyRemoteStateTests(unittest.TestCase):
             {
                 "postgresql": "16.2",
                 "postgis": "3.4.2",
+                "postgisExtversion": "3.4.2",
                 "proj": "9.3.1",
                 "geos": "3.12.1",
             },

@@ -10,8 +10,14 @@ import federation_store
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
 
-MATCHING_VERSIONS = {"postgis": "3.5.7", "proj": "9.8.1", "geos": "3.14.1"}
-DIFFERENT_VERSIONS = {"postgis": "3.0.0", "proj": "8.0.0", "geos": "3.9.0"}
+MATCHING_VERSIONS = {
+    "postgis": "3.5.7", "postgisExtversion": "3.5.7", "proj": "9.8.1",
+    "geos": "3.14.1",
+}
+DIFFERENT_VERSIONS = {
+    "postgis": "3.0.0", "postgisExtversion": "3.0.0", "proj": "8.0.0",
+    "geos": "3.9.0",
+}
 OBSERVED_AT = datetime(2026, 8, 11, 0, 0, 0, tzinfo=timezone.utc)
 
 # Matches _connection_identity() of "postgresql://reader:secret@source-db
@@ -1233,6 +1239,47 @@ class FederationAliasStoreTests(unittest.TestCase):
             # re-check above (DIFFERENT_VERSIONS), not this stored value:
             # an in-place remote extension upgrade since Observe changes
             # no OID, so the physical-identity check alone can't catch it.
+            provision_row(
+                provisionedAt=None,
+                lastObservation={
+                    "schema": "current",
+                    "extensionVersions": MATCHING_VERSIONS,
+                },
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertNotIn("extensions", create_server)
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(
+            SOURCE_DB_PHYSICAL_IDENTITY,
+            {**MATCHING_VERSIONS, "postgisExtversion": "3.4.0"},
+            True, False, None,
+        ),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_does_not_mark_postgis_shippable_when_only_extversion_differs(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # round 26 finding: a matching PostGIS_Lib_Version() (the linked
+        # library, governing operator/function *behavior*) is not enough
+        # on its own — pg_extension.extversion can still lag behind an
+        # ALTER EXTENSION postgis UPDATE on one side, meaning its SQL
+        # catalog may be missing a function or operator the other side's
+        # newer script added. Pushing that down would fail at the SQL
+        # level, not just evaluate differently, so this must also block
+        # shippability even though the library versions alone match.
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
             provision_row(
                 provisionedAt=None,
                 lastObservation={

@@ -79,8 +79,11 @@ def extension_versions(cursor: Any) -> dict[str, str]:
     cursor.execute("SELECT current_setting('server_version') AS version")
     versions = {"postgresql": cursor.fetchone()["version"]}
 
-    cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'postgis'")
-    if not cursor.fetchone():
+    cursor.execute(
+        "SELECT extversion FROM pg_extension WHERE extname = 'postgis'"
+    )
+    extension_row = cursor.fetchone()
+    if not extension_row:
         return versions
 
     # PostGIS_Lib_Version() reports the actual linked library — the signal
@@ -88,9 +91,15 @@ def extension_versions(cursor: Any) -> dict[str, str]:
     # pg_extension.extversion, which only reflects the installed SQL
     # extension script and can lag behind a library upgrade until
     # `ALTER EXTENSION postgis UPDATE` runs (PostGIS_Full_Version()'s own
-    # "[EXTENSION] ... needs upgrade" note is exactly this drift — using
-    # extversion here would compare stale script bookkeeping, not whether
-    # the two sides would actually evaluate an expression identically).
+    # "[EXTENSION] ... needs upgrade" note is exactly this drift). Neither
+    # signal alone is sufficient for the pushdown-safety gate this feeds
+    # (federation_store.py's _shippable_extensions): a same-library,
+    # different-extversion pair still evaluates expressions identically,
+    # but the *other* side's SQL catalog may be missing a function or
+    # operator the newer script added — pushing down an expression that
+    # uses it would fail at the SQL level, not just evaluate differently.
+    # Both are captured and both must match.
+    versions["postgisExtversion"] = extension_row["extversion"]
     cursor.execute("SELECT PostGIS_Lib_Version() AS version")
     lib_row = cursor.fetchone()
     if lib_row and lib_row["version"]:
@@ -129,20 +138,37 @@ def _verify_allowed_relations(
 
     "schema_fingerprint" combines each allowed relation's column list
     (name/full type including modifiers/nullability, in ordinal position)
-    with, for a view, its actual defining query text — closing a gap
-    physical_identity can't: an ADD COLUMN on an already-allowlisted
-    table, or a CREATE OR REPLACE VIEW that narrows or drops a row-
-    filtering predicate while keeping the same output columns, changes
-    neither the relation's own oid nor its RLS/security-barrier flags, so
-    it would otherwise be invisible to every other check this module
-    runs. The type is captured via format_type(atttypid, atttypmod), not
-    atttypid alone — a bare type oid is unchanged by a type-modifier-only
-    edit (varchar length, numeric precision/scale, or — most importantly
-    on a platform built around spatial data — a PostGIS geometry column's
-    subtype/SRID, both encoded entirely in the typmod), so atttypid alone
-    would let exactly that class of edit through unreviewed. A relation
-    gone missing gets the literal string "missing" here too — its absence
-    must change the fingerprint, not be silently skipped, for the same
+    with, for a view, its actual defining query text, and separately its
+    security_invoker reloption — closing gaps physical_identity can't: an
+    ADD COLUMN on an already-allowlisted table, or a CREATE OR REPLACE
+    VIEW that narrows or drops a row-filtering predicate while keeping
+    the same output columns, changes neither the relation's own oid nor
+    its RLS/security-barrier flags, so it would otherwise be invisible to
+    every other check this module runs. The type is captured via
+    format_type(atttypid, atttypmod), not atttypid alone — a bare type
+    oid is unchanged by a type-modifier-only edit (varchar length,
+    numeric precision/scale, or — most importantly on a platform built
+    around spatial data — a PostGIS geometry column's subtype/SRID, both
+    encoded entirely in the typmod), so atttypid alone would let exactly
+    that class of edit through unreviewed. security_invoker is captured
+    separately from pg_get_viewdef() (which reflects only the query text,
+    not reloptions) because ALTER VIEW ... SET (security_invoker=...)
+    changes neither a view's own query text nor its oid, yet flips
+    whether its underlying relations are evaluated under the connecting
+    role's privileges or the view owner's — a definer-semantics view can
+    surface rows RLS on an underlying table would otherwise have filtered
+    for the connecting role (verified live: pg_get_viewdef() returns
+    byte-identical text across a security_invoker flip; only reloptions
+    changes). Deliberately fingerprinted, not folded into
+    bypasses_per_user_access below: correctly deciding whether a given
+    invoker/definer setting is actually an RLS bypass depends on whatever
+    the view's underlying relations (potentially several, potentially
+    nested through other views) themselves enforce, which this
+    per-relation query has no way to walk generically. Fingerprinting it
+    guarantees a flip is never silently accepted regardless of relkind,
+    without guessing at that separate, harder question. A relation gone
+    missing gets the literal string "missing" here too — its absence must
+    change the fingerprint, not be silently skipped, for the same
     fail-closed reason as all_present above."""
     all_present = True
     rls_detected = False
@@ -178,6 +204,15 @@ def _verify_allowed_relations(
                     THEN pg_get_viewdef(c.oid, true)
                   END,
                   ''
+                )
+                || '|' ||
+                COALESCE(
+                  (
+                    SELECT split_part(option, '=', 2)
+                    FROM unnest(c.reloptions) AS option
+                    WHERE option LIKE 'security_invoker=%%'
+                  ),
+                  'false'
                 )
               ) AS definition_fingerprint
             FROM pg_catalog.pg_class AS c
