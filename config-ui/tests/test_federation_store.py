@@ -390,6 +390,89 @@ class FederationAliasStoreTests(unittest.TestCase):
                 OBSERVED_AT,
             )
 
+    @patch("federation_store.detect_capability")
+    def test_observe_acquires_a_per_alias_advisory_lock_before_probing(
+        self, mock_detect
+    ):
+        # round 25 finding: two overlapping Observe calls for the same
+        # alias can otherwise commit out of order across a reachability
+        # transition (record_observation() has no shared clock to compare
+        # a reachable probe's remote-clock timestamp against an
+        # unreachable probe's local-clock one, so it accepts every
+        # transition unconditionally). observe() closes this by holding a
+        # per-alias advisory lock across the whole probe-and-persist
+        # cycle, so a second Observe for the same alias can't even start
+        # probing until the first one's entire cycle has committed.
+        mock_detect.return_value = (
+            {
+                "connectivity": "reachable",
+                "schema": "current",
+                "sourceFreshness": "unknown",
+                "lastConnected": "2026-08-13T00:00:00+00:00",
+                "lastSchemaVerified": "2026-08-13T00:00:00+00:00",
+                "sourceVersion": None,
+            },
+            OBSERVED_AT,
+            SOURCE_DB_PHYSICAL_IDENTITY,
+        )
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.observe(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertEqual(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", statements[0]
+        )
+        lock_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(("federation:observe:leeds_ext",), lock_params)
+        mock_detect.assert_called_once_with(
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+            version_relation=None,
+        )
+
+    @patch("federation_store.detect_capability")
+    def test_observe_uses_a_lock_key_scoped_to_its_own_alias(self, mock_detect):
+        mock_detect.return_value = (
+            {
+                "connectivity": "unavailable",
+                "schema": "unknown",
+                "sourceFreshness": "unknown",
+                "lastConnected": None,
+                "lastSchemaVerified": None,
+                "sourceVersion": None,
+            },
+            OBSERVED_AT,
+            None,
+        )
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"alias": "other_alias", "provisioned_at": None},
+            alias_row(status="unavailable"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.observe(
+            "other_alias",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+        )
+
+        lock_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(("federation:observe:other_alias",), lock_params)
+
     def test_record_observation_reads_but_never_writes_the_accepted_schema_fingerprint(self):
         # accepted_schema_fingerprint is durable, written only by a
         # successful provision() call. Observe reads it read-only, purely
@@ -692,18 +775,23 @@ class FederationAliasStoreTests(unittest.TestCase):
         return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-first"),
     )
     @patch("federation_store.extension_versions")
-    def test_provision_proceeds_on_first_ever_acceptance_regardless_of_fingerprint(
+    def test_provision_proceeds_on_first_ever_acceptance_when_it_matches_the_last_observation(
         self, mock_versions, mock_verify_remote_state
     ):
         # accepted_schema_fingerprint is None — nothing has ever been
         # durably accepted for this alias (its first provisioning) — so
-        # there is nothing to compare the live fingerprint against yet.
+        # there is nothing to compare the live fingerprint against for
+        # THAT check specifically. It must still match what the last
+        # Observe actually saw, though (see the test right below this one
+        # for the case where it doesn't).
         mock_versions.return_value = {}
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             provision_row(
                 provisionedAt=None,
-                lastObservation={"schema": "current"},
+                lastObservation={
+                    "schema": "current", "schemaFingerprint": "fp-first",
+                },
                 accepted_schema_fingerprint=None,
             ),
             alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
@@ -720,6 +808,49 @@ class FederationAliasStoreTests(unittest.TestCase):
         )
         # The live fingerprint becomes the newly-accepted baseline.
         self.assertEqual(("admin", False, "fp-first", "leeds_ext"), activation.args[1])
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-drifted"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_first_ever_provisioning_rejects_a_fingerprint_drifted_since_the_last_observation(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # round 25 finding: accepted_schema_fingerprint being None (first
+        # provisioning) must not mean "no drift possible" — a column
+        # added or a view redefined between Observe and this call changes
+        # neither relations_verified nor physical_identity, so without
+        # comparing against what the last Observe actually recorded, an
+        # unreviewed definition would be imported on the very first
+        # provisioning.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            provisionedAt=None,
+            lastObservation={
+                "schema": "current", "schemaFingerprint": "fp-observed",
+            },
+            accepted_schema_fingerprint=None,
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+        self.assertEqual(
+            "federation.observation_not_current", raised.exception.code
+        )
+        # No acknowledgement flag can override this — there is nothing
+        # yet accepted to acknowledge past, only stale evidence to refresh.
+        with self.assertRaises(FederationSchemaError) as raised_again:
+            store.provision(
+                "leeds_ext", SOURCE_DB_URL, "admin",
+                acknowledge_schema_change=True,
+            )
+        self.assertEqual(
+            "federation.observation_not_current", raised_again.exception.code
+        )
 
     @patch(
         "federation_store.verify_remote_state",

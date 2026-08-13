@@ -44,7 +44,6 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_capability import detect_capability
 from federation_schema import FederationSchemaError
 from federation_store import FederationAliasStore
 from static_files import safe_static_path
@@ -7466,9 +7465,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # latter's status/code (validation, RLS-not-acknowledged,
                 # observation-not-current, etc.) is already routed correctly
                 # by the outer handler chain; only a raw local-database
-                # failure (FEDERATION.get/record_observation/provision all
-                # touch the local federation database, independent of the
-                # remote source's own reachability, which detect_capability
+                # failure (FEDERATION.get/observe/provision all touch the
+                # local federation database, independent of the remote
+                # source's own reachability, which FEDERATION.observe
                 # already reports as a normal observation rather than
                 # raising) needs translating here, matching the GET
                 # federation routes' existing "federation.registry_unavailable"
@@ -7486,49 +7485,20 @@ class Handler(SimpleHTTPRequestHandler):
                                 + ", ".join(sorted(payload)),
                                 code="federation.invalid_request",
                             )
-                        # detect_capability's own observed_at (the server's own
-                        # clock, queried as the first statement inside the
-                        # probe's REPEATABLE READ transaction — the exact
-                        # moment its snapshot is fixed, not merely "sometime
-                        # after this process connected") is the ordering key
-                        # two overlapping Observe calls for the same alias are
-                        # serialized by (FederationAliasStore.record_observation)
-                        # — a timestamp captured here, before the remote probe,
-                        # would instead reflect whichever request merely
-                        # *started* first, which a stalled connection (or even
-                        # just being descheduled between connecting and its
-                        # first query) can decouple entirely from which one
-                        # actually saw the more current state. record_observation's
-                        # guard is also reachability-aware — it only ever compares
-                        # this timestamp between two observations of the same
-                        # connectivity, since a reachable probe's observed_at is
-                        # the *remote's* clock while an unreachable one's is this
-                        # process's own, and comparing across those two clock
-                        # domains directly would let ordinary drift between the
-                        # two hosts discard a genuinely later connectivity change.
-                        # Its physical identity is likewise
-                        # computed from that same connection's snapshot (None
-                        # when unreachable) — a second, separate connection here
-                        # could observe a relation the remote dropped and
-                        # recreated in between, see federation_capability's
-                        # _physical_identity_from_cursor for why that matters.
-                        # Provision re-fetches and compares this same value
-                        # live, so a stale None here simply means the next
-                        # Provision attempt will need a fresh Observe first,
-                        # same as any other "not current" observation.
-                        observation, observed_at, observed_physical_identity = (
-                            detect_capability(
-                                connection_url,
-                                allowed_relations=tuple(record["allowedRelations"]),
-                                tls_policy=record["tlsPolicy"],
-                            )
-                        )
-                        result = FEDERATION.record_observation(
+                        # FEDERATION.observe() runs the remote probe and
+                        # persists its result serialized behind a per-alias
+                        # advisory lock spanning both — see its docstring for
+                        # why two overlapping Observe calls for the same
+                        # alias can't be safely reconciled by comparing
+                        # timestamps after the fact (a reachable probe's
+                        # remote-clock observed_at and an unreachable probe's
+                        # local-clock one share no common clock), and why
+                        # preventing the interleaving outright is the fix.
+                        result = FEDERATION.observe(
                             alias_name,
-                            observation,
                             connection_url,
-                            observed_physical_identity,
-                            observed_at,
+                            allowed_relations=tuple(record["allowedRelations"]),
+                            tls_policy=record["tlsPolicy"],
                         )
                         CONTROL.audit(
                             "federation_alias.observed",
@@ -7536,7 +7506,9 @@ class Handler(SimpleHTTPRequestHandler):
                             remote=self._remote(),
                             details={
                                 "alias": alias_name,
-                                "connectivity": observation["connectivity"],
+                                "connectivity": (
+                                    result["lastObservation"]["connectivity"]
+                                ),
                             },
                         )
                     else:

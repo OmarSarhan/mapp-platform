@@ -96,6 +96,43 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
         self.assertEqual("federation.registry_unavailable", body["code"])
 
+    def test_observe_route_calls_federation_observe_not_record_observation(
+        self,
+    ):
+        # The route must go through the new, serialized FEDERATION.observe()
+        # entry point (round 25 fix) rather than calling detect_capability()
+        # and FEDERATION.record_observation() separately here — the whole
+        # point of the fix is that the probe and the persisted write happen
+        # inside the same held per-alias lock, which only observe() does.
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.return_value = {
+            "lastObservation": {"connectivity": "reachable"},
+        }
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.observe.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+        )
+        self.assertFalse(federation.record_observation.called)
+        self.assertEqual(1, len(responses))
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
     def test_a_federation_schema_error_still_carries_its_own_status_and_code(
         self,
     ):

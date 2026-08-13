@@ -585,6 +585,30 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(column=column):
                 self.assertIn(f"AS {column}", stand_in)
 
+    def test_verifier_checks_the_foreign_server_matches_its_connection_ref(
+        self,
+    ) -> None:
+        # round 25 finding: the exemption logic confirms a foreign table's
+        # name and ftoptions match the registry, but never checked that the
+        # underlying FDW server still points at the registered connectionRef
+        # — an ALTER SERVER retargeting host/database would pass every
+        # check above unnoticed. Resolving connectionRef needs os.environ,
+        # so this runs as a separate, dedicated check rather than a fifth
+        # nested condition in the audit's boolean expression.
+        normalized = self.normalized("scripts/verify.sh")
+        self.assertIn(
+            '"SELECT alias, connection_ref FROM federation._aliases " '
+            '"WHERE provisioned_at IS NOT NULL"',
+            normalized,
+        )
+        self.assertIn('os.environ.get(f"DBS_{connection_ref}")', normalized)
+        self.assertIn(
+            "SELECT srvoptions FROM pg_catalog.pg_foreign_server", normalized
+        )
+        for field in ("host", "port", "dbname"):
+            with self.subTest(field=field):
+                self.assertIn(f'server_options.get("{field}")', normalized)
+
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(
             "docker/postgis/prepare-spatial-indexes.sh"

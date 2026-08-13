@@ -2136,6 +2136,70 @@ with psycopg.connect(
                 "and timeout limits."
             )
 
+        # The exemption logic above confirms a foreign table name and its
+        # ftoptions match the registry, but never checks that the
+        # underlying FDW server still points at the registered
+        # connectionRef — the derived owner could ALTER SERVER to a
+        # different host/database while every check above still passes,
+        # silently reaching an unreviewed source (round 25 finding). This
+        # does not fold into the boolean expression above: it needs
+        # os.environ to resolve what connectionRef currently means, the
+        # same way config-ui/app.py resolve_federation_connection_url
+        # does, so it runs as its own check here instead of a fifth
+        # nested condition on an already dense predicate.
+        #
+        # The finding also asked for the runtime reader user mapping to
+        # be compared the same way — verified live that this genuinely
+        # is not possible from this connection: pg_user_mappings redacts
+        # umoptions to everyone except the mapping own target role or a
+        # superuser, and even the server owner (the derived owner this
+        # audit runs as) cannot read a different role mapped
+        # credentials. Closing that half would need either a superuser
+        # audit connection — defeating the point of a least-privilege
+        # audit — or a different mechanism entirely. The check below
+        # still closes the more impactful half: which remote host and
+        # database a federated query actually reaches.
+        if federation_registry_source == "federation._aliases":
+            cursor.execute(
+                "SELECT alias, connection_ref FROM federation._aliases "
+                "WHERE provisioned_at IS NOT NULL"
+            )
+            for fed_alias_row in cursor.fetchall():
+                alias_value = fed_alias_row["alias"]
+                connection_ref = fed_alias_row["connection_ref"]
+                connection_url = os.environ.get(f"DBS_{connection_ref}")
+                if not connection_url:
+                    fail(
+                        f"Federation alias {alias_value!r} connectionRef "
+                        f"{connection_ref!r} does not match a configured "
+                        "DBS_<NAME> connection."
+                    )
+                params = psycopg.conninfo.conninfo_to_dict(connection_url)
+                cursor.execute(
+                    "SELECT srvoptions FROM pg_catalog.pg_foreign_server "
+                    "WHERE srvname = %s",
+                    (f"{alias_value}_srv",),
+                )
+                server_row = cursor.fetchone()
+                server_options = dict(
+                    option.split("=", 1)
+                    for option in (
+                        server_row["srvoptions"] if server_row else []
+                    )
+                )
+                if (
+                    server_options.get("host") != str(params.get("host", ""))
+                    or server_options.get("port")
+                    != str(params.get("port", "5432"))
+                    or server_options.get("dbname")
+                    != str(params.get("dbname", ""))
+                ):
+                    fail(
+                        f"Federation alias {alias_value!r} foreign "
+                        "server no longer points at its registered "
+                        "connectionRef."
+                    )
+
         if database_mode == "bundled":
             for relation in (
                 "leeds.bus_stops",

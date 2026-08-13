@@ -30,7 +30,11 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from federation_capability import extension_versions, verify_remote_state
+from federation_capability import (
+    detect_capability,
+    extension_versions,
+    verify_remote_state,
+)
 from federation_schema import (
     FederationSchemaError,
     enforce_tls_policy,
@@ -329,124 +333,207 @@ class FederationAliasStore:
         the same accepted_schema_fingerprint against a fresh live probe)
         remains the sole authority on whether provisioning may proceed.
         This never writes accepted_schema_fingerprint itself, so it
-        cannot affect that gate either way — only what Observe reports."""
+        cannot affect that gate either way — only what Observe reports.
+
+        Callable directly (used here, and by any caller that already has
+        its own observation evidence), but see observe() below for the
+        preferred entry point when you also need to run the remote probe
+        yourself: it serializes the whole probe-and-persist cycle per
+        alias, closing a race this method's own comparisons cannot (see
+        observe()'s docstring)."""
         alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            self._persist_observation(
+                cur, alias, observation, connection_url, physical_identity,
+                observed_at,
+            )
+        return self.get(alias)
+
+    def observe(
+        self,
+        alias: str,
+        connection_url: str,
+        *,
+        allowed_relations: tuple[str, ...],
+        tls_policy: str,
+        version_relation: str | None = None,
+    ) -> dict[str, Any]:
+        """The full Observe cycle — remote probe (detect_capability) then
+        persisted write (record_observation()'s own logic, reused via
+        _persist_observation) — serialized per alias by a held advisory
+        lock spanning both, so two concurrent Observe calls for the same
+        alias can never interleave.
+
+        This closes a race record_observation()'s own comparisons cannot:
+        a reachability *transition* is accepted unconditionally there (see
+        its docstring — there is no shared clock between a reachable
+        probe's remote-clock timestamp and an unreachable probe's local-
+        clock one), so without serialization, an older probe that stalls
+        after taking its snapshot could still commit its result *after* a
+        newer, more-current probe's result already committed, silently
+        overwriting it with stale evidence — or the reverse, an unrelated
+        newer outage overwriting a fresher recovery. No single comparison
+        rule can fix this after the fact, because the two results being
+        compared were never ordered relative to each other in the first
+        place. Preventing the interleaving outright removes the ambiguity:
+        holding this lock across the remote round-trip means a second
+        Observe for this alias cannot even start probing until the first
+        one's entire cycle has committed and released it, so whichever
+        cycle starts second is always the one reflecting the more current
+        remote state.
+
+        Callers that already run detect_capability() themselves (or have
+        evidence from elsewhere) should still go through
+        record_observation() directly — that one is unaffected by this
+        method and remains correct for a single, non-overlapping call."""
+        alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:observe:{alias}",),
+            )
+            observation, observed_at, physical_identity = detect_capability(
+                connection_url,
+                allowed_relations=allowed_relations,
+                tls_policy=tls_policy,
+                version_relation=version_relation,
+            )
+            self._persist_observation(
+                cur, alias, observation, connection_url, physical_identity,
+                observed_at,
+            )
+        return self.get(alias)
+
+    def _persist_observation(
+        self,
+        cur,
+        alias: str,
+        observation: dict[str, Any],
+        connection_url: str,
+        physical_identity: str | None,
+        observed_at: datetime,
+    ) -> None:
+        """The write half of record_observation()/observe() — takes an
+        already-open cursor so observe() can run it inside the same
+        transaction as its advisory lock. `alias` must already be
+        validated. Raises FileNotFoundError if the alias doesn't exist."""
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
-        with self._connect() as connection, connection.cursor() as cur:
-            incoming_fingerprint = observation.get("schemaFingerprint")
-            if incoming_fingerprint is not None:
-                cur.execute(
-                    sql.SQL(
-                        "SELECT accepted_schema_fingerprint FROM {}._aliases "
-                        "WHERE alias = %s"
-                    ).format(sql.Identifier(SCHEMA)),
-                    (alias,),
-                )
-                existing = cur.fetchone()
-                accepted_fingerprint = (
-                    existing["accepted_schema_fingerprint"] if existing else None
-                )
-                observation = {
-                    **observation,
-                    "acceptedSchemaCurrent": (
-                        accepted_fingerprint is None
-                        or accepted_fingerprint == incoming_fingerprint
-                    ),
-                }
-            # Appended unconditionally, regardless of whether this
-            # observation goes on to win the latest-observation race below
-            # — a lost race is still a real fact about what this probe saw
-            # and when. The WHERE EXISTS guard makes this a silent no-op
-            # for a nonexistent alias rather than a foreign-key violation;
-            # the conditional UPDATE below still raises FileNotFoundError.
+        incoming_fingerprint = observation.get("schemaFingerprint")
+        if incoming_fingerprint is not None:
             cur.execute(
-                sql.SQL("""
-                    INSERT INTO {}._observations
-                      (alias, observation, connection_identity,
-                       physical_identity, observed_at)
-                    SELECT %s, %s, %s, %s, %s
-                    WHERE EXISTS (
-                      SELECT 1 FROM {}._aliases WHERE alias = %s
-                    )
-                """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)),
-                (
-                    alias,
-                    Jsonb(observation),
-                    connection_identity,
-                    physical_identity,
-                    observed_at,
-                    alias,
-                ),
+                sql.SQL(
+                    "SELECT accepted_schema_fingerprint FROM {}._aliases "
+                    "WHERE alias = %s"
+                ).format(sql.Identifier(SCHEMA)),
+                (alias,),
             )
+            existing = cur.fetchone()
+            accepted_fingerprint = (
+                existing["accepted_schema_fingerprint"] if existing else None
+            )
+            observation = {
+                **observation,
+                "acceptedSchemaCurrent": (
+                    accepted_fingerprint is None
+                    or accepted_fingerprint == incoming_fingerprint
+                ),
+            }
+        # Appended unconditionally, regardless of whether this
+        # observation goes on to win the latest-observation race below
+        # — a lost race is still a real fact about what this probe saw
+        # and when. The WHERE EXISTS guard makes this a silent no-op
+        # for a nonexistent alias rather than a foreign-key violation;
+        # the conditional UPDATE below still raises FileNotFoundError.
+        cur.execute(
+            sql.SQL("""
+                INSERT INTO {}._observations
+                  (alias, observation, connection_identity,
+                   physical_identity, observed_at)
+                SELECT %s, %s, %s, %s, %s
+                WHERE EXISTS (
+                  SELECT 1 FROM {}._aliases WHERE alias = %s
+                )
+            """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)),
+            (
+                alias,
+                Jsonb(observation),
+                connection_identity,
+                physical_identity,
+                observed_at,
+                alias,
+            ),
+        )
+        cur.execute(
+            sql.SQL("""
+                UPDATE {}._aliases
+                SET last_observation = %s,
+                    last_observed_connection_identity = %s,
+                    physical_identity = %s,
+                    observed_at = %s,
+                    status = CASE
+                      WHEN provisioned_at IS NULL THEN status
+                      WHEN %s THEN 'active'
+                      ELSE 'unavailable'
+                    END
+                WHERE alias = %s
+                  AND (
+                    observed_at IS NULL
+                    OR (last_observation ->> 'connectivity' = 'reachable')
+                         <> %s
+                    OR observed_at < %s
+                  )
+                RETURNING alias, provisioned_at
+            """).format(sql.Identifier(SCHEMA)),
+            (
+                Jsonb(observation),
+                connection_identity,
+                physical_identity,
+                observed_at,
+                reachable,
+                alias,
+                reachable,
+                observed_at,
+            ),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # Either this alias doesn't exist, or a newer Observe already
+            # committed while this one's remote probe was still running
+            # (observe() closes that specific race — see its docstring —
+            # but record_observation() remains directly callable by a
+            # caller running its own probe outside that serialization).
+            # The latter isn't a failure — the row already holds the
+            # fresher result — so only raise once non-existence is
+            # confirmed.
             cur.execute(
-                sql.SQL("""
-                    UPDATE {}._aliases
-                    SET last_observation = %s,
-                        last_observed_connection_identity = %s,
-                        physical_identity = %s,
-                        observed_at = %s,
-                        status = CASE
-                          WHEN provisioned_at IS NULL THEN status
-                          WHEN %s THEN 'active'
-                          ELSE 'unavailable'
-                        END
-                    WHERE alias = %s
-                      AND (
-                        observed_at IS NULL
-                        OR (last_observation ->> 'connectivity' = 'reachable')
-                             <> %s
-                        OR observed_at < %s
-                      )
-                    RETURNING alias, provisioned_at
-                """).format(sql.Identifier(SCHEMA)),
-                (
-                    Jsonb(observation),
-                    connection_identity,
-                    physical_identity,
-                    observed_at,
-                    reachable,
-                    alias,
-                    reachable,
-                    observed_at,
+                sql.SQL("SELECT 1 FROM {}._aliases WHERE alias = %s").format(
+                    sql.Identifier(SCHEMA)
                 ),
+                (alias,),
             )
-            row = cur.fetchone()
-            if row is None:
-                # Either this alias doesn't exist, or a newer Observe
-                # already committed while this one's remote probe was
-                # still running. The latter isn't a failure — the row
-                # already holds the fresher result — so only raise once
-                # non-existence is confirmed.
-                cur.execute(
-                    sql.SQL("SELECT 1 FROM {}._aliases WHERE alias = %s").format(
-                        sql.Identifier(SCHEMA)
-                    ),
-                    (alias,),
+            if cur.fetchone() is None:
+                raise FileNotFoundError(alias)
+            return
+        # A version drift discovered after provisioning must fail
+        # pushdown closed immediately (docs/federation-architecture-
+        # waypoint.md: "a version drift detected after provisioning
+        # downgrades the alias to pushdown disabled") — re-enabling it
+        # afterward is a deliberate federation:provision-scoped
+        # reprovisioning action, never automatic, so this only ever
+        # drops the option here, never adds it.
+        if row["provisioned_at"] is not None:
+            server_name = f"{alias}_srv"
+            local_versions = extension_versions(cur)
+            remote_versions = observation.get("extensionVersions") or {}
+            shippable = self._shippable_extensions(
+                local_versions, remote_versions
+            )
+            current = self._current_shippable_extensions(cur, server_name)
+            if current and not shippable:
+                self._apply_shippable_extensions(
+                    cur, server_name, current, shippable
                 )
-                if cur.fetchone() is None:
-                    raise FileNotFoundError(alias)
-                return self.get(alias)
-            # A version drift discovered after provisioning must fail
-            # pushdown closed immediately (docs/federation-architecture-
-            # waypoint.md: "a version drift detected after provisioning
-            # downgrades the alias to pushdown disabled") — re-enabling it
-            # afterward is a deliberate federation:provision-scoped
-            # reprovisioning action, never automatic, so this only ever
-            # drops the option here, never adds it.
-            if row["provisioned_at"] is not None:
-                server_name = f"{alias}_srv"
-                local_versions = extension_versions(cur)
-                remote_versions = observation.get("extensionVersions") or {}
-                shippable = self._shippable_extensions(
-                    local_versions, remote_versions
-                )
-                current = self._current_shippable_extensions(cur, server_name)
-                if current and not shippable:
-                    self._apply_shippable_extensions(
-                        cur, server_name, current, shippable
-                    )
-        return self.get(alias)
 
     # PostGIS/PROJ/GEOS versions may differ between the federation database
     # and a source — execution happens in the federation database, so a
@@ -860,11 +947,41 @@ class FederationAliasStore:
             # comparing against it would self-heal the moment anyone
             # observes twice with nothing further changed. None means
             # nothing has been accepted yet (this alias's first
-            # provisioning), which always proceeds.
+            # provisioning) — handled separately just below, since there
+            # is nothing yet to acknowledge past.
             schema_fingerprint_changed = (
                 accepted_schema_fingerprint is not None
                 and accepted_schema_fingerprint != current_schema_fingerprint
             )
+            # On a first-ever provisioning, accepted_schema_fingerprint is
+            # always None, so the check above is vacuously false — nothing
+            # yet compares the live fingerprint against what the last
+            # Observe actually saw. Without this, a column added or a view
+            # redefined between Observe and this call would import
+            # unreviewed: relations_verified and physical_identity both
+            # stay true (neither changes on an ADD COLUMN or a same-object
+            # CREATE OR REPLACE VIEW), so nothing else here would catch it.
+            # last_observation.get("schema") == "current" already passed
+            # above, and detect_capability() always sets schemaFingerprint
+            # alongside schema in its reachable branch, so it's guaranteed
+            # present here. This is deliberately observation_not_current,
+            # not schema_change_not_acknowledged: the human's last Observe
+            # is the only thing ever reviewed for a first provisioning, so
+            # a live mismatch means that review is stale — there is
+            # nothing yet accepted to knowingly acknowledge past, only
+            # fresher evidence to go collect.
+            if (
+                accepted_schema_fingerprint is None
+                and last_observation.get("schemaFingerprint")
+                != current_schema_fingerprint
+            ):
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source's relation definitions "
+                    "(columns or view query) no longer match its last "
+                    "observation — observe it again immediately before "
+                    "provisioning.",
+                    code="federation.observation_not_current",
+                )
             if schema_fingerprint_changed and not acknowledge_schema_change:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's relation definitions "
