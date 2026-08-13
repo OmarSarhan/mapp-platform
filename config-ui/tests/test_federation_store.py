@@ -517,6 +517,17 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(
             any("SELECT accepted_schema_fingerprint" in s for s in statements)
         )
+        # FOR UPDATE — self-audit finding: an unlocked read here could see
+        # a pre-commit value while a concurrent provision() call (which
+        # takes its own FOR UPDATE on this row) is mid-transaction,
+        # computing acceptedSchemaCurrent against a fingerprint
+        # provision() is about to replace rather than the one it commits.
+        self.assertTrue(
+            any(
+                "SELECT accepted_schema_fingerprint" in s and "FOR UPDATE" in s
+                for s in statements
+            )
+        )
         insert = cursor.execute.call_args_list[1]
         self.assertEqual("current", insert.args[1][1].obj["schema"])
         self.assertTrue(insert.args[1][1].obj["acceptedSchemaCurrent"])

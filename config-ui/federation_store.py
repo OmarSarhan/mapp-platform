@@ -421,10 +421,24 @@ class FederationAliasStore:
         connection_identity = self._connection_identity(connection_url)
         incoming_fingerprint = observation.get("schemaFingerprint")
         if incoming_fingerprint is not None:
+            # FOR UPDATE — without it, this plain read can see a pre-
+            # commit value while a concurrent provision() call is mid-
+            # transaction (provision() takes its own FOR UPDATE lock on
+            # this same row for its whole duration): this observation
+            # would then compute acceptedSchemaCurrent against a
+            # fingerprint provision() is about to replace, rather than
+            # the one it actually commits. Only acceptedSchemaCurrent
+            # depends on this read — never a security/correctness gate,
+            # since provision()'s own comparison always re-reads live —
+            # but there is no reason to leave even a reporting field
+            # racy when closing it is a one-clause change: this lock
+            # simply makes the write below wait for a concurrent
+            # provision() to finish first, exactly as the UPDATE further
+            # down already does.
             cur.execute(
                 sql.SQL(
                     "SELECT accepted_schema_fingerprint FROM {}._aliases "
-                    "WHERE alias = %s"
+                    "WHERE alias = %s FOR UPDATE"
                 ).format(sql.Identifier(SCHEMA)),
                 (alias,),
             )
