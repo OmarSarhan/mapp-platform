@@ -477,7 +477,16 @@ class DatabaseAccessContractTests(unittest.TestCase):
         self.assertIn(
             "ON foreign_server.oid = foreign_table.ftserver", normalized
         )
-        self.assertNotIn("relation.relname IN (", normalized)
+        # The old (pre-tightening) per-source_<alias> exemption used a weak
+        # local-relname-basename match instead of the ftoptions check above
+        # — confirm it hasn't reappeared. This can no longer be a bare
+        # assertNotIn: round 24 added a *different*, legitimate
+        # relation.relname IN (...) allowlist for the federation schema's
+        # own managed objects (see
+        # test_federation_schema_relation_exemption_requires_a_managed_object_name),
+        # so an exact count is what actually proves the old check is gone
+        # without also forbidding the new one.
+        self.assertEqual(4, normalized.count("relation.relname IN ("))
         # The two schema-level checks (canCreateBaseSchema and its
         # reachable_role mirror) must stay untouched — a provisioned
         # alias's owner legitimately needs CREATE on the whole schema, so
@@ -512,6 +521,46 @@ class DatabaseAccessContractTests(unittest.TestCase):
             self.assertNotIn("allowed_relations", window)
             schema_level_windows += 1
         self.assertEqual(2, schema_level_windows)
+
+    def test_federation_schema_relation_exemption_requires_a_managed_object_name(
+        self,
+    ) -> None:
+        # The schema-level CREATE-privilege check above legitimately exempts
+        # the whole federation schema by name — the derived owner needs
+        # CREATE there for provision() to work. But the RELATION-level
+        # unsafe-privilege checks must not: the derived owner having CREATE
+        # there means it could also add an unexpected local table, view, or
+        # sequence inside federation, and a blanket schema-name exemption
+        # would silently trust it too. Reproduced live (round 24 finding): a
+        # rogue table created in the federation schema by the derived-owner
+        # role passed ./bin/mapp verify before this fix and correctly failed
+        # it afterward. The relation-level checks must instead name every
+        # actually-managed object explicitly, the same way the source_<alias>
+        # branch already requires the specific foreign table.
+        normalized = self.normalized("scripts/verify.sh")
+        managed_objects_fragment = (
+            "namespace.nspname = $$federation$$ AND relation.relname IN ( "
+            "$$_aliases$$, $$_aliases_pkey$$, $$_observations$$, "
+            "$$_observations_pkey$$, $$_observations_alias_observed_at_idx$$, "
+            "$$_observations_id_seq$$ )"
+        )
+        self.assertEqual(
+            4,
+            normalized.count(managed_objects_fragment),
+            "expected exactly 4 relation-level federation exemptions (2 "
+            "checks x login_role/reachable_role) explicitly naming every "
+            "managed object — a count drift here means a check was added, "
+            "removed, or merged without updating this test, or a managed "
+            "object (e.g. a new index) was added to federation._aliases / "
+            "_observations without updating this allowlist too.",
+        )
+        # The schema-level CREATE check must still exempt federation by name
+        # alone — that one is legitimately schema-scoped, not relation-scoped,
+        # and must not be tightened the same way.
+        self.assertIn(
+            "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
+            normalized,
+        )
 
     def test_federation_registry_stand_in_declares_every_referenced_column(
         self,

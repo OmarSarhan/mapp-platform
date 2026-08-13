@@ -1700,7 +1700,16 @@ with psycopg.connect(
                   AND NOT (
                     namespace.nspowner = login_role.oid
                     AND (
-                      namespace.nspname IN ($$derived_layers$$, $$federation$$)
+                      namespace.nspname = $$derived_layers$$
+                      OR (
+                        namespace.nspname = $$federation$$
+                        AND relation.relname IN (
+                          $$_aliases$$, $$_aliases_pkey$$,
+                          $$_observations$$, $$_observations_pkey$$,
+                          $$_observations_alias_observed_at_idx$$,
+                          $$_observations_id_seq$$
+                        )
+                      )
                       OR EXISTS (
                         SELECT 1
                         FROM federation._aliases AS fed_alias
@@ -1770,7 +1779,16 @@ with psycopg.connect(
                   AND NOT (
                     namespace.nspowner = login_role.oid
                     AND (
-                      namespace.nspname IN ($$derived_layers$$, $$federation$$)
+                      namespace.nspname = $$derived_layers$$
+                      OR (
+                        namespace.nspname = $$federation$$
+                        AND relation.relname IN (
+                          $$_aliases$$, $$_aliases_pkey$$,
+                          $$_observations$$, $$_observations_pkey$$,
+                          $$_observations_alias_observed_at_idx$$,
+                          $$_observations_id_seq$$
+                        )
+                      )
                       OR EXISTS (
                         SELECT 1
                         FROM federation._aliases AS fed_alias
@@ -1869,8 +1887,16 @@ with psycopg.connect(
                         AND NOT (
                           namespace.nspowner = reachable_role.oid
                           AND (
-                            namespace.nspname
-                              IN ($$derived_layers$$, $$federation$$)
+                            namespace.nspname = $$derived_layers$$
+                            OR (
+                              namespace.nspname = $$federation$$
+                              AND relation.relname IN (
+                                $$_aliases$$, $$_aliases_pkey$$,
+                                $$_observations$$, $$_observations_pkey$$,
+                                $$_observations_alias_observed_at_idx$$,
+                                $$_observations_id_seq$$
+                              )
+                            )
                             OR EXISTS (
                               SELECT 1
                               FROM federation._aliases AS fed_alias
@@ -1967,8 +1993,16 @@ with psycopg.connect(
                         AND NOT (
                           namespace.nspowner = reachable_role.oid
                           AND (
-                            namespace.nspname
-                              IN ($$derived_layers$$, $$federation$$)
+                            namespace.nspname = $$derived_layers$$
+                            OR (
+                              namespace.nspname = $$federation$$
+                              AND relation.relname IN (
+                                $$_aliases$$, $$_aliases_pkey$$,
+                                $$_observations$$, $$_observations_pkey$$,
+                                $$_observations_alias_observed_at_idx$$,
+                                $$_observations_id_seq$$
+                              )
+                            )
                             OR EXISTS (
                               SELECT 1
                               FROM federation._aliases AS fed_alias
