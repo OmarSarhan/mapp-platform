@@ -302,19 +302,58 @@ class FederationAliasStore:
         clock domain's timestamp.
 
         `observation["schema"]` as computed by detect_capability() only
-        reflects relation existence/selectability, not whether the
-        column list or view definition changed since some prior Observe —
-        this function does not attempt that comparison (an earlier version
-        did, comparing against last_observation, but last_observation is
-        exactly what every Observe overwrites, including this one, so it
-        self-healed the moment anyone observed twice — see provision()'s
-        accepted_schema_fingerprint column and docstring for where that
-        comparison correctly lives instead: against a value only a
-        successful Provision call ever changes)."""
+        reflects relation existence/selectability, not whether the column
+        list or view definition changed since it was last explicitly
+        accepted — that comparison is added here as a separate
+        `acceptedSchemaCurrent` boolean, deliberately NOT folded into
+        `schema` itself. An earlier version of this fix did overwrite
+        `schema` to "changed" on a fingerprint mismatch, mirroring how
+        detect_capability() already uses "changed" for a missing/
+        unselectable relation — but provision() has its own stored-
+        evidence fast-fail, `last_observation.get("schema") != "current"`,
+        that exists to reject provisioning against stale evidence *before*
+        a live round-trip. That check has no acknowledgement escape by
+        design (a genuinely missing relation cannot be reconciled by
+        acknowledging anything — Observe must run again). Overwriting
+        `schema` made a fingerprint drift indistinguishable from a missing
+        relation to that check, so it fired first on every drift and
+        permanently blocked the very acknowledge_schema_change path this
+        module exists to support — caught live against the real FDW rig,
+        not in a mock. Keeping `schema` untouched and reporting the
+        fingerprint comparison through its own field avoids that
+        collision entirely: `schema` keeps meaning exactly what
+        detect_capability() computed, and `acceptedSchemaCurrent` (true
+        when nothing has been accepted yet or the live fingerprint still
+        matches what was) is purely for visibility — provision()'s own,
+        separately-computed schema_fingerprint_changed gate (comparing
+        the same accepted_schema_fingerprint against a fresh live probe)
+        remains the sole authority on whether provisioning may proceed.
+        This never writes accepted_schema_fingerprint itself, so it
+        cannot affect that gate either way — only what Observe reports."""
         alias = validate_alias(alias)
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
         with self._connect() as connection, connection.cursor() as cur:
+            incoming_fingerprint = observation.get("schemaFingerprint")
+            if incoming_fingerprint is not None:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT accepted_schema_fingerprint FROM {}._aliases "
+                        "WHERE alias = %s"
+                    ).format(sql.Identifier(SCHEMA)),
+                    (alias,),
+                )
+                existing = cur.fetchone()
+                accepted_fingerprint = (
+                    existing["accepted_schema_fingerprint"] if existing else None
+                )
+                observation = {
+                    **observation,
+                    "acceptedSchemaCurrent": (
+                        accepted_fingerprint is None
+                        or accepted_fingerprint == incoming_fingerprint
+                    ),
+                }
             # Appended unconditionally, regardless of whether this
             # observation goes on to win the latest-observation race below
             # — a lost race is still a real fact about what this probe saw
@@ -511,6 +550,69 @@ class FederationAliasStore:
             )
 
     @staticmethod
+    def _import_and_grant(
+        cur,
+        alias: str,
+        server_name: str,
+        schema_name: str,
+        allowed_relations,
+        reader_role: str,
+    ) -> None:
+        """IMPORT FOREIGN SCHEMA each allowed relation individually (not a
+        blanket import), confirm every one actually landed, then grant the
+        reader role access to the schema and everything just imported into
+        it. Shared by first-time provisioning and by drift reconciliation
+        during reprovisioning (see provision()) — both need the identical
+        all-or-nothing behaviour: IMPORT FOREIGN SCHEMA ... LIMIT TO
+        silently imports whatever of the named relations actually exists on
+        the remote rather than erroring on one that's missing, so without
+        the explicit check below, an alias could be left active with an
+        incomplete set of foreign tables."""
+        for relation in allowed_relations:
+            remote_schema, remote_table = relation.split(".", 1)
+            cur.execute(sql.SQL("""
+                IMPORT FOREIGN SCHEMA {remote_schema}
+                LIMIT TO ({table})
+                FROM SERVER {server}
+                INTO {local_schema}
+            """).format(
+                remote_schema=sql.Identifier(remote_schema),
+                table=sql.Identifier(remote_table),
+                server=sql.Identifier(server_name),
+                local_schema=sql.Identifier(schema_name),
+            ))
+        cur.execute(
+            sql.SQL("""
+                SELECT c.relname
+                FROM pg_catalog.pg_class AS c
+                JOIN pg_catalog.pg_namespace AS n
+                  ON n.oid = c.relnamespace
+                WHERE n.nspname = %s AND c.relkind = 'f'
+            """),
+            (schema_name,),
+        )
+        imported = {row["relname"] for row in cur.fetchall()}
+        expected = {relation.split(".", 1)[1] for relation in allowed_relations}
+        missing = sorted(expected - imported)
+        if missing:
+            raise FederationSchemaError(
+                f"Alias {alias!r} provisioning did not import: "
+                f"{missing} — the source schema may have changed "
+                "since it was last observed.",
+                code="federation.import_incomplete",
+            )
+        cur.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                sql.Identifier(schema_name), sql.Identifier(reader_role)
+            )
+        )
+        cur.execute(
+            sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
+                sql.Identifier(schema_name), sql.Identifier(reader_role)
+            )
+        )
+
+    @staticmethod
     def _connection_identity(connection_url: str) -> str:
         """The remote endpoint and login role a connectionRef currently
         resolves to (host/port/dbname/user — deliberately not password,
@@ -544,10 +646,14 @@ class FederationAliasStore:
         """Create the real FDW server, user mapping, schema, and foreign
         tables for this alias's allowedRelations the first time this is
         called. Callable again afterward as a reprovisioning action (e.g.
-        an admin acting on a drift observation) — a repeat call only
-        re-decides and reconciles the server's `extensions` option; it
-        does not repeat CREATE SERVER/USER MAPPING/IMPORT FOREIGN SCHEMA,
-        which would fail on objects that already exist. `actor` is the
+        an admin acting on a drift observation) — a repeat call normally
+        only re-decides and reconciles the server's `extensions` option; it
+        does not repeat CREATE SERVER/USER MAPPING, which would fail on
+        objects that already exist. It DOES repeat IMPORT FOREIGN SCHEMA
+        (via DROP FOREIGN TABLE + reimport) when acknowledging a schema
+        change, since that is the only way the local foreign table's
+        columns/types ever catch up with the remote's — see the
+        acknowledge_schema_change paragraph below. `actor` is the
         approving principal — every call (initial or reprovisioning) is
         itself an act of Approve exposure, recorded atomically with
         activation as the docs/federation-architecture-waypoint.md source-
@@ -561,7 +667,20 @@ class FederationAliasStore:
         acceptance* — not merely since the last Observe, which self-heals
         the comparison the moment anyone observes twice with no further
         changes (see record_observation()'s docstring). A caller must
-        explicitly accept that change to proceed, exactly as with RLS;
+        explicitly accept that change to proceed, exactly as with RLS.
+        On an already-provisioned alias, acknowledging a genuine change
+        also DROPs and reimports the foreign tables for every allowed
+        relation — a foreign table's columns/types are fixed at IMPORT
+        time and never auto-update, so persisting the new accepted
+        fingerprint without this would silence the warning forever while
+        every runtime query kept using the stale local definition. This
+        reuses the exact IMPORT FOREIGN SCHEMA DDL first-time provisioning
+        already uses (see _import_and_grant) rather than hand-diffing
+        column lists; a relation a derived layer already depends on fails
+        the DROP outright (pg_depend) and rolls back this whole call
+        instead of silently reconciling around a dependent object — an
+        informed stop, consistent with this module's own impact-visibility
+        design, not a gap.
         every successful call, whether or not acknowledgement was needed
         this time, re-persists accepted_schema_fingerprint as the new
         baseline."""
@@ -839,6 +958,32 @@ class FederationAliasStore:
                 ))
                 current = self._current_shippable_extensions(cur, server_name)
                 self._apply_shippable_extensions(cur, server_name, current, shippable)
+                if schema_fingerprint_changed:
+                    # Reaching here means acknowledge_schema_change was true
+                    # (the gate above already raised otherwise) — the
+                    # foreign tables' columns/types are fixed at IMPORT
+                    # time and never auto-update, so persisting the new
+                    # accepted fingerprint below without reconciling them
+                    # would silence this warning forever while every
+                    # runtime query kept using the stale local definition.
+                    # See provision()'s docstring for why DROP + reimport,
+                    # not ALTER FOREIGN TABLE.
+                    for relation in record["allowedRelations"]:
+                        _, remote_table = relation.split(".", 1)
+                        cur.execute(
+                            sql.SQL("DROP FOREIGN TABLE {}.{}").format(
+                                sql.Identifier(schema_name),
+                                sql.Identifier(remote_table),
+                            )
+                        )
+                    self._import_and_grant(
+                        cur,
+                        alias,
+                        server_name,
+                        schema_name,
+                        record["allowedRelations"],
+                        self.reader_role,
+                    )
                 cur.execute(
                     sql.SQL("""
                         UPDATE {}._aliases
@@ -943,57 +1088,13 @@ class FederationAliasStore:
                 # before this transaction commits. Judged not worth the
                 # added complexity for this test slice; revisit if this
                 # module moves beyond a test slice.
-                for relation in record["allowedRelations"]:
-                    remote_schema, remote_table = relation.split(".", 1)
-                    cur.execute(sql.SQL("""
-                        IMPORT FOREIGN SCHEMA {remote_schema}
-                        LIMIT TO ({table})
-                        FROM SERVER {server}
-                        INTO {local_schema}
-                    """).format(
-                        remote_schema=sql.Identifier(remote_schema),
-                        table=sql.Identifier(remote_table),
-                        server=sql.Identifier(server_name),
-                        local_schema=sql.Identifier(schema_name),
-                    ))
-                # IMPORT FOREIGN SCHEMA ... LIMIT TO silently imports whatever
-                # of the named relations actually exists on the remote — it
-                # does not error on one that's missing. Confirm every approved
-                # relation actually landed as a foreign table before marking
-                # the alias active; the whole transaction rolls back otherwise,
-                # rather than leaving an alias active with an incomplete set.
-                cur.execute(
-                    sql.SQL("""
-                        SELECT c.relname
-                        FROM pg_catalog.pg_class AS c
-                        JOIN pg_catalog.pg_namespace AS n
-                          ON n.oid = c.relnamespace
-                        WHERE n.nspname = %s AND c.relkind = 'f'
-                    """),
-                    (schema_name,),
-                )
-                imported = {row["relname"] for row in cur.fetchall()}
-                expected = {
-                    relation.split(".", 1)[1]
-                    for relation in record["allowedRelations"]
-                }
-                missing = sorted(expected - imported)
-                if missing:
-                    raise FederationSchemaError(
-                        f"Alias {alias!r} provisioning did not import: "
-                        f"{missing} — the source schema may have changed "
-                        "since it was last observed.",
-                        code="federation.import_incomplete",
-                    )
-                cur.execute(
-                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                        sql.Identifier(schema_name), sql.Identifier(self.reader_role)
-                    )
-                )
-                cur.execute(
-                    sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
-                        sql.Identifier(schema_name), sql.Identifier(self.reader_role)
-                    )
+                self._import_and_grant(
+                    cur,
+                    alias,
+                    server_name,
+                    schema_name,
+                    record["allowedRelations"],
+                    self.reader_role,
                 )
                 cur.execute(
                     sql.SQL("""

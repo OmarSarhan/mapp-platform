@@ -390,14 +390,16 @@ class FederationAliasStoreTests(unittest.TestCase):
                 OBSERVED_AT,
             )
 
-    def test_record_observation_never_touches_the_accepted_schema_fingerprint(self):
+    def test_record_observation_reads_but_never_writes_the_accepted_schema_fingerprint(self):
         # accepted_schema_fingerprint is durable, written only by a
-        # successful provision() call — Observe must never read or write
-        # it, or the same self-healing bug this split was meant to fix
-        # (comparing against a value Observe itself can overwrite) would
-        # creep back in.
+        # successful provision() call. Observe reads it read-only, purely
+        # to report drift (see record_observation()'s docstring) — it must
+        # never WRITE it, or the same self-healing bug this split was
+        # meant to fix (comparing against a value Observe itself can
+        # overwrite) would creep back in.
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
+            {"accepted_schema_fingerprint": None},
             {"alias": "leeds_ext", "provisioned_at": None},
             alias_row(status="active"),
         ]
@@ -419,11 +421,62 @@ class FederationAliasStoreTests(unittest.TestCase):
         )
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        writes = [s for s in statements if "SET" in s or "INSERT INTO" in s]
         self.assertFalse(
-            any("accepted_schema_fingerprint" in s for s in statements)
+            any("accepted_schema_fingerprint" in s for s in writes)
         )
-        insert = cursor.execute.call_args_list[0]
+        self.assertTrue(
+            any("SELECT accepted_schema_fingerprint" in s for s in statements)
+        )
+        insert = cursor.execute.call_args_list[1]
         self.assertEqual("current", insert.args[1][1].obj["schema"])
+        self.assertTrue(insert.args[1][1].obj["acceptedSchemaCurrent"])
+
+    def test_record_observation_reports_drift_from_the_accepted_fingerprint(self):
+        # The read-only counterpart to provision()'s gate: Observe should
+        # surface a drifted fingerprint as soon as it sees it, not leave
+        # an operator to discover it only when someone next attempts to
+        # Provision (round 22 finding). This must land in its own field,
+        # not overwrite "schema" — schema's existing meaning (relation
+        # present/selectable) feeds provision()'s stored-evidence fast-
+        # fail, which has no acknowledgement escape; conflating the two
+        # would make that fast-fail fire on every fingerprint drift and
+        # permanently block the acknowledge_schema_change path (caught
+        # live against the real FDW rig — see record_observation()'s
+        # docstring).
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"accepted_schema_fingerprint": "fp-old"},
+            {"alias": "leeds_ext", "provisioned_at": None},
+            alias_row(status="active"),
+        ]
+        store = self.store_with_cursor(cursor)
+        observation = {
+            "connectivity": "reachable",
+            "schema": "current",
+            "sourceFreshness": "unknown",
+            "lastConnected": "2026-08-11T00:00:00+00:00",
+            "lastSchemaVerified": "2026-08-11T00:00:00+00:00",
+            "sourceVersion": None,
+            "schemaFingerprint": "fp-new",
+        }
+
+        store.record_observation(
+            "leeds_ext", observation,
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            SOURCE_DB_PHYSICAL_IDENTITY, OBSERVED_AT,
+        )
+
+        insert = cursor.execute.call_args_list[1]
+        self.assertEqual("current", insert.args[1][1].obj["schema"])
+        self.assertFalse(insert.args[1][1].obj["acceptedSchemaCurrent"])
+        update = cursor.execute.call_args_list[2]
+        self.assertFalse(update.args[1][0].obj["acceptedSchemaCurrent"])
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        writes = [s for s in statements if "SET" in s or "INSERT INTO" in s]
+        self.assertFalse(
+            any("accepted_schema_fingerprint" in s for s in writes)
+        )
 
     @patch("federation_store.extension_versions")
     def test_record_observation_auto_disables_pushdown_on_version_drift(self, mock_versions):
@@ -1066,6 +1119,57 @@ class FederationAliasStoreTests(unittest.TestCase):
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertNotIn("extensions", create_server)
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS, True, False, "fp-new"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_reprovision_reimports_foreign_tables_when_accepting_schema_drift(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # Accepting a drift must not just silence the warning — a foreign
+        # table's columns/types are fixed at IMPORT time and never auto-
+        # update, so persisting the new fingerprint without reconciling
+        # the actual foreign table would leave every runtime query using
+        # the stale local definition (round 22 finding).
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current"},
+                accepted_schema_fingerprint="fp-old",
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", SOURCE_DB_URL, "admin",
+            acknowledge_schema_change=True,
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertTrue(
+            any(
+                "DROP FOREIGN TABLE" in s and "smoke_control_orders" in s
+                for s in statements
+            )
+        )
+        self.assertTrue(any("IMPORT FOREIGN SCHEMA" in s for s in statements))
+        self.assertTrue(
+            any("GRANT SELECT ON ALL TABLES IN SCHEMA" in s for s in statements)
+        )
+        activation = next(
+            call for call in cursor.execute.call_args_list
+            if "accepted_schema_fingerprint = %s" in str(call.args[0])
+            and "approved_by" in str(call.args[0])
+        )
+        self.assertEqual(("admin", False, "fp-new", "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",

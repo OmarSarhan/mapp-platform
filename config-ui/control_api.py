@@ -1613,6 +1613,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 "rowLevelSecurityAcknowledged": {"const": True},
+                "schemaChangeAcknowledged": {"const": True},
             },
             "additionalProperties": False,
         },
