@@ -279,6 +279,8 @@ init_env() {
     -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_DERIVED/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_FEDERATION/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_SOURCE_POSTGRES/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_SOURCE_READER/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_SEMANTIC/$(openssl rand -hex 32)/" \
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \

@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import unittest
+from http import HTTPStatus
 from unittest.mock import patch
 
 import psycopg
@@ -23,6 +24,20 @@ from semantic_sources import (
 )
 
 
+FOREIGN_FIELD_ROW = {
+    "relation_kind": "f",
+    "relation_description": None,
+    "name": "id",
+    "type": "bigint",
+    "description": None,
+    "nullable": False,
+    "geometryType": "",
+    "srid": None,
+    "primaryKey": False,
+    "unique": False,
+}
+
+
 class FakeCursor:
     def __init__(
         self,
@@ -31,11 +46,13 @@ class FakeCursor:
         one=None,
         execute_error=None,
         fetchall_results=None,
+        fetchone_results=None,
     ):
         self.rows = rows
         self.one = one
         self.execute_error = execute_error
         self.fetchall_results = list(fetchall_results or [])
+        self.fetchone_results = list(fetchone_results or [])
         self.executed = []
         self.fetchall_calls = 0
         self.fetchmany_sizes = []
@@ -67,21 +84,29 @@ class FakeCursor:
         return self.rows[:size]
 
     def fetchone(self):
+        if self.fetchone_results:
+            return self.fetchone_results.pop(0)
         return self.one
 
 
 class FakeConnection:
     def __init__(self, cursor):
         self._cursor = cursor
+        self.commits = 0
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_args):
+        self.closed = True
         return False
 
     def cursor(self):
         return self._cursor
+
+    def commit(self):
+        self.commits += 1
 
 
 class SemanticSourceContractTests(unittest.TestCase):
@@ -448,20 +473,7 @@ class SemanticSourceContractTests(unittest.TestCase):
         self.assertEqual("semantic.source_metadata_invalid", error.exception.code)
 
     def test_locked_relation_admits_a_foreign_table(self):
-        cursor = FakeCursor([
-            {
-                "relation_kind": "f",
-                "relation_description": None,
-                "name": "id",
-                "type": "bigint",
-                "description": None,
-                "nullable": False,
-                "geometryType": "",
-                "srid": None,
-                "primaryKey": False,
-                "unique": False,
-            },
-        ])
+        cursor = FakeCursor([FOREIGN_FIELD_ROW])
         sources = PostgresSemanticSources(
             {"MAPP": "postgresql://reader"},
             parse_allowlist("MAPP:leeds.*"),
@@ -480,20 +492,7 @@ class SemanticSourceContractTests(unittest.TestCase):
         # not supported for foreign tables") — verified against a real FDW
         # foreign table. The relkind precheck must steer around it.
         cursor = FakeCursor(
-            [
-                {
-                    "relation_kind": "f",
-                    "relation_description": None,
-                    "name": "id",
-                    "type": "bigint",
-                    "description": None,
-                    "nullable": False,
-                    "geometryType": "",
-                    "srid": None,
-                    "primaryKey": False,
-                    "unique": False,
-                },
-            ],
+            [FOREIGN_FIELD_ROW],
             one={"relkind": "f"},
         )
         sources = PostgresSemanticSources(
@@ -512,6 +511,78 @@ class SemanticSourceContractTests(unittest.TestCase):
                 for rendered, _params in cursor.executed
             )
         )
+
+    def test_federated_sync_locks_alias_before_snapshot_through_publish(self):
+        cursor = FakeCursor(
+            [FOREIGN_FIELD_ROW],
+            fetchone_results=[{"locked": True}, {"relkind": "f"}],
+        )
+        connection = FakeConnection(cursor)
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:source_leeds_ext.*"),
+        )
+
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=connection,
+        ):
+            with sources.locked_relation(
+                "MAPP", "source_leeds_ext", "bus_stops"
+            ):
+                # The caller publishes while the context is open.
+                self.assertFalse(connection.closed)
+                self.assertEqual(1, connection.commits)
+
+        statements = [query for query, _params in cursor.executed]
+        alias_lock = next(
+            index for index, query in enumerate(statements)
+            if "pg_try_advisory_lock" in query
+        )
+        transaction = next(
+            index for index, query in enumerate(statements)
+            if query.startswith("SET TRANSACTION")
+        )
+        metadata = next(
+            index for index, query in enumerate(statements)
+            if "SELECT c.relkind" in query
+        )
+        self.assertLess(alias_lock, transaction)
+        self.assertLess(transaction, metadata)
+        self.assertEqual(
+            ("federation:observe:leeds_ext",),
+            cursor.executed[alias_lock][1],
+        )
+        self.assertTrue(connection.closed)
+
+    def test_federated_sync_contention_fails_before_metadata_read(self):
+        cursor = FakeCursor([], fetchone_results=[{"locked": False}])
+        connection = FakeConnection(cursor)
+        sources = PostgresSemanticSources(
+            {"MAPP": "postgresql://reader"},
+            parse_allowlist("MAPP:source_leeds_ext.*"),
+        )
+
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=connection,
+        ):
+            with self.assertRaises(SemanticSourceError) as error:
+                with sources.locked_relation(
+                    "MAPP", "source_leeds_ext", "bus_stops"
+                ):
+                    pass
+
+        self.assertEqual(HTTPStatus.CONFLICT, error.exception.status)
+        self.assertEqual("semantic.source_changed", error.exception.code)
+        self.assertEqual(0, connection.commits)
+        self.assertFalse(
+            any(
+                "pg_catalog.pg_class" in query
+                for query, _params in cursor.executed
+            )
+        )
+        self.assertTrue(connection.closed)
 
     def test_locked_relation_locks_a_plain_table(self):
         cursor = FakeCursor(
@@ -874,20 +945,7 @@ class NoWriteContractTests(unittest.TestCase):
         self.assert_no_write_statements(cursor)
 
     def test_locked_relation_issues_no_write_statements(self):
-        cursor = FakeCursor([
-            {
-                "relation_kind": "f",
-                "relation_description": None,
-                "name": "id",
-                "type": "bigint",
-                "description": None,
-                "nullable": False,
-                "geometryType": "",
-                "srid": None,
-                "primaryKey": False,
-                "unique": False,
-            },
-        ])
+        cursor = FakeCursor([FOREIGN_FIELD_ROW])
         sources = PostgresSemanticSources(
             {"MAPP": "postgresql://reader"},
             parse_allowlist("MAPP:leeds.*"),

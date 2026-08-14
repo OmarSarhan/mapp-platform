@@ -602,6 +602,28 @@ class PostgresSemanticSources:
                 row_factory=dict_row,
             ) as connection:
                 with connection.cursor() as cursor:
+                    if schema.startswith("source_") and ALIAS_RE.fullmatch(
+                        schema[len("source_"):]
+                    ):
+                        federation_alias = schema[len("source_"):]
+                        cursor.execute(
+                            "SELECT pg_try_advisory_lock(hashtext(%s)) AS locked",
+                            (f"federation:observe:{federation_alias}",),
+                        )
+                        if not cursor.fetchone()["locked"]:
+                            raise SemanticSourceError(
+                                "The federated source is being reprovisioned. "
+                                "Retry the sync.",
+                                status=HTTPStatus.CONFLICT,
+                                code="semantic.source_changed",
+                            )
+                        # The session lock survives this commit and conflicts
+                        # with FederationAliasStore's per-alias transaction
+                        # lock. Acquire it before starting REPEATABLE READ so a
+                        # concurrent reprovision cannot leave this sync on a
+                        # stale snapshot; closing this dedicated connection
+                        # releases it after the caller publishes the yielded data.
+                        connection.commit()
                     self._begin_read_only(cursor)
                     # Foreign tables cannot be locked ("This operation is
                     # not supported for foreign tables") — skip the lock
