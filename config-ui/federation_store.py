@@ -360,7 +360,8 @@ class FederationAliasStore:
         connection_identity = self._connection_identity(connection_url)
         cur.execute(
             sql.SQL("""
-                SELECT provisioned_at, accepted_schema_fingerprint,
+                SELECT provisioned_at, allowed_relations,
+                       accepted_schema_fingerprint,
                        accepted_physical_identity,
                        accepted_connection_identity,
                        row_level_security_acknowledged
@@ -420,6 +421,27 @@ class FederationAliasStore:
                 or registry_state["row_level_security_acknowledged"]
             )
         )
+        shippable = None
+        if provisioned and reachable and "extensionVersions" in observation:
+            shippable = self._shippable_extensions(
+                extension_versions(cur), observation["extensionVersions"]
+            )
+            # Remove only the known PostGIS hint before validating state;
+            # unexpected extension options require explicit reprovisioning.
+            server_name = f"{alias}_srv"
+            current = self._current_shippable_extensions(cur, server_name)
+            if current == ["postgis"] and not shippable:
+                self._apply_shippable_extensions(
+                    cur, server_name, current, shippable
+                )
+        if provisioned and evidence_current:
+            evidence_current = self._local_state_matches(
+                cur,
+                alias,
+                registry_state["allowed_relations"],
+                connection_url,
+                shippable or [],
+            )
         cur.execute(
             sql.SQL("""
                 UPDATE {}._aliases
@@ -448,11 +470,7 @@ class FederationAliasStore:
 
         if provisioned:
             schema_name = f"source_{alias}"
-            cur.execute(
-                "SELECT pg_catalog.to_regnamespace(%s) AS oid",
-                (schema_name,),
-            )
-            if cur.fetchone()["oid"] is not None:
+            if self._local_schema_owned(cur, schema_name):
                 action = "GRANT" if evidence_current else "REVOKE"
                 preposition = "TO" if evidence_current else "FROM"
                 for role in dict.fromkeys((self.derived_role, self.reader_role)):
@@ -471,20 +489,6 @@ class FederationAliasStore:
                             sql.Identifier(schema_name), sql.Identifier(role)
                         )
                     )
-
-        # An outage has no version evidence and must not rewrite FDW state.
-        if provisioned and reachable and "extensionVersions" in observation:
-            server_name = f"{alias}_srv"
-            local_versions = extension_versions(cur)
-            remote_versions = observation["extensionVersions"]
-            shippable = self._shippable_extensions(
-                local_versions, remote_versions
-            )
-            current = self._current_shippable_extensions(cur, server_name)
-            if current and not shippable:
-                self._apply_shippable_extensions(
-                    cur, server_name, current, shippable
-                )
 
     # PostGIS/PROJ/GEOS versions may differ between the federation database
     # and a source — execution happens in the federation database, so a
@@ -514,8 +518,11 @@ class FederationAliasStore:
     @staticmethod
     def _current_shippable_extensions(cur, server_name: str) -> list[str]:
         cur.execute(
-            "SELECT srvoptions FROM pg_catalog.pg_foreign_server "
-            "WHERE srvname = %s",
+            "SELECT s.srvoptions FROM pg_catalog.pg_foreign_server AS s "
+            "JOIN pg_catalog.pg_foreign_data_wrapper AS f ON f.oid = s.srvfdw "
+            "WHERE s.srvname = %s AND f.fdwname = 'postgres_fdw' "
+            "AND s.srvowner = (SELECT oid FROM pg_catalog.pg_roles "
+            "WHERE rolname = current_user)",
             (server_name,),
         )
         row = cur.fetchone()
@@ -559,17 +566,40 @@ class FederationAliasStore:
         "hostaddr", "sslmode", "sslrootcert", "gssencmode",
     )
 
+    @classmethod
+    def _desired_server_options(
+        cls, params: dict[str, Any], shippable: list[str]
+    ) -> dict[str, str]:
+        options = {
+            "host": str(params.get("host", "")),
+            "port": str(params.get("port", "5432")),
+            "dbname": str(params.get("dbname", "")),
+            "use_remote_estimate": "true",
+        }
+        for name in cls._FORWARDED_CONNECTION_OPTIONS:
+            if params.get(name):
+                options[name] = str(params[name])
+        if shippable:
+            options["extensions"] = ",".join(shippable)
+        return options
+
     @staticmethod
     def _current_server_options(cur, server_name: str) -> dict[str, str]:
         cur.execute(
-            "SELECT s.srvoptions, f.fdwname "
+            "SELECT s.srvoptions, f.fdwname, "
+            "s.srvowner = (SELECT oid FROM pg_catalog.pg_roles "
+            "WHERE rolname = current_user) AS owned "
             "FROM pg_catalog.pg_foreign_server AS s "
             "JOIN pg_catalog.pg_foreign_data_wrapper AS f "
             "ON f.oid = s.srvfdw WHERE s.srvname = %s",
             (server_name,),
         )
         row = cur.fetchone()
-        if row is None or row["fdwname"] != "postgres_fdw":
+        if (
+            row is None
+            or row["fdwname"] != "postgres_fdw"
+            or not row["owned"]
+        ):
             raise FederationSchemaError(
                 f"Federation server {server_name!r} is missing or invalid.",
                 code="federation.local_state_invalid",
@@ -579,6 +609,84 @@ class FederationAliasStore:
             key, _, value = option.partition("=")
             options[key] = value
         return options
+
+    @staticmethod
+    def _local_schema_owned(cur, schema_name: str) -> bool:
+        cur.execute(
+            "SELECT n.nspowner = (SELECT oid FROM pg_catalog.pg_roles "
+            "WHERE rolname = current_user) AS owned "
+            "FROM pg_catalog.pg_namespace AS n WHERE n.nspname = %s",
+            (schema_name,),
+        )
+        row = cur.fetchone()
+        return bool(row and row["owned"])
+
+    def _local_state_matches(
+        self,
+        cur,
+        alias: str,
+        allowed_relations,
+        connection_url: str,
+        shippable: list[str],
+    ) -> bool:
+        server_name = f"{alias}_srv"
+        schema_name = f"source_{alias}"
+        params = psycopg.conninfo.conninfo_to_dict(connection_url)
+        try:
+            current_options = self._current_server_options(cur, server_name)
+            current_extensions = current_options.pop("extensions", None)
+            if current_options != self._desired_server_options(params, []):
+                return False
+            if current_extensions is not None and (
+                not shippable
+                or current_extensions != ",".join(shippable)
+            ):
+                return False
+        except FederationSchemaError:
+            return False
+
+        cur.execute(
+            "SELECT usename AS role_name, usename = current_user AS is_current, "
+            "umoptions FROM pg_catalog.pg_user_mappings WHERE srvname = %s",
+            (server_name,),
+        )
+        mappings = cur.fetchall()
+        current_mappings = [row for row in mappings if row["is_current"]]
+        if len(current_mappings) != 1:
+            return False
+        expected_roles = {
+            current_mappings[0]["role_name"],
+            self.derived_role,
+            self.reader_role,
+        }
+        if {row["role_name"] for row in mappings} != expected_roles:
+            return False
+        current_mapping_options = {}
+        for option in (current_mappings[0]["umoptions"] or []):
+            name, _, value = option.partition("=")
+            current_mapping_options[name] = value
+        if current_mapping_options != {
+            "user": str(params.get("user", "")),
+            "password": str(params.get("password", "")),
+        }:
+            return False
+        if not self._local_schema_owned(cur, schema_name):
+            return False
+
+        expected = {
+            relation.split(".", 1)[1]: relation.split(".", 1)
+            for relation in allowed_relations
+        }
+        bindings = self._local_relation_bindings(cur, schema_name)
+        return bindings.keys() == expected.keys() and all(
+            self._binding_matches(
+                bindings[remote_table],
+                server_name,
+                remote_schema,
+                remote_table,
+            )
+            for remote_table, (remote_schema, _) in expected.items()
+        )
 
     @staticmethod
     def _reconcile_server_options(
@@ -879,9 +987,6 @@ class FederationAliasStore:
                     code="federation.schema_change_not_acknowledged",
                 )
             params = psycopg.conninfo.conninfo_to_dict(connection_url)
-            host = str(params.get("host", ""))
-            port = str(params.get("port", "5432"))
-            dbname = str(params.get("dbname", ""))
             user = str(params.get("user", ""))
             password = str(params.get("password", ""))
             server_name = f"{alias}_srv"
@@ -897,18 +1002,9 @@ class FederationAliasStore:
             shippable = self._shippable_extensions(
                 local_versions, live_remote_versions
             )
-            desired_server_options = {
-                "host": host,
-                "port": port,
-                "dbname": dbname,
-                "use_remote_estimate": "true",
-            }
-            for option_name in self._FORWARDED_CONNECTION_OPTIONS:
-                value = params.get(option_name)
-                if value:
-                    desired_server_options[option_name] = str(value)
-            if shippable:
-                desired_server_options["extensions"] = ",".join(shippable)
+            desired_server_options = self._desired_server_options(
+                params, shippable
+            )
 
             if already_provisioned:
                 current_server_options = self._current_server_options(
@@ -920,14 +1016,7 @@ class FederationAliasStore:
                     current_server_options,
                     desired_server_options,
                 )
-                cur.execute(
-                    "SELECT n.nspowner = (SELECT oid FROM pg_catalog.pg_roles "
-                    "WHERE rolname = current_user) AS owned "
-                    "FROM pg_catalog.pg_namespace AS n WHERE n.nspname = %s",
-                    (schema_name,),
-                )
-                local_schema = cur.fetchone()
-                if local_schema is None or not local_schema["owned"]:
+                if not self._local_schema_owned(cur, schema_name):
                     raise FederationSchemaError(
                         f"Federation schema {schema_name!r} is missing or "
                         "owned by another role.",

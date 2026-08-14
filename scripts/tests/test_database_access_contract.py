@@ -708,6 +708,11 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "set(mappings).issubset(allowed_mapping_roles)", normalized
         )
         self.assertIn(
+            'alias_row["status"] == "active" and set(mappings) != '
+            "allowed_mapping_roles",
+            normalized,
+        )
+        self.assertIn(
             "mappings[federation_role] != expected_mapping", normalized
         )
 

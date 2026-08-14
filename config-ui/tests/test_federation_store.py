@@ -14,6 +14,14 @@ OBSERVATION_ID = 41
 OBSERVED_AT = datetime(2026, 8, 11, tzinfo=timezone.utc)
 PHYSICAL_IDENTITY = "7672778953115078690/16384"
 CONNECTION_IDENTITY = "reader@source-db:5432/sourcedb"
+SERVER_OPTIONS = {
+    "host": "source-db",
+    "port": "5432",
+    "dbname": "sourcedb",
+    "use_remote_estimate": "true",
+    "sslmode": "require",
+    "gssencmode": "disable",
+}
 SOURCE_URL = (
     "postgresql://reader:secret@source-db:5432/sourcedb?"
     "sslmode=require&gssencmode=disable"
@@ -120,6 +128,7 @@ def provision_row(
 def registry_state(**overrides):
     value = {
         "provisioned_at": None,
+        "allowed_relations": ["leeds.smoke_control_orders"],
         "accepted_schema_fingerprint": None,
         "accepted_physical_identity": None,
         "accepted_connection_identity": None,
@@ -140,6 +149,33 @@ def local_binding(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def server_row(*, options=None, **overrides):
+    value = {
+        "fdwname": "postgres_fdw",
+        "owned": True,
+        "srvoptions": [
+            f"{name}={option}"
+            for name, option in (
+                SERVER_OPTIONS if options is None else options
+            ).items()
+        ],
+    }
+    value.update(overrides)
+    return value
+
+
+def mapping_rows(current_options=("user=reader", "password=secret")):
+    return [
+        {
+            "role_name": "mapp_federation",
+            "is_current": True,
+            "umoptions": list(current_options),
+        },
+        {"role_name": "mapp_derived", "is_current": False, "umoptions": None},
+        {"role_name": "mapp_reader", "is_current": False, "umoptions": None},
+    ]
 
 
 def statements(cursor):
@@ -267,7 +303,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                 accepted_connection_identity=CONNECTION_IDENTITY,
             ),
             {"id": OBSERVATION_ID},
-            {"oid": 123},
+            {"owned": True},
         ]
         store = self.store_with_cursor(cursor)
 
@@ -293,32 +329,108 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIs(False, update.args[1][-2])
 
     def test_matching_evidence_restores_runtime_schema_access(self):
-        cursor = MagicMock()
-        cursor.fetchone.side_effect = [
-            registry_state(
-                provisioned_at=OBSERVED_AT,
-                accepted_schema_fingerprint="same",
-                accepted_physical_identity=PHYSICAL_IDENTITY,
-                accepted_connection_identity=CONNECTION_IDENTITY,
+        cases = (
+            (server_row(), True, "GRANT"),
+            (
+                server_row(options={**SERVER_OPTIONS, "host": "other-source"}),
+                False,
+                "REVOKE",
             ),
-            {"id": OBSERVATION_ID},
-            {"oid": 123},
-        ]
-        store = self.store_with_cursor(cursor)
-
-        store._persist_observation(
-            cursor,
-            "leeds_ext",
-            observation(fingerprint="same"),
-            SOURCE_URL,
-            PHYSICAL_IDENTITY,
-            OBSERVED_AT,
         )
+        for local_server, active, action in cases:
+            with self.subTest(action=action):
+                cursor = MagicMock()
+                cursor.fetchone.side_effect = [
+                    registry_state(
+                        provisioned_at=OBSERVED_AT,
+                        accepted_schema_fingerprint="same",
+                        accepted_physical_identity=PHYSICAL_IDENTITY,
+                        accepted_connection_identity=CONNECTION_IDENTITY,
+                    ),
+                    {"id": OBSERVATION_ID},
+                    local_server,
+                    {"owned": True},
+                    {"owned": True},
+                ]
+                cursor.fetchall.side_effect = [
+                    mapping_rows(),
+                    [local_binding()],
+                ]
+                store = self.store_with_cursor(cursor)
 
-        sql_text = "\n".join(statements(cursor))
-        self.assertIn("GRANT USAGE ON SCHEMA", sql_text)
-        self.assertIn("GRANT SELECT ON ALL TABLES IN SCHEMA", sql_text)
-        self.assertNotIn("REVOKE USAGE ON SCHEMA", sql_text)
+                store._persist_observation(
+                    cursor, "leeds_ext", observation(fingerprint="same"),
+                    SOURCE_URL, PHYSICAL_IDENTITY, OBSERVED_AT,
+                )
+
+                update = next(
+                    call for call in cursor.execute.call_args_list
+                    if "SET last_observation" in str(call.args[0])
+                )
+                self.assertIs(active, update.args[1][-2])
+                sql_text = "\n".join(statements(cursor))
+                self.assertIn(f"{action} USAGE ON SCHEMA", sql_text)
+                self.assertIn(f"{action} SELECT ON ALL TABLES", sql_text)
+
+    def test_local_state_gate_requires_exact_owned_fdw_objects(self):
+        store = self.store_with_cursor(MagicMock())
+
+        def matches(
+            server=server_row(), schema={"owned": True},
+            mappings=None, bindings=(local_binding(),), shippable=(),
+        ):
+            cursor = MagicMock()
+            cursor.fetchone.side_effect = [server, schema]
+            cursor.fetchall.side_effect = [
+                mapping_rows() if mappings is None else mappings,
+                list(bindings),
+            ]
+            return store._local_state_matches(
+                cursor, "leeds_ext", ["leeds.smoke_control_orders"],
+                SOURCE_URL, list(shippable),
+            )
+
+        self.assertTrue(matches())
+        for server in (
+            None,
+            server_row(fdwname="file_fdw"),
+            server_row(owned=False),
+            server_row(options={**SERVER_OPTIONS, "host": "other-source"}),
+        ):
+            self.assertFalse(matches(server=server))
+        for schema in (None, {"owned": False}):
+            self.assertFalse(matches(schema=schema))
+        valid_mappings = mapping_rows()
+        for mappings in (
+            valid_mappings[1:],
+            valid_mappings[:-1],
+            valid_mappings + [{
+                "role_name": "intruder", "is_current": False,
+                "umoptions": None,
+            }],
+            mapping_rows(("user=other", "password=secret")),
+            mapping_rows(("user=reader", "password=wrong")),
+        ):
+            self.assertFalse(matches(mappings=mappings))
+        for bindings in (
+            (),
+            (local_binding(), local_binding(relname="extra")),
+            (local_binding(relkind="r"),),
+            (local_binding(owned=False),),
+            (local_binding(srvname="other_srv"),),
+            (local_binding(remote_schema="archive"),),
+            (local_binding(remote_table="other"),),
+        ):
+            self.assertFalse(matches(bindings=bindings))
+
+        self.assertTrue(matches(shippable=("postgis",)))
+        postgis = server_row(options={**SERVER_OPTIONS, "extensions": "postgis"})
+        self.assertTrue(matches(server=postgis, shippable=("postgis",)))
+        self.assertFalse(matches(server=postgis))
+        unexpected = server_row(
+            options={**SERVER_OPTIONS, "extensions": "postgis_topology"}
+        )
+        self.assertFalse(matches(server=unexpected, shippable=("postgis",)))
 
     @patch("federation_store.extension_versions")
     def test_outage_does_not_change_pushdown_without_version_evidence(self, versions):
@@ -326,7 +438,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             registry_state(provisioned_at=OBSERVED_AT),
             {"id": OBSERVATION_ID},
-            {"oid": 123},
+            {"owned": True},
         ]
         store = self.store_with_cursor(cursor)
 
@@ -362,9 +474,12 @@ class FederationAliasStoreTests(unittest.TestCase):
                 accepted_connection_identity=CONNECTION_IDENTITY,
             ),
             {"id": OBSERVATION_ID},
-            {"oid": 123},
             {"srvoptions": ["extensions=postgis"]},
+            server_row(),
+            {"owned": True},
+            {"owned": True},
         ]
+        cursor.fetchall.side_effect = [mapping_rows(), [local_binding()]]
         store = self.store_with_cursor(cursor)
 
         store._persist_observation(
@@ -379,6 +494,12 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(
             any("DROP extensions" in text for text in statements(cursor))
         )
+        update = next(
+            call for call in cursor.execute.call_args_list
+            if "SET last_observation" in str(call.args[0])
+        )
+        self.assertIs(True, update.args[1][-2])
+        self.assertIn("GRANT USAGE ON SCHEMA", "\n".join(statements(cursor)))
 
     @patch("federation_store.detect_capability")
     def test_observe_locks_before_probe_and_has_no_dead_freshness_route(self, detect):
@@ -576,6 +697,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             ),
             {
                 "fdwname": "postgres_fdw",
+                "owned": True,
                 "srvoptions": [
                     "host=source-db",
                     "port=5432",
@@ -623,6 +745,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     ),
                     {
                         "fdwname": "postgres_fdw",
+                        "owned": True,
                         "srvoptions": [
                             "host=source-db",
                             "port=5432",
@@ -661,7 +784,11 @@ class FederationAliasStoreTests(unittest.TestCase):
     def test_reprovision_fails_closed_for_missing_or_wrong_server(
         self, _versions, _verify
     ):
-        for server in (None, {"fdwname": "file_fdw", "srvoptions": []}):
+        for server in (
+            None,
+            server_row(fdwname="file_fdw"),
+            server_row(owned=False),
+        ):
             with self.subTest(server=server):
                 cursor = MagicMock()
                 cursor.fetchone.side_effect = [

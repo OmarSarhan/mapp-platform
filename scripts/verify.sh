@@ -2558,6 +2558,10 @@ if federation_database_url:
                         "user": str(params.get("user", "")),
                         "password": str(params.get("password", "")),
                     }
+                    # PostgreSQL masks umoptions for mappings owned by other
+                    # roles when those roles intentionally lack server USAGE.
+                    # The closed role set and privilege checks below keep the
+                    # federation provisioner as the only mapping authority.
                     required_mapping_roles = {derived_role, reader_role}
                     allowed_mapping_roles = required_mapping_roles | {
                         federation_role
@@ -2565,6 +2569,10 @@ if federation_database_url:
                     if (
                         not required_mapping_roles.issubset(mappings)
                         or not set(mappings).issubset(allowed_mapping_roles)
+                        or (
+                            alias_row["status"] == "active"
+                            and set(mappings) != allowed_mapping_roles
+                        )
                         or (
                             federation_role in mappings
                             and mappings[federation_role] != expected_mapping
