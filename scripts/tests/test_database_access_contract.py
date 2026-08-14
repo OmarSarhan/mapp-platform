@@ -486,7 +486,9 @@ class DatabaseAccessContractTests(unittest.TestCase):
         # test_federation_schema_relation_exemption_requires_a_managed_object_name),
         # so an exact count is what actually proves the old check is gone
         # without also forbidding the new one.
-        self.assertEqual(4, normalized.count("relation.relname IN ("))
+        self.assertEqual(
+            4, normalized.count("(relation.relname, relation.relkind) IN (")
+        )
         # The two schema-level checks (canCreateBaseSchema and its
         # reachable_role mirror) must stay untouched — a provisioned
         # alias's owner legitimately needs CREATE on the whole schema, so
@@ -538,11 +540,16 @@ class DatabaseAccessContractTests(unittest.TestCase):
         # actually-managed object explicitly, the same way the source_<alias>
         # branch already requires the specific foreign table.
         normalized = self.normalized("scripts/verify.sh")
+        # relkind is pinned alongside each name: the derived owner owns this
+        # schema, so a name-only allowlist would also exempt a crafted view or
+        # table substituted for the real registry objects.
         managed_objects_fragment = (
-            "namespace.nspname = $$federation$$ AND relation.relname IN ( "
-            "$$_aliases$$, $$_aliases_pkey$$, $$_observations$$, "
-            "$$_observations_pkey$$, $$_observations_alias_observed_at_idx$$, "
-            "$$_observations_id_seq$$ )"
+            "namespace.nspname = $$federation$$ AND "
+            "(relation.relname, relation.relkind) IN ( "
+            "($$_aliases$$, $$r$$), ($$_aliases_pkey$$, $$i$$), "
+            "($$_observations$$, $$r$$), ($$_observations_pkey$$, $$i$$), "
+            "($$_observations_alias_observed_at_idx$$, $$i$$), "
+            "($$_observations_id_seq$$, $$S$$) )"
         )
         self.assertEqual(
             4,

@@ -273,6 +273,15 @@ class DetectCapabilityTests(unittest.TestCase):
 
         executed_sql = "\n".join(query for query, _ in cursor.executed)
         self.assertIn("security_invoker", executed_sql)
+        # Collation is equally invisible to format_type() — a text column
+        # reads as plain "text" whether it is COLLATE "C" or COLLATE "POSIX"
+        # — yet it governs comparison/ordering semantics, and the local
+        # foreign table keeps whatever collation it was imported with. The
+        # collation NAME is used, not attcollation: the oid is not stable
+        # across a dump/restore and would manufacture phantom drift.
+        self.assertIn("pg_catalog.pg_collation", executed_sql)
+        self.assertIn("co.collname", executed_sql)
+        self.assertNotIn("a.attcollation::", executed_sql)
         # This query is called with bound (schema, relation) parameters
         # (%s placeholders), so a literal % anywhere else in the same
         # string must be escaped as %% or psycopg's placeholder scanner

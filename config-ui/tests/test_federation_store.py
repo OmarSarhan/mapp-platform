@@ -75,6 +75,7 @@ def provision_row(
     last_observed_connection_identity=None,
     physical_identity=None,
     accepted_schema_fingerprint=None,
+    accepted_physical_identity=None,
     **overrides,
 ):
     """The single locked SELECT provision() issues combines the public
@@ -97,6 +98,7 @@ def provision_row(
         else SOURCE_DB_PHYSICAL_IDENTITY
     )
     row["accepted_schema_fingerprint"] = accepted_schema_fingerprint
+    row["accepted_physical_identity"] = accepted_physical_identity
     return row
 
 
@@ -824,7 +826,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             if "provisioned_at = clock_timestamp()" in str(call.args[0])
         )
         # The live fingerprint becomes the newly-accepted baseline.
-        self.assertEqual(("admin", False, "fp-first", "leeds_ext"), activation.args[1])
+        self.assertEqual(("admin", False, "fp-first", SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",
@@ -956,7 +958,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             if "provisioned_at = clock_timestamp()" in str(call.args[0])
         )
         # The new fingerprint becomes the durably-accepted baseline.
-        self.assertEqual(("admin", False, "fp-new", "leeds_ext"), activation.args[1])
+        self.assertEqual(("admin", False, "fp-new", SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",
@@ -1029,7 +1031,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             call for call in cursor.execute.call_args_list
             if "provisioned_at = clock_timestamp()" in str(call.args[0])
         )
-        self.assertEqual(("admin", True, None, "leeds_ext"), activation.args[1])
+        self.assertEqual(("admin", True, None, SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",
@@ -1051,13 +1053,14 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIsNotNone(result["provisionedAt"])
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         # The initial read locks the row and everything else — the
-        # identity/policy checks and the FDW DDL — runs inside that same
-        # connection/transaction: a concurrent Observe on this alias
-        # cannot commit a newer observation until this call finishes.
-        # (The trailing self.get(alias) return is a second, separate,
-        # post-commit read — the lock is already released by then.)
+        # identity/policy checks, the FDW DDL, and the read of the row this
+        # call returns — runs inside that same connection/transaction: a
+        # concurrent Observe on this alias cannot commit a newer observation
+        # until this call finishes, and the returned row is the one THIS
+        # transaction produced rather than whatever a racing writer left
+        # behind (it used to be a second, separate, post-commit read).
         self.assertIn("FOR UPDATE", statements[0])
-        self.assertEqual(2, store._connect.call_count)
+        self.assertEqual(1, store._connect.call_count)
         self.assertTrue(any("CREATE EXTENSION IF NOT EXISTS postgres_fdw" in s for s in statements))
         create_server = next(s for s in statements if "CREATE SERVER" in s)
         self.assertIn("leeds_ext_srv", create_server)
@@ -1083,7 +1086,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("approved_at = clock_timestamp()", str(activation.args[0]))
         # No RLS was detected in this fixture's observation, so nothing
         # was there to acknowledge.
-        self.assertEqual(("admin", False, None, "leeds_ext"), activation.args[1])
+        self.assertEqual(("admin", False, None, SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",
@@ -1117,7 +1120,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             call for call in cursor.execute.call_args_list
             if "approved_by = %s" in str(call.args[0])
         )
-        self.assertEqual(("reviewer", False, None, "leeds_ext"), approval.args[1])
+        self.assertEqual(("reviewer", False, None, SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), approval.args[1])
         # provisioned_at is when the alias was first activated — untouched
         # on reprovision, unlike approved_by/approved_at.
         self.assertNotIn(
@@ -1358,7 +1361,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             if "accepted_schema_fingerprint = %s" in str(call.args[0])
             and "approved_by" in str(call.args[0])
         )
-        self.assertEqual(("admin", False, "fp-new", "leeds_ext"), activation.args[1])
+        self.assertEqual(("admin", False, "fp-new", SOURCE_DB_PHYSICAL_IDENTITY, "leeds_ext"), activation.args[1])
 
     @patch(
         "federation_store.verify_remote_state",
@@ -1597,6 +1600,150 @@ class FederationAliasStoreTests(unittest.TestCase):
             store.provision("leeds_ext", SOURCE_DB_URL, "admin")
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-1"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_rejects_a_database_replaced_since_it_was_accepted(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # The staleness check above compares against physical_identity, which
+        # every Observe overwrites — so a source that was replaced and THEN
+        # re-observed matches itself and passes it. Proven live: a
+        # dropped-and-recreated relation kept an identical schema
+        # fingerprint, cleared every other gate, and served replacement rows
+        # through the existing foreign table. The durable
+        # accepted_physical_identity is what actually catches it.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            provisionedAt="2026-08-11T00:00:00+00:00",
+            lastObservation={"schema": "current", "schemaFingerprint": "fp-1"},
+            accepted_schema_fingerprint="fp-1",
+            # what a prior successful provision() accepted...
+            accepted_physical_identity="7672778953115078690/16384/OLD",
+            # ...and what the latest Observe already recorded, so the
+            # staleness check cannot see any discrepancy.
+            physical_identity=SOURCE_DB_PHYSICAL_IDENTITY,
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+        self.assertEqual(
+            "federation.physical_rebind_not_acknowledged", raised.exception.code
+        )
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        self.assertFalse(any("ALTER SERVER" in s for s in statements))
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, MATCHING_VERSIONS, True, False, "fp-1"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_accepts_a_physical_rebind_once_acknowledged(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        mock_versions.return_value = MATCHING_VERSIONS
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt="2026-08-11T00:00:00+00:00",
+                lastObservation={"schema": "current", "schemaFingerprint": "fp-1"},
+                accepted_schema_fingerprint="fp-1",
+                accepted_physical_identity="7672778953115078690/16384/OLD",
+                physical_identity=SOURCE_DB_PHYSICAL_IDENTITY,
+            ),
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            {"srvoptions": ["host=source-db", "extensions=postgis"]},
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext", SOURCE_DB_URL, "admin",
+            acknowledge_physical_rebind=True,
+        )
+
+        approval = next(
+            call for call in cursor.execute.call_args_list
+            if "accepted_physical_identity = %s" in str(call.args[0])
+        )
+        # The rebound identity becomes the new durable baseline.
+        self.assertIn(SOURCE_DB_PHYSICAL_IDENTITY, approval.args[1])
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-1"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_first_provisioning_has_no_accepted_identity_to_compare_against(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # accepted_physical_identity is None until a provision() sets it, so
+        # the rebind gate must be vacuous on the first call rather than
+        # blocking every new alias.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt=None,
+                lastObservation={"schema": "current", "schemaFingerprint": "fp-1"},
+                accepted_physical_identity=None,
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        result = store.provision("leeds_ext", SOURCE_DB_URL, "admin")
+
+        self.assertIsNotNone(result["provisionedAt"])
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(SOURCE_DB_PHYSICAL_IDENTITY, {}, True, False, "fp-1"),
+    )
+    @patch("federation_store.extension_versions")
+    def test_provision_forwards_hostaddr_to_the_foreign_server(
+        self, mock_versions, mock_verify_remote_state
+    ):
+        # When a connectionRef pins hostaddr, Observe and verify_remote_state
+        # connect to THAT address. A foreign server built from host alone can
+        # resolve somewhere else entirely, so the identity, schema, and
+        # privileges that were just verified would describe a different
+        # database than the one runtime queries actually reach.
+        mock_versions.return_value = {}
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt=None,
+                lastObservation={"schema": "current", "schemaFingerprint": "fp-1"},
+                last_observed_connection_identity="reader@source-db:5432/sourcedb",
+            ),
+            alias_row(provisionedAt="2026-08-11T00:00:00+00:00"),
+        ]
+        cursor.fetchall.return_value = [{"relname": "smoke_control_orders"}]
+        store = self.store_with_cursor(cursor)
+
+        store.provision(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb"
+            "?sslmode=require&hostaddr=10.1.2.3",
+            "admin",
+        )
+
+        statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
+        create_server = next(s for s in statements if "CREATE SERVER" in s)
+        self.assertIn("hostaddr", create_server)
+        self.assertIn("10.1.2.3", create_server)
+        # host is still sent: with hostaddr present libpq uses host purely
+        # for TLS name verification.
+        self.assertIn("source-db", create_server)
 
     def test_provision_wraps_a_physical_identity_connection_failure(self):
         # A source that goes unreachable in the narrow window between the

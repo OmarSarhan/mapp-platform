@@ -119,7 +119,8 @@ class FederationAliasStore:
               physical_identity text,
               observed_at timestamptz,
               row_level_security_acknowledged boolean NOT NULL DEFAULT false,
-              accepted_schema_fingerprint text
+              accepted_schema_fingerprint text,
+              accepted_physical_identity text
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
@@ -153,6 +154,24 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "accepted_schema_fingerprint text"
+        ).format(sql.Identifier(SCHEMA)))
+        # The durable counterpart to physical_identity, for the same reason
+        # accepted_schema_fingerprint is the durable counterpart to
+        # last_observation's fingerprint: physical_identity records whatever
+        # the most recent Observe merely *saw*, so comparing a live probe
+        # against it only ever catches a replacement that happened between
+        # Observe and Provision — never one that was already observed. This
+        # column records the identity a successful provision() actually
+        # accepted, so a source database replaced and then re-observed is
+        # still caught (docs/federation-architecture-waypoint.md: "The same
+        # table name at a new physical database is not the same source
+        # unless an operator performs an explicit, evidenced rebind").
+        # Deliberately not backfilled from physical_identity — that would
+        # retroactively "accept" whatever is there now, which is exactly the
+        # replacement this exists to catch.
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "accepted_physical_identity text"
         ).format(sql.Identifier(SCHEMA)))
         # DEFAULT backfills any alias registered before tlsPolicy was
         # persisted with the weakest of the three valid policies — the
@@ -245,16 +264,30 @@ class FederationAliasStore:
     def get(self, alias: str) -> dict[str, Any]:
         alias = validate_alias(alias)
         with self._connect() as connection, connection.cursor() as cur:
-            cur.execute(
-                sql.SQL("SELECT {} FROM {}._aliases WHERE alias = %s").format(
-                    self._SELECT_COLUMNS, sql.Identifier(SCHEMA)
-                ),
-                (alias,),
-            )
-            item = cur.fetchone()
-            if not item:
-                raise FileNotFoundError(alias)
-            return item
+            return self._get_with_cursor(cur, alias)
+
+    def _get_with_cursor(self, cur, alias: str) -> dict[str, Any]:
+        """Read an alias through an already-open cursor. `alias` must already
+        be validated.
+
+        observe() and provision() return this rather than calling get(), so
+        the row they hand back is the one their own transaction produced.
+        get() opens a separate connection, which — because it can only see
+        committed data — would either miss the caller's own uncommitted work
+        or, once committed, race a concurrent writer and return somebody
+        else's result. app.py records the returned connectivity in the
+        caller's audit event, so returning another request's observation
+        would misattribute the evidence."""
+        cur.execute(
+            sql.SQL("SELECT {} FROM {}._aliases WHERE alias = %s").format(
+                self._SELECT_COLUMNS, sql.Identifier(SCHEMA)
+            ),
+            (alias,),
+        )
+        item = cur.fetchone()
+        if not item:
+            raise FileNotFoundError(alias)
+        return item
 
     def list(self) -> list[dict[str, Any]]:
         with self._connect() as connection, connection.cursor() as cur:
@@ -347,7 +380,7 @@ class FederationAliasStore:
                 cur, alias, observation, connection_url, physical_identity,
                 observed_at,
             )
-        return self.get(alias)
+            return self._get_with_cursor(cur, alias)
 
     def observe(
         self,
@@ -402,7 +435,7 @@ class FederationAliasStore:
                 cur, alias, observation, connection_url, physical_identity,
                 observed_at,
             )
-        return self.get(alias)
+            return self._get_with_cursor(cur, alias)
 
     def _persist_observation(
         self,
@@ -608,7 +641,19 @@ class FederationAliasStore:
                 )
             )
 
-    _SSL_OPTIONS = ("sslmode", "sslrootcert", "sslcert", "sslkey")
+    # libpq settings from the connectionRef that must be reproduced on the
+    # foreign server, because postgres_fdw opens its own connection and would
+    # otherwise fall back to libpq defaults. hostaddr belongs here with the
+    # TLS settings: when a connectionRef supplies it, Observe and
+    # verify_remote_state() connect to THAT address, so a server built from
+    # host alone can resolve somewhere else entirely — the identity, schema,
+    # and privileges that were verified would then describe a different
+    # database than the one runtime queries actually reach. (host is still
+    # sent too, since with hostaddr present libpq uses host purely for TLS
+    # name verification.) Not user/password: those live in the user mapping.
+    _FORWARDED_CONNECTION_OPTIONS = (
+        "hostaddr", "sslmode", "sslrootcert", "sslcert", "sslkey",
+    )
 
     @staticmethod
     def _current_server_options(cur, server_name: str) -> dict[str, str]:
@@ -625,30 +670,32 @@ class FederationAliasStore:
         return options
 
     @classmethod
-    def _reconcile_ssl_options(
+    def _reconcile_forwarded_options(
         cls, cur, server_name: str, current: dict[str, str], params
     ) -> None:
-        """Reconcile sslmode/sslrootcert/sslcert/sslkey to match the
-        connectionRef's current connection string — a rotated SSL setting
-        (e.g. require -> verify-full, a renewed CA/client certificate, or
-        one removed outright) must reach the live server the same way a
-        rotated host/password does, or foreign-table queries keep using
-        stale, possibly weaker, transport settings."""
+        """Reconcile _FORWARDED_CONNECTION_OPTIONS to match the
+        connectionRef's current connection string — a rotated setting (e.g.
+        sslmode require -> verify-full, a renewed CA/client certificate, a
+        changed hostaddr, or any of them removed outright) must reach the
+        live server the same way a rotated host/password does, or
+        foreign-table queries keep using stale settings: possibly weaker
+        transport, or an address that no longer hosts the verified
+        database."""
         actions = []
-        for ssl_option in cls._SSL_OPTIONS:
-            value = params.get(ssl_option)
+        for option_name in cls._FORWARDED_CONNECTION_OPTIONS:
+            value = params.get(option_name)
             if value:
-                verb = "SET" if ssl_option in current else "ADD"
+                verb = "SET" if option_name in current else "ADD"
                 actions.append(
                     sql.SQL("{} {} {}").format(
                         sql.SQL(verb),
-                        sql.Identifier(ssl_option),
+                        sql.Identifier(option_name),
                         sql.Literal(str(value)),
                     )
                 )
-            elif ssl_option in current:
+            elif option_name in current:
                 actions.append(
-                    sql.SQL("DROP {}").format(sql.Identifier(ssl_option))
+                    sql.SQL("DROP {}").format(sql.Identifier(option_name))
                 )
         if actions:
             cur.execute(
@@ -750,6 +797,7 @@ class FederationAliasStore:
         *,
         acknowledge_row_level_security: bool = False,
         acknowledge_schema_change: bool = False,
+        acknowledge_physical_rebind: bool = False,
     ) -> dict[str, Any]:
         """Create the real FDW server, user mapping, schema, and foreign
         tables for this alias's allowedRelations the first time this is
@@ -789,9 +837,20 @@ class FederationAliasStore:
         instead of silently reconciling around a dependent object — an
         informed stop, consistent with this module's own impact-visibility
         design, not a gap.
-        every successful call, whether or not acknowledgement was needed
-        this time, re-persists accepted_schema_fingerprint as the new
-        baseline."""
+
+        `acknowledge_physical_rebind` is the third gate in the same family,
+        guarding `accepted_physical_identity`: the source being a *different
+        physical database* than the one previously accepted. The doc treats
+        this as its own class of change — "The same table name at a new
+        physical database is not the same source unless an operator performs
+        an explicit, evidenced rebind" — and it is genuinely not covered by
+        the other two, since a restored or recreated database can present a
+        byte-identical schema fingerprint and satisfy every RLS check while
+        serving entirely different rows.
+
+        Every successful call, whether or not any acknowledgement was needed
+        this time, re-persists accepted_schema_fingerprint and
+        accepted_physical_identity as the new baselines."""
         alias = validate_alias(alias)
         with self._connect() as connection, connection.cursor() as cur:
             # Locks the row for the remainder of this call — a concurrent
@@ -806,7 +865,8 @@ class FederationAliasStore:
             cur.execute(
                 sql.SQL("""
                     SELECT {}, last_observed_connection_identity,
-                           physical_identity, accepted_schema_fingerprint
+                           physical_identity, accepted_schema_fingerprint,
+                           accepted_physical_identity
                     FROM {}._aliases
                     WHERE alias = %s
                     FOR UPDATE
@@ -822,6 +882,7 @@ class FederationAliasStore:
             )
             last_observed_physical_identity = record.pop("physical_identity")
             accepted_schema_fingerprint = record.pop("accepted_schema_fingerprint")
+            accepted_physical_identity = record.pop("accepted_physical_identity")
             already_provisioned = record["provisionedAt"] is not None
             last_observation = record.get("lastObservation") or {}
             # Every MAPP caller queries a federated source through the same
@@ -947,6 +1008,9 @@ class FederationAliasStore:
             # _observations table records what was detected, but not that
             # it was accepted).
             rls_bypass_acknowledged = rls_detected and acknowledge_row_level_security
+            # Staleness: the evidence being acted on must have been collected
+            # against the same physical database this call is about to wire
+            # up. Escape hatch is a fresh Observe.
             if last_observed_physical_identity != current_physical_identity:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's physical database identity "
@@ -954,6 +1018,31 @@ class FederationAliasStore:
                     "been dropped, restored, or replaced. Observe it again "
                     "and review before provisioning.",
                     code="federation.observation_not_current",
+                )
+            # Acceptance: the live database must still be the one a previous
+            # successful provisioning actually accepted. The staleness check
+            # above cannot cover this — it compares against physical_identity,
+            # which every Observe overwrites, so a source that was replaced
+            # and *then* observed matches itself and sails through (verified
+            # live: a dropped-and-recreated relation kept an identical schema
+            # fingerprint, passed every other gate, and served replacement
+            # rows through the existing foreign table). The doc is explicit
+            # that this is not the same source: "The same table name at a new
+            # physical database is not the same source unless an operator
+            # performs an explicit, evidenced rebind"
+            # (docs/federation-architecture-waypoint.md). None means nothing
+            # has been accepted yet, i.e. this alias's first provisioning.
+            if (
+                accepted_physical_identity is not None
+                and accepted_physical_identity != current_physical_identity
+                and not acknowledge_physical_rebind
+            ):
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s source is a different physical "
+                    "database than the one previously accepted — it was "
+                    "dropped, restored, or replaced. Acknowledge this "
+                    "rebind explicitly to provision.",
+                    code="federation.physical_rebind_not_acknowledged",
                 )
             # physical_identity only proves the relation itself wasn't
             # dropped/recreated — an ADD COLUMN or a CREATE OR REPLACE VIEW
@@ -1063,7 +1152,7 @@ class FederationAliasStore:
                 current_server_options = self._current_server_options(
                     cur, server_name
                 )
-                self._reconcile_ssl_options(
+                self._reconcile_forwarded_options(
                     cur, server_name, current_server_options, params
                 )
                 cur.execute(sql.SQL("""
@@ -1127,13 +1216,15 @@ class FederationAliasStore:
                         UPDATE {}._aliases
                         SET approved_by = %s, approved_at = clock_timestamp(),
                             row_level_security_acknowledged = %s,
-                            accepted_schema_fingerprint = %s
+                            accepted_schema_fingerprint = %s,
+                            accepted_physical_identity = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
                     (
                         actor,
                         rls_bypass_acknowledged,
                         current_schema_fingerprint,
+                        current_physical_identity,
                         alias,
                     ),
                 )
@@ -1144,16 +1235,18 @@ class FederationAliasStore:
                     sql.SQL("dbname {}").format(sql.Literal(dbname)),
                     sql.SQL("use_remote_estimate 'true'"),
                 ]
-                # Forward whatever transport guarantees the operator already put
-                # in the connectionRef's connection string (the repo's existing
+                # Forward whatever the operator already put in the
+                # connectionRef's connection string (the repo's existing
                 # sslmode/sslrootcert convention — see .env.example) instead of
-                # letting libpq silently fall back to its own permissive default.
-                for ssl_option in ("sslmode", "sslrootcert", "sslcert", "sslkey"):
-                    value = params.get(ssl_option)
+                # letting libpq silently fall back to its own permissive
+                # default. Same tuple the reprovision path reconciles against,
+                # so create and reconcile cannot drift apart.
+                for option_name in self._FORWARDED_CONNECTION_OPTIONS:
+                    value = params.get(option_name)
                     if value:
                         server_options.append(
                             sql.SQL("{} {}").format(
-                                sql.Identifier(ssl_option), sql.Literal(str(value))
+                                sql.Identifier(option_name), sql.Literal(str(value))
                             )
                         )
                 if shippable:
@@ -1240,17 +1333,19 @@ class FederationAliasStore:
                         SET provisioned_at = clock_timestamp(), status = 'active',
                             approved_by = %s, approved_at = clock_timestamp(),
                             row_level_security_acknowledged = %s,
-                            accepted_schema_fingerprint = %s
+                            accepted_schema_fingerprint = %s,
+                            accepted_physical_identity = %s
                         WHERE alias = %s
                     """).format(sql.Identifier(SCHEMA)),
                     (
                         actor,
                         rls_bypass_acknowledged,
                         current_schema_fingerprint,
+                        current_physical_identity,
                         alias,
                     ),
                 )
-        return self.get(alias)
+            return self._get_with_cursor(cur, alias)
 
     def affected_derived_layer_names(self, alias: str) -> list[str]:
         """Derived layers whose declared sources read from this alias's

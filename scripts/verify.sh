@@ -1703,11 +1703,13 @@ with psycopg.connect(
                       namespace.nspname = $$derived_layers$$
                       OR (
                         namespace.nspname = $$federation$$
-                        AND relation.relname IN (
-                          $$_aliases$$, $$_aliases_pkey$$,
-                          $$_observations$$, $$_observations_pkey$$,
-                          $$_observations_alias_observed_at_idx$$,
-                          $$_observations_id_seq$$
+                        AND (relation.relname, relation.relkind) IN (
+                          ($$_aliases$$, $$r$$),
+                          ($$_aliases_pkey$$, $$i$$),
+                          ($$_observations$$, $$r$$),
+                          ($$_observations_pkey$$, $$i$$),
+                          ($$_observations_alias_observed_at_idx$$, $$i$$),
+                          ($$_observations_id_seq$$, $$S$$)
                         )
                       )
                       OR EXISTS (
@@ -1782,11 +1784,13 @@ with psycopg.connect(
                       namespace.nspname = $$derived_layers$$
                       OR (
                         namespace.nspname = $$federation$$
-                        AND relation.relname IN (
-                          $$_aliases$$, $$_aliases_pkey$$,
-                          $$_observations$$, $$_observations_pkey$$,
-                          $$_observations_alias_observed_at_idx$$,
-                          $$_observations_id_seq$$
+                        AND (relation.relname, relation.relkind) IN (
+                          ($$_aliases$$, $$r$$),
+                          ($$_aliases_pkey$$, $$i$$),
+                          ($$_observations$$, $$r$$),
+                          ($$_observations_pkey$$, $$i$$),
+                          ($$_observations_alias_observed_at_idx$$, $$i$$),
+                          ($$_observations_id_seq$$, $$S$$)
                         )
                       )
                       OR EXISTS (
@@ -1890,11 +1894,13 @@ with psycopg.connect(
                             namespace.nspname = $$derived_layers$$
                             OR (
                               namespace.nspname = $$federation$$
-                              AND relation.relname IN (
-                                $$_aliases$$, $$_aliases_pkey$$,
-                                $$_observations$$, $$_observations_pkey$$,
-                                $$_observations_alias_observed_at_idx$$,
-                                $$_observations_id_seq$$
+                              AND (relation.relname, relation.relkind) IN (
+                                ($$_aliases$$, $$r$$),
+                                ($$_aliases_pkey$$, $$i$$),
+                                ($$_observations$$, $$r$$),
+                                ($$_observations_pkey$$, $$i$$),
+                                ($$_observations_alias_observed_at_idx$$, $$i$$),
+                                ($$_observations_id_seq$$, $$S$$)
                               )
                             )
                             OR EXISTS (
@@ -1996,11 +2002,13 @@ with psycopg.connect(
                             namespace.nspname = $$derived_layers$$
                             OR (
                               namespace.nspname = $$federation$$
-                              AND relation.relname IN (
-                                $$_aliases$$, $$_aliases_pkey$$,
-                                $$_observations$$, $$_observations_pkey$$,
-                                $$_observations_alias_observed_at_idx$$,
-                                $$_observations_id_seq$$
+                              AND (relation.relname, relation.relkind) IN (
+                                ($$_aliases$$, $$r$$),
+                                ($$_aliases_pkey$$, $$i$$),
+                                ($$_observations$$, $$r$$),
+                                ($$_observations_pkey$$, $$i$$),
+                                ($$_observations_alias_observed_at_idx$$, $$i$$),
+                                ($$_observations_id_seq$$, $$S$$)
                               )
                             )
                             OR EXISTS (

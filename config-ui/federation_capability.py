@@ -150,7 +150,16 @@ def _verify_allowed_relations(
     numeric precision/scale, or — most importantly on a platform built
     around spatial data — a PostGIS geometry column's subtype/SRID, both
     encoded entirely in the typmod), so atttypid alone would let exactly
-    that class of edit through unreviewed. security_invoker is captured
+    that class of edit through unreviewed. Collation is captured alongside
+    it for the same reason and is equally invisible to format_type(), which
+    renders a text column as plain "text" whether it is COLLATE "C" or
+    COLLATE "POSIX" — yet collation governs comparison and ordering
+    semantics, and the local foreign table keeps whatever collation it was
+    imported with, so an unreviewed change would silently diverge remote and
+    local results. The collation NAME is used rather than attcollation
+    itself: the oid is not stable across a dump/restore of the same source,
+    which would manufacture phantom drift. (pg_collation is LEFT JOINed
+    because attcollation is 0 for non-collatable types.) security_invoker is captured
     separately from pg_get_viewdef() (which reflects only the query text,
     not reloptions) because ALTER VIEW ... SET (security_invoker=...)
     changes neither a view's own query text nor its oid, yet flips
@@ -188,10 +197,13 @@ def _verify_allowed_relations(
                     SELECT string_agg(
                       a.attname || ':'
                         || format_type(a.atttypid, a.atttypmod)
-                        || ':' || a.attnotnull::text,
+                        || ':' || a.attnotnull::text
+                        || ':' || COALESCE(co.collname, ''),
                       ',' ORDER BY a.attnum
                     )
                     FROM pg_catalog.pg_attribute AS a
+                    LEFT JOIN pg_catalog.pg_collation AS co
+                      ON co.oid = a.attcollation
                     WHERE a.attrelid = c.oid
                       AND a.attnum > 0
                       AND NOT a.attisdropped

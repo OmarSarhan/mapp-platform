@@ -1572,10 +1572,23 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     "type": "string", "minLength": 1, "maxLength": 200,
                 },
                 "tlsPolicy": {"enum": ["require", "verify-ca", "verify-full"]},
+                # Mirrors federation_schema._normalized_allowed_relations():
+                # each entry must be schema-qualified with identifier-shaped
+                # parts, and entries must be distinct. (That validator also
+                # rejects two relations sharing a basename across different
+                # schemas, since both would import into one local
+                # source_<alias> table — not expressible in JSON Schema, so
+                # it stays a server-side rejection.)
                 "allowedRelations": {
                     "type": "array",
                     "minItems": 1,
-                    "items": {"type": "string"},
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "pattern": (
+                            "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$"
+                        ),
+                    },
                 },
                 "dataHandlingClassification": {
                     "type": "string", "minLength": 1, "maxLength": 2000,
@@ -1614,6 +1627,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "rowLevelSecurityAcknowledged": {"const": True},
                 "schemaChangeAcknowledged": {"const": True},
+                "physicalRebindAcknowledged": {"const": True},
             },
             "additionalProperties": False,
         },

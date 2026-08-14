@@ -7528,46 +7528,44 @@ class Handler(SimpleHTTPRequestHandler):
                             },
                         )
                     else:
-                        unexpected = sorted(
-                            set(payload)
-                            - {
-                                "rowLevelSecurityAcknowledged",
-                                "schemaChangeAcknowledged",
-                            }
-                        )
+                        # Each provision acknowledgement is an opt-in boolean
+                        # that must be literally true when present — see
+                        # FederationAliasStore.provision() for what each one
+                        # gates. Kept as one table so the payload allowlist,
+                        # the validation, and the call stay in sync.
+                        acknowledgements = {
+                            "rowLevelSecurityAcknowledged": (
+                                "acknowledge_row_level_security"
+                            ),
+                            "schemaChangeAcknowledged": (
+                                "acknowledge_schema_change"
+                            ),
+                            "physicalRebindAcknowledged": (
+                                "acknowledge_physical_rebind"
+                            ),
+                        }
+                        unexpected = sorted(set(payload) - set(acknowledgements))
                         if unexpected:
                             raise FederationSchemaError(
                                 "Unknown provision properties: "
                                 + ", ".join(unexpected),
                                 code="federation.invalid_request",
                             )
-                        acknowledged = payload.get("rowLevelSecurityAcknowledged")
-                        if acknowledged is not None and acknowledged is not True:
-                            raise FederationSchemaError(
-                                "rowLevelSecurityAcknowledged must be true "
-                                "when present.",
-                                code="federation.invalid_request",
-                            )
-                        schema_change_acknowledged = payload.get(
-                            "schemaChangeAcknowledged"
-                        )
-                        if (
-                            schema_change_acknowledged is not None
-                            and schema_change_acknowledged is not True
-                        ):
-                            raise FederationSchemaError(
-                                "schemaChangeAcknowledged must be true "
-                                "when present.",
-                                code="federation.invalid_request",
-                            )
+                        provision_flags = {}
+                        for property_name, parameter in acknowledgements.items():
+                            value = payload.get(property_name)
+                            if value is not None and value is not True:
+                                raise FederationSchemaError(
+                                    f"{property_name} must be true when "
+                                    "present.",
+                                    code="federation.invalid_request",
+                                )
+                            provision_flags[parameter] = value is True
                         result = FEDERATION.provision(
                             alias_name,
                             connection_url,
                             actor,
-                            acknowledge_row_level_security=acknowledged is True,
-                            acknowledge_schema_change=(
-                                schema_change_acknowledged is True
-                            ),
+                            **provision_flags,
                         )
                         CONTROL.audit(
                             "federation_alias.provisioned",
