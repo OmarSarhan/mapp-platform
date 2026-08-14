@@ -3548,6 +3548,19 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertIn("LIMIT %s", str(statement))
         self.assertEqual(("places", 3), values)
 
+    def test_federation_impact_uses_the_derived_owner_catalog(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{"name": "bus_stop_summary"}]
+        store = self.store_with_cursor(cursor)
+
+        self.assertEqual(
+            ["bus_stop_summary"],
+            store.affected_by_source_schema("source_leeds_ext"),
+        )
+        statement, values = cursor.execute.call_args.args
+        self.assertIn("unnest(sources)", str(statement))
+        self.assertEqual(("source_leeds_ext",), values)
+
     def test_profile_blockers_query_only_page_names_and_tombstones(self):
         cursor = MagicMock()
         cursor.fetchall.return_value = []

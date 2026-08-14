@@ -1,29 +1,8 @@
-"""Read-only capability and connectivity detection for a registered alias.
+"""Bounded, read-only capability detection for a registered source alias.
 
-Implements the "genuinely new work" Waypoint 1 (non-invasive external read
-mode) calls for: connectivity, schema-compatibility, and extension-version
-evidence as a first-class, separately reported fact. Builds on the same
-bounded read-only transaction already established in semantic_sources.py
-(`PostgresSemanticSources._begin_read_only`) rather than a second discovery
-path, matching the Discover lifecycle step's own instruction to extend the
-existing bounded metadata read.
-
-Freshness *state* is deliberately not assessed here. Comparing a version
-signal against history is the verifier's job once an alias registry with
-observation history exists (Waypoint 2) — this function only collects the
-raw evidence Discover's bullet list calls for and reports `sourceFreshness`
-as "unknown", the honest answer for a single bounded pass with no baseline
-to compare against.
-
-`detect_capability()` never raises for an expected external-source failure
-(unreachable host, authentication failure, insufficient privilege, timeout)
-— those produce a valid observation with `connectivity: "unavailable"`
-instead. That returned-not-raised failure response is deliberate: whoever
-requested the check always gets a reportable result, never a crash. It does
-raise FederationSchemaError for a caller/configuration mistake (a
-version_relation that isn't on the allowlist, or whose closed contract is
-violated) — that is a distinct failure class from source unavailability and
-must surface to whoever registered it, not be folded into "unavailable".
+Expected source failures become observations; invalid caller input raises a
+FederationSchemaError. Freshness remains unknown because one probe has no
+historical baseline.
 """
 
 from __future__ import annotations
@@ -44,15 +23,6 @@ from relation_identity import IDENTIFIER_PART_RE, parse_relation
 from semantic_sources import PostgresSemanticSources
 
 CONNECT_TIMEOUT_SECONDS = 5
-# The statement timeout for every read-only probe in this file comes from
-# PostgresSemanticSources._begin_read_only's own SET LOCAL statement_timeout
-# (semantic_sources.py) — there used to be a STATEMENT_TIMEOUT_MS constant
-# here too, but nothing ever wired it to that (or any) timeout, so editing
-# it silently had no effect. Removed rather than wired up: this module
-# deliberately reuses the same bounded transaction semantic_sources.py
-# already established (see this file's own module docstring), so its
-# timeout should stay a single source of truth there, not be duplicated
-# here as a second, easily-desynchronized constant.
 
 
 def _now_iso() -> str:
@@ -121,64 +91,14 @@ def extension_versions(cursor: Any) -> dict[str, str]:
 def _verify_allowed_relations(
     cursor: Any, allowed_relations: tuple[str, ...]
 ) -> tuple[bool, bool, str]:
-    """Returns (all_present_and_selectable, row_level_security_detected,
-    schema_fingerprint).
+    """Return selectability, per-user access risk, and schema fingerprint.
 
-    A relation that no longer exists, or that this connection can no
-    longer SELECT, must not be silently skipped — it means the schema
-    Discover verified has changed from what was registered, and the
-    caller must not report it as "current" evidence.
-
-    "row_level_security_detected" also covers a security-barrier view
-    (docs/federation-architecture-waypoint.md: "If any allowlisted
-    relation has RLS or a security-barrier view enabled...") — a view
-    marked security_barrier is commonly how per-user row filtering is
-    implemented without native RLS, and the same "every MAPP caller
-    shares one mapped remote user" bypass risk applies to it.
-
-    "schema_fingerprint" combines each allowed relation's column list
-    (name/full type including modifiers/nullability, in ordinal position)
-    with, for a view, its actual defining query text, and separately its
-    security_invoker reloption — closing gaps physical_identity can't: an
-    ADD COLUMN on an already-allowlisted table, or a CREATE OR REPLACE
-    VIEW that narrows or drops a row-filtering predicate while keeping
-    the same output columns, changes neither the relation's own oid nor
-    its RLS/security-barrier flags, so it would otherwise be invisible to
-    every other check this module runs. The type is captured via
-    format_type(atttypid, atttypmod), not atttypid alone — a bare type
-    oid is unchanged by a type-modifier-only edit (varchar length,
-    numeric precision/scale, or — most importantly on a platform built
-    around spatial data — a PostGIS geometry column's subtype/SRID, both
-    encoded entirely in the typmod), so atttypid alone would let exactly
-    that class of edit through unreviewed. Collation is captured alongside
-    it for the same reason and is equally invisible to format_type(), which
-    renders a text column as plain "text" whether it is COLLATE "C" or
-    COLLATE "POSIX" — yet collation governs comparison and ordering
-    semantics, and the local foreign table keeps whatever collation it was
-    imported with, so an unreviewed change would silently diverge remote and
-    local results. The collation NAME is used rather than attcollation
-    itself: the oid is not stable across a dump/restore of the same source,
-    which would manufacture phantom drift. (pg_collation is LEFT JOINed
-    because attcollation is 0 for non-collatable types.) security_invoker is captured
-    separately from pg_get_viewdef() (which reflects only the query text,
-    not reloptions) because ALTER VIEW ... SET (security_invoker=...)
-    changes neither a view's own query text nor its oid, yet flips
-    whether its underlying relations are evaluated under the connecting
-    role's privileges or the view owner's — a definer-semantics view can
-    surface rows RLS on an underlying table would otherwise have filtered
-    for the connecting role (verified live: pg_get_viewdef() returns
-    byte-identical text across a security_invoker flip; only reloptions
-    changes). Deliberately fingerprinted, not folded into
-    bypasses_per_user_access below: correctly deciding whether a given
-    invoker/definer setting is actually an RLS bypass depends on whatever
-    the view's underlying relations (potentially several, potentially
-    nested through other views) themselves enforce, which this
-    per-relation query has no way to walk generically. Fingerprinting it
-    guarantees a flip is never silently accepted regardless of relkind,
-    without guessing at that separate, harder question. A relation gone
-    missing gets the literal string "missing" here too — its absence must
-    change the fingerprint, not be silently skipped, for the same
-    fail-closed reason as all_present above."""
+    The fingerprint hashes canonical JSON containing each allowed relation's
+    columns and view/RLS policy semantics. Qualified collation names and JSON
+    fields avoid oid instability and delimiter collisions. Missing relations
+    and unsupported kinds fail closed. A view attests itself, not policies of
+    transitive dependencies; source administrators remain trusted for those.
+    """
     all_present = True
     rls_detected = False
     fingerprints = []
@@ -191,45 +111,83 @@ def _verify_allowed_relations(
               OR COALESCE(
                    reloptions && ARRAY['security_barrier=true'], false
                  ) AS bypasses_per_user_access,
-              md5(
-                COALESCE(
-                  (
-                    SELECT string_agg(
-                      a.attname || ':'
-                        || format_type(a.atttypid, a.atttypmod)
-                        || ':' || a.attnotnull::text
-                        || ':' || COALESCE(co.collname, ''),
-                      ',' ORDER BY a.attnum
+              encode(sha256(convert_to(jsonb_build_object(
+                'schema', n.nspname,
+                'relation', c.relname,
+                'relkind', c.relkind,
+                'owner', pg_get_userbyid(c.relowner),
+                'rowSecurity', c.relrowsecurity,
+                'forceRowSecurity', c.relforcerowsecurity,
+                'rowSecurityActive', pg_catalog.row_security_active(c.oid),
+                'currentRoleOwnsRelation', pg_has_role(
+                  current_user, c.relowner, 'USAGE'
+                ),
+                'currentRoleBypassesRls', COALESCE((
+                  SELECT r.rolsuper OR r.rolbypassrls
+                  FROM pg_catalog.pg_roles AS r
+                  WHERE r.rolname = current_user
+                ), false),
+                'securityBarrier', COALESCE(
+                  c.reloptions && ARRAY['security_barrier=true'], false
+                ),
+                'securityInvoker', COALESCE(
+                  c.reloptions && ARRAY['security_invoker=true'], false
+                ),
+                'viewDefinition', CASE WHEN c.relkind IN ('v', 'm')
+                  THEN pg_get_viewdef(c.oid, false)
+                  ELSE NULL
+                END,
+                'columns', COALESCE((
+                  SELECT jsonb_agg(jsonb_build_object(
+                    'position', a.attnum,
+                    'name', a.attname,
+                    'type', format_type(a.atttypid, a.atttypmod),
+                    'notNull', a.attnotnull,
+                    'collation', CASE WHEN co.oid IS NULL THEN NULL
+                      ELSE jsonb_build_array(cn.nspname, co.collname)
+                    END
+                  ) ORDER BY a.attnum)
+                  FROM pg_catalog.pg_attribute AS a
+                  LEFT JOIN pg_catalog.pg_collation AS co
+                    ON co.oid = a.attcollation
+                  LEFT JOIN pg_catalog.pg_namespace AS cn
+                    ON cn.oid = co.collnamespace
+                  WHERE a.attrelid = c.oid
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                ), '[]'::jsonb),
+                'policies', COALESCE((
+                  SELECT jsonb_agg(jsonb_build_object(
+                    'name', p.polname,
+                    'command', p.polcmd,
+                    'permissive', p.polpermissive,
+                    'appliesToCurrentRole', 0 = ANY(p.polroles) OR EXISTS (
+                      SELECT 1
+                      FROM unnest(p.polroles) AS applicable_role(role_oid)
+                      WHERE pg_has_role(current_user, role_oid, 'USAGE')
+                    ),
+                    'roles', to_jsonb(ARRAY(
+                      SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(role_oid)
+                      END
+                      FROM unnest(p.polroles) AS policy_role(role_oid)
+                      ORDER BY CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(role_oid)
+                      END
+                    )),
+                    'using', pg_get_expr(p.polqual, p.polrelid, false),
+                    'withCheck', pg_get_expr(
+                      p.polwithcheck, p.polrelid, false
                     )
-                    FROM pg_catalog.pg_attribute AS a
-                    LEFT JOIN pg_catalog.pg_collation AS co
-                      ON co.oid = a.attcollation
-                    WHERE a.attrelid = c.oid
-                      AND a.attnum > 0
-                      AND NOT a.attisdropped
-                  ),
-                  ''
-                )
-                || '|' ||
-                COALESCE(
-                  CASE WHEN c.relkind = 'v'
-                    THEN pg_get_viewdef(c.oid, true)
-                  END,
-                  ''
-                )
-                || '|' ||
-                COALESCE(
-                  (
-                    SELECT split_part(option, '=', 2)
-                    FROM unnest(c.reloptions) AS option
-                    WHERE option LIKE 'security_invoker=%%'
-                  ),
-                  'false'
-                )
-              ) AS definition_fingerprint
+                  ) ORDER BY p.polname)
+                  FROM pg_catalog.pg_policy AS p
+                  WHERE p.polrelid = c.oid
+                ), '[]'::jsonb)
+              )::text, 'UTF8')), 'hex') AS definition_fingerprint
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
             WHERE n.nspname = %s AND c.relname = %s
+              AND c.relkind IN ('r', 'p', 'v', 'm')
             """,
             (schema, relation),
         )
@@ -245,63 +203,20 @@ def _verify_allowed_relations(
 
 
 def _selectable(cursor: Any, schema: str, relation: str) -> bool:
-    """Actually attempt a bounded, zero-row SELECT rather than trusting
-    has_table_privilege() alone — a PostgreSQL 15+ security_invoker view
-    evaluates privilege on its *underlying* relations using the calling
-    role, so has_table_privilege() on the view itself can be true while
-    selecting it fails in practice (verified live: a reader granted
-    SELECT only on such a view, not its base table, is reported
-    privileged but gets "permission denied" on an actual SELECT).
-
-    A permission failure aborts the surrounding transaction unless
-    contained — this only ever runs inside detect_capability()'s single
-    bounded read-only transaction, which must keep working for whatever
-    allowed_relations entry comes next and for the physical-identity read
-    afterward. SAVEPOINT/ROLLBACK TO SAVEPOINT contains the failure to
-    just this probe, same as a plain ROLLBACK would for the whole
-    transaction; the same savepoint name is safely reused across loop
-    iterations since it never survives past its own rollback."""
+    """Verify SELECT privilege for every column without reading rows."""
     cursor.execute("SAVEPOINT relation_selectable")
     try:
         cursor.execute(
-            sql.SQL("SELECT 1 FROM {}.{} WHERE FALSE").format(
+            sql.SQL("SELECT * FROM {}.{} WHERE FALSE").format(
                 sql.Identifier(schema), sql.Identifier(relation)
             )
         )
-        return True
     except psycopg.Error:
-        return False
-    finally:
         cursor.execute("ROLLBACK TO SAVEPOINT relation_selectable")
-
-
-def _version_relation_scalar(
-    cursor: Any, version_relation: str
-) -> str | int | float | None:
-    schema, relation = _parsed_schema_relation(version_relation)
-    cursor.execute(
-        sql.SQL("SELECT * FROM {}.{}").format(
-            sql.Identifier(schema), sql.Identifier(relation)
-        )
-    )
-    rows = cursor.fetchall()
-    if len(rows) != 1:
-        raise FederationSchemaError(
-            "versionRelation must be a closed contract returning exactly one "
-            f"row (got {len(rows)})."
-        )
-    (row,) = rows
-    if len(row) != 1:
-        raise FederationSchemaError(
-            "versionRelation must be a closed contract returning exactly one "
-            f"bounded scalar column (got {len(row)})."
-        )
-    (value,) = row.values()
-    if value is not None and not isinstance(value, (str, int, float)):
-        raise FederationSchemaError(
-            "versionRelation's scalar value must be text, a number, or null."
-        )
-    return value
+        cursor.execute("RELEASE SAVEPOINT relation_selectable")
+        return False
+    cursor.execute("RELEASE SAVEPOINT relation_selectable")
+    return True
 
 
 def _physical_identity_from_cursor(
@@ -346,7 +261,8 @@ def _physical_identity_from_cursor(
             "SELECT c.oid FROM pg_catalog.pg_class AS c "
             "JOIN pg_catalog.pg_namespace AS n "
             "ON n.oid = c.relnamespace "
-            "WHERE n.nspname = %s AND c.relname = %s",
+            "WHERE n.nspname = %s AND c.relname = %s "
+            "AND c.relkind IN ('r', 'p', 'v', 'm')",
             (schema, relation),
         )
         row = cursor.fetchone()
@@ -359,7 +275,6 @@ def detect_capability(
     *,
     allowed_relations: tuple[str, ...],
     tls_policy: str,
-    version_relation: str | None = None,
 ) -> tuple[dict[str, Any], datetime, str | None]:
     """Bounded, read-only capability and connectivity detection.
 
@@ -368,31 +283,13 @@ def detect_capability(
     the alias's registered requirement — enforced against the connection
     string's actual sslmode before connecting, the same as Provision, so a
     weak connectionRef is never even Observed successfully.
-    `version_relation`, if given, must be one of `allowed_relations` — its
-    single scalar column is read as the observation's `sourceVersion`,
-    implementing the freshnessStrategy "versionRelation" evidence
-    collection Discover calls for. Never reads anything not on the
-    allowlist.
-
     Returns (observation, observed_at, physical_identity) — observation is
     already validated against `federation_schema.validate_observation()`'s
-    closed contract. observed_at marks the moment this probe's REPEATABLE
-    READ snapshot was actually fixed (or, on failure, the moment the
-    connection was given up as failed) — a connection that stalls, or a
-    probe descheduled between connecting and its first query, must not
-    make this probe look "older" than a concurrent one that started later
-    but whose snapshot was established first.
-    FederationAliasStore.record_observation()'s ordering depends on this:
-    it compares observed_at, not call order, to decide which of two
-    overlapping Observe calls actually saw the more current state.
+    closed contract. observed_at is a local audit timestamp captured just
+    before the first catalog query; it is not an ordering authority.
     physical_identity is computed from this same connection's snapshot when
     reachable (None otherwise) — see _physical_identity_from_cursor for why
     it must not be a second, separate connection."""
-    if version_relation is not None and version_relation not in allowed_relations:
-        raise FederationSchemaError(
-            f"version_relation {version_relation!r} must be one of the "
-            "registered allowedRelations."
-        )
     enforce_tls_policy(tls_policy, connection_url)
 
     try:
@@ -402,49 +299,37 @@ def detect_capability(
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
-                PostgresSemanticSources._begin_read_only(cursor)
-                # REPEATABLE READ fixes its snapshot at the first query
-                # that actually reads data, not at BEGIN and not at
-                # connect() — a client-side datetime.now() taken any
-                # earlier, even right after connect() succeeds, leaves a
-                # scheduling gap (this process descheduled before its
-                # first statement reaches the server) that a concurrent,
-                # faster-scheduled Observe could establish a later
-                # snapshot inside of. Asking the server for its own clock
-                # as literally the first query closes that gap: the
-                # returned value marks the same instant the snapshot was
-                # established, not merely "sometime before it."
-                cursor.execute("SELECT clock_timestamp() AS observed_at")
-                observed_at = cursor.fetchone()["observed_at"]
-                versions = extension_versions(cursor)
-                relations_verified, rls_detected, schema_fingerprint = (
-                    _verify_allowed_relations(cursor, allowed_relations)
-                )
-                source_version = (
-                    _version_relation_scalar(cursor, version_relation)
-                    if version_relation is not None
-                    else None
-                )
-                physical_id = _physical_identity_from_cursor(
-                    cursor, allowed_relations
-                )
+                try:
+                    PostgresSemanticSources._begin_read_only(cursor)
+                    observed_at = datetime.now(timezone.utc)
+                    versions = extension_versions(cursor)
+                    relations_verified, rls_detected, schema_fingerprint = (
+                        _verify_allowed_relations(cursor, allowed_relations)
+                    )
+                    physical_id = _physical_identity_from_cursor(
+                        cursor, allowed_relations
+                    )
+                except psycopg.Error:
+                    return validate_observation({
+                        "connectivity": "reachable",
+                        "schema": "unknown",
+                        "sourceFreshness": "unknown",
+                        "lastConnected": _now_iso(),
+                        "lastSchemaVerified": None,
+                        "sourceVersion": None,
+                    }), datetime.now(timezone.utc), None
     except psycopg.Error as exc:
-        # A rejected credential needs MAPP-side secret rotation, not a
-        # wait — the architecture doc requires reporting it distinctly
-        # from an outage (docs/federation-architecture-waypoint.md,
-        # "Drift and retirement"). psycopg surfaces a connection-phase
-        # auth rejection as a bare OperationalError with no SQLSTATE or
-        # diagnostics (unlike a query-time error), so the server's FATAL
-        # message text is the only signal available. Postgres
-        # deliberately uses this same message for both a wrong password
-        # and a nonexistent role, to avoid confirming which usernames
-        # exist — either way, the remote credential needs attention.
+        sqlstate = getattr(exc, "sqlstate", None)
+        message = str(exc).lower()
+        unauthorized = (
+            isinstance(sqlstate, str) and sqlstate.startswith("28")
+        ) or any(marker in message for marker in (
+            "authentication failed",
+            "no pg_hba.conf entry",
+            "no password supplied",
+        ))
         return validate_observation({
-            "connectivity": (
-                "unauthorized"
-                if "password authentication failed" in str(exc)
-                else "unavailable"
-            ),
+            "connectivity": "unauthorized" if unauthorized else "unavailable",
             "schema": "unknown",
             "sourceFreshness": "unknown",
             "lastConnected": None,
@@ -458,7 +343,7 @@ def detect_capability(
         "sourceFreshness": "unknown",
         "lastConnected": _now_iso(),
         "lastSchemaVerified": _now_iso(),
-        "sourceVersion": source_version,
+        "sourceVersion": None,
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
         "schemaFingerprint": schema_fingerprint,
@@ -468,37 +353,12 @@ def detect_capability(
 def verify_remote_state(
     connection_url: str, allowed_relations: tuple[str, ...]
 ) -> tuple[str, dict[str, str], bool, bool, str]:
-    """Provision's own standalone, live re-check of the remote's physical
-    identity, current extension versions, relation existence/selectability,
-    RLS/security-barrier exposure, and column/view-definition fingerprint —
-    deliberately a fresh connection, not shared with any prior Observe,
-    since the whole point is to catch drift that happened *since* Observe's
-    snapshot (docs/federation-architecture-waypoint.md, "Drift and
-    retirement": "Different physical database | Raise identity conflict;
-    require explicit rebind"). A connectionRef's host/port/dbname/user can
-    stay byte-for-byte identical while pointing at a genuinely different
-    physical database — nothing about the connection string itself would
-    ever reveal a same-name replacement.
+    """Read all live provisioning evidence in one repeatable-read snapshot.
 
-    Returns (physical_identity, extension_versions, relations_verified,
-    row_level_security_detected, schema_fingerprint) — all five collected
-    from this one connection's snapshot for the same reason
-    `_physical_identity_from_cursor` gives for not being a second connection
-    off of Observe's: an in-place extension upgrade, a newly-enabled RLS
-    policy, an added column, or a redefined view all change no OID at all,
-    so identity alone can't catch any of them, and a decision (pushdown
-    safety, the row_level_security_acknowledged gate, or schema currency)
-    made against evidence read from a *separate* live connection could
-    itself be stale by the time another one of these checks runs — the same
-    class of TOCTOU gap as pairing Observe's schema evidence with a second
-    connection's physical identity. Provision must not trust
-    last_observation's stored rowLevelSecurityDetected/schemaFingerprint any
-    more than it trusts a stored physical identity or extension-version set.
-
-    Raises psycopg.Error on a connection failure — callers already
-    reachability-gate this (Observe via detect_capability, Provision via
-    its own preceding checks), so a failure here is never the first
-    sign of an unreachable source."""
+    Returns physical identity, extension versions, relation selectability,
+    access-control detection, and schema fingerprint. Connection/query
+    failures are left to the provisioning caller as psycopg errors.
+    """
     with psycopg.connect(
         connection_url,
         connect_timeout=CONNECT_TIMEOUT_SECONDS,

@@ -2929,6 +2929,20 @@ class DerivedLayerStore:
                 for item in cur.fetchall()
             ]
 
+    def affected_by_source_schema(self, source_schema: str) -> list[str]:
+        """Return managed layers that declare a source in one schema."""
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("""
+                SELECT name
+                FROM {}._definitions
+                WHERE EXISTS (
+                  SELECT 1 FROM unnest(sources) AS source
+                  WHERE split_part(source, '.', 1) = %s
+                )
+                ORDER BY name
+            """).format(sql.Identifier(SCHEMA)), (source_schema,))
+            return [row["name"] for row in cur.fetchall()]
+
     def list_page(
         self,
         *,

@@ -364,6 +364,12 @@ before Approve exposure can proceed. This is a recorded warning, not a
 block: the platform surfaces the loss rather than silently inheriting it, but
 does not refuse to federate a relation that has RLS.
 
+The same shared identity applies to application-level recipient, tenant, and
+encryption-key filtering, which PostgreSQL catalog inspection cannot detect.
+User-private or end-to-end-encrypted message/key relations are therefore not a
+supported federation source. A source administrator must expose a dedicated
+relation whose rows are safe for every MAPP caller sharing the mapped role.
+
 **Decided (platform scope):** the design assumes self-managed PostgreSQL as
 the baseline for physical-identity evidence and system-catalog access. Managed
 services (RDS/Aurora, Azure Database for PostgreSQL, Cloud SQL) restrict
@@ -1602,13 +1608,13 @@ the platform side of the contract must land first:
 
 | Contract surface | Current state | Federation requirement |
 | --- | --- | --- |
-| `apiVersion` / `contractVersion` | `1.4` | A minor bump for additive federation commands; a major bump if relation identity changes shape |
+| `apiVersion` / `contractVersion` | `1.5` | A minor bump for additive federation actions; a major bump if relation identity changes shape |
 | `rulesVersion` | `1.6` | Bumps if workspace relation or `dbs` validation changes |
-| `contracts/api-compatibility-v1.4.json` | Declares consumers and pagination endpoints | A new versioned artifact; alias and observation collections are growing collections and need pagination entries |
-| `GET /api/contract` | Runtime authority for command names | Must advertise new federation command names |
+| `contracts/api-compatibility-v1.5.json` | Declares consumers and pagination endpoints | Alias registration is currently capped at 100, so its list remains one bounded response; add pagination before lifting that cap or exposing observation history |
+| `GET /api/contract` | Runtime authority; no federation CLI commands are currently advertised | Add command names only in the same release that implements them in the independently shipped CLI |
 | `GET /api/capabilities` | Runtime authority for action IDs, risk classes, conditional scopes | Must advertise federation actions, their risk class, and their exact scope combinations |
 | Scope model | `derive`, `semantic:*`, etc., explicitly non-hierarchical | New `federation:register` / `federation:provision` / `federation:observe` scopes, plus a separately-granted **reclaim** action for re-registering a retired alias's name; reachable from the dashboard session or from a CLI credential holding them, peer to each other, not reachable from any other existing scope. `federation:provision` also gates Discover and the verify-not-read endpoint, not just Approve exposure |
-| Pagination | Contract `1`, 100-item pages, opaque cursors | Alias lists, relation lists, and observation history all need cursors; note that the semantic cursor scope already binds a digest of alias configuration at `config-ui/semantic_sources.py:339`, so adding aliases invalidates cursors by design |
+| Pagination | Contract `1`, 100-item pages, opaque cursors | Relation lists and any future observation-history endpoint need cursors. The alias list stays bounded by the 100-alias registry ceiling; add a cursor before that ceiling is lifted |
 | Topology view | No equivalent today | New read-only `federation status` command gated by `federation:observe`, backed by the same observation endpoint the dashboard's topology view renders — must never diverge from the dashboard's answer to "is everything alive" |
 
 The CLI must fail closed against an older or newer server, which the existing

@@ -48,13 +48,9 @@ class ScriptedFakeConnection:
         return self._cursor
 
 
-# The mocked reply to detect_capability's first query inside the
-# transaction (SELECT clock_timestamp()) — the moment its REPEATABLE READ
-# snapshot is actually fixed, per federation_capability.detect_capability's
-# docstring.
-CLOCK_TIMESTAMP_RESULT = {
-    "observed_at": datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
-}
+TLS_URL = (
+    "postgresql://reader:secret@host/source?sslmode=require&gssencmode=disable"
+)
 
 
 def extension_version_results(*, postgis=True):
@@ -98,8 +94,7 @@ def physical_identity_results(relation_oids=(24601,)):
 class DetectCapabilityTests(unittest.TestCase):
     def test_reports_reachable_with_full_extension_versions(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results()
+            extension_and_rls_results()
             + physical_identity_results()
         )
         with patch(
@@ -107,17 +102,13 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ) as mock_connect:
             observation, observed_at, physical_id = detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
 
-        # The server's own clock, queried as the first statement inside
-        # the transaction — the exact moment the REPEATABLE READ snapshot
-        # is fixed, not a client-side timestamp taken any earlier (which
-        # would leave a scheduling gap between connecting and this query
-        # actually reaching the server).
-        self.assertEqual(CLOCK_TIMESTAMP_RESULT["observed_at"], observed_at)
+        self.assertIsInstance(observed_at, datetime)
+        self.assertIsNotNone(observed_at.tzinfo)
         self.assertEqual("reachable", observation["connectivity"])
         self.assertEqual("current", observation["schema"])
         self.assertEqual("unknown", observation["sourceFreshness"])
@@ -134,12 +125,6 @@ class DetectCapabilityTests(unittest.TestCase):
         )
         self.assertFalse(observation["rowLevelSecurityDetected"])
         self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
-        # format_type(atttypid, atttypmod), not atttypid alone — a bare
-        # type oid is unchanged by a type-modifier-only edit (e.g. a
-        # PostGIS geometry column's subtype/SRID), so the fingerprint
-        # would silently miss exactly that class of drift without it.
-        executed_sql = "\n".join(query for query, _ in cursor.executed)
-        self.assertIn("format_type(a.atttypid, a.atttypmod)", executed_sql)
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNotNone(observation["lastSchemaVerified"])
         # The physical identity must come from this same probe's snapshot,
@@ -152,8 +137,7 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_reports_no_postgis_without_probing_proj_or_geos(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(postgis=False)
+            extension_and_rls_results(postgis=False)
             + physical_identity_results()
         )
         with patch(
@@ -161,7 +145,7 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
@@ -176,7 +160,6 @@ class DetectCapabilityTests(unittest.TestCase):
         # SELECT) must not be silently skipped — the schema Discover
         # verified no longer matches what was registered.
         cursor = ScriptedFakeCursor([
-            CLOCK_TIMESTAMP_RESULT,
             {"version": "16.2"},
             {"extversion": "3.4.2"},
             {"version": "3.4.2"},
@@ -189,7 +172,7 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation, _, physical_id = detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
@@ -207,8 +190,7 @@ class DetectCapabilityTests(unittest.TestCase):
 
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(rls=True)
+            extension_and_rls_results(rls=True)
             + physical_identity_results()
         )
         with patch(
@@ -216,49 +198,16 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
 
         self.assertTrue(observation["rowLevelSecurityDetected"])
 
-    def test_detects_a_security_barrier_view_without_native_rls(self):
-        # docs/federation-architecture-waypoint.md: the same per-user
-        # bypass risk applies to a security-barrier view (a common way to
-        # implement per-user row filtering without native RLS) as to
-        # relrowsecurity — the query combines both signals.
+    def test_fingerprint_covers_schema_and_access_control(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(rls=True)
-            + physical_identity_results()
-        )
-        with patch(
-            "federation_capability.psycopg.connect",
-            return_value=ScriptedFakeConnection(cursor),
-        ):
-            observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
-                allowed_relations=("leeds.tenant_scoped_view",),
-                tls_policy="require",
-            )
-
-        self.assertTrue(observation["rowLevelSecurityDetected"])
-        executed_sql = "\n".join(query for query, _ in cursor.executed)
-        self.assertIn("security_barrier", executed_sql)
-
-    def test_fingerprint_query_captures_the_security_invoker_reloption(self):
-        # round 26 finding: ALTER VIEW ... SET (security_invoker=...)
-        # changes neither a view's query text (pg_get_viewdef() returns
-        # byte-identical text across the flip, verified live) nor its
-        # oid, yet flips whether its underlying relations are evaluated
-        # under the connecting role or the view owner — a definer-
-        # semantics view can surface rows RLS on an underlying table
-        # would otherwise have filtered. Must be part of the fingerprint
-        # so a flip is never silently accepted.
-        cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results()
+            extension_and_rls_results()
             + physical_identity_results()
         )
         with patch(
@@ -266,35 +215,41 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.tenant_scoped_view",),
                 tls_policy="require",
             )
 
         executed_sql = "\n".join(query for query, _ in cursor.executed)
-        self.assertIn("security_invoker", executed_sql)
-        # Collation is equally invisible to format_type() — a text column
-        # reads as plain "text" whether it is COLLATE "C" or COLLATE "POSIX"
-        # — yet it governs comparison/ordering semantics, and the local
-        # foreign table keeps whatever collation it was imported with. The
-        # collation NAME is used, not attcollation: the oid is not stable
-        # across a dump/restore and would manufacture phantom drift.
-        self.assertIn("pg_catalog.pg_collation", executed_sql)
-        self.assertIn("co.collname", executed_sql)
-        self.assertNotIn("a.attcollation::", executed_sql)
-        # This query is called with bound (schema, relation) parameters
-        # (%s placeholders), so a literal % anywhere else in the same
-        # string must be escaped as %% or psycopg's placeholder scanner
-        # raises ProgrammingError before the query ever reaches Postgres
-        # — caught live against the real rig, not by any mock, since
-        # ScriptedFakeCursor never performs real placeholder substitution.
-        self.assertIn("security_invoker=%%", executed_sql)
-        self.assertNotIn("security_invoker=%'", executed_sql)
+        for fragment in (
+            "jsonb_build_object",
+            "sha256(convert_to",
+            "format_type(a.atttypid, a.atttypmod)",
+            "jsonb_build_array(cn.nspname, co.collname)",
+            "c.relkind",
+            "pg_get_userbyid(c.relowner)",
+            "c.relrowsecurity",
+            "c.relforcerowsecurity",
+            "pg_catalog.row_security_active(c.oid)",
+            "r.rolsuper OR r.rolbypassrls",
+            "currentRoleOwnsRelation",
+            "appliesToCurrentRole",
+            "security_barrier=true",
+            "security_invoker=true",
+            "pg_catalog.pg_policy",
+            "p.polcmd",
+            "p.polpermissive",
+            "p.polroles",
+            "pg_get_expr(p.polqual",
+            "p.polwithcheck",
+            "c.relkind IN ('r', 'p', 'v', 'm')",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, executed_sql)
 
     def test_combines_multiple_relations_into_one_ordered_fingerprint(self):
         cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(fingerprints=("fp-a", "fp-b"))
+            extension_and_rls_results(fingerprints=("fp-a", "fp-b"))
             + physical_identity_results(relation_oids=(24601, 24602)),
         )
         with patch(
@@ -302,7 +257,7 @@ class DetectCapabilityTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops", "leeds.roads"),
                 tls_policy="require",
             )
@@ -317,7 +272,8 @@ class DetectCapabilityTests(unittest.TestCase):
             side_effect=psycopg.OperationalError("could not connect"),
         ):
             observation, observed_at, physical_id = detect_capability(
-                "postgresql://unreachable?sslmode=require",
+                "postgresql://reader:secret@unreachable/source?"
+                "sslmode=require&gssencmode=disable",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
@@ -340,38 +296,45 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertIsInstance(observed_at, datetime)
         self.assertIsNone(physical_id)
 
-    def test_authentication_failure_is_reported_distinctly_from_an_outage(self):
-        # A rejected credential needs MAPP-side secret rotation, not a
-        # wait, and must never be conflated with "unreachable" (docs/
-        # federation-architecture-waypoint.md, "Drift and retirement").
-        # Postgres uses the exact same FATAL message for a wrong password
-        # and for a nonexistent role, to avoid confirming which usernames
-        # exist — both cases are "unauthorized" here.
+    def test_query_failure_preserves_successful_connectivity(self):
+        cursor = ScriptedFakeCursor([])
         with patch(
             "federation_capability.psycopg.connect",
-            side_effect=psycopg.OperationalError(
-                'connection failed: connection to server at "10.0.0.5", '
-                'port 5432 failed: FATAL:  password authentication failed '
-                'for user "reader"'
-            ),
+            return_value=ScriptedFakeConnection(cursor),
+        ), patch(
+            "federation_capability.extension_versions",
+            side_effect=psycopg.errors.InsufficientPrivilege("denied"),
         ):
-            observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
+            observation, _, physical_id = detect_capability(
+                TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
             )
 
-        self.assertEqual(
-            {
-                "connectivity": "unauthorized",
-                "schema": "unknown",
-                "sourceFreshness": "unknown",
-                "lastConnected": None,
-                "lastSchemaVerified": None,
-                "sourceVersion": None,
-            },
-            observation,
+        self.assertEqual("reachable", observation["connectivity"])
+        self.assertEqual("unknown", observation["schema"])
+        self.assertIsNotNone(observation["lastConnected"])
+        self.assertIsNone(observation["lastSchemaVerified"])
+        self.assertIsNone(physical_id)
+
+    def test_authentication_failures_are_reported_distinctly_from_outages(self):
+        failures = (
+            psycopg.errors.InvalidAuthorizationSpecification(
+                "certificate authentication rejected"
+            ),
+            psycopg.OperationalError("PAM authentication failed"),
+            psycopg.OperationalError("no pg_hba.conf entry for host"),
         )
+        for failure in failures:
+            with self.subTest(failure=failure), patch(
+                "federation_capability.psycopg.connect", side_effect=failure
+            ):
+                observation, _, _ = detect_capability(
+                    TLS_URL,
+                    allowed_relations=("leeds.bus_stops",),
+                    tls_policy="require",
+                )
+            self.assertEqual("unauthorized", observation["connectivity"])
 
     def test_rejects_a_connection_weaker_than_the_registered_tls_policy(self):
         # Enforced before ever connecting — a weak connectionRef must not
@@ -379,82 +342,12 @@ class DetectCapabilityTests(unittest.TestCase):
         with patch("federation_capability.psycopg.connect") as mock_connect:
             with self.assertRaises(FederationSchemaError):
                 detect_capability(
-                    "postgresql://reader?sslmode=disable",
+                    "postgresql://reader:secret@host/source?"
+                    "sslmode=disable&gssencmode=disable",
                     allowed_relations=("leeds.bus_stops",),
                     tls_policy="verify-full",
                 )
         mock_connect.assert_not_called()
-
-    def test_reads_a_configured_version_relation_scalar(self):
-        cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(fingerprints=("fp-a", "fp-b"))
-            + physical_identity_results(relation_oids=(24601, 24602)),
-            fetchall_results=[[{"release_id": "release-42"}]],
-        )
-        with patch(
-            "federation_capability.psycopg.connect",
-            return_value=ScriptedFakeConnection(cursor),
-        ):
-            observation, _, _ = detect_capability(
-                "postgresql://reader?sslmode=require",
-                allowed_relations=("leeds.bus_stops", "leeds.dataset_publication"),
-                tls_policy="require",
-                version_relation="leeds.dataset_publication",
-            )
-
-        self.assertEqual("release-42", observation["sourceVersion"])
-
-    def test_rejects_a_version_relation_not_on_the_allowlist(self):
-        with self.assertRaises(FederationSchemaError):
-            detect_capability(
-                "postgresql://reader?sslmode=require",
-                allowed_relations=("leeds.bus_stops",),
-                tls_policy="require",
-                version_relation="leeds.dataset_publication",
-            )
-
-    def test_rejects_a_version_relation_returning_more_than_one_row(self):
-        cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(fingerprints=("fp-a", "fp-b")),
-            fetchall_results=[[{"release_id": "a"}, {"release_id": "b"}]],
-        )
-        with patch(
-            "federation_capability.psycopg.connect",
-            return_value=ScriptedFakeConnection(cursor),
-        ):
-            with self.assertRaises(FederationSchemaError):
-                detect_capability(
-                    "postgresql://reader?sslmode=require",
-                    allowed_relations=(
-                        "leeds.bus_stops",
-                        "leeds.dataset_publication",
-                    ),
-                    tls_policy="require",
-                    version_relation="leeds.dataset_publication",
-                )
-
-    def test_rejects_a_version_relation_returning_more_than_one_column(self):
-        cursor = ScriptedFakeCursor(
-            [CLOCK_TIMESTAMP_RESULT]
-            + extension_and_rls_results(fingerprints=("fp-a", "fp-b")),
-            fetchall_results=[[{"release_id": "a", "schema_version": 1}]],
-        )
-        with patch(
-            "federation_capability.psycopg.connect",
-            return_value=ScriptedFakeConnection(cursor),
-        ):
-            with self.assertRaises(FederationSchemaError):
-                detect_capability(
-                    "postgresql://reader?sslmode=require",
-                    allowed_relations=(
-                        "leeds.bus_stops",
-                        "leeds.dataset_publication",
-                    ),
-                    tls_policy="require",
-                    version_relation="leeds.dataset_publication",
-                )
 
 
 class VerifyRemoteStateTests(unittest.TestCase):
@@ -592,7 +485,7 @@ class VerifyRemoteStateTests(unittest.TestCase):
         self.assertFalse(relations_verified)
         self.assertEqual("missing", schema_fingerprint)
 
-    def test_reports_relations_not_verified_when_a_present_relation_is_unselectable(self):
+    def test_reports_relations_not_verified_when_present_but_unselectable(self):
         # The relation exists in pg_class (a real row is returned, unlike
         # the "missing" case above) but _selectable()'s actual SELECT
         # fails — e.g. a security_invoker view whose underlying relation
@@ -645,12 +538,6 @@ class VerifyRemoteStateTests(unittest.TestCase):
 
 
 class SelectableTests(unittest.TestCase):
-    # has_table_privilege() alone is fooled by a PostgreSQL 15+
-    # security_invoker view whose underlying relation the connecting role
-    # can't read (verified live against the real FDW rig) — _selectable()
-    # must attempt a real SELECT instead, and must never leave the
-    # surrounding transaction aborted when that SELECT fails.
-
     def test_returns_true_when_the_select_succeeds(self):
         cursor = MagicMock()
         self.assertTrue(
@@ -658,14 +545,14 @@ class SelectableTests(unittest.TestCase):
         )
         statements = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertEqual("SAVEPOINT relation_selectable", statements[0])
-        self.assertIn("SELECT 1 FROM", str(statements[1]))
-        self.assertEqual("ROLLBACK TO SAVEPOINT relation_selectable", statements[-1])
+        self.assertIn("SELECT * FROM", str(statements[1]))
+        self.assertEqual("RELEASE SAVEPOINT relation_selectable", statements[-1])
 
     def test_returns_false_and_still_rolls_back_when_the_select_is_denied(self):
         cursor = MagicMock()
 
         def execute(statement, *args, **kwargs):
-            if "SELECT 1 FROM" in str(statement):
+            if "SELECT * FROM" in str(statement):
                 raise psycopg.errors.InsufficientPrivilege(
                     "permission denied for table bus_stops"
                 )
@@ -677,7 +564,10 @@ class SelectableTests(unittest.TestCase):
         )
         statements = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertEqual("SAVEPOINT relation_selectable", statements[0])
-        self.assertEqual("ROLLBACK TO SAVEPOINT relation_selectable", statements[-1])
+        self.assertEqual(
+            "ROLLBACK TO SAVEPOINT relation_selectable", statements[-2]
+        )
+        self.assertEqual("RELEASE SAVEPOINT relation_selectable", statements[-1])
 
 
 if __name__ == "__main__":

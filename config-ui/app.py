@@ -45,7 +45,7 @@ from derived_layers import (
     validate_spatial_scope,
 )
 from federation_schema import FederationSchemaError
-from federation_store import FederationAliasStore
+from federation_store import MAX_ALIASES, FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
@@ -225,25 +225,21 @@ DERIVED = (
     if os.environ.get("DERIVED_DATABASE_URL")
     else None
 )
-def federation_enabled(derived_database_url, database_mode) -> bool:
-    """Federation provisions a `federation` schema, postgres_fdw, and a
-    database-level CREATE grant (config-ui/federation_store.py) that only
-    bundled mode's upgrade-derived actually sets up — the external handoff
-    (docs/external-postgresql.md) grants ownership of derived_layers alone.
-    An external deployment that set DERIVED_DATABASE_URL would otherwise see
-    every federation route enabled but fail confusingly on first use, rather
-    than the clean "not configured" response every other missing-
-    prerequisite case already returns."""
-    return bool(derived_database_url) and database_mode == "bundled"
+
+
+def federation_enabled(federation_database_url, database_mode) -> bool:
+    """Enable only where the dedicated bundled provisioner is installed."""
+    return bool(federation_database_url) and database_mode == "bundled"
 
 
 FEDERATION = (
     FederationAliasStore(
-        os.environ["DERIVED_DATABASE_URL"],
+        os.environ["FEDERATION_DATABASE_URL"],
         os.environ["DERIVED_READER_ROLE"],
+        os.environ["DERIVED_OWNER_ROLE"],
     )
     if federation_enabled(
-        os.environ.get("DERIVED_DATABASE_URL"),
+        os.environ.get("FEDERATION_DATABASE_URL"),
         os.environ.get("MAPP_DATABASE_MODE"),
     )
     else None
@@ -6038,9 +6034,18 @@ class Handler(SimpleHTTPRequestHandler):
                         "Federation alias registry is not configured.",
                         code="federation.not_configured",
                     )
-                self._json(HTTPStatus.OK, {"aliases": FEDERATION.list()})
+                aliases = FEDERATION.list()
+                if len(aliases) > MAX_ALIASES:
+                    raise FederationSchemaError(
+                        "Federation alias registry exceeds its supported "
+                        f"limit of {MAX_ALIASES} aliases.",
+                        status=HTTPStatus.CONFLICT,
+                        code="federation.alias_limit_exceeded",
+                    )
+                self._json(HTTPStatus.OK, {"aliases": aliases})
             except FederationSchemaError as exc:
-                # Must come before except psycopg.Error below — e.g. an
+                # FederationSchemaError subclasses ValueError, so this must
+                # precede both pagination ValueError and psycopg.Error — e.g. an
                 # intentionally-disabled deployment (FEDERATION is None
                 # outside bundled mode) raises federation.not_configured
                 # here, a permanent configuration fact, not a transient
@@ -6068,7 +6073,11 @@ class Handler(SimpleHTTPRequestHandler):
                 if "/" in name:
                     raise FileNotFoundError(name)
                 alias = FEDERATION.get(name)
-                affected = FEDERATION.affected_derived_layer_names(name)
+                affected = (
+                    DERIVED.affected_by_source_schema(f"source_{name}")
+                    if DERIVED
+                    else []
+                )
                 alias["affectedDerivedLayers"] = [
                     {
                         "name": derived_name,
@@ -7522,6 +7531,7 @@ class Handler(SimpleHTTPRequestHandler):
                             remote=self._remote(),
                             details={
                                 "alias": alias_name,
+                                "observationId": result["lastObservationId"],
                                 "connectivity": (
                                     result["lastObservation"]["connectivity"]
                                 ),
@@ -7544,11 +7554,28 @@ class Handler(SimpleHTTPRequestHandler):
                                 "acknowledge_physical_rebind"
                             ),
                         }
-                        unexpected = sorted(set(payload) - set(acknowledgements))
+                        unexpected = sorted(
+                            set(payload)
+                            - set(acknowledgements)
+                            - {"expectedObservationId"}
+                        )
                         if unexpected:
                             raise FederationSchemaError(
                                 "Unknown provision properties: "
                                 + ", ".join(unexpected),
+                                code="federation.invalid_request",
+                            )
+                        expected_observation_id = payload.get(
+                            "expectedObservationId"
+                        )
+                        if (
+                            isinstance(expected_observation_id, bool)
+                            or not isinstance(expected_observation_id, int)
+                            or expected_observation_id < 1
+                            or expected_observation_id > 9223372036854775807
+                        ):
+                            raise FederationSchemaError(
+                                "expectedObservationId must be a positive integer.",
                                 code="federation.invalid_request",
                             )
                         provision_flags = {}
@@ -7565,13 +7592,22 @@ class Handler(SimpleHTTPRequestHandler):
                             alias_name,
                             connection_url,
                             actor,
+                            expected_observation_id=expected_observation_id,
                             **provision_flags,
                         )
                         CONTROL.audit(
                             "federation_alias.provisioned",
                             actor=actor,
                             remote=self._remote(),
-                            details={"alias": alias_name},
+                            details={
+                                "alias": alias_name,
+                                "observationId": expected_observation_id,
+                                **{
+                                    property_name: True
+                                    for property_name in acknowledgements
+                                    if payload.get(property_name) is True
+                                },
+                            },
                         )
                 except psycopg.Error as exc:
                     self._json(

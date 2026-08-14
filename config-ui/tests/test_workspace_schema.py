@@ -36,24 +36,21 @@ class WorkspaceValidationTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["path"], "dbs")
 
-    def test_rejects_a_dbs_key_over_56_characters(self):
-        # Max length 56, not PostgreSQL's usual 63: this grammar is shared
-        # with federation_schema.py's ALIAS_RE, which becomes the schema
-        # name source_<alias> (see that file for why "source_" costs 7
-        # bytes of the 63-byte identifier budget).
+    def test_rejects_a_dbs_key_over_63_characters(self):
         data = valid_workspace()
-        data["dbs"] = "a" * 57
+        data["dbs"] = "a" * 64
 
-        errors = validate_workspace(data, {"a" * 57, "MAPP"})
+        errors = validate_workspace(data, {"a" * 64, "MAPP"})
 
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["path"], "dbs")
 
-    def test_accepts_a_dbs_key_at_exactly_56_characters(self):
+    def test_accepts_existing_workspace_alias_shapes(self):
         data = valid_workspace()
-        data["dbs"] = "a" * 56
+        data["dbs"] = "council-prod_" + "a" * 50
+        data["locale"]["layers"]["Places"]["dbs"] = data["dbs"]
 
-        errors = validate_workspace(data, {"a" * 56, "MAPP"})
+        errors = validate_workspace(data, {data["dbs"]})
 
         self.assertEqual(errors, [])
 

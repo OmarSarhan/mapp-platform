@@ -45,6 +45,14 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_contract_does_not_claim_unimplemented_federation_cli_commands(self):
+        self.assertFalse(
+            any(
+                command.startswith("federation ")
+                for command in contract("instance")["commands"]
+            )
+        )
+
     def test_contract_advertises_every_stable_cli_exit_code(self):
         self.assertEqual(
             {
@@ -84,8 +92,8 @@ class ControlApiTests(unittest.TestCase):
         payload = capabilities("instance")
         actions = {item["id"]: item for item in payload["actions"]}
         self.assertEqual("instance", payload["instanceId"])
-        self.assertEqual("1.4", payload["apiVersion"])
-        self.assertEqual("1.4", payload["contractVersion"])
+        self.assertEqual("1.5", payload["apiVersion"])
+        self.assertEqual("1.5", payload["contractVersion"])
         self.assertEqual(
             ["revision", "operations"],
             actions["proposals.check"]["inputSchema"]["required"],
@@ -98,6 +106,29 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(
             "proposal.screenshot",
             actions["proposals.screenshot"]["operationKind"],
+        )
+        self.assertNotIn("querySchema", actions["federation.aliases.list"])
+        allowed_relations = actions["federation.aliases.register"][
+            "inputSchema"
+        ]["properties"]["allowedRelations"]
+        self.assertEqual(100, allowed_relations["maxItems"])
+        self.assertEqual(127, allowed_relations["items"]["maxLength"])
+        self.assertEqual(
+            "^[A-Za-z_][A-Za-z0-9_]{0,62}\\."
+            "[A-Za-z_][A-Za-z0-9_]{0,62}$",
+            allowed_relations["items"]["pattern"],
+        )
+        provision_schema = actions["federation.aliases.provision"][
+            "inputSchema"
+        ]
+        self.assertEqual(["expectedObservationId"], provision_schema["required"])
+        self.assertEqual(
+            {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9223372036854775807,
+            },
+            provision_schema["properties"]["expectedObservationId"],
         )
         screenshot_properties = actions["proposals.screenshot"]["inputSchema"][
             "properties"

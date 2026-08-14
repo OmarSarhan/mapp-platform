@@ -31,8 +31,8 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
     sql = None
 
 
-API_VERSION = "1.4"
-CONTRACT_VERSION = "1.4"
+API_VERSION = "1.5"
+CONTRACT_VERSION = "1.5"
 RULES_VERSION = "1.6"
 FIXED_FILTER_NUMBER_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
@@ -1582,11 +1582,14 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "allowedRelations": {
                     "type": "array",
                     "minItems": 1,
+                    "maxItems": 100,
                     "uniqueItems": True,
                     "items": {
                         "type": "string",
+                        "maxLength": 127,
                         "pattern": (
-                            "^[A-Za-z_][A-Za-z0-9_]*\\.[A-Za-z_][A-Za-z0-9_]*$"
+                            "^[A-Za-z_][A-Za-z0-9_]{0,62}\\."
+                            "[A-Za-z_][A-Za-z0-9_]{0,62}$"
                         ),
                     },
                 },
@@ -1624,7 +1627,13 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "scope": "federation:provision",
         "inputSchema": {
             "type": "object",
+            "required": ["expectedObservationId"],
             "properties": {
+                "expectedObservationId": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854775807,
+                },
                 "rowLevelSecurityAcknowledged": {"const": True},
                 "schemaChangeAcknowledged": {"const": True},
                 "physicalRebindAcknowledged": {"const": True},
@@ -1686,9 +1695,6 @@ def contract(instance_id: str) -> dict[str, Any]:
             "semantic proposals check", "semantic proposals create",
             "semantic proposals list", "semantic proposals show",
             "semantic proposals apply", "semantic proposals decline",
-            "federation aliases list", "federation aliases show",
-            "federation aliases register", "federation aliases observe",
-            "federation aliases provision",
             "validate", "set", "unset", "amend", "sql capabilities", "sql test",
             "visual-plan", "visual-test", "screenshot",
             "proposals preview-plan", "proposals preview-test",
@@ -1740,7 +1746,7 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "maxItems": MAX_PAGE_LIMIT,
                 "firstPageOnly": True,
             },
-            "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.5.json",
         },
     }
 

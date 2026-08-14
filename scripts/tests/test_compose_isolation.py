@@ -143,6 +143,38 @@ class ComposeIsolationTests(unittest.TestCase):
                     self.assertNotIn("GEMINI_APIKEY", environment, name)
                     self.assertNotIn("GEMINI_MODEL", environment, name)
 
+    def test_federation_provisioner_credential_is_isolated(self) -> None:
+        for mode in ("external", "external-production"):
+            with self.subTest(mode=mode):
+                environment = self.models[mode]["services"]["config-ui"].get(
+                    "environment", {}
+                )
+                self.assertNotIn("FEDERATION_DATABASE_URL", environment)
+                self.assertNotIn("FEDERATION_DB_USER", environment)
+
+        for mode in ("bundled", "bundled-production"):
+            with self.subTest(mode=mode):
+                services = self.models[mode]["services"]
+                config_environment = services["config-ui"]["environment"]
+                database_environment = services["db"]["environment"]
+                self.assertEqual(
+                    "mapp_federation",
+                    config_environment["FEDERATION_DB_USER"],
+                )
+                self.assertIn(
+                    "mapp_federation",
+                    config_environment["FEDERATION_DATABASE_URL"],
+                )
+                self.assertIn(
+                    "FEDERATION_DB_PASSWORD", database_environment
+                )
+                for name, service in services.items():
+                    if name in {"config-ui", "db"}:
+                        continue
+                    environment = service.get("environment", {})
+                    self.assertNotIn("FEDERATION_DATABASE_URL", environment)
+                    self.assertNotIn("FEDERATION_DB_PASSWORD", environment)
+
     def test_browser_egress_is_only_available_through_allowlisting_proxy(self) -> None:
         expected_allowlist = str(
             (ROOT / "instance/browser-egress-allowlist.txt").resolve()

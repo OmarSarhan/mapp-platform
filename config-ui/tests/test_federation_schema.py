@@ -1,4 +1,5 @@
 import unittest
+from math import inf, nan
 
 from federation_schema import (
     FederationSchemaError,
@@ -156,7 +157,7 @@ class ValidateRegistrationTests(unittest.TestCase):
             validate_registration(valid_registration(connectionRef="x" * 201))
 
     def test_rejects_an_invalid_tls_policy(self):
-        for invalid in ("disable", "allow", "prefer", ""):
+        for invalid in ("disable", "allow", "prefer", "", [], {}):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(FederationSchemaError):
                     validate_registration(valid_registration(tlsPolicy=invalid))
@@ -197,6 +198,20 @@ class ValidateRegistrationTests(unittest.TestCase):
                 )
             )
 
+    def test_bounds_allowed_relation_count_and_identifier_lengths(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_registration(
+                valid_registration(
+                    allowedRelations=[f"leeds.table_{index}" for index in range(101)]
+                )
+            )
+        for relation in (f"{'s' * 64}.roads", f"leeds.{'r' * 64}"):
+            with self.subTest(relation=relation):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(allowedRelations=[relation])
+                    )
+
     def test_rejects_an_empty_or_overlong_data_handling_classification(self):
         with self.assertRaises(FederationSchemaError):
             validate_registration(valid_registration(dataHandlingClassification=""))
@@ -214,8 +229,12 @@ class ValidateRegistrationTests(unittest.TestCase):
                     )
 
     def test_rejects_an_invalid_freshness_strategy(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_registration(valid_registration(freshnessStrategy="nightly"))
+        for invalid in ("nightly", []):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(freshnessStrategy=invalid)
+                    )
 
     def test_status_is_always_pending_regardless_of_input(self):
         result = validate_registration(valid_registration())
@@ -260,12 +279,16 @@ class ValidateObservationTests(unittest.TestCase):
             validate_observation(valid_observation(healthy=True))
 
     def test_rejects_invalid_enum_values(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(connectivity="up"))
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(schema="ok"))
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(sourceFreshness="fresh"))
+        for field, value in (
+            ("connectivity", "up"),
+            ("schema", "ok"),
+            ("sourceFreshness", "fresh"),
+            ("connectivity", []),
+            ("schema", {}),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(FederationSchemaError):
+                    validate_observation(valid_observation(**{field: value}))
 
     def test_rejects_a_timestamp_without_timezone(self):
         with self.assertRaises(FederationSchemaError):
@@ -274,8 +297,12 @@ class ValidateObservationTests(unittest.TestCase):
             )
 
     def test_rejects_a_non_scalar_source_version(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(sourceVersion=["v1"]))
+        for invalid in (
+            ["v1"], True, False, nan, inf, -inf, "x" * 201, int("1" * 201)
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(FederationSchemaError):
+                    validate_observation(valid_observation(sourceVersion=invalid))
 
     def test_accepts_optional_extension_versions_and_rls_flag(self):
         result = validate_observation(
@@ -326,35 +353,66 @@ class ValidateObservationTests(unittest.TestCase):
 
 class EnforceTlsPolicyTests(unittest.TestCase):
     def test_accepts_a_connection_meeting_the_policy(self):
-        enforce_tls_policy("require", "postgresql://reader@host/db?sslmode=require")
-        enforce_tls_policy(
-            "require", "postgresql://reader@host/db?sslmode=verify-full"
+        valid = (
+            (
+                "require",
+                "postgresql://reader:secret@host/db?sslmode=require"
+                "&gssencmode=disable",
+            ),
+            (
+                "verify-full",
+                "postgresql://reader:secret@host/db?sslmode=verify-full"
+                "&gssencmode=disable&sslrootcert=system",
+            ),
         )
-        enforce_tls_policy(
-            "verify-full", "postgresql://reader@host/db?sslmode=verify-full"
+        for policy, connection_url in valid:
+            with self.subTest(policy=policy):
+                enforce_tls_policy(policy, connection_url)
+
+    def test_rejects_weak_or_unsupported_connection_contracts(self):
+        invalid = (
+            ("require", "sslmode=disable gssencmode=disable"),
+            ("verify-full", "sslmode=require gssencmode=disable sslrootcert=system"),
+            ("require", "gssencmode=disable"),
+            ("require", "sslmode=typo gssencmode=disable"),
+            ("require", "sslmode=require"),
+            ("require", "sslmode=require gssencmode=prefer"),
+            ("verify-ca", "sslmode=verify-ca gssencmode=disable"),
+            (
+                "require",
+                "sslmode=require gssencmode=disable "
+                "target_session_attrs=read-write",
+            ),
+            (
+                "verify-full",
+                "sslmode=verify-full gssencmode=disable "
+                "sslrootcert=/run/secrets/ca.pem",
+            ),
+            (
+                "verify-full",
+                "sslmode=verify-full gssencmode=disable "
+                "sslrootcert=system sslcert=/run/secrets/client.pem",
+            ),
         )
+        base = "host=host dbname=db user=reader password=secret"
+        for policy, options in invalid:
+            with self.subTest(policy=policy, options=options):
+                with self.assertRaises(FederationSchemaError):
+                    enforce_tls_policy(policy, f"{base} {options}")
 
-    def test_rejects_a_connection_weaker_than_the_policy(self):
-        with self.assertRaises(FederationSchemaError):
-            enforce_tls_policy(
-                "require", "postgresql://reader@host/db?sslmode=disable"
-            )
-        with self.assertRaises(FederationSchemaError):
-            enforce_tls_policy(
-                "verify-full", "postgresql://reader@host/db?sslmode=require"
-            )
-
-    def test_rejects_an_unset_sslmode_against_any_policy(self):
-        # libpq's own default for a TCP host connection is "prefer", which
-        # meets none of the three valid tlsPolicy values.
-        with self.assertRaises(FederationSchemaError):
-            enforce_tls_policy("require", "postgresql://reader@host/db")
-
-    def test_rejects_an_unrecognized_sslmode(self):
-        with self.assertRaises(FederationSchemaError):
-            enforce_tls_policy(
-                "require", "postgresql://reader@host/db?sslmode=typo"
-            )
+    def test_rejects_implicit_or_non_tcp_endpoints(self):
+        invalid = (
+            "dbname=db user=reader password=secret",
+            "host=/var/run/postgresql dbname=db user=reader password=secret",
+            "host=one,two dbname=db user=reader password=secret",
+            "host=host dbname=db user=reader",
+        )
+        for connection in invalid:
+            with self.subTest(connection=connection):
+                with self.assertRaises(FederationSchemaError):
+                    enforce_tls_policy(
+                        "require", f"{connection} sslmode=require gssencmode=disable"
+                    )
 
 
 if __name__ == "__main__":

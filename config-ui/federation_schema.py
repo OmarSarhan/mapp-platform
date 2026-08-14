@@ -1,24 +1,10 @@
-"""Closed validation contracts for federation identities.
-
-Covers exactly the two record shapes the federation architecture waypoint
-document (docs/federation-architecture-waypoint.md) specifies precisely: the
-Source alias registration (and its Register-step input) and the Observation
-record. Both are pure structural/value contracts — no storage, no live
-connection, no FDW object — since neither a federation database nor a
-registry backing store exists yet. That is deliberate: this module is the
-"design-and-test slice" the document's Recommended first implementation task
-calls for, not an early start on Waypoint 2.
-
-`physicalIdentity` is intentionally not validated here. The document leaves
-its exact evidence fields open pending a real target hosting platform
-(decision #10) — inventing a closed shape for it now would be exactly the
-kind of premature precision the rest of this module tries to avoid.
-"""
+"""Closed validation contracts shared by the federation API and store."""
 
 from __future__ import annotations
 
 import re
 from http import HTTPStatus
+from math import isfinite
 from typing import Any
 
 import psycopg
@@ -43,9 +29,7 @@ ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,55}$")
 
 ALIAS_KINDS = frozenset({"postgresql"})
 ALIAS_STATUSES = frozenset({"pending", "active", "unavailable", "retired"})
-FRESHNESS_STRATEGIES = frozenset(
-    {"manual", "maximumAge", "timestampColumn", "versionRelation"}
-)
+FRESHNESS_STRATEGIES = frozenset({"manual"})
 TLS_POLICIES = frozenset({"require", "verify-ca", "verify-full"})
 
 CONNECTIVITY_STATES = frozenset(
@@ -59,6 +43,9 @@ SOURCE_FRESHNESS_STATES = frozenset(
 MAX_DISPLAY_NAME = 200
 MAX_CONNECTION_REF = 200
 MAX_DATA_HANDLING_CLASSIFICATION = 2000
+MAX_ALLOWED_RELATIONS = 100
+MAX_IDENTIFIER_PART = 63
+MAX_SOURCE_VERSION = 200
 
 
 class FederationSchemaError(ValueError):
@@ -105,7 +92,7 @@ def _bounded_text(value: Any, *, label: str, maximum: int) -> str:
 
 
 def _enum(value: Any, *, label: str, allowed: frozenset[str]) -> str:
-    if value not in allowed:
+    if not isinstance(value, str) or value not in allowed:
         raise FederationSchemaError(
             f"{label} must be one of: {', '.join(sorted(allowed))}."
         )
@@ -143,6 +130,11 @@ def _normalized_allowed_relations(value: Any) -> tuple[str, ...]:
             "allowedRelations must be a non-empty list of schema-qualified "
             "relation names."
         )
+    if len(value) > MAX_ALLOWED_RELATIONS:
+        raise FederationSchemaError(
+            f"allowedRelations must contain at most {MAX_ALLOWED_RELATIONS} "
+            "relations."
+        )
     normalized = []
     for entry in value:
         parsed = parse_relation(
@@ -154,6 +146,11 @@ def _normalized_allowed_relations(value: Any) -> tuple[str, ...]:
                 "schema-qualified identifier."
             )
         _, schema, relation = parsed
+        if len(schema) > MAX_IDENTIFIER_PART or len(relation) > MAX_IDENTIFIER_PART:
+            raise FederationSchemaError(
+                "allowedRelations schema and relation names must be at most "
+                f"{MAX_IDENTIFIER_PART} characters."
+            )
         normalized.append(f"{schema}.{relation}")
     if len(set(normalized)) != len(normalized):
         raise FederationSchemaError("allowedRelations must not contain duplicates.")
@@ -229,22 +226,6 @@ def validate_registration(payload: Any) -> dict[str, Any]:
         label="freshnessStrategy",
         allowed=FRESHNESS_STRATEGIES,
     )
-    # maximumAge/timestampColumn/versionRelation are a documented part of
-    # this contract (docs/federation-architecture-waypoint.md, Freshness
-    # and verification) but no evidence-collection exists for any of them
-    # yet — detect_capability() always reports sourceFreshness as
-    # "unknown" regardless of strategy, and nothing lets an operator
-    # configure which relation/column a non-manual strategy would even
-    # read. Accepting one of these here would silently promise freshness
-    # evidence the platform can never produce. Reject until implemented.
-    if freshness_strategy != "manual":
-        raise FederationSchemaError(
-            f"freshnessStrategy {freshness_strategy!r} is not yet "
-            "implemented. Register with 'manual' until "
-            "maximumAge/timestampColumn/versionRelation evidence "
-            "collection lands."
-        )
-
     return {
         "alias": alias,
         "displayName": display_name,
@@ -305,11 +286,26 @@ def validate_observation(payload: Any) -> dict[str, Any]:
     )
 
     source_version = fields["sourceVersion"]
-    if source_version is not None and not isinstance(
-        source_version, (str, int, float)
-    ):
+    valid_source_version = (
+        source_version is None
+        or (
+            isinstance(source_version, str)
+            and len(source_version) <= MAX_SOURCE_VERSION
+        )
+        or (
+            isinstance(source_version, int)
+            and not isinstance(source_version, bool)
+            and len(str(source_version)) <= MAX_SOURCE_VERSION
+        )
+        or (
+            isinstance(source_version, float)
+            and isfinite(source_version)
+        )
+    )
+    if not valid_source_version:
         raise FederationSchemaError(
-            "sourceVersion must be an opaque scalar value or null."
+            "sourceVersion must be null or a finite text/number scalar of "
+            f"at most {MAX_SOURCE_VERSION} characters."
         )
 
     result = {
@@ -369,6 +365,18 @@ _SSLMODE_STRENGTH = {
     "verify-full": 5,
 }
 
+_SUPPORTED_CONNECTION_OPTIONS = frozenset({
+    "dbname",
+    "gssencmode",
+    "host",
+    "hostaddr",
+    "password",
+    "port",
+    "sslmode",
+    "sslrootcert",
+    "user",
+})
+
 
 def enforce_tls_policy(tls_policy: str, connection_url: str) -> None:
     """Reject a connectionRef whose actual sslmode is weaker than the
@@ -377,11 +385,59 @@ def enforce_tls_policy(tls_policy: str, connection_url: str) -> None:
     checked the DBS_<NAME> connection string actually delivers it — a
     registered "verify-full" alias could observe and provision over
     plaintext (sslmode=disable) without ever being flagged."""
-    params = psycopg.conninfo.conninfo_to_dict(connection_url)
-    # libpq's own default for a TCP host connection when sslmode is
-    # unset — a federation connectionRef is always host=..., never a
-    # Unix-socket connection (whose default would be "prefer" too, so
-    # this default is correct either way).
+    _enum(tls_policy, label="tlsPolicy", allowed=TLS_POLICIES)
+    try:
+        params = psycopg.conninfo.conninfo_to_dict(connection_url)
+    except psycopg.Error as exc:
+        raise FederationSchemaError(
+            "connectionRef must be valid PostgreSQL connection information."
+        ) from exc
+
+    unsupported = sorted(set(params) - _SUPPORTED_CONNECTION_OPTIONS)
+    if unsupported:
+        raise FederationSchemaError(
+            "connectionRef contains unsupported options: "
+            + ", ".join(unsupported)
+            + "."
+        )
+
+    required = ("host", "dbname", "user", "password")
+    if any(not str(params.get(name, "")).strip() for name in required):
+        raise FederationSchemaError(
+            "connectionRef must explicitly set a TCP host, database, user, "
+            "and password."
+        )
+
+    if any(
+        "," in str(params.get(name, ""))
+        for name in ("host", "hostaddr", "port")
+    ):
+        raise FederationSchemaError(
+            "connectionRef must identify exactly one TCP endpoint."
+        )
+    if str(params["host"]).startswith("/"):
+        raise FederationSchemaError(
+            "connectionRef must use explicit TCP hosts; Unix sockets are "
+            "not valid for federation TLS."
+        )
+
+    if params.get("gssencmode") != "disable":
+        raise FederationSchemaError(
+            "connectionRef must set gssencmode=disable so its registered "
+            "TLS policy cannot be bypassed by GSS encryption."
+        )
+
+    sslrootcert = params.get("sslrootcert")
+    if sslrootcert not in (None, "system"):
+        raise FederationSchemaError(
+            "connectionRef may only use sslrootcert=system; filesystem TLS "
+            "credentials are not shared safely with the FDW runtime."
+        )
+    if tls_policy in {"verify-ca", "verify-full"} and sslrootcert != "system":
+        raise FederationSchemaError(
+            f"tlsPolicy {tls_policy!r} requires sslrootcert=system."
+        )
+
     sslmode = str(params.get("sslmode", "prefer"))
     if _SSLMODE_STRENGTH.get(sslmode, -1) < _SSLMODE_STRENGTH[tls_policy]:
         raise FederationSchemaError(

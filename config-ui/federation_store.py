@@ -1,23 +1,4 @@
-"""Durable alias registry for federation (architecture waypoint decision #3).
-
-Wires the previously-unwired `federation_schema`/`federation_capability`
-validation and detection logic into a real, queryable Postgres store. The
-registry lives in a new `federation` schema inside the *existing* derived
-database rather than a separate dedicated federation database — the doc's
-migration into a standalone federation database (`MAPP_DATABASE_MODE`
-`federated`) is a distinct, later piece of work, not required to prove FDW
-mechanics end to end.
-
-Deliberately out of scope here (see the accompanying plan): the doc's
-write-only secret-submission/verify-not-read endpoints (we resolve
-`connectionRef` through the existing `DBS_<ALIAS>` convention instead),
-alias-count ceilings, registration TTL, and retire/reclaim. Also
-deliberately out of scope: forcing derived layers through an integration
-view before they may read a foreign schema. Instead this module answers a
-narrower, explicitly requested question — which derived layers currently
-read from a given alias, so removing it is an informed choice rather than a
-silent break.
-"""
+"""Durable federation alias registry and postgres_fdw provisioner."""
 
 from __future__ import annotations
 
@@ -44,13 +25,13 @@ from federation_schema import (
 
 SCHEMA = "federation"
 
-# Must match derived_layers.SCHEMA. Hardcoded rather than imported to avoid
-# pulling in the whole derived_layers module for one stable constant.
-DERIVED_LAYERS_SCHEMA = "derived_layers"
+MAX_ALIASES = 100
 
 
 class FederationAliasStore:
-    def __init__(self, connection_string: str, reader_role: str):
+    def __init__(
+        self, connection_string: str, reader_role: str, derived_role: str
+    ):
         if not connection_string:
             raise FederationSchemaError(
                 "Federation alias registry is not configured.",
@@ -58,6 +39,7 @@ class FederationAliasStore:
             )
         self.connection_string = connection_string
         self.reader_role = reader_role
+        self.derived_role = derived_role
         self._initialization_lock = threading.Lock()
         self._initialized = False
 
@@ -89,10 +71,8 @@ class FederationAliasStore:
 
     @staticmethod
     def _initialize(cur) -> None:
-        # The federation schema itself is provisioned by docker/postgis's
-        # role-setup scripts (owned by the derived-owner role), the same way
-        # derived_layers is — not created lazily here. The derived-owner
-        # role has no CREATE privilege on the database itself to do so.
+        # The federation schema is created and owned by the dedicated
+        # federation provisioner in docker/postgis's role-setup scripts.
         cur.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {}._aliases (
               alias text PRIMARY KEY,
@@ -120,7 +100,9 @@ class FederationAliasStore:
               observed_at timestamptz,
               row_level_security_acknowledged boolean NOT NULL DEFAULT false,
               accepted_schema_fingerprint text,
-              accepted_physical_identity text
+              accepted_physical_identity text,
+              accepted_connection_identity text,
+              last_observation_id bigint
             )
         """).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
@@ -173,6 +155,14 @@ class FederationAliasStore:
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "accepted_physical_identity text"
         ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "accepted_connection_identity text"
+        ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "last_observation_id bigint"
+        ).format(sql.Identifier(SCHEMA)))
         # DEFAULT backfills any alias registered before tlsPolicy was
         # persisted with the weakest of the three valid policies — the
         # conservative choice: it neither claims a stronger guarantee than
@@ -185,12 +175,7 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._aliases FROM PUBLIC"
         ).format(sql.Identifier(SCHEMA)))
-        # Every subsequent Observe replaces _aliases.last_observation, so a
-        # network outage, credential rejection, or schema drift permanently
-        # destroyed the preceding evidence — nothing could explain drift or
-        # an outage after the fact. This is the append-only counterpart:
-        # every observation ever taken, kept regardless of whether it went
-        # on to win record_observation()'s latest-observation race.
+        # Keep evidence append-only even though _aliases exposes only latest.
         cur.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {}._observations (
               id bigserial PRIMARY KEY,
@@ -209,6 +194,25 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._observations FROM PUBLIC"
         ).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {}._approvals (
+              id bigserial PRIMARY KEY,
+              alias text NOT NULL REFERENCES {}._aliases (alias),
+              observation_id bigint NOT NULL REFERENCES {}._observations (id),
+              approved_by text NOT NULL,
+              approved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+              acknowledged_row_level_security boolean NOT NULL,
+              acknowledged_schema_change boolean NOT NULL,
+              acknowledged_physical_rebind boolean NOT NULL
+            )
+        """).format(
+            sql.Identifier(SCHEMA),
+            sql.Identifier(SCHEMA),
+            sql.Identifier(SCHEMA),
+        ))
+        cur.execute(sql.SQL(
+            "REVOKE ALL ON {}._approvals FROM PUBLIC"
+        ).format(sql.Identifier(SCHEMA)))
 
     _SELECT_COLUMNS = sql.SQL("""
         alias, display_name AS "displayName", kind,
@@ -219,6 +223,7 @@ class FederationAliasStore:
         registered_by AS "registeredBy",
         registered_at AS "registeredAt",
         last_observation AS "lastObservation",
+        last_observation_id AS "lastObservationId",
         tls_policy AS "tlsPolicy",
         provisioned_at AS "provisionedAt",
         approved_by AS "approvedBy",
@@ -230,13 +235,25 @@ class FederationAliasStore:
         record = validate_registration(payload)
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
-                sql.SQL("SELECT 1 FROM {}._aliases WHERE alias = %s").format(
-                    sql.Identifier(SCHEMA)
-                ),
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:register",),
+            )
+            cur.execute(
+                sql.SQL("""
+                    SELECT count(*) AS count,
+                           count(*) FILTER (WHERE alias = %s) > 0 AS exists
+                    FROM {}._aliases
+                """).format(sql.Identifier(SCHEMA)),
                 (record["alias"],),
             )
-            if cur.fetchone():
+            registry = cur.fetchone()
+            if registry["exists"]:
                 raise FileExistsError(record["alias"])
+            if registry["count"] >= MAX_ALIASES:
+                raise FederationSchemaError(
+                    f"Federation alias limit ({MAX_ALIASES}) reached.",
+                    code="federation.alias_limit_reached",
+                )
             cur.execute(
                 sql.SQL("""
                     INSERT INTO {}._aliases
@@ -245,6 +262,8 @@ class FederationAliasStore:
                        data_handling_classification, registered_by,
                        tls_policy)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (alias) DO NOTHING
+                    RETURNING alias
                 """).format(sql.Identifier(SCHEMA)),
                 (
                     record["alias"],
@@ -259,7 +278,9 @@ class FederationAliasStore:
                     record["tlsPolicy"],
                 ),
             )
-        return self.get(record["alias"])
+            if cur.fetchone() is None:
+                raise FileExistsError(record["alias"])
+            return self._get_with_cursor(cur, record["alias"])
 
     def get(self, alias: str) -> dict[str, Any]:
         alias = validate_alias(alias)
@@ -292,95 +313,12 @@ class FederationAliasStore:
     def list(self) -> list[dict[str, Any]]:
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
-                sql.SQL("SELECT {} FROM {}._aliases ORDER BY alias").format(
-                    self._SELECT_COLUMNS, sql.Identifier(SCHEMA)
-                )
+                sql.SQL(
+                    "SELECT {} FROM {}._aliases ORDER BY alias LIMIT %s"
+                ).format(self._SELECT_COLUMNS, sql.Identifier(SCHEMA)),
+                (MAX_ALIASES + 1,),
             )
             return list(cur.fetchall())
-
-    def record_observation(
-        self,
-        alias: str,
-        observation: dict[str, Any],
-        connection_url: str,
-        physical_identity: str | None,
-        observed_at: datetime,
-    ) -> dict[str, Any]:
-        """Persist an already-validated observation (see
-        federation_capability.detect_capability, which computes both
-        `observation` and `physical_identity` from the same connection's
-        snapshot) — `physical_identity` is None when connectivity wasn't
-        "reachable", since it can't be fetched from a source that couldn't
-        be reached. `observed_at` marks the moment *this* Observe's
-        REPEATABLE READ snapshot was actually fixed on the *remote* (via its
-        own clock_timestamp(), captured by the caller as the first query
-        inside that snapshot) when reachable, or the moment the connection
-        attempt was given up as failed, on this *local* process's clock,
-        when not — two different clock domains. Two overlapping Observe
-        calls for the same alias can finish and try to write in either
-        order; without comparing something, whichever write simply
-        *commits* last would win even if its own probe's snapshot was the
-        older, now-superseded one. The WHERE clause below compares
-        observed_at only between two observations of the *same*
-        reachability (both remote-clock, or both local-clock — a single,
-        internally consistent domain either way) and makes a same-domain
-        stale write a no-op: Postgres serializes concurrent UPDATEs to the
-        same row, and each one re-checks this condition against whatever
-        the other just committed. When the incoming observation's
-        reachability *differs* from what's currently stored, there is no
-        shared clock to compare on — comparing a remote timestamp against a
-        local one directly would let ordinary clock drift between the two
-        hosts discard a genuinely later connectivity-state change (e.g. a
-        real, more-recent outage silently losing to an earlier success
-        whose remote clock merely happened to run ahead) — so a
-        reachability *transition* is instead accepted unconditionally: it
-        is new information last_observation doesn't reflect at all, so
-        there is no coherent basis to call it "stale" against a different
-        clock domain's timestamp.
-
-        `observation["schema"]` as computed by detect_capability() only
-        reflects relation existence/selectability, not whether the column
-        list or view definition changed since it was last explicitly
-        accepted — that comparison is added here as a separate
-        `acceptedSchemaCurrent` boolean, deliberately NOT folded into
-        `schema` itself. An earlier version of this fix did overwrite
-        `schema` to "changed" on a fingerprint mismatch, mirroring how
-        detect_capability() already uses "changed" for a missing/
-        unselectable relation — but provision() has its own stored-
-        evidence fast-fail, `last_observation.get("schema") != "current"`,
-        that exists to reject provisioning against stale evidence *before*
-        a live round-trip. That check has no acknowledgement escape by
-        design (a genuinely missing relation cannot be reconciled by
-        acknowledging anything — Observe must run again). Overwriting
-        `schema` made a fingerprint drift indistinguishable from a missing
-        relation to that check, so it fired first on every drift and
-        permanently blocked the very acknowledge_schema_change path this
-        module exists to support — caught live against the real FDW rig,
-        not in a mock. Keeping `schema` untouched and reporting the
-        fingerprint comparison through its own field avoids that
-        collision entirely: `schema` keeps meaning exactly what
-        detect_capability() computed, and `acceptedSchemaCurrent` (true
-        when nothing has been accepted yet or the live fingerprint still
-        matches what was) is purely for visibility — provision()'s own,
-        separately-computed schema_fingerprint_changed gate (comparing
-        the same accepted_schema_fingerprint against a fresh live probe)
-        remains the sole authority on whether provisioning may proceed.
-        This never writes accepted_schema_fingerprint itself, so it
-        cannot affect that gate either way — only what Observe reports.
-
-        Callable directly (used here, and by any caller that already has
-        its own observation evidence), but see observe() below for the
-        preferred entry point when you also need to run the remote probe
-        yourself: it serializes the whole probe-and-persist cycle per
-        alias, closing a race this method's own comparisons cannot (see
-        observe()'s docstring)."""
-        alias = validate_alias(alias)
-        with self._connect() as connection, connection.cursor() as cur:
-            self._persist_observation(
-                cur, alias, observation, connection_url, physical_identity,
-                observed_at,
-            )
-            return self._get_with_cursor(cur, alias)
 
     def observe(
         self,
@@ -389,36 +327,8 @@ class FederationAliasStore:
         *,
         allowed_relations: tuple[str, ...],
         tls_policy: str,
-        version_relation: str | None = None,
     ) -> dict[str, Any]:
-        """The full Observe cycle — remote probe (detect_capability) then
-        persisted write (record_observation()'s own logic, reused via
-        _persist_observation) — serialized per alias by a held advisory
-        lock spanning both, so two concurrent Observe calls for the same
-        alias can never interleave.
-
-        This closes a race record_observation()'s own comparisons cannot:
-        a reachability *transition* is accepted unconditionally there (see
-        its docstring — there is no shared clock between a reachable
-        probe's remote-clock timestamp and an unreachable probe's local-
-        clock one), so without serialization, an older probe that stalls
-        after taking its snapshot could still commit its result *after* a
-        newer, more-current probe's result already committed, silently
-        overwriting it with stale evidence — or the reverse, an unrelated
-        newer outage overwriting a fresher recovery. No single comparison
-        rule can fix this after the fact, because the two results being
-        compared were never ordered relative to each other in the first
-        place. Preventing the interleaving outright removes the ambiguity:
-        holding this lock across the remote round-trip means a second
-        Observe for this alias cannot even start probing until the first
-        one's entire cycle has committed and released it, so whichever
-        cycle starts second is always the one reflecting the more current
-        remote state.
-
-        Callers that already run detect_capability() themselves (or have
-        evidence from elsewhere) should still go through
-        record_observation() directly — that one is unaffected by this
-        method and remains correct for a single, non-overlapping call."""
+        """Probe and persist under the alias's local ordering lock."""
         alias = validate_alias(alias)
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
@@ -429,7 +339,6 @@ class FederationAliasStore:
                 connection_url,
                 allowed_relations=allowed_relations,
                 tls_policy=tls_policy,
-                version_relation=version_relation,
             )
             self._persist_observation(
                 cur, alias, observation, connection_url, physical_identity,
@@ -446,39 +355,28 @@ class FederationAliasStore:
         physical_identity: str | None,
         observed_at: datetime,
     ) -> None:
-        """The write half of record_observation()/observe() — takes an
-        already-open cursor so observe() can run it inside the same
-        transaction as its advisory lock. `alias` must already be
-        validated. Raises FileNotFoundError if the alias doesn't exist."""
+        """Write one observation after its per-alias lock is held."""
         reachable = observation["connectivity"] == "reachable"
         connection_identity = self._connection_identity(connection_url)
+        cur.execute(
+            sql.SQL("""
+                SELECT provisioned_at, accepted_schema_fingerprint,
+                       accepted_physical_identity,
+                       accepted_connection_identity,
+                       row_level_security_acknowledged
+                FROM {}._aliases
+                WHERE alias = %s
+                FOR UPDATE
+            """).format(sql.Identifier(SCHEMA)),
+            (alias,),
+        )
+        registry_state = cur.fetchone()
+        if registry_state is None:
+            raise FileNotFoundError(alias)
+
         incoming_fingerprint = observation.get("schemaFingerprint")
         if incoming_fingerprint is not None:
-            # FOR UPDATE — without it, this plain read can see a pre-
-            # commit value while a concurrent provision() call is mid-
-            # transaction (provision() takes its own FOR UPDATE lock on
-            # this same row for its whole duration): this observation
-            # would then compute acceptedSchemaCurrent against a
-            # fingerprint provision() is about to replace, rather than
-            # the one it actually commits. Only acceptedSchemaCurrent
-            # depends on this read — never a security/correctness gate,
-            # since provision()'s own comparison always re-reads live —
-            # but there is no reason to leave even a reporting field
-            # racy when closing it is a one-clause change: this lock
-            # simply makes the write below wait for a concurrent
-            # provision() to finish first, exactly as the UPDATE further
-            # down already does.
-            cur.execute(
-                sql.SQL(
-                    "SELECT accepted_schema_fingerprint FROM {}._aliases "
-                    "WHERE alias = %s FOR UPDATE"
-                ).format(sql.Identifier(SCHEMA)),
-                (alias,),
-            )
-            existing = cur.fetchone()
-            accepted_fingerprint = (
-                existing["accepted_schema_fingerprint"] if existing else None
-            )
+            accepted_fingerprint = registry_state["accepted_schema_fingerprint"]
             observation = {
                 **observation,
                 "acceptedSchemaCurrent": (
@@ -486,35 +384,47 @@ class FederationAliasStore:
                     or accepted_fingerprint == incoming_fingerprint
                 ),
             }
-        # Appended unconditionally, regardless of whether this
-        # observation goes on to win the latest-observation race below
-        # — a lost race is still a real fact about what this probe saw
-        # and when. The WHERE EXISTS guard makes this a silent no-op
-        # for a nonexistent alias rather than a foreign-key violation;
-        # the conditional UPDATE below still raises FileNotFoundError.
         cur.execute(
             sql.SQL("""
                 INSERT INTO {}._observations
                   (alias, observation, connection_identity,
                    physical_identity, observed_at)
-                SELECT %s, %s, %s, %s, %s
-                WHERE EXISTS (
-                  SELECT 1 FROM {}._aliases WHERE alias = %s
-                )
-            """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)),
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+            """).format(sql.Identifier(SCHEMA)),
             (
                 alias,
                 Jsonb(observation),
                 connection_identity,
                 physical_identity,
                 observed_at,
-                alias,
             ),
+        )
+        observation_id = cur.fetchone()["id"]
+
+        provisioned = registry_state["provisioned_at"] is not None
+        evidence_current = (
+            reachable
+            and observation.get("schema") == "current"
+            and registry_state["accepted_schema_fingerprint"] is not None
+            and registry_state["accepted_schema_fingerprint"]
+                == incoming_fingerprint
+            and registry_state["accepted_physical_identity"] is not None
+            and registry_state["accepted_physical_identity"]
+                == physical_identity
+            and registry_state["accepted_connection_identity"] is not None
+            and registry_state["accepted_connection_identity"]
+                == connection_identity
+            and (
+                not observation.get("rowLevelSecurityDetected", False)
+                or registry_state["row_level_security_acknowledged"]
+            )
         )
         cur.execute(
             sql.SQL("""
                 UPDATE {}._aliases
                 SET last_observation = %s,
+                    last_observation_id = %s,
                     last_observed_connection_identity = %s,
                     physical_identity = %s,
                     observed_at = %s,
@@ -524,55 +434,49 @@ class FederationAliasStore:
                       ELSE 'unavailable'
                     END
                 WHERE alias = %s
-                  AND (
-                    observed_at IS NULL
-                    OR (last_observation ->> 'connectivity' = 'reachable')
-                         <> %s
-                    OR observed_at < %s
-                  )
-                RETURNING alias, provisioned_at
             """).format(sql.Identifier(SCHEMA)),
             (
                 Jsonb(observation),
+                observation_id,
                 connection_identity,
                 physical_identity,
                 observed_at,
-                reachable,
+                evidence_current,
                 alias,
-                reachable,
-                observed_at,
             ),
         )
-        row = cur.fetchone()
-        if row is None:
-            # Either this alias doesn't exist, or a newer Observe already
-            # committed while this one's remote probe was still running
-            # (observe() closes that specific race — see its docstring —
-            # but record_observation() remains directly callable by a
-            # caller running its own probe outside that serialization).
-            # The latter isn't a failure — the row already holds the
-            # fresher result — so only raise once non-existence is
-            # confirmed.
+
+        if provisioned:
+            schema_name = f"source_{alias}"
             cur.execute(
-                sql.SQL("SELECT 1 FROM {}._aliases WHERE alias = %s").format(
-                    sql.Identifier(SCHEMA)
-                ),
-                (alias,),
+                "SELECT pg_catalog.to_regnamespace(%s) AS oid",
+                (schema_name,),
             )
-            if cur.fetchone() is None:
-                raise FileNotFoundError(alias)
-            return
-        # A version drift discovered after provisioning must fail
-        # pushdown closed immediately (docs/federation-architecture-
-        # waypoint.md: "a version drift detected after provisioning
-        # downgrades the alias to pushdown disabled") — re-enabling it
-        # afterward is a deliberate federation:provision-scoped
-        # reprovisioning action, never automatic, so this only ever
-        # drops the option here, never adds it.
-        if row["provisioned_at"] is not None:
+            if cur.fetchone()["oid"] is not None:
+                action = "GRANT" if evidence_current else "REVOKE"
+                preposition = "TO" if evidence_current else "FROM"
+                for role in dict.fromkeys((self.derived_role, self.reader_role)):
+                    cur.execute(
+                        sql.SQL(
+                            f"{action} USAGE ON SCHEMA {{}} {preposition} {{}}"
+                        ).format(
+                            sql.Identifier(schema_name), sql.Identifier(role)
+                        )
+                    )
+                    cur.execute(
+                        sql.SQL(
+                            f"{action} SELECT ON ALL TABLES IN SCHEMA {{}} "
+                            f"{preposition} {{}}"
+                        ).format(
+                            sql.Identifier(schema_name), sql.Identifier(role)
+                        )
+                    )
+
+        # An outage has no version evidence and must not rewrite FDW state.
+        if provisioned and reachable and "extensionVersions" in observation:
             server_name = f"{alias}_srv"
             local_versions = extension_versions(cur)
-            remote_versions = observation.get("extensionVersions") or {}
+            remote_versions = observation["extensionVersions"]
             shippable = self._shippable_extensions(
                 local_versions, remote_versions
             )
@@ -652,47 +556,50 @@ class FederationAliasStore:
     # sent too, since with hostaddr present libpq uses host purely for TLS
     # name verification.) Not user/password: those live in the user mapping.
     _FORWARDED_CONNECTION_OPTIONS = (
-        "hostaddr", "sslmode", "sslrootcert", "sslcert", "sslkey",
+        "hostaddr", "sslmode", "sslrootcert", "gssencmode",
     )
 
     @staticmethod
     def _current_server_options(cur, server_name: str) -> dict[str, str]:
         cur.execute(
-            "SELECT srvoptions FROM pg_catalog.pg_foreign_server "
-            "WHERE srvname = %s",
+            "SELECT s.srvoptions, f.fdwname "
+            "FROM pg_catalog.pg_foreign_server AS s "
+            "JOIN pg_catalog.pg_foreign_data_wrapper AS f "
+            "ON f.oid = s.srvfdw WHERE s.srvname = %s",
             (server_name,),
         )
         row = cur.fetchone()
+        if row is None or row["fdwname"] != "postgres_fdw":
+            raise FederationSchemaError(
+                f"Federation server {server_name!r} is missing or invalid.",
+                code="federation.local_state_invalid",
+            )
         options: dict[str, str] = {}
         for option in (row["srvoptions"] if row and row["srvoptions"] else []):
             key, _, value = option.partition("=")
             options[key] = value
         return options
 
-    @classmethod
-    def _reconcile_forwarded_options(
-        cls, cur, server_name: str, current: dict[str, str], params
+    @staticmethod
+    def _reconcile_server_options(
+        cur,
+        server_name: str,
+        current: dict[str, str],
+        desired: dict[str, str],
     ) -> None:
-        """Reconcile _FORWARDED_CONNECTION_OPTIONS to match the
-        connectionRef's current connection string — a rotated setting (e.g.
-        sslmode require -> verify-full, a renewed CA/client certificate, a
-        changed hostaddr, or any of them removed outright) must reach the
-        live server the same way a rotated host/password does, or
-        foreign-table queries keep using stale settings: possibly weaker
-        transport, or an address that no longer hosts the verified
-        database."""
         actions = []
-        for option_name in cls._FORWARDED_CONNECTION_OPTIONS:
-            value = params.get(option_name)
-            if value:
+        for option_name in sorted(current.keys() | desired.keys()):
+            value = desired.get(option_name)
+            if value is not None:
                 verb = "SET" if option_name in current else "ADD"
-                actions.append(
-                    sql.SQL("{} {} {}").format(
-                        sql.SQL(verb),
-                        sql.Identifier(option_name),
-                        sql.Literal(str(value)),
+                if current.get(option_name) != value:
+                    actions.append(
+                        sql.SQL("{} {} {}").format(
+                            sql.SQL(verb),
+                            sql.Identifier(option_name),
+                            sql.Literal(value),
+                        )
                     )
-                )
             elif option_name in current:
                 actions.append(
                     sql.SQL("DROP {}").format(sql.Identifier(option_name))
@@ -705,24 +612,14 @@ class FederationAliasStore:
             )
 
     @staticmethod
-    def _import_and_grant(
+    def _import_relations(
         cur,
         alias: str,
         server_name: str,
         schema_name: str,
         allowed_relations,
-        reader_role: str,
     ) -> None:
-        """IMPORT FOREIGN SCHEMA each allowed relation individually (not a
-        blanket import), confirm every one actually landed, then grant the
-        reader role access to the schema and everything just imported into
-        it. Shared by first-time provisioning and by drift reconciliation
-        during reprovisioning (see provision()) — both need the identical
-        all-or-nothing behaviour: IMPORT FOREIGN SCHEMA ... LIMIT TO
-        silently imports whatever of the named relations actually exists on
-        the remote rather than erroring on one that's missing, so without
-        the explicit check below, an alias could be left active with an
-        incomplete set of foreign tables."""
+        """Import the allowlist and fail if postgres_fdw omits any item."""
         for relation in allowed_relations:
             remote_schema, remote_table = relation.split(".", 1)
             cur.execute(sql.SQL("""
@@ -756,15 +653,46 @@ class FederationAliasStore:
                 "since it was last observed.",
                 code="federation.import_incomplete",
             )
+
+    @staticmethod
+    def _local_relation_bindings(cur, schema_name: str) -> dict[str, Any]:
         cur.execute(
-            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
-                sql.Identifier(schema_name), sql.Identifier(reader_role)
-            )
+            """
+            SELECT c.relname, c.relkind,
+                   c.relowner = (SELECT oid FROM pg_catalog.pg_roles
+                                 WHERE rolname = current_user) AS owned,
+                   s.srvname,
+                   (SELECT option_value
+                    FROM pg_catalog.pg_options_to_table(ft.ftoptions)
+                    WHERE option_name = 'schema_name') AS remote_schema,
+                   (SELECT option_value
+                    FROM pg_catalog.pg_options_to_table(ft.ftoptions)
+                    WHERE option_name = 'table_name') AS remote_table
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n
+              ON n.oid = c.relnamespace
+            LEFT JOIN pg_catalog.pg_foreign_table AS ft
+              ON ft.ftrelid = c.oid
+            LEFT JOIN pg_catalog.pg_foreign_server AS s
+              ON s.oid = ft.ftserver
+            WHERE n.nspname = %s
+              AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            """,
+            (schema_name,),
         )
-        cur.execute(
-            sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
-                sql.Identifier(schema_name), sql.Identifier(reader_role)
-            )
+        return {row["relname"]: row for row in cur.fetchall()}
+
+    @staticmethod
+    def _binding_matches(
+        binding, server_name: str, remote_schema: str, remote_table: str
+    ) -> bool:
+        return (
+            binding is not None
+            and binding["relkind"] == "f"
+            and binding["owned"]
+            and binding["srvname"] == server_name
+            and binding["remote_schema"] == remote_schema
+            and binding["remote_table"] == remote_table
         )
 
     @staticmethod
@@ -784,10 +712,12 @@ class FederationAliasStore:
         much as a host change can."""
         params = psycopg.conninfo.conninfo_to_dict(connection_url)
         host = str(params.get("host", ""))
+        hostaddr = str(params.get("hostaddr", ""))
         port = str(params.get("port", "5432"))
         dbname = str(params.get("dbname", ""))
         user = str(params.get("user", ""))
-        return f"{user}@{host}:{port}/{dbname}"
+        endpoint = f"{host}[{hostaddr}]" if hostaddr else host
+        return f"{user}@{endpoint}:{port}/{dbname}"
 
     def provision(
         self,
@@ -795,78 +725,40 @@ class FederationAliasStore:
         connection_url: str,
         actor: str,
         *,
+        expected_observation_id: int,
         acknowledge_row_level_security: bool = False,
         acknowledge_schema_change: bool = False,
         acknowledge_physical_rebind: bool = False,
     ) -> dict[str, Any]:
-        """Create the real FDW server, user mapping, schema, and foreign
-        tables for this alias's allowedRelations the first time this is
-        called. Callable again afterward as a reprovisioning action (e.g.
-        an admin acting on a drift observation) — a repeat call normally
-        only re-decides and reconciles the server's `extensions` option; it
-        does not repeat CREATE SERVER/USER MAPPING, which would fail on
-        objects that already exist. It DOES repeat IMPORT FOREIGN SCHEMA
-        (via DROP FOREIGN TABLE + reimport) when acknowledging a schema
-        change, since that is the only way the local foreign table's
-        columns/types ever catch up with the remote's — see the
-        acknowledge_schema_change paragraph below. `actor` is the
-        approving principal — every call (initial or reprovisioning) is
-        itself an act of Approve exposure, recorded atomically with
-        activation as the docs/federation-architecture-waypoint.md source-
-        alias contract's approvedBy/approvedAt consent record.
+        """Approve one exact observation and reconcile its local FDW state.
 
-        `acknowledge_schema_change` mirrors `acknowledge_row_level_security`
-        exactly, for the same reason: `accepted_schema_fingerprint` is a
-        durable column this method alone ever writes (never Observe), so a
-        live fingerprint that no longer matches it means the source's
-        columns or view definition changed since the *last explicit
-        acceptance* — not merely since the last Observe, which self-heals
-        the comparison the moment anyone observes twice with no further
-        changes (see record_observation()'s docstring). A caller must
-        explicitly accept that change to proceed, exactly as with RLS.
-        On an already-provisioned alias, acknowledging a genuine change
-        also DROPs and reimports the foreign tables for every allowed
-        relation — a foreign table's columns/types are fixed at IMPORT
-        time and never auto-update, so persisting the new accepted
-        fingerprint without this would silence the warning forever while
-        every runtime query kept using the stale local definition. This
-        reuses the exact IMPORT FOREIGN SCHEMA DDL first-time provisioning
-        already uses (see _import_and_grant) rather than hand-diffing
-        column lists; a relation a derived layer already depends on fails
-        the DROP outright (pg_depend) and rolls back this whole call
-        instead of silently reconciling around a dependent object — an
-        informed stop, consistent with this module's own impact-visibility
-        design, not a gap.
-
-        `acknowledge_physical_rebind` is the third gate in the same family,
-        guarding `accepted_physical_identity`: the source being a *different
-        physical database* than the one previously accepted. The doc treats
-        this as its own class of change — "The same table name at a new
-        physical database is not the same source unless an operator performs
-        an explicit, evidenced rebind" — and it is genuinely not covered by
-        the other two, since a restored or recreated database can present a
-        byte-identical schema fingerprint and satisfy every RLS check while
-        serving entirely different rows.
-
-        Every successful call, whether or not any acknowledgement was needed
-        this time, re-persists accepted_schema_fingerprint and
-        accepted_physical_identity as the new baselines."""
+        Remote state is checked before local DDL and again after any import.
+        A remote trusted to serve live data can still change after those
+        checks; callers that need immutable approval must snapshot data.
+        """
         alias = validate_alias(alias)
+        if (
+            isinstance(expected_observation_id, bool)
+            or not isinstance(expected_observation_id, int)
+            or expected_observation_id < 1
+            or expected_observation_id > 9223372036854775807
+        ):
+            raise FederationSchemaError(
+                "expectedObservationId must be a positive integer.",
+                code="federation.invalid_observation_id",
+            )
         with self._connect() as connection, connection.cursor() as cur:
-            # Locks the row for the remainder of this call — a concurrent
-            # Observe attempting to record a newer observation on this
-            # same alias blocks until this transaction commits or rolls
-            # back. Without this, a concurrent Observe could commit a
-            # worse observation (schema "changed", or a version drift
-            # that should disable pushdown) after this reads the old
-            # evidence but before the FDW changes below commit, letting
-            # Provision report success — or even re-enable pushdown —
-            # against evidence Observe had already superseded.
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:observe:{alias}",),
+            )
             cur.execute(
                 sql.SQL("""
                     SELECT {}, last_observed_connection_identity,
                            physical_identity, accepted_schema_fingerprint,
-                           accepted_physical_identity
+                           accepted_physical_identity,
+                           accepted_connection_identity,
+                           last_observation_id
                     FROM {}._aliases
                     WHERE alias = %s
                     FOR UPDATE
@@ -883,51 +775,23 @@ class FederationAliasStore:
             last_observed_physical_identity = record.pop("physical_identity")
             accepted_schema_fingerprint = record.pop("accepted_schema_fingerprint")
             accepted_physical_identity = record.pop("accepted_physical_identity")
+            accepted_connection_identity = record.pop(
+                "accepted_connection_identity"
+            )
+            last_observation_id = record.pop("last_observation_id")
             already_provisioned = record["provisionedAt"] is not None
             last_observation = record.get("lastObservation") or {}
-            # Every MAPP caller queries a federated source through the same
-            # mapped remote user (there is only one connectionRef per alias),
-            # so any row-level security the source enforces per connecting
-            # user is bypassed entirely once federated — the mapped role's
-            # full row set becomes visible to every runtime caller. The
-            # generic dataHandlingAcknowledged at registration cannot cover
-            # this: RLS is only discovered later, by Observe. This is a
-            # fast-fail using the *stored* evidence only — it saves a live
-            # remote round-trip in the common case where the last Observe
-            # already showed RLS and nothing acknowledged it since; it is
-            # NOT the authoritative gate (verify_remote_state's live re-check
-            # below is — RLS could just as easily have been enabled *after*
-            # this Observe, which this check alone could never catch).
-            if last_observation.get("rowLevelSecurityDetected") and not (
-                acknowledge_row_level_security
-            ):
+            if last_observation_id != expected_observation_id:
                 raise FederationSchemaError(
-                    f"Alias {alias!r}'s source has row-level security that "
-                    "would be bypassed once federated — acknowledge this "
-                    "explicitly to provision.",
-                    code="federation.row_level_security_not_acknowledged",
+                    f"Alias {alias!r}'s observation changed before approval.",
+                    code="federation.observation_not_current",
                 )
-            # Applies to reprovisioning too, not just the first call: the
-            # reprovision branch below never re-verifies or re-imports the
-            # foreign tables, so without this, /provision on an alias whose
-            # latest observation reports "changed" would still reconcile
-            # connection settings and report success — silently implying
-            # the schema drift it never actually addressed was fine.
             if last_observation.get("schema") != "current":
                 raise FederationSchemaError(
                     f"Alias {alias!r} has not been observed as current — "
                     "observe it again immediately before provisioning.",
                     code="federation.observation_not_current",
                 )
-            # A "current" schema above only proves *some* past Observe call
-            # was current — not that it was taken against the endpoint and
-            # remote role this call is about to provision. If connectionRef's
-            # DBS_<NAME> was rotated to a different host/database, or to a
-            # different remote login role on the same host/database, since
-            # that Observe (e.g. the service restarted with a new value), this
-            # call would otherwise activate identically-named relations, or a
-            # different row set, that were never observed or reviewed under
-            # the role about to be wired up.
             connection_identity = self._connection_identity(connection_url)
             if last_observed_connection_identity != connection_identity:
                 raise FederationSchemaError(
@@ -937,24 +801,7 @@ class FederationAliasStore:
                     "provisioning.",
                     code="federation.observation_not_current",
                 )
-            # The registered tlsPolicy is an attestation the operator made at
-            # registration time — without this, nothing ever checked that the
-            # connectionRef this alias actually resolves to delivers it, so a
-            # registered "verify-full" alias could be provisioned over
-            # plaintext without ever being flagged.
             enforce_tls_policy(record["tlsPolicy"], connection_url)
-            # connection_identity alone can't catch a database dropped,
-            # restored, or replaced in place — that keeps the exact same
-            # host/port/dbname/user (docs/federation-architecture-waypoint.md,
-            # "Drift and retirement": "Different physical database | Raise
-            # identity conflict; require explicit rebind"). Re-fetch the
-            # remote's live physical identity, extension versions, relation
-            # existence/selectability, RLS/security-barrier exposure, and
-            # column/view-definition fingerprint now, all from this one
-            # connection — see federation_capability.verify_remote_state's
-            # docstring for why every decision below must use evidence from
-            # this single live snapshot, never a stored value or a second,
-            # separate connection.
             try:
                 (
                     current_physical_identity,
@@ -972,15 +819,6 @@ class FederationAliasStore:
                     "again.",
                     code="federation.observation_not_current",
                 ) from exc
-            # The stored last_observation.schema == "current" check above
-            # only proves this was true as of the last Observe — none of
-            # Observe's own evidence-collecting checks (existence,
-            # selectability, RLS/security-barrier, or column/view
-            # definition) are re-verified anywhere else, so without this,
-            # a relation dropped, a SELECT revoked, RLS newly enabled, or a
-            # column added / view redefined since that Observe would all be
-            # silently invisible to Provision (physical_identity alone
-            # covers none of them — none change a relation's own oid).
             if not relations_verified:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's allowed relations are no "
@@ -989,109 +827,49 @@ class FederationAliasStore:
                     "provisioning.",
                     code="federation.observation_not_current",
                 )
-            # The authoritative RLS gate — unlike the stored-evidence fast-
-            # fail above, this catches RLS/security-barrier exposure
-            # enabled on the remote at any point up to this live snapshot,
-            # not just what the last Observe happened to see.
+            if (
+                last_observed_physical_identity != current_physical_identity
+                or last_observation.get("schemaFingerprint")
+                    != current_schema_fingerprint
+                or last_observation.get("rowLevelSecurityDetected", False)
+                    != rls_detected
+                or last_observation.get("extensionVersions", {})
+                    != live_remote_versions
+            ):
+                raise FederationSchemaError(
+                    f"Alias {alias!r}'s live evidence no longer matches "
+                    "the observation being approved — observe it again.",
+                    code="federation.observation_not_current",
+                )
             if rls_detected and not acknowledge_row_level_security:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source has row-level security that "
-                    "would be bypassed once federated — acknowledge this "
-                    "explicitly to provision.",
+                    "cannot distinguish individual platform callers: all "
+                    "callers use one mapped remote role. Acknowledge this "
+                    "shared identity explicitly to provision.",
                     code="federation.row_level_security_not_acknowledged",
                 )
-            # Persisted atomically with approval below — a durable record
-            # that the approving principal explicitly accepted the
-            # per-user-RLS bypass this source has *as of this live check*,
-            # not just a transient gate that leaves no trace once a later
-            # Observe replaces last_observation (the append-only
-            # _observations table records what was detected, but not that
-            # it was accepted).
-            rls_bypass_acknowledged = rls_detected and acknowledge_row_level_security
-            # Staleness: the evidence being acted on must have been collected
-            # against the same physical database this call is about to wire
-            # up. Escape hatch is a fresh Observe.
-            if last_observed_physical_identity != current_physical_identity:
-                raise FederationSchemaError(
-                    f"Alias {alias!r}'s source's physical database identity "
-                    "no longer matches its last observation — it may have "
-                    "been dropped, restored, or replaced. Observe it again "
-                    "and review before provisioning.",
-                    code="federation.observation_not_current",
-                )
-            # Acceptance: the live database must still be the one a previous
-            # successful provisioning actually accepted. The staleness check
-            # above cannot cover this — it compares against physical_identity,
-            # which every Observe overwrites, so a source that was replaced
-            # and *then* observed matches itself and sails through (verified
-            # live: a dropped-and-recreated relation kept an identical schema
-            # fingerprint, passed every other gate, and served replacement
-            # rows through the existing foreign table). The doc is explicit
-            # that this is not the same source: "The same table name at a new
-            # physical database is not the same source unless an operator
-            # performs an explicit, evidenced rebind"
-            # (docs/federation-architecture-waypoint.md). None means nothing
-            # has been accepted yet, i.e. this alias's first provisioning.
+            rls_acknowledged = rls_detected and acknowledge_row_level_security
             if (
-                accepted_physical_identity is not None
-                and accepted_physical_identity != current_physical_identity
-                and not acknowledge_physical_rebind
-            ):
+                (
+                    accepted_physical_identity is not None
+                    and accepted_physical_identity != current_physical_identity
+                )
+                or (
+                    accepted_connection_identity is not None
+                    and accepted_connection_identity != connection_identity
+                )
+            ) and not acknowledge_physical_rebind:
                 raise FederationSchemaError(
-                    f"Alias {alias!r}'s source is a different physical "
-                    "database than the one previously accepted — it was "
-                    "dropped, restored, or replaced. Acknowledge this "
-                    "rebind explicitly to provision.",
+                    f"Alias {alias!r}'s source binding differs from the one "
+                    "previously accepted. Acknowledge this rebind explicitly "
+                    "to provision.",
                     code="federation.physical_rebind_not_acknowledged",
                 )
-            # physical_identity only proves the relation itself wasn't
-            # dropped/recreated — an ADD COLUMN or a CREATE OR REPLACE VIEW
-            # that narrows or drops a row-filtering predicate changes
-            # neither a relation's oid nor its RLS flags, so without this,
-            # either could silently reach every runtime caller through the
-            # blanket GRANT SELECT below, never having been reviewed.
-            # Compared against accepted_schema_fingerprint (durable, set
-            # only by a prior successful provision() below), not against
-            # last_observation — the latter is exactly what every Observe
-            # overwrites, including one that itself reports the drift, so
-            # comparing against it would self-heal the moment anyone
-            # observes twice with nothing further changed. None means
-            # nothing has been accepted yet (this alias's first
-            # provisioning) — handled separately just below, since there
-            # is nothing yet to acknowledge past.
             schema_fingerprint_changed = (
                 accepted_schema_fingerprint is not None
                 and accepted_schema_fingerprint != current_schema_fingerprint
             )
-            # On a first-ever provisioning, accepted_schema_fingerprint is
-            # always None, so the check above is vacuously false — nothing
-            # yet compares the live fingerprint against what the last
-            # Observe actually saw. Without this, a column added or a view
-            # redefined between Observe and this call would import
-            # unreviewed: relations_verified and physical_identity both
-            # stay true (neither changes on an ADD COLUMN or a same-object
-            # CREATE OR REPLACE VIEW), so nothing else here would catch it.
-            # last_observation.get("schema") == "current" already passed
-            # above, and detect_capability() always sets schemaFingerprint
-            # alongside schema in its reachable branch, so it's guaranteed
-            # present here. This is deliberately observation_not_current,
-            # not schema_change_not_acknowledged: the human's last Observe
-            # is the only thing ever reviewed for a first provisioning, so
-            # a live mismatch means that review is stale — there is
-            # nothing yet accepted to knowingly acknowledge past, only
-            # fresher evidence to go collect.
-            if (
-                accepted_schema_fingerprint is None
-                and last_observation.get("schemaFingerprint")
-                != current_schema_fingerprint
-            ):
-                raise FederationSchemaError(
-                    f"Alias {alias!r}'s source's relation definitions "
-                    "(columns or view query) no longer match its last "
-                    "observation — observe it again immediately before "
-                    "provisioning.",
-                    code="federation.observation_not_current",
-                )
             if schema_fingerprint_changed and not acknowledge_schema_change:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s source's relation definitions "
@@ -1108,159 +886,95 @@ class FederationAliasStore:
             password = str(params.get("password", ""))
             server_name = f"{alias}_srv"
             schema_name = f"source_{alias}"
+            expected_bindings = {
+                relation.split(".", 1)[1]: relation.split(".", 1)
+                for relation in record["allowedRelations"]
+            }
 
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
 
-            # postgres_fdw only ships operators/functions to the remote
-            # side for extensions explicitly marked "shippable" — PostGIS
-            # isn't in its built-in list, so spatial predicates would
-            # otherwise pull the whole remote relation and filter locally.
-            # Only mark it shippable when the federation database's own
-            # PostGIS/PROJ/GEOS versions exactly match the remote's *live*
-            # versions, just re-verified above — an in-place extension
-            # upgrade on the remote changes no OID at all, so the physical-
-            # identity check above can't catch a version drift since
-            # Observe, and comparing against Observe's stored
-            # lastObservation.extensionVersions instead of this live value
-            # would risk enabling pushdown against a version the remote no
-            # longer actually has. An unconditional claim would risk a
-            # silently wrong pushed-down result, not just a remote
-            # execution error. This is a same-owner, non-superuser server
-            # option; it does not duplicate any data, it only widens what
-            # may cross the wire as a pushed-down predicate instead of a
-            # full relation.
             local_versions = extension_versions(cur)
             shippable = self._shippable_extensions(
                 local_versions, live_remote_versions
             )
+            desired_server_options = {
+                "host": host,
+                "port": port,
+                "dbname": dbname,
+                "use_remote_estimate": "true",
+            }
+            for option_name in self._FORWARDED_CONNECTION_OPTIONS:
+                value = params.get(option_name)
+                if value:
+                    desired_server_options[option_name] = str(value)
+            if shippable:
+                desired_server_options["extensions"] = ",".join(shippable)
 
             if already_provisioned:
-                # A reprovisioning call is also the only place a rotated
-                # connectionRef (new password, host, or database behind the
-                # same alias) ever reaches the live foreign server —
-                # reconcile it every time, not just the extensions option.
-                cur.execute(sql.SQL("""
-                    ALTER SERVER {server} OPTIONS (
-                        SET host {host}, SET port {port}, SET dbname {dbname}
-                    )
-                """).format(
-                    server=sql.Identifier(server_name),
-                    host=sql.Literal(host),
-                    port=sql.Literal(port),
-                    dbname=sql.Literal(dbname),
-                ))
                 current_server_options = self._current_server_options(
                     cur, server_name
                 )
-                self._reconcile_forwarded_options(
-                    cur, server_name, current_server_options, params
+                self._reconcile_server_options(
+                    cur,
+                    server_name,
+                    current_server_options,
+                    desired_server_options,
                 )
-                cur.execute(sql.SQL("""
-                    ALTER USER MAPPING FOR CURRENT_USER SERVER {server}
-                    OPTIONS (SET user {user}, SET password {password})
-                """).format(
-                    server=sql.Identifier(server_name),
-                    user=sql.Literal(user),
-                    password=sql.Literal(password),
-                ))
-                # DROP + CREATE, not ALTER: an alias provisioned before the
-                # reader mapping existed has no mapping for self.reader_role
-                # yet to ALTER — this converges it the next time it's
-                # reprovisioned, and is a no-op-then-recreate for one that
-                # already has a mapping.
-                cur.execute(sql.SQL("""
-                    DROP USER MAPPING IF EXISTS FOR {reader} SERVER {server}
-                """).format(
-                    reader=sql.Identifier(self.reader_role),
-                    server=sql.Identifier(server_name),
-                ))
-                cur.execute(sql.SQL("""
-                    CREATE USER MAPPING FOR {reader} SERVER {server}
-                    OPTIONS (user {user}, password {password})
-                """).format(
-                    reader=sql.Identifier(self.reader_role),
-                    server=sql.Identifier(server_name),
-                    user=sql.Literal(user),
-                    password=sql.Literal(password),
-                ))
-                current = self._current_shippable_extensions(cur, server_name)
-                self._apply_shippable_extensions(cur, server_name, current, shippable)
-                if schema_fingerprint_changed:
-                    # Reaching here means acknowledge_schema_change was true
-                    # (the gate above already raised otherwise) — the
-                    # foreign tables' columns/types are fixed at IMPORT
-                    # time and never auto-update, so persisting the new
-                    # accepted fingerprint below without reconciling them
-                    # would silence this warning forever while every
-                    # runtime query kept using the stale local definition.
-                    # See provision()'s docstring for why DROP + reimport,
-                    # not ALTER FOREIGN TABLE.
-                    for relation in record["allowedRelations"]:
-                        _, remote_table = relation.split(".", 1)
-                        cur.execute(
-                            sql.SQL("DROP FOREIGN TABLE {}.{}").format(
-                                sql.Identifier(schema_name),
-                                sql.Identifier(remote_table),
-                            )
-                        )
-                    self._import_and_grant(
-                        cur,
-                        alias,
-                        server_name,
-                        schema_name,
-                        record["allowedRelations"],
-                        self.reader_role,
-                    )
                 cur.execute(
-                    sql.SQL("""
-                        UPDATE {}._aliases
-                        SET approved_by = %s, approved_at = clock_timestamp(),
-                            row_level_security_acknowledged = %s,
-                            accepted_schema_fingerprint = %s,
-                            accepted_physical_identity = %s
-                        WHERE alias = %s
-                    """).format(sql.Identifier(SCHEMA)),
-                    (
-                        actor,
-                        rls_bypass_acknowledged,
-                        current_schema_fingerprint,
-                        current_physical_identity,
-                        alias,
-                    ),
+                    "SELECT n.nspowner = (SELECT oid FROM pg_catalog.pg_roles "
+                    "WHERE rolname = current_user) AS owned "
+                    "FROM pg_catalog.pg_namespace AS n WHERE n.nspname = %s",
+                    (schema_name,),
                 )
+                local_schema = cur.fetchone()
+                if local_schema is None or not local_schema["owned"]:
+                    raise FederationSchemaError(
+                        f"Federation schema {schema_name!r} is missing or "
+                        "owned by another role.",
+                        code="federation.local_state_invalid",
+                )
+                bindings = self._local_relation_bindings(cur, schema_name)
+                if bindings.keys() - expected_bindings.keys():
+                    raise FederationSchemaError(
+                        f"Federation schema {schema_name!r} contains an "
+                        "unmanaged relation.",
+                        code="federation.local_state_invalid",
+                    )
+                relations_to_import = []
+                for relation in record["allowedRelations"]:
+                    remote_schema, remote_table = relation.split(".", 1)
+                    binding = bindings.get(remote_table)
+                    if binding is not None and (
+                        binding["relkind"] != "f" or not binding["owned"]
+                    ):
+                        raise FederationSchemaError(
+                            f"Federation relation {schema_name}.{remote_table} "
+                            "is not an owned foreign table.",
+                            code="federation.local_state_invalid",
+                        )
+                    binding_current = self._binding_matches(
+                        binding, server_name, remote_schema, remote_table
+                    )
+                    if (
+                        accepted_schema_fingerprint is None
+                        or schema_fingerprint_changed
+                        or not binding_current
+                    ):
+                        if binding is not None:
+                            cur.execute(
+                                sql.SQL("DROP FOREIGN TABLE {}.{}").format(
+                                    sql.Identifier(schema_name),
+                                    sql.Identifier(remote_table),
+                                )
+                            )
+                        relations_to_import.append(relation)
             else:
                 server_options = [
-                    sql.SQL("host {}").format(sql.Literal(host)),
-                    sql.SQL("port {}").format(sql.Literal(port)),
-                    sql.SQL("dbname {}").format(sql.Literal(dbname)),
-                    sql.SQL("use_remote_estimate 'true'"),
-                ]
-                # Forward whatever the operator already put in the
-                # connectionRef's connection string (the repo's existing
-                # sslmode/sslrootcert convention — see .env.example) instead of
-                # letting libpq silently fall back to its own permissive
-                # default. Same tuple the reprovision path reconciles against,
-                # so create and reconcile cannot drift apart.
-                for option_name in self._FORWARDED_CONNECTION_OPTIONS:
-                    value = params.get(option_name)
-                    if value:
-                        server_options.append(
-                            sql.SQL("{} {}").format(
-                                sql.Identifier(option_name), sql.Literal(str(value))
-                            )
-                        )
-                if shippable:
-                    server_options.append(
-                        sql.SQL("extensions {}").format(
-                            sql.Literal(",".join(shippable))
-                        )
+                    sql.SQL("{} {}").format(
+                        sql.Identifier(name), sql.Literal(value)
                     )
-                # Not IF NOT EXISTS: same reasoning as the schema below — a
-                # not-yet-provisioned alias should never legitimately reach a
-                # pre-existing <alias>_srv. Silently reusing one from an
-                # unrelated origin (and possibly a different actual remote
-                # endpoint) would import and grant access to the wrong data
-                # under this alias's name. Fail closed.
+                    for name, value in desired_server_options.items()
+                ]
                 cur.execute(sql.SQL("""
                     CREATE SERVER {server}
                     FOREIGN DATA WRAPPER postgres_fdw
@@ -1269,110 +983,134 @@ class FederationAliasStore:
                     server=sql.Identifier(server_name),
                     options=sql.SQL(", ").join(server_options),
                 ))
-                cur.execute(sql.SQL("""
-                    CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER
-                    SERVER {server}
-                    OPTIONS (user {user}, password {password})
-                """).format(
-                    server=sql.Identifier(server_name),
-                    user=sql.Literal(user),
-                    password=sql.Literal(password),
-                ))
-                # A security_invoker=true derived VIEW (derived_layers.py) runs
-                # its underlying query as whichever role queries the view — the
-                # runtime reader, not the derived owner — so it needs its own
-                # mapping too, not just CURRENT_USER's. Both mappings use the
-                # same remote credential; there is only one connectionRef per
-                # alias. (A materialized view's REFRESH always runs as the
-                # derived owner, so this isn't needed for that path, but views
-                # are a supported derived-layer kind and must work too.)
-                cur.execute(sql.SQL("""
-                    CREATE USER MAPPING IF NOT EXISTS FOR {reader}
-                    SERVER {server}
-                    OPTIONS (user {user}, password {password})
-                """).format(
-                    reader=sql.Identifier(self.reader_role),
-                    server=sql.Identifier(server_name),
-                    user=sql.Literal(user),
-                    password=sql.Literal(password),
-                ))
-                # Not IF NOT EXISTS: an alias's own reprovisioning never reaches
-                # this branch (see already_provisioned above), so the only way
-                # this schema could already exist here is an unrelated object —
-                # e.g. a stray schema an operator created by hand that happens
-                # to collide with source_<alias>. Silently reusing it would
-                # import into and then GRANT SELECT ON ALL TABLES IN that
-                # schema, exposing whatever was already there. Fail closed.
                 cur.execute(
                     sql.SQL("CREATE SCHEMA {}").format(
                         sql.Identifier(schema_name)
                     )
                 )
-                # KNOWN GAP, deliberately not closed here (PR #25 review,
-                # round 20): verify_remote_state() above closes its own
-                # connection before this IMPORT FOREIGN SCHEMA runs, which
-                # opens a separate FDW-managed connection to the remote —
-                # DDL between the two could let this bind a replacement or
-                # altered relation that the live verification above never
-                # actually saw. Closing it would mean re-verifying physical
-                # identity and schema fingerprint again after import,
-                # before this transaction commits. Judged not worth the
-                # added complexity for this test slice; revisit if this
-                # module moves beyond a test slice.
-                self._import_and_grant(
+                relations_to_import = list(record["allowedRelations"])
+
+            for role in (None, self.derived_role, self.reader_role):
+                principal = (
+                    sql.SQL("CURRENT_USER")
+                    if role is None
+                    else sql.Identifier(role)
+                )
+                cur.execute(sql.SQL("""
+                    DROP USER MAPPING IF EXISTS FOR {principal} SERVER {server}
+                """).format(
+                    principal=principal,
+                    server=sql.Identifier(server_name),
+                ))
+                cur.execute(sql.SQL("""
+                    CREATE USER MAPPING FOR {principal} SERVER {server}
+                    OPTIONS (user {user}, password {password})
+                """).format(
+                    principal=principal,
+                    server=sql.Identifier(server_name),
+                    user=sql.Literal(user),
+                    password=sql.Literal(password),
+                ))
+
+            if relations_to_import:
+                self._import_relations(
                     cur,
                     alias,
                     server_name,
                     schema_name,
-                    record["allowedRelations"],
-                    self.reader_role,
+                    relations_to_import,
+                )
+                try:
+                    imported_state = verify_remote_state(
+                        connection_url, tuple(record["allowedRelations"])
+                    )
+                except psycopg.Error as exc:
+                    raise FederationSchemaError(
+                        f"Alias {alias!r}'s source changed while importing.",
+                        code="federation.observation_not_current",
+                    ) from exc
+                if imported_state != (
+                    current_physical_identity,
+                    live_remote_versions,
+                    relations_verified,
+                    rls_detected,
+                    current_schema_fingerprint,
+                ):
+                    raise FederationSchemaError(
+                        f"Alias {alias!r}'s source changed while importing.",
+                        code="federation.observation_not_current",
+                    )
+
+            local_bindings = self._local_relation_bindings(cur, schema_name)
+            valid_local_state = local_bindings.keys() == expected_bindings.keys()
+            valid_local_state = valid_local_state and all(
+                self._binding_matches(
+                    local_bindings[remote_table],
+                    server_name,
+                    remote_schema,
+                    remote_table,
+                )
+                for remote_table, (remote_schema, _) in expected_bindings.items()
+            )
+            if not valid_local_state:
+                raise FederationSchemaError(
+                    f"Federation schema {schema_name!r} does not exactly "
+                    "match its registered allowlist.",
+                    code="federation.local_state_invalid",
+                )
+
+            for role in dict.fromkeys((self.derived_role, self.reader_role)):
+                cur.execute(
+                    sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(role)
+                    )
                 )
                 cur.execute(
-                    sql.SQL("""
-                        UPDATE {}._aliases
-                        SET provisioned_at = clock_timestamp(), status = 'active',
-                            approved_by = %s, approved_at = clock_timestamp(),
-                            row_level_security_acknowledged = %s,
-                            accepted_schema_fingerprint = %s,
-                            accepted_physical_identity = %s
-                        WHERE alias = %s
-                    """).format(sql.Identifier(SCHEMA)),
-                    (
-                        actor,
-                        rls_bypass_acknowledged,
-                        current_schema_fingerprint,
-                        current_physical_identity,
-                        alias,
-                    ),
+                    sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA {} TO {}").format(
+                        sql.Identifier(schema_name), sql.Identifier(role)
+                    )
                 )
-            return self._get_with_cursor(cur, alias)
 
-    def affected_derived_layer_names(self, alias: str) -> list[str]:
-        """Derived layers whose declared sources read from this alias's
-        foreign schema (`source_<alias>`) — the impact-visibility query."""
-        alias = validate_alias(alias)
-        with self._connect() as connection, connection.cursor() as cur:
-            # derived_layers._definitions is created lazily by
-            # DerivedLayerStore._initialize() on first use, not by
-            # database init — a fresh deployment that registered a
-            # federation alias but never called a derived-layer endpoint
-            # has the `derived_layers` schema (init script) but not yet
-            # this table. An absent table has no rows to depend on any
-            # alias, so it's an empty dependency set, not an error.
-            cur.execute(
-                "SELECT to_regclass('derived_layers._definitions') AS oid"
-            )
-            if cur.fetchone()["oid"] is None:
-                return []
             cur.execute(
                 sql.SQL("""
-                    SELECT name FROM {}._definitions
-                    WHERE EXISTS (
-                      SELECT 1 FROM unnest(sources) AS source
-                      WHERE split_part(source, '.', 1) = %s
-                    )
-                    ORDER BY name
-                """).format(sql.Identifier(DERIVED_LAYERS_SCHEMA)),
-                (f"source_{alias}",),
+                    INSERT INTO {}._approvals
+                      (alias, observation_id, approved_by,
+                       acknowledged_row_level_security,
+                       acknowledged_schema_change,
+                       acknowledged_physical_rebind)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """).format(sql.Identifier(SCHEMA)),
+                (
+                    alias,
+                    expected_observation_id,
+                    actor,
+                    acknowledge_row_level_security,
+                    acknowledge_schema_change,
+                    acknowledge_physical_rebind,
+                ),
             )
-            return [row["name"] for row in cur.fetchall()]
+            cur.execute(
+                sql.SQL("""
+                    UPDATE {}._aliases
+                    SET provisioned_at = COALESCE(
+                            provisioned_at, clock_timestamp()
+                        ),
+                        status = 'active',
+                        approved_by = %s,
+                        approved_at = clock_timestamp(),
+                        row_level_security_acknowledged = %s,
+                        accepted_schema_fingerprint = %s,
+                        accepted_physical_identity = %s,
+                        accepted_connection_identity = %s
+                    WHERE alias = %s
+                """).format(sql.Identifier(SCHEMA)),
+                (
+                    actor,
+                    rls_acknowledged,
+                    current_schema_fingerprint,
+                    current_physical_identity,
+                    connection_identity,
+                    alias,
+                ),
+            )
+            return self._get_with_cursor(cur, alias)

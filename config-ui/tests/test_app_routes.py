@@ -21,7 +21,7 @@ class FederationEnabledTests(unittest.TestCase):
     def test_requires_both_a_connection_url_and_bundled_mode(self):
         self.assertTrue(app.federation_enabled("postgresql://x", "bundled"))
 
-    def test_disabled_without_a_derived_database_url(self):
+    def test_disabled_without_a_federation_database_url(self):
         self.assertFalse(app.federation_enabled(None, "bundled"))
         self.assertFalse(app.federation_enabled("", "bundled"))
 
@@ -30,7 +30,7 @@ class FederationEnabledTests(unittest.TestCase):
         # ownership of derived_layers alone — not the federation schema,
         # postgres_fdw, or the database-level CREATE that provisioning
         # needs, so an external deployment must never see federation
-        # routes enabled even if it happens to set DERIVED_DATABASE_URL.
+        # routes enabled even if it happens to set FEDERATION_DATABASE_URL.
         self.assertFalse(app.federation_enabled("postgresql://x", "external"))
         self.assertFalse(app.federation_enabled("postgresql://x", None))
         self.assertFalse(app.federation_enabled("postgresql://x", ""))
@@ -46,13 +46,13 @@ class FederationAliasActionRouteTests(unittest.TestCase):
     by the outer handler chain, and must keep passing through untouched."""
 
     @staticmethod
-    def handler(action, *, actor="admin"):
+    def handler(action, *, actor="admin", payload=None):
         responses = []
         handler = object.__new__(app.Handler)
         handler.path = f"/api/federation/aliases/leeds_ext/{action}"
         handler._host_allowed = lambda: True
         handler._authorized = lambda state_change=False: actor
-        handler._payload = lambda: {}
+        handler._payload = lambda: {} if payload is None else payload
         handler._remote = lambda: "127.0.0.1"
         handler._json = lambda status, body: responses.append((status, body))
         handler.send_error = lambda status: responses.append((status, {}))
@@ -96,14 +96,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
         self.assertEqual("federation.registry_unavailable", body["code"])
 
-    def test_observe_route_calls_federation_observe_not_record_observation(
-        self,
-    ):
-        # The route must go through the new, serialized FEDERATION.observe()
-        # entry point (round 25 fix) rather than calling detect_capability()
-        # and FEDERATION.record_observation() separately here — the whole
-        # point of the fix is that the probe and the persisted write happen
-        # inside the same held per-alias lock, which only observe() does.
+    def test_observe_route_calls_the_serialized_store_operation(self):
         federation = MagicMock()
         federation.get.return_value = {
             "connectionRef": "LEEDS_EXT",
@@ -111,6 +104,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
             "tlsPolicy": "require",
         }
         federation.observe.return_value = {
+            "lastObservationId": 42,
             "lastObservation": {"connectivity": "reachable"},
         }
         handler, responses = self.handler("observe")
@@ -129,9 +123,71 @@ class FederationAliasActionRouteTests(unittest.TestCase):
             allowed_relations=("leeds.smoke_control_orders",),
             tls_policy="require",
         )
-        self.assertFalse(federation.record_observation.called)
         self.assertEqual(1, len(responses))
         self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_binds_approval_to_the_observed_revision(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.provision.return_value = {"alias": "leeds_ext"}
+        handler, responses = self.handler(
+            "provision",
+            payload={
+                "expectedObservationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+        )
+        control = MagicMock()
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", control
+        ), patch.object(
+            app, "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.provision.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            "admin",
+            expected_observation_id=42,
+            acknowledge_row_level_security=False,
+            acknowledge_schema_change=True,
+            acknowledge_physical_rebind=False,
+        )
+        self.assertEqual(
+            {
+                "alias": "leeds_ext",
+                "observationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+            control.audit.call_args.kwargs["details"],
+        )
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_requires_a_positive_observation_id(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        handler, responses = self.handler("provision", payload={})
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("federation.invalid_request", responses[0][1]["code"])
+        federation.provision.assert_not_called()
 
     def test_a_federation_schema_error_still_carries_its_own_status_and_code(
         self,
@@ -203,6 +259,23 @@ class FederationAliasReadRouteTests(unittest.TestCase):
         status, body = responses[0]
         self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
         self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_list_uses_the_store_bound_without_cursor_surface(self):
+        federation = MagicMock()
+        federation.list.return_value = [
+            {"alias": "alpha"},
+            {"alias": "bravo"},
+        ]
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        federation.list.assert_called_once_with()
+        self.assertEqual(
+            [{"alias": "alpha"}, {"alias": "bravo"}],
+            responses[0][1]["aliases"],
+        )
 
     def test_get_by_name_preserves_not_configured_status_and_code(self):
         handler, responses = self.handler("/api/federation/aliases/leeds_ext")

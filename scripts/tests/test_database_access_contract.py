@@ -39,6 +39,23 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(path=relative_path, contract=contract):
                 self.assertIn(contract, source)
 
+    def assert_federation_role_defaults(self, relative_path: str) -> None:
+        source = self.normalized(relative_path)
+        for contract in (
+            'ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;',
+            'ALTER ROLE :"federation_db_user" SET search_path = pg_catalog, public;',
+            'ALTER ROLE :"federation_db_user" SET work_mem = \'16MB\';',
+            'ALTER ROLE :"federation_db_user" SET hash_mem_multiplier = \'1\';',
+            'ALTER ROLE :"federation_db_user" SET maintenance_work_mem = \'64MB\';',
+            'ALTER ROLE :"federation_db_user" SET max_parallel_workers_per_gather = \'2\';',
+            'ALTER ROLE :"federation_db_user" SET temp_file_limit = \'1GB\';',
+            'ALTER ROLE :"federation_db_user" SET statement_timeout = \'30min\';',
+            'ALTER ROLE :"federation_db_user" SET transaction_timeout = \'35min\';',
+            'ALTER ROLE :"federation_db_user" SET lock_timeout = \'5s\';',
+        ):
+            with self.subTest(path=relative_path, contract=contract):
+                self.assertIn(contract, source)
+
     def assert_h3_sql_wrapper_hardening(self, relative_path: str) -> None:
         source = self.normalized(relative_path)
         for contract in (
@@ -88,7 +105,11 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "DERIVED_DB_USER",
             "DERIVED_DB_PASSWORD",
             "DERIVED_DATABASE_URL",
+            "DERIVED_OWNER_ROLE",
             "DERIVED_READER_ROLE",
+            "FEDERATION_DB_USER",
+            "FEDERATION_DB_PASSWORD",
+            "FEDERATION_DATABASE_URL",
         }
         for relative_path in ("bin/mapp", "scripts/verify.sh"):
             with self.subTest(path=relative_path):
@@ -267,6 +288,58 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertNotIn("ON SEQUENCES", source)
         self.assert_resource_role_defaults("docker/postgis/init/10-roles.sh")
+        self.assert_federation_role_defaults("docker/postgis/init/10-roles.sh")
+        self.assertIn(
+            'CREATE SCHEMA federation AUTHORIZATION :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'GRANT CREATE ON DATABASE :"DBNAME" TO :"federation_db_user";',
+            normalized,
+        )
+        self.assertNotIn(
+            'GRANT CREATE ON DATABASE :"DBNAME" TO :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE CREATE ON DATABASE :"DBNAME" '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'TO :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA federation '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION '
+            'NOBYPASSRLS PASSWORD',
+            normalized,
+        )
 
     def test_upgrade_repairs_legacy_database_and_sequence_privileges(self) -> None:
         source = (
@@ -280,7 +353,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'REVOKE TEMPORARY ON DATABASE :"DBNAME" '
-            'FROM :"xyz_db_user", :"derived_db_user";',
+            'FROM :"xyz_db_user", :"derived_db_user", '
+            ':"federation_db_user";',
             normalized,
         )
         self.assertIn(
@@ -290,7 +364,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'GRANT CONNECT ON DATABASE :"DBNAME" '
-            'TO :"xyz_db_user", :"derived_db_user";',
+            'TO :"xyz_db_user", :"derived_db_user", '
+            ':"federation_db_user";',
             normalized,
         )
         self.assertIn(
@@ -317,6 +392,69 @@ class DatabaseAccessContractTests(unittest.TestCase):
             source,
         )
         self.assert_resource_role_defaults("docker/postgis/upgrade-derived.sh")
+        self.assert_federation_role_defaults(
+            "docker/postgis/upgrade-derived.sh"
+        )
+        self.assertIn(
+            "Refusing to take ownership of existing federation schema",
+            source,
+        )
+        for object_kind in ("object", "schema", "table", "server"):
+            with self.subTest(object_kind=object_kind):
+                self.assertIn(
+                    f"Refusing to migrate known federation {object_kind}",
+                    source,
+                )
+        self.assertIn(
+            "owner_role.rolname NOT IN (derived_role, federation_role)",
+            normalized,
+        )
+        self.assertNotIn(
+            'ALTER SCHEMA federation OWNER TO :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE CREATE ON DATABASE :"DBNAME" '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            "REVOKE USAGE ON FOREIGN SERVER %I FROM %I, %I", normalized
+        )
+        self.assertIn("alias_record.status = 'active'", normalized)
+        self.assertIn(
+            "REVOKE USAGE ON SCHEMA %I FROM %I, %I", normalized
+        )
+        self.assertIn(
+            "REVOKE SELECT ON TABLE %I.%I FROM %I, %I", normalized
+        )
+        self.assertIn(
+            "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA federation",
+            normalized,
+        )
+        self.assertIn(
+            "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA federation",
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
+            'FROM :"xyz_db_user", :"federation_db_user";',
+            normalized,
+        )
         self.assert_h3_sql_wrapper_hardening(
             "docker/postgis/upgrade-derived.sh"
         )
@@ -324,6 +462,106 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "sh /usr/local/bin/mapp-prepare-spatial-indexes ensure",
             source,
         )
+
+    def test_upgrade_demotes_unbaselined_active_federation_aliases(self) -> None:
+        normalized = self.normalized("docker/postgis/upgrade-derived.sh")
+        columns = {
+            "accepted_schema_fingerprint": "text",
+            "accepted_physical_identity": "text",
+            "accepted_connection_identity": "text",
+            "last_observation_id": "bigint",
+        }
+        for column, column_type in columns.items():
+            with self.subTest(column=column):
+                self.assertIn(
+                    f"ADD COLUMN IF NOT EXISTS {column} {column_type}",
+                    normalized,
+                )
+                self.assertIn(f"{column} IS NULL", normalized)
+
+        demotion = (
+            "UPDATE federation._aliases SET status = 'unavailable' "
+            "WHERE provisioned_at IS NOT NULL AND status = 'active'"
+        )
+        self.assertIn(demotion, normalized)
+        self.assertLess(
+            normalized.index(demotion), normalized.index("FOR alias_record IN")
+        )
+
+    def test_upgrade_refuses_an_unsafe_existing_federation_role_early(
+        self,
+    ) -> None:
+        source = (
+            ROOT / "docker/postgis/upgrade-derived.sh"
+        ).read_text(encoding="utf-8")
+        normalized = self.normalized("docker/postgis/upgrade-derived.sh")
+        guard = source.index(
+            "Refusing to alter existing federation role % with unsafe attributes"
+        )
+
+        self.assertLess(guard, source.index("CREATE EXTENSION IF NOT EXISTS h3;"))
+        self.assertLess(
+            guard,
+            source.index(
+                'ALTER ROLE :"federation_db_user" LOGIN PASSWORD'
+            ),
+        )
+        for attribute in (
+            "rolsuper",
+            "rolcreatedb",
+            "rolcreaterole",
+            "rolreplication",
+            "rolbypassrls",
+        ):
+            with self.subTest(attribute=attribute):
+                self.assertIn(f"federation_role.{attribute}", normalized)
+        self.assertIn("FROM pg_catalog.pg_auth_members AS membership", normalized)
+        self.assertIn(
+            "membership.roleid = federation_role.oid OR "
+            "membership.member = federation_role.oid",
+            normalized,
+        )
+        self.assertIn(
+            "Refusing to alter existing federation role % with memberships",
+            source,
+        )
+        self.assertIn(
+            "CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS PASSWORD %L",
+            normalized,
+        )
+
+    def test_federation_role_collision_fails_before_database_mutation(self) -> None:
+        for relative in (
+            "docker/postgis/init/10-roles.sh",
+            "docker/postgis/upgrade-derived.sh",
+        ):
+            with self.subTest(relative=relative):
+                source = (ROOT / relative).read_text(encoding="utf-8")
+                guard = source.index("FEDERATION_DB_USER must be distinct")
+                self.assertLess(guard, source.index("psql "))
+                for role in (
+                    "POSTGRES_USER",
+                    "ETL_DB_USER",
+                    "XYZ_DB_USER",
+                    "DERIVED_DB_USER",
+                ):
+                    self.assertIn(
+                        f'FEDERATION_DB_USER}}" = "${{{role}', source
+                    )
+
+    def test_healthcheck_allows_the_pre_role_split_upgrade_to_start(self) -> None:
+        healthcheck = (
+            ROOT / "docker/postgis/healthcheck.sh"
+        ).read_text(encoding="utf-8")
+        wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+
+        self.assertIn('up --detach --build --no-deps --wait db', wrapper)
+        self.assertIn(
+            'exec -T db sh /usr/local/bin/mapp-upgrade-derived', wrapper
+        )
+        self.assertNotIn("federation_db_user", healthcheck)
+        self.assertNotIn("nspname = 'federation'", healthcheck)
 
     def test_verifier_covers_reader_derived_and_census_audit_edges(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
@@ -335,6 +573,13 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "Bundled database CONNECT and TEMPORARY must be revoked from PUBLIC",
             "Runtime reader and derived owner defaults must not permit sequence mutation",
             "Runtime reader and derived owner must both read %",
+            'AS "canUseFdw"',
+            'AS "canCreateSchema"',
+            'AS "canCreateDatabaseObject"',
+            'audit["canUseFdw"]',
+            'audit["canCreateSchema"]',
+            "audit.canUseFdw",
+            "audit.canCreateDatabaseObject",
             'current_user::text AS "currentUser"',
             'session_user::text AS "sessionUser"',
             'AS "hasTemporary"',
@@ -377,244 +622,110 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
 
-    def test_derived_owner_schema_exemption_is_name_scoped_not_blanket_ownership(
-        self,
-    ) -> None:
-        # federation_store.py's provision() dynamically creates one
-        # source_<alias> schema per registered alias, owned by the same
-        # derived-owner role as the two fixed schemas (derived_layers,
-        # federation) — a static name allowlist can't enumerate those, but
-        # exempting a schema purely because the role owns it would let an
-        # unexpected schema (e.g. public) silently escape the unsafe-
-        # privilege audit if it ever ended up owned by that role through a
-        # future bug or operator error. The exemption must always require
-        # BOTH ownership AND (one of the two fixed names OR a real
-        # registered, provisioned alias) — never ownership alone.
-        source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
-        self.assertNotIn("namespace.nspowner <> login_role.oid", source)
-        self.assertNotIn("namespace.nspowner <> reachable_role.oid", source)
+    def test_derived_and_federation_ownership_are_separate(self) -> None:
         normalized = self.normalized("scripts/verify.sh")
-        for owner_variable in ("login_role.oid", "reachable_role.oid"):
-            with self.subTest(owner_variable=owner_variable):
-                self.assertIn(
-                    f"namespace.nspowner = {owner_variable}", normalized
-                )
-        self.assertIn(
+        self.assertNotIn(
             "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
             normalized,
         )
-        # A name/pattern match alone is not enough: the derived owner has
-        # database-level CREATE (needed for provision() itself), so it
-        # could create a same-shaped schema (e.g. source_fake) without
-        # ever registering a real alias. The exemption must join against
-        # the actual registry, not just recognize the naming convention.
-        self.assertIn("FROM federation._aliases AS fed_alias", normalized)
+        self.assertNotIn("FROM federation._aliases AS fed_alias", normalized)
         self.assertIn(
-            "namespace.nspname = ($$source_$$ || fed_alias.alias)",
+            "namespace.nspowner = login_role.oid AND "
+            "namespace.nspname = $$derived_layers$$",
             normalized,
         )
         self.assertIn(
-            "fed_alias.provisioned_at IS NOT NULL", normalized
+            'federation_audit["ownsFederationSchema"]', normalized
         )
-
-    def test_source_schema_exemption_requires_the_managed_foreign_table_itself(
-        self,
-    ) -> None:
-        # A source_<alias> schema match plus provisioned_at IS NOT NULL
-        # (the previous test) still only proves the SCHEMA is legitimate —
-        # the derived-owner role owns that schema (needed for IMPORT
-        # FOREIGN SCHEMA to work), so it could create an ordinary local
-        # table/view/sequence there, or a foreign table bound to a
-        # DIFFERENT server, and either would still be silently exempted
-        # without this. Nor is being a foreign table bound to the right
-        # server enough on its own: `ALTER FOREIGN TABLE ... OPTIONS (SET
-        # schema_name/table_name ...)` can retarget which *remote*
-        # relation it actually queries without changing its local name,
-        # relkind, or server. The relation/sequence-level unsafe-privilege
-        # checks (not the schema-level CREATE-privilege checks, which
-        # legitimately stay schema-scoped) must additionally require the
-        # foreign table's own schema_name/table_name options — the actual
-        # remote binding postgres_fdw uses, not just local naming — to
-        # match one of the alias's registered allowedRelations.
-        normalized = self.normalized("scripts/verify.sh")
-        self.assertEqual(
-            6, normalized.count("fed_alias.provisioned_at IS NOT NULL"),
-            "expected exactly 6 fed_alias exemption blocks (3 checks x "
-            "login_role/reachable_role) — a count drift here means a "
-            "check was added, removed, or merged without updating this "
-            "test.",
-        )
-        # Exactly 4 of the 6 are relation/sequence-level and must be
-        # tightened; the other 2 are schema-level CREATE-privilege checks
-        # and must NOT reference foreign-table binding at all.
-        self.assertEqual(4, normalized.count("relation.relkind = $$f$$"))
-        self.assertEqual(
-            4, normalized.count("FROM pg_catalog.pg_foreign_table")
-        )
-        self.assertEqual(
-            4, normalized.count("JOIN pg_catalog.pg_foreign_server")
-        )
-        self.assertEqual(
-            4, normalized.count("foreign_server.srvname = (fed_alias.alias || $$_srv$$)")
-        )
-        # The foreign table's actual remote binding (schema_name +
-        # table_name options — always set explicitly by IMPORT FOREIGN
-        # SCHEMA) must match one of the alias's registered
-        # allowedRelations, not just its local name.
-        self.assertEqual(
-            8, normalized.count("FROM unnest(foreign_table.ftoptions) AS option")
-        )
-        self.assertEqual(
-            4, normalized.count("WHERE option LIKE $$schema_name=%$$")
-        )
-        self.assertEqual(
-            4, normalized.count("WHERE option LIKE $$table_name=%$$")
-        )
-        self.assertEqual(
-            4, normalized.count("= ANY(fed_alias.allowed_relations)")
-        )
-        self.assertIn("foreign_table.ftrelid = relation.oid", normalized)
+        self.assertIn('federation_audit["canCreateSchema"]', normalized)
         self.assertIn(
-            "ON foreign_server.oid = foreign_table.ftserver", normalized
+            'federation_audit["hasDerivedSchemaPrivilege"]', normalized
         )
-        # The old (pre-tightening) per-source_<alias> exemption used a weak
-        # local-relname-basename match instead of the ftoptions check above
-        # — confirm it hasn't reappeared. This can no longer be a bare
-        # assertNotIn: round 24 added a *different*, legitimate
-        # relation.relname IN (...) allowlist for the federation schema's
-        # own managed objects (see
-        # test_federation_schema_relation_exemption_requires_a_managed_object_name),
-        # so an exact count is what actually proves the old check is gone
-        # without also forbidding the new one.
-        self.assertEqual(
-            4, normalized.count("(relation.relname, relation.relkind) IN (")
-        )
-        # The two schema-level checks (canCreateBaseSchema and its
-        # reachable_role mirror) must stay untouched — a provisioned
-        # alias's owner legitimately needs CREATE on the whole schema, so
-        # nothing between each of those two fed_alias blocks and their own
-        # has_schema_privilege call should reference foreign-table binding
-        # at all.
-        for marker in (
-            'has_schema_privilege(namespace.oid, $$CREATE$$) ) AS '
-            '"canCreateBaseSchema"',
-            "has_schema_privilege( reachable_role.oid, namespace.oid, "
-            "$$CREATE$$",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, normalized)
-        # has_schema_privilege( reachable_role.oid, ... $$CREATE$$ also
-        # appears once earlier for the two pre-existing, non-federation
-        # schemas — search only from the federation section onward so
-        # this test locates the federation-specific occurrence, not that
-        # unrelated one.
-        federation_section_start = normalized.index("federation._aliases")
-        schema_level_windows = 0
-        for marker in (
-            'AS "canCreateBaseSchema"',
-            "has_schema_privilege( reachable_role.oid, namespace.oid, "
-            "$$CREATE$$",
-        ):
-            end = normalized.index(marker, federation_section_start)
-            start = normalized.rindex("OR EXISTS (", 0, end)
-            window = normalized[start:end]
-            self.assertIn("federation._aliases", window)
-            self.assertNotIn("pg_foreign_table", window)
-            self.assertNotIn("allowed_relations", window)
-            schema_level_windows += 1
-        self.assertEqual(2, schema_level_windows)
-
-    def test_federation_schema_relation_exemption_requires_a_managed_object_name(
-        self,
-    ) -> None:
-        # The schema-level CREATE-privilege check above legitimately exempts
-        # the whole federation schema by name — the derived owner needs
-        # CREATE there for provision() to work. But the RELATION-level
-        # unsafe-privilege checks must not: the derived owner having CREATE
-        # there means it could also add an unexpected local table, view, or
-        # sequence inside federation, and a blanket schema-name exemption
-        # would silently trust it too. Reproduced live (round 24 finding): a
-        # rogue table created in the federation schema by the derived-owner
-        # role passed ./bin/mapp verify before this fix and correctly failed
-        # it afterward. The relation-level checks must instead name every
-        # actually-managed object explicitly, the same way the source_<alias>
-        # branch already requires the specific foreign table.
-        normalized = self.normalized("scripts/verify.sh")
-        # relkind is pinned alongside each name: the derived owner owns this
-        # schema, so a name-only allowlist would also exempt a crafted view or
-        # table substituted for the real registry objects.
-        managed_objects_fragment = (
-            "namespace.nspname = $$federation$$ AND "
-            "(relation.relname, relation.relkind) IN ( "
-            "($$_aliases$$, $$r$$), ($$_aliases_pkey$$, $$i$$), "
-            "($$_observations$$, $$r$$), ($$_observations_pkey$$, $$i$$), "
-            "($$_observations_alias_observed_at_idx$$, $$i$$), "
-            "($$_observations_id_seq$$, $$S$$) )"
-        )
-        self.assertEqual(
-            4,
-            normalized.count(managed_objects_fragment),
-            "expected exactly 4 relation-level federation exemptions (2 "
-            "checks x login_role/reachable_role) explicitly naming every "
-            "managed object — a count drift here means a check was added, "
-            "removed, or merged without updating this test, or a managed "
-            "object (e.g. a new index) was added to federation._aliases / "
-            "_observations without updating this allowlist too.",
-        )
-        # The schema-level CREATE check must still exempt federation by name
-        # alone — that one is legitimately schema-scoped, not relation-scoped,
-        # and must not be tightened the same way.
         self.assertIn(
-            "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
-            normalized,
+            'federation_audit["hasDerivedObjectPrivilege"]', normalized
         )
-
-    def test_federation_registry_stand_in_declares_every_referenced_column(
-        self,
-    ) -> None:
-        # federation._aliases is created lazily
-        # (FederationAliasStore._initialize() on first use), so a fresh
-        # deployment that has never taken a federation API call substitutes
-        # an always-empty stand-in rather than aborting this whole audit
-        # with UndefinedTable. PostgreSQL still resolves every fed_alias.*
-        # column reference against that stand-in even though it's always
-        # empty, so a column referenced elsewhere but missing here aborts
-        # with UndefinedColumn instead of performing the audit (round 23
-        # finding — the stand-in was never updated when allowed_relations
-        # was added to the audit query in an earlier round).
-        normalized = self.normalized("scripts/verify.sh")
-        referenced_columns = set(re.findall(r"fed_alias\.([a-z_]+)", normalized))
-        self.assertTrue(referenced_columns)
-        stand_in_start = normalized.index('else "(SELECT NULL::text AS alias')
-        stand_in_end = normalized.index("WHERE FALSE)", stand_in_start)
-        stand_in = normalized[stand_in_start:stand_in_end]
-        for column in sorted(referenced_columns):
-            with self.subTest(column=column):
-                self.assertIn(f"AS {column}", stand_in)
+        self.assertIn('federation_audit["hasBaseSchemaPrivilege"]', normalized)
+        self.assertIn(
+            'federation_audit["hasBaseObjectPrivilege"]', normalized
+        )
+        self.assertIn('AS "hasRegistrySchemaAccess"', normalized)
+        self.assertIn('AS "hasRegistryObjectAccess"', normalized)
+        self.assertIn("has_any_column_privilege(", normalized)
+        self.assertIn("$$USAGE,CREATE$$", normalized)
+        self.assertIn(
+            "must not access the", normalized
+        )
+        self.assertIn("federation control registry.", normalized)
 
     def test_verifier_checks_the_foreign_server_matches_its_connection_ref(
         self,
     ) -> None:
-        # round 25 finding: the exemption logic confirms a foreign table's
-        # name and ftoptions match the registry, but never checked that the
-        # underlying FDW server still points at the registered connectionRef
-        # — an ALTER SERVER retargeting host/database would pass every
-        # check above unnoticed. Resolving connectionRef needs os.environ,
-        # so this runs as a separate, dedicated check rather than a fifth
-        # nested condition in the audit's boolean expression.
+        # Resolving connectionRef needs os.environ, so the verifier compares
+        # each provisioned server against its registered connection directly.
         normalized = self.normalized("scripts/verify.sh")
         self.assertIn(
-            '"SELECT alias, connection_ref FROM federation._aliases " '
-            '"WHERE provisioned_at IS NOT NULL"',
+            '"SELECT alias, connection_ref, allowed_relations, status, "',
             normalized,
         )
-        self.assertIn('os.environ.get(f"DBS_{connection_ref}")', normalized)
         self.assertIn(
-            "SELECT srvoptions FROM pg_catalog.pg_foreign_server", normalized
+            '"last_observation, accepted_schema_fingerprint, "', normalized
         )
-        for field in ("host", "port", "dbname"):
+        self.assertIn('"WHERE provisioned_at IS NOT NULL"', normalized)
+        self.assertIn('os.environ.get(f"DBS_{connection_ref}")', normalized)
+        self.assertIn("srvoptions", normalized)
+        self.assertIn(
+            "FROM pg_catalog.pg_foreign_server WHERE srvname = %s",
+            normalized,
+        )
+        self.assertIn(
+            "has_server_privilege(%s, oid, $$USAGE$$)", normalized
+        )
+        self.assertIn('server["derived_use"]', normalized)
+        self.assertIn('server["reader_use"]', normalized)
+        for field in (
+            "host", "hostaddr", "port", "dbname", "sslmode",
+            "sslrootcert", "gssencmode",
+        ):
             with self.subTest(field=field):
-                self.assertIn(f'server_options.get("{field}")', normalized)
+                self.assertIn(f'"{field}"', normalized)
+        self.assertIn("actual_options != expected_options", normalized)
+        self.assertIn("unexpected_options = set(server_options)", normalized)
+        self.assertIn("pushdown_safe = all(", normalized)
+        self.assertIn('alias_row["status"] == "active"', normalized)
+        self.assertIn("and not pushdown_safe", normalized)
+        self.assertIn("remote_relation != expected_relations", normalized)
+        self.assertIn(
+            'relation["derived_select"] != expected_usage', normalized
+        )
+        self.assertIn(
+            'relation["reader_select"] != expected_usage', normalized
+        )
+        self.assertIn("FROM pg_catalog.pg_user_mappings", normalized)
+        self.assertIn(
+            "required_mapping_roles.issubset(mappings)", normalized
+        )
+        self.assertIn(
+            "set(mappings).issubset(allowed_mapping_roles)", normalized
+        )
+        self.assertIn(
+            "mappings[federation_role] != expected_mapping", normalized
+        )
+
+    def test_verifier_rejects_active_aliases_without_accepted_evidence(
+        self,
+    ) -> None:
+        normalized = self.normalized("scripts/verify.sh")
+        for field in (
+            "accepted_schema_fingerprint",
+            "accepted_physical_identity",
+            "accepted_connection_identity",
+            "last_observation_id",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', normalized)
+        self.assertIn('alias_row["status"] == "active"', normalized)
+        self.assertIn("alias_row[field] is None", normalized)
+        self.assertIn("without complete accepted evidence", normalized)
 
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(

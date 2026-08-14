@@ -245,6 +245,18 @@ artifact retention, storage quotas, or host-level resource controls.
   operation errors expose safe user guidance and keep database diagnostics out
   of the primary message; an uncertain commit is marked indeterminate rather
   than claiming the state is unchanged.
+- Treat `FEDERATION_DATABASE_URL` as a separate provisioner credential. Its
+  role alone owns the `federation` registry, registered `source_<alias>`
+  schemas, foreign servers, and foreign tables. It has database `CREATE` and
+  `postgres_fdw` `USAGE` solely to create those reviewed objects; the derived
+  owner and runtime reader receive only `USAGE`/`SELECT` on active source
+  schemas and tables. The provisioner must not own or access `derived_layers`
+  or source-data schemas such as `leeds`, and the derived owner must not retain
+  database `CREATE` or FDW `USAGE`.
+- Every platform caller uses the same mapped remote federation identity.
+  Do not register user-private, recipient-filtered, or end-to-end-encrypted
+  message/key relations. Catalog RLS detection cannot attest application-level
+  filtering; expose only a dedicated remote view that is safe for every caller.
 - Treat `SEMANTIC_INTERNAL_TOKEN` as a service credential. Only
   `config-ui` and `semantic-service` receive it. It must be random, at least 32
   characters in production, and distinct from database and user credentials.
