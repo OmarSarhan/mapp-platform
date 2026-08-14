@@ -118,6 +118,24 @@ environment_value() {
   fi
 }
 
+require_bundled_federation_settings() {
+  local key
+  local -a missing=()
+  for key in \
+    FEDERATION_DB_USER FEDERATION_DB_PASSWORD FEDERATION_DATABASE_URL
+  do
+    if [[ -z "$(dotenv_value "${key}")" ]]; then
+      missing+=("${key}")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf 'Bundled database mode requires federation settings missing from %s: %s\n' \
+      "${ENV_FILE}" "${missing[*]}" >&2
+    printf 'Run ./bin/mapp doctor --add-missing, then retry.\n' >&2
+    exit 2
+  fi
+}
+
 reject_database_environment_overrides() {
   local key configured
   for key in \
@@ -319,12 +337,15 @@ if [[ "${1:-}" == "cleanup-temp" ]]; then
   exit $?
 fi
 
-require_docker
-
 if [[ ! -f "${ENV_FILE}" ]]; then
   printf 'Missing %s. Run ./bin/mapp init first.\n' "${ENV_FILE}" >&2
   exit 2
 fi
+database_mode="$(dotenv_value MAPP_DATABASE_MODE)"
+if [[ "${database_mode}" == "bundled" ]]; then
+  require_bundled_federation_settings
+fi
+require_docker
 reject_database_environment_overrides
 case "${1:-}" in
   up|serve|config-ui|reset-data|all)
@@ -345,7 +366,6 @@ compose=(
   --env-file "${ENV_FILE}"
   --file "${ROOT_DIR}/compose.yaml"
 )
-database_mode="$(dotenv_value MAPP_DATABASE_MODE)"
 if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]]; then
   printf 'Exported MAPP_DATABASE_MODE conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
     "${ENV_FILE}" >&2
