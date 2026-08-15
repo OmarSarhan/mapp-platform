@@ -25,9 +25,9 @@ After bearer or dashboard-session authentication:
   require the advertised `layers effective` capability before using this
   endpoint so they fail closed against an older independently released server.
 
-The current API and contract versions are `1.4`; the rules version is `1.6`.
+The current API and contract versions are `1.5`; the rules version is `1.6`.
 The machine-readable compatibility and pagination declaration is versioned at
-[`contracts/api-compatibility-v1.4.json`](../contracts/api-compatibility-v1.4.json).
+[`contracts/api-compatibility-v1.5.json`](../contracts/api-compatibility-v1.5.json).
 The CLI rejects an unsupported major contract version and does not assume that
 a newer command exists merely because an older server used it.
 

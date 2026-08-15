@@ -31,8 +31,8 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
     sql = None
 
 
-API_VERSION = "1.4"
-CONTRACT_VERSION = "1.4"
+API_VERSION = "1.5"
+CONTRACT_VERSION = "1.5"
 RULES_VERSION = "1.6"
 FIXED_FILTER_NUMBER_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
@@ -820,6 +820,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "alias": {
                     "type": "string",
+                    # Ordinary DBS_* aliases follow semantic_sources.ALIAS_RE;
+                    # federation aliases are intentionally narrower.
                     "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
                 },
                 "schema": {
@@ -1535,6 +1537,112 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "federation.aliases.list": {
+        "method": "GET",
+        "path": "/api/federation/aliases",
+        "risk": "inspect",
+        "scope": "federation:observe",
+    },
+    "federation.aliases.show": {
+        "method": "GET",
+        "pathTemplate": "/api/federation/aliases/{alias}",
+        "risk": "inspect",
+        "scope": "federation:observe",
+    },
+    "federation.aliases.register": {
+        "method": "POST",
+        "path": "/api/federation/aliases",
+        "risk": "federation-register",
+        "scope": "federation:register",
+        "inputSchema": {
+            "type": "object",
+            "required": [
+                "alias", "displayName", "kind", "connectionRef", "tlsPolicy",
+                "allowedRelations", "dataHandlingClassification",
+                "dataHandlingAcknowledged",
+            ],
+            "properties": {
+                "alias": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,55}$",
+                },
+                "displayName": {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                },
+                "kind": {"const": "postgresql"},
+                "connectionRef": {
+                    "type": "string", "minLength": 1, "maxLength": 200,
+                },
+                "tlsPolicy": {"enum": ["require", "verify-ca", "verify-full"]},
+                # Mirrors federation_schema._normalized_allowed_relations():
+                # each entry must be schema-qualified with identifier-shaped
+                # parts, and entries must be distinct. (That validator also
+                # rejects two relations sharing a basename across different
+                # schemas, since both would import into one local
+                # source_<alias> table — not expressible in JSON Schema, so
+                # it stays a server-side rejection.)
+                "allowedRelations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "maxLength": 127,
+                        "pattern": (
+                            "^[A-Za-z_][A-Za-z0-9_]{0,62}\\."
+                            "[A-Za-z_][A-Za-z0-9_]{0,62}$"
+                        ),
+                    },
+                },
+                "dataHandlingClassification": {
+                    "type": "string", "minLength": 1, "maxLength": 2000,
+                },
+                "dataHandlingAcknowledged": {"const": True},
+                "freshnessStrategy": {
+                    # maximumAge/timestampColumn/versionRelation are a
+                    # documented part of the architecture but have no
+                    # evidence-collection implementation yet — see
+                    # federation_schema.py's validate_registration(). The
+                    # contract must not advertise support the server
+                    # rejects.
+                    "enum": ["manual"],
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "federation.aliases.observe": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/observe",
+        "risk": "federation-observe",
+        # Not federation:observe — Discover opens a live, credentialed
+        # outbound connection, so it requires the same scope as Approve
+        # exposure (see app.py's _required_scope).
+        "scope": "federation:provision",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    "federation.aliases.provision": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/provision",
+        "risk": "federation-provision",
+        "scope": "federation:provision",
+        "inputSchema": {
+            "type": "object",
+            "required": ["expectedObservationId"],
+            "properties": {
+                "expectedObservationId": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854775807,
+                },
+                "rowLevelSecurityAcknowledged": {"const": True},
+                "schemaChangeAcknowledged": {"const": True},
+                "physicalRebindAcknowledged": {"const": True},
+            },
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -1554,6 +1662,8 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "semantic:generate", "semantic:data",
                 "semantic:propose",
                 "semantic:apply", "semantic:admin",
+                "federation:register", "federation:provision",
+                "federation:observe",
             ],
             "defaultDeviceScopes": [
                 "inspect", "propose", "visual", "semantic:inspect",
@@ -1638,7 +1748,7 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "maxItems": MAX_PAGE_LIMIT,
                 "firstPageOnly": True,
             },
-            "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.5.json",
         },
     }
 

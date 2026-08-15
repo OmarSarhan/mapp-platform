@@ -431,6 +431,15 @@ def _area_weighted_h3_query(
     resolution: int,
     measures: list[dict[str, str]],
 ) -> str:
+    # Deliberately takes no idColumn: this query never groups, dedups, or
+    # otherwise keys anything off the source's row identity — every
+    # accepted source row is aggregated by geometry alone. That is the
+    # only reason plan_area_weighted_h3_recipe's foreign-table carve-out
+    # (skipping the primary-key-or-unique check, which a postgres_fdw
+    # foreign table could never satisfy) is safe. If this query is ever
+    # changed to dedup or key by id — e.g. to address the "overlapping
+    # source polygons... double-count" assumption below — revisit that
+    # carve-out first.
     source_geometry = sql.SQL("source.{}").format(
         sql.Identifier(geometry_column)
     )
@@ -820,7 +829,18 @@ def plan_area_weighted_h3_recipe(
         source["idColumn"],
         "Recipe ID column",
     )
-    if id_field.get("nullable") is not False or not (
+    if id_field.get("nullable") is not False:
+        raise DerivedLayerError("Recipe ID column must be non-null.")
+    # PostgreSQL foreign tables can never carry a PRIMARY KEY or UNIQUE
+    # constraint (a postgres_fdw/FDW limitation, not a detection gap), so
+    # semantic sync always reports primaryKey/unique as False for them —
+    # this uniqueness assurance can only be enforced for locally-owned
+    # relation kinds. For a foreign table, the alias's own admin-reviewed
+    # allowedRelations declaration is the trust boundary instead. Safe only
+    # because _area_weighted_h3_query never keys anything off idColumn —
+    # see the note at the top of that function before reusing this
+    # carve-out for a different recipe kind.
+    if generated.get("kind") != "foreign-table" and not (
         id_field.get("primaryKey") is True or id_field.get("unique") is True
     ):
         raise DerivedLayerError(
@@ -2908,6 +2928,20 @@ class DerivedLayerStore:
                 self._with_semantic_profile(item)
                 for item in cur.fetchall()
             ]
+
+    def affected_by_source_schema(self, source_schema: str) -> list[str]:
+        """Return managed layers that declare a source in one schema."""
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("""
+                SELECT name
+                FROM {}._definitions
+                WHERE EXISTS (
+                  SELECT 1 FROM unnest(sources) AS source
+                  WHERE split_part(source, '.', 1) = %s
+                )
+                ORDER BY name
+            """).format(sql.Identifier(SCHEMA)), (source_schema,))
+            return [row["name"] for row in cur.fetchall()]
 
     def list_page(
         self,

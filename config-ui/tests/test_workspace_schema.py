@@ -45,6 +45,15 @@ class WorkspaceValidationTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["path"], "dbs")
 
+    def test_accepts_existing_workspace_alias_shapes(self):
+        data = valid_workspace()
+        data["dbs"] = "council-prod_" + "a" * 50
+        data["locale"]["layers"]["Places"]["dbs"] = data["dbs"]
+
+        errors = validate_workspace(data, {data["dbs"]})
+
+        self.assertEqual(errors, [])
+
     def test_accepts_a_dbs_key_with_an_underscore(self):
         data = valid_workspace()
         data["dbs"] = "council_prod"

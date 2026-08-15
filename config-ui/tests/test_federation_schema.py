@@ -1,7 +1,9 @@
 import unittest
+from math import inf, nan
 
 from federation_schema import (
     FederationSchemaError,
+    enforce_tls_policy,
     validate_alias,
     validate_observation,
     validate_registration,
@@ -47,6 +49,27 @@ class ValidateAliasTests(unittest.TestCase):
                 with self.assertRaises(FederationSchemaError):
                     validate_alias(invalid)
 
+    def test_rejects_a_hyphen(self):
+        # An alias becomes the schema name source_<alias> and must also be
+        # usable, unquoted, wherever it's referenced as a schema/relation
+        # name component (semantic_sources.py, derived_layers.py) — both
+        # reject hyphens, so a hyphenated alias could register and
+        # provision but never be usable for semantic sync or a derived
+        # layer.
+        with self.assertRaises(FederationSchemaError):
+            validate_alias("leeds-ext")
+
+    def test_max_length_leaves_room_for_the_source_schema_prefix(self):
+        # federation_store.py generates the schema name source_<alias> —
+        # PostgreSQL silently truncates identifiers over 63 bytes, so two
+        # long aliases sharing a truncated prefix would collide. The alias
+        # bound must leave exactly enough room for "source_" (7 bytes).
+        max_length_alias = "a" * 56
+        self.assertEqual(max_length_alias, validate_alias(max_length_alias))
+        self.assertLessEqual(len(f"source_{max_length_alias}"), 63)
+        with self.assertRaises(FederationSchemaError):
+            validate_alias("a" * 57)
+
 
 class ValidateRegistrationTests(unittest.TestCase):
     def test_accepts_a_well_formed_registration_and_normalizes_it(self):
@@ -74,11 +97,23 @@ class ValidateRegistrationTests(unittest.TestCase):
         result = validate_registration(valid_registration())
         self.assertEqual("manual", result["freshnessStrategy"])
 
-    def test_accepts_an_explicit_freshness_strategy(self):
+    def test_accepts_the_only_currently_implemented_freshness_strategy(self):
         result = validate_registration(
-            valid_registration(freshnessStrategy="versionRelation")
+            valid_registration(freshnessStrategy="manual")
         )
-        self.assertEqual("versionRelation", result["freshnessStrategy"])
+        self.assertEqual("manual", result["freshnessStrategy"])
+
+    def test_rejects_freshness_strategies_with_no_evidence_collection_yet(self):
+        # maximumAge/timestampColumn/versionRelation are documented, but
+        # detect_capability() has no evidence-collection for any of them —
+        # accepting one would silently promise freshness evidence the
+        # platform can never produce.
+        for strategy in ("maximumAge", "timestampColumn", "versionRelation"):
+            with self.subTest(strategy=strategy):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(freshnessStrategy=strategy)
+                    )
 
     def test_rejects_missing_required_fields(self):
         for field in (
@@ -122,7 +157,7 @@ class ValidateRegistrationTests(unittest.TestCase):
             validate_registration(valid_registration(connectionRef="x" * 201))
 
     def test_rejects_an_invalid_tls_policy(self):
-        for invalid in ("disable", "allow", "prefer", ""):
+        for invalid in ("disable", "allow", "prefer", "", [], {}):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(FederationSchemaError):
                     validate_registration(valid_registration(tlsPolicy=invalid))
@@ -151,6 +186,32 @@ class ValidateRegistrationTests(unittest.TestCase):
                 )
             )
 
+    def test_rejects_allowed_relations_with_colliding_basenames(self):
+        # provision() imports every entry into one local source_<alias>
+        # schema — two different remote schemas with a same-named table
+        # would collide on the second IMPORT FOREIGN SCHEMA and could never
+        # be provisioned, so this must fail at registration instead.
+        with self.assertRaises(FederationSchemaError):
+            validate_registration(
+                valid_registration(
+                    allowedRelations=["public.orders", "archive.orders"]
+                )
+            )
+
+    def test_bounds_allowed_relation_count_and_identifier_lengths(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_registration(
+                valid_registration(
+                    allowedRelations=[f"leeds.table_{index}" for index in range(101)]
+                )
+            )
+        for relation in (f"{'s' * 64}.roads", f"leeds.{'r' * 64}"):
+            with self.subTest(relation=relation):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(allowedRelations=[relation])
+                    )
+
     def test_rejects_an_empty_or_overlong_data_handling_classification(self):
         with self.assertRaises(FederationSchemaError):
             validate_registration(valid_registration(dataHandlingClassification=""))
@@ -168,8 +229,12 @@ class ValidateRegistrationTests(unittest.TestCase):
                     )
 
     def test_rejects_an_invalid_freshness_strategy(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_registration(valid_registration(freshnessStrategy="nightly"))
+        for invalid in ("nightly", []):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(FederationSchemaError):
+                    validate_registration(
+                        valid_registration(freshnessStrategy=invalid)
+                    )
 
     def test_status_is_always_pending_regardless_of_input(self):
         result = validate_registration(valid_registration())
@@ -214,12 +279,16 @@ class ValidateObservationTests(unittest.TestCase):
             validate_observation(valid_observation(healthy=True))
 
     def test_rejects_invalid_enum_values(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(connectivity="up"))
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(schema="ok"))
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(sourceFreshness="fresh"))
+        for field, value in (
+            ("connectivity", "up"),
+            ("schema", "ok"),
+            ("sourceFreshness", "fresh"),
+            ("connectivity", []),
+            ("schema", {}),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(FederationSchemaError):
+                    validate_observation(valid_observation(**{field: value}))
 
     def test_rejects_a_timestamp_without_timezone(self):
         with self.assertRaises(FederationSchemaError):
@@ -228,8 +297,12 @@ class ValidateObservationTests(unittest.TestCase):
             )
 
     def test_rejects_a_non_scalar_source_version(self):
-        with self.assertRaises(FederationSchemaError):
-            validate_observation(valid_observation(sourceVersion=["v1"]))
+        for invalid in (
+            ["v1"], True, False, nan, inf, -inf, "x" * 201, int("1" * 201)
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(FederationSchemaError):
+                    validate_observation(valid_observation(sourceVersion=invalid))
 
     def test_accepts_optional_extension_versions_and_rls_flag(self):
         result = validate_observation(
@@ -255,6 +328,91 @@ class ValidateObservationTests(unittest.TestCase):
     def test_rejects_a_non_boolean_rls_flag(self):
         with self.assertRaises(FederationSchemaError):
             validate_observation(valid_observation(rowLevelSecurityDetected="yes"))
+
+    def test_accepts_an_optional_schema_fingerprint(self):
+        result = validate_observation(
+            valid_observation(schemaFingerprint="abc123|def456")
+        )
+        self.assertEqual("abc123|def456", result["schemaFingerprint"])
+
+    def test_omitted_schema_fingerprint_still_validates(self):
+        # A pre-Discover, connectivity-only observation must still
+        # validate — schemaFingerprint is only ever collected alongside
+        # the RLS/extension-version evidence.
+        result = validate_observation(valid_observation())
+        self.assertNotIn("schemaFingerprint", result)
+
+    def test_rejects_an_empty_schema_fingerprint(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_observation(valid_observation(schemaFingerprint=""))
+
+    def test_rejects_a_non_string_schema_fingerprint(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_observation(valid_observation(schemaFingerprint=123))
+
+
+class EnforceTlsPolicyTests(unittest.TestCase):
+    def test_accepts_a_connection_meeting_the_policy(self):
+        valid = (
+            (
+                "require",
+                "postgresql://reader:secret@host/db?sslmode=require"
+                "&gssencmode=disable",
+            ),
+            (
+                "verify-full",
+                "postgresql://reader:secret@host/db?sslmode=verify-full"
+                "&gssencmode=disable&sslrootcert=system",
+            ),
+        )
+        for policy, connection_url in valid:
+            with self.subTest(policy=policy):
+                enforce_tls_policy(policy, connection_url)
+
+    def test_rejects_weak_or_unsupported_connection_contracts(self):
+        invalid = (
+            ("require", "sslmode=disable gssencmode=disable"),
+            ("verify-full", "sslmode=require gssencmode=disable sslrootcert=system"),
+            ("require", "gssencmode=disable"),
+            ("require", "sslmode=typo gssencmode=disable"),
+            ("require", "sslmode=require"),
+            ("require", "sslmode=require gssencmode=prefer"),
+            ("verify-ca", "sslmode=verify-ca gssencmode=disable"),
+            (
+                "require",
+                "sslmode=require gssencmode=disable "
+                "target_session_attrs=read-write",
+            ),
+            (
+                "verify-full",
+                "sslmode=verify-full gssencmode=disable "
+                "sslrootcert=/run/secrets/ca.pem",
+            ),
+            (
+                "verify-full",
+                "sslmode=verify-full gssencmode=disable "
+                "sslrootcert=system sslcert=/run/secrets/client.pem",
+            ),
+        )
+        base = "host=host dbname=db user=reader password=secret"
+        for policy, options in invalid:
+            with self.subTest(policy=policy, options=options):
+                with self.assertRaises(FederationSchemaError):
+                    enforce_tls_policy(policy, f"{base} {options}")
+
+    def test_rejects_implicit_or_non_tcp_endpoints(self):
+        invalid = (
+            "dbname=db user=reader password=secret",
+            "host=/var/run/postgresql dbname=db user=reader password=secret",
+            "host=one,two dbname=db user=reader password=secret",
+            "host=host dbname=db user=reader",
+        )
+        for connection in invalid:
+            with self.subTest(connection=connection):
+                with self.assertRaises(FederationSchemaError):
+                    enforce_tls_policy(
+                        "require", f"{connection} sslmode=require gssencmode=disable"
+                    )
 
 
 if __name__ == "__main__":

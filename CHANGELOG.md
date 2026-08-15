@@ -324,7 +324,6 @@ first release.
   follow-up.
 - Added production validation for distinct public DNS hostnames, direct HTTPS
   on port 443, non-wildcard allowed hosts, and a monitored ACME contact.
-
 These entries describe the staged structure and intended invariants. They do
 not claim that final split histories, production deployment, or restore paths
 have been validated.

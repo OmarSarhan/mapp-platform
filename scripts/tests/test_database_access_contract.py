@@ -39,6 +39,23 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(path=relative_path, contract=contract):
                 self.assertIn(contract, source)
 
+    def assert_federation_role_defaults(self, relative_path: str) -> None:
+        source = self.normalized(relative_path)
+        for contract in (
+            'ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;',
+            'ALTER ROLE :"federation_db_user" SET search_path = pg_catalog, public;',
+            'ALTER ROLE :"federation_db_user" SET work_mem = \'16MB\';',
+            'ALTER ROLE :"federation_db_user" SET hash_mem_multiplier = \'1\';',
+            'ALTER ROLE :"federation_db_user" SET maintenance_work_mem = \'64MB\';',
+            'ALTER ROLE :"federation_db_user" SET max_parallel_workers_per_gather = \'2\';',
+            'ALTER ROLE :"federation_db_user" SET temp_file_limit = \'1GB\';',
+            'ALTER ROLE :"federation_db_user" SET statement_timeout = \'30min\';',
+            'ALTER ROLE :"federation_db_user" SET transaction_timeout = \'35min\';',
+            'ALTER ROLE :"federation_db_user" SET lock_timeout = \'5s\';',
+        ):
+            with self.subTest(path=relative_path, contract=contract):
+                self.assertIn(contract, source)
+
     def assert_h3_sql_wrapper_hardening(self, relative_path: str) -> None:
         source = self.normalized(relative_path)
         for contract in (
@@ -88,7 +105,11 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "DERIVED_DB_USER",
             "DERIVED_DB_PASSWORD",
             "DERIVED_DATABASE_URL",
+            "DERIVED_OWNER_ROLE",
             "DERIVED_READER_ROLE",
+            "FEDERATION_DB_USER",
+            "FEDERATION_DB_PASSWORD",
+            "FEDERATION_DATABASE_URL",
         }
         for relative_path in ("bin/mapp", "scripts/verify.sh"):
             with self.subTest(path=relative_path):
@@ -102,9 +123,27 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 "every DBS_<ALIAS> variable must be covered by a prefix rule, "
                 "not a literal DBS_MAPP enumeration",
             )
+            self.assertIn(
+                '"${!FEDERATION_DBS_@}"',
+                guard,
+                "federation connection variables must be covered by their "
+                "own prefix rule",
+            )
             for key in expected:
                 self.assertIn(key, guard)
                 self.assertIn('unset "${key}"', guard)
+
+    def test_federation_seed_pins_collatable_columns_to_portable_c(self) -> None:
+        source = self.normalized("docker/source-db/seed.sh")
+        for contract in (
+            "'leeds.smoke_control_orders'::pg_catalog.regclass",
+            "a.attcollation <> 0",
+            "COLLATE pg_catalog.\"C\"",
+            "(n.nspname, co.collname) <> ('pg_catalog', 'C')",
+            "seeded collatable columns must use pg_catalog.C",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
 
     def test_layer_drop_guard_installs_blocking_sql_objects(self) -> None:
         source = self.normalized("docker/postgis/init/25-platform-layer-drop-guard.sql")
@@ -267,6 +306,58 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertNotIn("ON SEQUENCES", source)
         self.assert_resource_role_defaults("docker/postgis/init/10-roles.sh")
+        self.assert_federation_role_defaults("docker/postgis/init/10-roles.sh")
+        self.assertIn(
+            'CREATE SCHEMA federation AUTHORIZATION :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'GRANT CREATE ON DATABASE :"DBNAME" TO :"federation_db_user";',
+            normalized,
+        )
+        self.assertNotIn(
+            'GRANT CREATE ON DATABASE :"DBNAME" TO :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE CREATE ON DATABASE :"DBNAME" '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'TO :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA federation '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION '
+            'NOBYPASSRLS PASSWORD',
+            normalized,
+        )
 
     def test_upgrade_repairs_legacy_database_and_sequence_privileges(self) -> None:
         source = (
@@ -280,7 +371,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'REVOKE TEMPORARY ON DATABASE :"DBNAME" '
-            'FROM :"xyz_db_user", :"derived_db_user";',
+            'FROM :"xyz_db_user", :"derived_db_user", '
+            ':"federation_db_user";',
             normalized,
         )
         self.assertIn(
@@ -290,7 +382,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'GRANT CONNECT ON DATABASE :"DBNAME" '
-            'TO :"xyz_db_user", :"derived_db_user";',
+            'TO :"xyz_db_user", :"derived_db_user", '
+            ':"federation_db_user";',
             normalized,
         )
         self.assertIn(
@@ -317,6 +410,69 @@ class DatabaseAccessContractTests(unittest.TestCase):
             source,
         )
         self.assert_resource_role_defaults("docker/postgis/upgrade-derived.sh")
+        self.assert_federation_role_defaults(
+            "docker/postgis/upgrade-derived.sh"
+        )
+        self.assertIn(
+            "Refusing to take ownership of existing federation schema",
+            source,
+        )
+        for object_kind in ("object", "schema", "table", "server"):
+            with self.subTest(object_kind=object_kind):
+                self.assertIn(
+                    f"Refusing to migrate known federation {object_kind}",
+                    source,
+                )
+        self.assertIn(
+            "owner_role.rolname NOT IN (derived_role, federation_role)",
+            normalized,
+        )
+        self.assertNotIn(
+            'ALTER SCHEMA federation OWNER TO :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE CREATE ON DATABASE :"DBNAME" '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
+            'FROM :"xyz_db_user", :"derived_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            "REVOKE USAGE ON FOREIGN SERVER %I FROM %I, %I", normalized
+        )
+        self.assertIn("alias_record.status = 'active'", normalized)
+        self.assertIn(
+            "REVOKE USAGE ON SCHEMA %I FROM %I, %I", normalized
+        )
+        self.assertIn(
+            "REVOKE SELECT ON TABLE %I.%I FROM %I, %I", normalized
+        )
+        self.assertIn(
+            "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA federation",
+            normalized,
+        )
+        self.assertIn(
+            "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA federation",
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
+            'FROM :"federation_db_user";',
+            normalized,
+        )
+        self.assertIn(
+            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
+            'FROM :"xyz_db_user", :"federation_db_user";',
+            normalized,
+        )
         self.assert_h3_sql_wrapper_hardening(
             "docker/postgis/upgrade-derived.sh"
         )
@@ -324,6 +480,106 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "sh /usr/local/bin/mapp-prepare-spatial-indexes ensure",
             source,
         )
+
+    def test_upgrade_demotes_unbaselined_active_federation_aliases(self) -> None:
+        normalized = self.normalized("docker/postgis/upgrade-derived.sh")
+        columns = {
+            "accepted_schema_fingerprint": "text",
+            "accepted_physical_identity": "text",
+            "accepted_connection_identity": "text",
+            "last_observation_id": "bigint",
+        }
+        for column, column_type in columns.items():
+            with self.subTest(column=column):
+                self.assertIn(
+                    f"ADD COLUMN IF NOT EXISTS {column} {column_type}",
+                    normalized,
+                )
+                self.assertIn(f"{column} IS NULL", normalized)
+
+        demotion = (
+            "UPDATE federation._aliases SET status = 'unavailable' "
+            "WHERE provisioned_at IS NOT NULL AND status = 'active'"
+        )
+        self.assertIn(demotion, normalized)
+        self.assertLess(
+            normalized.index(demotion), normalized.index("FOR alias_record IN")
+        )
+
+    def test_upgrade_refuses_an_unsafe_existing_federation_role_early(
+        self,
+    ) -> None:
+        source = (
+            ROOT / "docker/postgis/upgrade-derived.sh"
+        ).read_text(encoding="utf-8")
+        normalized = self.normalized("docker/postgis/upgrade-derived.sh")
+        guard = source.index(
+            "Refusing to alter existing federation role % with unsafe attributes"
+        )
+
+        self.assertLess(guard, source.index("CREATE EXTENSION IF NOT EXISTS h3;"))
+        self.assertLess(
+            guard,
+            source.index(
+                'ALTER ROLE :"federation_db_user" LOGIN PASSWORD'
+            ),
+        )
+        for attribute in (
+            "rolsuper",
+            "rolcreatedb",
+            "rolcreaterole",
+            "rolreplication",
+            "rolbypassrls",
+        ):
+            with self.subTest(attribute=attribute):
+                self.assertIn(f"federation_role.{attribute}", normalized)
+        self.assertIn("FROM pg_catalog.pg_auth_members AS membership", normalized)
+        self.assertIn(
+            "membership.roleid = federation_role.oid OR "
+            "membership.member = federation_role.oid",
+            normalized,
+        )
+        self.assertIn(
+            "Refusing to alter existing federation role % with memberships",
+            source,
+        )
+        self.assertIn(
+            "CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+            "NOREPLICATION NOBYPASSRLS PASSWORD %L",
+            normalized,
+        )
+
+    def test_federation_role_collision_fails_before_database_mutation(self) -> None:
+        for relative in (
+            "docker/postgis/init/10-roles.sh",
+            "docker/postgis/upgrade-derived.sh",
+        ):
+            with self.subTest(relative=relative):
+                source = (ROOT / relative).read_text(encoding="utf-8")
+                guard = source.index("FEDERATION_DB_USER must be distinct")
+                self.assertLess(guard, source.index("psql "))
+                for role in (
+                    "POSTGRES_USER",
+                    "ETL_DB_USER",
+                    "XYZ_DB_USER",
+                    "DERIVED_DB_USER",
+                ):
+                    self.assertIn(
+                        f'FEDERATION_DB_USER}}" = "${{{role}', source
+                    )
+
+    def test_healthcheck_allows_the_pre_role_split_upgrade_to_start(self) -> None:
+        healthcheck = (
+            ROOT / "docker/postgis/healthcheck.sh"
+        ).read_text(encoding="utf-8")
+        wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+
+        self.assertIn('up --detach --build --no-deps --wait db', wrapper)
+        self.assertIn(
+            'exec -T db sh /usr/local/bin/mapp-upgrade-derived', wrapper
+        )
+        self.assertNotIn("federation_db_user", healthcheck)
+        self.assertNotIn("nspname = 'federation'", healthcheck)
 
     def test_verifier_covers_reader_derived_and_census_audit_edges(self) -> None:
         source = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
@@ -335,6 +591,13 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "Bundled database CONNECT and TEMPORARY must be revoked from PUBLIC",
             "Runtime reader and derived owner defaults must not permit sequence mutation",
             "Runtime reader and derived owner must both read %",
+            'AS "canUseFdw"',
+            'AS "canCreateSchema"',
+            'AS "canCreateDatabaseObject"',
+            'audit["canUseFdw"]',
+            'audit["canCreateSchema"]',
+            "audit.canUseFdw",
+            "audit.canCreateDatabaseObject",
             'current_user::text AS "currentUser"',
             'session_user::text AS "sessionUser"',
             'AS "hasTemporary"',
@@ -376,6 +639,146 @@ class DatabaseAccessContractTests(unittest.TestCase):
         for contract in required_contracts:
             with self.subTest(contract=contract):
                 self.assertIn(contract, source)
+
+    def test_derived_and_federation_ownership_are_separate(self) -> None:
+        normalized = self.normalized("scripts/verify.sh")
+        self.assertNotIn(
+            "namespace.nspname IN ($$derived_layers$$, $$federation$$)",
+            normalized,
+        )
+        self.assertNotIn("FROM federation._aliases AS fed_alias", normalized)
+        self.assertIn(
+            "namespace.nspowner = login_role.oid AND "
+            "namespace.nspname = $$derived_layers$$",
+            normalized,
+        )
+        self.assertIn(
+            'federation_audit["ownsFederationSchema"]', normalized
+        )
+        self.assertIn('federation_audit["canCreateSchema"]', normalized)
+        self.assertIn(
+            'federation_audit["hasDerivedSchemaPrivilege"]', normalized
+        )
+        self.assertIn(
+            'federation_audit["hasDerivedObjectPrivilege"]', normalized
+        )
+        self.assertIn('federation_audit["hasBaseSchemaPrivilege"]', normalized)
+        self.assertIn(
+            'federation_audit["hasBaseObjectPrivilege"]', normalized
+        )
+        self.assertIn('AS "hasRegistrySchemaAccess"', normalized)
+        self.assertIn('AS "hasRegistryObjectAccess"', normalized)
+        self.assertIn("has_any_column_privilege(", normalized)
+        self.assertIn("$$USAGE,CREATE$$", normalized)
+        self.assertIn(
+            "must not access the", normalized
+        )
+        self.assertIn("federation control registry.", normalized)
+
+    def test_verifier_checks_the_foreign_server_matches_its_connection_ref(
+        self,
+    ) -> None:
+        # Resolving connectionRef needs os.environ, so the verifier compares
+        # each provisioned server against its registered connection directly.
+        normalized = self.normalized("scripts/verify.sh")
+        self.assertIn(
+            '"SELECT alias, connection_ref, allowed_relations, status, "',
+            normalized,
+        )
+        self.assertIn(
+            '"last_observation, accepted_schema_fingerprint, "', normalized
+        )
+        self.assertIn('"WHERE provisioned_at IS NOT NULL"', normalized)
+        self.assertIn(
+            'f"FEDERATION_DBS_{connection_ref}"', normalized
+        )
+        self.assertIn("srvoptions", normalized)
+        self.assertIn(
+            "FROM pg_catalog.pg_foreign_server WHERE srvname = %s",
+            normalized,
+        )
+        self.assertIn(
+            "has_server_privilege(%s, oid, $$USAGE$$)", normalized
+        )
+        self.assertIn('server["derived_use"]', normalized)
+        self.assertIn('server["reader_use"]', normalized)
+        for field in (
+            "host", "hostaddr", "port", "dbname", "sslmode",
+            "sslrootcert", "gssencmode",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', normalized)
+        self.assertIn("actual_options != expected_options", normalized)
+        self.assertIn("unexpected_options = set(server_options)", normalized)
+        self.assertIn("pushdown_safe = all(", normalized)
+        self.assertIn('alias_row["status"] == "active"', normalized)
+        self.assertIn("and not pushdown_safe", normalized)
+        self.assertIn("remote_relation != expected_relations", normalized)
+        self.assertIn(
+            'relation["derived_select"] != expected_usage', normalized
+        )
+        self.assertIn(
+            'relation["reader_select"] != expected_usage', normalized
+        )
+        self.assertIn("FROM pg_catalog.pg_user_mappings", normalized)
+        self.assertIn(
+            "required_mapping_roles.issubset(mappings)", normalized
+        )
+        self.assertIn(
+            "set(mappings).issubset(allowed_mapping_roles)", normalized
+        )
+        self.assertIn(
+            'alias_row["status"] == "active" and set(mappings) != '
+            "allowed_mapping_roles",
+            normalized,
+        )
+        self.assertIn(
+            "mappings[federation_role] != expected_mapping", normalized
+        )
+
+    def test_verifier_rejects_unsafe_federation_acl_edges(self) -> None:
+        normalized = self.normalized("scripts/verify.sh")
+        for contract in (
+            "nspacl, pg_catalog.acldefault($$n$$, nspowner)",
+            "privilege.grantee = nspowner",
+            "privilege.grantor = nspowner",
+            "privilege.privilege_type = $$USAGE$$",
+            "relation.relacl, pg_catalog.acldefault( "
+            "$$r$$, relation.relowner )",
+            "privilege.grantee = relation.relowner",
+            "privilege.grantor = relation.relowner",
+            "privilege.privilege_type = $$SELECT$$",
+            "NOT privilege.is_grantable",
+            "attribute.attacl IS NOT NULL",
+            'schema["hasUnexpectedAcl"]',
+            'relation["hasUnexpectedAcl"]',
+            'relation["hasColumnAcl"]',
+            "FROM pg_catalog.pg_auth_members AS membership",
+            "consumer_role.oid = membership.roleid",
+            "consumer_role.rolname IN (%s, %s)",
+            'cursor.fetchone()["hasConsumerRoleMember"]',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+        self.assertEqual(2, normalized.count("pg_catalog.aclexplode(COALESCE("))
+        self.assertEqual(2, normalized.count("%s AND privilege.grantor"))
+        self.assertEqual(2, normalized.count("AND NOT privilege.is_grantable)"))
+
+    def test_verifier_rejects_active_aliases_without_accepted_evidence(
+        self,
+    ) -> None:
+        normalized = self.normalized("scripts/verify.sh")
+        for field in (
+            "accepted_schema_fingerprint",
+            "accepted_physical_identity",
+            "accepted_connection_identity",
+            "last_observation_id",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', normalized)
+        self.assertIn('alias_row["status"] == "active"', normalized)
+        self.assertIn("alias_row[field] is None", normalized)
+        self.assertIn("without complete accepted evidence", normalized)
 
     def test_bundled_spatial_index_preparer_covers_managed_relations(self) -> None:
         source = self.normalized(

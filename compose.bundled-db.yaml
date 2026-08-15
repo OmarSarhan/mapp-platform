@@ -21,6 +21,8 @@ services:
       XYZ_DB_PASSWORD: ${XYZ_DB_PASSWORD:?Set XYZ_DB_PASSWORD in .env}
       DERIVED_DB_USER: ${DERIVED_DB_USER:?Set DERIVED_DB_USER in .env}
       DERIVED_DB_PASSWORD: ${DERIVED_DB_PASSWORD:?Set DERIVED_DB_PASSWORD in .env}
+      FEDERATION_DB_USER: ${FEDERATION_DB_USER:?Set FEDERATION_DB_USER in .env}
+      FEDERATION_DB_PASSWORD: ${FEDERATION_DB_PASSWORD:?Set FEDERATION_DB_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgis/init/05-h3.sql:/docker-entrypoint-initdb.d/80-mapp-h3.sql:ro
@@ -52,7 +54,10 @@ services:
         condition: service_healthy
     environment:
       DERIVED_DATABASE_URL: ${DERIVED_DATABASE_URL:?Set DERIVED_DATABASE_URL in .env}
+      DERIVED_OWNER_ROLE: ${DERIVED_DB_USER:?Set DERIVED_DB_USER in .env}
       DERIVED_READER_ROLE: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
+      FEDERATION_DATABASE_URL: ${FEDERATION_DATABASE_URL:?Set FEDERATION_DATABASE_URL in .env}
+      FEDERATION_DB_USER: ${FEDERATION_DB_USER:?Set FEDERATION_DB_USER in .env}
 
   etl:
     image: mapp-leeds-etl:local

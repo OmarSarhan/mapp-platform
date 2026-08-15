@@ -17,6 +17,326 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class FederationEnabledTests(unittest.TestCase):
+    def test_requires_both_a_connection_url_and_bundled_mode(self):
+        self.assertTrue(app.federation_enabled("postgresql://x", "bundled"))
+
+    def test_disabled_without_a_federation_database_url(self):
+        self.assertFalse(app.federation_enabled(None, "bundled"))
+        self.assertFalse(app.federation_enabled("", "bundled"))
+
+    def test_disabled_outside_bundled_mode(self):
+        # The external handoff (docs/external-postgresql.md) grants
+        # ownership of derived_layers alone — not the federation schema,
+        # postgres_fdw, or the database-level CREATE that provisioning
+        # needs, so an external deployment must never see federation
+        # routes enabled even if it happens to set FEDERATION_DATABASE_URL.
+        self.assertFalse(app.federation_enabled("postgresql://x", "external"))
+        self.assertFalse(app.federation_enabled("postgresql://x", None))
+        self.assertFalse(app.federation_enabled("postgresql://x", ""))
+
+
+class FederationAliasActionRouteTests(unittest.TestCase):
+    """POST /api/federation/aliases/<alias>/(observe|provision) must
+    translate a raw local-database failure into the same
+    "federation.registry_unavailable" 502 the sibling GET federation routes
+    already use — not fall through to the generic, code-less 422
+    psycopg.Error handler. FederationSchemaError is deliberately NOT
+    caught here: it already carries its own status/code, correctly routed
+    by the outer handler chain, and must keep passing through untouched."""
+
+    @staticmethod
+    def handler(action, *, actor="admin", payload=None):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = f"/api/federation/aliases/leeds_ext/{action}"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: {} if payload is None else payload
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_observe_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_provision_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("provision")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_observe_route_calls_the_serialized_store_operation(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.return_value = {
+            "lastObservationId": 42,
+            "lastObservation": {"connectivity": "reachable"},
+        }
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.observe.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+        )
+        self.assertEqual(1, len(responses))
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_binds_approval_to_the_observed_revision(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.provision.return_value = {"alias": "leeds_ext"}
+        handler, responses = self.handler(
+            "provision",
+            payload={
+                "expectedObservationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+        )
+        control = MagicMock()
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", control
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.provision.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            "admin",
+            expected_observation_id=42,
+            acknowledge_row_level_security=False,
+            acknowledge_schema_change=True,
+            acknowledge_physical_rebind=False,
+        )
+        self.assertEqual(
+            {
+                "alias": "leeds_ext",
+                "observationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+            control.audit.call_args.kwargs["details"],
+        )
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_requires_a_positive_observation_id(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        handler, responses = self.handler("provision", payload={})
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("federation.invalid_request", responses[0][1]["code"])
+        federation.provision.assert_not_called()
+
+    def test_federation_connections_are_isolated_from_normal_discovery(self):
+        federation_url = "postgresql://federation-reader@source-db/source"
+        ordinary_url = "postgresql://runtime-reader@db/mapp"
+        with patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": federation_url}
+        ), patch.object(
+            app, "DB_CONNECTIONS", {"MAPP": ordinary_url}
+        ), patch.object(app, "discover_connection", return_value=[]) as discover:
+            self.assertEqual(
+                federation_url,
+                app.resolve_federation_connection_url("LEEDS_EXT"),
+            )
+            self.assertEqual([], app.discover())
+
+        discover.assert_called_once_with("MAPP", ordinary_url)
+
+    def test_normal_database_connection_cannot_satisfy_connection_ref(self):
+        with patch.object(app, "FEDERATION_CONNECTIONS", {}), patch.object(
+            app,
+            "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://runtime-reader@source-db/source"},
+        ):
+            with self.assertRaises(app.FederationSchemaError) as raised:
+                app.resolve_federation_connection_url("LEEDS_EXT")
+
+        self.assertEqual(
+            "federation.connection_ref_not_found", raised.exception.code
+        )
+
+    def test_a_federation_schema_error_still_carries_its_own_status_and_code(
+        self,
+    ):
+        # Confirms the new try/except wraps only psycopg.Error — a
+        # validation-style FederationSchemaError (e.g. alias not found)
+        # must still be handled by the existing, unrelated
+        # FederationSchemaError chain, not swallowed into a 502.
+        from federation_schema import FederationSchemaError
+
+        federation = MagicMock()
+        federation.get.side_effect = FederationSchemaError(
+            "boom", code="federation.some_validation_error", status=HTTPStatus.CONFLICT
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.some_validation_error", body["code"])
+
+
+class FederationAliasReadRouteTests(unittest.TestCase):
+    """GET /api/federation/aliases(/<alias>) must preserve a
+    FederationSchemaError's own status/code (round 26 finding) — e.g.
+    federation.not_configured, a permanent configuration fact when
+    FEDERATION is unset outside bundled mode, must never be folded into
+    the generic 502 federation.registry_unavailable a real psycopg.Error
+    still gets, or a contract-driven client would retry a deployment mode
+    that will never become available."""
+
+    @staticmethod
+    def handler(path, *, actor="admin"):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_list_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_list_still_reports_a_real_database_failure_as_unavailable(self):
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_list_uses_the_store_bound_without_cursor_surface(self):
+        federation = MagicMock()
+        federation.list.return_value = [
+            {"alias": "alpha"},
+            {"alias": "bravo"},
+        ]
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        federation.list.assert_called_once_with()
+        self.assertEqual(
+            [{"alias": "alpha"}, {"alias": "bravo"}],
+            responses[0][1]["aliases"],
+        )
+
+    def test_get_by_name_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_get_by_name_still_reports_a_real_database_failure_as_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")

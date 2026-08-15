@@ -29,10 +29,14 @@ environment_value() {
 reject_database_environment_overrides() {
   local key configured
   for key in \
-    "${!DBS_@}" ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
+    "${!DBS_@}" "${!FEDERATION_DBS_@}" \
+    ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
     ETL_DB_USER ETL_DB_PASSWORD XYZ_DB_USER XYZ_DB_PASSWORD \
     DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL \
-    DERIVED_READER_ROLE
+    DERIVED_OWNER_ROLE DERIVED_READER_ROLE \
+    FEDERATION_DB_USER FEDERATION_DB_PASSWORD FEDERATION_DATABASE_URL \
+    SOURCE_POSTGRES_DB SOURCE_POSTGRES_USER SOURCE_POSTGRES_PASSWORD \
+    SOURCE_READER_USER SOURCE_READER_PASSWORD
   do
     if [[ -v "${key}" ]]; then
       configured="$(dotenv_value "${key}")"
@@ -137,13 +141,36 @@ resolved_derived_dbs="$(
   "${compose[@]}" config --format json \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"]["DERIVED_DATABASE_URL"], end="")'
 )"
+resolved_derived_owner="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"]["DERIVED_OWNER_ROLE"], end="")'
+)"
 resolved_derived_reader="$(
   "${compose[@]}" config --format json \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"]["DERIVED_READER_ROLE"], end="")'
 )"
-if [[ -z "${resolved_derived_dbs}" && -n "${resolved_derived_reader}" ]] \
-  || [[ -n "${resolved_derived_dbs}" && -z "${resolved_derived_reader}" ]]; then
-  printf 'DERIVED_DATABASE_URL and DERIVED_READER_ROLE must either both be configured or both be empty.\n' >&2
+resolved_federation_dbs="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"].get("FEDERATION_DATABASE_URL", ""), end="")'
+)"
+resolved_federation_role="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"].get("FEDERATION_DB_USER", ""), end="")'
+)"
+if [[ -z "${resolved_derived_dbs}" \
+      && ( -n "${resolved_derived_owner}" || -n "${resolved_derived_reader}" ) ]] \
+  || [[ -n "${resolved_derived_dbs}" \
+      && ( -z "${resolved_derived_owner}" || -z "${resolved_derived_reader}" ) ]]; then
+  printf 'DERIVED_DATABASE_URL, DERIVED_OWNER_ROLE, and DERIVED_READER_ROLE must either all be configured or all be empty.\n' >&2
+  exit 2
+fi
+if [[ -z "${resolved_federation_dbs}" && -n "${resolved_federation_role}" ]] \
+  || [[ -n "${resolved_federation_dbs}" && -z "${resolved_federation_role}" ]]; then
+  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be configured or both be empty.\n' >&2
+  exit 2
+fi
+if [[ "${database_mode}" == "bundled" && -z "${resolved_federation_dbs}" ]]; then
+  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required in bundled mode.\n' >&2
   exit 2
 fi
 if [[ "${database_mode}" == "external" ]]; then
@@ -151,6 +178,10 @@ if [[ "${database_mode}" == "external" ]]; then
     | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
   if [[ -n "${resolved_derived_dbs}" ]]; then
     printf '%s' "${resolved_derived_dbs}" \
+      | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
+  fi
+  if [[ -n "${resolved_federation_dbs}" ]]; then
+    printf '%s' "${resolved_federation_dbs}" \
       | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
   fi
 fi
@@ -227,12 +258,36 @@ if [[ "${running_derived_dbs}" != "${resolved_derived_dbs}" ]]; then
   printf 'config-ui is not running with the DERIVED_DATABASE_URL value resolved from the current environment. Recreate the service before verification.\n' >&2
   exit 1
 fi
+running_derived_owner="$(
+  "${compose[@]}" exec -T config-ui sh -c \
+    'printf %s "$DERIVED_OWNER_ROLE"'
+)"
+if [[ "${running_derived_owner}" != "${resolved_derived_owner}" ]]; then
+  printf 'config-ui is not running with the DERIVED_OWNER_ROLE value resolved from the current environment. Recreate the service before verification.\n' >&2
+  exit 1
+fi
 running_derived_reader="$(
   "${compose[@]}" exec -T config-ui sh -c \
     'printf %s "$DERIVED_READER_ROLE"'
 )"
 if [[ "${running_derived_reader}" != "${resolved_derived_reader}" ]]; then
   printf 'config-ui is not running with the DERIVED_READER_ROLE value resolved from the current environment. Recreate the service before verification.\n' >&2
+  exit 1
+fi
+running_federation_dbs="$(
+  "${compose[@]}" exec -T config-ui sh -c \
+    'printf %s "$FEDERATION_DATABASE_URL"'
+)"
+if [[ "${running_federation_dbs}" != "${resolved_federation_dbs}" ]]; then
+  printf 'config-ui is not running with the FEDERATION_DATABASE_URL value resolved from the current environment. Recreate the service before verification.\n' >&2
+  exit 1
+fi
+running_federation_role="$(
+  "${compose[@]}" exec -T config-ui sh -c \
+    'printf %s "$FEDERATION_DB_USER"'
+)"
+if [[ "${running_federation_role}" != "${resolved_federation_role}" ]]; then
+  printf 'config-ui is not running with the FEDERATION_DB_USER value resolved from the current environment. Recreate the service before verification.\n' >&2
   exit 1
 fi
 
@@ -1102,6 +1157,18 @@ fi
           current_database(),
           $$TEMPORARY$$
         ) AS "hasTemporary",
+        has_database_privilege(
+          current_database(),
+          $$CREATE$$
+        ) AS "canCreateDatabaseObject",
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+          WHERE wrapper.fdwname = $$postgres_fdw$$
+            AND has_foreign_data_wrapper_privilege(
+              current_user, wrapper.oid, $$USAGE$$
+            )
+        ) AS "canUseFdw",
         EXISTS (
           SELECT 1
           FROM pg_catalog.pg_database AS database
@@ -1183,6 +1250,19 @@ fi
                 reachable_role.oid,
                 current_database(),
                 $$TEMPORARY$$
+              )
+              OR has_database_privilege(
+                reachable_role.oid,
+                current_database(),
+                $$CREATE$$
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+                WHERE wrapper.fdwname = $$postgres_fdw$$
+                  AND has_foreign_data_wrapper_privilege(
+                    reachable_role.oid, wrapper.oid, $$USAGE$$
+                  )
               )
               OR EXISTS (
                 SELECT 1
@@ -1302,6 +1382,8 @@ fi
       || audit.bypassesRls
       || audit.ownsDatabase
       || audit.hasTemporary
+      || audit.canCreateDatabaseObject
+      || audit.canUseFdw
       || audit.hasPublicDatabasePrivilege
       || audit.canCreateSchema
       || audit.hasUnsafeRelationPrivilege
@@ -1468,18 +1550,31 @@ derived_resource_limits = {
 database_mode = sys.argv[1]
 bundled_derived_role = sys.argv[2]
 database_url = os.environ.get("DERIVED_DATABASE_URL", "")
+derived_role = os.environ.get("DERIVED_OWNER_ROLE", "")
 reader_role = os.environ.get("DERIVED_READER_ROLE", "")
+federation_database_url = os.environ.get("FEDERATION_DATABASE_URL", "")
+federation_role = os.environ.get("FEDERATION_DB_USER", "")
 
 if not database_url:
-    if reader_role:
+    if derived_role or reader_role:
         fail(
-            "DERIVED_READER_ROLE must be empty when derived database "
-            "management is disabled."
+            "DERIVED_OWNER_ROLE and DERIVED_READER_ROLE must be empty when "
+            "derived database management is disabled."
         )
     print("Derived database management is disabled and internally consistent.")
     raise SystemExit(0)
-if not reader_role:
-    fail("DERIVED_READER_ROLE is required with DERIVED_DATABASE_URL.")
+if not derived_role or not reader_role:
+    fail(
+        "DERIVED_OWNER_ROLE and DERIVED_READER_ROLE are required with "
+        "DERIVED_DATABASE_URL."
+    )
+if bool(federation_database_url) != bool(federation_role):
+    fail(
+        "FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be "
+        "configured or both be empty."
+    )
+if database_mode == "bundled" and not federation_database_url:
+    fail("Bundled federation requires FEDERATION_DATABASE_URL.")
 
 try:
     parsed = urlsplit(database_url)
@@ -1488,6 +1583,30 @@ try:
     uri_user = unquote_to_bytes(parsed.username).decode("utf-8")
 except (UnicodeDecodeError, ValueError):
     fail("DERIVED_DATABASE_URL contains an invalid encoded login identity.")
+if uri_user != derived_role:
+    fail("DERIVED_DATABASE_URL login must match DERIVED_OWNER_ROLE.")
+federation_uri_user = None
+if federation_database_url:
+    try:
+        parsed_federation = urlsplit(federation_database_url)
+        if (
+            parsed_federation.scheme not in {"postgres", "postgresql"}
+            or parsed_federation.username is None
+        ):
+            fail(
+                "FEDERATION_DATABASE_URL must contain an explicit "
+                "PostgreSQL login."
+            )
+        federation_uri_user = unquote_to_bytes(
+            parsed_federation.username
+        ).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        fail(
+            "FEDERATION_DATABASE_URL contains an invalid encoded login "
+            "identity."
+        )
+    if federation_uri_user != federation_role:
+        fail("FEDERATION_DATABASE_URL login must match FEDERATION_DB_USER.")
 
 with psycopg.connect(
     os.environ["DBS_MAPP"],
@@ -1574,7 +1693,7 @@ with psycopg.connect(
     row_factory=dict_row,
 ) as connection:
     with connection.cursor() as cursor:
-        cursor.execute("""
+        audit_sql = """
             SELECT
               current_database() AS "databaseName",
               current_user::text AS "currentUser",
@@ -1609,6 +1728,18 @@ with psycopg.connect(
                 current_database(),
                 $$TEMPORARY$$
               ) AS "hasTemporary",
+              has_database_privilege(
+                current_database(),
+                $$CREATE$$
+              ) AS "canCreateSchema",
+              EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+                WHERE wrapper.fdwname = $$postgres_fdw$$
+                  AND has_foreign_data_wrapper_privilege(
+                    current_user, wrapper.oid, $$USAGE$$
+                  )
+              ) AS "canUseFdw",
               EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_database AS database
@@ -1637,13 +1768,16 @@ with psycopg.connect(
                 $$derived_layers$$,
                 $$CREATE$$
               ) AS "canCreateDerived",
+              -- The derived owner may create objects only in its own schema.
+              -- Federation control/source objects have a separate owner.
               EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_namespace AS namespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
+                  AND namespace.nspname <> $$information_schema$$
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND namespace.nspname = $$derived_layers$$
                   )
                   AND has_schema_privilege(namespace.oid, $$CREATE$$)
               ) AS "canCreateBaseSchema",
@@ -1653,9 +1787,10 @@ with psycopg.connect(
                 JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
+                  AND namespace.nspname <> $$information_schema$$
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND namespace.nspname = $$derived_layers$$
                   )
                   AND relation.relkind IN (
                     $$r$$,
@@ -1691,9 +1826,10 @@ with psycopg.connect(
                 JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname !~ $$^pg_$$
-                  AND namespace.nspname NOT IN (
-                    $$information_schema$$,
-                    $$derived_layers$$
+                  AND namespace.nspname <> $$information_schema$$
+                  AND NOT (
+                    namespace.nspowner = login_role.oid
+                    AND namespace.nspname = $$derived_layers$$
                   )
                   AND relation.relkind = $$S$$
                   AND (
@@ -1727,13 +1863,27 @@ with psycopg.connect(
                       current_database(),
                       $$TEMPORARY$$
                     )
+                    OR has_database_privilege(
+                      reachable_role.oid,
+                      current_database(),
+                      $$CREATE$$
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+                      WHERE wrapper.fdwname = $$postgres_fdw$$
+                        AND has_foreign_data_wrapper_privilege(
+                          reachable_role.oid, wrapper.oid, $$USAGE$$
+                        )
+                    )
                     OR EXISTS (
                       SELECT 1
                       FROM pg_catalog.pg_namespace AS namespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
+                        AND namespace.nspname <> $$information_schema$$
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND namespace.nspname = $$derived_layers$$
                         )
                         AND has_schema_privilege(
                           reachable_role.oid,
@@ -1747,9 +1897,10 @@ with psycopg.connect(
                       JOIN pg_catalog.pg_namespace AS namespace
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
+                        AND namespace.nspname <> $$information_schema$$
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND namespace.nspname = $$derived_layers$$
                         )
                         AND relation.relkind IN (
                           $$r$$,
@@ -1812,9 +1963,10 @@ with psycopg.connect(
                       JOIN pg_catalog.pg_namespace AS namespace
                         ON namespace.oid = relation.relnamespace
                       WHERE namespace.nspname !~ $$^pg_$$
-                        AND namespace.nspname NOT IN (
-                          $$information_schema$$,
-                          $$derived_layers$$
+                        AND namespace.nspname <> $$information_schema$$
+                        AND NOT (
+                          namespace.nspowner = reachable_role.oid
+                          AND namespace.nspname = $$derived_layers$$
                         )
                         AND relation.relkind = $$S$$
                         AND (
@@ -1870,7 +2022,8 @@ with psycopg.connect(
               )
             ) AS settings
             WHERE login_role.rolname = current_user
-        """)
+        """
+        cursor.execute(audit_sql)
         audit = cursor.fetchone()
         if audit and audit["searchPath"] != "pg_catalog, public":
             fail(
@@ -1883,6 +2036,7 @@ with psycopg.connect(
             or audit["databaseName"] != reader_session["database_name"]
             or audit["currentUser"] != audit["sessionUser"]
             or audit["currentUser"] != uri_user
+            or audit["currentUser"] != derived_role
             or audit["currentUser"] == reader_role
             or (
                 database_mode == "bundled"
@@ -1896,6 +2050,8 @@ with psycopg.connect(
             or audit["bypassesRls"]
             or audit["ownsDatabase"]
             or audit["hasTemporary"]
+            or audit["canCreateSchema"]
+            or audit["canUseFdw"]
             or audit["hasPublicDatabasePrivilege"]
             or not audit["ownsDerivedSchema"]
             or not audit["canCreateDerived"]
@@ -1937,7 +2093,578 @@ with psycopg.connect(
                         "Census row count."
                     )
 
-print("Runtime and derived PostgreSQL identities and privileges verified.")
+if federation_database_url:
+    with psycopg.connect(
+        federation_database_url,
+        connect_timeout=10,
+        row_factory=dict_row,
+    ) as federation_connection:
+        with federation_connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                  current_database() AS "databaseName",
+                  current_user::text AS "currentUser",
+                  session_user::text AS "sessionUser",
+                  role.rolcanlogin AS "canLogin",
+                  role.rolsuper AS superuser,
+                  role.rolcreatedb AS "canCreateDatabase",
+                  role.rolcreaterole AS "canCreateRole",
+                  role.rolreplication AS replication,
+                  role.rolbypassrls AS "bypassesRls",
+                  role.rolconnlimit AS "connectionLimit",
+                  current_setting($$search_path$$) AS "searchPath",
+                  current_setting($$server_version_num$$)::integer
+                    AS "serverVersionNum",
+                  settings.work_mem_kb AS "workMemKb",
+                  settings.hash_mem_multiplier AS "hashMemMultiplier",
+                  settings.maintenance_work_mem_kb AS "maintenanceWorkMemKb",
+                  settings.max_parallel_workers AS "maxParallelWorkers",
+                  settings.temp_file_limit_kb AS "tempFileLimitKb",
+                  settings.statement_timeout_ms AS "statementTimeoutMs",
+                  settings.transaction_timeout_ms AS "transactionTimeoutMs",
+                  settings.lock_timeout_ms AS "lockTimeoutMs",
+                  settings.idle_transaction_timeout_ms
+                    AS "idleTransactionTimeoutMs",
+                  has_database_privilege(current_database(), $$CREATE$$)
+                    AS "canCreateSchema",
+                  has_database_privilege(current_database(), $$TEMPORARY$$)
+                    AS "hasTemporary",
+                  has_foreign_data_wrapper_privilege(
+                    current_user, $$postgres_fdw$$, $$USAGE$$
+                  ) AS "canUseFdw",
+                  (
+                    SELECT namespace.nspowner = role.oid
+                    FROM pg_catalog.pg_namespace AS namespace
+                    WHERE namespace.nspname = $$federation$$
+                  ) AS "ownsFederationSchema",
+                  has_schema_privilege($$federation$$, $$CREATE$$)
+                    AS "canCreateFederation",
+                  has_schema_privilege(
+                    $$derived_layers$$, $$USAGE,CREATE$$
+                  ) AS "hasDerivedSchemaPrivilege",
+                  EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS derived_object
+                    JOIN pg_catalog.pg_namespace AS derived_namespace
+                      ON derived_namespace.oid = derived_object.relnamespace
+                    WHERE derived_namespace.nspname = $$derived_layers$$
+                      AND CASE
+                        WHEN derived_object.relkind = $$S$$
+                        THEN has_sequence_privilege(
+                          current_user,
+                          derived_object.oid,
+                          $$USAGE,SELECT,UPDATE$$
+                        )
+                        WHEN derived_object.relkind IN (
+                          $$r$$, $$p$$, $$v$$, $$m$$, $$f$$
+                        ) THEN
+                          has_table_privilege(
+                            current_user,
+                            derived_object.oid,
+                            $$SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER$$
+                          )
+                          OR has_any_column_privilege(
+                            current_user,
+                            derived_object.oid,
+                            $$SELECT,INSERT,UPDATE,REFERENCES$$
+                          )
+                        ELSE false
+                      END
+                  ) AS "hasDerivedObjectPrivilege",
+                  COALESCE(
+                    has_schema_privilege(
+                      current_user,
+                      pg_catalog.to_regnamespace($$leeds$$),
+                      $$USAGE,CREATE$$
+                    ),
+                    false
+                  ) AS "hasBaseSchemaPrivilege",
+                  EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS base_object
+                    JOIN pg_catalog.pg_namespace AS base_namespace
+                      ON base_namespace.oid = base_object.relnamespace
+                    WHERE base_namespace.nspname = $$leeds$$
+                      AND CASE
+                        WHEN base_object.relkind = $$S$$
+                        THEN has_sequence_privilege(
+                          current_user,
+                          base_object.oid,
+                          $$USAGE,SELECT,UPDATE$$
+                        )
+                        WHEN base_object.relkind IN (
+                          $$r$$, $$p$$, $$v$$, $$m$$, $$f$$
+                        ) THEN
+                          has_table_privilege(
+                            current_user,
+                            base_object.oid,
+                            $$SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER$$
+                          )
+                          OR has_any_column_privilege(
+                            current_user,
+                            base_object.oid,
+                            $$SELECT,INSERT,UPDATE,REFERENCES$$
+                          )
+                        ELSE false
+                      END
+                  ) AS "hasBaseObjectPrivilege",
+                  EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS relation
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname = $$federation$$
+                      AND relation.relowner <> role.oid
+                  ) AS "hasUnownedRegistryObject",
+                  EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_auth_members AS membership
+                    WHERE membership.member = role.oid
+                       OR membership.roleid = role.oid
+                  ) AS "hasMembership"
+                FROM pg_catalog.pg_roles AS role
+                CROSS JOIN LATERAL (
+                  SELECT
+                    max(setting::numeric) FILTER (WHERE name = $$work_mem$$)
+                      AS work_mem_kb,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$hash_mem_multiplier$$
+                    ) AS hash_mem_multiplier,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$maintenance_work_mem$$
+                    ) AS maintenance_work_mem_kb,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$max_parallel_workers_per_gather$$
+                    ) AS max_parallel_workers,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$temp_file_limit$$
+                    ) AS temp_file_limit_kb,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$statement_timeout$$
+                    ) AS statement_timeout_ms,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$transaction_timeout$$
+                    ) AS transaction_timeout_ms,
+                    max(setting::numeric) FILTER (WHERE name = $$lock_timeout$$)
+                      AS lock_timeout_ms,
+                    max(setting::numeric) FILTER (
+                      WHERE name = $$idle_in_transaction_session_timeout$$
+                    ) AS idle_transaction_timeout_ms
+                  FROM pg_catalog.pg_settings
+                  WHERE name IN (
+                    $$work_mem$$, $$hash_mem_multiplier$$,
+                    $$maintenance_work_mem$$,
+                    $$max_parallel_workers_per_gather$$, $$temp_file_limit$$,
+                    $$statement_timeout$$, $$transaction_timeout$$,
+                    $$lock_timeout$$, $$idle_in_transaction_session_timeout$$
+                  )
+                ) AS settings
+                WHERE role.rolname = current_user
+            """)
+            federation_audit = cursor.fetchone()
+            if (
+                not federation_audit
+                or federation_audit["databaseName"]
+                != reader_session["database_name"]
+                or federation_audit["currentUser"]
+                != federation_audit["sessionUser"]
+                or federation_audit["currentUser"] != federation_uri_user
+                or federation_audit["currentUser"] != federation_role
+                or federation_audit["currentUser"] in {derived_role, reader_role}
+                or not federation_audit["canLogin"]
+                or federation_audit["superuser"]
+                or federation_audit["canCreateDatabase"]
+                or federation_audit["canCreateRole"]
+                or federation_audit["replication"]
+                or federation_audit["bypassesRls"]
+                or federation_audit["hasTemporary"]
+                or not federation_audit["canCreateSchema"]
+                or not federation_audit["canUseFdw"]
+                or not federation_audit["ownsFederationSchema"]
+                or not federation_audit["canCreateFederation"]
+                or federation_audit["hasDerivedSchemaPrivilege"]
+                or federation_audit["hasDerivedObjectPrivilege"]
+                or federation_audit["hasBaseSchemaPrivilege"]
+                or federation_audit["hasBaseObjectPrivilege"]
+                or federation_audit["hasUnownedRegistryObject"]
+                or federation_audit["hasMembership"]
+                or federation_audit["searchPath"] != "pg_catalog, public"
+                or not resource_policy_valid(
+                    federation_audit, derived_resource_limits
+                )
+            ):
+                fail(
+                    "FEDERATION_DATABASE_URL is not the required isolated "
+                    "FDW provisioner."
+                )
+
+            cursor.execute("""
+                WITH blocked_roles(role_name) AS (
+                  VALUES (%s::name), (%s::name)
+                )
+                SELECT
+                  bool_or(
+                    has_schema_privilege(
+                      role_name, $$federation$$, $$USAGE,CREATE$$
+                    )
+                  ) AS "hasRegistrySchemaAccess",
+                  bool_or(EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS registry_object
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = registry_object.relnamespace
+                    WHERE namespace.nspname = $$federation$$
+                      AND CASE
+                        WHEN registry_object.relkind = $$S$$
+                        THEN has_sequence_privilege(
+                          role_name,
+                          registry_object.oid,
+                          $$USAGE,SELECT,UPDATE$$
+                        )
+                        WHEN registry_object.relkind IN (
+                          $$r$$, $$p$$, $$v$$, $$m$$, $$f$$
+                        ) THEN
+                          has_table_privilege(
+                            role_name,
+                            registry_object.oid,
+                            $$SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER$$
+                          )
+                          OR has_any_column_privilege(
+                            role_name,
+                            registry_object.oid,
+                            $$SELECT,INSERT,UPDATE,REFERENCES$$
+                          )
+                        ELSE false
+                      END
+                  )) AS "hasRegistryObjectAccess"
+                FROM blocked_roles
+            """, (derived_role, reader_role))
+            registry_access = cursor.fetchone()
+            if any(registry_access.values()):
+                fail(
+                    "Runtime reader and derived owner must not access the "
+                    "federation control registry."
+                )
+
+            cursor.execute("""
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_auth_members AS membership
+                  JOIN pg_catalog.pg_roles AS consumer_role
+                    ON consumer_role.oid = membership.roleid
+                  WHERE consumer_role.rolname IN (%s, %s)
+                ) AS "hasConsumerRoleMember"
+            """, (derived_role, reader_role))
+            if cursor.fetchone()["hasConsumerRoleMember"]:
+                fail(
+                    "Runtime reader and derived owner roles must not have "
+                    "members."
+                )
+
+            cursor.execute(
+                "SELECT to_regclass($$federation._aliases$$) AS oid"
+            )
+            if cursor.fetchone()["oid"] is not None:
+                cursor.execute(
+                    "SELECT public.PostGIS_Lib_Version() AS postgis, "
+                    "(SELECT extversion FROM pg_catalog.pg_extension "
+                    " WHERE extname = $$postgis$$) AS postgis_extversion, "
+                    "public.PostGIS_PROJ_Version() AS proj, "
+                    "public.PostGIS_GEOS_Version() AS geos"
+                )
+                local_extension_versions = dict(cursor.fetchone())
+                cursor.execute(
+                    "SELECT alias, connection_ref, allowed_relations, status, "
+                    "last_observation, accepted_schema_fingerprint, "
+                    "accepted_physical_identity, "
+                    "accepted_connection_identity, last_observation_id "
+                    "FROM federation._aliases "
+                    "WHERE provisioned_at IS NOT NULL"
+                )
+                for alias_row in cursor.fetchall():
+                    alias_value = alias_row["alias"]
+                    if (
+                        alias_row["status"] == "active"
+                        and any(
+                            alias_row[field] is None
+                            for field in (
+                                "accepted_schema_fingerprint",
+                                "accepted_physical_identity",
+                                "accepted_connection_identity",
+                                "last_observation_id",
+                            )
+                        )
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} is active "
+                            "without complete accepted evidence."
+                        )
+                    connection_ref = alias_row["connection_ref"]
+                    connection_url = os.environ.get(
+                        f"FEDERATION_DBS_{connection_ref}"
+                    )
+                    if not connection_url:
+                        fail(
+                            f"Federation alias {alias_value!r} connectionRef "
+                            f"{connection_ref!r} is not configured."
+                        )
+                    params = psycopg.conninfo.conninfo_to_dict(connection_url)
+                    server_name = f"{alias_value}_srv"
+                    cursor.execute(
+                        "SELECT pg_get_userbyid(srvowner) AS owner, srvoptions, "
+                        "has_server_privilege(%s, oid, $$USAGE$$) AS derived_use, "
+                        "has_server_privilege(%s, oid, $$USAGE$$) AS reader_use "
+                        "FROM pg_catalog.pg_foreign_server WHERE srvname = %s",
+                        (derived_role, reader_role, server_name),
+                    )
+                    server = cursor.fetchone()
+                    if (
+                        not server
+                        or server["owner"] != federation_role
+                        or server["derived_use"]
+                        or server["reader_use"]
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} server is not "
+                            "isolated to the FDW provisioner."
+                        )
+                    server_options = dict(
+                        option.split("=", 1)
+                        for option in server["srvoptions"]
+                    )
+                    connection_option_names = (
+                        "host", "hostaddr", "port", "dbname", "sslmode",
+                        "sslrootcert", "gssencmode",
+                    )
+                    expected_options = {
+                        "host": str(params.get("host", "")),
+                        "port": str(params.get("port", "5432")),
+                        "dbname": str(params.get("dbname", "")),
+                    }
+                    expected_options.update({
+                        name: str(params[name])
+                        for name in connection_option_names
+                        if name not in expected_options and params.get(name)
+                    })
+                    actual_options = {
+                        name: server_options[name]
+                        for name in connection_option_names
+                        if name in server_options
+                    }
+                    unexpected_options = set(server_options) - (
+                        set(connection_option_names)
+                        | {"use_remote_estimate", "extensions"}
+                    )
+                    remote_extension_versions = (
+                        alias_row["last_observation"] or {}
+                    ).get("extensionVersions", {})
+                    pushdown_safe = all(
+                        local_extension_versions.get(local_key)
+                        and local_extension_versions[local_key]
+                            == remote_extension_versions.get(remote_key)
+                        for local_key, remote_key in (
+                            ("postgis", "postgis"),
+                            ("postgis_extversion", "postgisExtversion"),
+                            ("proj", "proj"),
+                            ("geos", "geos"),
+                        )
+                    )
+                    if (
+                        actual_options != expected_options
+                        or unexpected_options
+                        or server_options.get("use_remote_estimate") != "true"
+                        or server_options.get("extensions")
+                            not in {None, "postgis"}
+                        or (
+                            alias_row["status"] == "active"
+                            and server_options.get("extensions") == "postgis"
+                            and not pushdown_safe
+                        )
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} server options "
+                            "do not match its connectionRef."
+                        )
+                    schema_name = f"source_{alias_value}"
+                    expected_usage = alias_row["status"] == "active"
+                    cursor.execute(
+                        "SELECT pg_get_userbyid(nspowner) AS owner, "
+                        "has_schema_privilege(%s, oid, $$USAGE$$) AS derived_use, "
+                        "has_schema_privilege(%s, oid, $$USAGE$$) AS reader_use, "
+                        "EXISTS ("
+                        "  SELECT 1 FROM pg_catalog.aclexplode(COALESCE("
+                        "    nspacl, pg_catalog.acldefault($$n$$, nspowner)"
+                        "  )) AS privilege "
+                        "  WHERE NOT ("
+                        "    privilege.grantee = nspowner "
+                        "    OR (%s AND privilege.grantor = nspowner "
+                        "      AND privilege.grantee IN ("
+                        "        pg_catalog.to_regrole(%s)::oid, "
+                        "        pg_catalog.to_regrole(%s)::oid"
+                        "      ) "
+                        "      AND privilege.privilege_type = $$USAGE$$ "
+                        "      AND NOT privilege.is_grantable)"
+                        "    )"
+                        ") AS \"hasUnexpectedAcl\" "
+                        "FROM pg_catalog.pg_namespace WHERE nspname = %s",
+                        (
+                            derived_role,
+                            reader_role,
+                            expected_usage,
+                            derived_role,
+                            reader_role,
+                            schema_name,
+                        ),
+                    )
+                    schema = cursor.fetchone()
+                    if (
+                        not schema
+                        or schema["owner"] != federation_role
+                        or schema["derived_use"] != expected_usage
+                        or schema["reader_use"] != expected_usage
+                        or schema["hasUnexpectedAcl"]
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} source schema "
+                            "ownership or access does not match its status."
+                        )
+
+                    cursor.execute("""
+                        SELECT relation.relname, relation.relkind,
+                               pg_get_userbyid(relation.relowner) AS owner,
+                               server.srvname, foreign_table.ftoptions,
+                               has_table_privilege(%s, relation.oid, $$SELECT$$)
+                                 AS derived_select,
+                               has_table_privilege(%s, relation.oid, $$SELECT$$)
+                                 AS reader_select,
+                               EXISTS (
+                                 SELECT 1
+                                 FROM pg_catalog.aclexplode(COALESCE(
+                                   relation.relacl,
+                                   pg_catalog.acldefault(
+                                     $$r$$, relation.relowner
+                                   )
+                                 )) AS privilege
+                                 WHERE NOT (
+                                   privilege.grantee = relation.relowner
+                                   OR (%s
+                                     AND privilege.grantor = relation.relowner
+                                     AND privilege.grantee IN (
+                                       pg_catalog.to_regrole(%s)::oid,
+                                       pg_catalog.to_regrole(%s)::oid
+                                     )
+                                     AND privilege.privilege_type = $$SELECT$$
+                                     AND NOT privilege.is_grantable)
+                                   )
+                               ) AS "hasUnexpectedAcl",
+                               EXISTS (
+                                 SELECT 1
+                                 FROM pg_catalog.pg_attribute AS attribute
+                                 WHERE attribute.attrelid = relation.oid
+                                   AND attribute.attnum > 0
+                                   AND NOT attribute.attisdropped
+                                   AND attribute.attacl IS NOT NULL
+                               ) AS "hasColumnAcl"
+                        FROM pg_catalog.pg_class AS relation
+                        JOIN pg_catalog.pg_namespace AS namespace
+                          ON namespace.oid = relation.relnamespace
+                        LEFT JOIN pg_catalog.pg_foreign_table AS foreign_table
+                          ON foreign_table.ftrelid = relation.oid
+                        LEFT JOIN pg_catalog.pg_foreign_server AS server
+                          ON server.oid = foreign_table.ftserver
+                        WHERE namespace.nspname = %s
+                          AND relation.relkind IN (
+                            $$r$$, $$p$$, $$v$$, $$m$$, $$f$$, $$S$$
+                          )
+                    """, (
+                        derived_role,
+                        reader_role,
+                        expected_usage,
+                        derived_role,
+                        reader_role,
+                        schema_name,
+                    ))
+                    local_relations = cursor.fetchall()
+                    expected_relations = {
+                        relation.split(".", 1)[1]: relation
+                        for relation in alias_row["allowed_relations"]
+                    }
+                    if {row["relname"] for row in local_relations} != set(
+                        expected_relations
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} local relation "
+                            "set does not match its allowlist."
+                        )
+                    for relation in local_relations:
+                        remote_options = dict(
+                            option.split("=", 1)
+                            for option in (relation["ftoptions"] or [])
+                        )
+                        remote_schema = remote_options.get("schema_name", "")
+                        remote_table = remote_options.get("table_name", "")
+                        remote_relation = f"{remote_schema}.{remote_table}"
+                        if (
+                            relation["relkind"] != "f"
+                            or relation["owner"] != federation_role
+                            or relation["srvname"] != server_name
+                            or remote_relation
+                            != expected_relations[relation["relname"]]
+                            or relation["derived_select"] != expected_usage
+                            or relation["reader_select"] != expected_usage
+                            or relation["hasUnexpectedAcl"]
+                            or relation["hasColumnAcl"]
+                        ):
+                            fail(
+                                f"Federation alias {alias_value!r} has an "
+                                "unmanaged local foreign-table binding."
+                            )
+
+                    cursor.execute("""
+                        SELECT usename AS role_name, umoptions
+                        FROM pg_catalog.pg_user_mappings
+                        WHERE srvname = %s
+                    """, (server_name,))
+                    mappings = {
+                        row["role_name"]: dict(
+                            option.split("=", 1)
+                            for option in (row["umoptions"] or [])
+                        )
+                        for row in cursor.fetchall()
+                    }
+                    expected_mapping = {
+                        "user": str(params.get("user", "")),
+                        "password": str(params.get("password", "")),
+                    }
+                    # PostgreSQL masks umoptions for mappings owned by other
+                    # roles when those roles intentionally lack server USAGE.
+                    # The closed role set and privilege checks below keep the
+                    # federation provisioner as the only mapping authority.
+                    required_mapping_roles = {derived_role, reader_role}
+                    allowed_mapping_roles = required_mapping_roles | {
+                        federation_role
+                    }
+                    if (
+                        not required_mapping_roles.issubset(mappings)
+                        or not set(mappings).issubset(allowed_mapping_roles)
+                        or (
+                            alias_row["status"] == "active"
+                            and set(mappings) != allowed_mapping_roles
+                        )
+                        or (
+                            federation_role in mappings
+                            and mappings[federation_role] != expected_mapping
+                        )
+                    ):
+                        fail(
+                            f"Federation alias {alias_value!r} has unexpected "
+                            "user mappings."
+                        )
+
+print(
+    "Runtime, derived, and federation PostgreSQL identities and privileges "
+    "verified."
+)
 ' "${database_mode}" "$(dotenv_value DERIVED_DB_USER)"
 
 published_http="$("${compose[@]}" port caddy 80 | tail -n 1)"
