@@ -123,6 +123,12 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 "every DBS_<ALIAS> variable must be covered by a prefix rule, "
                 "not a literal DBS_MAPP enumeration",
             )
+            self.assertIn(
+                '"${!FEDERATION_DBS_@}"',
+                guard,
+                "federation connection variables must be covered by their "
+                "own prefix rule",
+            )
             for key in expected:
                 self.assertIn(key, guard)
                 self.assertIn('unset "${key}"', guard)
@@ -671,7 +677,9 @@ class DatabaseAccessContractTests(unittest.TestCase):
             '"last_observation, accepted_schema_fingerprint, "', normalized
         )
         self.assertIn('"WHERE provisioned_at IS NOT NULL"', normalized)
-        self.assertIn('os.environ.get(f"DBS_{connection_ref}")', normalized)
+        self.assertIn(
+            'f"FEDERATION_DBS_{connection_ref}"', normalized
+        )
         self.assertIn("srvoptions", normalized)
         self.assertIn(
             "FROM pg_catalog.pg_foreign_server WHERE srvname = %s",

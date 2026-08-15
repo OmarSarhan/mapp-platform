@@ -88,6 +88,23 @@ class ComposeIsolationTests(unittest.TestCase):
                     json.dumps(service, sort_keys=True),
                 )
 
+    def test_federation_source_reference_is_only_given_to_config_ui(self) -> None:
+        model = resolved_compose(
+            "compose.bundled-db.yaml",
+            "compose.federation-test.yaml",
+        )
+        services = model["services"]
+        config_environment = services["config-ui"]["environment"]
+
+        self.assertIn("FEDERATION_DBS_LEEDS_EXT", config_environment)
+        self.assertNotIn("DBS_LEEDS_EXT", config_environment)
+        for service_name in ("xyz", "xyz-preview", "semantic-service"):
+            with self.subTest(service=service_name):
+                self.assertNotIn(
+                    "FEDERATION_DBS_LEEDS_EXT",
+                    services[service_name].get("environment", {}),
+                )
+
     def test_config_ui_is_the_only_semantic_service_peer(self) -> None:
         semantic_state = str((ROOT / "var/semantic").resolve())
         for mode, model in self.models.items():

@@ -29,7 +29,8 @@ environment_value() {
 reject_database_environment_overrides() {
   local key configured
   for key in \
-    "${!DBS_@}" ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
+    "${!DBS_@}" "${!FEDERATION_DBS_@}" \
+    ETL_DATABASE_URL POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD \
     ETL_DB_USER ETL_DB_PASSWORD XYZ_DB_USER XYZ_DB_PASSWORD \
     DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL \
     DERIVED_OWNER_ROLE DERIVED_READER_ROLE \
@@ -2384,7 +2385,9 @@ if federation_database_url:
                             "without complete accepted evidence."
                         )
                     connection_ref = alias_row["connection_ref"]
-                    connection_url = os.environ.get(f"DBS_{connection_ref}")
+                    connection_url = os.environ.get(
+                        f"FEDERATION_DBS_{connection_ref}"
+                    )
                     if not connection_url:
                         fail(
                             f"Federation alias {alias_value!r} connectionRef "

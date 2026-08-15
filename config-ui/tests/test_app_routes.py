@@ -112,7 +112,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         with patch.object(app, "FEDERATION", federation), patch.object(
             app, "CONTROL", MagicMock()
         ), patch.object(
-            app, "DB_CONNECTIONS",
+            app, "FEDERATION_CONNECTIONS",
             {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
         ):
             handler.do_POST()
@@ -146,7 +146,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         with patch.object(app, "FEDERATION", federation), patch.object(
             app, "CONTROL", control
         ), patch.object(
-            app, "DB_CONNECTIONS",
+            app, "FEDERATION_CONNECTIONS",
             {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
         ):
             handler.do_POST()
@@ -180,7 +180,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         handler, responses = self.handler("provision", payload={})
 
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "DB_CONNECTIONS",
+            app, "FEDERATION_CONNECTIONS",
             {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
         ):
             handler.do_POST()
@@ -188,6 +188,35 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
         self.assertEqual("federation.invalid_request", responses[0][1]["code"])
         federation.provision.assert_not_called()
+
+    def test_federation_connections_are_isolated_from_normal_discovery(self):
+        federation_url = "postgresql://federation-reader@source-db/source"
+        ordinary_url = "postgresql://runtime-reader@db/mapp"
+        with patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": federation_url}
+        ), patch.object(
+            app, "DB_CONNECTIONS", {"MAPP": ordinary_url}
+        ), patch.object(app, "discover_connection", return_value=[]) as discover:
+            self.assertEqual(
+                federation_url,
+                app.resolve_federation_connection_url("LEEDS_EXT"),
+            )
+            self.assertEqual([], app.discover())
+
+        discover.assert_called_once_with("MAPP", ordinary_url)
+
+    def test_normal_database_connection_cannot_satisfy_connection_ref(self):
+        with patch.object(app, "FEDERATION_CONNECTIONS", {}), patch.object(
+            app,
+            "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://runtime-reader@source-db/source"},
+        ):
+            with self.assertRaises(app.FederationSchemaError) as raised:
+                app.resolve_federation_connection_url("LEEDS_EXT")
+
+        self.assertEqual(
+            "federation.connection_ref_not_found", raised.exception.code
+        )
 
     def test_a_federation_schema_error_still_carries_its_own_status_and_code(
         self,

@@ -9,18 +9,18 @@
 # config-ui must be named alongside source-db here even if it's already
 # running from the base stack — `up -d <service>` only starts/recreates
 # the services it's given, so an already-running config-ui started without
-# this overlay never picks up the DBS_LEEDS_EXT entry below, and Observe
-# fails with federation.connection_ref_not_found.
+# this overlay never picks up the FEDERATION_DBS_LEEDS_EXT entry below, and
+# Observe fails with federation.connection_ref_not_found.
 #
 # Deliberately plain postgis/postgis, not the custom mapp-postgis-h3 image —
 # a real independently-operated external source would not have MAPP's own
 # H3 extension installed (docs/federation-architecture-waypoint.md).
 services:
-  # config-ui only sees DBS_<ALIAS> vars explicitly listed here — Compose's
-  # `environment:` block does not forward arbitrary .env keys automatically.
+  # config-ui only sees FEDERATION_DBS_<REF> vars explicitly listed here —
+  # Compose's `environment:` block does not forward arbitrary .env keys.
   config-ui:
     environment:
-      DBS_LEEDS_EXT: ${DBS_LEEDS_EXT:?Set DBS_LEEDS_EXT in .env}
+      FEDERATION_DBS_LEEDS_EXT: ${FEDERATION_DBS_LEEDS_EXT:?Set FEDERATION_DBS_LEEDS_EXT in .env}
 
   source-db:
     image: postgis/postgis:17-3.5-alpine@sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568

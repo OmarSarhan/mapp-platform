@@ -253,6 +253,10 @@ artifact retention, storage quotas, or host-level resource controls.
   schemas and tables. The provisioner must not own or access `derived_layers`
   or source-data schemas such as `leeds`, and the derived owner must not retain
   database `CREATE` or FDW `USAGE`.
+- Treat each `FEDERATION_DBS_<REF>` value as a remote-source credential. The
+  configuration service resolves it only for federation Observe/Provision;
+  the separate namespace deliberately keeps it out of ordinary `DBS_*`
+  catalog, layer, workspace, and semantic discovery.
 - Every platform caller uses the same mapped remote federation identity.
   Do not register user-private, recipient-filtered, or end-to-end-encrypted
   message/key relations. Catalog RLS detection cannot attest application-level

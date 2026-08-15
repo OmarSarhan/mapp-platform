@@ -382,8 +382,8 @@ def enforce_tls_policy(tls_policy: str, connection_url: str) -> None:
     """Reject a connectionRef whose actual sslmode is weaker than the
     alias's registered tlsPolicy. Registration validates tlsPolicy as an
     attestation of what the operator requires, but nothing previously
-    checked the DBS_<NAME> connection string actually delivers it — a
-    registered "verify-full" alias could observe and provision over
+    checked the FEDERATION_DBS_<NAME> connection string actually delivers
+    it — a registered "verify-full" alias could observe and provision over
     plaintext (sslmode=disable) without ever being flagged."""
     _enum(tls_policy, label="tlsPolicy", allowed=TLS_POLICIES)
     try:

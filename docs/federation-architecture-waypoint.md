@@ -831,14 +831,12 @@ proposals, audit details, screenshots, artifacts, logs, committed
 configuration, or ordinary API responses. Three existing mechanisms constrain
 how that is achieved.
 
-**The environment-override guard is a literal enumeration.**
-`reject_database_environment_overrides()` at `bin/mapp:121` and its verbatim
-mirror at `scripts/verify.sh:29` list the database environment keys that a
-shell export may not silently replace. A new `DBS_<ALIAS>` or federation
-connection variable that is not added to **both** lists escapes the guard
-entirely, letting an exported value redirect a source connection without
-detection. Any new connection variable must be added in both places in the same
-commit, and the enumeration should be replaced with a prefix rule.
+**The environment-override guards cover both connection namespaces.**
+`reject_database_environment_overrides()` in `bin/mapp` and its verbatim
+mirror in `scripts/verify.sh` cover both `${!DBS_@}` and the isolated
+`${!FEDERATION_DBS_@}` namespace. A connection variable that is not covered in
+**both** places would let an exported value redirect a source connection
+without detection.
 
 **`doctor --add-missing` generates secrets by name.** `scripts/check_env.py`
 substitutes a fresh `secrets.token_hex(24)` for any key whose name contains

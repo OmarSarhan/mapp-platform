@@ -108,6 +108,11 @@ DB_CONNECTIONS = {
     for key, value in os.environ.items()
     if key.startswith("DBS_") and value
 }
+FEDERATION_CONNECTIONS = {
+    key.removeprefix("FEDERATION_DBS_"): value
+    for key, value in os.environ.items()
+    if key.startswith("FEDERATION_DBS_") and value
+}
 LAYER_VALUES_DEFAULT_LIMIT = 100
 LAYER_VALUES_MAX_LIMIT = 500
 LAYER_STATISTICS_DEFAULT_BINS = 10
@@ -2669,17 +2674,16 @@ def resolve_derived_spatial_scope(payload: dict) -> dict:
 def resolve_federation_connection_url(connection_ref: str) -> str:
     """Resolve a Source alias's connectionRef to a real connection string.
 
-    connectionRef is deliberately just the suffix of an existing
-    `DBS_<NAME>` environment variable rather than a value produced by a
-    dedicated secret-submission endpoint (see federation_store.py's module
-    docstring) — this reuses the same, already override-protected
-    convention `PostgresSemanticSources` uses for every other alias.
+    connectionRef is the suffix of a `FEDERATION_DBS_<NAME>` environment
+    variable. Keeping these credentials outside `DB_CONNECTIONS` prevents
+    normal catalog, layer, and semantic discovery from reaching a federation
+    source; only explicitly scoped Observe/Provision actions resolve them.
     """
-    connection_url = DB_CONNECTIONS.get(connection_ref)
+    connection_url = FEDERATION_CONNECTIONS.get(connection_ref)
     if not connection_url:
         raise FederationSchemaError(
             f"connectionRef {connection_ref!r} does not match a configured "
-            "DBS_<NAME> connection.",
+            "FEDERATION_DBS_<NAME> connection.",
             code="federation.connection_ref_not_found",
         )
     return connection_url
