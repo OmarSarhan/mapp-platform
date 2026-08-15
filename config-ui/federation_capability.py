@@ -90,8 +90,8 @@ def extension_versions(cursor: Any) -> dict[str, str]:
 
 def _verify_allowed_relations(
     cursor: Any, allowed_relations: tuple[str, ...]
-) -> tuple[bool, bool, str]:
-    """Return selectability, per-user access risk, and schema fingerprint.
+) -> tuple[bool, bool, str, dict[str, str]]:
+    """Return selectability, access risk, schema and column-shape fingerprints.
 
     The fingerprint hashes canonical JSON containing each allowed relation's
     columns and view/RLS policy semantics. Qualified collation names and JSON
@@ -104,6 +104,7 @@ def _verify_allowed_relations(
     all_present = True
     rls_detected = False
     fingerprints = []
+    column_shapes = {}
     for entry in allowed_relations:
         schema, relation = _parsed_schema_relation(entry)
         cursor.execute(
@@ -146,6 +147,29 @@ def _verify_allowed_relations(
                     )
                   )
               ) AS types_importable,
+              encode(sha256(convert_to(COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'name', a.attname,
+                  'remoteName', a.attname,
+                  'type', jsonb_build_array(tn.nspname, t.typname),
+                  'typmod', a.atttypmod,
+                  'notNull', a.attnotnull,
+                  'collation', CASE WHEN co.oid IS NULL THEN NULL
+                    ELSE jsonb_build_array(cn.nspname, co.collname)
+                  END
+                ) ORDER BY a.attnum)
+                FROM pg_catalog.pg_attribute AS a
+                JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
+                JOIN pg_catalog.pg_namespace AS tn ON tn.oid = t.typnamespace
+                LEFT JOIN pg_catalog.pg_collation AS co
+                  ON co.oid = a.attcollation
+                LEFT JOIN pg_catalog.pg_namespace AS cn
+                  ON cn.oid = co.collnamespace
+                WHERE a.attrelid = c.oid
+                  AND a.attnum > 0
+                  AND NOT a.attisdropped
+              ), '[]'::jsonb)::text, 'UTF8')), 'hex')
+                AS column_shape_fingerprint,
               encode(sha256(convert_to(jsonb_build_object(
                 'schema', n.nspname,
                 'relation', c.relname,
@@ -236,7 +260,8 @@ def _verify_allowed_relations(
         if row["bypasses_per_user_access"]:
             rls_detected = True
         fingerprints.append(row["definition_fingerprint"])
-    return all_present, rls_detected, "|".join(fingerprints)
+        column_shapes[entry] = row["column_shape_fingerprint"]
+    return all_present, rls_detected, "|".join(fingerprints), column_shapes
 
 
 def _selectable(cursor: Any, schema: str, relation: str) -> bool:
@@ -312,7 +337,7 @@ def detect_capability(
     *,
     allowed_relations: tuple[str, ...],
     tls_policy: str,
-) -> tuple[dict[str, Any], datetime, str | None]:
+) -> tuple[dict[str, Any], datetime, str | None, dict[str, str]]:
     """Bounded, read-only capability and connectivity detection.
 
     `allowed_relations` are normalized "schema.relation" strings, matching
@@ -320,13 +345,14 @@ def detect_capability(
     the alias's registered requirement — enforced against the connection
     string's actual sslmode before connecting, the same as Provision, so a
     weak connectionRef is never even Observed successfully.
-    Returns (observation, observed_at, physical_identity) — observation is
-    already validated against `federation_schema.validate_observation()`'s
-    closed contract. observed_at is a local audit timestamp captured just
-    before the first catalog query; it is not an ordering authority.
-    physical_identity is computed from this same connection's snapshot when
-    reachable (None otherwise) — see _physical_identity_from_cursor for why
-    it must not be a second, separate connection."""
+    Returns observation, observed_at, physical_identity, and private canonical
+    column-shape hashes. The observation is already validated against
+    `federation_schema.validate_observation()`'s closed contract; the hashes do
+    not expand that public contract. observed_at is a local audit timestamp
+    captured just before the first catalog query; it is not an ordering
+    authority. physical_identity and the hashes come from this same snapshot
+    when reachable — see _physical_identity_from_cursor for why it must not be
+    a second, separate connection."""
     enforce_tls_policy(tls_policy, connection_url)
 
     try:
@@ -340,9 +366,12 @@ def detect_capability(
                     PostgresSemanticSources._begin_read_only(cursor)
                     observed_at = datetime.now(timezone.utc)
                     versions = extension_versions(cursor)
-                    relations_verified, rls_detected, schema_fingerprint = (
-                        _verify_allowed_relations(cursor, allowed_relations)
-                    )
+                    (
+                        relations_verified,
+                        rls_detected,
+                        schema_fingerprint,
+                        column_shapes,
+                    ) = _verify_allowed_relations(cursor, allowed_relations)
                     physical_id = _physical_identity_from_cursor(
                         cursor, allowed_relations
                     )
@@ -354,7 +383,7 @@ def detect_capability(
                         "lastConnected": _now_iso(),
                         "lastSchemaVerified": None,
                         "sourceVersion": None,
-                    }), datetime.now(timezone.utc), None
+                    }), datetime.now(timezone.utc), None, {}
     except psycopg.Error as exc:
         sqlstate = getattr(exc, "sqlstate", None)
         message = str(exc).lower()
@@ -372,7 +401,7 @@ def detect_capability(
             "lastConnected": None,
             "lastSchemaVerified": None,
             "sourceVersion": None,
-        }), datetime.now(timezone.utc), None
+        }), datetime.now(timezone.utc), None, {}
 
     return validate_observation({
         "connectivity": "reachable",
@@ -384,17 +413,18 @@ def detect_capability(
         "extensionVersions": versions,
         "rowLevelSecurityDetected": rls_detected,
         "schemaFingerprint": schema_fingerprint,
-    }), observed_at, physical_id
+    }), observed_at, physical_id, column_shapes
 
 
 def verify_remote_state(
     connection_url: str, allowed_relations: tuple[str, ...]
-) -> tuple[str, dict[str, str], bool, bool, str]:
+) -> tuple[str, dict[str, str], bool, bool, str, dict[str, str]]:
     """Read all live provisioning evidence in one repeatable-read snapshot.
 
     Returns physical identity, extension versions, relation selectability,
-    access-control detection, and schema fingerprint. Connection/query
-    failures are left to the provisioning caller as psycopg errors.
+    access-control detection, schema fingerprint, and per-relation canonical
+    column-shape hashes. Connection/query failures are left to the provisioning
+    caller as psycopg errors.
     """
     with psycopg.connect(
         connection_url,
@@ -405,13 +435,17 @@ def verify_remote_state(
             PostgresSemanticSources._begin_read_only(cursor)
             identity = _physical_identity_from_cursor(cursor, allowed_relations)
             versions = extension_versions(cursor)
-            relations_verified, rls_detected, schema_fingerprint = (
-                _verify_allowed_relations(cursor, allowed_relations)
-            )
+            (
+                relations_verified,
+                rls_detected,
+                schema_fingerprint,
+                column_shapes,
+            ) = _verify_allowed_relations(cursor, allowed_relations)
     return (
         identity,
         versions,
         relations_verified,
         rls_detected,
         schema_fingerprint,
+        column_shapes,
     )

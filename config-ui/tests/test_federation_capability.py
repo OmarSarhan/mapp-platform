@@ -72,6 +72,7 @@ def relation_check_results(
         {
             "bypasses_per_user_access": rls,
             "types_importable": types_importable,
+            "column_shape_fingerprint": f"columns-{fp}",
             "definition_fingerprint": fp,
         }
         for fp in fingerprints
@@ -107,7 +108,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ) as mock_connect:
-            observation, observed_at, physical_id = detect_capability(
+            observation, observed_at, physical_id, column_shapes = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -131,6 +132,7 @@ class DetectCapabilityTests(unittest.TestCase):
         )
         self.assertFalse(observation["rowLevelSecurityDetected"])
         self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
+        self.assertNotIn("columnShapes", observation)
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNotNone(observation["lastSchemaVerified"])
         # The physical identity must come from this same probe's snapshot,
@@ -139,6 +141,9 @@ class DetectCapabilityTests(unittest.TestCase):
         # for the *new* relation get paired with schema evidence that only
         # ever verified the *old* one.
         self.assertEqual("7672778953115078690/16384/24601", physical_id)
+        self.assertEqual(
+            {"leeds.bus_stops": "columns-fp-bus-stops"}, column_shapes
+        )
         self.assertEqual(1, mock_connect.call_count)
 
     def test_reports_no_postgis_without_probing_proj_or_geos(self):
@@ -150,7 +155,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _, _ = detect_capability(
+            observation, _, _, _ = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -177,7 +182,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _, physical_id = detect_capability(
+            observation, _, physical_id, column_shapes = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -193,6 +198,7 @@ class DetectCapabilityTests(unittest.TestCase):
         # itself found the relation missing — the identity's own "missing"
         # marker is what carries that fact forward, not a skipped call.
         self.assertEqual("7672778953115078690/16384/missing", physical_id)
+        self.assertEqual({}, column_shapes)
 
     def test_reports_schema_changed_for_a_source_only_column_type(self):
         cursor = ScriptedFakeCursor(
@@ -204,7 +210,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _, _ = detect_capability(
+            observation, _, _, _ = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -222,7 +228,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _, _ = detect_capability(
+            observation, _, _, _ = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -250,6 +256,10 @@ class DetectCapabilityTests(unittest.TestCase):
             "jsonb_build_object",
             "sha256(convert_to",
             "format_type(a.atttypid, a.atttypmod)",
+            "column_shape_fingerprint",
+            "'remoteName', a.attname",
+            "jsonb_build_array(tn.nspname, t.typname)",
+            "a.atttypmod",
             "pg_catalog.pg_type AS import_type",
             "type_extension.extname = 'postgis'",
             "jsonb_build_array(cn.nspname, co.collname)",
@@ -273,6 +283,8 @@ class DetectCapabilityTests(unittest.TestCase):
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, executed_sql)
+        self.assertNotIn("'default'", executed_sql)
+        self.assertNotIn("a.atthasdef", executed_sql)
 
     def test_combines_multiple_relations_into_one_ordered_fingerprint(self):
         cursor = ScriptedFakeCursor(
@@ -283,7 +295,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            observation, _, _ = detect_capability(
+            observation, _, _, column_shapes = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops", "leeds.roads"),
                 tls_policy="require",
@@ -292,13 +304,20 @@ class DetectCapabilityTests(unittest.TestCase):
         # Ordered by the given allowed_relations sequence, matching
         # physical_identity's own ordering convention.
         self.assertEqual("fp-a|fp-b", observation["schemaFingerprint"])
+        self.assertEqual(
+            {
+                "leeds.bus_stops": "columns-fp-a",
+                "leeds.roads": "columns-fp-b",
+            },
+            column_shapes,
+        )
 
     def test_connectivity_failure_is_reported_not_raised(self):
         with patch(
             "federation_capability.psycopg.connect",
             side_effect=psycopg.OperationalError("could not connect"),
         ):
-            observation, observed_at, physical_id = detect_capability(
+            observation, observed_at, physical_id, column_shapes = detect_capability(
                 "postgresql://reader:secret@unreachable/source?"
                 "sslmode=require&gssencmode=disable",
                 allowed_relations=("leeds.bus_stops",),
@@ -322,6 +341,7 @@ class DetectCapabilityTests(unittest.TestCase):
         # client-side timestamp is unavoidable.
         self.assertIsInstance(observed_at, datetime)
         self.assertIsNone(physical_id)
+        self.assertEqual({}, column_shapes)
 
     def test_query_failure_preserves_successful_connectivity(self):
         cursor = ScriptedFakeCursor([])
@@ -332,7 +352,7 @@ class DetectCapabilityTests(unittest.TestCase):
             "federation_capability.extension_versions",
             side_effect=psycopg.errors.InsufficientPrivilege("denied"),
         ):
-            observation, _, physical_id = detect_capability(
+            observation, _, physical_id, column_shapes = detect_capability(
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
@@ -343,6 +363,7 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertIsNotNone(observation["lastConnected"])
         self.assertIsNone(observation["lastSchemaVerified"])
         self.assertIsNone(physical_id)
+        self.assertEqual({}, column_shapes)
 
     def test_authentication_failures_are_reported_distinctly_from_outages(self):
         failures = (
@@ -356,7 +377,7 @@ class DetectCapabilityTests(unittest.TestCase):
             with self.subTest(failure=failure), patch(
                 "federation_capability.psycopg.connect", side_effect=failure
             ):
-                observation, _, _ = detect_capability(
+                observation, _, _, _ = detect_capability(
                     TLS_URL,
                     allowed_relations=("leeds.bus_stops",),
                     tls_policy="require",
@@ -380,8 +401,8 @@ class DetectCapabilityTests(unittest.TestCase):
 class VerifyRemoteStateTests(unittest.TestCase):
     """Provision's own live re-check — physical identity, extension
     versions, relation existence/selectability, RLS/security-barrier
-    exposure, and schema fingerprint, all gathered from the one connection
-    this opens."""
+    exposure, schema fingerprint, and canonical column shapes, all gathered
+    from the one connection this opens."""
 
     def test_combines_the_cluster_database_and_relation_identity(self):
         cursor = ScriptedFakeCursor(
@@ -399,6 +420,7 @@ class VerifyRemoteStateTests(unittest.TestCase):
                 relations_verified,
                 rls_detected,
                 schema_fingerprint,
+                column_shapes,
             ) = verify_remote_state("postgresql://reader", ("leeds.bus_stops",))
 
         self.assertEqual("7672778953115078690/16384/24601", identity)
@@ -415,6 +437,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
         self.assertTrue(relations_verified)
         self.assertFalse(rls_detected)
         self.assertEqual("fp-bus-stops", schema_fingerprint)
+        self.assertEqual(
+            {"leeds.bus_stops": "columns-fp-bus-stops"}, column_shapes
+        )
 
     def test_differs_when_the_database_was_dropped_and_recreated(self):
         # Same cluster (system_identifier unchanged), different database
@@ -505,12 +530,15 @@ class VerifyRemoteStateTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            _, _, relations_verified, _, schema_fingerprint = verify_remote_state(
+            (
+                _, _, relations_verified, _, schema_fingerprint, column_shapes
+            ) = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
         self.assertFalse(relations_verified)
         self.assertEqual("missing", schema_fingerprint)
+        self.assertEqual({}, column_shapes)
 
     def test_reports_relations_not_verified_when_present_but_unselectable(self):
         # The relation exists in pg_class (a real row is returned, unlike
@@ -532,12 +560,15 @@ class VerifyRemoteStateTests(unittest.TestCase):
         ), patch(
             "federation_capability._selectable", return_value=False
         ):
-            _, _, relations_verified, _, schema_fingerprint = verify_remote_state(
+            (
+                _, _, relations_verified, _, schema_fingerprint, column_shapes
+            ) = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 
         self.assertFalse(relations_verified)
         self.assertEqual("missing", schema_fingerprint)
+        self.assertEqual({}, column_shapes)
 
     def test_reports_row_level_security_detection(self):
         cursor = ScriptedFakeCursor(
@@ -549,7 +580,7 @@ class VerifyRemoteStateTests(unittest.TestCase):
             "federation_capability.psycopg.connect",
             return_value=ScriptedFakeConnection(cursor),
         ):
-            *_, rls_detected, _ = verify_remote_state(
+            _, _, _, rls_detected, _, _ = verify_remote_state(
                 "postgresql://reader", ("leeds.bus_stops",)
             )
 

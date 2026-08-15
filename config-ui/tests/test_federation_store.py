@@ -38,6 +38,10 @@ DIFFERENT_VERSIONS = {
     "proj": "8.0.0",
     "geos": "3.9.0",
 }
+COLUMN_SHAPE_FINGERPRINT = "column-shape"
+REMOTE_COLUMN_SHAPES = {
+    "leeds.smoke_control_orders": COLUMN_SHAPE_FINGERPRINT
+}
 
 
 def registration(**overrides):
@@ -146,6 +150,7 @@ def local_binding(**overrides):
         "srvname": "leeds_ext_srv",
         "remote_schema": "leeds",
         "remote_table": "smoke_control_orders",
+        "column_shape_fingerprint": COLUMN_SHAPE_FINGERPRINT,
     }
     value.update(overrides)
     return value
@@ -285,6 +290,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             SOURCE_URL,
             PHYSICAL_IDENTITY,
             OBSERVED_AT,
+            REMOTE_COLUMN_SHAPES,
         )
 
         update = next(
@@ -314,6 +320,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             SOURCE_URL,
             PHYSICAL_IDENTITY,
             OBSERVED_AT,
+            REMOTE_COLUMN_SHAPES,
         )
 
         sql_text = "\n".join(statements(cursor))
@@ -330,14 +337,21 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     def test_matching_evidence_restores_runtime_schema_access(self):
         cases = (
-            (server_row(), True, "GRANT"),
+            (server_row(), local_binding(), True, "GRANT"),
             (
                 server_row(options={**SERVER_OPTIONS, "host": "other-source"}),
+                local_binding(),
+                False,
+                "REVOKE",
+            ),
+            (
+                server_row(),
+                local_binding(column_shape_fingerprint="drifted"),
                 False,
                 "REVOKE",
             ),
         )
-        for local_server, active, action in cases:
+        for local_server, binding, active, action in cases:
             with self.subTest(action=action):
                 cursor = MagicMock()
                 cursor.fetchone.side_effect = [
@@ -354,13 +368,14 @@ class FederationAliasStoreTests(unittest.TestCase):
                 ]
                 cursor.fetchall.side_effect = [
                     mapping_rows(),
-                    [local_binding()],
+                    [binding],
                 ]
                 store = self.store_with_cursor(cursor)
 
                 store._persist_observation(
                     cursor, "leeds_ext", observation(fingerprint="same"),
                     SOURCE_URL, PHYSICAL_IDENTITY, OBSERVED_AT,
+                    REMOTE_COLUMN_SHAPES,
                 )
 
                 update = next(
@@ -387,7 +402,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             ]
             return store._local_state_matches(
                 cursor, "leeds_ext", ["leeds.smoke_control_orders"],
-                SOURCE_URL, list(shippable),
+                REMOTE_COLUMN_SHAPES, SOURCE_URL, list(shippable),
             )
 
         self.assertTrue(matches())
@@ -420,6 +435,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             (local_binding(srvname="other_srv"),),
             (local_binding(remote_schema="archive"),),
             (local_binding(remote_table="other"),),
+            (local_binding(column_shape_fingerprint="drifted"),),
         ):
             self.assertFalse(matches(bindings=bindings))
 
@@ -431,6 +447,26 @@ class FederationAliasStoreTests(unittest.TestCase):
             options={**SERVER_OPTIONS, "extensions": "postgis_topology"}
         )
         self.assertFalse(matches(server=unexpected, shippable=("postgis",)))
+
+    def test_local_column_shape_uses_effective_remote_column_names(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [local_binding()]
+
+        FederationAliasStore._local_relation_bindings(cursor, "source_leeds_ext")
+
+        query = str(cursor.execute.call_args.args[0])
+        for fragment in (
+            "column_shape_fingerprint",
+            "a.attname",
+            "a.attfdwoptions",
+            "option_name = 'column_name'",
+            "t.typnamespace",
+            "a.atttypmod",
+            "a.attnotnull",
+            "ORDER BY a.attnum",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, query)
 
     @patch("federation_store.extension_versions")
     def test_outage_does_not_change_pushdown_without_version_evidence(self, versions):
@@ -449,6 +485,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             SOURCE_URL,
             None,
             OBSERVED_AT,
+            {},
         )
 
         versions.assert_not_called()
@@ -489,6 +526,7 @@ class FederationAliasStoreTests(unittest.TestCase):
             SOURCE_URL,
             PHYSICAL_IDENTITY,
             OBSERVED_AT,
+            REMOTE_COLUMN_SHAPES,
         )
 
         self.assertTrue(
@@ -503,7 +541,9 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch("federation_store.detect_capability")
     def test_observe_locks_before_probe_and_has_no_dead_freshness_route(self, detect):
-        detect.return_value = (observation(), OBSERVED_AT, PHYSICAL_IDENTITY)
+        detect.return_value = (
+            observation(), OBSERVED_AT, PHYSICAL_IDENTITY, REMOTE_COLUMN_SHAPES
+        )
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             registry_state(),
@@ -546,19 +586,22 @@ class FederationAliasStoreTests(unittest.TestCase):
         cases = (
             (
                 observation(fingerprint="old", versions={}),
-                (PHYSICAL_IDENTITY, {}, True, False, "new"),
+                (PHYSICAL_IDENTITY, {}, True, False, "new", REMOTE_COLUMN_SHAPES),
             ),
             (
                 observation(versions={}, rls=False),
-                (PHYSICAL_IDENTITY, {}, True, True, None),
+                (PHYSICAL_IDENTITY, {}, True, True, None, REMOTE_COLUMN_SHAPES),
             ),
             (
                 observation(versions={}),
-                ("replacement/1", {}, True, False, None),
+                ("replacement/1", {}, True, False, None, REMOTE_COLUMN_SHAPES),
             ),
             (
                 observation(versions={"postgresql": "16"}),
-                (PHYSICAL_IDENTITY, {"postgresql": "17"}, True, False, None),
+                (
+                    PHYSICAL_IDENTITY, {"postgresql": "17"}, True, False,
+                    None, REMOTE_COLUMN_SHAPES,
+                ),
             ),
         )
         for observed, live in cases:
@@ -579,7 +622,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cases = (
             (
                 provision_row(lastObservation=observation(versions={}, rls=True)),
-                (PHYSICAL_IDENTITY, {}, True, True, None),
+                (PHYSICAL_IDENTITY, {}, True, True, None, REMOTE_COLUMN_SHAPES),
                 "federation.row_level_security_not_acknowledged",
             ),
             (
@@ -587,7 +630,7 @@ class FederationAliasStoreTests(unittest.TestCase):
                     lastObservation=observation(fingerprint="new", versions={}),
                     accepted_schema_fingerprint="old",
                 ),
-                (PHYSICAL_IDENTITY, {}, True, False, "new"),
+                (PHYSICAL_IDENTITY, {}, True, False, "new", REMOTE_COLUMN_SHAPES),
                 "federation.schema_change_not_acknowledged",
             ),
             (
@@ -595,12 +638,12 @@ class FederationAliasStoreTests(unittest.TestCase):
                     accepted_physical_identity="old/1",
                     lastObservation=observation(versions={}),
                 ),
-                (PHYSICAL_IDENTITY, {}, True, False, None),
+                (PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES),
                 "federation.physical_rebind_not_acknowledged",
             ),
             (
                 provision_row(accepted_connection_identity="other@host:5432/db"),
-                (PHYSICAL_IDENTITY, {}, True, False, None),
+                (PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES),
                 "federation.physical_rebind_not_acknowledged",
             ),
         )
@@ -616,7 +659,9 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_first_provision_reconciles_roles_and_appends_approval(
@@ -649,8 +694,8 @@ class FederationAliasStoreTests(unittest.TestCase):
     @patch("federation_store.extension_versions", return_value={})
     def test_import_change_rolls_back_before_approval(self, _versions, verify):
         verify.side_effect = [
-            (PHYSICAL_IDENTITY, {}, True, False, None),
-            (PHYSICAL_IDENTITY, {}, True, True, None),
+            (PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES),
+            (PHYSICAL_IDENTITY, {}, True, True, None, REMOTE_COLUMN_SHAPES),
         ]
         cursor = MagicMock()
         cursor.fetchone.return_value = provision_row()
@@ -665,24 +710,42 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
-    def test_incomplete_import_never_activates(self, _versions, _verify):
-        cursor = MagicMock()
-        cursor.fetchone.return_value = provision_row()
-        cursor.fetchall.return_value = []
-        store = self.store_with_cursor(cursor)
+    def test_incomplete_or_mismatched_import_never_activates(
+        self, _versions, _verify
+    ):
+        cases = (
+            ([], [], "federation.import_incomplete"),
+            (
+                [local_binding()],
+                [local_binding(column_shape_fingerprint="drifted")],
+                "federation.local_state_invalid",
+            ),
+        )
+        for imported, final_bindings, code in cases:
+            with self.subTest(code=code):
+                cursor = MagicMock()
+                cursor.fetchone.return_value = provision_row()
+                cursor.fetchall.side_effect = [imported, final_bindings]
+                store = self.store_with_cursor(cursor)
 
-        with self.assertRaises(FederationSchemaError) as raised:
-            self.provision(store)
+                with self.assertRaises(FederationSchemaError) as raised:
+                    self.provision(store)
 
-        self.assertEqual("federation.import_incomplete", raised.exception.code)
-        self.assertFalse(any("_approvals" in text for text in statements(cursor)))
+                self.assertEqual(code, raised.exception.code)
+                sql_text = "\n".join(statements(cursor))
+                self.assertNotIn("GRANT SELECT", sql_text)
+                self.assertNotIn("_approvals", sql_text)
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_reprovision_repairs_missing_local_foreign_table(
@@ -724,7 +787,9 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, "same"),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, "same", REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_reprovision_reimports_only_without_a_schema_baseline(
@@ -778,7 +843,44 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, "same", REMOTE_COLUMN_SHAPES
+        ),
+    )
+    @patch("federation_store.extension_versions", return_value={})
+    def test_reprovision_repairs_local_column_drift(self, _versions, verify):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt=OBSERVED_AT,
+                accepted_schema_fingerprint="same",
+                accepted_physical_identity=PHYSICAL_IDENTITY,
+                accepted_connection_identity=CONNECTION_IDENTITY,
+                lastObservation=observation(fingerprint="same", versions={}),
+            ),
+            server_row(),
+            {"owned": True},
+            alias_row(status="active", provisionedAt=OBSERVED_AT),
+        ]
+        cursor.fetchall.side_effect = [
+            [local_binding(column_shape_fingerprint="drifted")],
+            [local_binding()],
+            [local_binding()],
+        ]
+        store = self.store_with_cursor(cursor)
+
+        self.provision(store)
+
+        sql_text = "\n".join(statements(cursor))
+        self.assertIn("DROP FOREIGN TABLE", sql_text)
+        self.assertIn("IMPORT FOREIGN SCHEMA", sql_text)
+        self.assertEqual(2, verify.call_count)
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_reprovision_fails_closed_for_missing_or_wrong_server(
@@ -806,7 +908,9 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_provision_does_not_expose_an_extra_table_or_view(
@@ -866,7 +970,9 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     @patch(
         "federation_store.verify_remote_state",
-        return_value=(PHYSICAL_IDENTITY, {}, True, False, None),
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, None, REMOTE_COLUMN_SHAPES
+        ),
     )
     @patch("federation_store.extension_versions", return_value={})
     def test_first_server_uses_only_the_closed_connection_options(

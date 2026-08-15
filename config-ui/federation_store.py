@@ -335,14 +335,19 @@ class FederationAliasStore:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"{SCHEMA}:observe:{alias}",),
             )
-            observation, observed_at, physical_identity = detect_capability(
+            (
+                observation,
+                observed_at,
+                physical_identity,
+                remote_column_shapes,
+            ) = detect_capability(
                 connection_url,
                 allowed_relations=allowed_relations,
                 tls_policy=tls_policy,
             )
             self._persist_observation(
                 cur, alias, observation, connection_url, physical_identity,
-                observed_at,
+                observed_at, remote_column_shapes,
             )
             return self._get_with_cursor(cur, alias)
 
@@ -354,6 +359,7 @@ class FederationAliasStore:
         connection_url: str,
         physical_identity: str | None,
         observed_at: datetime,
+        remote_column_shapes: dict[str, str],
     ) -> None:
         """Write one observation after its per-alias lock is held."""
         reachable = observation["connectivity"] == "reachable"
@@ -439,6 +445,7 @@ class FederationAliasStore:
                 cur,
                 alias,
                 registry_state["allowed_relations"],
+                remote_column_shapes,
                 connection_url,
                 shippable or [],
             )
@@ -626,6 +633,7 @@ class FederationAliasStore:
         cur,
         alias: str,
         allowed_relations,
+        remote_column_shapes: dict[str, str],
         connection_url: str,
         shippable: list[str],
     ) -> bool:
@@ -678,14 +686,19 @@ class FederationAliasStore:
             for relation in allowed_relations
         }
         bindings = self._local_relation_bindings(cur, schema_name)
-        return bindings.keys() == expected.keys() and all(
-            self._binding_matches(
-                bindings[remote_table],
-                server_name,
-                remote_schema,
-                remote_table,
+        return (
+            bindings.keys() == expected.keys()
+            and all(
+                self._binding_matches(
+                    bindings[remote_table],
+                    server_name,
+                    remote_schema,
+                    remote_table,
+                )
+                and bindings[remote_table]["column_shape_fingerprint"]
+                    == remote_column_shapes.get(f"{remote_schema}.{remote_table}")
+                for remote_table, (remote_schema, _) in expected.items()
             )
-            for remote_table, (remote_schema, _) in expected.items()
         )
 
     @staticmethod
@@ -775,7 +788,35 @@ class FederationAliasStore:
                     WHERE option_name = 'schema_name') AS remote_schema,
                    (SELECT option_value
                     FROM pg_catalog.pg_options_to_table(ft.ftoptions)
-                    WHERE option_name = 'table_name') AS remote_table
+                    WHERE option_name = 'table_name') AS remote_table,
+                   encode(sha256(convert_to(COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                       'name', a.attname,
+                       'remoteName', COALESCE((
+                         SELECT option_value
+                         FROM pg_catalog.pg_options_to_table(a.attfdwoptions)
+                         WHERE option_name = 'column_name'
+                       ), a.attname),
+                       'type', jsonb_build_array(tn.nspname, t.typname),
+                       'typmod', a.atttypmod,
+                       'notNull', a.attnotnull,
+                       'collation', CASE WHEN co.oid IS NULL THEN NULL
+                         ELSE jsonb_build_array(cn.nspname, co.collname)
+                       END
+                     ) ORDER BY a.attnum)
+                     FROM pg_catalog.pg_attribute AS a
+                     JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
+                     JOIN pg_catalog.pg_namespace AS tn
+                       ON tn.oid = t.typnamespace
+                     LEFT JOIN pg_catalog.pg_collation AS co
+                       ON co.oid = a.attcollation
+                     LEFT JOIN pg_catalog.pg_namespace AS cn
+                       ON cn.oid = co.collnamespace
+                     WHERE a.attrelid = c.oid
+                       AND a.attnum > 0
+                       AND NOT a.attisdropped
+                   ), '[]'::jsonb)::text, 'UTF8')), 'hex')
+                     AS column_shape_fingerprint
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n
               ON n.oid = c.relnamespace
@@ -917,6 +958,7 @@ class FederationAliasStore:
                     relations_verified,
                     rls_detected,
                     current_schema_fingerprint,
+                    remote_column_shapes,
                 ) = verify_remote_state(
                     connection_url, tuple(record["allowedRelations"])
                 )
@@ -1044,10 +1086,16 @@ class FederationAliasStore:
                     binding_current = self._binding_matches(
                         binding, server_name, remote_schema, remote_table
                     )
+                    column_shape_current = (
+                        binding is not None
+                        and binding["column_shape_fingerprint"]
+                            == remote_column_shapes.get(relation)
+                    )
                     if (
                         accepted_schema_fingerprint is None
                         or schema_fingerprint_changed
                         or not binding_current
+                        or not column_shape_current
                     ):
                         if binding is not None:
                             cur.execute(
@@ -1124,6 +1172,7 @@ class FederationAliasStore:
                     relations_verified,
                     rls_detected,
                     current_schema_fingerprint,
+                    remote_column_shapes,
                 ):
                     raise FederationSchemaError(
                         f"Alias {alias!r}'s source changed while importing.",
@@ -1139,6 +1188,10 @@ class FederationAliasStore:
                     remote_schema,
                     remote_table,
                 )
+                and local_bindings[remote_table]["column_shape_fingerprint"]
+                    == remote_column_shapes.get(
+                        f"{remote_schema}.{remote_table}"
+                    )
                 for remote_table, (remote_schema, _) in expected_bindings.items()
             )
             if not valid_local_state:
