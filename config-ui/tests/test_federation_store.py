@@ -1168,6 +1168,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             {"status": "active", "provisioned_at": OBSERVED_AT},
             None,
+            None,
             alias_row(status="retired"),
         ]
         store = self.store_with_cursor(cursor)
@@ -1227,6 +1228,32 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(
             any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
         )
+
+    def test_retire_still_drops_credentials_when_the_schema_is_already_gone(self):
+        # The server and its mappings are archived under a gate independent of
+        # the schema. Tying them together left a decommissioned source holding
+        # live credentials whenever the schema had been removed by hand — the
+        # exact state retirement deliberately tolerates.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            None,
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = [{"role_name": "mapp_federation"}]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertTrue(any("DROP USER MAPPING" in text for text in executed))
+        self.assertTrue(
+            any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
+        )
+        # No schema to revoke on, so no schema statements at all.
+        self.assertFalse(any("ALTER SCHEMA" in text for text in executed))
+        self.assertFalse(any("REVOKE" in text for text in executed))
 
     def test_retire_tolerates_a_server_that_is_already_gone(self):
         cursor = MagicMock()

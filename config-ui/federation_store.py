@@ -1374,7 +1374,12 @@ class FederationAliasStore:
                     "ownership before retiring the alias.",
                     code="federation.local_state_invalid",
                 )
-            if row["provisioned_at"] is not None and local_schema is not None:
+            # The schema and the server are archived under independent
+            # gates. Tying the server work to the schema existing left a
+            # decommissioned source holding live credentials whenever the
+            # schema had already been removed by hand — the exact state the
+            # branch below deliberately tolerates.
+            if row["provisioned_at"] is not None:
                 server_name = f"{alias}_srv"
                 # Identifiers truncate silently at 63 bytes, so budget the
                 # suffix rather than letting a long alias produce a collision
@@ -1391,27 +1396,37 @@ class FederationAliasStore:
                     + suffix + "_srv"
                 )
 
-                for role in dict.fromkeys((self.derived_role, self.reader_role)):
+                if local_schema is None:
+                    # Nothing local to revoke or rename, so nothing is
+                    # archived and no archive name is recorded.
+                    archived_schema = None
+                else:
+                    for role in dict.fromkeys(
+                        (self.derived_role, self.reader_role)
+                    ):
+                        cur.execute(
+                            sql.SQL(
+                                "REVOKE SELECT ON ALL TABLES IN SCHEMA {} "
+                                "FROM {}"
+                            ).format(
+                                sql.Identifier(schema_name),
+                                sql.Identifier(role),
+                            )
+                        )
+                        cur.execute(
+                            sql.SQL("REVOKE USAGE ON SCHEMA {} FROM {}").format(
+                                sql.Identifier(schema_name),
+                                sql.Identifier(role),
+                            )
+                        )
+                    # A rename onto an existing name fails loudly rather than
+                    # merging two archives, which is the behaviour we want.
                     cur.execute(
-                        sql.SQL(
-                            "REVOKE SELECT ON ALL TABLES IN SCHEMA {} FROM {}"
-                        ).format(
-                            sql.Identifier(schema_name), sql.Identifier(role)
+                        sql.SQL("ALTER SCHEMA {} RENAME TO {}").format(
+                            sql.Identifier(schema_name),
+                            sql.Identifier(archived_schema),
                         )
                     )
-                    cur.execute(
-                        sql.SQL("REVOKE USAGE ON SCHEMA {} FROM {}").format(
-                            sql.Identifier(schema_name), sql.Identifier(role)
-                        )
-                    )
-                # A rename onto an existing name fails loudly rather than
-                # merging two archives, which is the behaviour we want.
-                cur.execute(
-                    sql.SQL("ALTER SCHEMA {} RENAME TO {}").format(
-                        sql.Identifier(schema_name),
-                        sql.Identifier(archived_schema),
-                    )
-                )
                 # The user mappings are the one thing retirement does drop.
                 # "Nothing is dropped" exists to preserve the audit trail, and
                 # a mapping is not audit evidence — it is the live credential
@@ -1419,28 +1434,28 @@ class FederationAliasStore:
                 # is no reason for a decommissioned source to keep working
                 # credentials indefinitely, and the archived server, schema and
                 # foreign tables still record exactly what was connected.
-                cur.execute(
-                    "SELECT usename AS role_name FROM pg_catalog.pg_user_mappings "
-                    "WHERE srvname = %s AND usename IS NOT NULL",
-                    (server_name,),
-                )
-                for mapping in cur.fetchall():
-                    cur.execute(
-                        sql.SQL(
-                            "DROP USER MAPPING IF EXISTS FOR {} SERVER {}"
-                        ).format(
-                            sql.Identifier(mapping["role_name"]),
-                            sql.Identifier(server_name),
-                        )
-                    )
-                # Guarded for the same reason the schema is: a server that has
-                # already been removed by hand must not make the alias
-                # permanently un-retirable.
+                # Guarded for the same reason the schema is: a server already
+                # removed by hand must not make the alias un-retirable.
                 cur.execute(
                     "SELECT 1 FROM pg_catalog.pg_foreign_server WHERE srvname = %s",
                     (server_name,),
                 )
                 if cur.fetchone():
+                    cur.execute(
+                        "SELECT usename AS role_name "
+                        "FROM pg_catalog.pg_user_mappings "
+                        "WHERE srvname = %s AND usename IS NOT NULL",
+                        (server_name,),
+                    )
+                    for mapping in cur.fetchall():
+                        cur.execute(
+                            sql.SQL(
+                                "DROP USER MAPPING IF EXISTS FOR {} SERVER {}"
+                            ).format(
+                                sql.Identifier(mapping["role_name"]),
+                                sql.Identifier(server_name),
+                            )
+                        )
                     cur.execute(
                         sql.SQL("ALTER SERVER {} RENAME TO {}").format(
                             sql.Identifier(server_name),

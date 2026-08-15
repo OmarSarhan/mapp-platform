@@ -1065,16 +1065,30 @@ change the workspace automatically.
 | Removed/type-changed field | Identify dependants and block affected publication or refresh |
 | Geometry type or SRID change | Mark incompatible pending explicit review |
 | Different physical database | Raise identity conflict; require explicit rebind |
-| Source retired | Archive normal discovery while retaining exact-ID audit history, including the physical schema/server/mapping objects — nothing is dropped |
+| Source retired | Archive normal discovery while retaining exact-ID audit history, including the physical schema, server and foreign tables — only the user mappings are dropped (see below) |
 
 Follow the existing semantic archive contract: retirement is not deletion, and
 normal collections omit archived assets while authorized exact-ID history
 remains available.
 
-**Decided:** retirement archives everything, including the live foreign
-server, user mapping, and foreign tables — none of it is dropped, so the
-exact-ID audit trail stays physically inspectable, not just metadata. This
-means the `source_<alias>` schema name stays taken for as long as the retired
+**Decided, and amended in implementation:** retirement archives the foreign
+server, the schema and the foreign tables so the exact-ID audit trail stays
+physically inspectable, not just metadata. It does **not** retain the user
+mappings. A mapping is not audit evidence — it is the live credential for the
+remote, held in `pg_user_mapping.umoptions` as plain text — and there is no
+justification for a decommissioned source to keep working credentials
+indefinitely. The archived server, schema and foreign tables still record
+exactly what was connected. `scripts/verify.sh` asserts that a retired alias
+retains no mappings on either its live or archived server name.
+
+Implementation also renames the archived objects
+(`retired_<alias>_<provisioned_at>`) rather than leaving them under the live
+name, which frees `source_<alias>` immediately. The **reclaim** action below
+is therefore not required to release a name; it remains the intended shape for
+carrying curated semantics across a re-registration, and is not implemented.
+The original intent is preserved verbatim from here:
+
+`source_<alias>` was to stay taken for as long as the retired
 registration is archived, so re-registering the identical alias name requires
 an explicit **reclaim** action (a new scope-gated operation, distinct from
 ordinary Register) that an administrator invokes deliberately — it is never

@@ -2455,6 +2455,37 @@ if federation_database_url:
                                 f"Federation alias {alias_value!r} is retired "
                                 "but its live source schema still exists."
                             )
+                        # The branch returns before the live-alias server and
+                        # mapping audits below, so the archived server needs
+                        # its own assertions or nothing checks it at all. A
+                        # decommissioned source must not keep working
+                        # credentials: user mappings hold the remote user and
+                        # password in the catalogue in plain text.
+                        cursor.execute(
+                            "SELECT count(*) AS mappings "
+                            "FROM pg_catalog.pg_user_mappings "
+                            "WHERE srvname = %s OR srvname = %s",
+                            (
+                                f"{alias_value}_srv",
+                                (archived or "") + "_srv",
+                            ),
+                        )
+                        if cursor.fetchone()["mappings"]:
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its foreign server still holds user "
+                                "mappings."
+                            )
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_foreign_server "
+                            "WHERE srvname = %s",
+                            (f"{alias_value}_srv",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live foreign server still exists."
+                            )
                         continue
                     if (
                         alias_row["status"] == "active"

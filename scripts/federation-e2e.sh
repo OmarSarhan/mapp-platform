@@ -154,7 +154,12 @@ source_sql "
       --command "COPY ${PROBE_RELATION} (object_id, reference, geom) FROM STDIN"
 
 seeded="$(source_sql "SELECT count(*) FROM ${PROBE_RELATION}")"
+expected="$(platform_sql "SELECT count(*) FROM leeds.smoke_control_orders")"
 [[ "${seeded}" -gt 0 ]] || fail "probe relation seeded no rows"
+# A partial transfer would still satisfy every assertion below while quietly
+# comparing two different datasets, so the equality proof would prove nothing.
+[[ "${seeded}" == "${expected}" ]] \
+  || fail "seeded ${seeded} rows but the local source has ${expected}"
 printf 'seeded %s polygons into the source database\n' "${seeded}"
 
 step "Driving register, observe and provision over HTTP"
@@ -264,6 +269,15 @@ finally:
     store.revoke_token(record["id"])
 PY
 
+step "Provisioning grants working access through the foreign table"
+readable="$(platform_sql "
+  SET ROLE ${DERIVED_OWNER_ROLE};
+  SELECT count(*) FROM source_${ALIAS}.e2e_probe_orders
+" | tail -n 1)"
+[[ "${readable}" == "${seeded}" ]] \
+  || fail "foreign table returned ${readable} rows, expected ${seeded}"
+printf 'derived owner reads %s rows through the foreign table\n' "${readable}"
+
 step "Cross-schema H3 aggregation: federated polygons against local data"
 # The source relation is a copy of the bundled one, so the federated result
 # must equal the local result exactly. That is a far stronger assertion than
@@ -287,7 +301,7 @@ aggregation="$(platform_sql "
       || ' ' || (SELECT count(*) FROM (
            SELECT cell FROM local_cells
            EXCEPT SELECT cell FROM federated_cells) AS d)
-" 2>/dev/null | tail -n 1)"
+" | tail -n 1)"
 read -r federated_cells local_cells federated_only local_only <<<"${aggregation}"
 [[ "${federated_cells}" -gt 0 ]] || fail "federated H3 expansion produced no cells"
 [[ "${federated_cells}" == "${local_cells}" ]] \
@@ -325,7 +339,7 @@ allocation="$(platform_sql "
   SELECT (SELECT pairs FROM allocated WHERE side = 'federated')
       || ' ' || (SELECT total FROM allocated WHERE side = 'federated')
       || ' ' || (SELECT count(DISTINCT (pairs, total)) FROM allocated)
-" 2>/dev/null | tail -n 1)"
+" | tail -n 1)"
 read -r pair_count allocated_total distinct_results <<<"${allocation}"
 [[ "${pair_count}" -gt 0 ]] || fail "census intersection produced no pairs"
 [[ "${distinct_results}" == "1" ]] \
@@ -463,33 +477,35 @@ finally:
     store.revoke_token(record["id"])
 PY
 
+# concat_ws with coalesce, not ||: a NULL from any subquery would otherwise
+# propagate through the whole concatenation, leave every shell variable empty,
+# and make the harness report whichever assertion happens to be checked first
+# rather than the one that actually failed.
 archive_state="$(platform_sql "
-  SELECT
+  SELECT concat_ws(' ',
     (SELECT count(*) FROM pg_catalog.pg_namespace
-     WHERE nspname = 'source_${ALIAS}')
-    || ' ' ||
+     WHERE nspname = 'source_${ALIAS}'),
     (SELECT count(*) FROM pg_catalog.pg_namespace AS n
      JOIN federation._aliases AS a ON a.archived_schema = n.nspname
-     WHERE a.alias = '${ALIAS}')
-    || ' ' ||
+     WHERE a.alias = '${ALIAS}'),
     (SELECT count(*) FROM pg_catalog.pg_class AS c
      JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
      JOIN federation._aliases AS a ON a.archived_schema = n.nspname
-     WHERE a.alias = '${ALIAS}' AND c.relkind = 'f')
-    || ' ' ||
+     WHERE a.alias = '${ALIAS}' AND c.relkind = 'f'),
     (SELECT count(*) FROM federation._aliases
-     WHERE alias = '${ALIAS}' AND status = 'retired')
-    || ' ' ||
-    (SELECT bool_and(NOT has_schema_privilege(r.role_name, n.nspname, 'USAGE'))::int
+     WHERE alias = '${ALIAS}' AND status = 'retired'),
+    (SELECT coalesce(bool_and(
+       NOT has_schema_privilege(r.role_name, n.nspname, 'USAGE')), false)::int
      FROM federation._aliases AS a
      JOIN pg_catalog.pg_namespace AS n ON n.nspname = a.archived_schema
      CROSS JOIN (VALUES ('${DERIVED_OWNER_ROLE}'), ('${DERIVED_READER_ROLE}'))
        AS r(role_name)
-     WHERE a.alias = '${ALIAS}')
-    || ' ' ||
+     WHERE a.alias = '${ALIAS}'),
     (SELECT count(*) FROM pg_catalog.pg_user_mappings
-     WHERE srvname LIKE 'retired\_${ALIAS}\_%')
-" 2>/dev/null | tail -n 1)"
+     WHERE srvname LIKE '${ALIAS}\_%'
+        OR srvname LIKE 'retired\_${ALIAS}\_%')
+  )
+" | tail -n 1)"
 read -r live_schema archived_schema archived_tables retired_rows revoked \
   retained_mappings <<<"${archive_state}"
 [[ "${live_schema}" == "0" ]] || fail "the live source schema still exists after retirement"
@@ -564,5 +580,22 @@ finally:
     store.revoke_token(record["id"])
 PY
 
+step "The privilege audit accepts the archived state"
+# The retired-alias branch of verify.sh is the part that has been wrong twice:
+# once selecting a column the store creates lazily, once hard-failing on a
+# state retirement deliberately produces. Both slipped through because the
+# audit and the store were only ever exercised apart. Running the real audit
+# here, while a retired alias with an archive is present, ties them together.
+verify_log="$(mktemp)"
+if ! "${ROOT_DIR}/scripts/verify.sh" >"${verify_log}" 2>&1; then
+  printf 'verify.sh failed with a retired alias present:\n' >&2
+  tail -n 20 "${verify_log}" >&2
+  rm -f "${verify_log}"
+  fail "the privilege audit rejected the archived state"
+fi
+rm -f "${verify_log}"
+printf 'verify.sh passes with a retired, archived alias present\n'
+
 printf '\nPASS: federation register, observe, provision, cross-schema H3 aggregation, '
-printf 'replacement refusal, retirement and archival verified against a real source.\n'
+printf 'replacement refusal, retirement, archival and privilege audit verified '
+printf 'against a real source.\n'
