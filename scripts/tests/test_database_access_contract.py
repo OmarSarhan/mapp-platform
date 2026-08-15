@@ -736,6 +736,34 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "mappings[federation_role] != expected_mapping", normalized
         )
 
+    def test_verifier_rejects_unsafe_federation_acl_edges(self) -> None:
+        normalized = self.normalized("scripts/verify.sh")
+        for contract in (
+            "nspacl, pg_catalog.acldefault($$n$$, nspowner)",
+            "privilege.grantee = nspowner",
+            "privilege.grantor = nspowner",
+            "privilege.privilege_type = $$USAGE$$",
+            "relation.relacl, pg_catalog.acldefault( "
+            "$$r$$, relation.relowner )",
+            "privilege.grantee = relation.relowner",
+            "privilege.grantor = relation.relowner",
+            "privilege.privilege_type = $$SELECT$$",
+            "NOT privilege.is_grantable",
+            "attribute.attacl IS NOT NULL",
+            'schema["hasUnexpectedAcl"]',
+            'relation["hasUnexpectedAcl"]',
+            'relation["hasColumnAcl"]',
+            "FROM pg_catalog.pg_auth_members AS membership",
+            "consumer_role.oid = membership.roleid",
+            "consumer_role.rolname IN (%s, %s)",
+            'cursor.fetchone()["hasConsumerRoleMember"]',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+        self.assertEqual(2, normalized.count("pg_catalog.aclexplode(COALESCE("))
+        self.assertEqual(2, normalized.count("%s AND privilege.grantor"))
+        self.assertEqual(2, normalized.count("AND NOT privilege.is_grantable)"))
+
     def test_verifier_rejects_active_aliases_without_accepted_evidence(
         self,
     ) -> None:

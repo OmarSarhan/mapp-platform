@@ -2346,6 +2346,21 @@ if federation_database_url:
                     "federation control registry."
                 )
 
+            cursor.execute("""
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_auth_members AS membership
+                  JOIN pg_catalog.pg_roles AS consumer_role
+                    ON consumer_role.oid = membership.roleid
+                  WHERE consumer_role.rolname IN (%s, %s)
+                ) AS "hasConsumerRoleMember"
+            """, (derived_role, reader_role))
+            if cursor.fetchone()["hasConsumerRoleMember"]:
+                fail(
+                    "Runtime reader and derived owner roles must not have "
+                    "members."
+                )
+
             cursor.execute(
                 "SELECT to_regclass($$federation._aliases$$) AS oid"
             )
@@ -2471,20 +2486,43 @@ if federation_database_url:
                             "do not match its connectionRef."
                         )
                     schema_name = f"source_{alias_value}"
+                    expected_usage = alias_row["status"] == "active"
                     cursor.execute(
                         "SELECT pg_get_userbyid(nspowner) AS owner, "
                         "has_schema_privilege(%s, oid, $$USAGE$$) AS derived_use, "
-                        "has_schema_privilege(%s, oid, $$USAGE$$) AS reader_use "
+                        "has_schema_privilege(%s, oid, $$USAGE$$) AS reader_use, "
+                        "EXISTS ("
+                        "  SELECT 1 FROM pg_catalog.aclexplode(COALESCE("
+                        "    nspacl, pg_catalog.acldefault($$n$$, nspowner)"
+                        "  )) AS privilege "
+                        "  WHERE NOT ("
+                        "    privilege.grantee = nspowner "
+                        "    OR (%s AND privilege.grantor = nspowner "
+                        "      AND privilege.grantee IN ("
+                        "        pg_catalog.to_regrole(%s)::oid, "
+                        "        pg_catalog.to_regrole(%s)::oid"
+                        "      ) "
+                        "      AND privilege.privilege_type = $$USAGE$$ "
+                        "      AND NOT privilege.is_grantable)"
+                        "    )"
+                        ") AS \"hasUnexpectedAcl\" "
                         "FROM pg_catalog.pg_namespace WHERE nspname = %s",
-                        (derived_role, reader_role, schema_name),
+                        (
+                            derived_role,
+                            reader_role,
+                            expected_usage,
+                            derived_role,
+                            reader_role,
+                            schema_name,
+                        ),
                     )
                     schema = cursor.fetchone()
-                    expected_usage = alias_row["status"] == "active"
                     if (
                         not schema
                         or schema["owner"] != federation_role
                         or schema["derived_use"] != expected_usage
                         or schema["reader_use"] != expected_usage
+                        or schema["hasUnexpectedAcl"]
                     ):
                         fail(
                             f"Federation alias {alias_value!r} source schema "
@@ -2498,7 +2536,35 @@ if federation_database_url:
                                has_table_privilege(%s, relation.oid, $$SELECT$$)
                                  AS derived_select,
                                has_table_privilege(%s, relation.oid, $$SELECT$$)
-                                 AS reader_select
+                                 AS reader_select,
+                               EXISTS (
+                                 SELECT 1
+                                 FROM pg_catalog.aclexplode(COALESCE(
+                                   relation.relacl,
+                                   pg_catalog.acldefault(
+                                     $$r$$, relation.relowner
+                                   )
+                                 )) AS privilege
+                                 WHERE NOT (
+                                   privilege.grantee = relation.relowner
+                                   OR (%s
+                                     AND privilege.grantor = relation.relowner
+                                     AND privilege.grantee IN (
+                                       pg_catalog.to_regrole(%s)::oid,
+                                       pg_catalog.to_regrole(%s)::oid
+                                     )
+                                     AND privilege.privilege_type = $$SELECT$$
+                                     AND NOT privilege.is_grantable)
+                                   )
+                               ) AS "hasUnexpectedAcl",
+                               EXISTS (
+                                 SELECT 1
+                                 FROM pg_catalog.pg_attribute AS attribute
+                                 WHERE attribute.attrelid = relation.oid
+                                   AND attribute.attnum > 0
+                                   AND NOT attribute.attisdropped
+                                   AND attribute.attacl IS NOT NULL
+                               ) AS "hasColumnAcl"
                         FROM pg_catalog.pg_class AS relation
                         JOIN pg_catalog.pg_namespace AS namespace
                           ON namespace.oid = relation.relnamespace
@@ -2510,7 +2576,14 @@ if federation_database_url:
                           AND relation.relkind IN (
                             $$r$$, $$p$$, $$v$$, $$m$$, $$f$$, $$S$$
                           )
-                    """, (derived_role, reader_role, schema_name))
+                    """, (
+                        derived_role,
+                        reader_role,
+                        expected_usage,
+                        derived_role,
+                        reader_role,
+                        schema_name,
+                    ))
                     local_relations = cursor.fetchall()
                     expected_relations = {
                         relation.split(".", 1)[1]: relation
@@ -2539,6 +2612,8 @@ if federation_database_url:
                             != expected_relations[relation["relname"]]
                             or relation["derived_select"] != expected_usage
                             or relation["reader_select"] != expected_usage
+                            or relation["hasUnexpectedAcl"]
+                            or relation["hasColumnAcl"]
                         ):
                             fail(
                                 f"Federation alias {alias_value!r} has an "
