@@ -1041,6 +1041,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             {"status": "active", "provisioned_at": OBSERVED_AT},
             {"owned": True},
+            {"exists": 1},
             alias_row(status="retired"),
         ]
         store = self.store_with_cursor(cursor)
@@ -1073,6 +1074,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             {"status": "active", "provisioned_at": OBSERVED_AT},
             {"owned": True},
+            {"exists": 1},
             alias_row(alias=long_alias, status="retired"),
         ]
         store = self.store_with_cursor(cursor)
@@ -1090,6 +1092,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             {"status": "pending", "provisioned_at": None},
+            None,
             alias_row(status="retired"),
         ]
         store = self.store_with_cursor(cursor)
@@ -1164,7 +1167,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [
             {"status": "active", "provisioned_at": OBSERVED_AT},
-            {"owned": False},
+            None,
             alias_row(status="retired"),
         ]
         store = self.store_with_cursor(cursor)
@@ -1174,6 +1177,72 @@ class FederationAliasStoreTests(unittest.TestCase):
         executed = statements(cursor)
         self.assertFalse(any("RENAME TO" in text for text in executed))
         self.assertFalse(any("REVOKE" in text for text in executed))
+        self.assertTrue(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_refuses_a_schema_owned_by_another_role(self):
+        # Skipping the revokes here while still marking the alias retired
+        # would leave both consumer roles holding the USAGE and SELECT that
+        # provisioning granted, on a source reported as decommissioned.
+        # provision() already calls this state local_state_invalid.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": False},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.retire("leeds_ext", "admin")
+
+        self.assertEqual(
+            "federation.local_state_invalid", raised.exception.code
+        )
+        executed = statements(cursor)
+        self.assertFalse(any("RENAME TO" in text for text in executed))
+        self.assertFalse(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_drops_the_user_mappings_it_archives_around(self):
+        # The archive preserves the audit trail, but a user mapping is not
+        # audit evidence — it is the live remote credential, held in the
+        # catalogue in plain text. A decommissioned source must not keep one.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = [
+            {"role_name": "mapp_federation"},
+            {"role_name": "mapp_xyz"},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        dropped = [text for text in executed if "DROP USER MAPPING" in text]
+        self.assertEqual(2, len(dropped))
+        # The server itself is still archived, not dropped.
+        self.assertTrue(
+            any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
+        )
+
+    def test_retire_tolerates_a_server_that_is_already_gone(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            None,
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertFalse(any("ALTER SERVER" in text for text in executed))
         self.assertTrue(any("status = 'retired'" in text for text in executed))
 
     def test_retire_raises_not_found_for_an_unknown_alias(self):
@@ -1189,6 +1258,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         cursor.fetchone.side_effect = [
             {"status": "active", "provisioned_at": OBSERVED_AT},
             {"owned": True},
+            {"exists": 1},
             alias_row(status="retired"),
         ]
         store = self.store_with_cursor(cursor)

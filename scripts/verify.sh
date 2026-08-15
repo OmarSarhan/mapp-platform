@@ -2365,6 +2365,23 @@ if federation_database_url:
                 "SELECT to_regclass($$federation._aliases$$) AS oid"
             )
             if cursor.fetchone()["oid"] is not None:
+                # archived_schema is added by the alias store the first time it
+                # connects, which on an upgraded deployment may not have
+                # happened yet. Selecting it unconditionally would abort this
+                # whole audit with UndefinedColumn. Its absence also means no
+                # alias can have been retired, so the retired branch below is
+                # unreachable and NULL is the correct stand-in.
+                cursor.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = $$federation$$ "
+                    "AND table_name = $$_aliases$$ "
+                    "AND column_name = $$archived_schema$$"
+                )
+                archived_column = (
+                    "archived_schema"
+                    if cursor.fetchone()
+                    else "NULL::text AS archived_schema"
+                )
                 cursor.execute(
                     "SELECT public.PostGIS_Lib_Version() AS postgis, "
                     "(SELECT extversion FROM pg_catalog.pg_extension "
@@ -2378,7 +2395,7 @@ if federation_database_url:
                     "last_observation, accepted_schema_fingerprint, "
                     "accepted_physical_identity, "
                     "accepted_connection_identity, last_observation_id, "
-                    "archived_schema "
+                    + archived_column + " "
                     "FROM federation._aliases "
                     "WHERE provisioned_at IS NOT NULL"
                 )
@@ -2392,10 +2409,21 @@ if federation_database_url:
                         # live name must be gone so nothing keeps serving.
                         archived = alias_row["archived_schema"]
                         if not archived:
-                            fail(
-                                f"Federation alias {alias_value!r} is retired "
-                                "without a recorded archived schema."
+                            # retire() records no archive when the local schema
+                            # was already gone. There is then nothing to audit
+                            # beyond the live name being absent, checked below.
+                            cursor.execute(
+                                "SELECT 1 FROM pg_catalog.pg_namespace "
+                                "WHERE nspname = %s",
+                                (f"source_{alias_value}",),
                             )
+                            if cursor.fetchone():
+                                fail(
+                                    f"Federation alias {alias_value!r} is "
+                                    "retired but its live source schema still "
+                                    "exists."
+                                )
+                            continue
                         cursor.execute(
                             "SELECT pg_get_userbyid(nspowner) AS owner, "
                             "has_schema_privilege(%s, oid, $$USAGE$$) "

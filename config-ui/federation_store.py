@@ -1352,15 +1352,29 @@ class FederationAliasStore:
 
             archived_schema = None
             schema_name = f"source_{alias}"
-            # "Provisioned but locally absent or foreign-owned" is a modelled
-            # state elsewhere in this class, so retirement must tolerate it
-            # too: without this guard the REVOKE below raises undefined_schema
-            # and the alias could never be retired at all. Recording the
-            # retirement is still correct — there is simply nothing left to
-            # archive.
-            if row["provisioned_at"] is not None and self._local_schema_owned(
-                cur, schema_name
-            ):
+            # Three distinct local states, and they must not be conflated.
+            # "Absent" is benign — there is nothing to revoke or archive, and
+            # refusing would strand the alias forever since there is no delete
+            # route. "Present but owned by another role" is not benign: the
+            # REVOKEs below would be skipped while the alias still reported
+            # itself retired, leaving both consumer roles holding the USAGE
+            # and SELECT that provisioning granted. provision() already treats
+            # that state as local_state_invalid, and retirement must not be
+            # the one operation that silently accepts it.
+            cur.execute(
+                "SELECT pg_get_userbyid(nspowner) = current_user AS owned "
+                "FROM pg_catalog.pg_namespace WHERE nspname = %s",
+                (schema_name,),
+            )
+            local_schema = cur.fetchone()
+            if local_schema is not None and not local_schema["owned"]:
+                raise FederationSchemaError(
+                    f"Federation schema {schema_name!r} is owned by another "
+                    "role, so its access cannot be revoked. Resolve the "
+                    "ownership before retiring the alias.",
+                    code="federation.local_state_invalid",
+                )
+            if row["provisioned_at"] is not None and local_schema is not None:
                 server_name = f"{alias}_srv"
                 # Identifiers truncate silently at 63 bytes, so budget the
                 # suffix rather than letting a long alias produce a collision
@@ -1398,12 +1412,41 @@ class FederationAliasStore:
                         sql.Identifier(archived_schema),
                     )
                 )
+                # The user mappings are the one thing retirement does drop.
+                # "Nothing is dropped" exists to preserve the audit trail, and
+                # a mapping is not audit evidence — it is the live credential
+                # for the remote, stored in the catalogue in plain text. There
+                # is no reason for a decommissioned source to keep working
+                # credentials indefinitely, and the archived server, schema and
+                # foreign tables still record exactly what was connected.
                 cur.execute(
-                    sql.SQL("ALTER SERVER {} RENAME TO {}").format(
-                        sql.Identifier(server_name),
-                        sql.Identifier(archived_server),
-                    )
+                    "SELECT usename AS role_name FROM pg_catalog.pg_user_mappings "
+                    "WHERE srvname = %s AND usename IS NOT NULL",
+                    (server_name,),
                 )
+                for mapping in cur.fetchall():
+                    cur.execute(
+                        sql.SQL(
+                            "DROP USER MAPPING IF EXISTS FOR {} SERVER {}"
+                        ).format(
+                            sql.Identifier(mapping["role_name"]),
+                            sql.Identifier(server_name),
+                        )
+                    )
+                # Guarded for the same reason the schema is: a server that has
+                # already been removed by hand must not make the alias
+                # permanently un-retirable.
+                cur.execute(
+                    "SELECT 1 FROM pg_catalog.pg_foreign_server WHERE srvname = %s",
+                    (server_name,),
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        sql.SQL("ALTER SERVER {} RENAME TO {}").format(
+                            sql.Identifier(server_name),
+                            sql.Identifier(archived_server),
+                        )
+                    )
 
             cur.execute(
                 sql.SQL("""
