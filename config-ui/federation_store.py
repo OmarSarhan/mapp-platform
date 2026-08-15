@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from datetime import datetime
 from typing import Any
@@ -264,6 +265,8 @@ class FederationAliasStore:
             cur.execute(
                 sql.SQL("""
                     SELECT count(*) AS count,
+                           count(*) FILTER (WHERE status = 'retired')
+                             AS retired,
                            count(*) FILTER (WHERE alias = %s) > 0 AS exists
                     FROM {}._aliases
                 """).format(sql.Identifier(SCHEMA)),
@@ -273,8 +276,16 @@ class FederationAliasStore:
             if registry["exists"]:
                 raise FileExistsError(record["alias"])
             if registry["count"] >= MAX_ALIASES:
+                # Retired rows still reserve a slot but no longer appear in
+                # list(), so an operator counting what they can see would
+                # otherwise find this limit inexplicable.
+                retired = registry["retired"]
+                detail = (
+                    f" {retired} of them retired and hidden from the alias"
+                    " list." if retired else ""
+                )
                 raise FederationSchemaError(
-                    f"Federation alias limit ({MAX_ALIASES}) reached.",
+                    f"Federation alias limit ({MAX_ALIASES}) reached.{detail}",
                     code="federation.alias_limit_reached",
                 )
             cur.execute(
@@ -334,10 +345,19 @@ class FederationAliasStore:
         return item
 
     def list(self) -> list[dict[str, Any]]:
+        """Aliases available for normal use, newest registration state first.
+
+        Retired aliases are omitted, matching the archive contract the
+        semantic store already follows (its list queries filter
+        `status = 'ready'`): normal collections omit archived assets while
+        exact-ID lookup stays available. get() still returns a retired alias
+        by name, so its history and archive location remain reachable.
+        """
         with self._connect() as connection, connection.cursor() as cur:
             cur.execute(
                 sql.SQL(
-                    "SELECT {} FROM {}._aliases ORDER BY alias LIMIT %s"
+                    "SELECT {} FROM {}._aliases WHERE status <> 'retired' "
+                    "ORDER BY alias LIMIT %s"
                 ).format(self._SELECT_COLUMNS, sql.Identifier(SCHEMA)),
                 (MAX_ALIASES + 1,),
             )
@@ -1381,12 +1401,21 @@ class FederationAliasStore:
             # branch below deliberately tolerates.
             if row["provisioned_at"] is not None:
                 server_name = f"{alias}_srv"
-                # Identifiers truncate silently at 63 bytes, so budget the
-                # suffix rather than letting a long alias produce a collision
-                # between two archives. provisioned_at is used as the suffix
-                # because it is already unique per provisioning and comes from
-                # the database clock.
-                suffix = row["provisioned_at"].strftime("_%Y%m%d%H%M%S")
+                # Identifiers truncate silently at 63 bytes, so the archive
+                # name is budgeted rather than left to truncate. Truncating
+                # the alias alone is not enough to keep it unique: two aliases
+                # sharing a long prefix and provisioned in the same second
+                # would produce the same name, and since provisioned_at never
+                # changes the second retirement would fail on every retry. A
+                # short digest of the full alias makes the name unique per
+                # alias, and the timestamp keeps it unique per provisioning.
+                digest = hashlib.blake2s(
+                    alias.encode(), digest_size=4
+                ).hexdigest()
+                suffix = (
+                    row["provisioned_at"].strftime("_%Y%m%d%H%M%S")
+                    + "_" + digest
+                )
                 prefix = "retired_"
                 archived_schema = (
                     prefix + alias[: 63 - len(prefix) - len(suffix)] + suffix

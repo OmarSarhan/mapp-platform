@@ -240,8 +240,11 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     def test_register_preserves_duplicates_and_counts_all_retained_rows(self):
         cases = (
-            ({"count": 1, "exists": True}, FileExistsError),
-            ({"count": MAX_ALIASES, "exists": False}, FederationSchemaError),
+            ({"count": 1, "retired": 0, "exists": True}, FileExistsError),
+            (
+                {"count": MAX_ALIASES, "retired": 0, "exists": False},
+                FederationSchemaError,
+            ),
         )
         for registry, error in cases:
             with self.subTest(registry=registry):
@@ -251,11 +254,33 @@ class FederationAliasStoreTests(unittest.TestCase):
                 with self.assertRaises(error):
                     store.register(registration(), "admin")
                 capacity_query = str(cursor.execute.call_args_list[1].args[0])
+                # The ceiling counts every retained row, retired included. An
+                # unqualified "count(*) AS count" is exactly that assertion: a
+                # restricted ceiling would have to read
+                # "count(*) FILTER (...) AS count" instead. The separate
+                # FILTERed tally alongside it only feeds the error message.
                 self.assertIn("count(*) AS count", capacity_query)
-                self.assertNotIn("FILTER (WHERE status", capacity_query)
                 self.assertFalse(
                     any("INSERT INTO" in text for text in statements(cursor))
                 )
+
+    def test_alias_limit_explains_slots_held_by_hidden_retired_rows(self):
+        # Retired rows still reserve a slot but no longer appear in list(), so
+        # the limit would otherwise look inexplicable to an operator counting
+        # what they can see.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "count": MAX_ALIASES,
+            "retired": 7,
+            "exists": False,
+        }
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.register(registration(), "admin")
+
+        self.assertIn("7", str(raised.exception))
+        self.assertIn("retired", str(raised.exception))
 
     def test_list_is_bounded_by_the_registry_ceiling(self):
         cursor = MagicMock()
