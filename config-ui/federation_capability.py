@@ -44,9 +44,22 @@ def _database_default_collation_identity(
     cursor: Any,
 ) -> tuple[str, str | None]:
     """Return database encoding and an attested default identity."""
+    # PostgreSQL 14 has only libc database defaults and no version fields.
+    actual_version = (
+        sql.SQL("pg_catalog.pg_database_collation_actual_version(d.oid)")
+        if cursor.connection.info.server_version >= 150000
+        else sql.SQL("NULL::text")
+    )
     cursor.execute(
-        """
-        SELECT d.datlocprovider AS provider,
+        sql.SQL(
+            """
+        SELECT CASE
+                 WHEN pg_catalog.current_setting(
+                   'server_version_num'
+                 )::integer >= 150000
+                 THEN pg_catalog.to_jsonb(d) ->> 'datlocprovider'
+                 ELSE 'c'
+               END AS provider,
                pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
                pg_catalog.current_setting('server_version_num')::integer
                  / 10000 AS server_major,
@@ -60,12 +73,13 @@ def _database_default_collation_identity(
                  ELSE pg_catalog.to_jsonb(d) ->> 'daticulocale'
                END AS locale,
                pg_catalog.to_jsonb(d) ->> 'daticurules' AS icu_rules,
-               d.datcollversion AS recorded_version,
-               pg_catalog.pg_database_collation_actual_version(d.oid)
-                 AS actual_version
+               pg_catalog.to_jsonb(d) ->> 'datcollversion'
+                 AS recorded_version,
+               {} AS actual_version
         FROM pg_catalog.pg_database AS d
         WHERE d.datname = pg_catalog.current_database()
         """
+        ).format(actual_version)
     )
     row = cursor.fetchone()
     encoding = row["encoding"]

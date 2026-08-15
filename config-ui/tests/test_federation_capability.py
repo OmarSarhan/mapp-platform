@@ -108,6 +108,9 @@ def physical_identity_results(relation_oids=(24601,)):
 class DefaultCollationIdentityTests(unittest.TestCase):
     @staticmethod
     def identity(**overrides):
+        connection_server_version = overrides.pop(
+            "connection_server_version", 170000
+        )
         row = {
             "provider": "b",
             "encoding": "UTF8",
@@ -121,6 +124,8 @@ class DefaultCollationIdentityTests(unittest.TestCase):
         }
         row.update(overrides)
         cursor = ScriptedFakeCursor([row])
+        cursor.connection = MagicMock()
+        cursor.connection.info.server_version = connection_server_version
         result = federation_capability._database_default_collation_identity(
             cursor
         )
@@ -155,13 +160,13 @@ class DefaultCollationIdentityTests(unittest.TestCase):
         )[0]
         self.assertEqual(c_identity, posix_identity)
         for fragment in (
-            "d.datlocprovider",
+            "pg_catalog.to_jsonb(d) ->> 'datlocprovider'",
             "pg_catalog.pg_encoding_to_char(d.encoding)",
             "pg_catalog.current_setting('server_version_num')::integer",
             "d.datcollate",
             "d.datctype",
             "pg_catalog.to_jsonb(d) ->> 'daticurules'",
-            "d.datcollversion",
+            "pg_catalog.to_jsonb(d) ->> 'datcollversion'",
             "pg_catalog.pg_database_collation_actual_version(d.oid)",
             "d.datname = pg_catalog.current_database()",
         ):
@@ -178,6 +183,38 @@ class DefaultCollationIdentityTests(unittest.TestCase):
         self.assertIn("::integer >= 170000", query)
         self.assertNotIn("d.datlocale", query)
         self.assertNotIn("d.daticulocale", query)
+
+    def test_normalizes_pg14_libc_without_new_catalog_symbols(self):
+        identity, query = self.identity(
+            connection_server_version=140024,
+            provider="c",
+            server_major=14,
+            lc_collate="C",
+            lc_ctype="C",
+            locale=None,
+            recorded_version=None,
+            actual_version=None,
+        )
+
+        self.assertIn('"provider":"libc"', identity[1])
+        self.assertIn('"lcCollate":"C/POSIX"', identity[1])
+        self.assertIn("::integer >= 150000", query)
+        self.assertIn("ELSE 'c'", query)
+        self.assertIn("NULL::text AS actual_version", query)
+        self.assertNotIn("pg_database_collation_actual_version", query)
+        self.assertNotIn("d.datlocprovider", query)
+        self.assertNotIn("d.datcollversion", query)
+        unattested, _ = self.identity(
+            connection_server_version=140024,
+            provider="c",
+            server_major=14,
+            lc_collate="en_GB.UTF-8",
+            lc_ctype="en_GB.UTF-8",
+            locale=None,
+            recorded_version=None,
+            actual_version=None,
+        )
+        self.assertIsNone(unattested[1])
 
 
 class DetectCapabilityTests(unittest.TestCase):
