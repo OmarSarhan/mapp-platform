@@ -126,7 +126,7 @@ class DefaultCollationIdentityTests(unittest.TestCase):
         )
         return result, cursor.executed[0][0]
 
-    def test_uses_only_attested_effective_pg17_catalog_fields(self):
+    def test_uses_only_attested_effective_catalog_fields(self):
         identity, query = self.identity()
         self.assertEqual("UTF8", identity[0])
         self.assertIn('"provider":"builtin"', identity[1])
@@ -160,14 +160,24 @@ class DefaultCollationIdentityTests(unittest.TestCase):
             "pg_catalog.current_setting('server_version_num')::integer",
             "d.datcollate",
             "d.datctype",
-            "d.datlocale",
-            "d.daticurules",
+            "pg_catalog.to_jsonb(d) ->> 'daticurules'",
             "d.datcollversion",
             "pg_catalog.pg_database_collation_actual_version(d.oid)",
             "d.datname = pg_catalog.current_database()",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, query)
+
+    def test_selects_the_pg16_or_pg17_locale_catalog_key_safely(self):
+        _, query = self.identity()
+
+        self.assertIn(
+            "pg_catalog.to_jsonb(d) ->> 'daticulocale'", query
+        )
+        self.assertIn("pg_catalog.to_jsonb(d) ->> 'datlocale'", query)
+        self.assertIn("::integer >= 170000", query)
+        self.assertNotIn("d.datlocale", query)
+        self.assertNotIn("d.daticulocale", query)
 
 
 class DetectCapabilityTests(unittest.TestCase):

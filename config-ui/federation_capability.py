@@ -43,7 +43,7 @@ def _parsed_schema_relation(value: str) -> tuple[str, str]:
 def _database_default_collation_identity(
     cursor: Any,
 ) -> tuple[str, str | None]:
-    """Return database encoding and an attested PG17 default identity."""
+    """Return database encoding and an attested default identity."""
     cursor.execute(
         """
         SELECT d.datlocprovider AS provider,
@@ -52,8 +52,14 @@ def _database_default_collation_identity(
                  / 10000 AS server_major,
                d.datcollate AS lc_collate,
                d.datctype AS lc_ctype,
-               d.datlocale AS locale,
-               d.daticurules AS icu_rules,
+               CASE
+                 WHEN pg_catalog.current_setting(
+                   'server_version_num'
+                 )::integer >= 170000
+                 THEN pg_catalog.to_jsonb(d) ->> 'datlocale'
+                 ELSE pg_catalog.to_jsonb(d) ->> 'daticulocale'
+               END AS locale,
+               pg_catalog.to_jsonb(d) ->> 'daticurules' AS icu_rules,
                d.datcollversion AS recorded_version,
                pg_catalog.pg_database_collation_actual_version(d.oid)
                  AS actual_version

@@ -237,7 +237,7 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (alias) DO NOTHING", sql_text)
         self.assertIn("RETURNING alias", sql_text)
 
-    def test_register_preserves_duplicate_semantics_and_enforces_ceiling(self):
+    def test_register_preserves_duplicates_and_counts_all_retained_rows(self):
         cases = (
             ({"count": 1, "exists": True}, FileExistsError),
             ({"count": MAX_ALIASES, "exists": False}, FederationSchemaError),
@@ -249,6 +249,9 @@ class FederationAliasStoreTests(unittest.TestCase):
                 store = self.store_with_cursor(cursor)
                 with self.assertRaises(error):
                     store.register(registration(), "admin")
+                capacity_query = str(cursor.execute.call_args_list[1].args[0])
+                self.assertIn("count(*) AS count", capacity_query)
+                self.assertNotIn("FILTER (WHERE status", capacity_query)
                 self.assertFalse(
                     any("INSERT INTO" in text for text in statements(cursor))
                 )

@@ -820,7 +820,9 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "properties": {
                 "alias": {
                     "type": "string",
-                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,55}$",
+                    # Ordinary DBS_* aliases follow semantic_sources.ALIAS_RE;
+                    # federation aliases are intentionally narrower.
+                    "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
                 },
                 "schema": {
                     "type": "string",

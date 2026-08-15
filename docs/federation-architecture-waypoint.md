@@ -433,38 +433,20 @@ A source registration should include at least:
 | `kind` | Initially `postgresql`; transport implementation remains internal |
 | `connectionRef` | Reference to a secret, never the connection string itself |
 | `allowedRelations` | Exact approved remote relation allowlist |
-| `status` | `pending` (registered, awaiting Approve exposure — TTL-bound, auto-expires), `active`, `unavailable`, or `retired`; only `pending` and `active` count against the alias cap |
+| `status` | `pending` (registered, awaiting Approve exposure), `active`, `unavailable`, or `retired`; every retained record counts against the alias cap |
 | `freshnessStrategy` | `manual`, `maximumAge`, `timestampColumn`, or `versionRelation` |
 | `physicalIdentity` | Observed database/server identity used to detect replacement |
 | `lastObservation` | Latest bounded connectivity, schema, and version evidence |
 | `registeredBy` | Principal that created the registration — dashboard user identity or CLI credential identity, and which scope was used; minimal viable attribution for audit, not itself a permissions boundary |
 | `approvedBy` / `approvedAt` | Principal and timestamp of Approve exposure — together with `allowedRelations`, this triple is the consent record (see **Source lifecycle > 3. Approve exposure**) |
 
-The alias contract is already fixed by existing code, and the two places that
-define it **already disagree**:
-
-| Definition | Pattern | Leading digit | Underscore | Length bound |
-| --- | --- | --- | --- | --- |
-| `DB_KEY` at `config-ui/workspace_schema.py:21`, mirrored as `databaseKey` in `config-ui/schema/workspace.schema.json` | `^[A-Za-z0-9-]+$` | permitted | rejected | **none** |
-| Allowlist parser at `config-ui/semantic_sources.py:113` | `[A-Za-z][A-Za-z0-9_-]{0,62}` | rejected | permitted | 63 |
-
-An alias such as `9-council` is a valid workspace `dbs` key that the semantic
-allowlist cannot express; an alias such as `council_prod` is the reverse.
-Reconciling these is a prerequisite, not a detail, because the alias becomes a
-generated PostgreSQL schema name — and the unbounded `DB_KEY` length is the
-sharper problem, since `source_` plus an alias must stay within PostgreSQL's
-63-byte identifier limit.
-
-**Decided:** the semantic allowlist pattern becomes the single alias
-grammar — `[A-Za-z][A-Za-z0-9_]{0,55}` (see decision #12 below for the
-final length and hyphen corrections made once real federation-alias
-provisioning surfaced why 63 characters and hyphens don't work).
-`DB_KEY` at `config-ui/workspace_schema.py:21` and
-`workspace.schema.json`'s `databaseKey` must be tightened to match — this
-narrows what a workspace `dbs` key may be, so any existing deployment with
-an alias outside the new pattern (leading digit, a hyphen, or over 56
-characters) needs an explicit migration note in the change that lands
-this, not a silent validation break.
+Ordinary `DBS_<ALIAS>` / workspace connection aliases use
+`[A-Za-z][A-Za-z0-9_-]{0,62}` consistently in `DB_KEY`, `databaseKey`, and
+the semantic allowlist. Federation registrations intentionally use the
+narrower `[A-Za-z][A-Za-z0-9_]{0,55}` grammar: a federation alias becomes a
+local `source_<alias>` PostgreSQL schema name, which must remain within the
+63-byte identifier limit and be usable unquoted. That implementation detail
+must not narrow existing ordinary connection aliases.
 
 Aliases must also not expose credentials, hostnames, or tenant-sensitive values
 in generated schema names.
@@ -749,26 +731,21 @@ parallelism, timeout, search-path, and effective-session checks. Add bounded
 per-alias connection and background-admission limits so a federation cannot
 exhaust a remote system.
 
-Bound the aggregate too: a platform-wide ceiling on the number of
-simultaneously registered aliases, defaulting to **50** and overridable via an
-environment value (for example `MAPP_FEDERATION_MAX_ALIASES`), enforced at
-registration regardless of whether the caller is the dashboard session or a
-CLI credential. Per-alias limits bound what one remote system can suffer; this
-bounds how many remote systems and foreign-server connections the federation
-database itself can be pushed to hold against `max_connections`. Raise the
-ceiling by redeploying with a new value, not through a self-service runtime
-API — the cap exists to be outside the reach of the same credential it
-constrains.
+Bound the aggregate too: the implemented waypoint has a platform-wide ceiling
+of **100 retained alias records** (`MAX_ALIASES`), enforced at registration
+regardless of whether the caller is the dashboard session or a CLI credential.
+Per-alias limits bound what one remote system can suffer; the registry ceiling
+bounds both potential remote connections and durable registry/list state, so
+the complete list remains a bounded response without pagination. The ceiling
+is not changeable through a self-service runtime API.
 
 **Decided:** the count-and-insert check runs under a serializing transaction
 (or equivalent lock) so two concurrent registrations can never both land on
-slot 50. A registration that reaches Approve exposure has a fixed TTL — it
-auto-expires and frees its slot if never approved, so the cap, whose entire
-purpose is to bound real connection resources, cannot be exhausted by
-resource-free, never-approved registrations. A **retired** alias never counts
-toward the ceiling, whether or not it retains archived state (see **Source
-lifecycle > 8. Drift and retirement**); only `active` and pending-approval
-registrations do.
+slot 100. Every retained alias row counts, irrespective of status. This keeps
+the registry bounded and prevents an `unavailable` alias from later returning
+to `active` above the ceiling. The current waypoint has no delete or reclaim
+operation; any future reclamation lifecycle must remove retained state and
+release its resources atomically before it frees a slot.
 
 ### API scopes, not only database roles
 
@@ -1037,9 +1014,10 @@ credential could edit an already-reviewed registration in the gap before a
 separate `federation:provision` credential acts on it, silently provisioning
 against relations or a credential nobody actually reviewed.
 
-A registration that never reaches Approve exposure has a fixed TTL and
-auto-expires, freeing its slot against the alias cap (see **Roles and trust
-boundaries**).
+The current waypoint does not auto-expire or delete a registration that never
+reaches Approve exposure; its retained record continues to reserve a slot. A
+future expiry mechanism must use the atomic reclamation rule under **Roles and
+trust boundaries** before freeing that slot.
 
 For now, this recorded approval — the exact relation allowlist, the approving
 principal, and the timestamp — is the consent record; no separate
@@ -1659,9 +1637,8 @@ The architecture is established only when a representative test demonstrates:
 15. External acceptance uses genuinely separate source and federation services;
     a second database in the bundled container alone is not claimed as that
     evidence.
-16. Registering an alias beyond the platform-wide ceiling (50 by default) is
-    rejected, and the ceiling only changes via redeploy with a new
-    `MAPP_FEDERATION_MAX_ALIASES` value, never through a runtime call.
+16. Registering an alias beyond the platform-wide ceiling of 100 retained
+    records is rejected, and the ceiling never changes through a runtime call.
 17. A credential holding only `federation:register` cannot itself complete
     "Approve exposure" — provisioning fails without a separately granted
     `federation:provision` credential (or the dashboard session).
@@ -1688,8 +1665,8 @@ The architecture is established only when a representative test demonstrates:
 25. The verify-not-read endpoint rate-limits and alerts distinctly after
     repeated mismatches against the same alias, without locking out the
     legitimate credential holder.
-26. A registration that never reaches Approve exposure auto-expires on its
-    TTL and its slot becomes available against the alias cap again.
+26. Pending, active, unavailable, and retired records all reserve a slot; no
+    status transition can make later reactivation exceed the alias cap.
 27. Retiring an alias and immediately attempting to re-register the identical
     name fails closed; the same name only succeeds after an explicit,
     separately-scoped reclaim action.
@@ -1769,15 +1746,14 @@ The next design pass must explicitly resolve, rather than silently assume:
    gates Discover, not `federation:register` alone, and gates the
    verify-not-read credential-check endpoint. A third scope, `federation:observe`,
    covers passive topology/freshness/provenance reads only. A platform-wide
-   ceiling of 50 registered aliases (env-configurable) bounds the aggregate
-   risk of self-service registration: it is enforced under a serializing
-   check, `pending` registrations auto-expire on a TTL, and `retired` aliases
-   never count toward it. Re-registering a retired alias's name requires an
-   explicit, separately-scoped **reclaim** action (see **Source lifecycle >
-   8. Drift and retirement**). Agentic/unattended CLI use of these scopes is
-   accepted. Still open: the exact grant/revoke flow, the TTL length, and
-   whether any of these scopes should ever be scoped to a subset of aliases
-   rather than granted blanket.
+   ceiling of 100 retained alias records bounds the aggregate risk of
+   self-service registration: it is enforced under a serializing check, and
+   every retained record counts regardless of status. The current waypoint
+   has no TTL expiry or reclaim operation; any future reclaim action must
+   remove retained state and release its resources atomically before freeing
+   the slot. Agentic/unattended CLI use of these scopes is accepted. Still
+   open: the exact grant/revoke flow and whether any of these scopes should
+   ever be scoped to a subset of aliases rather than granted blanket.
 5. **Decided (referencing and backup halves):** secrets are referenced via the
    write-only submission endpoint and the separate verify-not-read endpoint
    (see **Credential, egress, and configuration boundary**), and secret
@@ -1815,21 +1791,18 @@ The next design pass must explicitly resolve, rather than silently assume:
     **Non-goals and constraints**.
 11. **Decided:** never — integration/derived relations only, from day one.
     See **Federation database layout > Foreign source schemas**.
-12. **Decided:** the reconciled alias pattern is the existing semantic
-    allowlist grammar, `[A-Za-z][A-Za-z0-9_]{0,55}` (max length 56, not the
-    original 63 this decision first specified — 63 was wrong arithmetic:
-    `source_` is 7 bytes, and 7 + 63 exceeds PostgreSQL's 63-byte identifier
-    limit, so a long-enough alias silently truncated and could collide with
-    another; corrected once real federation-alias provisioning surfaced it.
-    No hyphen, also corrected later: `source_<alias>` must be usable,
-    unquoted, as a schema/relation name component elsewhere, and those
-    grammars already reject hyphens).
-    `config-ui/workspace_schema.py:21` (`DB_KEY`) and `databaseKey` in
-    `config-ui/schema/workspace.schema.json` must be tightened to match;
-    any existing alias outside the new pattern needs an explicit migration
-    note in the change that lands this, not a silent validation break. The
-    generated schema name is immutable once
-    created — renaming an alias means retiring it and registering a new one,
+12. **Decided:** federation aliases use
+    `[A-Za-z][A-Za-z0-9_]{0,55}` (max length 56, not the original 63 this
+    decision first specified — 63 was wrong arithmetic: `source_` is 7 bytes,
+    and 7 + 63 exceeds PostgreSQL's 63-byte identifier limit, so a long-enough
+    alias silently truncated and could collide with another; corrected once
+    real federation-alias provisioning surfaced it. No hyphen, also corrected
+    later: `source_<alias>` must be usable, unquoted, as a schema/relation name
+    component elsewhere). Ordinary semantic/workspace connection aliases keep
+    their existing `[A-Za-z][A-Za-z0-9_-]{0,62}` grammar because they do not
+    become local PostgreSQL identifiers. The generated schema name is
+    immutable once created — renaming an alias means retiring it and
+    registering a new one,
     never an in-place `ALTER SCHEMA`, consistent with how a physical-identity
     change is already handled elsewhere on this page. Ownership belongs
     solely to the FDW provisioner (no runtime or derived role may create,

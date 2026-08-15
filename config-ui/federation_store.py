@@ -239,6 +239,9 @@ class FederationAliasStore:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"{SCHEMA}:register",),
             )
+            # Every retained row reserves a slot. In particular, an
+            # unavailable alias can become active again, and list() relies on
+            # the registry itself remaining bounded.
             cur.execute(
                 sql.SQL("""
                     SELECT count(*) AS count,

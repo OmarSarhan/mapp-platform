@@ -118,6 +118,12 @@ class ControlApiTests(unittest.TestCase):
             "[A-Za-z_][A-Za-z0-9_]{0,62}$",
             allowed_relations["items"]["pattern"],
         )
+        self.assertEqual(
+            "^[A-Za-z][A-Za-z0-9_]{0,55}$",
+            actions["federation.aliases.register"]["inputSchema"][
+                "properties"
+            ]["alias"]["pattern"],
+        )
         provision_schema = actions["federation.aliases.provision"][
             "inputSchema"
         ]
@@ -237,6 +243,10 @@ class ControlApiTests(unittest.TestCase):
         )
         self.assertFalse(
             source_sync["inputSchema"]["additionalProperties"]
+        )
+        self.assertEqual(
+            "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
+            source_sync["inputSchema"]["properties"]["alias"]["pattern"],
         )
         for action_id, path_key, path in (
             (
