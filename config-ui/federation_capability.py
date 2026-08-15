@@ -95,9 +95,11 @@ def _verify_allowed_relations(
 
     The fingerprint hashes canonical JSON containing each allowed relation's
     columns and view/RLS policy semantics. Qualified collation names and JSON
-    fields avoid oid instability and delimiter collisions. Missing relations
-    and unsupported kinds fail closed. A view attests itself, not policies of
-    transitive dependencies; source administrators remain trusted for those.
+    fields avoid oid instability and delimiter collisions. Missing relations,
+    unsupported kinds, and source-only column types fail closed. Importable
+    types are limited to PostgreSQL's bootstrap catalog and the bundled
+    database's public PostGIS extension. A view attests itself, not policies
+    of transitive dependencies; source administrators remain trusted for those.
     """
     all_present = True
     rls_detected = False
@@ -111,6 +113,39 @@ def _verify_allowed_relations(
               OR COALESCE(
                    reloptions && ARRAY['security_barrier=true'], false
                  ) AS bypasses_per_user_access,
+              NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_attribute AS import_attribute
+                JOIN pg_catalog.pg_type AS import_type
+                  ON import_type.oid = import_attribute.atttypid
+                JOIN pg_catalog.pg_namespace AS import_namespace
+                  ON import_namespace.oid = import_type.typnamespace
+                WHERE import_attribute.attrelid = c.oid
+                  AND import_attribute.attnum > 0
+                  AND NOT import_attribute.attisdropped
+                  AND NOT (
+                    (
+                      import_namespace.nspname = 'pg_catalog'
+                      AND import_type.oid < 16384
+                    )
+                    OR (
+                      import_namespace.nspname = 'public'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_depend AS type_dependency
+                        JOIN pg_catalog.pg_extension AS type_extension
+                          ON type_extension.oid = type_dependency.refobjid
+                        WHERE type_dependency.classid =
+                                'pg_catalog.pg_type'::pg_catalog.regclass
+                          AND type_dependency.objid = import_type.oid
+                          AND type_dependency.refclassid =
+                                'pg_catalog.pg_extension'::pg_catalog.regclass
+                          AND type_dependency.deptype = 'e'
+                          AND type_extension.extname = 'postgis'
+                      )
+                    )
+                  )
+              ) AS types_importable,
               encode(sha256(convert_to(jsonb_build_object(
                 'schema', n.nspname,
                 'relation', c.relname,
@@ -196,6 +231,8 @@ def _verify_allowed_relations(
             all_present = False
             fingerprints.append("missing")
             continue
+        if not row["types_importable"]:
+            all_present = False
         if row["bypasses_per_user_access"]:
             rls_detected = True
         fingerprints.append(row["definition_fingerprint"])

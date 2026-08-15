@@ -65,9 +65,15 @@ def extension_version_results(*, postgis=True):
     return results
 
 
-def relation_check_results(*, rls=False, fingerprints=("fp-bus-stops",)):
+def relation_check_results(
+    *, rls=False, types_importable=True, fingerprints=("fp-bus-stops",)
+):
     return [
-        {"bypasses_per_user_access": rls, "definition_fingerprint": fp}
+        {
+            "bypasses_per_user_access": rls,
+            "types_importable": types_importable,
+            "definition_fingerprint": fp,
+        }
         for fp in fingerprints
     ]
 
@@ -188,6 +194,25 @@ class DetectCapabilityTests(unittest.TestCase):
         # marker is what carries that fact forward, not a skipped call.
         self.assertEqual("7672778953115078690/16384/missing", physical_id)
 
+    def test_reports_schema_changed_for_a_source_only_column_type(self):
+        cursor = ScriptedFakeCursor(
+            extension_version_results()
+            + relation_check_results(types_importable=False)
+            + physical_identity_results()
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            observation, _, _ = detect_capability(
+                TLS_URL,
+                allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
+            )
+
+        self.assertEqual("changed", observation["schema"])
+        self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
+
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(
             extension_and_rls_results(rls=True)
@@ -225,6 +250,8 @@ class DetectCapabilityTests(unittest.TestCase):
             "jsonb_build_object",
             "sha256(convert_to",
             "format_type(a.atttypid, a.atttypmod)",
+            "pg_catalog.pg_type AS import_type",
+            "type_extension.extname = 'postgis'",
             "jsonb_build_array(cn.nspname, co.collname)",
             "c.relkind",
             "pg_get_userbyid(c.relowner)",
