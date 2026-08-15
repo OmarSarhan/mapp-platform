@@ -257,6 +257,10 @@ artifact retention, storage quotas, or host-level resource controls.
   Do not register user-private, recipient-filtered, or end-to-end-encrypted
   message/key relations. Catalog RLS detection cannot attest application-level
   filtering; expose only a dedicated remote view that is safe for every caller.
+- Federation `active` status is point-in-time evidence from the last explicit
+  Observe/Provision, not continuous remote attestation. The manual freshness
+  strategy trusts source administrators to preserve approved relation semantics
+  between observations; rerun Observe after source schema or view releases.
 - Treat `SEMANTIC_INTERNAL_TOKEN` as a service credential. Only
   `config-ui` and `semantic-service` receive it. It must be random, at least 32
   characters in production, and distinct from database and user credentials.

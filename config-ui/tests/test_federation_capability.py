@@ -66,12 +66,16 @@ def extension_version_results(*, postgis=True):
 
 
 def relation_check_results(
-    *, rls=False, types_importable=True, fingerprints=("fp-bus-stops",)
+    *,
+    rls=False,
+    types_importable=True,
+    collations_importable=True,
+    fingerprints=("fp-bus-stops",),
 ):
     return [
         {
             "bypasses_per_user_access": rls,
-            "types_importable": types_importable,
+            "columns_importable": types_importable and collations_importable,
             "column_shape_fingerprint": f"columns-{fp}",
             "definition_fingerprint": fp,
         }
@@ -219,6 +223,25 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertEqual("changed", observation["schema"])
         self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
 
+    def test_reports_schema_changed_for_an_unimportable_column_collation(self):
+        cursor = ScriptedFakeCursor(
+            extension_version_results()
+            + relation_check_results(collations_importable=False)
+            + physical_identity_results()
+        )
+        with patch(
+            "federation_capability.psycopg.connect",
+            return_value=ScriptedFakeConnection(cursor),
+        ):
+            observation, _, _, _ = detect_capability(
+                TLS_URL,
+                allowed_relations=("leeds.bus_stops",),
+                tls_policy="require",
+            )
+
+        self.assertEqual("changed", observation["schema"])
+        self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
+
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(
             extension_and_rls_results(rls=True)
@@ -262,6 +285,10 @@ class DetectCapabilityTests(unittest.TestCase):
             "a.atttypmod",
             "pg_catalog.pg_type AS import_type",
             "type_extension.extname = 'postgis'",
+            "pg_catalog.pg_collation AS import_collation",
+            "import_collation_namespace.nspname = 'pg_catalog'",
+            "import_collation.collname IN (",
+            "'default', 'C', 'POSIX'",
             "jsonb_build_array(cn.nspname, co.collname)",
             "c.relkind",
             "pg_get_userbyid(c.relowner)",
@@ -283,8 +310,8 @@ class DetectCapabilityTests(unittest.TestCase):
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, executed_sql)
-        self.assertNotIn("'default'", executed_sql)
         self.assertNotIn("a.atthasdef", executed_sql)
+        self.assertNotIn("pg_catalog.pg_attrdef", executed_sql)
 
     def test_combines_multiple_relations_into_one_ordered_fingerprint(self):
         cursor = ScriptedFakeCursor(

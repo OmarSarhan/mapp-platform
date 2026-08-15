@@ -96,9 +96,10 @@ def _verify_allowed_relations(
     The fingerprint hashes canonical JSON containing each allowed relation's
     columns and view/RLS policy semantics. Qualified collation names and JSON
     fields avoid oid instability and delimiter collisions. Missing relations,
-    unsupported kinds, and source-only column types fail closed. Importable
-    types are limited to PostgreSQL's bootstrap catalog and the bundled
-    database's public PostGIS extension. A view attests itself, not policies
+    unsupported kinds, and columns that cannot be imported fail closed. Types
+    are limited to PostgreSQL's bootstrap catalog and the bundled database's
+    public PostGIS extension; collations are limited to the portable catalog
+    names present in every bundled database. A view attests itself, not policies
     of transitive dependencies; source administrators remain trusted for those.
     """
     all_present = True
@@ -121,32 +122,49 @@ def _verify_allowed_relations(
                   ON import_type.oid = import_attribute.atttypid
                 JOIN pg_catalog.pg_namespace AS import_namespace
                   ON import_namespace.oid = import_type.typnamespace
+                LEFT JOIN pg_catalog.pg_collation AS import_collation
+                  ON import_collation.oid = import_attribute.attcollation
+                LEFT JOIN pg_catalog.pg_namespace AS import_collation_namespace
+                  ON import_collation_namespace.oid =
+                       import_collation.collnamespace
                 WHERE import_attribute.attrelid = c.oid
                   AND import_attribute.attnum > 0
                   AND NOT import_attribute.attisdropped
-                  AND NOT (
-                    (
-                      import_namespace.nspname = 'pg_catalog'
-                      AND import_type.oid < 16384
+                  AND (
+                    NOT (
+                      (
+                        import_namespace.nspname = 'pg_catalog'
+                        AND import_type.oid < 16384
+                      )
+                      OR (
+                        import_namespace.nspname = 'public'
+                        AND EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_depend AS type_dependency
+                          JOIN pg_catalog.pg_extension AS type_extension
+                            ON type_extension.oid = type_dependency.refobjid
+                          WHERE type_dependency.classid =
+                                  'pg_catalog.pg_type'::pg_catalog.regclass
+                            AND type_dependency.objid = import_type.oid
+                            AND type_dependency.refclassid =
+                                  'pg_catalog.pg_extension'::pg_catalog.regclass
+                            AND type_dependency.deptype = 'e'
+                            AND type_extension.extname = 'postgis'
+                        )
+                      )
                     )
                     OR (
-                      import_namespace.nspname = 'public'
-                      AND EXISTS (
-                        SELECT 1
-                        FROM pg_catalog.pg_depend AS type_dependency
-                        JOIN pg_catalog.pg_extension AS type_extension
-                          ON type_extension.oid = type_dependency.refobjid
-                        WHERE type_dependency.classid =
-                                'pg_catalog.pg_type'::pg_catalog.regclass
-                          AND type_dependency.objid = import_type.oid
-                          AND type_dependency.refclassid =
-                                'pg_catalog.pg_extension'::pg_catalog.regclass
-                          AND type_dependency.deptype = 'e'
-                          AND type_extension.extname = 'postgis'
+                      import_attribute.attcollation <> 0
+                      AND NOT COALESCE(
+                        import_collation_namespace.nspname = 'pg_catalog'
+                        AND import_collation.collname IN (
+                          'default', 'C', 'POSIX'
+                        ),
+                        false
                       )
                     )
                   )
-              ) AS types_importable,
+              ) AS columns_importable,
               encode(sha256(convert_to(COALESCE((
                 SELECT jsonb_agg(jsonb_build_object(
                   'name', a.attname,
@@ -255,7 +273,7 @@ def _verify_allowed_relations(
             all_present = False
             fingerprints.append("missing")
             continue
-        if not row["types_importable"]:
+        if not row["columns_importable"]:
             all_present = False
         if row["bypasses_per_user_access"]:
             rls_detected = True
