@@ -257,6 +257,12 @@ artifact retention, storage quotas, or host-level resource controls.
   configuration service resolves it only for federation Observe/Provision;
   the separate namespace deliberately keeps it out of ordinary `DBS_*`
   catalog, layer, workspace, and semantic discovery.
+- A source column using `pg_catalog.default` is importable only when the
+  source and federation databases have the same attested provider, locale,
+  encoding, and matching recorded/actual version. An unversioned default is
+  accepted only for libc `C`/`POSIX`; built-in defaults also require the same
+  PostgreSQL major. Explicit `C` and `POSIX` remain portable when database
+  encodings match; other source collations are unsupported.
 - Every platform caller uses the same mapped remote federation identity.
   Do not register user-private, recipient-filtered, or end-to-end-encrypted
   message/key relations. Catalog RLS detection cannot attest application-level

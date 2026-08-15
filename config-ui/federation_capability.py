@@ -7,6 +7,7 @@ historical baseline.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,6 +38,83 @@ def _parsed_schema_relation(value: str) -> tuple[str, str]:
         )
     _, schema, relation = parsed
     return schema, relation
+
+
+def _database_default_collation_identity(
+    cursor: Any,
+) -> tuple[str, str | None]:
+    """Return database encoding and an attested PG17 default identity."""
+    cursor.execute(
+        """
+        SELECT d.datlocprovider AS provider,
+               pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+               pg_catalog.current_setting('server_version_num')::integer
+                 / 10000 AS server_major,
+               d.datcollate AS lc_collate,
+               d.datctype AS lc_ctype,
+               d.datlocale AS locale,
+               d.daticurules AS icu_rules,
+               d.datcollversion AS recorded_version,
+               pg_catalog.pg_database_collation_actual_version(d.oid)
+                 AS actual_version
+        FROM pg_catalog.pg_database AS d
+        WHERE d.datname = pg_catalog.current_database()
+        """
+    )
+    row = cursor.fetchone()
+    encoding = row["encoding"]
+    provider = {"b": "builtin", "c": "libc", "i": "icu"}.get(
+        row["provider"]
+    )
+    lc_collate = row["lc_collate"] if provider == "libc" else None
+    lc_ctype = row["lc_ctype"] if provider == "libc" else None
+    if lc_collate in {"C", "POSIX"}:
+        lc_collate = "C/POSIX"
+    if lc_ctype in {"C", "POSIX"}:
+        lc_ctype = "C/POSIX"
+    stable_c = (
+        provider == "libc"
+        and lc_collate == "C/POSIX"
+        and lc_ctype == "C/POSIX"
+    )
+    recorded_version = row["recorded_version"]
+    actual_version = row["actual_version"]
+    if (
+        provider is None
+        or recorded_version != actual_version
+        or (actual_version is None and not stable_c)
+    ):
+        return encoding, None
+    identity = {
+        "provider": provider,
+        "encoding": encoding,
+        "serverMajor": row["server_major"] if provider == "builtin" else None,
+        "lcCollate": lc_collate,
+        "lcCtype": lc_ctype,
+        "locale": row["locale"] if provider != "libc" else None,
+        "icuRules": row["icu_rules"] if provider == "icu" else None,
+        "recordedVersion": recorded_version,
+        "actualVersion": actual_version,
+    }
+    return encoding, json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def _collation_compatibility(
+    cursor: Any,
+    local_default_collation: tuple[str, str | None],
+) -> tuple[bool, bool]:
+    """Return portable-encoding and attested-default compatibility."""
+    remote_encoding, remote_identity = _database_default_collation_identity(
+        cursor
+    )
+    local_encoding, local_identity = local_default_collation
+    encoding_matches = remote_encoding == local_encoding
+    default_matches = (
+        encoding_matches
+        and remote_identity is not None
+        and remote_identity == local_identity
+    )
+    return encoding_matches, default_matches
 
 
 def extension_versions(cursor: Any) -> dict[str, str]:
@@ -89,7 +167,11 @@ def extension_versions(cursor: Any) -> dict[str, str]:
 
 
 def _verify_allowed_relations(
-    cursor: Any, allowed_relations: tuple[str, ...]
+    cursor: Any,
+    allowed_relations: tuple[str, ...],
+    *,
+    default_collation_matches: bool,
+    portable_collation_encoding_matches: bool,
 ) -> tuple[bool, bool, str, dict[str, str]]:
     """Return selectability, access risk, schema and column-shape fingerprints.
 
@@ -98,9 +180,11 @@ def _verify_allowed_relations(
     fields avoid oid instability and delimiter collisions. Missing relations,
     unsupported kinds, and columns that cannot be imported fail closed. Types
     are limited to PostgreSQL's bootstrap catalog and the bundled database's
-    public PostGIS extension; collations are limited to the portable catalog
-    names present in every bundled database. A view attests itself, not policies
-    of transitive dependencies; source administrators remain trusted for those.
+    public PostGIS extension. C/POSIX collations are portable between matching
+    database encodings; the database default is importable only when its
+    effective source and local identities match. A view attests itself, not
+    policies of transitive dependencies; source administrators remain trusted
+    for those.
     """
     all_present = True
     rls_detected = False
@@ -157,8 +241,15 @@ def _verify_allowed_relations(
                       import_attribute.attcollation <> 0
                       AND NOT COALESCE(
                         import_collation_namespace.nspname = 'pg_catalog'
-                        AND import_collation.collname IN (
-                          'default', 'C', 'POSIX'
+                        AND (
+                          (
+                            import_collation.collname IN ('C', 'POSIX')
+                            AND %s
+                          )
+                          OR (
+                            import_collation.collname = 'default'
+                            AND %s
+                          )
                         ),
                         false
                       )
@@ -266,7 +357,12 @@ def _verify_allowed_relations(
             WHERE n.nspname = %s AND c.relname = %s
               AND c.relkind IN ('r', 'p', 'v', 'm')
             """,
-            (schema, relation),
+            (
+                portable_collation_encoding_matches,
+                default_collation_matches,
+                schema,
+                relation,
+            ),
         )
         row = cursor.fetchone()
         if row is None or not _selectable(cursor, schema, relation):
@@ -355,6 +451,7 @@ def detect_capability(
     *,
     allowed_relations: tuple[str, ...],
     tls_policy: str,
+    local_default_collation: tuple[str, str | None],
 ) -> tuple[dict[str, Any], datetime, str | None, dict[str, str]]:
     """Bounded, read-only capability and connectivity detection.
 
@@ -362,7 +459,9 @@ def detect_capability(
     `federation_schema.validate_registration()`'s output. `tls_policy` is
     the alias's registered requirement — enforced against the connection
     string's actual sslmode before connecting, the same as Provision, so a
-    weak connectionRef is never even Observed successfully.
+    weak connectionRef is never even Observed successfully. The private local
+    default-collation identity gates importability without expanding the
+    observation contract.
     Returns observation, observed_at, physical_identity, and private canonical
     column-shape hashes. The observation is already validated against
     `federation_schema.validate_observation()`'s closed contract; the hashes do
@@ -383,13 +482,24 @@ def detect_capability(
                 try:
                     PostgresSemanticSources._begin_read_only(cursor)
                     observed_at = datetime.now(timezone.utc)
+                    (
+                        encoding_matches,
+                        default_collation_matches,
+                    ) = _collation_compatibility(
+                        cursor, local_default_collation
+                    )
                     versions = extension_versions(cursor)
                     (
                         relations_verified,
                         rls_detected,
                         schema_fingerprint,
                         column_shapes,
-                    ) = _verify_allowed_relations(cursor, allowed_relations)
+                    ) = _verify_allowed_relations(
+                        cursor,
+                        allowed_relations,
+                        default_collation_matches=default_collation_matches,
+                        portable_collation_encoding_matches=encoding_matches,
+                    )
                     physical_id = _physical_identity_from_cursor(
                         cursor, allowed_relations
                     )
@@ -435,14 +545,18 @@ def detect_capability(
 
 
 def verify_remote_state(
-    connection_url: str, allowed_relations: tuple[str, ...]
+    connection_url: str,
+    allowed_relations: tuple[str, ...],
+    *,
+    local_default_collation: tuple[str, str | None],
 ) -> tuple[str, dict[str, str], bool, bool, str, dict[str, str]]:
     """Read all live provisioning evidence in one repeatable-read snapshot.
 
     Returns physical identity, extension versions, relation selectability,
     access-control detection, schema fingerprint, and per-relation canonical
-    column-shape hashes. Connection/query failures are left to the provisioning
-    caller as psycopg errors.
+    column-shape hashes. The private local default-collation identity gates
+    importability without expanding the returned tuple. Connection/query
+    failures are left to the provisioning caller as psycopg errors.
     """
     with psycopg.connect(
         connection_url,
@@ -451,6 +565,12 @@ def verify_remote_state(
     ) as connection:
         with connection.cursor() as cursor:
             PostgresSemanticSources._begin_read_only(cursor)
+            (
+                encoding_matches,
+                default_collation_matches,
+            ) = _collation_compatibility(
+                cursor, local_default_collation
+            )
             identity = _physical_identity_from_cursor(cursor, allowed_relations)
             versions = extension_versions(cursor)
             (
@@ -458,7 +578,12 @@ def verify_remote_state(
                 rls_detected,
                 schema_fingerprint,
                 column_shapes,
-            ) = _verify_allowed_relations(cursor, allowed_relations)
+            ) = _verify_allowed_relations(
+                cursor,
+                allowed_relations,
+                default_collation_matches=default_collation_matches,
+                portable_collation_encoding_matches=encoding_matches,
+            )
     return (
         identity,
         versions,

@@ -51,6 +51,9 @@ class ScriptedFakeConnection:
 TLS_URL = (
     "postgresql://reader:secret@host/source?sslmode=require&gssencmode=disable"
 )
+DEFAULT_COLLATION = ("UTF8", "local-default-collation")
+MISMATCHED_COLLATION = ("UTF8", "remote-default-collation")
+UNATTESTED_COLLATION = ("UTF8", None)
 
 
 def extension_version_results(*, postgis=True):
@@ -102,7 +105,80 @@ def physical_identity_results(relation_oids=(24601,)):
     return results
 
 
+class DefaultCollationIdentityTests(unittest.TestCase):
+    @staticmethod
+    def identity(**overrides):
+        row = {
+            "provider": "b",
+            "encoding": "UTF8",
+            "server_major": 17,
+            "lc_collate": "C.UTF-8",
+            "lc_ctype": "C.UTF-8",
+            "locale": "C.UTF-8",
+            "icu_rules": None,
+            "recorded_version": "1",
+            "actual_version": "1",
+        }
+        row.update(overrides)
+        cursor = ScriptedFakeCursor([row])
+        result = federation_capability._database_default_collation_identity(
+            cursor
+        )
+        return result, cursor.executed[0][0]
+
+    def test_uses_only_attested_effective_pg17_catalog_fields(self):
+        identity, query = self.identity()
+        self.assertEqual("UTF8", identity[0])
+        self.assertIn('"provider":"builtin"', identity[1])
+        self.assertNotEqual(identity, self.identity(server_major=18)[0])
+
+        for overrides in (
+            {
+                "provider": "c",
+                "lc_collate": "C.UTF-8",
+                "lc_ctype": "C.UTF-8",
+                "recorded_version": None,
+                "actual_version": None,
+            },
+            {"recorded_version": "old", "actual_version": "new"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertIsNone(self.identity(**overrides)[0][1])
+
+        c_identity = self.identity(
+            provider="c", lc_collate="C", lc_ctype="C",
+            recorded_version=None, actual_version=None,
+        )[0]
+        posix_identity = self.identity(
+            provider="c", lc_collate="POSIX", lc_ctype="POSIX",
+            recorded_version=None, actual_version=None,
+        )[0]
+        self.assertEqual(c_identity, posix_identity)
+        for fragment in (
+            "d.datlocprovider",
+            "pg_catalog.pg_encoding_to_char(d.encoding)",
+            "pg_catalog.current_setting('server_version_num')::integer",
+            "d.datcollate",
+            "d.datctype",
+            "d.datlocale",
+            "d.daticurules",
+            "d.datcollversion",
+            "pg_catalog.pg_database_collation_actual_version(d.oid)",
+            "d.datname = pg_catalog.current_database()",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, query)
+
+
 class DetectCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch(
+            "federation_capability._database_default_collation_identity",
+            return_value=DEFAULT_COLLATION,
+        )
+        self.default_collation_identity = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_reports_reachable_with_full_extension_versions(self):
         cursor = ScriptedFakeCursor(
             extension_and_rls_results()
@@ -116,6 +192,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertIsInstance(observed_at, datetime)
@@ -148,6 +225,11 @@ class DetectCapabilityTests(unittest.TestCase):
         self.assertEqual(
             {"leeds.bus_stops": "columns-fp-bus-stops"}, column_shapes
         )
+        self.default_collation_identity.assert_called_once_with(cursor)
+        relation_query = next(
+            item for item in cursor.executed if "columns_importable" in item[0]
+        )
+        self.assertEqual((True, True), relation_query[1][:2])
         self.assertEqual(1, mock_connect.call_count)
 
     def test_reports_no_postgis_without_probing_proj_or_geos(self):
@@ -163,6 +245,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual({"postgresql": "16.2"}, observation["extensionVersions"])
@@ -190,6 +273,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("reachable", observation["connectivity"])
@@ -218,6 +302,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("changed", observation["schema"])
@@ -237,10 +322,45 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("changed", observation["schema"])
         self.assertEqual("fp-bus-stops", observation["schemaFingerprint"])
+
+    def test_default_and_portable_collations_require_matching_evidence(self):
+        cases = (
+            (MISMATCHED_COLLATION, DEFAULT_COLLATION, (True, False)),
+            (UNATTESTED_COLLATION, UNATTESTED_COLLATION, (True, False)),
+            (("LATIN1", DEFAULT_COLLATION[1]), DEFAULT_COLLATION, (False, False)),
+        )
+        for remote, local, expected_gates in cases:
+            with self.subTest(remote=remote, local=local):
+                self.default_collation_identity.reset_mock()
+                self.default_collation_identity.return_value = remote
+                cursor = ScriptedFakeCursor(
+                    extension_version_results()
+                    + relation_check_results(collations_importable=False)
+                    + physical_identity_results()
+                )
+                with patch(
+                    "federation_capability.psycopg.connect",
+                    return_value=ScriptedFakeConnection(cursor),
+                ):
+                    observation, _, _, _ = detect_capability(
+                        TLS_URL,
+                        allowed_relations=("leeds.bus_stops",),
+                        tls_policy="require",
+                        local_default_collation=local,
+                    )
+
+                self.assertEqual("changed", observation["schema"])
+                relation_query = next(
+                    item for item in cursor.executed
+                    if "columns_importable" in item[0]
+                )
+                self.assertEqual(expected_gates, relation_query[1][:2])
+                self.default_collation_identity.assert_called_once_with(cursor)
 
     def test_detects_row_level_security(self):
         cursor = ScriptedFakeCursor(
@@ -255,6 +375,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertTrue(observation["rowLevelSecurityDetected"])
@@ -272,6 +393,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.tenant_scoped_view",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         executed_sql = "\n".join(query for query, _ in cursor.executed)
@@ -287,8 +409,8 @@ class DetectCapabilityTests(unittest.TestCase):
             "type_extension.extname = 'postgis'",
             "pg_catalog.pg_collation AS import_collation",
             "import_collation_namespace.nspname = 'pg_catalog'",
-            "import_collation.collname IN (",
-            "'default', 'C', 'POSIX'",
+            "import_collation.collname IN ('C', 'POSIX')",
+            "import_collation.collname = 'default'",
             "jsonb_build_array(cn.nspname, co.collname)",
             "c.relkind",
             "pg_get_userbyid(c.relowner)",
@@ -326,6 +448,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops", "leeds.roads"),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         # Ordered by the given allowed_relations sequence, matching
@@ -349,6 +472,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 "sslmode=require&gssencmode=disable",
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual(
@@ -383,6 +507,7 @@ class DetectCapabilityTests(unittest.TestCase):
                 TLS_URL,
                 allowed_relations=("leeds.bus_stops",),
                 tls_policy="require",
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("reachable", observation["connectivity"])
@@ -408,6 +533,7 @@ class DetectCapabilityTests(unittest.TestCase):
                     TLS_URL,
                     allowed_relations=("leeds.bus_stops",),
                     tls_policy="require",
+                    local_default_collation=DEFAULT_COLLATION,
                 )
             self.assertEqual("unauthorized", observation["connectivity"])
 
@@ -421,6 +547,7 @@ class DetectCapabilityTests(unittest.TestCase):
                     "sslmode=disable&gssencmode=disable",
                     allowed_relations=("leeds.bus_stops",),
                     tls_policy="verify-full",
+                    local_default_collation=DEFAULT_COLLATION,
                 )
         mock_connect.assert_not_called()
 
@@ -430,6 +557,14 @@ class VerifyRemoteStateTests(unittest.TestCase):
     versions, relation existence/selectability, RLS/security-barrier
     exposure, schema fingerprint, and canonical column shapes, all gathered
     from the one connection this opens."""
+
+    def setUp(self):
+        patcher = patch(
+            "federation_capability._database_default_collation_identity",
+            return_value=DEFAULT_COLLATION,
+        )
+        self.default_collation_identity = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_combines_the_cluster_database_and_relation_identity(self):
         cursor = ScriptedFakeCursor(
@@ -448,7 +583,11 @@ class VerifyRemoteStateTests(unittest.TestCase):
                 rls_detected,
                 schema_fingerprint,
                 column_shapes,
-            ) = verify_remote_state("postgresql://reader", ("leeds.bus_stops",))
+            ) = verify_remote_state(
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
+            )
 
         self.assertEqual("7672778953115078690/16384/24601", identity)
         self.assertEqual(
@@ -468,6 +607,12 @@ class VerifyRemoteStateTests(unittest.TestCase):
             {"leeds.bus_stops": "columns-fp-bus-stops"}, column_shapes
         )
 
+        self.default_collation_identity.assert_called_once_with(cursor)
+        relation_query = next(
+            item for item in cursor.executed if "columns_importable" in item[0]
+        )
+        self.assertEqual((True, True), relation_query[1][:2])
+
     def test_differs_when_the_database_was_dropped_and_recreated(self):
         # Same cluster (system_identifier unchanged), different database
         # oid — a DROP DATABASE + CREATE DATABASE within the same cluster.
@@ -485,7 +630,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             identity, *_ = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertNotEqual("7672778953115078690/16384/24601", identity)
@@ -506,7 +653,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             identity, *_ = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertNotEqual("7672778953115078690/16384/24601", identity)
@@ -525,7 +674,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             identity, *_ = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("7672778953115078690/16384/missing", identity)
@@ -543,6 +694,7 @@ class VerifyRemoteStateTests(unittest.TestCase):
             identity, *_ = verify_remote_state(
                 "postgresql://reader",
                 ("leeds.bus_stops", "leeds.roads"),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertEqual("7672778953115078690/16384/111,222", identity)
@@ -560,7 +712,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             (
                 _, _, relations_verified, _, schema_fingerprint, column_shapes
             ) = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertFalse(relations_verified)
@@ -590,7 +744,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             (
                 _, _, relations_verified, _, schema_fingerprint, column_shapes
             ) = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertFalse(relations_verified)
@@ -608,7 +764,9 @@ class VerifyRemoteStateTests(unittest.TestCase):
             return_value=ScriptedFakeConnection(cursor),
         ):
             _, _, _, rls_detected, _, _ = verify_remote_state(
-                "postgresql://reader", ("leeds.bus_stops",)
+                "postgresql://reader",
+                ("leeds.bus_stops",),
+                local_default_collation=DEFAULT_COLLATION,
             )
 
         self.assertTrue(rls_detected)
@@ -619,7 +777,11 @@ class VerifyRemoteStateTests(unittest.TestCase):
             side_effect=psycopg.OperationalError("could not connect"),
         ):
             with self.assertRaises(psycopg.Error):
-                verify_remote_state("postgresql://unreachable", ())
+                verify_remote_state(
+                    "postgresql://unreachable",
+                    (),
+                    local_default_collation=DEFAULT_COLLATION,
+                )
 
 
 class SelectableTests(unittest.TestCase):

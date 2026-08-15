@@ -133,6 +133,18 @@ class DatabaseAccessContractTests(unittest.TestCase):
                 self.assertIn(key, guard)
                 self.assertIn('unset "${key}"', guard)
 
+    def test_federation_seed_pins_collatable_columns_to_portable_c(self) -> None:
+        source = self.normalized("docker/source-db/seed.sh")
+        for contract in (
+            "'leeds.smoke_control_orders'::pg_catalog.regclass",
+            "a.attcollation <> 0",
+            "COLLATE pg_catalog.\"C\"",
+            "(n.nspname, co.collname) <> ('pg_catalog', 'C')",
+            "seeded collatable columns must use pg_catalog.C",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, source)
+
     def test_layer_drop_guard_installs_blocking_sql_objects(self) -> None:
         source = self.normalized("docker/postgis/init/25-platform-layer-drop-guard.sql")
         for contract in (

@@ -54,6 +54,43 @@ SOURCE_READER_USER="$(dotenv_value SOURCE_READER_USER)"
   --username "${SOURCE_POSTGRES_USER}" \
   --dbname "${SOURCE_POSTGRES_DB}" \
   --set reader_user="${SOURCE_READER_USER}" <<'SQL'
+DO $body$
+DECLARE
+  column_record record;
+BEGIN
+  FOR column_record IN
+    SELECT a.attname,
+           pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type
+    FROM pg_catalog.pg_attribute AS a
+    WHERE a.attrelid = 'leeds.smoke_control_orders'::pg_catalog.regclass
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attcollation <> 0
+  LOOP
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE leeds.smoke_control_orders '
+      'ALTER COLUMN %I TYPE %s COLLATE pg_catalog."C"',
+      column_record.attname,
+      column_record.data_type
+    );
+  END LOOP;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_attribute AS a
+    JOIN pg_catalog.pg_collation AS co ON co.oid = a.attcollation
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = co.collnamespace
+    WHERE a.attrelid = 'leeds.smoke_control_orders'::pg_catalog.regclass
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attcollation <> 0
+      AND (n.nspname, co.collname) <> ('pg_catalog', 'C')
+  ) THEN
+    RAISE EXCEPTION 'seeded collatable columns must use pg_catalog.C';
+  END IF;
+END
+$body$;
+
 GRANT USAGE ON SCHEMA leeds TO :"reader_user";
 GRANT SELECT ON leeds.smoke_control_orders TO :"reader_user";
 SQL

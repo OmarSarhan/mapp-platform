@@ -42,6 +42,7 @@ COLUMN_SHAPE_FINGERPRINT = "column-shape"
 REMOTE_COLUMN_SHAPES = {
     "leeds.smoke_control_orders": COLUMN_SHAPE_FINGERPRINT
 }
+DEFAULT_COLLATION = ("UTF8", "default-collation")
 
 
 def registration(**overrides):
@@ -188,6 +189,14 @@ def statements(cursor):
 
 
 class FederationAliasStoreTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch(
+            "federation_store._database_default_collation_identity",
+            return_value=DEFAULT_COLLATION,
+        )
+        self.default_collation_identity = patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def store_with_cursor(cursor):
         store = FederationAliasStore(
@@ -561,6 +570,11 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         self.assertIn("advisory_xact_lock", statements(cursor)[0])
         self.assertNotIn("version_relation", detect.call_args.kwargs)
+        self.assertEqual(
+            DEFAULT_COLLATION,
+            detect.call_args.kwargs["local_default_collation"],
+        )
+        self.default_collation_identity.assert_called_once_with(cursor)
 
     def test_provision_requires_the_exact_observation_id(self):
         for value in (None, 0, True, "41"):
@@ -689,6 +703,11 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("_approvals", sql_text)
         self.assertIn("accepted_connection_identity", sql_text)
         self.assertEqual(2, verify.call_count)
+        self.default_collation_identity.assert_called_once_with(cursor)
+        self.assertTrue(all(
+            call.kwargs["local_default_collation"] == DEFAULT_COLLATION
+            for call in verify.call_args_list
+        ))
 
     @patch("federation_store.verify_remote_state")
     @patch("federation_store.extension_versions", return_value={})

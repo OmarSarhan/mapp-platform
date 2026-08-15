@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from federation_capability import (
+    _database_default_collation_identity,
     detect_capability,
     extension_versions,
     verify_remote_state,
@@ -335,6 +336,9 @@ class FederationAliasStore:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"{SCHEMA}:observe:{alias}",),
             )
+            local_default_collation = (
+                _database_default_collation_identity(cur)
+            )
             (
                 observation,
                 observed_at,
@@ -344,6 +348,7 @@ class FederationAliasStore:
                 connection_url,
                 allowed_relations=allowed_relations,
                 tls_policy=tls_policy,
+                local_default_collation=local_default_collation,
             )
             self._persist_observation(
                 cur, alias, observation, connection_url, physical_identity,
@@ -951,6 +956,9 @@ class FederationAliasStore:
                     code="federation.observation_not_current",
                 )
             enforce_tls_policy(record["tlsPolicy"], connection_url)
+            local_default_collation = (
+                _database_default_collation_identity(cur)
+            )
             try:
                 (
                     current_physical_identity,
@@ -960,7 +968,9 @@ class FederationAliasStore:
                     current_schema_fingerprint,
                     remote_column_shapes,
                 ) = verify_remote_state(
-                    connection_url, tuple(record["allowedRelations"])
+                    connection_url,
+                    tuple(record["allowedRelations"]),
+                    local_default_collation=local_default_collation,
                 )
             except psycopg.Error as exc:
                 raise FederationSchemaError(
@@ -1159,7 +1169,9 @@ class FederationAliasStore:
                 )
                 try:
                     imported_state = verify_remote_state(
-                        connection_url, tuple(record["allowedRelations"])
+                        connection_url,
+                        tuple(record["allowedRelations"]),
+                        local_default_collation=local_default_collation,
                     )
                 except psycopg.Error as exc:
                     raise FederationSchemaError(
