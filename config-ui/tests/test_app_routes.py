@@ -96,6 +96,78 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
         self.assertEqual("federation.registry_unavailable", body["code"])
 
+    def test_retire_is_refused_while_a_derived_layer_still_reads_the_alias(
+        self,
+    ):
+        # Revoking access underneath a dependent materialized view would
+        # leave it refreshing against a source nobody believes is connected.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.affected_by_source_schema.return_value = ["smoke_h3_r9"]
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.alias_in_use", body["code"])
+        self.assertIn("smoke_h3_r9", body["error"])
+        derived.affected_by_source_schema.assert_called_once_with(
+            "source_leeds_ext"
+        )
+
+    def test_retire_proceeds_when_nothing_depends_on_the_alias(self):
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.return_value = {
+            "alias": "leeds_ext",
+            "status": "retired",
+            "archivedSchema": "retired_leeds_ext_20260811000000",
+        }
+        derived = MagicMock()
+        derived.affected_by_source_schema.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_called_once_with("leeds_ext", "admin")
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("retired", body["alias"]["status"])
+
+    def test_retire_does_not_require_the_connection_reference_to_resolve(self):
+        # A source whose credentials have already been removed from the
+        # environment must still be retirable; resolving connectionRef would
+        # raise federation.connection_ref_not_found and strand the alias.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "ALREADY_REMOVED"}
+        federation.retire.return_value = {
+            "alias": "leeds_ext",
+            "status": "retired",
+            "archivedSchema": None,
+        }
+        derived = MagicMock()
+        derived.affected_by_source_schema.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_called_once()
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
     def test_observe_route_calls_the_serialized_store_operation(self):
         federation = MagicMock()
         federation.get.return_value = {

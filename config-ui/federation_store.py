@@ -103,9 +103,25 @@ class FederationAliasStore:
               accepted_schema_fingerprint text,
               accepted_physical_identity text,
               accepted_connection_identity text,
-              last_observation_id bigint
+              last_observation_id bigint,
+              retired_at timestamptz,
+              retired_by text,
+              archived_schema text
             )
         """).format(sql.Identifier(SCHEMA)))
+        # Retirement archives rather than deletes: the alias row and its whole
+        # observation history are retained, and archived_schema records where
+        # the physical objects were moved to, so the audit trail stays
+        # inspectable in the catalogue and not only as metadata here.
+        for column, column_type in (
+            ("retired_at", "timestamptz"),
+            ("retired_by", "text"),
+            ("archived_schema", "text"),
+        ):
+            cur.execute(sql.SQL(
+                "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+                + column + " " + column_type
+            ).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "last_observed_connection_identity text"
@@ -229,7 +245,10 @@ class FederationAliasStore:
         provisioned_at AS "provisionedAt",
         approved_by AS "approvedBy",
         approved_at AS "approvedAt",
-        row_level_security_acknowledged AS "rowLevelSecurityAcknowledged"
+        row_level_security_acknowledged AS "rowLevelSecurityAcknowledged",
+        retired_at AS "retiredAt",
+        retired_by AS "retiredBy",
+        archived_schema AS "archivedSchema"
     """)
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -466,6 +485,12 @@ class FederationAliasStore:
                     physical_identity = %s,
                     observed_at = %s,
                     status = CASE
+                      -- Retirement is terminal. Without this an observe
+                      -- would resurrect a retired alias to active or
+                      -- unavailable, because retire() deliberately leaves
+                      -- provisioned_at set, and a later provision would then
+                      -- reinstate access to a source somebody had removed.
+                      WHEN status = 'retired' THEN 'retired'
                       WHEN provisioned_at IS NULL THEN status
                       WHEN %s THEN 'active'
                       ELSE 'unavailable'
@@ -938,6 +963,17 @@ class FederationAliasStore:
             last_observation_id = record.pop("last_observation_id")
             already_provisioned = record["provisionedAt"] is not None
             last_observation = record.get("lastObservation") or {}
+            if record["status"] == "retired":
+                # Terminal, and not merely cosmetic: retire() renamed the
+                # server and schema out from under this alias, so the
+                # reconcile path below would fail confusingly anyway. Refusing
+                # here keeps retirement an actual guarantee that access is not
+                # silently reinstated.
+                raise FederationSchemaError(
+                    f"Alias {alias!r} is retired and cannot be provisioned. "
+                    "Register a new alias for the source instead.",
+                    code="federation.alias_retired",
+                )
             if last_observation_id != expected_observation_id:
                 raise FederationSchemaError(
                     f"Alias {alias!r}'s observation changed before approval.",
@@ -1269,5 +1305,115 @@ class FederationAliasStore:
                     connection_identity,
                     alias,
                 ),
+            )
+            return self._get_with_cursor(cur, alias)
+
+    def retire(self, alias: str, actor: str) -> dict[str, Any]:
+        """Stop serving an alias and archive its physical objects.
+
+        Retirement is not deletion. The alias row and its whole observation
+        and approval history are retained, and the foreign server, schema, and
+        foreign tables are renamed rather than dropped, so the exact-identity
+        audit trail stays inspectable in the catalogue itself rather than only
+        as metadata in this registry.
+
+        The caller must have established that no derived layer still reads
+        from this alias — see app.py, which refuses using
+        DerivedLayerStore.affected_by_source_schema(). That check lives at the
+        route because the federation registry deliberately does not import the
+        derived-layer store. Revoking access here would otherwise leave a
+        dependent materialized view refreshing against a source nobody
+        believes is still connected.
+
+        Revoking precedes the rename because revoking is the step that
+        actually stops the source serving rows; a rename alone does not, since
+        PostgreSQL tracks dependencies by oid and any existing grant would
+        simply follow the object to its new name.
+        """
+        alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                sql.SQL("""
+                    SELECT status, provisioned_at
+                    FROM {}._aliases
+                    WHERE alias = %s
+                    FOR UPDATE
+                """).format(sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise FileNotFoundError(alias)
+            if row["status"] == "retired":
+                raise FederationSchemaError(
+                    f"Alias {alias!r} is already retired.",
+                    code="federation.already_retired",
+                )
+
+            archived_schema = None
+            schema_name = f"source_{alias}"
+            # "Provisioned but locally absent or foreign-owned" is a modelled
+            # state elsewhere in this class, so retirement must tolerate it
+            # too: without this guard the REVOKE below raises undefined_schema
+            # and the alias could never be retired at all. Recording the
+            # retirement is still correct — there is simply nothing left to
+            # archive.
+            if row["provisioned_at"] is not None and self._local_schema_owned(
+                cur, schema_name
+            ):
+                server_name = f"{alias}_srv"
+                # Identifiers truncate silently at 63 bytes, so budget the
+                # suffix rather than letting a long alias produce a collision
+                # between two archives. provisioned_at is used as the suffix
+                # because it is already unique per provisioning and comes from
+                # the database clock.
+                suffix = row["provisioned_at"].strftime("_%Y%m%d%H%M%S")
+                prefix = "retired_"
+                archived_schema = (
+                    prefix + alias[: 63 - len(prefix) - len(suffix)] + suffix
+                )
+                archived_server = (
+                    prefix + alias[: 63 - len(prefix) - len(suffix) - 4]
+                    + suffix + "_srv"
+                )
+
+                for role in dict.fromkeys((self.derived_role, self.reader_role)):
+                    cur.execute(
+                        sql.SQL(
+                            "REVOKE SELECT ON ALL TABLES IN SCHEMA {} FROM {}"
+                        ).format(
+                            sql.Identifier(schema_name), sql.Identifier(role)
+                        )
+                    )
+                    cur.execute(
+                        sql.SQL("REVOKE USAGE ON SCHEMA {} FROM {}").format(
+                            sql.Identifier(schema_name), sql.Identifier(role)
+                        )
+                    )
+                # A rename onto an existing name fails loudly rather than
+                # merging two archives, which is the behaviour we want.
+                cur.execute(
+                    sql.SQL("ALTER SCHEMA {} RENAME TO {}").format(
+                        sql.Identifier(schema_name),
+                        sql.Identifier(archived_schema),
+                    )
+                )
+                cur.execute(
+                    sql.SQL("ALTER SERVER {} RENAME TO {}").format(
+                        sql.Identifier(server_name),
+                        sql.Identifier(archived_server),
+                    )
+                )
+
+            cur.execute(
+                sql.SQL("""
+                    UPDATE {}._aliases
+                    SET status = 'retired',
+                        retired_at = clock_timestamp(),
+                        retired_by = %s,
+                        archived_schema = %s
+                    WHERE alias = %s
+                """).format(sql.Identifier(SCHEMA)),
+                (actor, archived_schema, alias),
             )
             return self._get_with_cursor(cur, alias)

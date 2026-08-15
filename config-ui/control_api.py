@@ -1643,6 +1643,17 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "federation.aliases.retire": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/retire",
+        "risk": "federation-provision",
+        # Retirement revokes access and archives the physical objects, so it
+        # changes exposure and carries the same scope as granting it. It takes
+        # no body: it is refused outright while any derived layer still reads
+        # the alias, rather than offering a force flag.
+        "scope": "federation:provision",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
 }
 
 

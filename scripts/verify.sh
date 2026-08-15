@@ -2377,12 +2377,57 @@ if federation_database_url:
                     "SELECT alias, connection_ref, allowed_relations, status, "
                     "last_observation, accepted_schema_fingerprint, "
                     "accepted_physical_identity, "
-                    "accepted_connection_identity, last_observation_id "
+                    "accepted_connection_identity, last_observation_id, "
+                    "archived_schema "
                     "FROM federation._aliases "
                     "WHERE provisioned_at IS NOT NULL"
                 )
                 for alias_row in cursor.fetchall():
                     alias_value = alias_row["alias"]
+                    if alias_row["status"] == "retired":
+                        # Retirement archives rather than drops, so the
+                        # objects must still exist under their archived name,
+                        # must remain owned by the provisioner, and must no
+                        # longer be reachable by either consumer role. The
+                        # live name must be gone so nothing keeps serving.
+                        archived = alias_row["archived_schema"]
+                        if not archived:
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "without a recorded archived schema."
+                            )
+                        cursor.execute(
+                            "SELECT pg_get_userbyid(nspowner) AS owner, "
+                            "has_schema_privilege(%s, oid, $$USAGE$$) "
+                            "  AS derived_use, "
+                            "has_schema_privilege(%s, oid, $$USAGE$$) "
+                            "  AS reader_use "
+                            "FROM pg_catalog.pg_namespace WHERE nspname = %s",
+                            (derived_role, reader_role, archived),
+                        )
+                        archive = cursor.fetchone()
+                        if (
+                            not archive
+                            or archive["owner"] != federation_role
+                            or archive["derived_use"]
+                            or archive["reader_use"]
+                        ):
+                            fail(
+                                f"Federation alias {alias_value!r} archived "
+                                "schema is missing, misowned, or still "
+                                "readable by a consumer role."
+                            )
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_namespace "
+                            "WHERE nspname = %s",
+                            (f"source_{alias_value}",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live source schema still exists."
+                            )
+                        continue
                     if (
                         alias_row["status"] == "active"
                         and any(

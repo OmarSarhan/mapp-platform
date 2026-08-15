@@ -5208,7 +5208,7 @@ class Handler(SimpleHTTPRequestHandler):
             # is a non-connecting intent record.
             if re.fullmatch(
                 r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_]{0,55}/"
-                r"(observe|provision)",
+                r"(observe|provision|retire)",
                 path,
             ):
                 return "federation:provision"
@@ -7124,7 +7124,7 @@ class Handler(SimpleHTTPRequestHandler):
         )
         federation_alias_action_path = re.fullmatch(
             r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_]{0,55})/"
-            r"(observe|provision)",
+            r"(observe|provision|retire)",
             request_path,
         )
         if (
@@ -7504,6 +7504,52 @@ class Handler(SimpleHTTPRequestHandler):
                 # psycopg.Error handler with no federation-specific code.
                 try:
                     record = FEDERATION.get(alias_name)
+                    if federation_action == "retire":
+                        if payload:
+                            raise FederationSchemaError(
+                                "Unknown retire properties: "
+                                + ", ".join(sorted(payload)),
+                                code="federation.invalid_request",
+                            )
+                        # Refused while any derived layer still reads the
+                        # alias: revoking access underneath a dependent
+                        # materialized view would leave it refreshing against
+                        # a source nobody believes is connected any more. The
+                        # check lives here rather than in the store because
+                        # the federation registry deliberately does not import
+                        # the derived-layer store; this route already composes
+                        # the two for affectedDerivedLayers.
+                        dependants = (
+                            DERIVED.affected_by_source_schema(
+                                f"source_{alias_name}"
+                            )
+                            if DERIVED
+                            else []
+                        )
+                        if dependants:
+                            raise FederationSchemaError(
+                                f"Alias {alias_name!r} still has derived "
+                                "layers reading from it: "
+                                + ", ".join(dependants)
+                                + ". Drop or repoint them before retiring.",
+                                code="federation.alias_in_use",
+                                status=HTTPStatus.CONFLICT,
+                            )
+                        result = FEDERATION.retire(alias_name, actor)
+                        CONTROL.audit(
+                            "federation_alias.retired",
+                            actor=actor,
+                            remote=self._remote(),
+                            details={
+                                "alias": alias_name,
+                                "archivedSchema": result.get("archivedSchema"),
+                            },
+                        )
+                        self._json(HTTPStatus.OK, {"alias": result})
+                        return
+                    # Retirement deliberately precedes this: a source whose
+                    # connectionRef has already been removed from the
+                    # environment must still be retirable.
                     connection_url = resolve_federation_connection_url(
                         record["connectionRef"]
                     )
