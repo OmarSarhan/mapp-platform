@@ -39,6 +39,19 @@ step() {
   printf '\n== %s ==\n' "$1"
 }
 
+# This harness seeds a throwaway source and mutates the federation registry,
+# so it has no business touching a production deployment. It also has to
+# recreate config-ui to pick up the overlay, and the compose array below
+# cannot carry compose.production.yaml — that overlay demands the production
+# host variables, which a test rig has no business requiring. Recreating the
+# dashboard without it would silently drop CONFIG_ALLOWED_HOSTS and
+# CONFIG_SECURE_COOKIES and leave it serving with development defaults.
+# Refusing here rather than in bin/mapp covers direct invocation too.
+DEPLOYMENT_ENVIRONMENT="$(dotenv_value MAPP_ENVIRONMENT)"
+if [[ "${DEPLOYMENT_ENVIRONMENT}" == "production" ]]; then
+  fail "federation-test is disabled when MAPP_ENVIRONMENT=production."
+fi
+
 # A dedicated alias so a failed run never leaves a half-configured source
 # behind under a name an operator might be using.
 ALIAS="e2e_probe"
@@ -74,10 +87,19 @@ source_sql() {
       --command "$1"
 }
 
+# Guarded by OWNS_ALIAS: the trap is armed before the harness has proved the
+# alias is its own, and this tears down schemas and servers with CASCADE. An
+# operator who happens to have registered a real alias under this name must
+# never lose it to a test run that merely started.
+OWNS_ALIAS=0
+# Whether source-db was already up before this run, so a rig an operator is
+# using by hand survives; only a container this harness started gets removed.
+SOURCE_DB_PREEXISTING=0
+
 # Retirement archives rather than drops, so a repeat run would otherwise
-# accumulate archived schemas and collide. The harness owns this alias
-# completely, so it removes its own leftovers outright.
-cleanup() {
+# accumulate archived schemas and collide. Once ownership is established the
+# harness removes its own leftovers outright.
+remove_alias_state() {
   local archived
   archived="$(platform_sql "
     SELECT string_agg(quote_ident(nspname), ',')
@@ -113,17 +135,64 @@ cleanup() {
   source_sql "DROP TABLE IF EXISTS ${PROBE_RELATION}" >/dev/null 2>&1 || true
 }
 
+# Puts back what this run took, and nothing else. Without it the advertised
+# self-cleaning test leaves a source-db container and its volume running
+# indefinitely on a deployment that had neither before.
+cleanup() {
+  if [[ "${OWNS_ALIAS}" == "1" ]]; then
+    remove_alias_state
+  fi
+  # Only the container this harness started gets removed; one that was already
+  # up belongs to an operator driving the rig by hand. The named
+  # source_postgres_data volume is left alone either way — it is cheap to
+  # reuse and may hold data they seeded themselves.
+  if [[ "${SOURCE_DB_PREEXISTING}" == "0" ]]; then
+    "${compose[@]}" rm --stop --force source-db >/dev/null 2>&1 || true
+  fi
+  # config-ui is deliberately NOT recreated from the base files. The overlay's
+  # only effect on it is to forward FEDERATION_DBS_LEEDS_EXT, and no base
+  # compose file forwards any FEDERATION_DBS_<REF> at all — so stripping the
+  # overlay would delete the connection reference every alias on the
+  # deployment resolves through, leaving provisioned sources unusable and
+  # scripts/verify.sh failing on "connectionRef is not configured". The next
+  # `./bin/mapp serve` rebuilds config-ui from its own file list regardless,
+  # so the composition corrects itself without this doing damage on the way.
+}
+
 trap cleanup EXIT
 
 step "Bringing up the federation source"
+if [[ -n "$("${compose[@]}" ps --quiet source-db 2>/dev/null)" ]]; then
+  SOURCE_DB_PREEXISTING=1
+fi
 # config-ui must be named here even when already running: compose only injects
 # FEDERATION_DBS_LEEDS_EXT into the container when the overlay is applied to
 # it, and without that Observe fails with federation.connection_ref_not_found.
 "${compose[@]}" up -d source-db config-ui >/dev/null
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
 
+step "Claiming the probe alias"
+# The alias name is a legal one an operator could have registered, and the
+# cleanup below is irreversible, so the harness proves the name is free before
+# it takes ownership. A crashed run (SIGKILL, where the EXIT trap never fired)
+# is the one case that legitimately leaves residue behind; clearing that is an
+# explicit decision a human makes, not something a test does on their behalf.
+existing="$(platform_sql "
+  SELECT count(*) FROM federation._aliases WHERE alias = '${ALIAS}'
+" 2>/dev/null || echo 0)"
+if [[ "${existing}" != "0" ]]; then
+  if [[ "${MAPP_FEDERATION_E2E_RESET:-0}" != "1" ]]; then
+    fail "A federation alias named '${ALIAS}' already exists. If it is residue
+from a killed run, re-run with MAPP_FEDERATION_E2E_RESET=1 to clear it;
+otherwise rename or retire that alias first — this harness would drop its
+schema and server with CASCADE."
+  fi
+  printf 'MAPP_FEDERATION_E2E_RESET=1: clearing pre-existing %s state\n' "${ALIAS}"
+fi
+OWNS_ALIAS=1
+remove_alias_state
+
 step "Seeding the source with real geometry"
-cleanup
 # A dedicated probe relation copied from the bundled data, so the harness
 # never mutates a relation another alias is federating. Collations are pinned
 # to C to satisfy the portability rule federation_capability.py enforces.

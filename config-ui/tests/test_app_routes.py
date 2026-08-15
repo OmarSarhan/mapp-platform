@@ -104,7 +104,9 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         federation = MagicMock()
         federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
         derived = MagicMock()
-        derived.affected_by_source_schema.return_value = ["smoke_h3_r9"]
+        derived.source_schema_admission.return_value.__enter__.return_value = [
+            "smoke_h3_r9",
+        ]
         handler, responses = self.handler("retire")
 
         with patch.object(app, "FEDERATION", federation), patch.object(
@@ -117,7 +119,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, status)
         self.assertEqual("federation.alias_in_use", body["code"])
         self.assertIn("smoke_h3_r9", body["error"])
-        derived.affected_by_source_schema.assert_called_once_with(
+        derived.source_schema_admission.assert_called_once_with(
             "source_leeds_ext"
         )
 
@@ -130,7 +132,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
             "archivedSchema": "retired_leeds_ext_20260811000000",
         }
         derived = MagicMock()
-        derived.affected_by_source_schema.return_value = []
+        derived.source_schema_admission.return_value.__enter__.return_value = []
         handler, responses = self.handler("retire")
 
         with patch.object(app, "FEDERATION", federation), patch.object(
@@ -142,6 +144,33 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         status, body = responses[0]
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("retired", body["alias"]["status"])
+
+    def test_retire_refuses_when_a_derived_mutation_holds_admission(self):
+        # The dependency check and the retirement DDL commit in separate
+        # transactions, so admission is held across both to stop a layer
+        # binding the schema in between. When a derived mutation already owns
+        # it that guarantee is unavailable, and retirement must refuse rather
+        # than act on a check it could not serialize.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        # Raised from __enter__, not from the call: source_schema_admission is
+        # a @contextmanager, so calling it only builds the generator and the
+        # lock is taken when the block is entered.
+        derived.source_schema_admission.return_value.__enter__.side_effect = (
+            app.DerivedLayerContentionError("derived-mutation")
+        )
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.derived_layers_busy", body["code"])
 
     def test_retire_does_not_require_the_connection_reference_to_resolve(self):
         # A source whose credentials have already been removed from the
@@ -155,7 +184,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
             "archivedSchema": None,
         }
         derived = MagicMock()
-        derived.affected_by_source_schema.return_value = []
+        derived.source_schema_admission.return_value.__enter__.return_value = []
         handler, responses = self.handler("retire")
 
         with patch.object(app, "FEDERATION", federation), patch.object(

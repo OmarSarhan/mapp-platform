@@ -2929,19 +2929,43 @@ class DerivedLayerStore:
                 for item in cur.fetchall()
             ]
 
+    @staticmethod
+    def _affected_by_source_schema(cur, source_schema: str) -> list[str]:
+        cur.execute(sql.SQL("""
+            SELECT name
+            FROM {}._definitions
+            WHERE EXISTS (
+              SELECT 1 FROM unnest(sources) AS source
+              WHERE split_part(source, '.', 1) = %s
+            )
+            ORDER BY name
+        """).format(sql.Identifier(SCHEMA)), (source_schema,))
+        return [row["name"] for row in cur.fetchall()]
+
     def affected_by_source_schema(self, source_schema: str) -> list[str]:
         """Return managed layers that declare a source in one schema."""
         with self._connect() as connection, connection.cursor() as cur:
-            cur.execute(sql.SQL("""
-                SELECT name
-                FROM {}._definitions
-                WHERE EXISTS (
-                  SELECT 1 FROM unnest(sources) AS source
-                  WHERE split_part(source, '.', 1) = %s
-                )
-                ORDER BY name
-            """).format(sql.Identifier(SCHEMA)), (source_schema,))
-            return [row["name"] for row in cur.fetchall()]
+            return self._affected_by_source_schema(cur, source_schema)
+
+    @contextmanager
+    def source_schema_admission(self, source_schema: str):
+        """Hold derived-mutation admission while a caller acts on a source schema.
+
+        Reading the dependants and then acting on them in a later transaction
+        is a time-of-check/time-of-use race: a layer created in between binds
+        the schema and then has it revoked and renamed underneath, leaving a
+        managed definition whose refresh fails even though the caller was told
+        the schema was unused.
+
+        Admission is the same lock every derived mutation already takes, so
+        holding it across the caller's work makes a competing create or
+        replace fail with DerivedLayerContentionError rather than slip
+        through. The try-variant is deliberate: a blocking wait here would
+        stall behind a materialization that is allowed to run for 30 minutes.
+        """
+        with self._connect() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
+            yield self._affected_by_source_schema(cur, source_schema)
 
     def list_page(
         self,

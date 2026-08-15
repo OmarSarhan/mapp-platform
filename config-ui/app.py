@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -7519,23 +7520,44 @@ class Handler(SimpleHTTPRequestHandler):
                         # the federation registry deliberately does not import
                         # the derived-layer store; this route already composes
                         # the two for affectedDerivedLayers.
-                        dependants = (
-                            DERIVED.affected_by_source_schema(
-                                f"source_{alias_name}"
+                        #
+                        # Admission is held across the retirement so a layer
+                        # cannot bind the schema between the check and the
+                        # DDL; the two stores commit in separate transactions,
+                        # so nothing else serializes them.
+                        try:
+                            admission = (
+                                DERIVED.source_schema_admission(
+                                    f"source_{alias_name}"
+                                )
+                                if DERIVED
+                                else nullcontext([])
                             )
-                            if DERIVED
-                            else []
-                        )
-                        if dependants:
+                            with admission as dependants:
+                                if dependants:
+                                    raise FederationSchemaError(
+                                        f"Alias {alias_name!r} still has "
+                                        "derived layers reading from it: "
+                                        + ", ".join(dependants)
+                                        + ". Drop or repoint them before "
+                                        "retiring.",
+                                        code="federation.alias_in_use",
+                                        status=HTTPStatus.CONFLICT,
+                                    )
+                                result = FEDERATION.retire(alias_name, actor)
+                        except DerivedLayerContentionError as exc:
+                            # Translated rather than routed through the derived
+                            # error machinery, which would describe this as a
+                            # derived-layer operation the caller never asked
+                            # for. Retirement simply could not prove the alias
+                            # was unused.
                             raise FederationSchemaError(
-                                f"Alias {alias_name!r} still has derived "
-                                "layers reading from it: "
-                                + ", ".join(dependants)
-                                + ". Drop or repoint them before retiring.",
-                                code="federation.alias_in_use",
+                                "A derived-layer operation is in progress, so "
+                                f"alias {alias_name!r} cannot be retired "
+                                "safely yet. Retry once it finishes.",
+                                code="federation.derived_layers_busy",
                                 status=HTTPStatus.CONFLICT,
-                            )
-                        result = FEDERATION.retire(alias_name, actor)
+                            ) from exc
                         CONTROL.audit(
                             "federation_alias.retired",
                             actor=actor,
