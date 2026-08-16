@@ -1115,15 +1115,19 @@ def run_federation_verifier() -> None:
             # which is queryable in a way a log line is not. Only the
             # exceptional paths below log, and those do emit.
             verify_federation_sources()
+            # Only after a pass that actually walked the aliases. A pass that
+            # threw got nowhere -- an unreachable registry raises before the
+            # first alias -- and reporting that as verification complete would
+            # let startup proceed having checked nothing, silently. Failing to
+            # signal costs the grace period and logs why, which is the honest
+            # outcome. Per-alias failures inside the pass do not reach here and
+            # do not block readiness; they are already handled and counted.
+            FEDERATION_FIRST_PASS_DONE.set()
         except Exception:
             # Broad by intent, matching run_semantic_outbox: a registry that
             # is briefly unreachable must not end the thread for the lifetime
             # of the process. The next pass retries everything.
             LOGGER.warning("Federation verification pass failed", exc_info=True)
-        # Set however the pass ended, including on failure: startup waits for
-        # the attempt, not for a particular outcome. A source that is down must
-        # not also cost the full grace period on top of its probe timeouts.
-        FEDERATION_FIRST_PASS_DONE.set()
         # A plain sleep, not an Event. The outbox waits on one because
         # something calls SEMANTIC_OUTBOX_WAKE.set(); nothing would ever wake
         # this loop, so an Event here would be wait()/clear() dressed up as a
@@ -1218,6 +1222,26 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
                 tls_policy=record["tlsPolicy"],
             )
             summary["observed"] += 1
+        except (
+            psycopg.errors.IdleInTransactionSessionTimeout,
+            psycopg.errors.TransactionTimeout,
+        ):
+            # observe() holds its local transaction open across the probe, so
+            # these mean the probe outran the transaction's own budget rather
+            # than any remote statement exceeding its five-second limit. The
+            # persist never ran, so without this the source too slow to verify
+            # would keep consumer access indefinitely while a source merely
+            # down lost it in five seconds -- the same inversion the timeout
+            # allowance was raised to remove, just at a larger threshold.
+            # Recoverable exactly like the missing-reference case: a pass that
+            # completes grants access straight back.
+            if FEDERATION.mark_unverifiable(alias):
+                LOGGER.warning(
+                    "Federation alias %r could not be probed within its "
+                    "transaction budget; consumer access withdrawn until a "
+                    "pass completes", alias,
+                )
+            summary["failed"] += 1
         except Exception:
             # One alias must not stop the rest: a single removed connectionRef
             # would otherwise leave every later source unverified. Broad by

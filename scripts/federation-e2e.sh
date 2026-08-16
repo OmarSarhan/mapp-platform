@@ -275,15 +275,31 @@ step "Seeding the source with real geometry"
 # the reader USAGE keeps it, and one whose schema does not gets it back the way
 # it was. The schema check has to come first because has_schema_privilege
 # errors outright on a schema that does not exist.
-if [[ "$(source_sql "
+# Fail closed, like the ownership guard above. Swallowing an error here is
+# worse than it looks: a transient failure would record a pre-existing schema
+# as one this run created and its existing grant as one this run added, so
+# cleanup would revoke an operator's own USAGE and could drop their schema once
+# the probe table left it empty.
+if ! schema_present="$(source_sql "
   SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = '${PROBE_SCHEMA}'
-" 2>/dev/null || echo 0)" == "0" ]]; then
+" 2>&1)"; then
+  fail "Could not determine whether schema '${PROBE_SCHEMA}' exists on the
+source, so the harness cannot tell what it would be creating: ${schema_present}"
+fi
+if [[ "${schema_present}" == "0" ]]; then
   PROBE_SCHEMA_CREATED=1
   PROBE_USAGE_GRANTED=1
-elif [[ "$(source_sql "
-  SELECT has_schema_privilege('${SOURCE_READER_USER}', '${PROBE_SCHEMA}', 'USAGE')
-" 2>/dev/null || echo t)" == "f" ]]; then
-  PROBE_USAGE_GRANTED=1
+else
+  if ! reader_usage="$(source_sql "
+    SELECT has_schema_privilege('${SOURCE_READER_USER}', '${PROBE_SCHEMA}', 'USAGE')
+  " 2>&1)"; then
+    fail "Could not read '${SOURCE_READER_USER}' privileges on
+'${PROBE_SCHEMA}', so the harness cannot tell what it would be granting:
+${reader_usage}"
+  fi
+  if [[ "${reader_usage}" == "f" ]]; then
+    PROBE_USAGE_GRANTED=1
+  fi
 fi
 
 # A dedicated probe relation copied from the bundled data, so the harness

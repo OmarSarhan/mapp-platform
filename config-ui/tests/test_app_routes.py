@@ -7353,6 +7353,28 @@ class FederationVerificationTickTests(unittest.TestCase):
         federation.mark_unverifiable.assert_called_once_with("gone")
         self.assertEqual(1, summary["failed"])
 
+    def test_a_probe_that_outruns_its_transaction_withdraws_access(self):
+        # observe() holds its local transaction across the probe, so this means
+        # the probe outran the transaction budget rather than a remote
+        # statement exceeding its limit. Nothing was persisted, so without this
+        # the source too slow to verify keeps access while one merely down
+        # loses it in five seconds.
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("slow")]
+        federation.observe.side_effect = (
+            psycopg.errors.IdleInTransactionSessionTimeout("terminating")
+        )
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("slow")
+        self.assertEqual(1, summary["failed"])
+
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source
         # after it in the list unverified until someone noticed.
@@ -7455,6 +7477,48 @@ class FederationVerifierLoopTests(unittest.TestCase):
         # asserting on the message passes even when the real exception is a
         # NameError from a missing import.
         self.assertIs(psycopg.OperationalError, logs.records[0].exc_info[0])
+
+    def test_readiness_is_not_signalled_when_the_pass_never_ran(self):
+        # An unreachable registry raises before the first alias. Reporting that
+        # as verification complete would let startup proceed having checked
+        # nothing at all, silently.
+        import psycopg
+
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                side_effect=psycopg.OperationalError("registry down"),
+            ), self.assertLogs(app.LOGGER, level="WARNING"):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_readiness_is_signalled_once_a_pass_completes(self):
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={"observed": 1, "failed": 0, "skipped": 0},
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertTrue(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
 
     def test_interval_is_long_enough_to_be_polite_to_a_third_party(self):
         # Each pass opens a connection to a database somebody else operates.
