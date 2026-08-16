@@ -7300,6 +7300,26 @@ class FederationVerificationTickTests(unittest.TestCase):
         )
         self.assertEqual({"observed": 1, "failed": 0, "skipped": 1}, summary)
 
+    def test_only_scopes_a_pass_to_a_single_alias(self):
+        # The timer never passes this. A test that stops a shared source must
+        # not revoke every other alias pointing at it, since its teardown only
+        # knows about its own probe.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("e2e_probe"),
+            self.alias("someone_elses"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            summary = app.verify_federation_sources(only="e2e_probe")
+
+        self.assertEqual(
+            ["e2e_probe"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertEqual(1, summary["observed"])
+
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source
         # after it in the list unverified until someone noticed.

@@ -1119,7 +1119,7 @@ def run_federation_verifier() -> None:
         time.sleep(FEDERATION_VERIFY_INTERVAL_SECONDS)
 
 
-def verify_federation_sources() -> dict[str, int]:
+def verify_federation_sources(only: str | None = None) -> dict[str, int]:
     """Re-observe every provisioned source once, and report what happened.
 
     This is deliberately the same call the operator's Observe route makes,
@@ -1149,6 +1149,13 @@ def verify_federation_sources() -> dict[str, int]:
     # the condition here would be a second place to forget to change.
     for record in FEDERATION.list():
         alias = record["alias"]
+        if only is not None and alias != only:
+            # The timer never passes this. It exists so a test can drive the
+            # real pass without touching aliases it does not own: the harness
+            # stops the shared source to prove an outage revokes, and an
+            # unscoped pass would revoke every other alias pointing at it and
+            # leave that behind, since teardown only knows about the probe.
+            continue
         if record["provisionedAt"] is None:
             # Nothing is exposed yet, so there is no access to keep honest and
             # no reason to open a connection to somebody else's database.

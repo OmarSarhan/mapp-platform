@@ -228,17 +228,33 @@ step "Claiming the probe alias and relation"
 # clearing that is an explicit decision a human makes, not something a test
 # does on their behalf.
 claimed=""
-existing="$(platform_sql "
-  SELECT count(*) FROM federation._aliases WHERE alias = '${ALIAS}'
-" 2>/dev/null || echo 0)"
+# These must fail closed. Suppressing errors into a default of 0 would turn a
+# database that is merely unreachable for a moment into proof that the alias is
+# free, and the teardown that follows drops schemas and servers with CASCADE.
+# The registry table legitimately does not exist before the store first
+# initialises, so that case is answered in SQL rather than by swallowing the
+# error -- to_regclass returns NULL instead of raising.
+if ! existing="$(platform_sql "
+  SELECT CASE
+           WHEN to_regclass('federation._aliases') IS NULL THEN 0
+           ELSE (SELECT count(*) FROM federation._aliases
+                  WHERE alias = '${ALIAS}')
+         END
+" 2>&1)"; then
+  fail "Could not determine whether alias '${ALIAS}' already exists, so the
+harness cannot prove the name is free: ${existing}"
+fi
 if [[ "${existing}" != "0" ]]; then
   claimed="federation alias '${ALIAS}'"
 fi
-probe_exists="$(source_sql "
+if ! probe_exists="$(source_sql "
   SELECT count(*) FROM pg_catalog.pg_class AS c
   JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-  WHERE n.nspname = '${PROBE_RELATION%%.*}' AND c.relname = '${PROBE_RELATION#*.}'
-" 2>/dev/null || echo 0)"
+  WHERE n.nspname = '${PROBE_SCHEMA}' AND c.relname = '${PROBE_RELATION#*.}'
+" 2>&1)"; then
+  fail "Could not determine whether '${PROBE_RELATION}' already exists, so the
+harness cannot prove the relation is free: ${probe_exists}"
+fi
 if [[ "${probe_exists}" != "0" ]]; then
   claimed="${claimed:+${claimed} and }source relation '${PROBE_RELATION}'"
 fi
@@ -281,9 +297,20 @@ source_sql "
     reference text COLLATE pg_catalog.\"C\",
     geom public.geometry(MultiPolygon, 4326) NOT NULL
   );
-  GRANT USAGE ON SCHEMA ${PROBE_SCHEMA} TO ${SOURCE_READER_USER};
   GRANT SELECT ON ${PROBE_RELATION} TO ${SOURCE_READER_USER};
 " >/dev/null
+
+# Issued only when the reader lacked USAGE outright. has_schema_privilege is
+# true for access inherited through PUBLIC or role membership, so granting
+# unconditionally would add a direct ACL entry the flag says nothing about --
+# and cleanup, which revokes only what the flag recorded, would leave it
+# behind, quietly strengthening the role if the inherited privilege is ever
+# withdrawn.
+if [[ "${PROBE_USAGE_GRANTED}" == "1" ]]; then
+  source_sql "
+    GRANT USAGE ON SCHEMA ${PROBE_SCHEMA} TO ${SOURCE_READER_USER}
+  " >/dev/null
+fi
 
 # Move real MultiPolygons across so the aggregation below exercises genuine
 # geometry, not synthetic squares. Streamed through a plain SELECT rather than
@@ -502,9 +529,12 @@ step "Periodic verification revokes on outage and restores on recovery"
 # The tick is called directly instead of waiting out the interval. That runs
 # the real function the thread runs; waiting 15 minutes would test the clock.
 verifier_tick() {
+  # Scoped to this alias. The stage below stops the shared source, and an
+  # unscoped pass would revoke every other alias pointing at it while teardown
+  # only ever restores the probe.
   "${compose[@]}" exec -T config-ui python3 -c "
 import app
-print(app.verify_federation_sources())
+print(app.verify_federation_sources(only='${ALIAS}'))
 " 2>/dev/null
 }
 
