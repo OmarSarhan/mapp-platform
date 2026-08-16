@@ -7222,6 +7222,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             "allowedRelations": ["leeds.smoke_control_orders"],
             "tlsPolicy": "require",
             "acceptedEvidenceComplete": True,
+            "lastObservationId": 1,
         }
         record.update(overrides)
         return record
@@ -7238,7 +7239,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         ):
             summary = app.verify_federation_sources()
 
-        self.assertEqual({"observed": 2, "failed": 0, "skipped": 0}, summary)
+        self.assertEqual({"observed": 2, "failed": 0, "skipped": 0, "deferred": 0}, summary)
         observed = {
             call.args[0]: call for call in federation.observe.call_args_list
         }
@@ -7261,7 +7262,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             summary = app.verify_federation_sources()
 
         federation.observe.assert_not_called()
-        self.assertEqual({"observed": 0, "failed": 0, "skipped": 1}, summary)
+        self.assertEqual({"observed": 0, "failed": 0, "skipped": 1, "deferred": 0}, summary)
 
     def test_never_observes_a_retired_alias(self):
         # Retired exclusion comes from list(). Pinning it here means a change
@@ -7298,7 +7299,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             ["leeds_ext"],
             [call.args[0] for call in federation.observe.call_args_list],
         )
-        self.assertEqual({"observed": 1, "failed": 0, "skipped": 1}, summary)
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 1, "deferred": 0}, summary)
 
     def test_only_scopes_a_pass_to_a_single_alias(self):
         # The timer never passes this. A test that stops a shared source must
@@ -7375,6 +7376,52 @@ class FederationVerificationTickTests(unittest.TestCase):
         federation.mark_unverifiable.assert_called_once_with("slow")
         self.assertEqual(1, summary["failed"])
 
+    def test_a_pass_stops_starting_work_once_its_budget_is_spent(self):
+        # The traversal is serial and one alias can consume the whole
+        # idle-transaction allowance, so without a budget the interval is not a
+        # staleness bound: an alias near the end of a hundred could wait most
+        # of a day for its first check.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("first", lastObservationId=1),
+            self.alias("second", lastObservationId=2),
+            self.alias("third", lastObservationId=3),
+        ]
+        clock = iter([0.0, 0.0, 10_000.0, 10_000.0])
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), patch.object(app.time, "monotonic", lambda: next(clock)),                 self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        # One observed before the budget ran out; the rest deferred, not lost.
+        self.assertEqual(1, summary["observed"])
+        self.assertEqual(2, summary["deferred"])
+        self.assertEqual(
+            ["first"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertIn("deferred", "\n".join(logs.output))
+
+    def test_least_recently_verified_aliases_go_first(self):
+        # Ordering by alias would let a slow source early in the alphabet
+        # starve everything after it forever, because a deferred tail is only
+        # reached by a pass that happens to run fast enough.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("aaa_recent", lastObservationId=99),
+            self.alias("zzz_stale", lastObservationId=2),
+            self.alias("mmm_never", lastObservationId=None),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            app.verify_federation_sources()
+
+        self.assertEqual(
+            ["mmm_never", "zzz_stale", "aaa_recent"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source
         # after it in the list unverified until someone noticed.
@@ -7388,7 +7435,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
             summary = app.verify_federation_sources()
 
-        self.assertEqual({"observed": 1, "failed": 1, "skipped": 0}, summary)
+        self.assertEqual({"observed": 1, "failed": 1, "skipped": 0, "deferred": 0}, summary)
         self.assertEqual(
             ["leeds_ext"],
             [call.args[0] for call in federation.observe.call_args_list],
@@ -7411,14 +7458,14 @@ class FederationVerificationTickTests(unittest.TestCase):
         ):
             summary = app.verify_federation_sources()
 
-        self.assertEqual({"observed": 1, "failed": 0, "skipped": 0}, summary)
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}, summary)
 
     def test_is_inert_when_federation_is_not_configured(self):
         # Outside bundled mode FEDERATION is None; the tick must be safe to
         # call rather than raising into a background thread.
         with patch.object(app, "FEDERATION", None):
             self.assertEqual(
-                {"observed": 0, "failed": 0, "skipped": 0},
+                {"observed": 0, "failed": 0, "skipped": 0, "deferred": 0},
                 app.verify_federation_sources(),
             )
 
@@ -7464,7 +7511,7 @@ class FederationVerifierLoopTests(unittest.TestCase):
             calls.append(1)
             if len(calls) == 1:
                 raise psycopg.OperationalError("registry down")
-            return {"observed": 1, "failed": 0, "skipped": 0}
+            return {"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}
 
         with patch.object(app.time, "sleep", sleep), patch.object(
             app, "verify_federation_sources", side_effect=pass_then_raise
@@ -7511,7 +7558,7 @@ class FederationVerifierLoopTests(unittest.TestCase):
         try:
             with patch.object(app.time, "sleep", sleep), patch.object(
                 app, "verify_federation_sources",
-                return_value={"observed": 1, "failed": 0, "skipped": 0},
+                return_value={"observed": 1, "failed": 0, "skipped": 0, "deferred": 0},
             ):
                 with self.assertRaises(StopIteration):
                     app.run_federation_verifier()

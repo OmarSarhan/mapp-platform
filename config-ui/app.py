@@ -301,6 +301,14 @@ FEDERATION_VERIFY_INTERVAL_SECONDS = 900
 # in well under a second per alias, and bounded so a broken source costs a
 # minute rather than the whole startup.
 FEDERATION_VERIFY_STARTUP_GRACE_SECONDS = 60
+# A pass stops starting new aliases once it has spent this long. Without it the
+# interval is not a staleness bound at all: the traversal is serial, one alias
+# can consume the whole idle-transaction allowance, and the registry permits a
+# hundred of them, so an alias near the end could wait most of a day for its
+# first check. Aliases are taken least-recently-verified first, so whatever a
+# slow pass defers is exactly what the next pass starts with -- bounded and
+# fair, rather than the same prefix being rechecked forever.
+FEDERATION_VERIFY_PASS_BUDGET_SECONDS = 600
 FEDERATION_FIRST_PASS_DONE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
@@ -1158,14 +1166,38 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
 
     Returns counts rather than raising so a caller can log one line per pass.
     """
-    summary = {"observed": 0, "failed": 0, "skipped": 0}
+    summary = {"observed": 0, "failed": 0, "skipped": 0, "deferred": 0}
     if not FEDERATION:
         return summary
+    deadline = time.monotonic() + FEDERATION_VERIFY_PASS_BUDGET_SECONDS
     # list() already excludes retired aliases, which is the filter that keeps
     # a decommissioned source from being probed on a timer forever. Repeating
     # the condition here would be a second place to forget to change.
-    for record in FEDERATION.list():
+    # Least-recently-verified first, never observed before that. Ordering by
+    # alias would mean a slow source early in the alphabet permanently starves
+    # everything after it, since a deferred tail is only ever reached by a pass
+    # that happens to run fast enough. lastObservationId rises monotonically,
+    # so it stands in for "longest since anyone looked".
+    candidates = sorted(
+        FEDERATION.list(),
+        key=lambda item: (
+            item["lastObservationId"] is not None,
+            item["lastObservationId"] or 0,
+        ),
+    )
+    for index, record in enumerate(candidates):
         alias = record["alias"]
+        if time.monotonic() >= deadline:
+            # Stop starting new work rather than abandoning what is running.
+            # The bound is therefore this budget plus one alias, not the sum of
+            # every alias's worst case.
+            summary["deferred"] = len(candidates) - index
+            LOGGER.warning(
+                "Federation verification pass ran out of time; %d alias(es) "
+                "deferred to the next pass",
+                summary["deferred"],
+            )
+            break
         if only is not None and alias != only:
             # The timer never passes this. It exists so a test can drive the
             # real pass without touching aliases it does not own: the harness
