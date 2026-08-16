@@ -107,7 +107,8 @@ class FederationAliasStore:
               last_observation_id bigint,
               retired_at timestamptz,
               retired_by text,
-              archived_schema text
+              archived_schema text,
+              archived_server text
             )
         """).format(sql.Identifier(SCHEMA)))
         # Retirement archives rather than deletes: the alias row and its whole
@@ -118,6 +119,7 @@ class FederationAliasStore:
             ("retired_at", "timestamptz"),
             ("retired_by", "text"),
             ("archived_schema", "text"),
+            ("archived_server", "text"),
         ):
             cur.execute(sql.SQL(
                 "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
@@ -249,7 +251,8 @@ class FederationAliasStore:
         row_level_security_acknowledged AS "rowLevelSecurityAcknowledged",
         retired_at AS "retiredAt",
         retired_by AS "retiredBy",
-        archived_schema AS "archivedSchema"
+        archived_schema AS "archivedSchema",
+        archived_server AS "archivedServer"
     """)
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -1371,6 +1374,13 @@ class FederationAliasStore:
                 )
 
             archived_schema = None
+            # Recorded only once the rename actually happens. The audit must
+            # never have to guess this name: deriving it from archived_schema
+            # is wrong (the alias is truncated four characters further for the
+            # server), and classifying it by a "retired_" prefix is wrong too
+            # (ALIAS_RE permits an alias called retired_sites, whose live
+            # server would then be read as an archive).
+            archived_server_recorded = None
             schema_name = f"source_{alias}"
             # Three distinct local states, and they must not be conflated.
             # "Absent" is benign — there is nothing to revoke or archive, and
@@ -1491,6 +1501,7 @@ class FederationAliasStore:
                             sql.Identifier(archived_server),
                         )
                     )
+                    archived_server_recorded = archived_server
 
             cur.execute(
                 sql.SQL("""
@@ -1498,9 +1509,10 @@ class FederationAliasStore:
                     SET status = 'retired',
                         retired_at = clock_timestamp(),
                         retired_by = %s,
-                        archived_schema = %s
+                        archived_schema = %s,
+                        archived_server = %s
                     WHERE alias = %s
                 """).format(sql.Identifier(SCHEMA)),
-                (actor, archived_schema, alias),
+                (actor, archived_schema, archived_server_recorded, alias),
             )
             return self._get_with_cursor(cur, alias)

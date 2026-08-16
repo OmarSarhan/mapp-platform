@@ -52,6 +52,18 @@ if [[ "${DEPLOYMENT_ENVIRONMENT}" == "production" ]]; then
   fail "federation-test is disabled when MAPP_ENVIRONMENT=production."
 fi
 
+# The same guard bin/mapp applies, repeated here because the comment above
+# claims direct invocation is covered and it was not. The compose array below
+# hardcodes compose.bundled-db.yaml, which is the only file injecting
+# FEDERATION_DATABASE_URL and DERIVED_DATABASE_URL into config-ui. Running
+# this against a deployment configured for another mode would recreate the
+# live dashboard with the FDW provisioner and derived-layer DDL surfaces
+# switched on, and leave them on until the next `./bin/mapp serve`.
+DEPLOYMENT_DATABASE_MODE="$(dotenv_value MAPP_DATABASE_MODE)"
+if [[ "${DEPLOYMENT_DATABASE_MODE}" != "bundled" ]]; then
+  fail "federation-test needs the bundled federation provisioner and is disabled when MAPP_DATABASE_MODE=${DEPLOYMENT_DATABASE_MODE}."
+fi
+
 # A dedicated alias so a failed run never leaves a half-configured source
 # behind under a name an operator might be using.
 ALIAS="e2e_probe"
@@ -100,11 +112,20 @@ SOURCE_DB_PREEXISTING=0
 # accumulate archived schemas and collide. Once ownership is established the
 # harness removes its own leftovers outright.
 remove_alias_state() {
+  # Anchored regex, never LIKE. Two things make a glob wrong here. The alias
+  # contains underscores, which LIKE treats as single-character wildcards, and
+  # a trailing wildcard matches any longer alias, so "e2e_probe\_%" matches
+  # e2e_probe_v2_srv, so the teardown would DROP ... CASCADE another live
+  # source while the ownership guard -- which only ever checks the exact name
+  # e2e_probe -- saw nothing to stop it. These patterns match this alias and
+  # the archive shape retire() generates for it, and nothing else.
+  local archive_suffix='_[0-9]{14}_[0-9a-f]{8}'
   local archived
   archived="$(platform_sql "
     SELECT string_agg(quote_ident(nspname), ',')
     FROM pg_catalog.pg_namespace
-    WHERE nspname LIKE 'retired\\_${ALIAS}\\_%' OR nspname = 'source_${ALIAS}'
+    WHERE nspname = 'source_${ALIAS}'
+       OR nspname ~ '^retired_${ALIAS}${archive_suffix}\$'
   " 2>/dev/null || true)"
   if [[ -n "${archived}" ]]; then
     local schema
@@ -120,7 +141,8 @@ remove_alias_state() {
     BEGIN
       FOR target IN
         SELECT srvname FROM pg_catalog.pg_foreign_server
-        WHERE srvname LIKE '${ALIAS}\\_%' OR srvname LIKE 'retired\\_${ALIAS}\\_%'
+        WHERE srvname = '${ALIAS}_srv'
+           OR srvname ~ '^retired_${ALIAS}${archive_suffix}_srv\$'
       LOOP
         EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', target);
       END LOOP;

@@ -1083,8 +1083,15 @@ class FederationAliasStoreTests(unittest.TestCase):
             executed.index(renames[0]),
             "revoke must precede the rename",
         )
-        # Archive, never delete.
-        self.assertFalse(any("DROP " in text for text in executed))
+        # Archive, never delete -- but user mappings are the deliberate
+        # exception, so this cannot assert on "DROP " generally. retire()
+        # issues DROP USER MAPPING because a mapping is a live plaintext
+        # credential rather than audit evidence; asserting otherwise passed
+        # only because this fixture yields no mappings, and would have fought
+        # the next maintainer who gave it a realistic one. The drop is covered
+        # by test_retire_drops_the_user_mappings_it_archives_around.
+        self.assertFalse(any("DROP SCHEMA" in text for text in executed))
+        self.assertFalse(any("DROP SERVER" in text for text in executed))
         self.assertFalse(any("DELETE FROM" in text for text in executed))
         # Both consumer roles lose access, matching the grant loop that
         # _persist_observation uses.
@@ -1253,6 +1260,64 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertTrue(
             any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
         )
+
+    def test_retire_records_the_archived_server_name(self):
+        # The audit must never derive this name. Deriving it from
+        # archived_schema is wrong because the alias is truncated four
+        # characters further for the server, and identifying it by a
+        # "retired_" prefix is wrong because ALIAS_RE permits an alias
+        # literally called retired_sites, whose live server would then read as
+        # an archive. Recording it is what lets verify.sh assert the archive
+        # still exists at all.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        renamed = [
+            text for text in executed
+            if "ALTER SERVER" in text and "RENAME TO" in text
+        ]
+        self.assertEqual(1, len(renamed))
+        archived_server = re.findall(r"Identifier\('([^']+)'\)", renamed[0])[-1]
+        update = next(
+            call for call in cursor.execute.call_args_list
+            if "archived_server" in str(call.args[0])
+        )
+        self.assertIn(archived_server, update.args[1])
+
+    def test_retire_records_no_archived_server_when_none_existed(self):
+        # A server removed by hand must not make the alias un-retirable, and
+        # must not leave the registry pointing at a name that never existed --
+        # verify.sh treats a recorded name as something it can demand to find.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            None,
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        self.assertFalse(
+            any("ALTER SERVER" in text for text in statements(cursor))
+        )
+        update = next(
+            call for call in cursor.execute.call_args_list
+            if "archived_server" in str(call.args[0])
+        )
+        self.assertIn(None, update.args[1])
 
     def test_retire_still_drops_credentials_when_the_schema_is_already_gone(self):
         # The server and its mappings are archived under a gate independent of
