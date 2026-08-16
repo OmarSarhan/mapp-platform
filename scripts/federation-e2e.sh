@@ -193,23 +193,39 @@ fi
 "${compose[@]}" up -d source-db config-ui >/dev/null
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
 
-step "Claiming the probe alias"
-# The alias name is a legal one an operator could have registered, and the
-# cleanup below is irreversible, so the harness proves the name is free before
-# it takes ownership. A crashed run (SIGKILL, where the EXIT trap never fired)
-# is the one case that legitimately leaves residue behind; clearing that is an
-# explicit decision a human makes, not something a test does on their behalf.
+step "Claiming the probe alias and relation"
+# Both names are ones an operator could legitimately be using, and the cleanup
+# below is irreversible, so the harness proves each is free before it takes
+# ownership. The relation matters as much as the alias: it lives in the
+# operator's source-db, which this harness deliberately leaves running when it
+# found it running, so treating that rig as expendable while claiming to
+# preserve it would be the worse contradiction. A crashed run (SIGKILL, where
+# the EXIT trap never fired) is the one case that legitimately leaves residue;
+# clearing that is an explicit decision a human makes, not something a test
+# does on their behalf.
+claimed=""
 existing="$(platform_sql "
   SELECT count(*) FROM federation._aliases WHERE alias = '${ALIAS}'
 " 2>/dev/null || echo 0)"
 if [[ "${existing}" != "0" ]]; then
+  claimed="federation alias '${ALIAS}'"
+fi
+probe_exists="$(source_sql "
+  SELECT count(*) FROM pg_catalog.pg_class AS c
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+  WHERE n.nspname = '${PROBE_RELATION%%.*}' AND c.relname = '${PROBE_RELATION#*.}'
+" 2>/dev/null || echo 0)"
+if [[ "${probe_exists}" != "0" ]]; then
+  claimed="${claimed:+${claimed} and }source relation '${PROBE_RELATION}'"
+fi
+if [[ -n "${claimed}" ]]; then
   if [[ "${MAPP_FEDERATION_E2E_RESET:-0}" != "1" ]]; then
-    fail "A federation alias named '${ALIAS}' already exists. If it is residue
-from a killed run, re-run with MAPP_FEDERATION_E2E_RESET=1 to clear it;
-otherwise rename or retire that alias first — this harness would drop its
-schema and server with CASCADE."
+    fail "This deployment already has ${claimed}. If that is residue from a
+killed run, re-run with MAPP_FEDERATION_E2E_RESET=1 to clear it; otherwise
+rename or retire it first — this harness drops the alias schema and server
+with CASCADE, and drops the source relation outright."
   fi
-  printf 'MAPP_FEDERATION_E2E_RESET=1: clearing pre-existing %s state\n' "${ALIAS}"
+  printf 'MAPP_FEDERATION_E2E_RESET=1: clearing pre-existing %s\n' "${claimed}"
 fi
 OWNS_ALIAS=1
 remove_alias_state
