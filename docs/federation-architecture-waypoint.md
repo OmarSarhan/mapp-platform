@@ -1082,8 +1082,15 @@ exactly what was connected. `scripts/verify.sh` asserts that a retired alias
 retains no mappings on either its live or archived server name.
 
 Implementation also renames the archived objects
-(`retired_<alias>_<provisioned_at>`) rather than leaving them under the live
-name, which frees `source_<alias>` immediately. The **reclaim** action below
+(`retired-<alias>_<provisioned_at>_<digest>`) rather than leaving them under
+the live name, which frees `source_<alias>` immediately. The hyphen is
+deliberate: `ALIAS_RE` admits no hyphen, so archive names occupy a namespace
+no registrable alias can reach. Under an all-underscore name the archive name
+for a short alias was itself a legal alias, and registering it would create a
+live server holding the exact name a later retirement needed — leaving the
+original un-retirable until the squatter was itself retired. The digest tells
+two archives apart; only the hyphen tells an archive from a live alias. The
+**reclaim** action below
 is therefore not required to release a name; it remains the intended shape for
 carrying curated semantics across a re-registration, and is not implemented.
 The original intent is preserved verbatim from here:

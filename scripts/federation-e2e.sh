@@ -125,7 +125,7 @@ remove_alias_state() {
     SELECT string_agg(quote_ident(nspname), ',')
     FROM pg_catalog.pg_namespace
     WHERE nspname = 'source_${ALIAS}'
-       OR nspname ~ '^retired_${ALIAS}${archive_suffix}\$'
+       OR nspname ~ '^retired[-_]${ALIAS}${archive_suffix}\$'
   " 2>/dev/null || true)"
   if [[ -n "${archived}" ]]; then
     local schema
@@ -142,7 +142,7 @@ remove_alias_state() {
       FOR target IN
         SELECT srvname FROM pg_catalog.pg_foreign_server
         WHERE srvname = '${ALIAS}_srv'
-           OR srvname ~ '^retired_${ALIAS}${archive_suffix}_srv\$'
+           OR srvname ~ '^retired[-_]${ALIAS}${archive_suffix}_srv\$'
       LOOP
         EXECUTE format('DROP SERVER IF EXISTS %I CASCADE', target);
       END LOOP;

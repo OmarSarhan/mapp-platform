@@ -1426,7 +1426,19 @@ class FederationAliasStore:
                     row["provisioned_at"].strftime("_%Y%m%d%H%M%S")
                     + "_" + digest
                 )
-                prefix = "retired_"
+                # The hyphen is load-bearing. ALIAS_RE is
+                # ^[A-Za-z][A-Za-z0-9_]{0,55}$, so no alias can contain one,
+                # which puts archive names in a namespace live aliases cannot
+                # reach. With "retired_" they shared one: the archive name for
+                # a short alias is itself a legal alias (32 + len(alias)
+                # characters, so legal whenever the alias is 24 or fewer), and
+                # registering it would create a live server occupying the exact
+                # name retirement later needs. Retiring the original would then
+                # fail at ALTER SERVER ... RENAME TO and keep failing until the
+                # squatter was retired. The digest distinguishes two archives
+                # from each other; it does not distinguish an archive from a
+                # live alias.
+                prefix = "retired-"
                 archived_schema = (
                     prefix + alias[: 63 - len(prefix) - len(suffix)] + suffix
                 )

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from federation_schema import FederationSchemaError
+from federation_schema import FederationSchemaError, validate_alias
 from federation_store import FederationAliasStore, MAX_ALIASES
 
 
@@ -1118,7 +1118,42 @@ class FederationAliasStoreTests(unittest.TestCase):
         for text in renames:
             target = re.findall(r"Identifier\('([^']+)'\)", text)[-1]
             self.assertLessEqual(len(target), 63, target)
-            self.assertTrue(target.startswith("retired_"), target)
+            self.assertTrue(target.startswith("retired-"), target)
+
+    def test_archive_names_cannot_be_registered_as_aliases(self):
+        # The real invariant behind the hyphen, asserted against validate_alias
+        # rather than a prefix string. With "retired_" the archive name for a
+        # short alias was itself a legal alias -- 32 + len(alias) characters,
+        # so legal for any alias of 24 or fewer -- and registering it created a
+        # live server holding the exact name retirement would later need,
+        # leaving the original un-retirable until the squatter was retired.
+        for alias in ("foo", "a", "x" * 24):
+            cursor = MagicMock()
+            cursor.fetchone.side_effect = [
+                {"status": "active", "provisioned_at": OBSERVED_AT},
+                {"owned": True},
+                {"exists": 1},
+                alias_row(alias=alias, status="retired"),
+            ]
+            store = self.store_with_cursor(cursor)
+
+            store.retire(alias, "admin")
+
+            renames = [
+                text for text in statements(cursor) if "RENAME TO" in text
+            ]
+            self.assertEqual(2, len(renames))
+            for text in renames:
+                archived = re.findall(r"Identifier\('([^']+)'\)", text)[-1]
+                with self.assertRaises(
+                    FederationSchemaError,
+                    msg=f"{archived!r} is registerable as an alias",
+                ):
+                    validate_alias(archived)
+                # The server name is what actually collided: a live alias
+                # named <archive> would own exactly <archive>_srv.
+                with self.assertRaises(FederationSchemaError):
+                    validate_alias(archived.removesuffix("_srv"))
 
     def test_retire_of_an_unprovisioned_alias_touches_no_physical_objects(self):
         cursor = MagicMock()
