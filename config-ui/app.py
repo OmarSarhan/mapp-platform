@@ -1122,15 +1122,20 @@ def run_federation_verifier() -> None:
             # pass is already recorded durably as observed_at on each alias,
             # which is queryable in a way a log line is not. Only the
             # exceptional paths below log, and those do emit.
-            verify_federation_sources()
-            # Only after a pass that actually walked the aliases. A pass that
-            # threw got nowhere -- an unreachable registry raises before the
-            # first alias -- and reporting that as verification complete would
-            # let startup proceed having checked nothing, silently. Failing to
-            # signal costs the grace period and logs why, which is the honest
-            # outcome. Per-alias failures inside the pass do not reach here and
-            # do not block readiness; they are already handled and counted.
-            FEDERATION_FIRST_PASS_DONE.set()
+            summary = verify_federation_sources()
+            # Readiness means every eligible alias was revalidated, not merely
+            # that the traversal ran. An alias whose observe() failed keeps the
+            # grants it had, and one the budget deferred was never reached, so
+            # signalling here would claim a startup check that did not happen
+            # for them. Withdrawing access on any failure is the wrong answer:
+            # the failures that reach this point are transient ones like lock
+            # contention -- the two that mean a source genuinely cannot be
+            # verified, a vanished connectionRef and a probe outrunning its
+            # budget, already withdraw access themselves. So this reports
+            # honestly and lets the bounded grace period expire, which logs
+            # what happened rather than serving in silence.
+            if not summary["failed"] and not summary["deferred"]:
+                FEDERATION_FIRST_PASS_DONE.set()
         except Exception:
             # Broad by intent, matching run_semantic_outbox: a registry that
             # is briefly unreachable must not end the thread for the lifetime

@@ -31,8 +31,8 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
     sql = None
 
 
-API_VERSION = "1.5"
-CONTRACT_VERSION = "1.5"
+API_VERSION = "1.6"
+CONTRACT_VERSION = "1.6"
 RULES_VERSION = "1.6"
 FIXED_FILTER_NUMBER_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
@@ -1759,7 +1759,7 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "maxItems": MAX_PAGE_LIMIT,
                 "firstPageOnly": True,
             },
-            "compatibilityArtifact": "contracts/api-compatibility-v1.5.json",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.6.json",
         },
     }
 

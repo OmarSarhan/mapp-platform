@@ -92,8 +92,8 @@ class ControlApiTests(unittest.TestCase):
         payload = capabilities("instance")
         actions = {item["id"]: item for item in payload["actions"]}
         self.assertEqual("instance", payload["instanceId"])
-        self.assertEqual("1.5", payload["apiVersion"])
-        self.assertEqual("1.5", payload["contractVersion"])
+        self.assertEqual("1.6", payload["apiVersion"])
+        self.assertEqual("1.6", payload["contractVersion"])
         self.assertEqual(
             ["revision", "operations"],
             actions["proposals.check"]["inputSchema"]["required"],

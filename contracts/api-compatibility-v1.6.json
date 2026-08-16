@@ -1,0 +1,86 @@
+{
+  "artifactVersion": "1.2.0",
+  "apiVersion": "1.6",
+  "contractVersion": "1.6",
+  "rulesVersion": "1.6",
+  "semanticServiceVersion": "1.1.0",
+  "consumers": {
+    "mapp-config-cli": {
+      "minimumVersion": "0.1.0",
+      "supportedApiMajor": 1,
+      "supportedContractMajor": 1
+    }
+  },
+  "pagination": {
+    "version": "1",
+    "defaultLimit": 100,
+    "maxLimit": 100,
+    "pageMaxResponseBytes": 16777216,
+    "pageTooLargeCode": "pagination.page_too_large",
+    "legacyMaxItems": 100,
+    "legacyOverflowCode": "pagination.required",
+    "semanticPageMaxResponseBytes": 16777216,
+    "semanticPageTooLargeCode": "semantic.page_too_large",
+    "derivedDeliveryBlockers": {
+      "itemsField": "deliveryBlockers",
+      "moreField": "deliveryBlockersMore",
+      "maxItems": 100,
+      "firstPageOnly": true
+    },
+    "request": {
+      "limit": "Maximum items returned in this response.",
+      "cursor": "Opaque nextCursor returned by the preceding request."
+    },
+    "response": {
+      "field": "pagination",
+      "limitField": "limit",
+      "nextCursorField": "nextCursor",
+      "endValue": null
+    },
+    "compatibility": "Pagination is activated by limit or cursor in API major 1. Parameterless requests retain the legacy shape through 100 items and return pagination.required above that threshold. Every collection response has a 16 MiB ceiling. A bounded page may contain fewer than limit items when its byte budget is reached; nextCursor, not page length, is the end-of-collection signal.",
+    "endpoints": [
+      {
+        "method": "GET",
+        "path": "/api/proposals",
+        "itemsField": "proposals",
+        "filters": []
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/catalog",
+        "itemsField": "assets",
+        "filters": []
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/catalog/search",
+        "itemsField": "results",
+        "filters": ["q"]
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/catalog/objects/{assetId}/history",
+        "itemsField": "history",
+        "filters": []
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/derived-profiles",
+        "itemsField": "derivedProfiles",
+        "filters": []
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/proposals",
+        "itemsField": "proposals",
+        "filters": ["state", "assetId"]
+      },
+      {
+        "method": "GET",
+        "path": "/api/semantic/source/relations",
+        "itemsField": "relations",
+        "filters": []
+      }
+    ]
+  }
+}

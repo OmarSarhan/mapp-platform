@@ -1607,7 +1607,7 @@ the platform side of the contract must land first:
 | --- | --- | --- |
 | `apiVersion` / `contractVersion` | `1.5` | A minor bump for additive federation actions; a major bump if relation identity changes shape |
 | `rulesVersion` | `1.6` | Bumps if workspace relation or `dbs` validation changes |
-| `contracts/api-compatibility-v1.5.json` | Declares consumers and pagination endpoints | Alias registration is currently capped at 100, so its list remains one bounded response; add pagination before lifting that cap or exposing observation history |
+| `contracts/api-compatibility-v1.6.json` | Declares consumers and pagination endpoints | Alias registration is currently capped at 100, so its list remains one bounded response; add pagination before lifting that cap or exposing observation history |
 | `GET /api/contract` | Runtime authority; no federation CLI commands are currently advertised | Add command names only in the same release that implements them in the independently shipped CLI |
 | `GET /api/capabilities` | Runtime authority for action IDs, risk classes, conditional scopes | Must advertise federation actions, their risk class, and their exact scope combinations |
 | Scope model | `derive`, `semantic:*`, etc., explicitly non-hierarchical | New `federation:register` / `federation:provision` / `federation:observe` scopes, plus a separately-granted **reclaim** action for re-registering a retired alias's name; reachable from the dashboard session or from a CLI credential holding them, peer to each other, not reachable from any other existing scope. `federation:provision` also gates Discover and the verify-not-read endpoint, not just Approve exposure |

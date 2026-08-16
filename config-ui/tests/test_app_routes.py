@@ -7550,6 +7550,47 @@ class FederationVerifierLoopTests(unittest.TestCase):
         finally:
             app.FEDERATION_FIRST_PASS_DONE.clear()
 
+    def test_readiness_is_withheld_when_an_alias_could_not_be_verified(self):
+        # The alias keeps the grants it had, so claiming the startup check
+        # happened would let planning run against a source nothing revalidated.
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={
+                    "observed": 1, "failed": 1, "skipped": 0, "deferred": 0
+                },
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_readiness_is_withheld_when_the_budget_deferred_an_alias(self):
+        # A deferred alias was never reached at all.
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={
+                    "observed": 1, "failed": 0, "skipped": 0, "deferred": 2
+                },
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
     def test_readiness_is_signalled_once_a_pass_completes(self):
         def sleep(seconds):
             raise StopIteration
