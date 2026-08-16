@@ -95,7 +95,7 @@ class SemanticStoreTest(unittest.TestCase):
 
     def test_database_is_migrated_and_restrictive(self) -> None:
         settings = self.store.database_settings()
-        self.assertEqual(settings["schemaVersion"], 4)
+        self.assertEqual(settings["schemaVersion"], 5)
         self.assertEqual(settings["journalMode"].lower(), "wal")
         self.assertEqual(settings["foreignKeys"], 1)
         self.assertEqual(settings["synchronous"], 2)  # FULL
@@ -162,7 +162,7 @@ class SemanticStoreTest(unittest.TestCase):
             connection.close()
 
         upgraded = SemanticStore(legacy_path)
-        self.assertEqual(upgraded.database_settings()["schemaVersion"], 4)
+        self.assertEqual(upgraded.database_settings()["schemaVersion"], 5)
         proposal = upgraded.get_proposal(
             "proposal:legacy",
             is_admin=False,
@@ -180,7 +180,7 @@ class SemanticStoreTest(unittest.TestCase):
         )
 
         reopened = SemanticStore(legacy_path)
-        self.assertEqual(reopened.database_settings()["schemaVersion"], 4)
+        self.assertEqual(reopened.database_settings()["schemaVersion"], 5)
 
     def test_generated_event_lifecycle_is_idempotent(self) -> None:
         first = self.register()
@@ -218,6 +218,64 @@ class SemanticStoreTest(unittest.TestCase):
                 }
             )
         self.assertEqual(stale.exception.code, "stale_generation")
+
+    def _federated(self, asset_id: str, schema: str, *, event_id: str) -> dict:
+        return self.register(
+            event_id=event_id,
+            asset_id=asset_id,
+            generated={
+                "kind": "managed-derived",
+                "name": "orders",
+                "binding": {
+                    "adapter": "postgresql",
+                    "schema": schema,
+                    "relation": "orders",
+                },
+                "fields": [{"name": "id", "type": "integer", "nullable": False}],
+            },
+        )
+
+    def test_source_state_flags_and_clears_by_binding_schema(self) -> None:
+        # The whole point is reversibility: an asset keeps its identity so the
+        # same source returning can turn it back on.
+        self._federated("asset:a", "source_leeds", event_id="e-a")
+        self._federated("asset:b", "source_leeds", event_id="e-b")
+        self._federated("asset:c", "source_other", event_id="e-c")
+
+        flagged = self.store.mark_source_state("source_leeds", available=False)
+        self.assertEqual(["asset:a", "asset:b"], sorted(flagged))
+        by_id = {
+            a["id"]: a for a in self.store.assets_for_source_schema("source_leeds")
+        }
+        self.assertEqual("unavailable", by_id["asset:a"]["sourceState"])
+        # An unrelated schema is untouched.
+        other = self.store.assets_for_source_schema("source_other")
+        self.assertIsNone(other[0]["sourceState"])
+
+        cleared = self.store.mark_source_state("source_leeds", available=True)
+        self.assertEqual(["asset:a", "asset:b"], sorted(cleared))
+        restored = self.store.assets_for_source_schema("source_leeds")
+        self.assertTrue(all(a["sourceState"] is None for a in restored))
+
+    def test_source_state_reports_only_what_it_changed(self) -> None:
+        # So a caller can log once rather than on every verification pass.
+        self._federated("asset:a", "source_leeds", event_id="e-a")
+        self.assertEqual(
+            ["asset:a"], self.store.mark_source_state("source_leeds", available=False)
+        )
+        self.assertEqual(
+            [], self.store.mark_source_state("source_leeds", available=False)
+        )
+        self.assertEqual(
+            ["asset:a"], self.store.mark_source_state("source_leeds", available=True)
+        )
+        self.assertEqual(
+            [], self.store.mark_source_state("source_leeds", available=True)
+        )
+
+    def test_a_healthy_asset_reports_no_source_state(self) -> None:
+        asset = self.register()["asset"]
+        self.assertIsNone(asset["sourceState"])
 
     def test_event_idempotency_survives_service_restart(self) -> None:
         first = self.register()
