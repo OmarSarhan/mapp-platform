@@ -293,6 +293,15 @@ SEMANTIC_OUTBOX_WAKE = threading.Event()
 # makes a shorter interval the safer one for availability, against four
 # connections an hour into a database somebody else operates.
 FEDERATION_VERIFY_INTERVAL_SECONDS = 900
+# How long startup will hold the dashboard for the first pass. The doc asks for
+# verification on startup before planning or refresh; blocking outright would
+# let an unreachable third party decide when this service starts, since every
+# unreachable alias costs a 5s connect. So the pass runs concurrently and
+# startup waits only this long -- ample for a healthy deployment, which probes
+# in well under a second per alias, and bounded so a broken source costs a
+# minute rather than the whole startup.
+FEDERATION_VERIFY_STARTUP_GRACE_SECONDS = 60
+FEDERATION_FIRST_PASS_DONE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
 
@@ -1111,6 +1120,10 @@ def run_federation_verifier() -> None:
             # is briefly unreachable must not end the thread for the lifetime
             # of the process. The next pass retries everything.
             LOGGER.warning("Federation verification pass failed", exc_info=True)
+        # Set however the pass ended, including on failure: startup waits for
+        # the attempt, not for a particular outcome. A source that is down must
+        # not also cost the full grace period on top of its probe timeouts.
+        FEDERATION_FIRST_PASS_DONE.set()
         # A plain sleep, not an Event. The outbox waits on one because
         # something calls SEMANTIC_OUTBOX_WAKE.set(); nothing would ever wake
         # this loop, so an Event here would be wait()/clear() dressed up as a
@@ -1176,9 +1189,31 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             summary["skipped"] += 1
             continue
         try:
+            try:
+                connection_url = resolve_federation_connection_url(
+                    record["connectionRef"]
+                )
+            except FederationSchemaError as exc:
+                if exc.code != "federation.connection_ref_not_found":
+                    raise
+                # No observation can ever reach this alias, yet its foreign
+                # tables keep working: the user mapping still holds the remote
+                # credential. Left alone, both consumer roles would read a
+                # source the deployment cannot verify, for as long as nobody
+                # noticed -- and every other revoke path runs from an
+                # observation there is no way to make. Recoverable: restoring
+                # the variable lets the next pass grant access straight back.
+                if FEDERATION.mark_unverifiable(alias):
+                    LOGGER.warning(
+                        "Federation alias %r has no configured connectionRef "
+                        "%r; consumer access withdrawn until it returns",
+                        alias, record["connectionRef"],
+                    )
+                summary["failed"] += 1
+                continue
             FEDERATION.observe(
                 alias,
-                resolve_federation_connection_url(record["connectionRef"]),
+                connection_url,
                 allowed_relations=tuple(record["allowedRelations"]),
                 tls_policy=record["tlsPolicy"],
             )
@@ -9740,4 +9775,17 @@ if __name__ == "__main__":
             name="federation-verifier",
             daemon=True,
         ).start()
+        # Wait for that first pass, but only so far. On a healthy deployment
+        # this returns in well under a second, so nothing is served against
+        # grants that have not been revalidated; on a broken one it gives up
+        # and serves anyway, because a dashboard that will not start is worse
+        # than one that finishes verifying a moment later.
+        if not FEDERATION_FIRST_PASS_DONE.wait(
+            FEDERATION_VERIFY_STARTUP_GRACE_SECONDS
+        ):
+            LOGGER.warning(
+                "Federation verification did not finish within %ss; serving "
+                "while it continues in the background",
+                FEDERATION_VERIFY_STARTUP_GRACE_SECONDS,
+            )
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

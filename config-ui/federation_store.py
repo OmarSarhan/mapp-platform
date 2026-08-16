@@ -550,26 +550,89 @@ class FederationAliasStore:
         )
 
         if provisioned:
-            schema_name = f"source_{alias}"
-            if self._local_schema_owned(cur, schema_name):
-                action = "GRANT" if evidence_current else "REVOKE"
-                preposition = "TO" if evidence_current else "FROM"
-                for role in dict.fromkeys((self.derived_role, self.reader_role)):
-                    cur.execute(
-                        sql.SQL(
-                            f"{action} USAGE ON SCHEMA {{}} {preposition} {{}}"
-                        ).format(
-                            sql.Identifier(schema_name), sql.Identifier(role)
-                        )
-                    )
-                    cur.execute(
-                        sql.SQL(
-                            f"{action} SELECT ON ALL TABLES IN SCHEMA {{}} "
-                            f"{preposition} {{}}"
-                        ).format(
-                            sql.Identifier(schema_name), sql.Identifier(role)
-                        )
-                    )
+            self._apply_consumer_access(cur, alias, grant=evidence_current)
+
+    def _apply_consumer_access(self, cur, alias: str, *, grant: bool) -> None:
+        """Give both consumer roles access to a source schema, or take it away.
+
+        Extracted so the two callers cannot drift apart: an observation decides
+        this from evidence currency, and mark_unverifiable() decides it from
+        the source having become impossible to verify at all. A schema owned by
+        another role is left alone either way -- provisioning refuses that
+        state, and silently re-granting on someone else's schema would be worse
+        than declining to touch it.
+        """
+        schema_name = f"source_{alias}"
+        if not self._local_schema_owned(cur, schema_name):
+            return
+        action = "GRANT" if grant else "REVOKE"
+        preposition = "TO" if grant else "FROM"
+        for role in dict.fromkeys((self.derived_role, self.reader_role)):
+            cur.execute(
+                sql.SQL(
+                    f"{action} USAGE ON SCHEMA {{}} {preposition} {{}}"
+                ).format(sql.Identifier(schema_name), sql.Identifier(role))
+            )
+            cur.execute(
+                sql.SQL(
+                    f"{action} SELECT ON ALL TABLES IN SCHEMA {{}} "
+                    f"{preposition} {{}}"
+                ).format(sql.Identifier(schema_name), sql.Identifier(role))
+            )
+
+    def mark_unverifiable(self, alias: str) -> bool:
+        """Withdraw consumer access from a provisioned source that cannot be probed.
+
+        A connectionRef removed from the environment leaves an alias that no
+        observation can ever reach, while its foreign tables keep working:
+        the user mapping still holds the remote credential, so both consumer
+        roles carry on reading a source the deployment can no longer verify.
+        Nothing else closes that, because every other revoke path runs from an
+        observation and there is no observation to run.
+
+        Recoverable on purpose. Restoring the variable lets the next pass
+        observe normally and _persist_observation grants access straight back,
+        so a configuration slip during a deploy costs a window, not a
+        reprovision. Retirement remains the way to decommission a source
+        properly -- it also drops the credential this cannot touch.
+
+        Returns True when it changed something, so a caller can log once
+        rather than on every pass.
+        """
+        alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:observe:{alias}",),
+            )
+            cur.execute(
+                sql.SQL("""
+                    SELECT status, provisioned_at
+                    FROM {}._aliases
+                    WHERE alias = %s
+                    FOR UPDATE
+                """).format(sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            row = cur.fetchone()
+            # Retirement is terminal and already revoked; an unprovisioned
+            # alias exposes nothing. Neither has access left to withdraw.
+            if (
+                row is None
+                or row["status"] == "retired"
+                or row["provisioned_at"] is None
+            ):
+                return False
+            already = row["status"] == "unavailable"
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {}._aliases SET status = 'unavailable' "
+                    "WHERE alias = %s"
+                ).format(sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            self._apply_consumer_access(cur, alias, grant=False)
+            return not already
 
     # PostGIS/PROJ/GEOS versions may differ between the federation database
     # and a source — execution happens in the federation database, so a

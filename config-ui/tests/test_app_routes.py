@@ -7320,6 +7320,39 @@ class FederationVerificationTickTests(unittest.TestCase):
         )
         self.assertEqual(1, summary["observed"])
 
+    def test_a_vanished_connection_reference_withdraws_access(self):
+        # No observation can reach this alias, but its foreign tables keep
+        # working because the user mapping still holds the credential. Without
+        # this, both consumer roles read a source nothing can verify, and every
+        # other revoke path runs from an observation that cannot happen.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("gone", connectionRef="REMOVED")]
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("gone")
+        federation.observe.assert_not_called()
+        self.assertEqual(1, summary["failed"])
+        self.assertIn("REMOVED", "\n".join(logs.output))
+
+    def test_a_vanished_reference_logs_only_when_something_changed(self):
+        # mark_unverifiable reports whether it changed anything, so a source
+        # left de-configured does not warn every fifteen minutes forever.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("gone", connectionRef="REMOVED")]
+        federation.mark_unverifiable.return_value = False
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            with self.assertNoLogs(app.LOGGER, level="WARNING"):
+                summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("gone")
+        self.assertEqual(1, summary["failed"])
+
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source
         # after it in the list unverified until someone noticed.

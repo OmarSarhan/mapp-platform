@@ -1296,6 +1296,57 @@ class FederationAliasStoreTests(unittest.TestCase):
             any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
         )
 
+    def test_mark_unverifiable_revokes_both_consumer_roles(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        self.assertTrue(store.mark_unverifiable("leeds_ext"))
+
+        executed = statements(cursor)
+        self.assertTrue(any("FOR UPDATE" in text for text in executed))
+        self.assertTrue(any("SET status = 'unavailable'" in text for text in executed))
+        # Rendered psycopg SQL is Composed([SQL('REVOKE ...'), ...]), so match
+        # on containment rather than the start of the string.
+        revokes = [text for text in executed if "REVOKE" in text]
+        # USAGE and SELECT, for each of the two consumer roles.
+        self.assertEqual(4, len(revokes))
+        self.assertFalse(any("GRANT" in text for text in executed))
+
+    def test_mark_unverifiable_leaves_a_retired_alias_alone(self):
+        # Retirement already revoked and is terminal; touching it would be the
+        # resurrection the status CASE exists to prevent.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "status": "retired", "provisioned_at": OBSERVED_AT,
+        }
+        store = self.store_with_cursor(cursor)
+
+        self.assertFalse(store.mark_unverifiable("leeds_ext"))
+
+        executed = statements(cursor)
+        self.assertFalse(any("REVOKE" in text for text in executed))
+        # Not "UPDATE": the row lock is SELECT ... FOR UPDATE, which contains
+        # it. The write is what must not happen.
+        self.assertFalse(any("SET status" in text for text in executed))
+
+    def test_mark_unverifiable_reports_no_change_when_already_unavailable(self):
+        # So a de-configured source does not warn on every pass forever.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "unavailable", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        self.assertFalse(store.mark_unverifiable("leeds_ext"))
+        # It still re-revokes: reporting "no change" is about logging, not
+        # about leaving access in place.
+        self.assertTrue(any("REVOKE" in t for t in statements(cursor)))
+
     def test_retire_records_the_archived_server_name(self):
         # The audit must never derive this name. Deriving it from
         # archived_schema is wrong because the alias is truncated four
