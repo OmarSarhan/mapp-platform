@@ -68,6 +68,7 @@ fi
 # behind under a name an operator might be using.
 ALIAS="e2e_probe"
 PROBE_RELATION="leeds.e2e_probe_orders"
+PROBE_SCHEMA="${PROBE_RELATION%%.*}"
 
 compose=(
   docker compose
@@ -107,6 +108,13 @@ OWNS_ALIAS=0
 # Whether source-db was already up before this run, so a rig an operator is
 # using by hand survives; only a container this harness started gets removed.
 SOURCE_DB_PREEXISTING=0
+# The same principle applied to what seeding changes inside that rig. Granting
+# the reader USAGE and leaving it granted permanently broadens a role in the
+# operator's database, which is the opposite of preserving the rig; so each is
+# recorded only when this run is the thing that introduced it, and undone only
+# then.
+PROBE_SCHEMA_CREATED=0
+PROBE_USAGE_GRANTED=0
 
 # Retirement archives rather than drops, so a repeat run would otherwise
 # accumulate archived schemas and collide. Once ownership is established the
@@ -155,6 +163,17 @@ remove_alias_state() {
     DELETE FROM federation._aliases WHERE alias = '${ALIAS}';
   " >/dev/null 2>&1 || true
   source_sql "DROP TABLE IF EXISTS ${PROBE_RELATION}" >/dev/null 2>&1 || true
+  # The table grant leaves with the table; the schema grant does not.
+  if [[ "${PROBE_USAGE_GRANTED}" == "1" ]]; then
+    source_sql "
+      REVOKE USAGE ON SCHEMA ${PROBE_SCHEMA} FROM ${SOURCE_READER_USER}
+    " >/dev/null 2>&1 || true
+  fi
+  # RESTRICT is the safety here: it refuses on a schema holding anything else,
+  # so this can only remove one this run created and then emptied.
+  if [[ "${PROBE_SCHEMA_CREATED}" == "1" ]]; then
+    source_sql "DROP SCHEMA IF EXISTS ${PROBE_SCHEMA} RESTRICT" >/dev/null 2>&1 || true
+  fi
 }
 
 # Puts back what this run took, and nothing else. Without it the advertised
@@ -231,18 +250,33 @@ OWNS_ALIAS=1
 remove_alias_state
 
 step "Seeding the source with real geometry"
+# Recorded before anything is granted: an operator whose schema already grants
+# the reader USAGE keeps it, and one whose schema does not gets it back the way
+# it was. The schema check has to come first because has_schema_privilege
+# errors outright on a schema that does not exist.
+if [[ "$(source_sql "
+  SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = '${PROBE_SCHEMA}'
+" 2>/dev/null || echo 0)" == "0" ]]; then
+  PROBE_SCHEMA_CREATED=1
+  PROBE_USAGE_GRANTED=1
+elif [[ "$(source_sql "
+  SELECT has_schema_privilege('${SOURCE_READER_USER}', '${PROBE_SCHEMA}', 'USAGE')
+" 2>/dev/null || echo t)" == "f" ]]; then
+  PROBE_USAGE_GRANTED=1
+fi
+
 # A dedicated probe relation copied from the bundled data, so the harness
 # never mutates a relation another alias is federating. Collations are pinned
 # to C to satisfy the portability rule federation_capability.py enforces.
 source_sql "
-  CREATE SCHEMA IF NOT EXISTS leeds;
+  CREATE SCHEMA IF NOT EXISTS ${PROBE_SCHEMA};
   DROP TABLE IF EXISTS ${PROBE_RELATION};
   CREATE TABLE ${PROBE_RELATION} (
     object_id bigint PRIMARY KEY,
     reference text COLLATE pg_catalog.\"C\",
     geom public.geometry(MultiPolygon, 4326) NOT NULL
   );
-  GRANT USAGE ON SCHEMA leeds TO ${SOURCE_READER_USER};
+  GRANT USAGE ON SCHEMA ${PROBE_SCHEMA} TO ${SOURCE_READER_USER};
   GRANT SELECT ON ${PROBE_RELATION} TO ${SOURCE_READER_USER};
 " >/dev/null
 
