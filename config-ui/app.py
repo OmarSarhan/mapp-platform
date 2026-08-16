@@ -293,7 +293,6 @@ SEMANTIC_OUTBOX_WAKE = threading.Event()
 # makes a shorter interval the safer one for availability, against four
 # connections an hour into a database somebody else operates.
 FEDERATION_VERIFY_INTERVAL_SECONDS = 900
-FEDERATION_VERIFY_WAKE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
 
@@ -1112,8 +1111,12 @@ def run_federation_verifier() -> None:
             # is briefly unreachable must not end the thread for the lifetime
             # of the process. The next pass retries everything.
             LOGGER.warning("Federation verification pass failed", exc_info=True)
-        FEDERATION_VERIFY_WAKE.wait(FEDERATION_VERIFY_INTERVAL_SECONDS)
-        FEDERATION_VERIFY_WAKE.clear()
+        # A plain sleep, not an Event. The outbox waits on one because
+        # something calls SEMANTIC_OUTBOX_WAKE.set(); nothing would ever wake
+        # this loop, so an Event here would be wait()/clear() dressed up as a
+        # mechanism that does not exist. Adding one is trivial if a "verify
+        # now" action ever wants it.
+        time.sleep(FEDERATION_VERIFY_INTERVAL_SECONDS)
 
 
 def verify_federation_sources() -> dict[str, int]:

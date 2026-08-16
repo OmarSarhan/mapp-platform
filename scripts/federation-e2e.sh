@@ -189,6 +189,11 @@ cleanup() {
   # reuse and may hold data they seeded themselves.
   if [[ "${SOURCE_DB_PREEXISTING}" == "0" ]]; then
     "${compose[@]}" rm --stop --force source-db >/dev/null 2>&1 || true
+  else
+    # The verification stage stops source-db to simulate an outage. Failing
+    # between the stop and the restart would otherwise hand an operator back a
+    # rig that was running when they lent it to us and is not now.
+    "${compose[@]}" start source-db >/dev/null 2>&1 || true
   fi
   # config-ui is deliberately NOT recreated from the base files. The overlay's
   # only effect on it is to forward FEDERATION_DBS_LEEDS_EXT, and no base
@@ -487,6 +492,60 @@ read -r pair_count allocated_total distinct_results <<<"${allocation}"
   || fail "area-weighted allocation differs between federated and local sources"
 printf 'area-weighted census: %s pairs, %s allocated, identical both sides\n' \
   "${pair_count}" "${allocated_total}"
+
+step "Periodic verification revokes on outage and restores on recovery"
+# The behaviour the timer exists for, and the one that justified accepting
+# observe()'s revoke semantics for the periodic path: an outage costs access
+# automatically, and recovery returns it automatically. Asserted rather than
+# argued, because the whole design rests on the second half being true.
+#
+# The tick is called directly instead of waiting out the interval. That runs
+# the real function the thread runs; waiting 15 minutes would test the clock.
+verifier_tick() {
+  "${compose[@]}" exec -T config-ui python3 -c "
+import app
+print(app.verify_federation_sources())
+" 2>/dev/null
+}
+
+alias_status() {
+  platform_sql "SELECT status FROM federation._aliases WHERE alias = '${ALIAS}'"
+}
+
+owner_can_read() {
+  platform_sql "
+    SELECT has_schema_privilege('${DERIVED_OWNER_ROLE}',
+                                'source_${ALIAS}', 'USAGE')
+  "
+}
+
+[[ "$(alias_status)" == "active" ]] || fail "alias was not active before the outage"
+[[ "$(owner_can_read)" == "t" ]] || fail "derived owner could not read before the outage"
+
+"${compose[@]}" stop source-db >/dev/null 2>&1
+printf 'source stopped; running a verification pass
+'
+verifier_tick >/dev/null
+
+outage_status="$(alias_status)"
+outage_access="$(owner_can_read)"
+[[ "${outage_status}" == "unavailable" ]]   || fail "an unreachable source left the alias ${outage_status}, expected unavailable"
+[[ "${outage_access}" == "f" ]]   || fail "an unreachable source kept the derived owner readable"
+printf 'outage: status=%s, derived owner access revoked
+' "${outage_status}"
+
+"${compose[@]}" start source-db >/dev/null 2>&1
+"${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
+printf 'source recovered; running a verification pass
+'
+verifier_tick >/dev/null
+
+recovered_status="$(alias_status)"
+recovered_access="$(owner_can_read)"
+[[ "${recovered_status}" == "active" ]]   || fail "recovery left the alias ${recovered_status}, expected active"
+[[ "${recovered_access}" == "t" ]]   || fail "recovery did not restore the derived owner grant"
+printf 'recovery: status=%s, derived owner access restored
+' "${recovered_status}"
 
 step "A replaced source database must not provision"
 # Dropping and recreating the relation keeps every name and column identical

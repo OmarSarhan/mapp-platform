@@ -7296,14 +7296,12 @@ class FederationVerifierLoopTests(unittest.TestCase):
         # A source that broke while the service was down should be caught at
         # startup, not one interval later.
         order = []
-        wake = MagicMock()
 
-        def wait(timeout):
-            order.append(("wait", timeout))
+        def sleep(seconds):
+            order.append(("wait", seconds))
             raise StopIteration
 
-        wake.wait.side_effect = wait
-        with patch.object(app, "FEDERATION_VERIFY_WAKE", wake), patch.object(
+        with patch.object(app.time, "sleep", sleep), patch.object(
             app, "verify_federation_sources",
             side_effect=lambda: order.append(("pass", None)) or {
                 "observed": 1, "failed": 0, "skipped": 0
@@ -7324,14 +7322,11 @@ class FederationVerifierLoopTests(unittest.TestCase):
 
         calls = []
         waits = []
-        wake = MagicMock()
 
-        def wait(timeout):
-            waits.append(timeout)
+        def sleep(seconds):
+            waits.append(seconds)
             if len(waits) >= 2:
                 raise StopIteration
-
-        wake.wait.side_effect = wait
 
         def pass_then_raise():
             calls.append(1)
@@ -7339,7 +7334,7 @@ class FederationVerifierLoopTests(unittest.TestCase):
                 raise psycopg.OperationalError("registry down")
             return {"observed": 1, "failed": 0, "skipped": 0}
 
-        with patch.object(app, "FEDERATION_VERIFY_WAKE", wake), patch.object(
+        with patch.object(app.time, "sleep", sleep), patch.object(
             app, "verify_federation_sources", side_effect=pass_then_raise
         ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
             with self.assertRaises(StopIteration):
