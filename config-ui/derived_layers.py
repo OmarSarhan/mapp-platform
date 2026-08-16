@@ -2962,6 +2962,16 @@ class DerivedLayerStore:
         replace fail with DerivedLayerContentionError rather than slip
         through. The try-variant is deliberate: a blocking wait here would
         stall behind a materialization that is allowed to run for 30 minutes.
+
+        This session sits idle in transaction while the caller works, and the
+        role carries idle_in_transaction_session_timeout=1min. Retirement is
+        far below that -- every statement it runs is bounded by lock_timeout,
+        and it refuses outright while any derived layer reads the schema, so
+        there is nothing to wait behind. But the guarantee does rest on that
+        margin: if the caller's work ever grows past the timeout, PostgreSQL
+        terminates this session and drops the lock mid-flight, silently
+        restoring the race instead of failing. Anything slower than a
+        retirement needs its own admission mechanism, not this one.
         """
         with self._connect() as connection, connection.cursor() as cur:
             self._acquire_mutation_lock(connection)
