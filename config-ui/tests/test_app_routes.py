@@ -96,6 +96,40 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
         self.assertEqual("federation.registry_unavailable", body["code"])
 
+    def test_lock_contention_is_not_reported_as_a_dead_registry(self):
+        # observe()/provision() take a blocking per-alias advisory lock and the
+        # role carries lock_timeout, so contention arrives as a psycopg error.
+        # Reporting it as "the registry is unavailable" sends an operator to
+        # check a database that is working. The periodic verifier holds that
+        # same lock across its probe, which is exactly when someone is likely
+        # to be observing the alias by hand.
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.side_effect = psycopg.errors.LockNotAvailable(
+            "canceling statement due to lock timeout"
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.verification_in_progress", body["code"])
+        # LockNotAvailable subclasses psycopg.Error, so the specific handler
+        # has to come first; if it is ever reordered this fails.
+        self.assertNotIn("registry", body["error"].lower())
+
     def test_retire_is_refused_while_a_derived_layer_still_reads_the_alias(
         self,
     ):

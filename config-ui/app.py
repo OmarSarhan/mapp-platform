@@ -7789,6 +7789,28 @@ class Handler(SimpleHTTPRequestHandler):
                                 },
                             },
                         )
+                except psycopg.errors.LockNotAvailable:
+                    # Must precede psycopg.Error. observe() and provision()
+                    # take a blocking per-alias advisory lock, and the role
+                    # carries lock_timeout, so contention surfaces here as a
+                    # database error. Reporting it as "the registry is
+                    # unavailable" sends an operator to check a database that
+                    # is working perfectly. The periodic verifier holds that
+                    # same lock across its remote probe, which is precisely
+                    # when someone is most likely to be observing the alias by
+                    # hand -- a slow source is both the thing that widens the
+                    # window and the thing that makes them look.
+                    self._json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                f"Alias {alias_name!r} is being verified right "
+                                "now. Retry in a moment."
+                            ),
+                            "code": "federation.verification_in_progress",
+                        },
+                    )
+                    return
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
