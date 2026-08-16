@@ -7291,5 +7291,73 @@ class FederationVerificationTickTests(unittest.TestCase):
             )
 
 
+class FederationVerifierLoopTests(unittest.TestCase):
+    def test_runs_a_pass_before_it_ever_waits(self):
+        # A source that broke while the service was down should be caught at
+        # startup, not one interval later.
+        order = []
+        wake = MagicMock()
+
+        def wait(timeout):
+            order.append(("wait", timeout))
+            raise StopIteration
+
+        wake.wait.side_effect = wait
+        with patch.object(app, "FEDERATION_VERIFY_WAKE", wake), patch.object(
+            app, "verify_federation_sources",
+            side_effect=lambda: order.append(("pass", None)) or {
+                "observed": 1, "failed": 0, "skipped": 0
+            },
+        ):
+            with self.assertRaises(StopIteration):
+                app.run_federation_verifier()
+
+        self.assertEqual(
+            [("pass", None), ("wait", app.FEDERATION_VERIFY_INTERVAL_SECONDS)],
+            order,
+        )
+
+    def test_a_failed_pass_does_not_end_the_thread(self):
+        # One unreachable registry must not silently stop verification for the
+        # lifetime of the process.
+        import psycopg
+
+        calls = []
+        waits = []
+        wake = MagicMock()
+
+        def wait(timeout):
+            waits.append(timeout)
+            if len(waits) >= 2:
+                raise StopIteration
+
+        wake.wait.side_effect = wait
+
+        def pass_then_raise():
+            calls.append(1)
+            if len(calls) == 1:
+                raise psycopg.OperationalError("registry down")
+            return {"observed": 1, "failed": 0, "skipped": 0}
+
+        with patch.object(app, "FEDERATION_VERIFY_WAKE", wake), patch.object(
+            app, "verify_federation_sources", side_effect=pass_then_raise
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            with self.assertRaises(StopIteration):
+                app.run_federation_verifier()
+
+        self.assertEqual(2, len(calls), "the loop kept going after a failure")
+        # The type, not the text: exc_info renders the raising source line, so
+        # asserting on the message passes even when the real exception is a
+        # NameError from a missing import.
+        self.assertIs(psycopg.OperationalError, logs.records[0].exc_info[0])
+
+    def test_interval_is_long_enough_to_be_polite_to_a_third_party(self):
+        # Each pass opens a connection to a database somebody else operates.
+        # This is also the window a false revoke persists for, so it is
+        # bounded on both sides deliberately.
+        self.assertGreaterEqual(app.FEDERATION_VERIFY_INTERVAL_SECONDS, 300)
+        self.assertLessEqual(app.FEDERATION_VERIFY_INTERVAL_SECONDS, 3600)
+
+
 if __name__ == "__main__":
     unittest.main()

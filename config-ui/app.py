@@ -287,6 +287,13 @@ except GeminiClientError as exc:
     GEMINI_CONFIGURATION_ERROR = exc
 SEMANTIC_OUTBOX_LOCK = threading.Lock()
 SEMANTIC_OUTBOX_WAKE = threading.Event()
+# Fifteen minutes. This is not only how stale an observation can get -- it is
+# also how long a false revoke lasts, because an unreachable source loses
+# consumer access and only regains it on the next pass that succeeds. That
+# makes a shorter interval the safer one for availability, against four
+# connections an hour into a database somebody else operates.
+FEDERATION_VERIFY_INTERVAL_SECONDS = 900
+FEDERATION_VERIFY_WAKE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
 
@@ -1079,6 +1086,34 @@ def run_semantic_outbox() -> None:
             pass
         SEMANTIC_OUTBOX_WAKE.wait(10)
         SEMANTIC_OUTBOX_WAKE.clear()
+
+
+def run_federation_verifier() -> None:
+    """Verify every provisioned source on a timer, starting immediately.
+
+    The first pass runs before the first wait, so a source that broke while
+    the service was down is caught at startup rather than an interval later.
+
+    Deliberately thin: everything worth testing lives in
+    verify_federation_sources(), because logic inside a while True is logic no
+    test can reach.
+    """
+    while True:
+        try:
+            # The return value is deliberately ignored. Nothing configures
+            # logging in this service, so the effective level is WARNING and a
+            # per-pass INFO summary could never appear -- and a successful
+            # pass is already recorded durably as observed_at on each alias,
+            # which is queryable in a way a log line is not. Only the
+            # exceptional paths below log, and those do emit.
+            verify_federation_sources()
+        except Exception:
+            # Broad by intent, matching run_semantic_outbox: a registry that
+            # is briefly unreachable must not end the thread for the lifetime
+            # of the process. The next pass retries everything.
+            LOGGER.warning("Federation verification pass failed", exc_info=True)
+        FEDERATION_VERIFY_WAKE.wait(FEDERATION_VERIFY_INTERVAL_SECONDS)
+        FEDERATION_VERIFY_WAKE.clear()
 
 
 def verify_federation_sources() -> dict[str, int]:
@@ -9651,4 +9686,12 @@ if __name__ == "__main__":
         name="semantic-outbox",
         daemon=True,
     ).start()
+    # Only where a registry exists: outside bundled mode FEDERATION is None,
+    # and a thread whose every pass is a no-op is just a thread to explain.
+    if FEDERATION:
+        threading.Thread(
+            target=run_federation_verifier,
+            name="federation-verifier",
+            daemon=True,
+        ).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
