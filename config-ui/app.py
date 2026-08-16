@@ -1081,6 +1081,62 @@ def run_semantic_outbox() -> None:
         SEMANTIC_OUTBOX_WAKE.clear()
 
 
+def verify_federation_sources() -> dict[str, int]:
+    """Re-observe every provisioned source once, and report what happened.
+
+    This is deliberately the same call the operator's Observe route makes,
+    which means it carries the same consequence: _persist_observation grants
+    or revokes consumer access according to whether the evidence is still
+    current, so a source that has gone away loses access without anyone
+    asking, and regains it on the first observation that succeeds again.
+    Running it on a timer is what makes that automatic in both directions.
+    Introducing a second, weaker observe for the periodic path would mean two
+    sets of semantics for the same word, which is a worse trade than the
+    recovery window.
+
+    An unreachable source is not an error here. detect_capability catches
+    psycopg failures and returns connectivity 'unavailable', so it arrives as
+    an ordinary observation -- exactly the condition this exists to notice.
+    The exceptions counted below are the genuinely exceptional ones: a
+    connectionRef no longer configured, or the local registry being
+    unavailable.
+
+    Returns counts rather than raising so a caller can log one line per pass.
+    """
+    summary = {"observed": 0, "failed": 0, "skipped": 0}
+    if not FEDERATION:
+        return summary
+    # list() already excludes retired aliases, which is the filter that keeps
+    # a decommissioned source from being probed on a timer forever. Repeating
+    # the condition here would be a second place to forget to change.
+    for record in FEDERATION.list():
+        alias = record["alias"]
+        if record["provisionedAt"] is None:
+            # Nothing is exposed yet, so there is no access to keep honest and
+            # no reason to open a connection to somebody else's database.
+            summary["skipped"] += 1
+            continue
+        try:
+            FEDERATION.observe(
+                alias,
+                resolve_federation_connection_url(record["connectionRef"]),
+                allowed_relations=tuple(record["allowedRelations"]),
+                tls_policy=record["tlsPolicy"],
+            )
+            summary["observed"] += 1
+        except Exception:
+            # One alias must not stop the rest: a single removed connectionRef
+            # would otherwise leave every later source unverified. Broad by
+            # intent -- this runs unattended, and the next pass retries
+            # everything regardless of why this one failed.
+            summary["failed"] += 1
+            LOGGER.warning(
+                "Federation verification failed for alias %r", alias,
+                exc_info=True,
+            )
+    return summary
+
+
 def archive_derived_semantics_before_reset(
     reset_owner: str,
     timeout_seconds: int = 120,

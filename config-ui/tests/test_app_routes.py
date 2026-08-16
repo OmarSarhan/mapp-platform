@@ -7171,5 +7171,125 @@ class AuthorizationScopeTests(unittest.TestCase):
                 self.assertIsNone(app.semantic_proxy_path(path))
 
 
+class FederationVerificationTickTests(unittest.TestCase):
+    """The tick that the periodic verifier will call.
+
+    Kept separate from any loop or thread so the behaviour that matters is
+    reachable from a test: run_semantic_outbox, the pattern this follows, has
+    no tests at all because its logic lives inside a while True.
+    """
+
+    @staticmethod
+    def alias(name, **overrides):
+        record = {
+            "alias": name,
+            "provisionedAt": "2026-08-11T00:00:00Z",
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        record.update(overrides)
+        return record
+
+    def test_observes_each_provisioned_source_with_its_own_settings(self):
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("leeds_ext"),
+            self.alias("bristol_ext", connectionRef="BRISTOL", tlsPolicy="verify-full"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://leeds", "BRISTOL": "postgresql://bristol"},
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 2, "failed": 0, "skipped": 0}, summary)
+        observed = {
+            call.args[0]: call for call in federation.observe.call_args_list
+        }
+        self.assertEqual({"leeds_ext", "bristol_ext"}, set(observed))
+        # Each alias must be probed with its own reference and policy; reusing
+        # the first alias's settings would silently verify the wrong thing.
+        self.assertEqual("postgresql://bristol", observed["bristol_ext"].args[1])
+        self.assertEqual(
+            "verify-full", observed["bristol_ext"].kwargs["tls_policy"]
+        )
+
+    def test_skips_sources_that_expose_nothing_yet(self):
+        # A pending alias has no access to keep honest, so probing it would be
+        # an outbound connection to a third party for no reason.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("pending_ext", provisionedAt=None)]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            summary = app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        self.assertEqual({"observed": 0, "failed": 0, "skipped": 1}, summary)
+
+    def test_never_observes_a_retired_alias(self):
+        # Retired exclusion comes from list(). Pinning it here means a change
+        # to that filter fails a test rather than quietly putting a
+        # decommissioned source back on a timer.
+        federation = MagicMock()
+        federation.list.return_value = []
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            app.verify_federation_sources()
+
+        statement = str(federation.list.call_args)
+        self.assertTrue(federation.list.called, statement)
+        federation.observe.assert_not_called()
+
+    def test_one_failing_alias_does_not_strand_the_others(self):
+        # A single removed connectionRef would otherwise leave every source
+        # after it in the list unverified until someone noticed.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("gone_ext", connectionRef="REMOVED"),
+            self.alias("leeds_ext"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 1, "failed": 1, "skipped": 0}, summary)
+        self.assertEqual(
+            ["leeds_ext"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertIn("gone_ext", "\n".join(logs.output))
+
+    def test_a_source_going_unreachable_is_not_counted_as_a_failure(self):
+        # detect_capability returns connectivity 'unavailable' rather than
+        # raising, so this is an ordinary observation -- the exact condition
+        # the verifier exists to notice, not an error to log.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {
+            "alias": "leeds_ext",
+            "status": "unavailable",
+            "lastObservation": {"connectivity": "unavailable"},
+        }
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 0}, summary)
+
+    def test_is_inert_when_federation_is_not_configured(self):
+        # Outside bundled mode FEDERATION is None; the tick must be safe to
+        # call rather than raising into a background thread.
+        with patch.object(app, "FEDERATION", None):
+            self.assertEqual(
+                {"observed": 0, "failed": 0, "skipped": 0},
+                app.verify_federation_sources(),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
