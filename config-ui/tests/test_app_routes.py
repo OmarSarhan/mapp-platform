@@ -7187,6 +7187,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             "connectionRef": "LEEDS_EXT",
             "allowedRelations": ["leeds.smoke_control_orders"],
             "tlsPolicy": "require",
+            "acceptedEvidenceComplete": True,
         }
         record.update(overrides)
         return record
@@ -7242,6 +7243,28 @@ class FederationVerificationTickTests(unittest.TestCase):
         statement = str(federation.list.call_args)
         self.assertTrue(federation.list.called, statement)
         federation.observe.assert_not_called()
+
+    def test_never_revokes_an_alias_it_could_never_restore(self):
+        # An alias approved before the accepted-evidence columns existed can
+        # never satisfy the currency test, so observing it on a timer revokes
+        # every pass and only an operator provision can undo it. The interval
+        # bounds a false revoke only for sources that can recover; this class
+        # cannot, so the timer must leave it alone.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("pre_migration", acceptedEvidenceComplete=False),
+            self.alias("leeds_ext"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(
+            ["leeds_ext"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 1}, summary)
 
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source

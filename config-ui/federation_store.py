@@ -252,7 +252,12 @@ class FederationAliasStore:
         retired_at AS "retiredAt",
         retired_by AS "retiredBy",
         archived_schema AS "archivedSchema",
-        archived_server AS "archivedServer"
+        archived_server AS "archivedServer",
+        (
+          accepted_schema_fingerprint IS NOT NULL
+          AND accepted_physical_identity IS NOT NULL
+          AND accepted_connection_identity IS NOT NULL
+        ) AS "acceptedEvidenceComplete"
     """)
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
@@ -380,6 +385,19 @@ class FederationAliasStore:
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"{SCHEMA}:observe:{alias}",),
+            )
+            # This transaction stays open across detect_capability below, so
+            # the role's idle_in_transaction_session_timeout of one minute
+            # applies to a remote probe, not to an idle session. The probe is
+            # bounded per statement (5s remote statement_timeout, 5s connect)
+            # but not in aggregate: it costs 11+5N round-trips for N allowed
+            # relations, so a high-latency source with many relations exceeds
+            # a minute and PostgreSQL terminates the session before anything
+            # is persisted -- leaving the alias never verified and never
+            # revoked, which is the opposite of what a slow source deserves.
+            # transaction_timeout remains the outer bound.
+            cur.execute(
+                "SET LOCAL idle_in_transaction_session_timeout = '10min'"
             )
             local_default_collation = (
                 _database_default_collation_identity(cur)

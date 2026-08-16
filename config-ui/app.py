@@ -1154,6 +1154,20 @@ def verify_federation_sources() -> dict[str, int]:
             # no reason to open a connection to somebody else's database.
             summary["skipped"] += 1
             continue
+        if not record["acceptedEvidenceComplete"]:
+            # An alias approved before the accepted-evidence columns existed
+            # can never satisfy _persist_observation's currency test, because
+            # that test requires all three to be non-NULL and to match. On a
+            # timer that is not a stale reading, it is a one-way door: every
+            # pass revokes, and only provision() with explicit operator
+            # acknowledgement can ever put it back, which no timer supplies.
+            # The interval bounds how long a false revoke lasts only for
+            # sources that can recover; this class cannot, so the timer leaves
+            # it exactly as it found it. An operator's own Observe still
+            # reaches it, and acceptedEvidenceComplete tells them which
+            # aliases need reprovisioning.
+            summary["skipped"] += 1
+            continue
         try:
             FEDERATION.observe(
                 alias,
