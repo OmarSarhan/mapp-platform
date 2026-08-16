@@ -45,7 +45,7 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_schema import FederationSchemaError
+from federation_schema import FederationSchemaError, enforce_tls_policy
 from federation_store import MAX_ALIASES, FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
@@ -309,6 +309,15 @@ FEDERATION_VERIFY_STARTUP_GRACE_SECONDS = 60
 # slow pass defers is exactly what the next pass starts with -- bounded and
 # fair, rather than the same prefix being rechecked forever.
 FEDERATION_VERIFY_PASS_BUDGET_SECONDS = 600
+# When each alias was last attempted, as opposed to last successfully observed.
+# lastObservationId only advances when an observation is persisted, so an alias
+# whose probe times out never moves under an ordering keyed on it alone: it
+# sorts first on every pass, spends the whole budget, and the aliases behind it
+# are never reached at all. Recording the attempt rotates it regardless of
+# outcome. Process-local and bounded by the registry ceiling; losing it on
+# restart only falls back to observation order, which is the right default for
+# a fresh process.
+FEDERATION_VERIFY_ATTEMPTS: dict[str, float] = {}
 FEDERATION_FIRST_PASS_DONE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
@@ -1186,6 +1195,7 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
     candidates = sorted(
         FEDERATION.list(),
         key=lambda item: (
+            FEDERATION_VERIFY_ATTEMPTS.get(item["alias"], 0.0),
             item["lastObservationId"] is not None,
             item["lastObservationId"] or 0,
         ),
@@ -1229,26 +1239,35 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             # aliases need reprovisioning.
             summary["skipped"] += 1
             continue
+        FEDERATION_VERIFY_ATTEMPTS[alias] = time.monotonic()
         try:
             try:
                 connection_url = resolve_federation_connection_url(
                     record["connectionRef"]
                 )
+                # Every way the configuration itself can be unusable, checked
+                # before observe() opens its transaction: the reference gone,
+                # conninfo that will not parse, unsupported options, or TLS
+                # weaker than the alias registered for. detect_capability
+                # enforces the same policy, but by then the failure arrives
+                # mid-observation with nothing persisted and no chance to act
+                # on it. None of these is transient -- no retry fixes a
+                # malformed connection string -- so the alias is unverifiable
+                # until someone repairs the configuration.
+                enforce_tls_policy(record["tlsPolicy"], connection_url)
             except FederationSchemaError as exc:
-                if exc.code != "federation.connection_ref_not_found":
-                    raise
-                # No observation can ever reach this alias, yet its foreign
-                # tables keep working: the user mapping still holds the remote
-                # credential. Left alone, both consumer roles would read a
-                # source the deployment cannot verify, for as long as nobody
-                # noticed -- and every other revoke path runs from an
-                # observation there is no way to make. Recoverable: restoring
-                # the variable lets the next pass grant access straight back.
+                # The foreign tables keep working regardless: the user mapping
+                # still holds the remote credential, so both consumer roles
+                # would read a source the deployment cannot verify. Every other
+                # revoke path runs from an observation that cannot be made
+                # here. Recoverable -- repairing the configuration lets the
+                # next pass grant access straight back.
                 if FEDERATION.mark_unverifiable(alias):
                     LOGGER.warning(
-                        "Federation alias %r has no configured connectionRef "
-                        "%r; consumer access withdrawn until it returns",
-                        alias, record["connectionRef"],
+                        "Federation alias %r cannot be verified with "
+                        "connectionRef %r (%s); consumer access withdrawn "
+                        "until the configuration is repaired",
+                        alias, record["connectionRef"], exc,
                     )
                 summary["failed"] += 1
                 continue

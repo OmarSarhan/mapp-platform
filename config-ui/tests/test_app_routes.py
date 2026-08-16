@@ -119,7 +119,7 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         with patch.object(app, "FEDERATION", federation), patch.object(
             app, "CONTROL", MagicMock()
         ), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             handler.do_POST()
 
@@ -7205,6 +7205,12 @@ class AuthorizationScopeTests(unittest.TestCase):
                 self.assertIsNone(app.semantic_proxy_path(path))
 
 
+VALID_SOURCE_URL = (
+    "postgresql://reader:secret@source-db:5432/sourcedb"
+    "?sslmode=require&gssencmode=disable"
+)
+
+
 class FederationVerificationTickTests(unittest.TestCase):
     """The tick that the periodic verifier will call.
 
@@ -7235,7 +7241,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         ]
         with patch.object(app, "FEDERATION", federation), patch.object(
             app, "FEDERATION_CONNECTIONS",
-            {"LEEDS_EXT": "postgresql://leeds", "BRISTOL": "postgresql://bristol"},
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable", "BRISTOL": "postgresql://reader:secret@bristol-db:5432/bristol?sslmode=verify-full&gssencmode=disable&sslrootcert=system"},
         ):
             summary = app.verify_federation_sources()
 
@@ -7246,7 +7252,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         self.assertEqual({"leeds_ext", "bristol_ext"}, set(observed))
         # Each alias must be probed with its own reference and policy; reusing
         # the first alias's settings would silently verify the wrong thing.
-        self.assertEqual("postgresql://bristol", observed["bristol_ext"].args[1])
+        self.assertEqual("postgresql://reader:secret@bristol-db:5432/bristol?sslmode=verify-full&gssencmode=disable&sslrootcert=system", observed["bristol_ext"].args[1])
         self.assertEqual(
             "verify-full", observed["bristol_ext"].kwargs["tls_policy"]
         )
@@ -7257,7 +7263,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         federation = MagicMock()
         federation.list.return_value = [self.alias("pending_ext", provisionedAt=None)]
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             summary = app.verify_federation_sources()
 
@@ -7291,7 +7297,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.alias("leeds_ext"),
         ]
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             summary = app.verify_federation_sources()
 
@@ -7311,7 +7317,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.alias("someone_elses"),
         ]
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             summary = app.verify_federation_sources(only="e2e_probe")
 
@@ -7369,7 +7375,7 @@ class FederationVerificationTickTests(unittest.TestCase):
         )
         federation.mark_unverifiable.return_value = True
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ), self.assertLogs(app.LOGGER, level="WARNING"):
             summary = app.verify_federation_sources()
 
@@ -7387,9 +7393,14 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.alias("second", lastObservationId=2),
             self.alias("third", lastObservationId=3),
         ]
-        clock = iter([0.0, 0.0, 10_000.0, 10_000.0])
+        # One reading for the pass deadline, then one per alias for the
+        # deadline check and one for its attempt stamp. A generator keeps the
+        # test from depending on that exact call count: the first alias is
+        # inside the budget, everything after it is not.
+        ticks = iter([0.0, 0.0, 0.1] + [10_000.0] * 20)
+        clock = ticks
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ), patch.object(app.time, "monotonic", lambda: next(clock)),                 self.assertLogs(app.LOGGER, level="WARNING") as logs:
             summary = app.verify_federation_sources()
 
@@ -7413,7 +7424,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.alias("mmm_never", lastObservationId=None),
         ]
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             app.verify_federation_sources()
 
@@ -7421,6 +7432,63 @@ class FederationVerificationTickTests(unittest.TestCase):
             ["mmm_never", "zzz_stale", "aaa_recent"],
             [call.args[0] for call in federation.observe.call_args_list],
         )
+
+    def test_an_alias_that_ate_the_budget_yields_to_the_deferred_one(self):
+        # The case that matters: lastObservationId only advances on a persisted
+        # observation, so an alias whose probe never persists would sort first
+        # forever, spend the whole budget again, and the alias it deferred
+        # would never be reached at all.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("hog", lastObservationId=1),
+            self.alias("starved", lastObservationId=2),
+        ]
+        # Pass one: deadline set, hog passes the check and is stamped, then the
+        # clock jumps past the budget so starved is deferred untouched.
+        # Pass two: plenty of budget, so ordering alone decides who goes first.
+        clock = iter([0.0, 0.0, 1.0, 10_000.0,
+                      20_000.0, 20_001.0, 20_002.0, 20_003.0, 20_004.0])
+        app.FEDERATION_VERIFY_ATTEMPTS.clear()
+        try:
+            with patch.object(app, "FEDERATION", federation), patch.object(
+                app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+            ), patch.object(app.time, "monotonic", lambda: next(clock)), \
+                    self.assertLogs(app.LOGGER, level="WARNING"):
+                first = app.verify_federation_sources()
+                attempted_first = [
+                    c.args[0] for c in federation.observe.call_args_list
+                ]
+                federation.observe.reset_mock()
+                app.verify_federation_sources()
+                attempted_second = [
+                    c.args[0] for c in federation.observe.call_args_list
+                ]
+        finally:
+            app.FEDERATION_VERIFY_ATTEMPTS.clear()
+
+        self.assertEqual(["hog"], attempted_first)
+        self.assertEqual(1, first["deferred"])
+        # The starved alias must lead the next pass, not the hog again.
+        self.assertEqual("starved", attempted_second[0])
+
+    def test_unusable_connection_configuration_withdraws_access(self):
+        # Resolution succeeds but the configuration cannot be used: TLS weaker
+        # than the alias registered for. No retry fixes that, and the foreign
+        # tables keep working from the retained user mapping meanwhile.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("weak_tls")]
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"
+                          "?sslmode=disable&gssencmode=disable"},
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        federation.mark_unverifiable.assert_called_once_with("weak_tls")
+        self.assertEqual(1, summary["failed"])
+        self.assertIn("weak_tls", "\n".join(logs.output))
 
     def test_one_failing_alias_does_not_strand_the_others(self):
         # A single removed connectionRef would otherwise leave every source
@@ -7431,7 +7499,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.alias("leeds_ext"),
         ]
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
             summary = app.verify_federation_sources()
 
@@ -7454,7 +7522,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             "lastObservation": {"connectivity": "unavailable"},
         }
         with patch.object(app, "FEDERATION", federation), patch.object(
-            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
         ):
             summary = app.verify_federation_sources()
 
