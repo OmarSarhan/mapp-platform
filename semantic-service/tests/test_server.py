@@ -131,7 +131,7 @@ class SemanticServerTest(unittest.TestCase):
         status, body = self.request("GET", "/v1/status")
         self.assertEqual(status, 200)
         self.assertEqual(body["schemaVersion"], 5)
-        self.assertEqual(body["serviceVersion"], "1.1.0")
+        self.assertEqual(body["serviceVersion"], "1.2.0")
         self.assertEqual(
             body["capabilities"]["pagination"],
             {

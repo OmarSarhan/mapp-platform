@@ -454,6 +454,17 @@ optimistic-locking `version`, its source `generation`, and the workspace
 revision. Clients use the asset `version`, not `catalogRevision`, as
 `baseVersion` for a curated semantic proposal.
 
+Every semantic asset also carries `sourceState`. It is `null` while the
+relation the asset was generated from is usable, and `"unavailable"` once the
+platform has observed that it is not — a federated source that has been retired
+or that verification can no longer reach. It is deliberately separate from
+`status`: `archived` records an operator's confirmed decision, whereas
+`sourceState` is an observation that reverses itself when the source returns,
+and an archived asset whose source also disappeared carries both. The asset,
+its `id`, and its curated semantics are retained throughout, so a source coming
+back restores exactly its own annotations rather than requiring them to be
+recreated.
+
 `SEMANTIC_SOURCE_EXCLUSIONS` affects future source discovery and synchronization
 but does not automatically hide profiles registered before the setting was
 changed. The confirmed archive-excluded action performs that explicit

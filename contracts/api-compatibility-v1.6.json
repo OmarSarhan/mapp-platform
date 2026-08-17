@@ -3,7 +3,7 @@
   "apiVersion": "1.6",
   "contractVersion": "1.6",
   "rulesVersion": "1.6",
-  "semanticServiceVersion": "1.1.0",
+  "semanticServiceVersion": "1.2.0",
   "consumers": {
     "mapp-config-cli": {
       "minimumVersion": "0.1.0",
