@@ -1174,6 +1174,43 @@ def run_federation_verifier() -> None:
         )
 
 
+def reconcile_semantic_source_state(alias: str, *, available: bool) -> None:
+    """Mirror an alias's usability onto the semantic assets bound to it.
+
+    Deliberately never raises. The federation observation that produced this
+    verdict has already been persisted, and its grants already applied; a
+    semantic service that is briefly unreachable must not turn a successful
+    verification into a failed one, nor block startup readiness on a subsystem
+    that has nothing to do with whether the source is reachable. The next pass
+    reconciles again, and mark_source_state reports nothing changed when it is
+    already right, so a persistent outage costs one warning per pass rather
+    than a silent divergence.
+    """
+    if not SEMANTIC:
+        return
+    try:
+        result = SEMANTIC.request(
+            "/v1/source-state",
+            method="POST",
+            payload={"schema": f"source_{alias}", "available": available},
+            actor="federation-verifier",
+            scopes=["semantic:admin"],
+        )
+    except Exception:
+        LOGGER.warning(
+            "Could not mirror federation state onto semantic assets for "
+            "alias %r; the catalog may show it as usable until the next pass",
+            alias, exc_info=True,
+        )
+        return
+    changed = result.get("changed") if isinstance(result, dict) else None
+    if changed:
+        LOGGER.info(
+            "Federation alias %r is %s; %d semantic asset(s) updated",
+            alias, "available" if available else "unavailable", len(changed),
+        )
+
+
 def verify_federation_sources(only: str | None = None) -> dict[str, int]:
     """Re-observe every provisioned source once, and report what happened.
 
@@ -1253,7 +1290,16 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             # it exactly as it found it. An operator's own Observe still
             # reaches it, and acceptedEvidenceComplete tells them which
             # aliases need reprovisioning.
+            #
+            # Its semantics are still mirrored. Skipping the observation is
+            # not the same as having nothing to say: this alias is very likely
+            # unavailable with its grants already revoked, and leaving its
+            # assets claiming otherwise is the exact divergence this exists to
+            # close.
             summary["skipped"] += 1
+            reconcile_semantic_source_state(
+                alias, available=record["status"] == "active"
+            )
             continue
         FEDERATION_VERIFY_ATTEMPTS[alias] = time.monotonic()
         try:
@@ -1286,14 +1332,20 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
                         alias, record["connectionRef"], exc,
                     )
                 summary["failed"] += 1
+                reconcile_semantic_source_state(alias, available=False)
                 continue
-            FEDERATION.observe(
+            observed = FEDERATION.observe(
                 alias,
                 connection_url,
                 allowed_relations=tuple(record["allowedRelations"]),
                 tls_policy=record["tlsPolicy"],
             )
             summary["observed"] += 1
+            # From the observation's own result, not the listed record, which
+            # is now stale by exactly this call.
+            reconcile_semantic_source_state(
+                alias, available=observed.get("status") == "active"
+            )
         except (
             psycopg.errors.IdleInTransactionSessionTimeout,
             psycopg.errors.TransactionTimeout,
@@ -1314,6 +1366,7 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
                     "pass completes", alias,
                 )
             summary["failed"] += 1
+            reconcile_semantic_source_state(alias, available=False)
         except Exception:
             # One alias must not stop the rest: a single removed connectionRef
             # would otherwise leave every later source unverified. Broad by
@@ -1323,6 +1376,12 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             LOGGER.warning(
                 "Federation verification failed for alias %r", alias,
                 exc_info=True,
+            )
+            # Transient, so the registry status is unchanged and still
+            # accurate. Mirroring it keeps the two from drifting apart while
+            # whatever went wrong is retried.
+            reconcile_semantic_source_state(
+                alias, available=record["status"] == "active"
             )
     return summary
 
@@ -7797,7 +7856,19 @@ class Handler(SimpleHTTPRequestHandler):
                                         code="federation.alias_in_use",
                                         status=HTTPStatus.CONFLICT,
                                     )
-                                result = FEDERATION.retire(alias_name, actor)
+                                # Before the retirement, not after. Retirement is
+                            # terminal and list() excludes retired aliases, so
+                            # the verifier never revisits this one -- a
+                            # semantic failure afterwards would leave its
+                            # assets claiming the source is fine forever, with
+                            # nothing left to correct it. Doing it first means
+                            # the only failure mode is the recoverable one: if
+                            # the retirement then fails, the alias stays
+                            # active and the next pass clears the flag.
+                            reconcile_semantic_source_state(
+                                alias_name, available=False
+                            )
+                            result = FEDERATION.retire(alias_name, actor)
                         except DerivedLayerContentionError as exc:
                             # Translated rather than routed through the derived
                             # error machinery, which would describe this as a

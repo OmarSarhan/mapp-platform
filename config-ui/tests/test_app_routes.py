@@ -179,6 +179,34 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("retired", body["alias"]["status"])
 
+    def test_retire_marks_semantics_before_the_point_of_no_return(self):
+        # Retirement is terminal and list() excludes retired aliases, so the
+        # verifier never revisits one. Flagging afterwards would leave the
+        # assets claiming the source is fine forever if the semantic call
+        # failed; flagging first makes the only failure mode recoverable.
+        order = []
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.side_effect = lambda *a, **k: (
+            order.append("retire") or {"alias": "leeds_ext", "status": "retired"}
+        )
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state",
+            side_effect=lambda alias, *, available: order.append(
+                ("semantics", alias, available)
+            ),
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
+
     def test_retire_refuses_when_a_derived_mutation_holds_admission(self):
         # The dependency check and the retirement DDL commit in separate
         # transactions, so admission is held across both to stop a layer
@@ -7269,6 +7297,7 @@ class FederationVerificationTickTests(unittest.TestCase):
             "tlsPolicy": "require",
             "acceptedEvidenceComplete": True,
             "lastObservationId": 1,
+            "status": "active",
         }
         record.update(overrides)
         return record
@@ -7346,6 +7375,75 @@ class FederationVerificationTickTests(unittest.TestCase):
             [call.args[0] for call in federation.observe.call_args_list],
         )
         self.assertEqual({"observed": 1, "failed": 0, "skipped": 1, "deferred": 0}, summary)
+
+    def test_a_semantic_outage_does_not_fail_the_verification(self):
+        # The observation is already persisted and its grants already applied.
+        # A semantic service that is briefly unreachable must not turn that
+        # into a failed pass, nor block startup readiness on a subsystem that
+        # has nothing to do with whether the source is reachable.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {"status": "active"}
+        semantic = MagicMock()
+        semantic.request.side_effect = RuntimeError("semantic service is down")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(
+            {"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}, summary
+        )
+        self.assertIn("leeds_ext", "\n".join(logs.output))
+
+    def test_semantics_follow_the_alias_status_after_observing(self):
+        for status, expected in (("active", True), ("unavailable", False)):
+            with self.subTest(status=status):
+                federation = MagicMock()
+                federation.list.return_value = [self.alias("leeds_ext")]
+                federation.observe.return_value = {"status": status}
+                semantic = MagicMock()
+                semantic.request.return_value = {"changed": []}
+
+                with patch.object(app, "FEDERATION", federation), patch.object(
+                    app, "SEMANTIC", semantic
+                ), patch.object(
+                    app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+                ):
+                    app.verify_federation_sources()
+
+                payload = semantic.request.call_args.kwargs["payload"]
+                self.assertEqual("source_leeds_ext", payload["schema"])
+                self.assertEqual(expected, payload["available"])
+
+    def test_an_alias_skipped_for_evidence_still_mirrors_its_status(self):
+        # Skipping the observation is not the same as having nothing to say:
+        # the alias is unavailable with its grants revoked, and its assets
+        # must not claim otherwise.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("stale", acceptedEvidenceComplete=False, status="unavailable")
+        ]
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": ["asset:x"]}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ):
+            app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertEqual({"schema": "source_stale", "available": False}, payload)
+
+    def test_reconciliation_is_inert_without_a_semantic_service(self):
+        with patch.object(app, "SEMANTIC", None):
+            app.reconcile_semantic_source_state("leeds_ext", available=False)
 
     def test_only_scopes_a_pass_to_a_single_alias(self):
         # The timer never passes this. A test that stops a shared source must
