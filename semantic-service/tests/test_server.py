@@ -113,6 +113,94 @@ class SemanticServerTest(unittest.TestCase):
             value["visibility"] = visibility
         return value
 
+    def _federated_event(self, asset_id: str, schema: str, event_id: str) -> dict:
+        return {
+            "eventId": event_id,
+            "assetId": asset_id,
+            "type": "register",
+            "generation": 1,
+            "generated": {
+                "kind": "managed-derived",
+                "name": "orders",
+                "binding": {
+                    "adapter": "postgresql",
+                    "schema": schema,
+                    "relation": "orders",
+                },
+                "fields": [{"name": "id", "type": "integer"}],
+            },
+        }
+
+    def test_source_state_route_flags_and_clears_by_schema(self) -> None:
+        self.request(
+            "POST", "/v1/events",
+            self._federated_event("asset:fed", "source_leeds", "e-fed"),
+            scopes="semantic:admin",
+        )
+        self.request(
+            "POST", "/v1/events", self.event(event_id="e-derived"),
+            scopes="semantic:admin",
+        )
+
+        status, body = self.request(
+            "POST", "/v1/source-state",
+            {"schema": "source_leeds", "available": False},
+            scopes="semantic:admin",
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual(["asset:fed"], body["changed"])
+
+        # Reported once: a second identical call changes nothing, so a caller
+        # on a timer does not log every pass.
+        _, repeat = self.request(
+            "POST", "/v1/source-state",
+            {"schema": "source_leeds", "available": False},
+            scopes="semantic:admin",
+        )
+        self.assertEqual([], repeat["changed"])
+
+        _, catalog = self.request("GET", "/v1/catalog")
+        states = {
+            a["id"]: a["sourceState"] for a in catalog["assets"]
+        }
+        self.assertEqual("unavailable", states["asset:fed"])
+        # An unrelated binding is untouched.
+        self.assertIsNone(states["asset:derived/roads"])
+
+        _, cleared = self.request(
+            "POST", "/v1/source-state",
+            {"schema": "source_leeds", "available": True},
+            scopes="semantic:admin",
+        )
+        self.assertEqual(["asset:fed"], cleared["changed"])
+        _, after = self.request("GET", "/v1/catalog")
+        self.assertTrue(all(a["sourceState"] is None for a in after["assets"]))
+
+    def test_source_state_route_rejects_malformed_requests(self) -> None:
+        for name, payload in (
+            ("missing schema", {"available": False}),
+            ("blank schema", {"schema": "   ", "available": False}),
+            # Truthiness would read a missing or misspelled property as false
+            # and quietly mark a healthy source unusable.
+            ("missing available", {"schema": "source_leeds"}),
+            ("non-boolean available", {"schema": "source_leeds", "available": "no"}),
+            ("unknown property", {"schema": "s", "available": True, "oops": 1}),
+        ):
+            with self.subTest(name=name):
+                status, body = self.request(
+                    "POST", "/v1/source-state", payload, scopes="semantic:admin",
+                )
+                self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+                self.assertEqual("invalid_request", body["error"]["code"])
+
+    def test_source_state_route_requires_the_admin_scope(self) -> None:
+        status, _ = self.request(
+            "POST", "/v1/source-state",
+            {"schema": "source_leeds", "available": False},
+            scopes="semantic:inspect",
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+
     def test_health_is_public_but_every_v1_route_requires_token(self) -> None:
         status, body = self.request("GET", "/healthz", token=False, scopes=None)
         self.assertEqual(status, 200)
@@ -177,6 +265,7 @@ class SemanticServerTest(unittest.TestCase):
 
         write_routes = {
             "/v1/events": ("semantic:admin", 400),
+            "/v1/source-state": ("semantic:admin", 400),
             "/v1/proposals/check": ("semantic:propose", 400),
             "/v1/proposals": ("semantic:propose", 400),
             "/v1/proposals/missing/apply": ("semantic:apply", 404),
@@ -203,6 +292,7 @@ class SemanticServerTest(unittest.TestCase):
     def test_private_route_actions_require_exact_paths(self) -> None:
         cases = (
             ("/v1/events/", "semantic:admin"),
+            ("/v1/source-state/", "semantic:admin"),
             ("/v1/proposals/check/", "semantic:propose"),
             ("/v1/proposals//apply", "semantic:apply"),
             ("/v1/proposals/proposal-1/apply/", "semantic:apply"),
