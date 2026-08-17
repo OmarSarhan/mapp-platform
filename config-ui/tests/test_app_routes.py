@@ -7548,7 +7548,12 @@ class FederationVerifierLoopTests(unittest.TestCase):
             order.append(("wait", seconds))
             raise StopIteration
 
-        with patch.object(app.time, "sleep", sleep), patch.object(
+        # Two readings per iteration: the pass start, and the elapsed
+        # calculation. Equal values mean an instant pass, so the sleep is the
+        # whole interval.
+        clock = iter([0.0, 0.0])
+        with patch.object(app.time, "monotonic", lambda: next(clock)), \
+                patch.object(app.time, "sleep", sleep), patch.object(
             app, "verify_federation_sources",
             side_effect=lambda: order.append(("pass", None)) or {
                 "observed": 1, "failed": 0, "skipped": 0
@@ -7675,6 +7680,36 @@ class FederationVerifierLoopTests(unittest.TestCase):
             self.assertTrue(app.FEDERATION_FIRST_PASS_DONE.is_set())
         finally:
             app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_the_next_pass_is_scheduled_from_the_last_one_starting(self):
+        # Sleeping the full interval after the pass makes the real period the
+        # interval plus however long the pass took -- up to 25 minutes with
+        # the pass budget, not the 15 the constant claims.
+        for elapsed, expected in (
+            (0.0, app.FEDERATION_VERIFY_INTERVAL_SECONDS),
+            (500.0, app.FEDERATION_VERIFY_INTERVAL_SECONDS - 500.0),
+            # A pass that overran the interval is already late: no sleep.
+            (app.FEDERATION_VERIFY_INTERVAL_SECONDS + 300.0, 0.0),
+        ):
+            with self.subTest(elapsed=elapsed):
+                slept = []
+
+                def sleep(seconds):
+                    slept.append(seconds)
+                    raise StopIteration
+
+                clock = iter([0.0, elapsed])
+                with patch.object(app.time, "monotonic", lambda: next(clock)), \
+                        patch.object(app.time, "sleep", sleep), patch.object(
+                    app, "verify_federation_sources",
+                    return_value={
+                        "observed": 1, "failed": 0, "skipped": 0, "deferred": 0
+                    },
+                ):
+                    with self.assertRaises(StopIteration):
+                        app.run_federation_verifier()
+
+                self.assertEqual([expected], slept)
 
     def test_interval_is_long_enough_to_be_polite_to_a_third_party(self):
         # Each pass opens a connection to a database somebody else operates.

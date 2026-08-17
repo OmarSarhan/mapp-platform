@@ -287,7 +287,9 @@ except GeminiClientError as exc:
     GEMINI_CONFIGURATION_ERROR = exc
 SEMANTIC_OUTBOX_LOCK = threading.Lock()
 SEMANTIC_OUTBOX_WAKE = threading.Event()
-# Fifteen minutes. This is not only how stale an observation can get -- it is
+# Fifteen minutes, measured from the start of one pass to the start of the
+# next, so this is a cadence rather than a gap bolted onto however long a pass
+# took. This is not only how stale an observation can get -- it is
 # also how long a false revoke lasts, because an unreachable source loses
 # consumer access and only regains it on the next pass that succeeds. That
 # makes a shorter interval the safer one for availability, against four
@@ -1124,6 +1126,7 @@ def run_federation_verifier() -> None:
     test can reach.
     """
     while True:
+        started = time.monotonic()
         try:
             # The return value is deliberately ignored. Nothing configures
             # logging in this service, so the effective level is WARNING and a
@@ -1150,12 +1153,25 @@ def run_federation_verifier() -> None:
             # is briefly unreachable must not end the thread for the lifetime
             # of the process. The next pass retries everything.
             LOGGER.warning("Federation verification pass failed", exc_info=True)
+        # Measured from when the pass started, not from when it finished.
+        # Sleeping the full interval afterwards makes the real period the
+        # interval plus however long the pass took -- with the pass budget
+        # that is up to 25 minutes, not the 15 this constant claims. A pass
+        # that overruns the interval sleeps not at all, which is right: it is
+        # already late.
+        #
         # A plain sleep, not an Event. The outbox waits on one because
         # something calls SEMANTIC_OUTBOX_WAKE.set(); nothing would ever wake
         # this loop, so an Event here would be wait()/clear() dressed up as a
         # mechanism that does not exist. Adding one is trivial if a "verify
         # now" action ever wants it.
-        time.sleep(FEDERATION_VERIFY_INTERVAL_SECONDS)
+        time.sleep(
+            max(
+                0.0,
+                FEDERATION_VERIFY_INTERVAL_SECONDS
+                - (time.monotonic() - started),
+            )
+        )
 
 
 def verify_federation_sources(only: str | None = None) -> dict[str, int]:
