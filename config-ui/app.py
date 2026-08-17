@@ -2845,6 +2845,13 @@ def require_semantic_derived_sources(
     for asset in assets:
         if not isinstance(asset, dict) or asset.get("status") != "ready":
             continue
+        if asset.get("sourceState") is not None:
+            # Ready, but the relation it was generated from is not currently
+            # usable -- a federated source retired or one verification can no
+            # longer reach. Counting it as a profile would let planning
+            # authorise work against a schema that has been renamed away, and
+            # fail later at a permission error that names nothing useful.
+            continue
         generated = asset.get("generated")
         if not isinstance(generated, dict):
             continue

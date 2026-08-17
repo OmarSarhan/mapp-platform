@@ -761,6 +761,17 @@ def plan_area_weighted_h3_recipe(
         raise DerivedLayerError(
             "Recipe source asset must have a ready semantic profile."
         )
+    if source_asset.get("sourceState") is not None:
+        # Separate from status on purpose: the profile is ready, the source
+        # behind it is not. Reported distinctly so an operator is not sent
+        # looking for a semantic problem that does not exist.
+        raise DerivedLayerError(
+            "Recipe source is currently unavailable: its semantic profile "
+            "reports sourceState "
+            f"“{source_asset['sourceState']}”. Restore the source, or wait "
+            "for verification to confirm it has returned, before planning "
+            "against it."
+        )
     asset_version = source_asset.get("version")
     if asset_version is not None and (
         isinstance(asset_version, bool)

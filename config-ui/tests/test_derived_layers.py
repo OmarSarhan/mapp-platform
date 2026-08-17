@@ -142,6 +142,22 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
         value.update(updates)
         return value
 
+    def test_rejects_a_source_whose_semantics_report_it_unavailable(self):
+        # The profile is ready; the source behind it is not. Without this the
+        # plan proceeds and fails later at a permission error on a schema that
+        # has been renamed away, which names nothing an operator can act on.
+        asset = self.source_asset()
+        asset["sourceState"] = "unavailable"
+
+        with self.assertRaises(DerivedLayerError) as raised:
+            plan_area_weighted_h3_recipe(self.request(), asset)
+
+        message = str(raised.exception)
+        self.assertIn("unavailable", message)
+        # Reported distinctly from a semantic problem, so nobody goes looking
+        # for one that does not exist.
+        self.assertNotIn("ready semantic profile", message)
+
     def test_plans_bounded_query_and_resolved_metadata_without_preflight(self):
         result = plan_area_weighted_h3_recipe(
             self.request(),

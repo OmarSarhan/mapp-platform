@@ -7211,6 +7211,46 @@ VALID_SOURCE_URL = (
 )
 
 
+class DegradedSourceAuthorizationTests(unittest.TestCase):
+    """A ready profile whose source is unavailable must not authorise work."""
+
+    @staticmethod
+    def asset(source_state=None):
+        return {
+            "id": "asset:src",
+            "status": "ready",
+            "sourceState": source_state,
+            "generated": {
+                "binding": {
+                    "adapter": "postgresql",
+                    "schema": "source_leeds_ext",
+                    "relation": "orders",
+                }
+            },
+        }
+
+    def test_planning_does_not_count_a_degraded_profile(self):
+        payload = {
+            "name": "layer",
+            "kind": "view",
+            "sources": ["source_leeds_ext.orders"],
+            "query": "SELECT 1",
+        }
+        with patch.object(app, "validate_definition", lambda p: {
+            "name": "layer", "sources": ["source_leeds_ext.orders"],
+        }):
+            # Healthy: the source counts, so planning proceeds.
+            app.require_semantic_derived_sources(
+                payload, {"assets": [self.asset()]}
+            )
+            # Degraded: it must not, and the error must name the source.
+            with self.assertRaises(app.DerivedLayerError) as raised:
+                app.require_semantic_derived_sources(
+                    payload, {"assets": [self.asset("unavailable")]}
+                )
+        self.assertIn("source_leeds_ext.orders", str(raised.exception))
+
+
 class FederationVerificationTickTests(unittest.TestCase):
     """The tick that the periodic verifier will call.
 
