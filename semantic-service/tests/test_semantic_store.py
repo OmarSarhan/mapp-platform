@@ -257,6 +257,67 @@ class SemanticStoreTest(unittest.TestCase):
         restored = self.store.assets_for_source_schema("source_leeds")
         self.assertTrue(all(a["sourceState"] is None for a in restored))
 
+    def test_source_state_change_is_a_new_catalog_snapshot(self) -> None:
+        # sourceState and updatedAt are API-visible, so the top-level revision
+        # has to move. Otherwise a pagination cursor minted before the change
+        # stays valid across it and a client can assemble one response out of
+        # two different snapshots.
+        self._federated("asset:a", "source_leeds", event_id="e-a")
+        self._federated("asset:b", "source_leeds", event_id="e-b")
+        before = self.store.catalog_revision()
+
+        self.store.mark_source_state("source_leeds", available=False)
+        after = self.store.catalog_revision()
+        self.assertGreater(after, before)
+
+        # One revision for the batch, stamped on every row it touched.
+        assets = self.store.assets_for_source_schema("source_leeds")
+        self.assertEqual({after}, {a["catalogRevision"] for a in assets})
+
+        # A call that changes nothing must not burn a revision.
+        self.store.mark_source_state("source_leeds", available=False)
+        self.assertEqual(after, self.store.catalog_revision())
+
+    def test_source_state_leaves_nothing_half_applied(self) -> None:
+        # The connection is opened with isolation_level=None, so without one
+        # explicit transaction each row would commit on its own and a failure
+        # midway would strand the schema in a mixed state.
+        self._federated("asset:a", "source_leeds", event_id="e-a")
+        self._federated("asset:b", "source_leeds", event_id="e-b")
+        before_revision = self.store.catalog_revision()
+
+        real_connect = self.store._connect
+
+        class FailsOnBatch:
+            """Delegates everything but the batch update.
+
+            sqlite3.Connection attributes are read-only, so the failure has to
+            be injected by wrapping rather than by patching a method onto it.
+            """
+
+            def __init__(self, inner: sqlite3.Connection) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str):
+                return getattr(self._inner, name)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        self.store._connect = lambda: FailsOnBatch(real_connect())
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.mark_source_state("source_leeds", available=False)
+        finally:
+            self.store._connect = real_connect
+
+        assets = self.store.assets_for_source_schema("source_leeds")
+        self.assertTrue(
+            all(a["sourceState"] is None for a in assets),
+            "a failed batch left assets flagged",
+        )
+        self.assertEqual(before_revision, self.store.catalog_revision())
+
     def test_source_state_reports_only_what_it_changed(self) -> None:
         # So a caller can log once rather than on every verification pass.
         self._federated("asset:a", "source_leeds", event_id="e-a")

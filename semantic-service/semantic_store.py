@@ -455,28 +455,50 @@ class SemanticStore:
         """
         state = None if available else "unavailable"
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT asset_id FROM assets
-                WHERE json_extract(generated_json, '$.binding.schema') = ?
-                  AND json_extract(generated_json, '$.binding.adapter')
-                      = 'postgresql'
-                  AND source_state IS NOT ?
-                """,
-                (schema, state),
-            ).fetchall()
-            if not rows:
-                return []
-            changed = [row["asset_id"] for row in rows]
-            connection.executemany(
-                "UPDATE assets SET source_state = ?, updated_at = ? "
-                "WHERE asset_id = ?",
-                [
-                    (state, utc_now(), asset_id)
-                    for asset_id in changed
-                ],
-            )
-            return changed
+            # One explicit write transaction over the select and every update.
+            # The connection is opened with isolation_level=None, so without
+            # this each row would commit on its own: a reader could catch a
+            # schema half marked, and an error midway would leave it that way
+            # permanently. The observation is about the schema, so it has to
+            # land for the whole schema or not at all.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT asset_id FROM assets
+                    WHERE json_extract(generated_json, '$.binding.schema') = ?
+                      AND json_extract(generated_json, '$.binding.adapter')
+                          = 'postgresql'
+                      AND source_state IS NOT ?
+                    """,
+                    (schema, state),
+                ).fetchall()
+                if not rows:
+                    connection.execute("COMMIT")
+                    return []
+                changed = [row["asset_id"] for row in rows]
+                # sourceState and updatedAt are API-visible, so this is a new
+                # catalog snapshot and has to say so. Without a revision the
+                # top-level number stays put while the payload underneath it
+                # changes, and a pagination cursor minted before the change
+                # stays valid across it -- letting a client assemble one
+                # response out of two different snapshots. One revision for
+                # the batch, stamped on every row it touched.
+                revision = self._next_catalog_revision(connection)
+                changed_at = utc_now()
+                connection.executemany(
+                    "UPDATE assets SET source_state = ?, updated_at = ?, "
+                    "catalog_revision = ? WHERE asset_id = ?",
+                    [
+                        (state, changed_at, revision, asset_id)
+                        for asset_id in changed
+                    ],
+                )
+                connection.execute("COMMIT")
+                return changed
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def assets_for_source_schema(self, schema: str) -> list[dict[str, Any]]:
         """Assets bound to one schema, whatever their status or source state."""
