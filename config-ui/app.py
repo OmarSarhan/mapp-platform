@@ -1174,20 +1174,29 @@ def run_federation_verifier() -> None:
         )
 
 
-def reconcile_semantic_source_state(alias: str, *, available: bool) -> None:
+def reconcile_semantic_source_state(alias: str, *, available: bool) -> bool:
     """Mirror an alias's usability onto the semantic assets bound to it.
 
-    Deliberately never raises. The federation observation that produced this
-    verdict has already been persisted, and its grants already applied; a
-    semantic service that is briefly unreachable must not turn a successful
-    verification into a failed one, nor block startup readiness on a subsystem
-    that has nothing to do with whether the source is reachable. The next pass
-    reconciles again, and mark_source_state reports nothing changed when it is
-    already right, so a persistent outage costs one warning per pass rather
-    than a silent divergence.
+    Never raises, and returns whether the mirror is now correct. Two callers
+    need opposite things from a failure, and returning it lets each decide.
+
+    The verifier ignores the result: the observation that produced this verdict
+    is already persisted and its grants already applied, so a semantic service
+    that is briefly unreachable must not turn a successful verification into a
+    failed one, nor block startup readiness on a subsystem that has nothing to
+    do with whether the source is reachable. The next pass reconciles again,
+    and mark_source_state reports nothing changed when it is already right, so
+    a persistent outage costs one warning per pass rather than silent
+    divergence.
+
+    Retirement cannot be so relaxed, because there is no next pass: a retired
+    alias is excluded from every future one. It checks the result and refuses.
+
+    True when there is no semantic service configured, because then there is
+    nothing that could be out of step.
     """
     if not SEMANTIC:
-        return
+        return True
     try:
         result = SEMANTIC.request(
             "/v1/source-state",
@@ -1202,13 +1211,14 @@ def reconcile_semantic_source_state(alias: str, *, available: bool) -> None:
             "alias %r; the catalog may show it as usable until the next pass",
             alias, exc_info=True,
         )
-        return
+        return False
     changed = result.get("changed") if isinstance(result, dict) else None
     if changed:
         LOGGER.info(
             "Federation alias %r is %s; %d semantic asset(s) updated",
             alias, "available" if available else "unavailable", len(changed),
         )
+    return True
 
 
 def verify_federation_sources(only: str | None = None) -> dict[str, int]:
@@ -7865,9 +7875,29 @@ class Handler(SimpleHTTPRequestHandler):
                             # the only failure mode is the recoverable one: if
                             # the retirement then fails, the alias stays
                             # active and the next pass clears the flag.
-                            reconcile_semantic_source_state(
+                            if not reconcile_semantic_source_state(
                                 alias_name, available=False
-                            )
+                            ):
+                                # Refused rather than retried. Retirement is
+                                # terminal and excluded from every future
+                                # verifier pass, so there is no later chance
+                                # to correct this -- the assets would go on
+                                # reporting a renamed schema as usable
+                                # indefinitely, and derived planning would go
+                                # on believing them. An operator can retry
+                                # once the semantic service is back, which is
+                                # a smaller cost than an outbox that exists
+                                # solely for this one call.
+                                raise FederationSchemaError(
+                                    "The semantic service could not be "
+                                    "updated, so retiring "
+                                    f"{alias_name!r} would leave its semantic "
+                                    "profiles reporting a source that no "
+                                    "longer exists. Retry once it is "
+                                    "reachable.",
+                                    code="federation.semantic_unavailable",
+                                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                                )
                             result = FEDERATION.retire(alias_name, actor)
                         except DerivedLayerContentionError as exc:
                             # Translated rather than routed through the derived

@@ -198,14 +198,39 @@ class FederationAliasActionRouteTests(unittest.TestCase):
             app, "DERIVED", derived
         ), patch.object(app, "CONTROL", MagicMock()), patch.object(
             app, "reconcile_semantic_source_state",
+            # Returns True: the mirror succeeded, so retirement proceeds and
+            # the ordering is what this test is about.
             side_effect=lambda alias, *, available: order.append(
                 ("semantics", alias, available)
-            ),
+            ) or True,
         ):
             handler.do_POST()
 
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
+
+    def test_retire_refuses_when_semantics_cannot_be_marked(self):
+        # There is no next pass for a retired alias: it is excluded from every
+        # future verification. If the mirror fails and retirement proceeds, the
+        # assets report a renamed schema as usable indefinitely and derived
+        # planning goes on believing them.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state", return_value=False
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("federation.semantic_unavailable", body["code"])
 
     def test_retire_refuses_when_a_derived_mutation_holds_admission(self):
         # The dependency check and the retirement DDL commit in separate
@@ -7442,8 +7467,28 @@ class FederationVerificationTickTests(unittest.TestCase):
         self.assertEqual({"schema": "source_stale", "available": False}, payload)
 
     def test_reconciliation_is_inert_without_a_semantic_service(self):
+        # True, not False: with nothing configured there is nothing that could
+        # be out of step, and retirement must not be blocked by its absence.
         with patch.object(app, "SEMANTIC", None):
-            app.reconcile_semantic_source_state("leeds_ext", available=False)
+            self.assertTrue(
+                app.reconcile_semantic_source_state("leeds_ext", available=False)
+            )
+
+    def test_reconciliation_reports_whether_the_mirror_is_correct(self):
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": ["asset:x"]}
+        with patch.object(app, "SEMANTIC", semantic):
+            self.assertTrue(
+                app.reconcile_semantic_source_state("leeds_ext", available=True)
+            )
+
+        semantic.request.side_effect = RuntimeError("service is down")
+        with patch.object(app, "SEMANTIC", semantic), self.assertLogs(
+            app.LOGGER, level="WARNING"
+        ):
+            self.assertFalse(
+                app.reconcile_semantic_source_state("leeds_ext", available=True)
+            )
 
     def test_only_scopes_a_pass_to_a_single_alias(self):
         # The timer never passes this. A test that stops a shared source must

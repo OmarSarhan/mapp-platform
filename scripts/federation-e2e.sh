@@ -305,9 +305,13 @@ fi
 # A dedicated probe relation copied from the bundled data, so the harness
 # never mutates a relation another alias is federating. Collations are pinned
 # to C to satisfy the portability rule federation_capability.py enforces.
+# No DROP before the CREATE. remove_alias_state has already cleared this run's
+# own residue, so anything here now appeared after the claim -- and dropping it
+# unconditionally would destroy a relation somebody else created in the window
+# between the two. A plain CREATE fails loudly on collision instead, which is
+# the right outcome for a name this harness has already proved was free.
 source_sql "
   CREATE SCHEMA IF NOT EXISTS ${PROBE_SCHEMA};
-  DROP TABLE IF EXISTS ${PROBE_RELATION};
   CREATE TABLE ${PROBE_RELATION} (
     object_id bigint PRIMARY KEY,
     reference text COLLATE pg_catalog.\"C\",
