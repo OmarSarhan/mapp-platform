@@ -255,6 +255,42 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
 
+    def test_explicit_observe_mirrors_the_result_onto_semantics(self):
+        # An operator observing a recovery changes exactly what the timer's
+        # observation changes. Without mirroring here the profiles keep their
+        # previous state until a later pass -- up to a full interval after an
+        # explicit action whose point was to be immediate.
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.return_value = {
+            "lastObservationId": 7,
+            "lastObservation": {"connectivity": "reachable"},
+        }
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "active"
+        )
+        mirrored = []
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), patch.object(
+            app, "reconcile_semantic_source_state",
+            side_effect=lambda alias, *, available: mirrored.append(
+                (alias, available)
+            ) or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([("leeds_ext", True)], mirrored)
+
     def test_retire_refuses_while_a_workspace_layer_reads_the_alias(self):
         # A published layer can point straight at source_<alias>.<relation>
         # through the bundled connection without any managed derived layer
@@ -7628,6 +7664,34 @@ class FederationVerificationTickTests(unittest.TestCase):
             self.assertFalse(
                 app.reconcile_semantic_source_state("leeds_ext", available=True)
             )
+
+    def test_a_transient_failure_mirrors_the_locked_status_not_the_listed_one(self):
+        # This branch can mirror "available" from the record the pass started
+        # with. A retirement committing in between would be overwritten, and
+        # retired aliases are excluded from every later pass, so the write
+        # would stand forever.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext", status="active")]
+        federation.observe.side_effect = RuntimeError("transient")
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "retired"
+        )
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": []}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(1, summary["failed"])
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertFalse(
+            payload["available"],
+            "a failed pass marked a retired source available",
+        )
 
     def test_only_scopes_a_pass_to_a_single_alias(self):
         # The timer never passes this. A test that stops a shared source must

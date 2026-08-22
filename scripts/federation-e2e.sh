@@ -105,6 +105,12 @@ source_sql() {
 # operator who happens to have registered a real alias under this name must
 # never lose it to a test run that merely started.
 OWNS_ALIAS=0
+# Separate from OWNS_ALIAS. The alias is claimed before seeding, but the
+# probe relation is only ours once the CREATE has actually succeeded -- and
+# that CREATE deliberately has no preceding drop, so it fails when somebody
+# else got there first. Without this the EXIT trap would then drop the
+# relation this run never created.
+OWNS_PROBE_RELATION=0
 # Whether source-db was already up before this run, so a rig an operator is
 # using by hand survives; only a container this harness started gets removed.
 SOURCE_DB_PREEXISTING=0
@@ -162,7 +168,9 @@ remove_alias_state() {
     DELETE FROM federation._observations WHERE alias = '${ALIAS}';
     DELETE FROM federation._aliases WHERE alias = '${ALIAS}';
   " >/dev/null 2>&1 || true
-  source_sql "DROP TABLE IF EXISTS ${PROBE_RELATION}" >/dev/null 2>&1 || true
+  if [[ "${OWNS_PROBE_RELATION}" == "1" ]]; then
+    source_sql "DROP TABLE IF EXISTS ${PROBE_RELATION}" >/dev/null 2>&1 || true
+  fi
   # The table grant leaves with the table; the schema grant does not.
   if [[ "${PROBE_USAGE_GRANTED}" == "1" ]]; then
     source_sql "
@@ -217,6 +225,34 @@ fi
 "${compose[@]}" up -d source-db config-ui >/dev/null
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
 
+step "Checking the deployment's other sources survive the recreate"
+# Recreating config-ui with this compose set gives it only the connection
+# references these files forward. On a deployment whose other aliases get their
+# FEDERATION_DBS_<REF> from a different overlay, those references would vanish
+# from the container -- and the startup verification pass, which is global
+# rather than scoped like the two explicit ticks below, would then find them
+# unverifiable and withdraw their consumer access. Cleanup deliberately leaves
+# the recreated container running, so that would outlast the run.
+#
+# Refusing is the right answer rather than trying to reconstruct another
+# overlay's environment: the harness cannot know what it is not being given.
+if [[ -n "$("${compose[@]}" ps --quiet config-ui 2>/dev/null)" ]]; then
+  before_refs="$("${compose[@]}" exec -T config-ui sh -c \
+    'env | sed -n "s/^\(FEDERATION_DBS_[A-Za-z0-9_]*\)=.*/\1/p" | sort' \
+    2>/dev/null || true)"
+  after_refs="$("${compose[@]}" config 2>/dev/null \
+    | sed -n 's/^ *\(FEDERATION_DBS_[A-Za-z0-9_]*\):.*/\1/p' | sort -u || true)"
+  lost="$(comm -23 <(printf '%s\n' "${before_refs}") \
+                   <(printf '%s\n' "${after_refs}") | tr -d ' ' | grep -v '^$' || true)"
+  if [[ -n "${lost}" ]]; then
+    fail "Recreating config-ui with this harness's compose files would drop
+connection references the running container has: $(echo "${lost}" | tr '\n' ' ')
+The startup verification pass would then withdraw consumer access for the
+aliases using them. Add the overlay that provides them to this harness, or run
+it on a deployment that does not need it."
+  fi
+fi
+
 step "Claiming the probe alias and relation"
 # Both names are ones an operator could legitimately be using, and the cleanup
 # below is irreversible, so the harness proves each is free before it takes
@@ -266,6 +302,11 @@ rename or retire it first — this harness drops the alias schema and server
 with CASCADE, and drops the source relation outright."
   fi
   printf 'MAPP_FEDERATION_E2E_RESET=1: clearing pre-existing %s\n' "${claimed}"
+  # Only an explicit reset authorises dropping a relation this run did not
+  # create. Everywhere else the teardown waits for the CREATE to prove
+  # ownership, so a create that loses a race cannot take somebody else's
+  # relation with it.
+  OWNS_PROBE_RELATION=1
 fi
 OWNS_ALIAS=1
 remove_alias_state
@@ -319,6 +360,7 @@ source_sql "
   );
   GRANT SELECT ON ${PROBE_RELATION} TO ${SOURCE_READER_USER};
 " >/dev/null
+OWNS_PROBE_RELATION=1
 
 # Issued only when the reader lacked USAGE outright. has_schema_privilege is
 # true for access inherited through PUBLIC or role membership, so granting

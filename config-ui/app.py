@@ -1393,11 +1393,15 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
                 exc_info=True,
             )
             # Transient, so the registry status is unchanged and still
-            # accurate. Mirroring it keeps the two from drifting apart while
-            # whatever went wrong is retried.
-            reconcile_semantic_source_state(
-                alias, available=record["status"] == "active"
-            )
+            # accurate -- but "unchanged" is only true until a retirement
+            # commits, and this branch can mirror "available" from the listed
+            # record. That is the one write that can outlive its subject, so
+            # it reads the status again under the same lock the success path
+            # uses rather than trusting what the pass started with.
+            with FEDERATION.alias_reconciliation(alias) as current:
+                reconcile_semantic_source_state(
+                    alias, available=current == "active"
+                )
     return summary
 
 
@@ -8008,6 +8012,21 @@ class Handler(SimpleHTTPRequestHandler):
                             allowed_relations=tuple(record["allowedRelations"]),
                             tls_policy=record["tlsPolicy"],
                         )
+                        # An operator observing an outage or a recovery changes
+                        # exactly what the timer's observation changes, so the
+                        # semantic mirror has to follow here too. Without it
+                        # the profiles keep their previous state until a later
+                        # pass, which means planning can authorise a source
+                        # this very request just found unavailable, or keep
+                        # refusing one it just found healthy -- for up to the
+                        # verification interval, after an explicit action whose
+                        # whole point was to be immediate.
+                        with FEDERATION.alias_reconciliation(
+                            alias_name
+                        ) as current:
+                            reconcile_semantic_source_state(
+                                alias_name, available=current == "active"
+                            )
                         CONTROL.audit(
                             "federation_alias.observed",
                             actor=actor,
