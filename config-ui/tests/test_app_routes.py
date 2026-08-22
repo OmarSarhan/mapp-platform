@@ -45,6 +45,19 @@ class FederationAliasActionRouteTests(unittest.TestCase):
     caught here: it already carries its own status/code, correctly routed
     by the outer handler chain, and must keep passing through untouched."""
 
+    def setUp(self):
+        # Retirement reads the workspace to find layers pointing straight at
+        # source_<alias>. These tests are about the federation paths, so the
+        # workspace is empty by default; the test that exercises the refusal
+        # overrides platform_dependencies itself.
+        for name, value in (
+            ("read_workspace", (None, {})),
+            ("platform_dependencies", []),
+        ):
+            patcher = patch.object(app, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def handler(action, *, actor="admin", payload=None):
         responses = []
@@ -241,6 +254,67 @@ class FederationAliasActionRouteTests(unittest.TestCase):
 
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
+
+    def test_retire_refuses_while_a_workspace_layer_reads_the_alias(self):
+        # A published layer can point straight at source_<alias>.<relation>
+        # through the bundled connection without any managed derived layer
+        # existing. Retiring revokes mapp_xyz and renames the schema, so the
+        # layer starts failing immediately.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "platform_dependencies",
+            return_value=[
+                {
+                    "alias": "MAPP",
+                    "relation": "source_leeds_ext.smoke_control_orders",
+                    "workspace": ["leeds/smoke_control"],
+                    "derived": [],
+                },
+                # A different schema must not block it.
+                {
+                    "alias": "MAPP",
+                    "relation": "leeds.other",
+                    "workspace": ["leeds/other"],
+                    "derived": [],
+                },
+            ],
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.alias_in_use", body["code"])
+        self.assertIn("leeds/smoke_control", body["error"])
+        self.assertNotIn("leeds/other", body["error"])
+
+    def test_retire_refuses_when_the_workspace_cannot_be_read(self):
+        # Fail closed: retirement is irreversible, and a workspace that cannot
+        # be read is one whose layers cannot be ruled out.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "read_workspace", side_effect=FileNotFoundError("no workspace")
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.workspace_unreadable", body["code"])
 
     def test_retire_refuses_when_semantics_cannot_be_marked(self):
         # There is no next pass for a retired alias: it is excluded from every

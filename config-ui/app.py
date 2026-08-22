@@ -7871,6 +7871,48 @@ class Handler(SimpleHTTPRequestHandler):
                                         code="federation.alias_in_use",
                                         status=HTTPStatus.CONFLICT,
                                     )
+                                # Managed derived layers are not the only
+                                # readers. A saved workspace layer can point
+                                # straight at source_<alias>.<relation> through
+                                # the bundled connection, and retiring would
+                                # revoke mapp_xyz and rename the schema under
+                                # a published layer that is serving now.
+                                # platform_dependencies already knows how to
+                                # find those references.
+                                try:
+                                    workspace = read_workspace()[1]
+                                except (
+                                    ValueError, RuntimeError, FileNotFoundError
+                                ) as exc:
+                                    # Fail closed. Retirement is irreversible,
+                                    # and a workspace that cannot be read is a
+                                    # workspace whose layers cannot be ruled
+                                    # out.
+                                    raise FederationSchemaError(
+                                        "The workspace could not be read, so "
+                                        f"retiring {alias_name!r} cannot be "
+                                        "shown to be safe for the layers it "
+                                        f"serves: {exc}",
+                                        code="federation.workspace_unreadable",
+                                        status=HTTPStatus.CONFLICT,
+                                    ) from exc
+                                schema_prefix = f"source_{alias_name}."
+                                using = sorted({
+                                    layer
+                                    for item in platform_dependencies(workspace)
+                                    if item["relation"].startswith(schema_prefix)
+                                    for layer in item["workspace"]
+                                })
+                                if using:
+                                    raise FederationSchemaError(
+                                        f"Alias {alias_name!r} still has "
+                                        "workspace layers reading from it: "
+                                        + ", ".join(using)
+                                        + ". Remove or repoint them before "
+                                        "retiring.",
+                                        code="federation.alias_in_use",
+                                        status=HTTPStatus.CONFLICT,
+                                    )
                                 # Before the retirement, not after. Retirement is
                                 # terminal and list() excludes retired aliases, so
                                 # the verifier never revisits this one -- a
