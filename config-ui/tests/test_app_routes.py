@@ -179,6 +179,39 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, status)
         self.assertEqual("retired", body["alias"]["status"])
 
+    def test_retire_holds_derived_admission_through_the_whole_operation(self):
+        # Scope, not order. An earlier version of this route had the semantic
+        # update and the retirement land outside the admission block through a
+        # mis-indented edit, which silently undid the lock that stops a derived
+        # layer binding source_<alias> between the check and the DDL. Order
+        # assertions cannot see that; entry and exit can.
+        order = []
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.side_effect = lambda *a, **k: (
+            order.append("retire") or {"alias": "leeds_ext", "status": "retired"}
+        )
+
+        admission = MagicMock()
+        admission.__enter__.side_effect = lambda: order.append("admission-in") or []
+        admission.__exit__.side_effect = lambda *a: order.append("admission-out")
+        derived = MagicMock()
+        derived.source_schema_admission.return_value = admission
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state",
+            side_effect=lambda alias, *, available: order.append("semantics") or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(
+            ["admission-in", "semantics", "retire", "admission-out"], order
+        )
+
     def test_retire_marks_semantics_before_the_point_of_no_return(self):
         # Retirement is terminal and list() excludes retired aliases, so the
         # verifier never revisits one. Flagging afterwards would leave the

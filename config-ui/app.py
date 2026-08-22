@@ -7867,38 +7867,38 @@ class Handler(SimpleHTTPRequestHandler):
                                         status=HTTPStatus.CONFLICT,
                                     )
                                 # Before the retirement, not after. Retirement is
-                            # terminal and list() excludes retired aliases, so
-                            # the verifier never revisits this one -- a
-                            # semantic failure afterwards would leave its
-                            # assets claiming the source is fine forever, with
-                            # nothing left to correct it. Doing it first means
-                            # the only failure mode is the recoverable one: if
-                            # the retirement then fails, the alias stays
-                            # active and the next pass clears the flag.
-                            if not reconcile_semantic_source_state(
-                                alias_name, available=False
-                            ):
-                                # Refused rather than retried. Retirement is
-                                # terminal and excluded from every future
-                                # verifier pass, so there is no later chance
-                                # to correct this -- the assets would go on
-                                # reporting a renamed schema as usable
-                                # indefinitely, and derived planning would go
-                                # on believing them. An operator can retry
-                                # once the semantic service is back, which is
-                                # a smaller cost than an outbox that exists
-                                # solely for this one call.
-                                raise FederationSchemaError(
-                                    "The semantic service could not be "
-                                    "updated, so retiring "
-                                    f"{alias_name!r} would leave its semantic "
-                                    "profiles reporting a source that no "
-                                    "longer exists. Retry once it is "
-                                    "reachable.",
-                                    code="federation.semantic_unavailable",
-                                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                                )
-                            result = FEDERATION.retire(alias_name, actor)
+                                # terminal and list() excludes retired aliases, so
+                                # the verifier never revisits this one -- a
+                                # semantic failure afterwards would leave its
+                                # assets claiming the source is fine forever, with
+                                # nothing left to correct it. Doing it first means
+                                # the only failure mode is the recoverable one: if
+                                # the retirement then fails, the alias stays
+                                # active and the next pass clears the flag.
+                                if not reconcile_semantic_source_state(
+                                    alias_name, available=False
+                                ):
+                                    # Refused rather than retried. Retirement is
+                                    # terminal and excluded from every future
+                                    # verifier pass, so there is no later chance
+                                    # to correct this -- the assets would go on
+                                    # reporting a renamed schema as usable
+                                    # indefinitely, and derived planning would go
+                                    # on believing them. An operator can retry
+                                    # once the semantic service is back, which is
+                                    # a smaller cost than an outbox that exists
+                                    # solely for this one call.
+                                    raise FederationSchemaError(
+                                        "The semantic service could not be "
+                                        "updated, so retiring "
+                                        f"{alias_name!r} would leave its semantic "
+                                        "profiles reporting a source that no "
+                                        "longer exists. Retry once it is "
+                                        "reachable.",
+                                        code="federation.semantic_unavailable",
+                                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                                    )
+                                result = FEDERATION.retire(alias_name, actor)
                         except DerivedLayerContentionError as exc:
                             # Translated rather than routed through the derived
                             # error machinery, which would describe this as a
