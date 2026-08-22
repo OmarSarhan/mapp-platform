@@ -7463,6 +7463,11 @@ class FederationVerificationTickTests(unittest.TestCase):
                 federation = MagicMock()
                 federation.list.return_value = [self.alias("leeds_ext")]
                 federation.observe.return_value = {"status": status}
+                # The mirror reads the status again under the per-alias lock,
+                # so this -- not observe()'s return -- is what it acts on.
+                federation.alias_reconciliation.return_value.__enter__.return_value = (
+                    status
+                )
                 semantic = MagicMock()
                 semantic.request.return_value = {"changed": []}
 
@@ -7476,6 +7481,33 @@ class FederationVerificationTickTests(unittest.TestCase):
                 payload = semantic.request.call_args.kwargs["payload"]
                 self.assertEqual("source_leeds_ext", payload["schema"])
                 self.assertEqual(expected, payload["available"])
+
+    def test_a_retirement_racing_the_pass_is_not_overwritten(self):
+        # The pass observed the alias as active, but a retirement committed
+        # before its mirror write. Reading the status again under the per-alias
+        # lock is what stops that write standing forever -- a retired alias is
+        # excluded from every later pass, so nothing would correct it.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {"status": "active"}
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "retired"
+        )
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": []}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ):
+            app.verify_federation_sources()
+
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertFalse(
+            payload["available"],
+            "a pass marked a retired source available",
+        )
 
     def test_an_alias_skipped_for_evidence_still_mirrors_its_status(self):
         # Skipping the observation is not the same as having nothing to say:

@@ -1296,6 +1296,30 @@ class FederationAliasStoreTests(unittest.TestCase):
             any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
         )
 
+    def test_alias_reconciliation_locks_before_reading_the_status(self):
+        # The status has to be read under the lock, not before it. Reading
+        # first would reintroduce exactly the window this closes.
+        order = []
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda *a, **k: order.append(
+            "lock" if "pg_advisory_xact_lock" in str(a[0]) else "status"
+        )
+        cursor.fetchone.return_value = {"status": "active"}
+        store = self.store_with_cursor(cursor)
+
+        with store.alias_reconciliation("leeds_ext") as status:
+            self.assertEqual("active", status)
+
+        self.assertEqual(["lock", "status"], order)
+
+    def test_alias_reconciliation_reports_a_missing_row_as_none(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        store = self.store_with_cursor(cursor)
+
+        with store.alias_reconciliation("leeds_ext") as status:
+            self.assertIsNone(status)
+
     def test_mark_unverifiable_revokes_both_consumer_roles(self):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [

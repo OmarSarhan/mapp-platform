@@ -1351,11 +1351,16 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
                 tls_policy=record["tlsPolicy"],
             )
             summary["observed"] += 1
-            # From the observation's own result, not the listed record, which
-            # is now stale by exactly this call.
-            reconcile_semantic_source_state(
-                alias, available=observed.get("status") == "active"
-            )
+            # Under the per-alias lock, reading the status again rather than
+            # trusting the observation's own result. This is the only place a
+            # pass can mark a source available, and a retirement committing
+            # between the observation and this write would otherwise be
+            # overwritten -- permanently, since a retired alias is excluded
+            # from every later pass.
+            with FEDERATION.alias_reconciliation(alias) as current:
+                reconcile_semantic_source_state(
+                    alias, available=current == "active"
+                )
         except (
             psycopg.errors.IdleInTransactionSessionTimeout,
             psycopg.errors.TransactionTimeout,
@@ -7875,9 +7880,20 @@ class Handler(SimpleHTTPRequestHandler):
                                 # the only failure mode is the recoverable one: if
                                 # the retirement then fails, the alias stays
                                 # active and the next pass clears the flag.
-                                if not reconcile_semantic_source_state(
-                                    alias_name, available=False
-                                ):
+                                reconciliation = (
+                                    FEDERATION.alias_reconciliation(alias_name)
+                                )
+                                with reconciliation:
+                                    mirrored = (
+                                        reconcile_semantic_source_state(
+                                            alias_name, available=False
+                                        )
+                                    )
+                                    if mirrored:
+                                        result = FEDERATION.retire(
+                                            alias_name, actor
+                                        )
+                                if not mirrored:
                                     # Refused rather than retried. Retirement is
                                     # terminal and excluded from every future
                                     # verifier pass, so there is no later chance
@@ -7898,7 +7914,6 @@ class Handler(SimpleHTTPRequestHandler):
                                         code="federation.semantic_unavailable",
                                         status=HTTPStatus.SERVICE_UNAVAILABLE,
                                     )
-                                result = FEDERATION.retire(alias_name, actor)
                         except DerivedLayerContentionError as exc:
                             # Translated rather than routed through the derived
                             # error machinery, which would describe this as a

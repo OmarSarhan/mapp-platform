@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -579,6 +580,42 @@ class FederationAliasStore:
                     f"{preposition} {{}}"
                 ).format(sql.Identifier(schema_name), sql.Identifier(role))
             )
+
+    @contextmanager
+    def alias_reconciliation(self, alias: str):
+        """Hold the per-alias lock while a caller mirrors this alias elsewhere.
+
+        Yields the alias's status as read under that lock, or None if it has
+        no row, so the caller mirrors what is true now rather than what it
+        observed a moment ago.
+
+        The semantic mirror lives outside every transaction this store opens:
+        observe() releases its lock on commit, and the mirroring HTTP call
+        happens afterwards. Without this, a pass that observed an alias as
+        active could write "available" after a retirement had already
+        committed -- and since retirement is excluded from every later pass,
+        that write would stand forever, leaving profiles authorising a schema
+        that had been renamed away.
+
+        Only writes that mark a source *available* can do that damage; marking
+        one unavailable is always the safe direction, so those callers do not
+        need this. It reuses the observe key deliberately, which also makes
+        retirement mutually exclusive with observe and provision, where
+        previously only the row lock separated them.
+        """
+        alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:observe:{alias}",),
+            )
+            cur.execute(
+                sql.SQL("SELECT status FROM {}._aliases WHERE alias = %s")
+                .format(sql.Identifier(SCHEMA)),
+                (alias,),
+            )
+            row = cur.fetchone()
+            yield None if row is None else row["status"]
 
     def mark_unverifiable(self, alias: str) -> bool:
         """Withdraw consumer access from a provisioned source that cannot be probed.
