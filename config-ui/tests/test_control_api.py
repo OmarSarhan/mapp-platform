@@ -45,12 +45,26 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
-    def test_contract_does_not_claim_unimplemented_federation_cli_commands(self):
-        self.assertFalse(
-            any(
-                command.startswith("federation ")
+    def test_contract_advertises_exactly_the_federation_cli_commands(self):
+        # This assertion used to be the inverse: advertising a command the CLI
+        # cannot run is a lie, and the CLI refuses anything unadvertised with
+        # capability.missing, so the two repositories have to move together.
+        # It stays an equality rather than a subset so a route added here
+        # without a CLI command still fails.
+        self.assertEqual(
+            [
+                "federation list",
+                "federation show",
+                "federation register",
+                "federation observe",
+                "federation provision",
+                "federation retire",
+            ],
+            [
+                command
                 for command in contract("instance")["commands"]
-            )
+                if command.startswith("federation ")
+            ],
         )
 
     def test_contract_advertises_every_stable_cli_exit_code(self):
