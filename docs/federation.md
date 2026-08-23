@@ -48,9 +48,27 @@ the runtime-reader probes were once skipped under `federated`, leaving a
 reader that could not serve the sample tables passing `verify`.
 
 There is **no dashboard UI** for any part of the lifecycle. Every step below
-is shown as an HTTP call, and each has an equivalent `mapp-config
-federation` subcommand, which is the easier route because it carries the
-profile, token, and contract handshake for you.
+is shown as an HTTP call, and each has an equivalent `config-cli` subcommand
+that carries the profile, token, and contract handshake for you:
+
+```bash
+config-cli federation list
+config-cli federation show leeds_ext
+config-cli federation register leeds_ext --connection-ref LEEDS_EXT \
+  --relation leeds.smoke_control_orders \
+  --data-handling 'Public open data, OGL v3.' --acknowledge-data-handling
+config-cli federation observe leeds_ext
+config-cli federation provision leeds_ext --expected-observation-id 88 --confirm
+config-cli federation retire leeds_ext --confirm
+```
+
+The `federation:*` scopes are elevated and are not part of the default device
+credential, so request them explicitly:
+
+```bash
+config-cli auth device --scope federation:observe --scope federation:register \
+  --scope federation:provision
+```
 
 Each source needs a credential in the environment, named by convention:
 
