@@ -352,6 +352,14 @@ non-null unique or primary-key ID, Polygon/MultiPolygon geometry with a known
 positive SRID, and one through 32 built-in numeric measures. Output measure
 names use the same lowercase ASCII-safe convention as managed layer names.
 
+The unique-or-primary-key requirement on the ID column is waived for a
+`postgres_fdw` foreign-table source — PostgreSQL foreign tables can never
+carry a `PRIMARY KEY` or `UNIQUE` constraint, so semantic sync always
+reports both as `false` for one. The non-null requirement still applies
+unconditionally. For a foreign table, the alias's own admin-reviewed
+`allowedRelations` declaration is the trust boundary for row-identity
+uniqueness instead of an enforced database constraint.
+
 The planner resolves the saved workspace scope and returns a replayable
 selector-based `createRequest`, the full `resolvedSpatialScope`, resolved
 source/field metadata, assumptions,

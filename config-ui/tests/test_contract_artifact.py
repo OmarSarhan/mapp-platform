@@ -16,7 +16,7 @@ from control_api import (
 
 
 PLATFORM_ROOT = Path(__file__).resolve().parents[2]
-ARTIFACT = PLATFORM_ROOT / "contracts/api-compatibility-v1.4.json"
+ARTIFACT = PLATFORM_ROOT / "contracts/api-compatibility-v1.6.json"
 
 
 class ContractArtifactTests(unittest.TestCase):
@@ -50,9 +50,9 @@ class ContractArtifactTests(unittest.TestCase):
             "derivedDeliveryBlockers": value["pagination"][
                 "derivedDeliveryBlockers"
             ],
-            "compatibilityArtifact": "contracts/api-compatibility-v1.4.json",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.6.json",
         })
-        self.assertEqual("1.1.0", value["artifactVersion"])
+        self.assertEqual("1.2.0", value["artifactVersion"])
         self.assertEqual(DEFAULT_PAGE_LIMIT, value["pagination"]["defaultLimit"])
         self.assertEqual(MAX_PAGE_LIMIT, value["pagination"]["maxLimit"])
         self.assertLess(

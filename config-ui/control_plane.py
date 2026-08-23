@@ -34,6 +34,7 @@ DEVICE_SCOPES = {
     "inspect", "propose", "visual", "apply", "reload", "derive",
     "semantic:inspect", "semantic:source", "semantic:generate",
     "semantic:data", "semantic:propose", "semantic:apply", "semantic:admin",
+    "federation:register", "federation:provision", "federation:observe",
 }
 TOKEN_SCOPES = {"full", *DEVICE_SCOPES}
 
