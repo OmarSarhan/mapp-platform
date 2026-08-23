@@ -47,8 +47,10 @@ and Python guards while missing one inside an embedded script is exactly how
 the runtime-reader probes were once skipped under `federated`, leaving a
 reader that could not serve the sample tables passing `verify`.
 
-It is **API-only**. There is no dashboard UI for any part of the lifecycle, so
-every step below is an HTTP call.
+There is **no dashboard UI** for any part of the lifecycle. Every step below
+is shown as an HTTP call, and each has an equivalent `mapp-config
+federation` subcommand, which is the easier route because it carries the
+profile, token, and contract handshake for you.
 
 Each source needs a credential in the environment, named by convention:
 
