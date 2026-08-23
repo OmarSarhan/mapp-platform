@@ -5,6 +5,8 @@ pg_isready \
   --username "${POSTGRES_USER}" \
   --dbname "${POSTGRES_DB}" >/dev/null
 
+# This baseline must let pre-role-split volumes start so bin/mapp can run the
+# transactional upgrade. scripts/verify.sh enforces the federation role after it.
 ready="$(
   psql \
     --no-psqlrc \
