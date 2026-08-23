@@ -22,7 +22,8 @@ access, and record checksums and retention dates.
 
 ## Database backup
 
-The command below applies only to `MAPP_DATABASE_MODE=bundled`:
+The command below applies to the local-database modes,
+`MAPP_DATABASE_MODE=bundled` and `federated`:
 
 Before an image, schema, state-boundary, or PostgreSQL change:
 
