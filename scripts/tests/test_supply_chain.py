@@ -136,7 +136,7 @@ class BaseImagePolicyTests(unittest.TestCase):
         self.assertIn("build-base=0.5-r4", postgis)
         self.assertIn("cmake=4.2.3-r0", postgis)
         self.assertIn("git=2.54.0-r0", postgis)
-        self.assertIn("postgresql17-dev=17.11-r0", postgis)
+        self.assertIn("postgresql17-dev=17.10-r0", postgis)
 
 
 class SupplyChainWorkflowTests(unittest.TestCase):

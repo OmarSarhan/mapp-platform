@@ -32,7 +32,7 @@ RUN set -eux; \
       build-base=0.5-r4 \
       cmake=4.2.3-r0 \
       git=2.54.0-r0 \
-      postgresql17-dev=17.11-r0; \
+      postgresql17-dev=17.10-r0; \
     git clone --branch "${H3_PG_REF}" --depth 1 \
       https://github.com/postgis/h3-pg.git /tmp/h3-pg; \
     test "$(git -C /tmp/h3-pg rev-parse HEAD)" = "${H3_PG_COMMIT}"; \
