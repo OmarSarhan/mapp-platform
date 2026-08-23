@@ -514,8 +514,8 @@ backups, and role changes remain the external operator's responsibility.
 ## Routine checks
 
 - Confirm all services are healthy.
-- In bundled mode, confirm recent ETL runs succeeded and expected row counts,
-  including Census when loaded, are plausible.
+- With a local database, confirm recent ETL runs succeeded and expected row
+  counts, including Census when loaded, are plausible.
 - Confirm the semantic service responds, the catalog revision is readable, and
   managed profiles are not unexpectedly stuck in `registering` or
   `repair_required`.
