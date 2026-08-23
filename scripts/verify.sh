@@ -1373,13 +1373,15 @@ fi
     const audit = result.rows[0];
     const declaredReader = process.argv[2];
     const bundledReader = process.argv[3];
+    const hasBundledDatabase = process.argv[1] === "bundled"
+      || process.argv[1] === "federated";
     if (
       !audit
       || !audit.postgis
       || audit.currentUser !== audit.sessionUser
       || audit.currentUser !== uriUser
       || (declaredReader && audit.currentUser !== declaredReader)
-      || (process.argv[1] === "bundled"
+      || (hasBundledDatabase
         && audit.currentUser !== bundledReader)
       || !audit.canLogin
       || audit.superuser
@@ -1400,7 +1402,7 @@ fi
       fail("The active DBS_MAPP session is not the required read-only runtime identity.");
     }
 
-    if (process.argv[1] === "bundled") {
+    if (hasBundledDatabase) {
       for (const relation of [
         "leeds.bus_stops",
         "leeds.definitive_paths",

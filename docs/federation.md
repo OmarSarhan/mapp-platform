@@ -224,8 +224,8 @@ against the same computation run locally, a replaced-database refusal, semantic
 degradation and recovery, retirement, archival, and the privilege audit. It is
 repeatable and cleans up after itself.
 
-It refuses to run when `MAPP_ENVIRONMENT=production` or
-`MAPP_DATABASE_MODE` is not `bundled`, aborts rather than destroying a
+It refuses to run when `MAPP_ENVIRONMENT=production` or `MAPP_DATABASE_MODE`
+is neither `bundled` nor `federated`, aborts rather than destroying a
 pre-existing `e2e_probe` alias or probe relation, and refuses if recreating
 `config-ui` would strip connection references the running container has.
 
@@ -237,7 +237,7 @@ pretending otherwise would hide real incompatibilities.
 
 | Code | Meaning |
 | --- | --- |
-| `federation.not_configured` | Not bundled mode, or no federation database. Permanent for that deployment. |
+| `federation.not_configured` | Not a local-database mode (`bundled` or `federated`), or no federation database. Permanent for that deployment. |
 | `federation.invalid_request` | Malformed or unknown properties in the body. |
 | `federation.alias_limit_reached` | Registering would exceed the 100-alias ceiling, retired ones included. |
 | `federation.alias_limit_exceeded` | The registry already holds more aliases than the ceiling allows — only reachable if rows were written directly to the database. |
