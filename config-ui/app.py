@@ -1221,6 +1221,35 @@ def reconcile_semantic_source_state(alias: str, *, available: bool) -> bool:
     return True
 
 
+def mirror_alias_semantics(alias: str) -> bool:
+    """Mirror an alias's current status onto its semantic assets, safely.
+
+    Takes the per-alias lock, reads the status under it, and mirrors that --
+    then swallows anything that goes wrong, including the lock itself being
+    unavailable. Contention here is ordinary: an explicit Observe, Provision or
+    retirement holds the same lock, and the role's lock_timeout turns a wait
+    into an exception. Letting that escape would abort the whole verification
+    pass over one busy alias and leave every later one unverified until the
+    next interval.
+
+    Skipping is safe in a way that failing is not: the mirror is reconciled
+    again on the next pass, and the alias's own status is already persisted.
+    Retirement deliberately does not use this -- it needs to know, because
+    there is no next pass for a retired alias.
+    """
+    try:
+        with FEDERATION.alias_reconciliation(alias) as current:
+            return reconcile_semantic_source_state(
+                alias, available=current == "active"
+            )
+    except Exception:
+        LOGGER.warning(
+            "Could not read %r under its alias lock to mirror semantic state; "
+            "the next pass reconciles it", alias, exc_info=True,
+        )
+        return False
+
+
 def verify_federation_sources(only: str | None = None) -> dict[str, int]:
     """Re-observe every provisioned source once, and report what happened.
 
@@ -1357,10 +1386,7 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             # between the observation and this write would otherwise be
             # overwritten -- permanently, since a retired alias is excluded
             # from every later pass.
-            with FEDERATION.alias_reconciliation(alias) as current:
-                reconcile_semantic_source_state(
-                    alias, available=current == "active"
-                )
+            mirror_alias_semantics(alias)
         except (
             psycopg.errors.IdleInTransactionSessionTimeout,
             psycopg.errors.TransactionTimeout,
@@ -1398,10 +1424,7 @@ def verify_federation_sources(only: str | None = None) -> dict[str, int]:
             # record. That is the one write that can outlive its subject, so
             # it reads the status again under the same lock the success path
             # uses rather than trusting what the pass started with.
-            with FEDERATION.alias_reconciliation(alias) as current:
-                reconcile_semantic_source_state(
-                    alias, available=current == "active"
-                )
+            mirror_alias_semantics(alias)
     return summary
 
 
@@ -8021,12 +8044,7 @@ class Handler(SimpleHTTPRequestHandler):
                         # refusing one it just found healthy -- for up to the
                         # verification interval, after an explicit action whose
                         # whole point was to be immediate.
-                        with FEDERATION.alias_reconciliation(
-                            alias_name
-                        ) as current:
-                            reconcile_semantic_source_state(
-                                alias_name, available=current == "active"
-                            )
+                        mirror_alias_semantics(alias_name)
                         CONTROL.audit(
                             "federation_alias.observed",
                             actor=actor,
@@ -8097,6 +8115,13 @@ class Handler(SimpleHTTPRequestHandler):
                             expected_observation_id=expected_observation_id,
                             **provision_flags,
                         )
+                        # Provisioning is how an unavailable alias comes back:
+                        # it restores the grants and sets the status active.
+                        # Without mirroring that, its semantic profiles stay
+                        # flagged and derived planning goes on refusing a
+                        # source that now works, until a timer pass happens to
+                        # notice -- after an explicit action taken to fix it.
+                        mirror_alias_semantics(alias_name)
                         CONTROL.audit(
                             "federation_alias.provisioned",
                             actor=actor,

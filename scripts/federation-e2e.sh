@@ -69,6 +69,11 @@ fi
 ALIAS="e2e_probe"
 PROBE_RELATION="leeds.e2e_probe_orders"
 PROBE_SCHEMA="${PROBE_RELATION%%.*}"
+# Per run, because the fixture is archived at the end and an archived asset
+# cannot be re-registered -- the store refuses with asset_exists. A fixed
+# identity would either leave a ready test profile in the catalogue forever or
+# break every run after the first.
+PROBE_SEMANTIC_RUN="$(date -u +%Y%m%d%H%M%S)$$"
 
 compose=(
   docker compose
@@ -111,6 +116,9 @@ OWNS_ALIAS=0
 # else got there first. Without this the EXIT trap would then drop the
 # relation this run never created.
 OWNS_PROBE_RELATION=0
+# Set once the semantic fixture exists, so cleanup only archives one this run
+# actually registered.
+OWNS_SEMANTIC_FIXTURE=0
 # Whether source-db was already up before this run, so a rig an operator is
 # using by hand survives; only a container this harness started gets removed.
 SOURCE_DB_PREEXISTING=0
@@ -202,6 +210,37 @@ cleanup() {
     # between the stop and the restart would otherwise hand an operator back a
     # rig that was running when they lent it to us and is not now.
     "${compose[@]}" start source-db >/dev/null 2>&1 || true
+  fi
+  # Archive the semantic fixture through the lifecycle rather than leaving a
+  # test profile in the catalogue. Archived assets are hidden from catalog and
+  # search, which is why the identity is per run: the store refuses to
+  # re-register an archived asset, so a fixed one would break every later run.
+  if [[ "${OWNS_SEMANTIC_FIXTURE}" == "1" ]]; then
+    "${compose[@]}" exec -T config-ui python3 - "${PROBE_SEMANTIC_RUN}" <<'ARCHIVE' >/dev/null 2>&1 || true
+import sys
+import app
+
+run = sys.argv[1]
+asset_id = f"federation-e2e-probe:{run}"
+catalog = app.SEMANTIC.request(
+    "/v1/catalog", actor="federation-e2e", scopes=["semantic:inspect"],
+)
+asset = next(
+    (a for a in catalog.get("assets") or [] if a.get("id") == asset_id), None
+)
+if asset is not None:
+    app.SEMANTIC.request(
+        "/v1/events", method="POST",
+        payload={
+            "eventId": f"federation-e2e-probe-archive-{run}",
+            "assetId": asset_id,
+            "type": "archive",
+            "generation": int(asset.get("generation", 1)) + 1,
+            "generated": asset["generated"],
+        },
+        actor="federation-e2e", scopes=["semantic:admin"],
+    )
+ARCHIVE
   fi
   # config-ui is deliberately NOT recreated from the base files. The overlay's
   # only effect on it is to forward FEDERATION_DBS_LEEDS_EXT, and no base
@@ -327,10 +366,16 @@ if ! schema_present="$(source_sql "
   fail "Could not determine whether schema '${PROBE_SCHEMA}' exists on the
 source, so the harness cannot tell what it would be creating: ${schema_present}"
 fi
+# These record what seeding *intends*, not what it owns. The flags that gate
+# teardown are set only once the DDL below has actually run -- the same race
+# that made the relation flag fail open applies here: another process can
+# create the schema between this check and the seed, and a failed CREATE TABLE
+# would then have the EXIT trap revoke that schema's pre-existing grant.
 if [[ "${schema_present}" == "0" ]]; then
-  PROBE_SCHEMA_CREATED=1
-  PROBE_USAGE_GRANTED=1
+  probe_schema_absent=1
+  probe_usage_missing=1
 else
+  probe_schema_absent=0
   if ! reader_usage="$(source_sql "
     SELECT has_schema_privilege('${SOURCE_READER_USER}', '${PROBE_SCHEMA}', 'USAGE')
   " 2>&1)"; then
@@ -339,7 +384,9 @@ else
 ${reader_usage}"
   fi
   if [[ "${reader_usage}" == "f" ]]; then
-    PROBE_USAGE_GRANTED=1
+    probe_usage_missing=1
+  else
+    probe_usage_missing=0
   fi
 fi
 
@@ -361,6 +408,9 @@ source_sql "
   GRANT SELECT ON ${PROBE_RELATION} TO ${SOURCE_READER_USER};
 " >/dev/null
 OWNS_PROBE_RELATION=1
+# The CREATE TABLE above succeeded, so this run is what put the schema and its
+# contents here. Only now is it safe for teardown to undo either.
+PROBE_SCHEMA_CREATED="${probe_schema_absent}"
 
 # Issued only when the reader lacked USAGE outright. has_schema_privilege is
 # true for access inherited through PUBLIC or role membership, so granting
@@ -368,10 +418,13 @@ OWNS_PROBE_RELATION=1
 # and cleanup, which revokes only what the flag recorded, would leave it
 # behind, quietly strengthening the role if the inherited privilege is ever
 # withdrawn.
-if [[ "${PROBE_USAGE_GRANTED}" == "1" ]]; then
+if [[ "${probe_usage_missing}" == "1" ]]; then
   source_sql "
     GRANT USAGE ON SCHEMA ${PROBE_SCHEMA} TO ${SOURCE_READER_USER}
   " >/dev/null
+  # Recorded after the grant, so a run that never reached this cannot revoke a
+  # grant it did not make.
+  PROBE_USAGE_GRANTED=1
 fi
 
 # Move real MultiPolygons across so the aggregation below exercises genuine
@@ -602,16 +655,17 @@ step "Seeding a semantic profile bound to the probe source"
 # stored response for a repeated id, so repeat runs do not accumulate assets
 # and no disposal step is needed -- which matters, because the semantic store
 # has no delete, only an operator-confirmed archive.
-"${compose[@]}" exec -T config-ui python3 - "${ALIAS}" "${PROBE_RELATION#*.}" <<'SEED'
+"${compose[@]}" exec -T config-ui python3 - "${ALIAS}" "${PROBE_RELATION#*.}" \
+  "${PROBE_SEMANTIC_RUN}" <<'SEED'
 import sys
 import app
 from semantic_sources import source_asset_id
 
-alias, relation = sys.argv[1], sys.argv[2]
+alias, relation, run = sys.argv[1], sys.argv[2], sys.argv[3]
 schema = f"source_{alias}"
 event = {
-    "eventId": "federation-e2e-probe-semantic-seed",
-    "assetId": source_asset_id("MAPP", schema, relation),
+    "eventId": f"federation-e2e-probe-semantic-{run}",
+    "assetId": f"federation-e2e-probe:{run}",
     "type": "register",
     "generation": 1,
     "generated": {
@@ -641,13 +695,12 @@ SEED
 
 # What the catalog reports for that profile: available, unavailable, or missing.
 probe_source_state() {
-  "${compose[@]}" exec -T config-ui python3 - "${ALIAS}" "${PROBE_RELATION#*.}" <<'STATE'
+  "${compose[@]}" exec -T config-ui python3 - "${PROBE_SEMANTIC_RUN}" <<'STATE'
 import sys
 import app
 from semantic_sources import source_asset_id
 
-alias, relation = sys.argv[1], sys.argv[2]
-asset_id = source_asset_id("MAPP", f"source_{alias}", relation)
+asset_id = f"federation-e2e-probe:{sys.argv[1]}"
 catalog = app.SEMANTIC.request(
     "/v1/catalog", actor="federation-e2e", scopes=["semantic:inspect"],
 )
@@ -665,6 +718,8 @@ STATE
 # mirror to match -- and it does so through the feature itself rather than the
 # harness asserting a state it has forced.
 verifier_tick >/dev/null
+OWNS_SEMANTIC_FIXTURE=1
+
 seeded_state="$(probe_source_state)"
 [[ "${seeded_state}" == "available" ]] \
   || fail "a pass did not settle the seeded profile to available (got ${seeded_state})"

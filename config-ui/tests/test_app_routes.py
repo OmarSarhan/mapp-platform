@@ -255,6 +255,35 @@ class FederationAliasActionRouteTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
 
+    def test_provisioning_mirrors_the_restored_state(self):
+        # Provisioning is how an unavailable alias comes back. Without
+        # mirroring, its profiles stay flagged and planning goes on refusing a
+        # source that now works, until a timer pass happens to notice.
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.provision.return_value = {"alias": "leeds_ext", "status": "active"}
+        mirrored = []
+        handler, responses = self.handler(
+            "provision", payload={"expectedObservationId": 12}
+        )
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), patch.object(
+            app, "mirror_alias_semantics",
+            side_effect=lambda alias: mirrored.append(alias) or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(["leeds_ext"], mirrored)
+
     def test_explicit_observe_mirrors_the_result_onto_semantics(self):
         # An operator observing a recovery changes exactly what the timer's
         # observation changes. Without mirroring here the profiles keep their
@@ -7691,6 +7720,36 @@ class FederationVerificationTickTests(unittest.TestCase):
         self.assertFalse(
             payload["available"],
             "a failed pass marked a retired source available",
+        )
+
+    def test_a_contended_alias_does_not_abort_the_whole_pass(self):
+        # The lock this takes is held by explicit Observe, Provision and
+        # retirement, and the role has a lock_timeout -- so contention is
+        # ordinary. Letting it escape would leave every later alias unverified
+        # until the next interval.
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("busy"), self.alias("after"),
+        ]
+        federation.observe.return_value = {"status": "active"}
+        federation.alias_reconciliation.side_effect = (
+            psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+        )
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        # Both aliases were still observed; the pass completed.
+        self.assertEqual(2, summary["observed"])
+        self.assertEqual(
+            ["busy", "after"],
+            [c.args[0] for c in federation.observe.call_args_list],
         )
 
     def test_only_scopes_a_pass_to_a_single_alias(self):
