@@ -233,9 +233,19 @@ DERIVED = (
 )
 
 
+LOCAL_DATABASE_MODES = frozenset({"bundled", "federated"})
+
+
 def federation_enabled(federation_database_url, database_mode) -> bool:
-    """Enable only where the dedicated bundled provisioner is installed."""
-    return bool(federation_database_url) and database_mode == "bundled"
+    """Enable only where a local federation provisioner is installed.
+
+    Both bundled and federated run MAPP's own PostgreSQL and so have the
+    provisioner role; external points at a server MAPP does not administer and
+    must never try to create foreign servers on.
+    """
+    return (
+        bool(federation_database_url) and database_mode in LOCAL_DATABASE_MODES
+    )
 
 
 FEDERATION = (

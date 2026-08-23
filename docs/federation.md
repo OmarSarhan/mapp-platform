@@ -11,9 +11,14 @@ approved once, verified continuously, and can be withdrawn.
 
 ## Before you start
 
-Federation runs **only in bundled mode**. `./bin/mapp` refuses
-`federation-test` outside it, and the configuration service disables the alias
-registry entirely unless `MAPP_DATABASE_MODE=bundled`.
+Federation needs a **local database**, which means
+`MAPP_DATABASE_MODE=bundled` or `federated`. The configuration service
+disables the alias registry entirely under `external`, because MAPP does not
+administer that server and must not create foreign servers on it.
+
+`federated` is currently **identical to bundled in every respect**. It exists
+so a deployment can name the intent to attach federated sources before doing
+so; it will grow its own behaviour only when it needs different behaviour.
 
 It is **API-only**. There is no dashboard UI for any part of the lifecycle, so
 every step below is an HTTP call.

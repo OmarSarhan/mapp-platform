@@ -60,9 +60,12 @@ fi
 # live dashboard with the FDW provisioner and derived-layer DDL surfaces
 # switched on, and leave them on until the next `./bin/mapp serve`.
 DEPLOYMENT_DATABASE_MODE="$(dotenv_value MAPP_DATABASE_MODE)"
-if [[ "${DEPLOYMENT_DATABASE_MODE}" != "bundled" ]]; then
-  fail "federation-test needs the bundled federation provisioner and is disabled when MAPP_DATABASE_MODE=${DEPLOYMENT_DATABASE_MODE}."
-fi
+case "${DEPLOYMENT_DATABASE_MODE}" in
+  bundled|federated) ;;
+  *)
+    fail "federation-test needs a local federation provisioner and is disabled when MAPP_DATABASE_MODE=${DEPLOYMENT_DATABASE_MODE}."
+    ;;
+esac
 
 # A dedicated alias so a failed run never leaves a half-configured source
 # behind under a name an operator might be using.
