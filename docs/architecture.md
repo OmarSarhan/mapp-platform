@@ -63,8 +63,8 @@ route nor a database credential.
 
 | Component | Responsibility | Persistent inputs/state |
 | --- | --- | --- |
-| PostgreSQL/PostGIS | Application data and spatial indexes; either bundled sample data or an externally managed server | Named PostgreSQL volume in bundled mode; external operator in external mode |
-| ETL | Optional Leeds sample and reviewed England Census 2021 provisioning through bounded, validated source reads | `instance/etl/layers.json`, `instance/etl/census.json`; bundled mode through the wrapper |
+| PostgreSQL/PostGIS | Application data and spatial indexes; either bundled sample data or an externally managed server | Named PostgreSQL volume in the local-database modes; external operator in external mode |
+| ETL | Optional Leeds sample and reviewed England Census 2021 provisioning through bounded, validated source reads | `instance/etl/layers.json`, `instance/etl/census.json`; local-database modes through the wrapper |
 | XYZ | Map UI, MVT and feature queries | `var/workspace/workspace.json`, `instance/xyz.env`, public assets |
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
 | Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
@@ -186,10 +186,14 @@ the result to its proposal ID and candidate hash.
 
 ## Database roles
 
+- "The bundled database" throughout this documentation means the PostgreSQL
+  instance MAPP runs itself, from `compose.bundled-db.yaml`. Both
+  local-database modes, `bundled` and `federated`, use it; only `external`
+  has none. Statements about it apply to both unless they name a mode.
 - `DBS_MAPP` is the single runtime connection shared by XYZ and configuration
   discovery/validation. Its role should have only the read privileges required
   by mapped workspace layers.
-- In bundled mode, the bootstrap PostgreSQL role initializes the sample
+- With a local database, the bootstrap PostgreSQL role initializes the sample
   database and is not passed to application services. The ETL role owns its
   sample schema and the XYZ role reads it.
 - In external mode, roles, PostGIS installation, schema privileges, TLS,

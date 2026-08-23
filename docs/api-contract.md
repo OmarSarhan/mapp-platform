@@ -538,9 +538,9 @@ trust boundaries.
 
 ## Federated PostgreSQL sources
 
-Available only where `MAPP_DATABASE_MODE=bundled`; the routes return
-`federation.not_configured` otherwise. There are no CLI commands for these and
-no dashboard UI — they are API-only. See
+Available where `MAPP_DATABASE_MODE` is `bundled` or `federated`; the routes
+return `federation.not_configured` otherwise. There are no CLI commands for
+these and no dashboard UI — they are API-only. See
 [Federated PostgreSQL sources](federation.md) for the operator procedure.
 
 | Route | Capability action ID | Required scope |

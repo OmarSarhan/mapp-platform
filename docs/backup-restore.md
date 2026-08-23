@@ -7,7 +7,7 @@ images and the versioned `instance` directory are not sufficient.
 
 | Data | Location | Reason |
 | --- | --- | --- |
-| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records in bundled mode |
+| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database |
 | Live workspace | `var/workspace` | Current configuration and previous atomic save |
 | Control state | `var/control` | Authentication and device state, token records, audit, proposals, durable operations, artifacts |
 | Semantic state | `var/semantic` | Generated and curated profiles, proposals, event receipts, history, and archive tombstones |
@@ -22,7 +22,8 @@ access, and record checksums and retention dates.
 
 ## Database backup
 
-The command below applies only to `MAPP_DATABASE_MODE=bundled`:
+The command below applies to the local-database modes,
+`MAPP_DATABASE_MODE=bundled` and `federated`:
 
 Before an image, schema, state-boundary, or PostgreSQL change:
 

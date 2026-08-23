@@ -70,8 +70,15 @@ if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]];
     "${ENV_FILE}" >&2
   exit 2
 fi
+# Whether this deployment runs MAPP's own PostgreSQL. Both bundled and
+# federated do; external points at somebody else's server. Every check below
+# that compared against "bundled" was asking this, not asking about bundled.
+has_bundled_database() {
+  [[ "${database_mode}" == "bundled" || "${database_mode}" == "federated" ]]
+}
+
 case "${database_mode}" in
-  bundled)
+  bundled|federated)
     compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
     required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
@@ -79,7 +86,7 @@ case "${database_mode}" in
     required_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
   *)
-    printf 'MAPP_DATABASE_MODE must be bundled or external.\n' >&2
+    printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
     exit 2
     ;;
 esac
@@ -169,8 +176,8 @@ if [[ -z "${resolved_federation_dbs}" && -n "${resolved_federation_role}" ]] \
   printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be configured or both be empty.\n' >&2
   exit 2
 fi
-if [[ "${database_mode}" == "bundled" && -z "${resolved_federation_dbs}" ]]; then
-  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required in bundled mode.\n' >&2
+if has_bundled_database && [[ -z "${resolved_federation_dbs}" ]]; then
+  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required with a local database.\n' >&2
   exit 2
 fi
 if [[ "${database_mode}" == "external" ]]; then
@@ -315,7 +322,7 @@ if ! "${compose[@]}" exec -T browser-runner \
   exit 1
 fi
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   "${compose[@]}" exec -T db \
     sh /usr/local/bin/mapp-prepare-spatial-indexes check
   "${compose[@]}" exec -T \
@@ -1366,13 +1373,15 @@ fi
     const audit = result.rows[0];
     const declaredReader = process.argv[2];
     const bundledReader = process.argv[3];
+    const hasBundledDatabase = process.argv[1] === "bundled"
+      || process.argv[1] === "federated";
     if (
       !audit
       || !audit.postgis
       || audit.currentUser !== audit.sessionUser
       || audit.currentUser !== uriUser
       || (declaredReader && audit.currentUser !== declaredReader)
-      || (process.argv[1] === "bundled"
+      || (hasBundledDatabase
         && audit.currentUser !== bundledReader)
       || !audit.canLogin
       || audit.superuser
@@ -1393,7 +1402,7 @@ fi
       fail("The active DBS_MAPP session is not the required read-only runtime identity.");
     }
 
-    if (process.argv[1] === "bundled") {
+    if (hasBundledDatabase) {
       for (const relation of [
         "leeds.bus_stops",
         "leeds.definitive_paths",
@@ -1573,8 +1582,11 @@ if bool(federation_database_url) != bool(federation_role):
         "FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be "
         "configured or both be empty."
     )
-if database_mode == "bundled" and not federation_database_url:
-    fail("Bundled federation requires FEDERATION_DATABASE_URL.")
+# Both bundled and federated run MAPP own PostgreSQL, so both require the
+# federation provisioner URL; external does not.
+local_database = database_mode in ("bundled", "federated")
+if local_database and not federation_database_url:
+    fail("A local database requires FEDERATION_DATABASE_URL.")
 
 try:
     parsed = urlsplit(database_url)
@@ -2030,6 +2042,14 @@ with psycopg.connect(
                 "The active DERIVED_DATABASE_URL owner search_path must be "
                 "exactly pg_catalog, public."
             )
+        # The databaseName comparison below is the generalized invariant from
+        # docs/federation-architecture-waypoint.md, "Relationship to the
+        # current single-database contract": the derived owner must live in
+        # the database the effective dbs alias of the workspace resolves to.
+        # compose.yaml forwards DBS_MAPP by explicit enumeration, so that
+        # alias can only resolve to this reader connection, and federated mode
+        # repoints reader and derived owner in the same step by design. Do not
+        # relax it when federated mode gains its own database.
         if (
             not audit
             or not audit["postgis"]
@@ -2039,7 +2059,7 @@ with psycopg.connect(
             or audit["currentUser"] != derived_role
             or audit["currentUser"] == reader_role
             or (
-                database_mode == "bundled"
+                database_mode in ("bundled", "federated")
                 and audit["currentUser"] != bundled_derived_role
             )
             or not audit["canLogin"]
@@ -2071,7 +2091,7 @@ with psycopg.connect(
                 "and timeout limits."
             )
 
-        if database_mode == "bundled":
+        if database_mode in ("bundled", "federated"):
             for relation in (
                 "leeds.bus_stops",
                 "leeds.definitive_paths",
@@ -2262,6 +2282,7 @@ if federation_database_url:
                 WHERE role.rolname = current_user
             """)
             federation_audit = cursor.fetchone()
+            # Same invariant as the derived owner above, for the same reason.
             if (
                 not federation_audit
                 or federation_audit["databaseName"]
@@ -2931,7 +2952,7 @@ if ((icon_count < 1)); then
 fi
 curl --fail --silent --show-error "${map_headers[@]}" "${map_url}/instance/svg/bus.svg" >/dev/null
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   mvt_query="$(
     "${compose[@]}" exec -T config-ui python - <<'PY'
 from urllib.parse import urlencode
@@ -3015,7 +3036,7 @@ if [[ "${internal_automation_status}" != "404" ]]; then
   exit 1
 fi
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   printf 'PASS: bundled PostGIS and sample data, service health, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards.\n'
 else
   printf 'PASS: external PostGIS connectivity, service health, catalog discovery, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards. Run layer-specific visual tests for the external workspace.\n'

@@ -24,12 +24,12 @@ usage() {
     "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  load sample and Census data in bundled-database mode" \
+    "  etl [layer]  load sample and Census data in a local-database mode" \
     "  census-etl   load the reviewed England Census 2021 OA dataset" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-data --confirm remove the bundled database and reload configured ETL data" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
-    "  all          start bundled mode, load bundled ETL data, then verify it" \
+    "  all          start a local-database mode, load bundled ETL data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
     "  production-acceptance [options] collect redacted production readiness evidence" \
@@ -117,6 +117,14 @@ environment_value() {
   else
     dotenv_value "${key}"
   fi
+}
+
+# Whether this deployment runs MAPP's own PostgreSQL. Both bundled and
+# federated do; external points at somebody else's server. The subcommands
+# below compared against "bundled" because it was the only local-database mode
+# there was, not because bundled was the thing they cared about.
+has_bundled_database() {
+  [[ "${database_mode}" == "bundled" || "${database_mode}" == "federated" ]]
 }
 
 require_bundled_federation_settings() {
@@ -344,7 +352,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   exit 2
 fi
 database_mode="$(dotenv_value MAPP_DATABASE_MODE)"
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   require_bundled_federation_settings
 fi
 require_docker
@@ -374,7 +382,11 @@ if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]];
   exit 2
 fi
 case "${database_mode}" in
-  bundled)
+  bundled|federated)
+    # Identical for now, deliberately. federated exists so the deployment
+    # model can describe a plain single-database install before any alias is
+    # registered; it earns its own compose files only when it actually needs
+    # different ones.
     compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
     runtime_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
@@ -382,7 +394,7 @@ case "${database_mode}" in
     runtime_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
   *)
-    printf 'MAPP_DATABASE_MODE must be bundled or external.\n' >&2
+    printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
     exit 2
     ;;
 esac
@@ -429,7 +441,7 @@ prepare_spatial_indexes() {
 }
 
 ensure_bundled_database_upgraded() {
-  if [[ "${database_mode}" != "bundled" ]]; then
+  if ! has_bundled_database; then
     return 0
   fi
   run_with_buildkit_lease_retry \
@@ -537,7 +549,7 @@ case "${1:-}" in
       'from app import WORKSPACE; from control_api import request_reload, wait_reload, workspace_fingerprint; fingerprint = workspace_fingerprint(WORKSPACE.read_bytes()); result = request_reload(fingerprint); status = wait_reload(result["requestedGeneration"], fingerprint); completed = status["completed"]; print("XYZ reload generation {} {} for workspace {}.".format(result["requestedGeneration"], "completed" if completed else "did not complete", fingerprint)); raise SystemExit(0 if completed else 1)'
     ;;
   etl)
-    if [[ "${database_mode}" != "bundled" ]]; then
+    if ! has_bundled_database; then
       printf './bin/mapp etl is bundled data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
       exit 2
     fi
@@ -550,7 +562,7 @@ case "${1:-}" in
     fi
     ;;
   census-etl)
-    if [[ "${database_mode}" != "bundled" ]]; then
+    if ! has_bundled_database; then
       printf './bin/mapp census-etl is optional data provisioning and is disabled when MAPP_DATABASE_MODE=external.\n' >&2
       exit 2
     fi
@@ -563,7 +575,7 @@ case "${1:-}" in
     prepare_spatial_indexes
     ;;
   census-check)
-    if [[ "${database_mode}" != "bundled" ]]; then
+    if ! has_bundled_database; then
       printf './bin/mapp census-check is available only with the bundled ETL tool image.\n' >&2
       exit 2
     fi
@@ -582,8 +594,8 @@ case "${1:-}" in
     run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl "${census_check_args[@]}"
     ;;
   recover-reset-data)
-    if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp recover-reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+    if ! has_bundled_database; then
+      printf './bin/mapp recover-reset-data needs a local database, so MAPP_DATABASE_MODE must be bundled or federated.\n' >&2
       exit 2
     fi
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
@@ -598,8 +610,8 @@ case "${1:-}" in
       'import json; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(force=True, wait_for_ready=True), separators=(",", ":")))'
     ;;
   reset-data)
-    if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+    if ! has_bundled_database; then
+      printf './bin/mapp reset-data needs a local database, so MAPP_DATABASE_MODE must be bundled or federated.\n' >&2
       exit 2
     fi
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
@@ -683,8 +695,8 @@ case "${1:-}" in
       'Bundled database reset completed, all configured ETL sources including Census were loaded, and the seed workspace was restored.'
     ;;
   upgrade-derived)
-    if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp upgrade-derived is available only for the bundled database; provision external roles and extensions with your database administrator.\n' >&2
+    if ! has_bundled_database; then
+      printf './bin/mapp upgrade-derived needs a local database, so MAPP_DATABASE_MODE must be bundled or federated; provision external roles and extensions with your database administrator.\n' >&2
       exit 2
     fi
     run_with_buildkit_lease_retry "${compose[@]}" build db
@@ -692,8 +704,8 @@ case "${1:-}" in
     "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
     ;;
   all)
-    if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp all includes bundled ETL data and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
+    if ! has_bundled_database; then
+      printf './bin/mapp all includes bundled ETL data and needs a local database, so MAPP_DATABASE_MODE must be bundled or federated. Use serve, then verify, for an external database.\n' >&2
       exit 2
     fi
     ensure_bundled_database_upgraded
@@ -705,7 +717,7 @@ case "${1:-}" in
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   federation-test)
-    if [[ "${database_mode}" != "bundled" ]]; then
+    if ! has_bundled_database; then
       printf './bin/mapp federation-test needs the bundled federation provisioner and is disabled when MAPP_DATABASE_MODE=%s.\n' \
         "${database_mode}" >&2
       exit 2
@@ -761,7 +773,7 @@ case "${1:-}" in
       --file "${ROOT_DIR}/compose.yaml" \
       --file "${ROOT_DIR}/compose.bundled-db.yaml" \
       config --quiet
-    printf 'Unit tests, semantic-service tests, and bundled/external Compose validation passed.\n'
+    printf 'Unit tests, semantic-service tests, and Compose validation for the local-database and external models passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet
@@ -777,8 +789,8 @@ case "${1:-}" in
     "${compose[@]}" logs --follow --tail 200
     ;;
   db)
-    if [[ "${database_mode}" != "bundled" ]]; then
-      printf './bin/mapp db is available only for the bundled sample database. Use an approved PostgreSQL client for the external service.\n' >&2
+    if ! has_bundled_database; then
+      printf './bin/mapp db needs a local database, so MAPP_DATABASE_MODE must be bundled or federated. Use an approved PostgreSQL client for the external service.\n' >&2
       exit 2
     fi
     postgres_user="$(environment_value POSTGRES_USER)"

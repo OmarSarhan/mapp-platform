@@ -1,6 +1,7 @@
-# Bundled sample-data overlay. The supported wrapper includes this file only
-# when MAPP_DATABASE_MODE=bundled. External mode has no local database or ETL
-# service in its resolved Compose model.
+# Bundled sample-data overlay. The supported wrapper includes this file in the
+# local-database modes, so when MAPP_DATABASE_MODE is bundled or federated.
+# External mode has no local database or ETL service in its resolved Compose
+# model.
 services:
   db:
     image: ${POSTGIS_IMAGE:-mapp-postgis-h3:17-3.5-4.2.3}
