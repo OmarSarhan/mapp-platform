@@ -431,6 +431,15 @@ def _area_weighted_h3_query(
     resolution: int,
     measures: list[dict[str, str]],
 ) -> str:
+    # Deliberately takes no idColumn: this query never groups, dedups, or
+    # otherwise keys anything off the source's row identity — every
+    # accepted source row is aggregated by geometry alone. That is the
+    # only reason plan_area_weighted_h3_recipe's foreign-table carve-out
+    # (skipping the primary-key-or-unique check, which a postgres_fdw
+    # foreign table could never satisfy) is safe. If this query is ever
+    # changed to dedup or key by id — e.g. to address the "overlapping
+    # source polygons... double-count" assumption below — revisit that
+    # carve-out first.
     source_geometry = sql.SQL("source.{}").format(
         sql.Identifier(geometry_column)
     )
@@ -752,6 +761,17 @@ def plan_area_weighted_h3_recipe(
         raise DerivedLayerError(
             "Recipe source asset must have a ready semantic profile."
         )
+    if source_asset.get("sourceState") is not None:
+        # Separate from status on purpose: the profile is ready, the source
+        # behind it is not. Reported distinctly so an operator is not sent
+        # looking for a semantic problem that does not exist.
+        raise DerivedLayerError(
+            "Recipe source is currently unavailable: its semantic profile "
+            "reports sourceState "
+            f"“{source_asset['sourceState']}”. Restore the source, or wait "
+            "for verification to confirm it has returned, before planning "
+            "against it."
+        )
     asset_version = source_asset.get("version")
     if asset_version is not None and (
         isinstance(asset_version, bool)
@@ -820,7 +840,18 @@ def plan_area_weighted_h3_recipe(
         source["idColumn"],
         "Recipe ID column",
     )
-    if id_field.get("nullable") is not False or not (
+    if id_field.get("nullable") is not False:
+        raise DerivedLayerError("Recipe ID column must be non-null.")
+    # PostgreSQL foreign tables can never carry a PRIMARY KEY or UNIQUE
+    # constraint (a postgres_fdw/FDW limitation, not a detection gap), so
+    # semantic sync always reports primaryKey/unique as False for them —
+    # this uniqueness assurance can only be enforced for locally-owned
+    # relation kinds. For a foreign table, the alias's own admin-reviewed
+    # allowedRelations declaration is the trust boundary instead. Safe only
+    # because _area_weighted_h3_query never keys anything off idColumn —
+    # see the note at the top of that function before reusing this
+    # carve-out for a different recipe kind.
+    if generated.get("kind") != "foreign-table" and not (
         id_field.get("primaryKey") is True or id_field.get("unique") is True
     ):
         raise DerivedLayerError(
@@ -2908,6 +2939,54 @@ class DerivedLayerStore:
                 self._with_semantic_profile(item)
                 for item in cur.fetchall()
             ]
+
+    @staticmethod
+    def _affected_by_source_schema(cur, source_schema: str) -> list[str]:
+        cur.execute(sql.SQL("""
+            SELECT name
+            FROM {}._definitions
+            WHERE EXISTS (
+              SELECT 1 FROM unnest(sources) AS source
+              WHERE split_part(source, '.', 1) = %s
+            )
+            ORDER BY name
+        """).format(sql.Identifier(SCHEMA)), (source_schema,))
+        return [row["name"] for row in cur.fetchall()]
+
+    def affected_by_source_schema(self, source_schema: str) -> list[str]:
+        """Return managed layers that declare a source in one schema."""
+        with self._connect() as connection, connection.cursor() as cur:
+            return self._affected_by_source_schema(cur, source_schema)
+
+    @contextmanager
+    def source_schema_admission(self, source_schema: str):
+        """Hold derived-mutation admission while a caller acts on a source schema.
+
+        Reading the dependants and then acting on them in a later transaction
+        is a time-of-check/time-of-use race: a layer created in between binds
+        the schema and then has it revoked and renamed underneath, leaving a
+        managed definition whose refresh fails even though the caller was told
+        the schema was unused.
+
+        Admission is the same lock every derived mutation already takes, so
+        holding it across the caller's work makes a competing create or
+        replace fail with DerivedLayerContentionError rather than slip
+        through. The try-variant is deliberate: a blocking wait here would
+        stall behind a materialization that is allowed to run for 30 minutes.
+
+        This session sits idle in transaction while the caller works, and the
+        role carries idle_in_transaction_session_timeout=1min. Retirement is
+        far below that -- every statement it runs is bounded by lock_timeout,
+        and it refuses outright while any derived layer reads the schema, so
+        there is nothing to wait behind. But the guarantee does rest on that
+        margin: if the caller's work ever grows past the timeout, PostgreSQL
+        terminates this session and drops the lock mid-flight, silently
+        restoring the race instead of failing. Anything slower than a
+        retirement needs its own admission mechanism, not this one.
+        """
+        with self._connect() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
+            yield self._affected_by_source_schema(cur, source_schema)
 
     def list_page(
         self,

@@ -17,6 +17,686 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class FederationEnabledTests(unittest.TestCase):
+    def test_requires_both_a_connection_url_and_bundled_mode(self):
+        self.assertTrue(app.federation_enabled("postgresql://x", "bundled"))
+
+    def test_disabled_without_a_federation_database_url(self):
+        self.assertFalse(app.federation_enabled(None, "bundled"))
+        self.assertFalse(app.federation_enabled("", "bundled"))
+
+    def test_disabled_outside_bundled_mode(self):
+        # The external handoff (docs/external-postgresql.md) grants
+        # ownership of derived_layers alone — not the federation schema,
+        # postgres_fdw, or the database-level CREATE that provisioning
+        # needs, so an external deployment must never see federation
+        # routes enabled even if it happens to set FEDERATION_DATABASE_URL.
+        self.assertFalse(app.federation_enabled("postgresql://x", "external"))
+        self.assertFalse(app.federation_enabled("postgresql://x", None))
+        self.assertFalse(app.federation_enabled("postgresql://x", ""))
+
+
+class FederationAliasActionRouteTests(unittest.TestCase):
+    """POST /api/federation/aliases/<alias>/(observe|provision) must
+    translate a raw local-database failure into the same
+    "federation.registry_unavailable" 502 the sibling GET federation routes
+    already use — not fall through to the generic, code-less 422
+    psycopg.Error handler. FederationSchemaError is deliberately NOT
+    caught here: it already carries its own status/code, correctly routed
+    by the outer handler chain, and must keep passing through untouched."""
+
+    def setUp(self):
+        # Retirement reads the workspace to find layers pointing straight at
+        # source_<alias>. These tests are about the federation paths, so the
+        # workspace is empty by default; the test that exercises the refusal
+        # overrides platform_dependencies itself.
+        for name, value in (
+            ("read_workspace", (None, {})),
+            ("platform_dependencies", []),
+        ):
+            patcher = patch.object(app, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def handler(action, *, actor="admin", payload=None):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = f"/api/federation/aliases/leeds_ext/{action}"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: {} if payload is None else payload
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_observe_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_provision_reports_a_local_database_failure_as_registry_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("provision")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_lock_contention_is_not_reported_as_a_dead_registry(self):
+        # observe()/provision() take a blocking per-alias advisory lock and the
+        # role carries lock_timeout, so contention arrives as a psycopg error.
+        # Reporting it as "the registry is unavailable" sends an operator to
+        # check a database that is working. The periodic verifier holds that
+        # same lock across its probe, which is exactly when someone is likely
+        # to be observing the alias by hand.
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.side_effect = psycopg.errors.LockNotAvailable(
+            "canceling statement due to lock timeout"
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.verification_in_progress", body["code"])
+        # LockNotAvailable subclasses psycopg.Error, so the specific handler
+        # has to come first; if it is ever reordered this fails.
+        self.assertNotIn("registry", body["error"].lower())
+
+    def test_retire_is_refused_while_a_derived_layer_still_reads_the_alias(
+        self,
+    ):
+        # Revoking access underneath a dependent materialized view would
+        # leave it refreshing against a source nobody believes is connected.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = [
+            "smoke_h3_r9",
+        ]
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.alias_in_use", body["code"])
+        self.assertIn("smoke_h3_r9", body["error"])
+        derived.source_schema_admission.assert_called_once_with(
+            "source_leeds_ext"
+        )
+
+    def test_retire_proceeds_when_nothing_depends_on_the_alias(self):
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.return_value = {
+            "alias": "leeds_ext",
+            "status": "retired",
+            "archivedSchema": "retired_leeds_ext_20260811000000",
+        }
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_called_once_with("leeds_ext", "admin")
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("retired", body["alias"]["status"])
+
+    def test_retire_holds_derived_admission_through_the_whole_operation(self):
+        # Scope, not order. An earlier version of this route had the semantic
+        # update and the retirement land outside the admission block through a
+        # mis-indented edit, which silently undid the lock that stops a derived
+        # layer binding source_<alias> between the check and the DDL. Order
+        # assertions cannot see that; entry and exit can.
+        order = []
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.side_effect = lambda *a, **k: (
+            order.append("retire") or {"alias": "leeds_ext", "status": "retired"}
+        )
+
+        admission = MagicMock()
+        admission.__enter__.side_effect = lambda: order.append("admission-in") or []
+        admission.__exit__.side_effect = lambda *a: order.append("admission-out")
+        derived = MagicMock()
+        derived.source_schema_admission.return_value = admission
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state",
+            side_effect=lambda alias, *, available: order.append("semantics") or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(
+            ["admission-in", "semantics", "retire", "admission-out"], order
+        )
+
+    def test_retire_marks_semantics_before_the_point_of_no_return(self):
+        # Retirement is terminal and list() excludes retired aliases, so the
+        # verifier never revisits one. Flagging afterwards would leave the
+        # assets claiming the source is fine forever if the semantic call
+        # failed; flagging first makes the only failure mode recoverable.
+        order = []
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        federation.retire.side_effect = lambda *a, **k: (
+            order.append("retire") or {"alias": "leeds_ext", "status": "retired"}
+        )
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state",
+            # Returns True: the mirror succeeded, so retirement proceeds and
+            # the ordering is what this test is about.
+            side_effect=lambda alias, *, available: order.append(
+                ("semantics", alias, available)
+            ) or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([("semantics", "leeds_ext", False), "retire"], order)
+
+    def test_provisioning_mirrors_the_restored_state(self):
+        # Provisioning is how an unavailable alias comes back. Without
+        # mirroring, its profiles stay flagged and planning goes on refusing a
+        # source that now works, until a timer pass happens to notice.
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.provision.return_value = {"alias": "leeds_ext", "status": "active"}
+        mirrored = []
+        handler, responses = self.handler(
+            "provision", payload={"expectedObservationId": 12}
+        )
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), patch.object(
+            app, "mirror_alias_semantics",
+            side_effect=lambda alias: mirrored.append(alias) or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(["leeds_ext"], mirrored)
+
+    def test_explicit_observe_mirrors_the_result_onto_semantics(self):
+        # An operator observing a recovery changes exactly what the timer's
+        # observation changes. Without mirroring here the profiles keep their
+        # previous state until a later pass -- up to a full interval after an
+        # explicit action whose point was to be immediate.
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.return_value = {
+            "lastObservationId": 7,
+            "lastObservation": {"connectivity": "reachable"},
+        }
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "active"
+        )
+        mirrored = []
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://leeds"}
+        ), patch.object(
+            app, "reconcile_semantic_source_state",
+            side_effect=lambda alias, *, available: mirrored.append(
+                (alias, available)
+            ) or True,
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([("leeds_ext", True)], mirrored)
+
+    def test_retire_refuses_while_a_workspace_layer_reads_the_alias(self):
+        # A published layer can point straight at source_<alias>.<relation>
+        # through the bundled connection without any managed derived layer
+        # existing. Retiring revokes mapp_xyz and renames the schema, so the
+        # layer starts failing immediately.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "platform_dependencies",
+            return_value=[
+                {
+                    "alias": "MAPP",
+                    "relation": "source_leeds_ext.smoke_control_orders",
+                    "workspace": ["leeds/smoke_control"],
+                    "derived": [],
+                },
+                # A different schema must not block it.
+                {
+                    "alias": "MAPP",
+                    "relation": "leeds.other",
+                    "workspace": ["leeds/other"],
+                    "derived": [],
+                },
+            ],
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.alias_in_use", body["code"])
+        self.assertIn("leeds/smoke_control", body["error"])
+        self.assertNotIn("leeds/other", body["error"])
+
+    def test_retire_refuses_when_the_workspace_cannot_be_read(self):
+        # Fail closed: retirement is irreversible, and a workspace that cannot
+        # be read is one whose layers cannot be ruled out.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "read_workspace", side_effect=FileNotFoundError("no workspace")
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.workspace_unreadable", body["code"])
+
+    def test_retire_refuses_when_semantics_cannot_be_marked(self):
+        # There is no next pass for a retired alias: it is excluded from every
+        # future verification. If the mirror fails and retirement proceeds, the
+        # assets report a renamed schema as usable indefinitely and derived
+        # planning goes on believing them.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "reconcile_semantic_source_state", return_value=False
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("federation.semantic_unavailable", body["code"])
+
+    def test_retire_refuses_when_a_derived_mutation_holds_admission(self):
+        # The dependency check and the retirement DDL commit in separate
+        # transactions, so admission is held across both to stop a layer
+        # binding the schema in between. When a derived mutation already owns
+        # it that guarantee is unavailable, and retirement must refuse rather
+        # than act on a check it could not serialize.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "LEEDS_EXT"}
+        derived = MagicMock()
+        # Raised from __enter__, not from the call: source_schema_admission is
+        # a @contextmanager, so calling it only builds the generator and the
+        # lock is taken when the block is entered.
+        derived.source_schema_admission.return_value.__enter__.side_effect = (
+            app.DerivedLayerContentionError("derived-mutation")
+        )
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        federation.retire.assert_not_called()
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.derived_layers_busy", body["code"])
+
+    def test_retire_does_not_require_the_connection_reference_to_resolve(self):
+        # A source whose credentials have already been removed from the
+        # environment must still be retirable; resolving connectionRef would
+        # raise federation.connection_ref_not_found and strand the alias.
+        federation = MagicMock()
+        federation.get.return_value = {"connectionRef": "ALREADY_REMOVED"}
+        federation.retire.return_value = {
+            "alias": "leeds_ext",
+            "status": "retired",
+            "archivedSchema": None,
+        }
+        derived = MagicMock()
+        derived.source_schema_admission.return_value.__enter__.return_value = []
+        handler, responses = self.handler("retire")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "DERIVED", derived
+        ), patch.object(app, "CONTROL", MagicMock()), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            handler.do_POST()
+
+        federation.retire.assert_called_once()
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_observe_route_calls_the_serialized_store_operation(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.observe.return_value = {
+            "lastObservationId": 42,
+            "lastObservation": {"connectivity": "reachable"},
+        }
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.observe.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            allowed_relations=("leeds.smoke_control_orders",),
+            tls_policy="require",
+        )
+        self.assertEqual(1, len(responses))
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_binds_approval_to_the_observed_revision(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        federation.provision.return_value = {"alias": "leeds_ext"}
+        handler, responses = self.handler(
+            "provision",
+            payload={
+                "expectedObservationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+        )
+        control = MagicMock()
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "CONTROL", control
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        federation.provision.assert_called_once_with(
+            "leeds_ext",
+            "postgresql://reader:secret@source-db:5432/sourcedb",
+            "admin",
+            expected_observation_id=42,
+            acknowledge_row_level_security=False,
+            acknowledge_schema_change=True,
+            acknowledge_physical_rebind=False,
+        )
+        self.assertEqual(
+            {
+                "alias": "leeds_ext",
+                "observationId": 42,
+                "schemaChangeAcknowledged": True,
+            },
+            control.audit.call_args.kwargs["details"],
+        )
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+
+    def test_provision_requires_a_positive_observation_id(self):
+        federation = MagicMock()
+        federation.get.return_value = {
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+        }
+        handler, responses = self.handler("provision", payload={})
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"},
+        ):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+        self.assertEqual("federation.invalid_request", responses[0][1]["code"])
+        federation.provision.assert_not_called()
+
+    def test_federation_connections_are_isolated_from_normal_discovery(self):
+        federation_url = "postgresql://federation-reader@source-db/source"
+        ordinary_url = "postgresql://runtime-reader@db/mapp"
+        with patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": federation_url}
+        ), patch.object(
+            app, "DB_CONNECTIONS", {"MAPP": ordinary_url}
+        ), patch.object(app, "discover_connection", return_value=[]) as discover:
+            self.assertEqual(
+                federation_url,
+                app.resolve_federation_connection_url("LEEDS_EXT"),
+            )
+            self.assertEqual([], app.discover())
+
+        discover.assert_called_once_with("MAPP", ordinary_url)
+
+    def test_normal_database_connection_cannot_satisfy_connection_ref(self):
+        with patch.object(app, "FEDERATION_CONNECTIONS", {}), patch.object(
+            app,
+            "DB_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://runtime-reader@source-db/source"},
+        ):
+            with self.assertRaises(app.FederationSchemaError) as raised:
+                app.resolve_federation_connection_url("LEEDS_EXT")
+
+        self.assertEqual(
+            "federation.connection_ref_not_found", raised.exception.code
+        )
+
+    def test_a_federation_schema_error_still_carries_its_own_status_and_code(
+        self,
+    ):
+        # Confirms the new try/except wraps only psycopg.Error — a
+        # validation-style FederationSchemaError (e.g. alias not found)
+        # must still be handled by the existing, unrelated
+        # FederationSchemaError chain, not swallowed into a 502.
+        from federation_schema import FederationSchemaError
+
+        federation = MagicMock()
+        federation.get.side_effect = FederationSchemaError(
+            "boom", code="federation.some_validation_error", status=HTTPStatus.CONFLICT
+        )
+        handler, responses = self.handler("observe")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_POST()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("federation.some_validation_error", body["code"])
+
+
+class FederationAliasReadRouteTests(unittest.TestCase):
+    """GET /api/federation/aliases(/<alias>) must preserve a
+    FederationSchemaError's own status/code (round 26 finding) — e.g.
+    federation.not_configured, a permanent configuration fact when
+    FEDERATION is unset outside bundled mode, must never be folded into
+    the generic 502 federation.registry_unavailable a real psycopg.Error
+    still gets, or a contract-driven client would retry a deployment mode
+    that will never become available."""
+
+    @staticmethod
+    def handler(path, *, actor="admin"):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_list_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_list_still_reports_a_real_database_failure_as_unavailable(self):
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+    def test_list_uses_the_store_bound_without_cursor_surface(self):
+        federation = MagicMock()
+        federation.list.return_value = [
+            {"alias": "alpha"},
+            {"alias": "bravo"},
+        ]
+        handler, responses = self.handler("/api/federation/aliases")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        federation.list.assert_called_once_with()
+        self.assertEqual(
+            [{"alias": "alpha"}, {"alias": "bravo"}],
+            responses[0][1]["aliases"],
+        )
+
+    def test_get_by_name_preserves_not_configured_status_and_code(self):
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", None):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("federation.not_configured", body["code"])
+
+    def test_get_by_name_still_reports_a_real_database_failure_as_unavailable(
+        self,
+    ):
+        import psycopg
+
+        federation = MagicMock()
+        federation.get.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler("/api/federation/aliases/leeds_ext")
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")
@@ -6748,6 +7428,740 @@ class AuthorizationScopeTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIsNone(app.semantic_proxy_path(path))
+
+
+VALID_SOURCE_URL = (
+    "postgresql://reader:secret@source-db:5432/sourcedb"
+    "?sslmode=require&gssencmode=disable"
+)
+
+
+class DegradedSourceAuthorizationTests(unittest.TestCase):
+    """A ready profile whose source is unavailable must not authorise work."""
+
+    @staticmethod
+    def asset(source_state=None):
+        return {
+            "id": "asset:src",
+            "status": "ready",
+            "sourceState": source_state,
+            "generated": {
+                "binding": {
+                    "adapter": "postgresql",
+                    "schema": "source_leeds_ext",
+                    "relation": "orders",
+                }
+            },
+        }
+
+    def test_planning_does_not_count_a_degraded_profile(self):
+        payload = {
+            "name": "layer",
+            "kind": "view",
+            "sources": ["source_leeds_ext.orders"],
+            "query": "SELECT 1",
+        }
+        with patch.object(app, "validate_definition", lambda p: {
+            "name": "layer", "sources": ["source_leeds_ext.orders"],
+        }):
+            # Healthy: the source counts, so planning proceeds.
+            app.require_semantic_derived_sources(
+                payload, {"assets": [self.asset()]}
+            )
+            # Degraded: it must not, and the error must name the source.
+            with self.assertRaises(app.DerivedLayerError) as raised:
+                app.require_semantic_derived_sources(
+                    payload, {"assets": [self.asset("unavailable")]}
+                )
+        self.assertIn("source_leeds_ext.orders", str(raised.exception))
+
+
+class FederationVerificationTickTests(unittest.TestCase):
+    """The tick that the periodic verifier will call.
+
+    Kept separate from any loop or thread so the behaviour that matters is
+    reachable from a test: run_semantic_outbox, the pattern this follows, has
+    no tests at all because its logic lives inside a while True.
+    """
+
+    @staticmethod
+    def alias(name, **overrides):
+        record = {
+            "alias": name,
+            "provisionedAt": "2026-08-11T00:00:00Z",
+            "connectionRef": "LEEDS_EXT",
+            "allowedRelations": ["leeds.smoke_control_orders"],
+            "tlsPolicy": "require",
+            "acceptedEvidenceComplete": True,
+            "lastObservationId": 1,
+            "status": "active",
+        }
+        record.update(overrides)
+        return record
+
+    def test_observes_each_provisioned_source_with_its_own_settings(self):
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("leeds_ext"),
+            self.alias("bristol_ext", connectionRef="BRISTOL", tlsPolicy="verify-full"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable", "BRISTOL": "postgresql://reader:secret@bristol-db:5432/bristol?sslmode=verify-full&gssencmode=disable&sslrootcert=system"},
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 2, "failed": 0, "skipped": 0, "deferred": 0}, summary)
+        observed = {
+            call.args[0]: call for call in federation.observe.call_args_list
+        }
+        self.assertEqual({"leeds_ext", "bristol_ext"}, set(observed))
+        # Each alias must be probed with its own reference and policy; reusing
+        # the first alias's settings would silently verify the wrong thing.
+        self.assertEqual("postgresql://reader:secret@bristol-db:5432/bristol?sslmode=verify-full&gssencmode=disable&sslrootcert=system", observed["bristol_ext"].args[1])
+        self.assertEqual(
+            "verify-full", observed["bristol_ext"].kwargs["tls_policy"]
+        )
+
+    def test_skips_sources_that_expose_nothing_yet(self):
+        # A pending alias has no access to keep honest, so probing it would be
+        # an outbound connection to a third party for no reason.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("pending_ext", provisionedAt=None)]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            summary = app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        self.assertEqual({"observed": 0, "failed": 0, "skipped": 1, "deferred": 0}, summary)
+
+    def test_never_observes_a_retired_alias(self):
+        # Retired exclusion comes from list(). Pinning it here means a change
+        # to that filter fails a test rather than quietly putting a
+        # decommissioned source back on a timer.
+        federation = MagicMock()
+        federation.list.return_value = []
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            app.verify_federation_sources()
+
+        statement = str(federation.list.call_args)
+        self.assertTrue(federation.list.called, statement)
+        federation.observe.assert_not_called()
+
+    def test_never_revokes_an_alias_it_could_never_restore(self):
+        # An alias approved before the accepted-evidence columns existed can
+        # never satisfy the currency test, so observing it on a timer revokes
+        # every pass and only an operator provision can undo it. The interval
+        # bounds a false revoke only for sources that can recover; this class
+        # cannot, so the timer must leave it alone.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("pre_migration", acceptedEvidenceComplete=False),
+            self.alias("leeds_ext"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(
+            ["leeds_ext"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 1, "deferred": 0}, summary)
+
+    def test_a_semantic_outage_does_not_fail_the_verification(self):
+        # The observation is already persisted and its grants already applied.
+        # A semantic service that is briefly unreachable must not turn that
+        # into a failed pass, nor block startup readiness on a subsystem that
+        # has nothing to do with whether the source is reachable.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {"status": "active"}
+        semantic = MagicMock()
+        semantic.request.side_effect = RuntimeError("semantic service is down")
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(
+            {"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}, summary
+        )
+        self.assertIn("leeds_ext", "\n".join(logs.output))
+
+    def test_semantics_follow_the_alias_status_after_observing(self):
+        for status, expected in (("active", True), ("unavailable", False)):
+            with self.subTest(status=status):
+                federation = MagicMock()
+                federation.list.return_value = [self.alias("leeds_ext")]
+                federation.observe.return_value = {"status": status}
+                # The mirror reads the status again under the per-alias lock,
+                # so this -- not observe()'s return -- is what it acts on.
+                federation.alias_reconciliation.return_value.__enter__.return_value = (
+                    status
+                )
+                semantic = MagicMock()
+                semantic.request.return_value = {"changed": []}
+
+                with patch.object(app, "FEDERATION", federation), patch.object(
+                    app, "SEMANTIC", semantic
+                ), patch.object(
+                    app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+                ):
+                    app.verify_federation_sources()
+
+                payload = semantic.request.call_args.kwargs["payload"]
+                self.assertEqual("source_leeds_ext", payload["schema"])
+                self.assertEqual(expected, payload["available"])
+
+    def test_a_retirement_racing_the_pass_is_not_overwritten(self):
+        # The pass observed the alias as active, but a retirement committed
+        # before its mirror write. Reading the status again under the per-alias
+        # lock is what stops that write standing forever -- a retired alias is
+        # excluded from every later pass, so nothing would correct it.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {"status": "active"}
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "retired"
+        )
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": []}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ):
+            app.verify_federation_sources()
+
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertFalse(
+            payload["available"],
+            "a pass marked a retired source available",
+        )
+
+    def test_an_alias_skipped_for_evidence_still_mirrors_its_status(self):
+        # Skipping the observation is not the same as having nothing to say:
+        # the alias is unavailable with its grants revoked, and its assets
+        # must not claim otherwise.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("stale", acceptedEvidenceComplete=False, status="unavailable")
+        ]
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": ["asset:x"]}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ):
+            app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertEqual({"schema": "source_stale", "available": False}, payload)
+
+    def test_reconciliation_is_inert_without_a_semantic_service(self):
+        # True, not False: with nothing configured there is nothing that could
+        # be out of step, and retirement must not be blocked by its absence.
+        with patch.object(app, "SEMANTIC", None):
+            self.assertTrue(
+                app.reconcile_semantic_source_state("leeds_ext", available=False)
+            )
+
+    def test_reconciliation_reports_whether_the_mirror_is_correct(self):
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": ["asset:x"]}
+        with patch.object(app, "SEMANTIC", semantic):
+            self.assertTrue(
+                app.reconcile_semantic_source_state("leeds_ext", available=True)
+            )
+
+        semantic.request.side_effect = RuntimeError("service is down")
+        with patch.object(app, "SEMANTIC", semantic), self.assertLogs(
+            app.LOGGER, level="WARNING"
+        ):
+            self.assertFalse(
+                app.reconcile_semantic_source_state("leeds_ext", available=True)
+            )
+
+    def test_a_transient_failure_mirrors_the_locked_status_not_the_listed_one(self):
+        # This branch can mirror "available" from the record the pass started
+        # with. A retirement committing in between would be overwritten, and
+        # retired aliases are excluded from every later pass, so the write
+        # would stand forever.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext", status="active")]
+        federation.observe.side_effect = RuntimeError("transient")
+        federation.alias_reconciliation.return_value.__enter__.return_value = (
+            "retired"
+        )
+        semantic = MagicMock()
+        semantic.request.return_value = {"changed": []}
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", semantic
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual(1, summary["failed"])
+        payload = semantic.request.call_args.kwargs["payload"]
+        self.assertFalse(
+            payload["available"],
+            "a failed pass marked a retired source available",
+        )
+
+    def test_a_contended_alias_does_not_abort_the_whole_pass(self):
+        # The lock this takes is held by explicit Observe, Provision and
+        # retirement, and the role has a lock_timeout -- so contention is
+        # ordinary. Letting it escape would leave every later alias unverified
+        # until the next interval.
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("busy"), self.alias("after"),
+        ]
+        federation.observe.return_value = {"status": "active"}
+        federation.alias_reconciliation.side_effect = (
+            psycopg.errors.LockNotAvailable("canceling statement due to lock timeout")
+        )
+
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "SEMANTIC", MagicMock()
+        ), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        # Both aliases were still observed; the pass completed.
+        self.assertEqual(2, summary["observed"])
+        self.assertEqual(
+            ["busy", "after"],
+            [c.args[0] for c in federation.observe.call_args_list],
+        )
+
+    def test_only_scopes_a_pass_to_a_single_alias(self):
+        # The timer never passes this. A test that stops a shared source must
+        # not revoke every other alias pointing at it, since its teardown only
+        # knows about its own probe.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("e2e_probe"),
+            self.alias("someone_elses"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            summary = app.verify_federation_sources(only="e2e_probe")
+
+        self.assertEqual(
+            ["e2e_probe"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertEqual(1, summary["observed"])
+
+    def test_a_vanished_connection_reference_withdraws_access(self):
+        # No observation can reach this alias, but its foreign tables keep
+        # working because the user mapping still holds the credential. Without
+        # this, both consumer roles read a source nothing can verify, and every
+        # other revoke path runs from an observation that cannot happen.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("gone", connectionRef="REMOVED")]
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("gone")
+        federation.observe.assert_not_called()
+        self.assertEqual(1, summary["failed"])
+        self.assertIn("REMOVED", "\n".join(logs.output))
+
+    def test_a_vanished_reference_logs_only_when_something_changed(self):
+        # mark_unverifiable reports whether it changed anything, so a source
+        # left de-configured does not warn every fifteen minutes forever.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("gone", connectionRef="REMOVED")]
+        federation.mark_unverifiable.return_value = False
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {}
+        ):
+            with self.assertNoLogs(app.LOGGER, level="WARNING"):
+                summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("gone")
+        self.assertEqual(1, summary["failed"])
+
+    def test_a_probe_that_outruns_its_transaction_withdraws_access(self):
+        # observe() holds its local transaction across the probe, so this means
+        # the probe outran the transaction budget rather than a remote
+        # statement exceeding its limit. Nothing was persisted, so without this
+        # the source too slow to verify keeps access while one merely down
+        # loses it in five seconds.
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("slow")]
+        federation.observe.side_effect = (
+            psycopg.errors.IdleInTransactionSessionTimeout("terminating")
+        )
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ), self.assertLogs(app.LOGGER, level="WARNING"):
+            summary = app.verify_federation_sources()
+
+        federation.mark_unverifiable.assert_called_once_with("slow")
+        self.assertEqual(1, summary["failed"])
+
+    def test_a_pass_stops_starting_work_once_its_budget_is_spent(self):
+        # The traversal is serial and one alias can consume the whole
+        # idle-transaction allowance, so without a budget the interval is not a
+        # staleness bound: an alias near the end of a hundred could wait most
+        # of a day for its first check.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("first", lastObservationId=1),
+            self.alias("second", lastObservationId=2),
+            self.alias("third", lastObservationId=3),
+        ]
+        # One reading for the pass deadline, then one per alias for the
+        # deadline check and one for its attempt stamp. A generator keeps the
+        # test from depending on that exact call count: the first alias is
+        # inside the budget, everything after it is not.
+        ticks = iter([0.0, 0.0, 0.1] + [10_000.0] * 20)
+        clock = ticks
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ), patch.object(app.time, "monotonic", lambda: next(clock)),                 self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        # One observed before the budget ran out; the rest deferred, not lost.
+        self.assertEqual(1, summary["observed"])
+        self.assertEqual(2, summary["deferred"])
+        self.assertEqual(
+            ["first"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertIn("deferred", "\n".join(logs.output))
+
+    def test_least_recently_verified_aliases_go_first(self):
+        # Ordering by alias would let a slow source early in the alphabet
+        # starve everything after it forever, because a deferred tail is only
+        # reached by a pass that happens to run fast enough.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("aaa_recent", lastObservationId=99),
+            self.alias("zzz_stale", lastObservationId=2),
+            self.alias("mmm_never", lastObservationId=None),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            app.verify_federation_sources()
+
+        self.assertEqual(
+            ["mmm_never", "zzz_stale", "aaa_recent"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+
+    def test_an_alias_that_ate_the_budget_yields_to_the_deferred_one(self):
+        # The case that matters: lastObservationId only advances on a persisted
+        # observation, so an alias whose probe never persists would sort first
+        # forever, spend the whole budget again, and the alias it deferred
+        # would never be reached at all.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("hog", lastObservationId=1),
+            self.alias("starved", lastObservationId=2),
+        ]
+        # Pass one: deadline set, hog passes the check and is stamped, then the
+        # clock jumps past the budget so starved is deferred untouched.
+        # Pass two: plenty of budget, so ordering alone decides who goes first.
+        clock = iter([0.0, 0.0, 1.0, 10_000.0,
+                      20_000.0, 20_001.0, 20_002.0, 20_003.0, 20_004.0])
+        app.FEDERATION_VERIFY_ATTEMPTS.clear()
+        try:
+            with patch.object(app, "FEDERATION", federation), patch.object(
+                app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": VALID_SOURCE_URL}
+            ), patch.object(app.time, "monotonic", lambda: next(clock)), \
+                    self.assertLogs(app.LOGGER, level="WARNING"):
+                first = app.verify_federation_sources()
+                attempted_first = [
+                    c.args[0] for c in federation.observe.call_args_list
+                ]
+                federation.observe.reset_mock()
+                app.verify_federation_sources()
+                attempted_second = [
+                    c.args[0] for c in federation.observe.call_args_list
+                ]
+        finally:
+            app.FEDERATION_VERIFY_ATTEMPTS.clear()
+
+        self.assertEqual(["hog"], attempted_first)
+        self.assertEqual(1, first["deferred"])
+        # The starved alias must lead the next pass, not the hog again.
+        self.assertEqual("starved", attempted_second[0])
+
+    def test_unusable_connection_configuration_withdraws_access(self):
+        # Resolution succeeds but the configuration cannot be used: TLS weaker
+        # than the alias registered for. No retry fixes that, and the foreign
+        # tables keep working from the retained user mapping meanwhile.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("weak_tls")]
+        federation.mark_unverifiable.return_value = True
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS",
+            {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb"
+                          "?sslmode=disable&gssencmode=disable"},
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        federation.observe.assert_not_called()
+        federation.mark_unverifiable.assert_called_once_with("weak_tls")
+        self.assertEqual(1, summary["failed"])
+        self.assertIn("weak_tls", "\n".join(logs.output))
+
+    def test_one_failing_alias_does_not_strand_the_others(self):
+        # A single removed connectionRef would otherwise leave every source
+        # after it in the list unverified until someone noticed.
+        federation = MagicMock()
+        federation.list.return_value = [
+            self.alias("gone_ext", connectionRef="REMOVED"),
+            self.alias("leeds_ext"),
+        ]
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 1, "failed": 1, "skipped": 0, "deferred": 0}, summary)
+        self.assertEqual(
+            ["leeds_ext"],
+            [call.args[0] for call in federation.observe.call_args_list],
+        )
+        self.assertIn("gone_ext", "\n".join(logs.output))
+
+    def test_a_source_going_unreachable_is_not_counted_as_a_failure(self):
+        # detect_capability returns connectivity 'unavailable' rather than
+        # raising, so this is an ordinary observation -- the exact condition
+        # the verifier exists to notice, not an error to log.
+        federation = MagicMock()
+        federation.list.return_value = [self.alias("leeds_ext")]
+        federation.observe.return_value = {
+            "alias": "leeds_ext",
+            "status": "unavailable",
+            "lastObservation": {"connectivity": "unavailable"},
+        }
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app, "FEDERATION_CONNECTIONS", {"LEEDS_EXT": "postgresql://reader:secret@source-db:5432/sourcedb?sslmode=require&gssencmode=disable"}
+        ):
+            summary = app.verify_federation_sources()
+
+        self.assertEqual({"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}, summary)
+
+    def test_is_inert_when_federation_is_not_configured(self):
+        # Outside bundled mode FEDERATION is None; the tick must be safe to
+        # call rather than raising into a background thread.
+        with patch.object(app, "FEDERATION", None):
+            self.assertEqual(
+                {"observed": 0, "failed": 0, "skipped": 0, "deferred": 0},
+                app.verify_federation_sources(),
+            )
+
+
+class FederationVerifierLoopTests(unittest.TestCase):
+    def test_runs_a_pass_before_it_ever_waits(self):
+        # A source that broke while the service was down should be caught at
+        # startup, not one interval later.
+        order = []
+
+        def sleep(seconds):
+            order.append(("wait", seconds))
+            raise StopIteration
+
+        # Two readings per iteration: the pass start, and the elapsed
+        # calculation. Equal values mean an instant pass, so the sleep is the
+        # whole interval.
+        clock = iter([0.0, 0.0])
+        with patch.object(app.time, "monotonic", lambda: next(clock)), \
+                patch.object(app.time, "sleep", sleep), patch.object(
+            app, "verify_federation_sources",
+            side_effect=lambda: order.append(("pass", None)) or {
+                "observed": 1, "failed": 0, "skipped": 0
+            },
+        ):
+            with self.assertRaises(StopIteration):
+                app.run_federation_verifier()
+
+        self.assertEqual(
+            [("pass", None), ("wait", app.FEDERATION_VERIFY_INTERVAL_SECONDS)],
+            order,
+        )
+
+    def test_a_failed_pass_does_not_end_the_thread(self):
+        # One unreachable registry must not silently stop verification for the
+        # lifetime of the process.
+        import psycopg
+
+        calls = []
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            if len(waits) >= 2:
+                raise StopIteration
+
+        def pass_then_raise():
+            calls.append(1)
+            if len(calls) == 1:
+                raise psycopg.OperationalError("registry down")
+            return {"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}
+
+        with patch.object(app.time, "sleep", sleep), patch.object(
+            app, "verify_federation_sources", side_effect=pass_then_raise
+        ), self.assertLogs(app.LOGGER, level="WARNING") as logs:
+            with self.assertRaises(StopIteration):
+                app.run_federation_verifier()
+
+        self.assertEqual(2, len(calls), "the loop kept going after a failure")
+        # The type, not the text: exc_info renders the raising source line, so
+        # asserting on the message passes even when the real exception is a
+        # NameError from a missing import.
+        self.assertIs(psycopg.OperationalError, logs.records[0].exc_info[0])
+
+    def test_readiness_is_not_signalled_when_the_pass_never_ran(self):
+        # An unreachable registry raises before the first alias. Reporting that
+        # as verification complete would let startup proceed having checked
+        # nothing at all, silently.
+        import psycopg
+
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                side_effect=psycopg.OperationalError("registry down"),
+            ), self.assertLogs(app.LOGGER, level="WARNING"):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_readiness_is_withheld_when_an_alias_could_not_be_verified(self):
+        # The alias keeps the grants it had, so claiming the startup check
+        # happened would let planning run against a source nothing revalidated.
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={
+                    "observed": 1, "failed": 1, "skipped": 0, "deferred": 0
+                },
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_readiness_is_withheld_when_the_budget_deferred_an_alias(self):
+        # A deferred alias was never reached at all.
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={
+                    "observed": 1, "failed": 0, "skipped": 0, "deferred": 2
+                },
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertFalse(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_readiness_is_signalled_once_a_pass_completes(self):
+        def sleep(seconds):
+            raise StopIteration
+
+        app.FEDERATION_FIRST_PASS_DONE.clear()
+        try:
+            with patch.object(app.time, "sleep", sleep), patch.object(
+                app, "verify_federation_sources",
+                return_value={"observed": 1, "failed": 0, "skipped": 0, "deferred": 0},
+            ):
+                with self.assertRaises(StopIteration):
+                    app.run_federation_verifier()
+
+            self.assertTrue(app.FEDERATION_FIRST_PASS_DONE.is_set())
+        finally:
+            app.FEDERATION_FIRST_PASS_DONE.clear()
+
+    def test_the_next_pass_is_scheduled_from_the_last_one_starting(self):
+        # Sleeping the full interval after the pass makes the real period the
+        # interval plus however long the pass took -- up to 25 minutes with
+        # the pass budget, not the 15 the constant claims.
+        for elapsed, expected in (
+            (0.0, app.FEDERATION_VERIFY_INTERVAL_SECONDS),
+            (500.0, app.FEDERATION_VERIFY_INTERVAL_SECONDS - 500.0),
+            # A pass that overran the interval is already late: no sleep.
+            (app.FEDERATION_VERIFY_INTERVAL_SECONDS + 300.0, 0.0),
+        ):
+            with self.subTest(elapsed=elapsed):
+                slept = []
+
+                def sleep(seconds):
+                    slept.append(seconds)
+                    raise StopIteration
+
+                clock = iter([0.0, elapsed])
+                with patch.object(app.time, "monotonic", lambda: next(clock)), \
+                        patch.object(app.time, "sleep", sleep), patch.object(
+                    app, "verify_federation_sources",
+                    return_value={
+                        "observed": 1, "failed": 0, "skipped": 0, "deferred": 0
+                    },
+                ):
+                    with self.assertRaises(StopIteration):
+                        app.run_federation_verifier()
+
+                self.assertEqual([expected], slept)
+
+    def test_interval_is_long_enough_to_be_polite_to_a_third_party(self):
+        # Each pass opens a connection to a database somebody else operates.
+        # This is also the window a false revoke persists for, so it is
+        # bounded on both sides deliberately.
+        self.assertGreaterEqual(app.FEDERATION_VERIFY_INTERVAL_SECONDS, 300)
+        self.assertLessEqual(app.FEDERATION_VERIFY_INTERVAL_SECONDS, 3600)
 
 
 if __name__ == "__main__":

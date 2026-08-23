@@ -202,6 +202,8 @@ class SemanticStore:
                 self._migration_3(connection)
             if 4 not in applied:
                 self._migration_4(connection)
+            if 5 not in applied:
+                self._migration_5(connection)
         os.chmod(self.db_path, 0o600)
 
     @staticmethod
@@ -389,6 +391,33 @@ class SemanticStore:
         return revision
 
     @staticmethod
+    def _migration_5(connection: sqlite3.Connection) -> None:
+        """Record that an asset's underlying source is not currently usable.
+
+        A separate column rather than a new `status` value, for two reasons.
+        SQLite cannot alter a CHECK constraint without rebuilding the table,
+        and `assets` is referenced by foreign keys. More importantly the two
+        facts are independent: `archived` is an operator's deliberate,
+        confirmed decision, while this is an observation about the world that
+        reverses itself when the source comes back. An archived asset whose
+        source also vanished needs to carry both.
+
+        NULL means the source is fine, which is what every existing row means.
+        """
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+
+            ALTER TABLE assets ADD COLUMN source_state TEXT
+                CHECK(source_state IS NULL OR source_state = 'unavailable');
+
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+            COMMIT;
+            """
+        )
+
+    @staticmethod
     def _asset_from_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["asset_id"],
@@ -404,7 +433,89 @@ class SemanticStore:
             "updatedAt": row["updated_at"],
             "archivedAt": row["archived_at"],
             "predecessorAssetId": row["predecessor_asset_id"],
+            # Absent unless something is wrong, so a healthy catalogue reads
+            # exactly as it did before.
+            "sourceState": row["source_state"],
         }
+
+    def mark_source_state(
+        self, schema: str, *, available: bool
+    ) -> list[str]:
+        """Flag or clear every asset bound to one PostgreSQL schema.
+
+        Keyed on the binding rather than on any federation identifier, so this
+        stays a fact about where an asset reads from and needs no knowledge of
+        aliases. Returns the assets it changed, so a caller can log once
+        instead of on every pass.
+
+        Deliberately not restricted to ready assets. An archived asset whose
+        source disappears is still an archived asset whose source disappeared,
+        and clearing the flag later must find it again -- filtering here would
+        strand it flagged forever.
+        """
+        state = None if available else "unavailable"
+        with self._connection() as connection:
+            # One explicit write transaction over the select and every update.
+            # The connection is opened with isolation_level=None, so without
+            # this each row would commit on its own: a reader could catch a
+            # schema half marked, and an error midway would leave it that way
+            # permanently. The observation is about the schema, so it has to
+            # land for the whole schema or not at all.
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT asset_id FROM assets
+                    WHERE json_extract(generated_json, '$.binding.schema') = ?
+                      AND json_extract(generated_json, '$.binding.adapter')
+                          = 'postgresql'
+                      AND source_state IS NOT ?
+                    """,
+                    (schema, state),
+                ).fetchall()
+                if not rows:
+                    connection.execute("COMMIT")
+                    return []
+                changed = [row["asset_id"] for row in rows]
+                # sourceState and updatedAt are API-visible, so this is a new
+                # catalog snapshot and has to say so. Without a revision the
+                # top-level number stays put while the payload underneath it
+                # changes, and a pagination cursor minted before the change
+                # stays valid across it -- letting a client assemble one
+                # response out of two different snapshots. One revision for
+                # the batch, stamped on every row it touched.
+                revision = self._next_catalog_revision(connection)
+                changed_at = utc_now()
+                connection.executemany(
+                    "UPDATE assets SET source_state = ?, updated_at = ?, "
+                    "catalog_revision = ? WHERE asset_id = ?",
+                    [
+                        (state, changed_at, revision, asset_id)
+                        for asset_id in changed
+                    ],
+                )
+                connection.execute("COMMIT")
+                return changed
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def assets_for_source_schema(self, schema: str) -> list[dict[str, Any]]:
+        """Assets bound to one schema, whatever their status or source state."""
+        with self._connection() as connection:
+            return [
+                self._asset_from_row(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM assets
+                    WHERE json_extract(generated_json, '$.binding.schema') = ?
+                      AND json_extract(generated_json, '$.binding.adapter')
+                          = 'postgresql'
+                    ORDER BY asset_id
+                    """,
+                    (schema,),
+                )
+            ]
 
     @staticmethod
     def _visible(row: sqlite3.Row, is_admin: bool) -> bool:

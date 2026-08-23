@@ -25,6 +25,9 @@ except ModuleNotFoundError:  # Imported as scripts.production_acceptance in test
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Modes where MAPP runs its own PostgreSQL, so the bundled compose file and
+# the db service apply. External points at a server MAPP does not run.
+LOCAL_DATABASE_MODES = frozenset({"bundled", "federated"})
 DEFAULT_OUTPUT = ROOT / "var" / "acceptance" / "production-evidence.json"
 
 
@@ -103,7 +106,7 @@ def compose_command(environment: Path, values: dict[str, str]) -> list[str]:
         str(ROOT / "compose.yaml"),
     ]
     mode = values.get("MAPP_DATABASE_MODE")
-    if mode == "bundled":
+    if mode in LOCAL_DATABASE_MODES:
         command += ["--file", str(ROOT / "compose.bundled-db.yaml")]
     command += ["--file", str(ROOT / "compose.production.yaml")]
     return command
@@ -162,7 +165,7 @@ def docker_checks(environment: Path, values: dict[str, str], live: bool) -> list
         "semantic-service", "xyz", "xyz-preview", "config-ui",
         "browser-runner", "egress-proxy", "caddy",
     ]
-    if values.get("MAPP_DATABASE_MODE") == "bundled":
+    if values.get("MAPP_DATABASE_MODE") in LOCAL_DATABASE_MODES:
         services.insert(0, "db")
     ps = run_quiet(command + ["ps", "--format", "json"], 30)
     if ps.returncode:
