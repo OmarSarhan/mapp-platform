@@ -24,12 +24,12 @@ usage() {
     "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  load sample and Census data in bundled-database mode" \
+    "  etl [layer]  load sample and Census data in a local-database mode" \
     "  census-etl   load the reviewed England Census 2021 OA dataset" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-data --confirm remove the bundled database and reload configured ETL data" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
-    "  all          start bundled mode, load bundled ETL data, then verify it" \
+    "  all          start a local-database mode, load bundled ETL data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
     "  production-acceptance [options] collect redacted production readiness evidence" \
@@ -595,7 +595,7 @@ case "${1:-}" in
     ;;
   recover-reset-data)
     if ! has_bundled_database; then
-      printf './bin/mapp recover-reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+      printf './bin/mapp recover-reset-data needs a local database, so MAPP_DATABASE_MODE must be bundled or federated.\n' >&2
       exit 2
     fi
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
@@ -611,7 +611,7 @@ case "${1:-}" in
     ;;
   reset-data)
     if ! has_bundled_database; then
-      printf './bin/mapp reset-data is available only when MAPP_DATABASE_MODE=bundled.\n' >&2
+      printf './bin/mapp reset-data needs a local database, so MAPP_DATABASE_MODE must be bundled or federated.\n' >&2
       exit 2
     fi
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
@@ -696,7 +696,7 @@ case "${1:-}" in
     ;;
   upgrade-derived)
     if ! has_bundled_database; then
-      printf './bin/mapp upgrade-derived is available only for the bundled database; provision external roles and extensions with your database administrator.\n' >&2
+      printf './bin/mapp upgrade-derived needs a local database, so MAPP_DATABASE_MODE must be bundled or federated; provision external roles and extensions with your database administrator.\n' >&2
       exit 2
     fi
     run_with_buildkit_lease_retry "${compose[@]}" build db
@@ -705,7 +705,7 @@ case "${1:-}" in
     ;;
   all)
     if ! has_bundled_database; then
-      printf './bin/mapp all includes bundled ETL data and is available only when MAPP_DATABASE_MODE=bundled. Use serve, then verify, for an external database.\n' >&2
+      printf './bin/mapp all includes bundled ETL data and needs a local database, so MAPP_DATABASE_MODE must be bundled or federated. Use serve, then verify, for an external database.\n' >&2
       exit 2
     fi
     ensure_bundled_database_upgraded
@@ -773,7 +773,7 @@ case "${1:-}" in
       --file "${ROOT_DIR}/compose.yaml" \
       --file "${ROOT_DIR}/compose.bundled-db.yaml" \
       config --quiet
-    printf 'Unit tests, semantic-service tests, and bundled/external Compose validation passed.\n'
+    printf 'Unit tests, semantic-service tests, and Compose validation for the local-database and external models passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet
@@ -790,7 +790,7 @@ case "${1:-}" in
     ;;
   db)
     if ! has_bundled_database; then
-      printf './bin/mapp db is available only for the bundled sample database. Use an approved PostgreSQL client for the external service.\n' >&2
+      printf './bin/mapp db needs a local database, so MAPP_DATABASE_MODE must be bundled or federated. Use an approved PostgreSQL client for the external service.\n' >&2
       exit 2
     fi
     postgres_user="$(environment_value POSTGRES_USER)"
