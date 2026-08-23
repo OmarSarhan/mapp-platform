@@ -2365,6 +2365,29 @@ if federation_database_url:
                 "SELECT to_regclass($$federation._aliases$$) AS oid"
             )
             if cursor.fetchone()["oid"] is not None:
+                # archived_schema is added by the alias store the first time it
+                # connects, which on an upgraded deployment may not have
+                # happened yet. Selecting it unconditionally would abort this
+                # whole audit with UndefinedColumn. Its absence also means no
+                # alias can have been retired, so the retired branch below is
+                # unreachable and NULL is the correct stand-in.
+                cursor.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = $$federation$$ "
+                    "AND table_name = $$_aliases$$ "
+                    "AND column_name IN "
+                    "($$archived_schema$$, $$archived_server$$)"
+                )
+                present = {row["column_name"] for row in cursor.fetchall()}
+                archived_column = (
+                    "archived_schema"
+                    if "archived_schema" in present
+                    else "NULL::text AS archived_schema"
+                ) + ", " + (
+                    "archived_server"
+                    if "archived_server" in present
+                    else "NULL::text AS archived_server"
+                )
                 cursor.execute(
                     "SELECT public.PostGIS_Lib_Version() AS postgis, "
                     "(SELECT extversion FROM pg_catalog.pg_extension "
@@ -2377,12 +2400,125 @@ if federation_database_url:
                     "SELECT alias, connection_ref, allowed_relations, status, "
                     "last_observation, accepted_schema_fingerprint, "
                     "accepted_physical_identity, "
-                    "accepted_connection_identity, last_observation_id "
+                    "accepted_connection_identity, last_observation_id, "
+                    + archived_column + " "
                     "FROM federation._aliases "
                     "WHERE provisioned_at IS NOT NULL"
                 )
                 for alias_row in cursor.fetchall():
                     alias_value = alias_row["alias"]
+                    if alias_row["status"] == "retired":
+                        # These three hold however the alias was retired.
+                        # retire() records no archived schema when the local
+                        # one had already been removed by hand, but it still
+                        # archives the server and drops the mappings
+                        # independently. Skipping the live-name audits on that
+                        # path left the credential-retention case unchecked --
+                        # precisely the state retirement exists to prevent, and
+                        # precisely the fix an earlier commit made to the
+                        # store, unverified by the thing that audits it.
+                        archived = alias_row["archived_schema"]
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_namespace "
+                            "WHERE nspname = %s",
+                            (f"source_{alias_value}",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live source schema still exists."
+                            )
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_foreign_server "
+                            "WHERE srvname = %s",
+                            (f"{alias_value}_srv",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live foreign server still exists."
+                            )
+                        cursor.execute(
+                            "SELECT count(*) AS mappings "
+                            "FROM pg_catalog.pg_user_mappings "
+                            "WHERE srvname = %s",
+                            (f"{alias_value}_srv",),
+                        )
+                        if cursor.fetchone()["mappings"]:
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its foreign server still holds user "
+                                "mappings."
+                            )
+                        # retire() records the archived server name, so the
+                        # audit never derives or pattern-matches it. Deriving
+                        # it from archived_schema is wrong -- the alias is
+                        # truncated four characters further for the server --
+                        # and a "retired_" prefix does not identify an archive
+                        # either, since ALIAS_RE permits an alias literally
+                        # named retired_sites whose live server would then be
+                        # read as one. Asserting existence is the point: the
+                        # contract is archive rather than drop, and an audit
+                        # that cannot notice a dropped archive does not verify
+                        # it.
+                        archived_srv = alias_row["archived_server"]
+                        if archived_srv:
+                            cursor.execute(
+                                "SELECT pg_get_userbyid(srvowner) AS owner, "
+                                "(SELECT count(*) "
+                                "   FROM pg_catalog.pg_user_mappings AS m "
+                                "  WHERE m.srvname = s.srvname) AS mappings "
+                                "FROM pg_catalog.pg_foreign_server AS s "
+                                "WHERE srvname = %s",
+                                (archived_srv,),
+                            )
+                            archived_row = cursor.fetchone()
+                            if not archived_row:
+                                fail(
+                                    f"Federation alias {alias_value!r} records "
+                                    f"archived server {archived_srv!r}, which "
+                                    "no longer exists."
+                                )
+                            archived_owner = archived_row["owner"]
+                            if archived_owner != federation_role:
+                                fail(
+                                    f"Archived server {archived_srv!r} is "
+                                    f"owned by {archived_owner!r}, not the "
+                                    "federation provisioner."
+                                )
+                            if archived_row["mappings"]:
+                                fail(
+                                    f"Archived server {archived_srv!r} still "
+                                    "holds user mappings."
+                                )
+                        if archived:
+                            # Retirement archives rather than drops, so the
+                            # schema must still exist under its archived name,
+                            # owned by the provisioner and unreachable by
+                            # either consumer role.
+                            cursor.execute(
+                                "SELECT pg_get_userbyid(nspowner) AS owner, "
+                                "has_schema_privilege(%s, oid, $$USAGE$$) "
+                                "  AS derived_use, "
+                                "has_schema_privilege(%s, oid, $$USAGE$$) "
+                                "  AS reader_use "
+                                "FROM pg_catalog.pg_namespace "
+                                "WHERE nspname = %s",
+                                (derived_role, reader_role, archived),
+                            )
+                            archive = cursor.fetchone()
+                            if (
+                                not archive
+                                or archive["owner"] != federation_role
+                                or archive["derived_use"]
+                                or archive["reader_use"]
+                            ):
+                                fail(
+                                    f"Federation alias {alias_value!r} "
+                                    "archived schema is missing, misowned, or "
+                                    "still readable by a consumer role."
+                                )
+                        continue
                     if (
                         alias_row["status"] == "active"
                         and any(
@@ -2660,6 +2796,41 @@ if federation_database_url:
                             f"Federation alias {alias_value!r} has unexpected "
                             "user mappings."
                         )
+
+                # A sweep to catch what the per-alias walk structurally
+                # cannot: a server orphaned by a deleted registry row, or one
+                # renamed out of any recognisable shape while keeping its
+                # credentials. It classifies nothing by name -- an earlier
+                # version matched a "retired_" prefix and would have failed
+                # the audit on a healthy live source whose alias was simply
+                # called retired_sites. The invariant is stated exactly
+                # instead: among the servers this feature provisioned, only
+                # one belonging to a live alias may hold user mappings, since
+                # those hold the remote user and password in the catalogue in
+                # plain text.
+                cursor.execute(
+                    "SELECT s.srvname, "
+                    "(SELECT count(*) FROM pg_catalog.pg_user_mappings AS m "
+                    "  WHERE m.srvname = s.srvname) AS mappings "
+                    "FROM pg_catalog.pg_foreign_server AS s "
+                    "JOIN pg_catalog.pg_foreign_data_wrapper AS w "
+                    "  ON w.oid = s.srvfdw "
+                    "WHERE w.fdwname = $$postgres_fdw$$ "
+                    "AND pg_get_userbyid(s.srvowner) = %s "
+                    "AND s.srvname NOT IN ("
+                    "  SELECT alias || $$_srv$$ FROM federation._aliases "
+                    "  WHERE status <> $$retired$$"
+                    ")",
+                    (federation_role,),
+                )
+                for server_row in cursor.fetchall():
+                    if not server_row["mappings"]:
+                        continue
+                    server_label = server_row["srvname"]
+                    fail(
+                        f"Foreign server {server_label!r} belongs to no live "
+                        "federation alias but still holds user mappings."
+                    )
 
 print(
     "Runtime, derived, and federation PostgreSQL identities and privileges "

@@ -142,6 +142,22 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
         value.update(updates)
         return value
 
+    def test_rejects_a_source_whose_semantics_report_it_unavailable(self):
+        # The profile is ready; the source behind it is not. Without this the
+        # plan proceeds and fails later at a permission error on a schema that
+        # has been renamed away, which names nothing an operator can act on.
+        asset = self.source_asset()
+        asset["sourceState"] = "unavailable"
+
+        with self.assertRaises(DerivedLayerError) as raised:
+            plan_area_weighted_h3_recipe(self.request(), asset)
+
+        message = str(raised.exception)
+        self.assertIn("unavailable", message)
+        # Reported distinctly from a semantic problem, so nobody goes looking
+        # for one that does not exist.
+        self.assertNotIn("ready semantic profile", message)
+
     def test_plans_bounded_query_and_resolved_metadata_without_preflight(self):
         result = plan_area_weighted_h3_recipe(
             self.request(),
@@ -3560,6 +3576,59 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         statement, values = cursor.execute.call_args.args
         self.assertIn("unnest(sources)", str(statement))
         self.assertEqual(("source_leeds_ext",), values)
+
+    def test_source_schema_admission_locks_before_reading_dependants(self):
+        # Ordering is the whole point. Reading first and locking afterwards
+        # would still leave the window this closes: a layer created in between
+        # binds the schema and then has it revoked underneath, even though the
+        # caller was told the schema was unused.
+        order = []
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+
+        read_cursor = MagicMock()
+        read_cursor.execute.side_effect = lambda *a, **k: order.append("read")
+        read_cursor.fetchall.return_value = [{"name": "bus_stop_summary"}]
+        read_context = MagicMock()
+        read_context.__enter__.return_value = read_cursor
+
+        lock_cursor = MagicMock()
+        lock_cursor.execute.side_effect = lambda *a, **k: order.append("lock")
+        lock_cursor.fetchone.return_value = {"acquired": True}
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lock_cursor
+
+        connection.cursor.side_effect = lambda *args, **kwargs: (
+            lock_context if "row_factory" in kwargs else read_context
+        )
+        store._connect = MagicMock(return_value=connection)
+
+        with store.source_schema_admission("source_leeds_ext") as dependants:
+            self.assertEqual(["bus_stop_summary"], dependants)
+
+        self.assertEqual(["lock", "read"], order)
+        self.assertIn(
+            "pg_try_advisory_xact_lock",
+            str(lock_cursor.execute.call_args.args[0]),
+        )
+
+    def test_source_schema_admission_reads_nothing_without_admission(self):
+        # A dependant list gathered without the lock is exactly the unusable
+        # answer this context manager exists to avoid, so it must not be
+        # produced at all when admission is refused.
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+        store._acquire_mutation_lock = MagicMock(
+            side_effect=DerivedLayerContentionError("derived-mutation")
+        )
+
+        with self.assertRaises(DerivedLayerContentionError):
+            with store.source_schema_admission("source_leeds_ext"):
+                pass
+
+        cursor.execute.assert_not_called()
 
     def test_profile_blockers_query_only_page_names_and_tombstones(self):
         cursor = MagicMock()

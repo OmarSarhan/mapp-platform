@@ -31,8 +31,8 @@ except ModuleNotFoundError:  # Allows pure contract/mutation tests without DB ex
     sql = None
 
 
-API_VERSION = "1.5"
-CONTRACT_VERSION = "1.5"
+API_VERSION = "1.6"
+CONTRACT_VERSION = "1.6"
 RULES_VERSION = "1.6"
 FIXED_FILTER_NUMBER_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
@@ -1643,6 +1643,17 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "federation.aliases.retire": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/retire",
+        "risk": "federation-provision",
+        # Retirement revokes access and archives the physical objects, so it
+        # changes exposure and carries the same scope as granting it. It takes
+        # no body: it is refused outright while any derived layer still reads
+        # the alias, rather than offering a force flag.
+        "scope": "federation:provision",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
 }
 
 
@@ -1748,7 +1759,7 @@ def contract(instance_id: str) -> dict[str, Any]:
                 "maxItems": MAX_PAGE_LIMIT,
                 "firstPageOnly": True,
             },
-            "compatibilityArtifact": "contracts/api-compatibility-v1.5.json",
+            "compatibilityArtifact": "contracts/api-compatibility-v1.6.json",
         },
     }
 

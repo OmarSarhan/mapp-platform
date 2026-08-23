@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +45,7 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_schema import FederationSchemaError
+from federation_schema import FederationSchemaError, enforce_tls_policy
 from federation_store import MAX_ALIASES, FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
@@ -286,6 +287,40 @@ except GeminiClientError as exc:
     GEMINI_CONFIGURATION_ERROR = exc
 SEMANTIC_OUTBOX_LOCK = threading.Lock()
 SEMANTIC_OUTBOX_WAKE = threading.Event()
+# Fifteen minutes, measured from the start of one pass to the start of the
+# next, so this is a cadence rather than a gap bolted onto however long a pass
+# took. This is not only how stale an observation can get -- it is
+# also how long a false revoke lasts, because an unreachable source loses
+# consumer access and only regains it on the next pass that succeeds. That
+# makes a shorter interval the safer one for availability, against four
+# connections an hour into a database somebody else operates.
+FEDERATION_VERIFY_INTERVAL_SECONDS = 900
+# How long startup will hold the dashboard for the first pass. The doc asks for
+# verification on startup before planning or refresh; blocking outright would
+# let an unreachable third party decide when this service starts, since every
+# unreachable alias costs a 5s connect. So the pass runs concurrently and
+# startup waits only this long -- ample for a healthy deployment, which probes
+# in well under a second per alias, and bounded so a broken source costs a
+# minute rather than the whole startup.
+FEDERATION_VERIFY_STARTUP_GRACE_SECONDS = 60
+# A pass stops starting new aliases once it has spent this long. Without it the
+# interval is not a staleness bound at all: the traversal is serial, one alias
+# can consume the whole idle-transaction allowance, and the registry permits a
+# hundred of them, so an alias near the end could wait most of a day for its
+# first check. Aliases are taken least-recently-verified first, so whatever a
+# slow pass defers is exactly what the next pass starts with -- bounded and
+# fair, rather than the same prefix being rechecked forever.
+FEDERATION_VERIFY_PASS_BUDGET_SECONDS = 600
+# When each alias was last attempted, as opposed to last successfully observed.
+# lastObservationId only advances when an observation is persisted, so an alias
+# whose probe times out never moves under an ordering keyed on it alone: it
+# sorts first on every pass, spends the whole budget, and the aliases behind it
+# are never reached at all. Recording the attempt rotates it regardless of
+# outcome. Process-local and bounded by the registry ceiling; losing it on
+# restart only falls back to observation order, which is the right default for
+# a fresh process.
+FEDERATION_VERIFY_ATTEMPTS: dict[str, float] = {}
+FEDERATION_FIRST_PASS_DONE = threading.Event()
 SEMANTIC_MAX_ATTEMPTS = 8
 SEMANTIC_SOURCE_LOCK = threading.Lock()
 
@@ -1078,6 +1113,319 @@ def run_semantic_outbox() -> None:
             pass
         SEMANTIC_OUTBOX_WAKE.wait(10)
         SEMANTIC_OUTBOX_WAKE.clear()
+
+
+def run_federation_verifier() -> None:
+    """Verify every provisioned source on a timer, starting immediately.
+
+    The first pass runs before the first wait, so a source that broke while
+    the service was down is caught at startup rather than an interval later.
+
+    Deliberately thin: everything worth testing lives in
+    verify_federation_sources(), because logic inside a while True is logic no
+    test can reach.
+    """
+    while True:
+        started = time.monotonic()
+        try:
+            # The return value is deliberately ignored. Nothing configures
+            # logging in this service, so the effective level is WARNING and a
+            # per-pass INFO summary could never appear -- and a successful
+            # pass is already recorded durably as observed_at on each alias,
+            # which is queryable in a way a log line is not. Only the
+            # exceptional paths below log, and those do emit.
+            summary = verify_federation_sources()
+            # Readiness means every eligible alias was revalidated, not merely
+            # that the traversal ran. An alias whose observe() failed keeps the
+            # grants it had, and one the budget deferred was never reached, so
+            # signalling here would claim a startup check that did not happen
+            # for them. Withdrawing access on any failure is the wrong answer:
+            # the failures that reach this point are transient ones like lock
+            # contention -- the two that mean a source genuinely cannot be
+            # verified, a vanished connectionRef and a probe outrunning its
+            # budget, already withdraw access themselves. So this reports
+            # honestly and lets the bounded grace period expire, which logs
+            # what happened rather than serving in silence.
+            if not summary["failed"] and not summary["deferred"]:
+                FEDERATION_FIRST_PASS_DONE.set()
+        except Exception:
+            # Broad by intent, matching run_semantic_outbox: a registry that
+            # is briefly unreachable must not end the thread for the lifetime
+            # of the process. The next pass retries everything.
+            LOGGER.warning("Federation verification pass failed", exc_info=True)
+        # Measured from when the pass started, not from when it finished.
+        # Sleeping the full interval afterwards makes the real period the
+        # interval plus however long the pass took -- with the pass budget
+        # that is up to 25 minutes, not the 15 this constant claims. A pass
+        # that overruns the interval sleeps not at all, which is right: it is
+        # already late.
+        #
+        # A plain sleep, not an Event. The outbox waits on one because
+        # something calls SEMANTIC_OUTBOX_WAKE.set(); nothing would ever wake
+        # this loop, so an Event here would be wait()/clear() dressed up as a
+        # mechanism that does not exist. Adding one is trivial if a "verify
+        # now" action ever wants it.
+        time.sleep(
+            max(
+                0.0,
+                FEDERATION_VERIFY_INTERVAL_SECONDS
+                - (time.monotonic() - started),
+            )
+        )
+
+
+def reconcile_semantic_source_state(alias: str, *, available: bool) -> bool:
+    """Mirror an alias's usability onto the semantic assets bound to it.
+
+    Never raises, and returns whether the mirror is now correct. Two callers
+    need opposite things from a failure, and returning it lets each decide.
+
+    The verifier ignores the result: the observation that produced this verdict
+    is already persisted and its grants already applied, so a semantic service
+    that is briefly unreachable must not turn a successful verification into a
+    failed one, nor block startup readiness on a subsystem that has nothing to
+    do with whether the source is reachable. The next pass reconciles again,
+    and mark_source_state reports nothing changed when it is already right, so
+    a persistent outage costs one warning per pass rather than silent
+    divergence.
+
+    Retirement cannot be so relaxed, because there is no next pass: a retired
+    alias is excluded from every future one. It checks the result and refuses.
+
+    True when there is no semantic service configured, because then there is
+    nothing that could be out of step.
+    """
+    if not SEMANTIC:
+        return True
+    try:
+        result = SEMANTIC.request(
+            "/v1/source-state",
+            method="POST",
+            payload={"schema": f"source_{alias}", "available": available},
+            actor="federation-verifier",
+            scopes=["semantic:admin"],
+        )
+    except Exception:
+        LOGGER.warning(
+            "Could not mirror federation state onto semantic assets for "
+            "alias %r; the catalog may show it as usable until the next pass",
+            alias, exc_info=True,
+        )
+        return False
+    changed = result.get("changed") if isinstance(result, dict) else None
+    if changed:
+        LOGGER.info(
+            "Federation alias %r is %s; %d semantic asset(s) updated",
+            alias, "available" if available else "unavailable", len(changed),
+        )
+    return True
+
+
+def mirror_alias_semantics(alias: str) -> bool:
+    """Mirror an alias's current status onto its semantic assets, safely.
+
+    Takes the per-alias lock, reads the status under it, and mirrors that --
+    then swallows anything that goes wrong, including the lock itself being
+    unavailable. Contention here is ordinary: an explicit Observe, Provision or
+    retirement holds the same lock, and the role's lock_timeout turns a wait
+    into an exception. Letting that escape would abort the whole verification
+    pass over one busy alias and leave every later one unverified until the
+    next interval.
+
+    Skipping is safe in a way that failing is not: the mirror is reconciled
+    again on the next pass, and the alias's own status is already persisted.
+    Retirement deliberately does not use this -- it needs to know, because
+    there is no next pass for a retired alias.
+    """
+    try:
+        with FEDERATION.alias_reconciliation(alias) as current:
+            return reconcile_semantic_source_state(
+                alias, available=current == "active"
+            )
+    except Exception:
+        LOGGER.warning(
+            "Could not read %r under its alias lock to mirror semantic state; "
+            "the next pass reconciles it", alias, exc_info=True,
+        )
+        return False
+
+
+def verify_federation_sources(only: str | None = None) -> dict[str, int]:
+    """Re-observe every provisioned source once, and report what happened.
+
+    This is deliberately the same call the operator's Observe route makes,
+    which means it carries the same consequence: _persist_observation grants
+    or revokes consumer access according to whether the evidence is still
+    current, so a source that has gone away loses access without anyone
+    asking, and regains it on the first observation that succeeds again.
+    Running it on a timer is what makes that automatic in both directions.
+    Introducing a second, weaker observe for the periodic path would mean two
+    sets of semantics for the same word, which is a worse trade than the
+    recovery window.
+
+    An unreachable source is not an error here. detect_capability catches
+    psycopg failures and returns connectivity 'unavailable', so it arrives as
+    an ordinary observation -- exactly the condition this exists to notice.
+    The exceptions counted below are the genuinely exceptional ones: a
+    connectionRef no longer configured, or the local registry being
+    unavailable.
+
+    Returns counts rather than raising so a caller can log one line per pass.
+    """
+    summary = {"observed": 0, "failed": 0, "skipped": 0, "deferred": 0}
+    if not FEDERATION:
+        return summary
+    deadline = time.monotonic() + FEDERATION_VERIFY_PASS_BUDGET_SECONDS
+    # list() already excludes retired aliases, which is the filter that keeps
+    # a decommissioned source from being probed on a timer forever. Repeating
+    # the condition here would be a second place to forget to change.
+    # Least-recently-verified first, never observed before that. Ordering by
+    # alias would mean a slow source early in the alphabet permanently starves
+    # everything after it, since a deferred tail is only ever reached by a pass
+    # that happens to run fast enough. lastObservationId rises monotonically,
+    # so it stands in for "longest since anyone looked".
+    candidates = sorted(
+        FEDERATION.list(),
+        key=lambda item: (
+            FEDERATION_VERIFY_ATTEMPTS.get(item["alias"], 0.0),
+            item["lastObservationId"] is not None,
+            item["lastObservationId"] or 0,
+        ),
+    )
+    for index, record in enumerate(candidates):
+        alias = record["alias"]
+        if time.monotonic() >= deadline:
+            # Stop starting new work rather than abandoning what is running.
+            # The bound is therefore this budget plus one alias, not the sum of
+            # every alias's worst case.
+            summary["deferred"] = len(candidates) - index
+            LOGGER.warning(
+                "Federation verification pass ran out of time; %d alias(es) "
+                "deferred to the next pass",
+                summary["deferred"],
+            )
+            break
+        if only is not None and alias != only:
+            # The timer never passes this. It exists so a test can drive the
+            # real pass without touching aliases it does not own: the harness
+            # stops the shared source to prove an outage revokes, and an
+            # unscoped pass would revoke every other alias pointing at it and
+            # leave that behind, since teardown only knows about the probe.
+            continue
+        if record["provisionedAt"] is None:
+            # Nothing is exposed yet, so there is no access to keep honest and
+            # no reason to open a connection to somebody else's database.
+            summary["skipped"] += 1
+            continue
+        if not record["acceptedEvidenceComplete"]:
+            # An alias approved before the accepted-evidence columns existed
+            # can never satisfy _persist_observation's currency test, because
+            # that test requires all three to be non-NULL and to match. On a
+            # timer that is not a stale reading, it is a one-way door: every
+            # pass revokes, and only provision() with explicit operator
+            # acknowledgement can ever put it back, which no timer supplies.
+            # The interval bounds how long a false revoke lasts only for
+            # sources that can recover; this class cannot, so the timer leaves
+            # it exactly as it found it. An operator's own Observe still
+            # reaches it, and acceptedEvidenceComplete tells them which
+            # aliases need reprovisioning.
+            #
+            # Its semantics are still mirrored. Skipping the observation is
+            # not the same as having nothing to say: this alias is very likely
+            # unavailable with its grants already revoked, and leaving its
+            # assets claiming otherwise is the exact divergence this exists to
+            # close.
+            summary["skipped"] += 1
+            reconcile_semantic_source_state(
+                alias, available=record["status"] == "active"
+            )
+            continue
+        FEDERATION_VERIFY_ATTEMPTS[alias] = time.monotonic()
+        try:
+            try:
+                connection_url = resolve_federation_connection_url(
+                    record["connectionRef"]
+                )
+                # Every way the configuration itself can be unusable, checked
+                # before observe() opens its transaction: the reference gone,
+                # conninfo that will not parse, unsupported options, or TLS
+                # weaker than the alias registered for. detect_capability
+                # enforces the same policy, but by then the failure arrives
+                # mid-observation with nothing persisted and no chance to act
+                # on it. None of these is transient -- no retry fixes a
+                # malformed connection string -- so the alias is unverifiable
+                # until someone repairs the configuration.
+                enforce_tls_policy(record["tlsPolicy"], connection_url)
+            except FederationSchemaError as exc:
+                # The foreign tables keep working regardless: the user mapping
+                # still holds the remote credential, so both consumer roles
+                # would read a source the deployment cannot verify. Every other
+                # revoke path runs from an observation that cannot be made
+                # here. Recoverable -- repairing the configuration lets the
+                # next pass grant access straight back.
+                if FEDERATION.mark_unverifiable(alias):
+                    LOGGER.warning(
+                        "Federation alias %r cannot be verified with "
+                        "connectionRef %r (%s); consumer access withdrawn "
+                        "until the configuration is repaired",
+                        alias, record["connectionRef"], exc,
+                    )
+                summary["failed"] += 1
+                reconcile_semantic_source_state(alias, available=False)
+                continue
+            observed = FEDERATION.observe(
+                alias,
+                connection_url,
+                allowed_relations=tuple(record["allowedRelations"]),
+                tls_policy=record["tlsPolicy"],
+            )
+            summary["observed"] += 1
+            # Under the per-alias lock, reading the status again rather than
+            # trusting the observation's own result. This is the only place a
+            # pass can mark a source available, and a retirement committing
+            # between the observation and this write would otherwise be
+            # overwritten -- permanently, since a retired alias is excluded
+            # from every later pass.
+            mirror_alias_semantics(alias)
+        except (
+            psycopg.errors.IdleInTransactionSessionTimeout,
+            psycopg.errors.TransactionTimeout,
+        ):
+            # observe() holds its local transaction open across the probe, so
+            # these mean the probe outran the transaction's own budget rather
+            # than any remote statement exceeding its five-second limit. The
+            # persist never ran, so without this the source too slow to verify
+            # would keep consumer access indefinitely while a source merely
+            # down lost it in five seconds -- the same inversion the timeout
+            # allowance was raised to remove, just at a larger threshold.
+            # Recoverable exactly like the missing-reference case: a pass that
+            # completes grants access straight back.
+            if FEDERATION.mark_unverifiable(alias):
+                LOGGER.warning(
+                    "Federation alias %r could not be probed within its "
+                    "transaction budget; consumer access withdrawn until a "
+                    "pass completes", alias,
+                )
+            summary["failed"] += 1
+            reconcile_semantic_source_state(alias, available=False)
+        except Exception:
+            # One alias must not stop the rest: a single removed connectionRef
+            # would otherwise leave every later source unverified. Broad by
+            # intent -- this runs unattended, and the next pass retries
+            # everything regardless of why this one failed.
+            summary["failed"] += 1
+            LOGGER.warning(
+                "Federation verification failed for alias %r", alias,
+                exc_info=True,
+            )
+            # Transient, so the registry status is unchanged and still
+            # accurate -- but "unchanged" is only true until a retirement
+            # commits, and this branch can mirror "available" from the listed
+            # record. That is the one write that can outlive its subject, so
+            # it reads the status again under the same lock the success path
+            # uses rather than trusting what the pass started with.
+            mirror_alias_semantics(alias)
+    return summary
 
 
 def archive_derived_semantics_before_reset(
@@ -2597,6 +2945,13 @@ def require_semantic_derived_sources(
     profiled_sources = set()
     for asset in assets:
         if not isinstance(asset, dict) or asset.get("status") != "ready":
+            continue
+        if asset.get("sourceState") is not None:
+            # Ready, but the relation it was generated from is not currently
+            # usable -- a federated source retired or one verification can no
+            # longer reach. Counting it as a profile would let planning
+            # authorise work against a schema that has been renamed away, and
+            # fail later at a permission error that names nothing useful.
             continue
         generated = asset.get("generated")
         if not isinstance(generated, dict):
@@ -5208,7 +5563,7 @@ class Handler(SimpleHTTPRequestHandler):
             # is a non-connecting intent record.
             if re.fullmatch(
                 r"/api/federation/aliases/[A-Za-z][A-Za-z0-9_]{0,55}/"
-                r"(observe|provision)",
+                r"(observe|provision|retire)",
                 path,
             ):
                 return "federation:provision"
@@ -7124,7 +7479,7 @@ class Handler(SimpleHTTPRequestHandler):
         )
         federation_alias_action_path = re.fullmatch(
             r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_]{0,55})/"
-            r"(observe|provision)",
+            r"(observe|provision|retire)",
             request_path,
         )
         if (
@@ -7504,6 +7859,157 @@ class Handler(SimpleHTTPRequestHandler):
                 # psycopg.Error handler with no federation-specific code.
                 try:
                     record = FEDERATION.get(alias_name)
+                    if federation_action == "retire":
+                        if payload:
+                            raise FederationSchemaError(
+                                "Unknown retire properties: "
+                                + ", ".join(sorted(payload)),
+                                code="federation.invalid_request",
+                            )
+                        # Refused while any derived layer still reads the
+                        # alias: revoking access underneath a dependent
+                        # materialized view would leave it refreshing against
+                        # a source nobody believes is connected any more. The
+                        # check lives here rather than in the store because
+                        # the federation registry deliberately does not import
+                        # the derived-layer store; this route already composes
+                        # the two for affectedDerivedLayers.
+                        #
+                        # Admission is held across the retirement so a layer
+                        # cannot bind the schema between the check and the
+                        # DDL; the two stores commit in separate transactions,
+                        # so nothing else serializes them.
+                        try:
+                            admission = (
+                                DERIVED.source_schema_admission(
+                                    f"source_{alias_name}"
+                                )
+                                if DERIVED
+                                else nullcontext([])
+                            )
+                            with admission as dependants:
+                                if dependants:
+                                    raise FederationSchemaError(
+                                        f"Alias {alias_name!r} still has "
+                                        "derived layers reading from it: "
+                                        + ", ".join(dependants)
+                                        + ". Drop or repoint them before "
+                                        "retiring.",
+                                        code="federation.alias_in_use",
+                                        status=HTTPStatus.CONFLICT,
+                                    )
+                                # Managed derived layers are not the only
+                                # readers. A saved workspace layer can point
+                                # straight at source_<alias>.<relation> through
+                                # the bundled connection, and retiring would
+                                # revoke mapp_xyz and rename the schema under
+                                # a published layer that is serving now.
+                                # platform_dependencies already knows how to
+                                # find those references.
+                                try:
+                                    workspace = read_workspace()[1]
+                                except (
+                                    ValueError, RuntimeError, FileNotFoundError
+                                ) as exc:
+                                    # Fail closed. Retirement is irreversible,
+                                    # and a workspace that cannot be read is a
+                                    # workspace whose layers cannot be ruled
+                                    # out.
+                                    raise FederationSchemaError(
+                                        "The workspace could not be read, so "
+                                        f"retiring {alias_name!r} cannot be "
+                                        "shown to be safe for the layers it "
+                                        f"serves: {exc}",
+                                        code="federation.workspace_unreadable",
+                                        status=HTTPStatus.CONFLICT,
+                                    ) from exc
+                                schema_prefix = f"source_{alias_name}."
+                                using = sorted({
+                                    layer
+                                    for item in platform_dependencies(workspace)
+                                    if item["relation"].startswith(schema_prefix)
+                                    for layer in item["workspace"]
+                                })
+                                if using:
+                                    raise FederationSchemaError(
+                                        f"Alias {alias_name!r} still has "
+                                        "workspace layers reading from it: "
+                                        + ", ".join(using)
+                                        + ". Remove or repoint them before "
+                                        "retiring.",
+                                        code="federation.alias_in_use",
+                                        status=HTTPStatus.CONFLICT,
+                                    )
+                                # Before the retirement, not after. Retirement is
+                                # terminal and list() excludes retired aliases, so
+                                # the verifier never revisits this one -- a
+                                # semantic failure afterwards would leave its
+                                # assets claiming the source is fine forever, with
+                                # nothing left to correct it. Doing it first means
+                                # the only failure mode is the recoverable one: if
+                                # the retirement then fails, the alias stays
+                                # active and the next pass clears the flag.
+                                reconciliation = (
+                                    FEDERATION.alias_reconciliation(alias_name)
+                                )
+                                with reconciliation:
+                                    mirrored = (
+                                        reconcile_semantic_source_state(
+                                            alias_name, available=False
+                                        )
+                                    )
+                                    if mirrored:
+                                        result = FEDERATION.retire(
+                                            alias_name, actor
+                                        )
+                                if not mirrored:
+                                    # Refused rather than retried. Retirement is
+                                    # terminal and excluded from every future
+                                    # verifier pass, so there is no later chance
+                                    # to correct this -- the assets would go on
+                                    # reporting a renamed schema as usable
+                                    # indefinitely, and derived planning would go
+                                    # on believing them. An operator can retry
+                                    # once the semantic service is back, which is
+                                    # a smaller cost than an outbox that exists
+                                    # solely for this one call.
+                                    raise FederationSchemaError(
+                                        "The semantic service could not be "
+                                        "updated, so retiring "
+                                        f"{alias_name!r} would leave its semantic "
+                                        "profiles reporting a source that no "
+                                        "longer exists. Retry once it is "
+                                        "reachable.",
+                                        code="federation.semantic_unavailable",
+                                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                                    )
+                        except DerivedLayerContentionError as exc:
+                            # Translated rather than routed through the derived
+                            # error machinery, which would describe this as a
+                            # derived-layer operation the caller never asked
+                            # for. Retirement simply could not prove the alias
+                            # was unused.
+                            raise FederationSchemaError(
+                                "A derived-layer operation is in progress, so "
+                                f"alias {alias_name!r} cannot be retired "
+                                "safely yet. Retry once it finishes.",
+                                code="federation.derived_layers_busy",
+                                status=HTTPStatus.CONFLICT,
+                            ) from exc
+                        CONTROL.audit(
+                            "federation_alias.retired",
+                            actor=actor,
+                            remote=self._remote(),
+                            details={
+                                "alias": alias_name,
+                                "archivedSchema": result.get("archivedSchema"),
+                            },
+                        )
+                        self._json(HTTPStatus.OK, {"alias": result})
+                        return
+                    # Retirement deliberately precedes this: a source whose
+                    # connectionRef has already been removed from the
+                    # environment must still be retirable.
                     connection_url = resolve_federation_connection_url(
                         record["connectionRef"]
                     )
@@ -7529,6 +8035,16 @@ class Handler(SimpleHTTPRequestHandler):
                             allowed_relations=tuple(record["allowedRelations"]),
                             tls_policy=record["tlsPolicy"],
                         )
+                        # An operator observing an outage or a recovery changes
+                        # exactly what the timer's observation changes, so the
+                        # semantic mirror has to follow here too. Without it
+                        # the profiles keep their previous state until a later
+                        # pass, which means planning can authorise a source
+                        # this very request just found unavailable, or keep
+                        # refusing one it just found healthy -- for up to the
+                        # verification interval, after an explicit action whose
+                        # whole point was to be immediate.
+                        mirror_alias_semantics(alias_name)
                         CONTROL.audit(
                             "federation_alias.observed",
                             actor=actor,
@@ -7599,6 +8115,13 @@ class Handler(SimpleHTTPRequestHandler):
                             expected_observation_id=expected_observation_id,
                             **provision_flags,
                         )
+                        # Provisioning is how an unavailable alias comes back:
+                        # it restores the grants and sets the status active.
+                        # Without mirroring that, its semantic profiles stay
+                        # flagged and derived planning goes on refusing a
+                        # source that now works, until a timer pass happens to
+                        # notice -- after an explicit action taken to fix it.
+                        mirror_alias_semantics(alias_name)
                         CONTROL.audit(
                             "federation_alias.provisioned",
                             actor=actor,
@@ -7613,6 +8136,28 @@ class Handler(SimpleHTTPRequestHandler):
                                 },
                             },
                         )
+                except psycopg.errors.LockNotAvailable:
+                    # Must precede psycopg.Error. observe() and provision()
+                    # take a blocking per-alias advisory lock, and the role
+                    # carries lock_timeout, so contention surfaces here as a
+                    # database error. Reporting it as "the registry is
+                    # unavailable" sends an operator to check a database that
+                    # is working perfectly. The periodic verifier holds that
+                    # same lock across its remote probe, which is precisely
+                    # when someone is most likely to be observing the alias by
+                    # hand -- a slow source is both the thing that widens the
+                    # window and the thing that makes them look.
+                    self._json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": (
+                                f"Alias {alias_name!r} is being verified right "
+                                "now. Retry in a moment."
+                            ),
+                            "code": "federation.verification_in_progress",
+                        },
+                    )
+                    return
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9527,4 +10072,25 @@ if __name__ == "__main__":
         name="semantic-outbox",
         daemon=True,
     ).start()
+    # Only where a registry exists: outside bundled mode FEDERATION is None,
+    # and a thread whose every pass is a no-op is just a thread to explain.
+    if FEDERATION:
+        threading.Thread(
+            target=run_federation_verifier,
+            name="federation-verifier",
+            daemon=True,
+        ).start()
+        # Wait for that first pass, but only so far. On a healthy deployment
+        # this returns in well under a second, so nothing is served against
+        # grants that have not been revalidated; on a broken one it gives up
+        # and serves anyway, because a dashboard that will not start is worse
+        # than one that finishes verifying a moment later.
+        if not FEDERATION_FIRST_PASS_DONE.wait(
+            FEDERATION_VERIFY_STARTUP_GRACE_SECONDS
+        ):
+            LOGGER.warning(
+                "Federation verification did not finish within %ss; serving "
+                "while it continues in the background",
+                FEDERATION_VERIFY_STARTUP_GRACE_SECONDS,
+            )
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

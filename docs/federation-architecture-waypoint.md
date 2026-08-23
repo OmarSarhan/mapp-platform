@@ -1065,16 +1065,37 @@ change the workspace automatically.
 | Removed/type-changed field | Identify dependants and block affected publication or refresh |
 | Geometry type or SRID change | Mark incompatible pending explicit review |
 | Different physical database | Raise identity conflict; require explicit rebind |
-| Source retired | Archive normal discovery while retaining exact-ID audit history, including the physical schema/server/mapping objects — nothing is dropped |
+| Source retired | Archive normal discovery while retaining exact-ID audit history, including the physical schema, server and foreign tables — only the user mappings are dropped (see below) |
 
 Follow the existing semantic archive contract: retirement is not deletion, and
 normal collections omit archived assets while authorized exact-ID history
 remains available.
 
-**Decided:** retirement archives everything, including the live foreign
-server, user mapping, and foreign tables — none of it is dropped, so the
-exact-ID audit trail stays physically inspectable, not just metadata. This
-means the `source_<alias>` schema name stays taken for as long as the retired
+**Decided, and amended in implementation:** retirement archives the foreign
+server, the schema and the foreign tables so the exact-ID audit trail stays
+physically inspectable, not just metadata. It does **not** retain the user
+mappings. A mapping is not audit evidence — it is the live credential for the
+remote, held in `pg_user_mapping.umoptions` as plain text — and there is no
+justification for a decommissioned source to keep working credentials
+indefinitely. The archived server, schema and foreign tables still record
+exactly what was connected. `scripts/verify.sh` asserts that a retired alias
+retains no mappings on either its live or archived server name.
+
+Implementation also renames the archived objects
+(`retired-<alias>_<provisioned_at>_<digest>`) rather than leaving them under
+the live name, which frees `source_<alias>` immediately. The hyphen is
+deliberate: `ALIAS_RE` admits no hyphen, so archive names occupy a namespace
+no registrable alias can reach. Under an all-underscore name the archive name
+for a short alias was itself a legal alias, and registering it would create a
+live server holding the exact name a later retirement needed — leaving the
+original un-retirable until the squatter was itself retired. The digest tells
+two archives apart; only the hyphen tells an archive from a live alias. The
+**reclaim** action below
+is therefore not required to release a name; it remains the intended shape for
+carrying curated semantics across a re-registration, and is not implemented.
+The original intent is preserved verbatim from here:
+
+`source_<alias>` was to stay taken for as long as the retired
 registration is archived, so re-registering the identical alias name requires
 an explicit **reclaim** action (a new scope-gated operation, distinct from
 ordinary Register) that an administrator invokes deliberately — it is never
@@ -1586,7 +1607,7 @@ the platform side of the contract must land first:
 | --- | --- | --- |
 | `apiVersion` / `contractVersion` | `1.5` | A minor bump for additive federation actions; a major bump if relation identity changes shape |
 | `rulesVersion` | `1.6` | Bumps if workspace relation or `dbs` validation changes |
-| `contracts/api-compatibility-v1.5.json` | Declares consumers and pagination endpoints | Alias registration is currently capped at 100, so its list remains one bounded response; add pagination before lifting that cap or exposing observation history |
+| `contracts/api-compatibility-v1.6.json` | Declares consumers and pagination endpoints | Alias registration is currently capped at 100, so its list remains one bounded response; add pagination before lifting that cap or exposing observation history |
 | `GET /api/contract` | Runtime authority; no federation CLI commands are currently advertised | Add command names only in the same release that implements them in the independently shipped CLI |
 | `GET /api/capabilities` | Runtime authority for action IDs, risk classes, conditional scopes | Must advertise federation actions, their risk class, and their exact scope combinations |
 | Scope model | `derive`, `semantic:*`, etc., explicitly non-hierarchical | New `federation:register` / `federation:provision` / `federation:observe` scopes, plus a separately-granted **reclaim** action for re-registering a retired alias's name; reachable from the dashboard session or from a CLI credential holding them, peer to each other, not reachable from any other existing scope. `federation:provision` also gates Discover and the verify-not-read endpoint, not just Approve exposure |
