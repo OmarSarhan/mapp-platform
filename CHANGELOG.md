@@ -8,6 +8,32 @@ first release.
 
 ### Added
 
+- Added federated PostgreSQL source retirement, which archives the schema,
+  server and foreign tables under a name no alias can occupy rather than
+  dropping them, drops only the user mappings because those are live
+  credentials rather than audit evidence, and refuses while a derived layer,
+  a workspace layer or an unreachable semantic service still depends on the
+  source.
+- Added continuous verification of provisioned federated sources on a
+  fifteen-minute cadence, with a bounded pass that takes the
+  least-recently-verified alias first. A source that becomes unreachable, or
+  whose connection configuration becomes unusable, loses consumer access
+  automatically and regains it on the first pass that succeeds. Startup waits
+  briefly for the first pass rather than blocking on an unreachable third
+  party.
+- Added `sourceState` to semantic assets, so a profile whose federated source
+  is retired or unreachable is flagged rather than deleted and stops
+  authorising derived planning, while keeping its identity and curated meaning
+  so a source that returns reclaims exactly its own annotations. Semantic
+  service contract `1.2.0`.
+- Added `./bin/mapp federation-test`, an end-to-end harness driving the whole
+  lifecycle over HTTP against a genuinely separate source database, including
+  a cross-schema H3 aggregation checked against the same computation run
+  locally, and semantic degradation and recovery.
+- Added [Federated PostgreSQL sources](docs/federation.md), the operator
+  procedure for attaching, verifying and withdrawing a source, with every
+  `federation.*` error code documented. API and contract version `1.6`.
+
 - Added bounded numeric layer statistics with null/non-finite counts, min/max,
   discrete quantiles, overflow-safe histograms, requested-threshold counts,
   and candidate exclusive class counts without returning source rows.
