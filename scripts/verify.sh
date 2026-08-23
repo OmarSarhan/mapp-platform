@@ -70,8 +70,15 @@ if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]];
     "${ENV_FILE}" >&2
   exit 2
 fi
+# Whether this deployment runs MAPP's own PostgreSQL. Both bundled and
+# federated do; external points at somebody else's server. Every check below
+# that compared against "bundled" was asking this, not asking about bundled.
+has_bundled_database() {
+  [[ "${database_mode}" == "bundled" || "${database_mode}" == "federated" ]]
+}
+
 case "${database_mode}" in
-  bundled)
+  bundled|federated)
     compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
     required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
@@ -79,7 +86,7 @@ case "${database_mode}" in
     required_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
     ;;
   *)
-    printf 'MAPP_DATABASE_MODE must be bundled or external.\n' >&2
+    printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
     exit 2
     ;;
 esac
@@ -169,8 +176,8 @@ if [[ -z "${resolved_federation_dbs}" && -n "${resolved_federation_role}" ]] \
   printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be configured or both be empty.\n' >&2
   exit 2
 fi
-if [[ "${database_mode}" == "bundled" && -z "${resolved_federation_dbs}" ]]; then
-  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required in bundled mode.\n' >&2
+if has_bundled_database && [[ -z "${resolved_federation_dbs}" ]]; then
+  printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required with a local database.\n' >&2
   exit 2
 fi
 if [[ "${database_mode}" == "external" ]]; then
@@ -315,7 +322,7 @@ if ! "${compose[@]}" exec -T browser-runner \
   exit 1
 fi
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   "${compose[@]}" exec -T db \
     sh /usr/local/bin/mapp-prepare-spatial-indexes check
   "${compose[@]}" exec -T \
@@ -1366,13 +1373,15 @@ fi
     const audit = result.rows[0];
     const declaredReader = process.argv[2];
     const bundledReader = process.argv[3];
+    const hasBundledDatabase = process.argv[1] === "bundled"
+      || process.argv[1] === "federated";
     if (
       !audit
       || !audit.postgis
       || audit.currentUser !== audit.sessionUser
       || audit.currentUser !== uriUser
       || (declaredReader && audit.currentUser !== declaredReader)
-      || (process.argv[1] === "bundled"
+      || (hasBundledDatabase
         && audit.currentUser !== bundledReader)
       || !audit.canLogin
       || audit.superuser
@@ -1393,7 +1402,7 @@ fi
       fail("The active DBS_MAPP session is not the required read-only runtime identity.");
     }
 
-    if (process.argv[1] === "bundled") {
+    if (hasBundledDatabase) {
       for (const relation of [
         "leeds.bus_stops",
         "leeds.definitive_paths",
@@ -1573,8 +1582,11 @@ if bool(federation_database_url) != bool(federation_role):
         "FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be "
         "configured or both be empty."
     )
-if database_mode == "bundled" and not federation_database_url:
-    fail("Bundled federation requires FEDERATION_DATABASE_URL.")
+# Both bundled and federated run MAPP own PostgreSQL, so both require the
+# federation provisioner URL; external does not.
+local_database = database_mode in ("bundled", "federated")
+if local_database and not federation_database_url:
+    fail("A local database requires FEDERATION_DATABASE_URL.")
 
 try:
     parsed = urlsplit(database_url)
@@ -2030,6 +2042,14 @@ with psycopg.connect(
                 "The active DERIVED_DATABASE_URL owner search_path must be "
                 "exactly pg_catalog, public."
             )
+        # The databaseName comparison below is the generalized invariant from
+        # docs/federation-architecture-waypoint.md, "Relationship to the
+        # current single-database contract": the derived owner must live in
+        # the database the effective dbs alias of the workspace resolves to.
+        # compose.yaml forwards DBS_MAPP by explicit enumeration, so that
+        # alias can only resolve to this reader connection, and federated mode
+        # repoints reader and derived owner in the same step by design. Do not
+        # relax it when federated mode gains its own database.
         if (
             not audit
             or not audit["postgis"]
@@ -2039,7 +2059,7 @@ with psycopg.connect(
             or audit["currentUser"] != derived_role
             or audit["currentUser"] == reader_role
             or (
-                database_mode == "bundled"
+                database_mode in ("bundled", "federated")
                 and audit["currentUser"] != bundled_derived_role
             )
             or not audit["canLogin"]
@@ -2071,7 +2091,7 @@ with psycopg.connect(
                 "and timeout limits."
             )
 
-        if database_mode == "bundled":
+        if database_mode in ("bundled", "federated"):
             for relation in (
                 "leeds.bus_stops",
                 "leeds.definitive_paths",
@@ -2262,6 +2282,7 @@ if federation_database_url:
                 WHERE role.rolname = current_user
             """)
             federation_audit = cursor.fetchone()
+            # Same invariant as the derived owner above, for the same reason.
             if (
                 not federation_audit
                 or federation_audit["databaseName"]
@@ -2365,6 +2386,29 @@ if federation_database_url:
                 "SELECT to_regclass($$federation._aliases$$) AS oid"
             )
             if cursor.fetchone()["oid"] is not None:
+                # archived_schema is added by the alias store the first time it
+                # connects, which on an upgraded deployment may not have
+                # happened yet. Selecting it unconditionally would abort this
+                # whole audit with UndefinedColumn. Its absence also means no
+                # alias can have been retired, so the retired branch below is
+                # unreachable and NULL is the correct stand-in.
+                cursor.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = $$federation$$ "
+                    "AND table_name = $$_aliases$$ "
+                    "AND column_name IN "
+                    "($$archived_schema$$, $$archived_server$$)"
+                )
+                present = {row["column_name"] for row in cursor.fetchall()}
+                archived_column = (
+                    "archived_schema"
+                    if "archived_schema" in present
+                    else "NULL::text AS archived_schema"
+                ) + ", " + (
+                    "archived_server"
+                    if "archived_server" in present
+                    else "NULL::text AS archived_server"
+                )
                 cursor.execute(
                     "SELECT public.PostGIS_Lib_Version() AS postgis, "
                     "(SELECT extversion FROM pg_catalog.pg_extension "
@@ -2377,12 +2421,125 @@ if federation_database_url:
                     "SELECT alias, connection_ref, allowed_relations, status, "
                     "last_observation, accepted_schema_fingerprint, "
                     "accepted_physical_identity, "
-                    "accepted_connection_identity, last_observation_id "
+                    "accepted_connection_identity, last_observation_id, "
+                    + archived_column + " "
                     "FROM federation._aliases "
                     "WHERE provisioned_at IS NOT NULL"
                 )
                 for alias_row in cursor.fetchall():
                     alias_value = alias_row["alias"]
+                    if alias_row["status"] == "retired":
+                        # These three hold however the alias was retired.
+                        # retire() records no archived schema when the local
+                        # one had already been removed by hand, but it still
+                        # archives the server and drops the mappings
+                        # independently. Skipping the live-name audits on that
+                        # path left the credential-retention case unchecked --
+                        # precisely the state retirement exists to prevent, and
+                        # precisely the fix an earlier commit made to the
+                        # store, unverified by the thing that audits it.
+                        archived = alias_row["archived_schema"]
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_namespace "
+                            "WHERE nspname = %s",
+                            (f"source_{alias_value}",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live source schema still exists."
+                            )
+                        cursor.execute(
+                            "SELECT 1 FROM pg_catalog.pg_foreign_server "
+                            "WHERE srvname = %s",
+                            (f"{alias_value}_srv",),
+                        )
+                        if cursor.fetchone():
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its live foreign server still exists."
+                            )
+                        cursor.execute(
+                            "SELECT count(*) AS mappings "
+                            "FROM pg_catalog.pg_user_mappings "
+                            "WHERE srvname = %s",
+                            (f"{alias_value}_srv",),
+                        )
+                        if cursor.fetchone()["mappings"]:
+                            fail(
+                                f"Federation alias {alias_value!r} is retired "
+                                "but its foreign server still holds user "
+                                "mappings."
+                            )
+                        # retire() records the archived server name, so the
+                        # audit never derives or pattern-matches it. Deriving
+                        # it from archived_schema is wrong -- the alias is
+                        # truncated four characters further for the server --
+                        # and a "retired_" prefix does not identify an archive
+                        # either, since ALIAS_RE permits an alias literally
+                        # named retired_sites whose live server would then be
+                        # read as one. Asserting existence is the point: the
+                        # contract is archive rather than drop, and an audit
+                        # that cannot notice a dropped archive does not verify
+                        # it.
+                        archived_srv = alias_row["archived_server"]
+                        if archived_srv:
+                            cursor.execute(
+                                "SELECT pg_get_userbyid(srvowner) AS owner, "
+                                "(SELECT count(*) "
+                                "   FROM pg_catalog.pg_user_mappings AS m "
+                                "  WHERE m.srvname = s.srvname) AS mappings "
+                                "FROM pg_catalog.pg_foreign_server AS s "
+                                "WHERE srvname = %s",
+                                (archived_srv,),
+                            )
+                            archived_row = cursor.fetchone()
+                            if not archived_row:
+                                fail(
+                                    f"Federation alias {alias_value!r} records "
+                                    f"archived server {archived_srv!r}, which "
+                                    "no longer exists."
+                                )
+                            archived_owner = archived_row["owner"]
+                            if archived_owner != federation_role:
+                                fail(
+                                    f"Archived server {archived_srv!r} is "
+                                    f"owned by {archived_owner!r}, not the "
+                                    "federation provisioner."
+                                )
+                            if archived_row["mappings"]:
+                                fail(
+                                    f"Archived server {archived_srv!r} still "
+                                    "holds user mappings."
+                                )
+                        if archived:
+                            # Retirement archives rather than drops, so the
+                            # schema must still exist under its archived name,
+                            # owned by the provisioner and unreachable by
+                            # either consumer role.
+                            cursor.execute(
+                                "SELECT pg_get_userbyid(nspowner) AS owner, "
+                                "has_schema_privilege(%s, oid, $$USAGE$$) "
+                                "  AS derived_use, "
+                                "has_schema_privilege(%s, oid, $$USAGE$$) "
+                                "  AS reader_use "
+                                "FROM pg_catalog.pg_namespace "
+                                "WHERE nspname = %s",
+                                (derived_role, reader_role, archived),
+                            )
+                            archive = cursor.fetchone()
+                            if (
+                                not archive
+                                or archive["owner"] != federation_role
+                                or archive["derived_use"]
+                                or archive["reader_use"]
+                            ):
+                                fail(
+                                    f"Federation alias {alias_value!r} "
+                                    "archived schema is missing, misowned, or "
+                                    "still readable by a consumer role."
+                                )
+                        continue
                     if (
                         alias_row["status"] == "active"
                         and any(
@@ -2661,6 +2818,41 @@ if federation_database_url:
                             "user mappings."
                         )
 
+                # A sweep to catch what the per-alias walk structurally
+                # cannot: a server orphaned by a deleted registry row, or one
+                # renamed out of any recognisable shape while keeping its
+                # credentials. It classifies nothing by name -- an earlier
+                # version matched a "retired_" prefix and would have failed
+                # the audit on a healthy live source whose alias was simply
+                # called retired_sites. The invariant is stated exactly
+                # instead: among the servers this feature provisioned, only
+                # one belonging to a live alias may hold user mappings, since
+                # those hold the remote user and password in the catalogue in
+                # plain text.
+                cursor.execute(
+                    "SELECT s.srvname, "
+                    "(SELECT count(*) FROM pg_catalog.pg_user_mappings AS m "
+                    "  WHERE m.srvname = s.srvname) AS mappings "
+                    "FROM pg_catalog.pg_foreign_server AS s "
+                    "JOIN pg_catalog.pg_foreign_data_wrapper AS w "
+                    "  ON w.oid = s.srvfdw "
+                    "WHERE w.fdwname = $$postgres_fdw$$ "
+                    "AND pg_get_userbyid(s.srvowner) = %s "
+                    "AND s.srvname NOT IN ("
+                    "  SELECT alias || $$_srv$$ FROM federation._aliases "
+                    "  WHERE status <> $$retired$$"
+                    ")",
+                    (federation_role,),
+                )
+                for server_row in cursor.fetchall():
+                    if not server_row["mappings"]:
+                        continue
+                    server_label = server_row["srvname"]
+                    fail(
+                        f"Foreign server {server_label!r} belongs to no live "
+                        "federation alias but still holds user mappings."
+                    )
+
 print(
     "Runtime, derived, and federation PostgreSQL identities and privileges "
     "verified."
@@ -2760,7 +2952,7 @@ if ((icon_count < 1)); then
 fi
 curl --fail --silent --show-error "${map_headers[@]}" "${map_url}/instance/svg/bus.svg" >/dev/null
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   mvt_query="$(
     "${compose[@]}" exec -T config-ui python - <<'PY'
 from urllib.parse import urlencode
@@ -2844,7 +3036,7 @@ if [[ "${internal_automation_status}" != "404" ]]; then
   exit 1
 fi
 
-if [[ "${database_mode}" == "bundled" ]]; then
+if has_bundled_database; then
   printf 'PASS: bundled PostGIS and sample data, service health, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards.\n'
 else
   printf 'PASS: external PostGIS connectivity, service health, catalog discovery, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards. Run layer-specific visual tests for the external workspace.\n'

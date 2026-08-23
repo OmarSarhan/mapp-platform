@@ -876,6 +876,37 @@ class DatabaseAccessContractTests(unittest.TestCase):
 
         compile(source[start:end], "verify-derived-session", "exec")
 
+    def test_every_bundled_mode_comparison_admits_federated(self) -> None:
+        """Both local-database modes must be widened together.
+
+        This is the defect class that let the runtime-reader probes be skipped
+        under MAPP_DATABASE_MODE=federated: the shell and Python guards were
+        widened while a comparison inside an embedded Node script was missed,
+        so verify passed on a reader that could not serve the sample tables.
+        A grep for the mode name cannot distinguish a guard from a help
+        string, so pin the comparison itself.
+        """
+        comparison = re.compile(r"""(?:==|!=|===|!==)\s*["']bundled["']""")
+        offenders = []
+        for relative_path in (
+            "bin/mapp",
+            "scripts/verify.sh",
+            "config-ui/app.py",
+            "scripts/production_acceptance.py",
+        ):
+            lines = (ROOT / relative_path).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            for index, line in enumerate(lines):
+                if not comparison.search(line):
+                    continue
+                # The federated alternative may wrap onto the next line.
+                if "federated" in " ".join(lines[index:index + 2]):
+                    continue
+                offenders.append(f"{relative_path}:{index + 1}:{line.strip()}")
+
+        self.assertEqual(offenders, [])
+
     def test_external_handoff_revokes_public_database_defaults(self) -> None:
         source = (
             ROOT / "docs/external-postgresql.md"

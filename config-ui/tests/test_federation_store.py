@@ -1,3 +1,4 @@
+import re
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from federation_schema import FederationSchemaError
+from federation_schema import FederationSchemaError, validate_alias
 from federation_store import FederationAliasStore, MAX_ALIASES
 
 
@@ -239,8 +240,11 @@ class FederationAliasStoreTests(unittest.TestCase):
 
     def test_register_preserves_duplicates_and_counts_all_retained_rows(self):
         cases = (
-            ({"count": 1, "exists": True}, FileExistsError),
-            ({"count": MAX_ALIASES, "exists": False}, FederationSchemaError),
+            ({"count": 1, "retired": 0, "exists": True}, FileExistsError),
+            (
+                {"count": MAX_ALIASES, "retired": 0, "exists": False},
+                FederationSchemaError,
+            ),
         )
         for registry, error in cases:
             with self.subTest(registry=registry):
@@ -250,11 +254,33 @@ class FederationAliasStoreTests(unittest.TestCase):
                 with self.assertRaises(error):
                     store.register(registration(), "admin")
                 capacity_query = str(cursor.execute.call_args_list[1].args[0])
+                # The ceiling counts every retained row, retired included. An
+                # unqualified "count(*) AS count" is exactly that assertion: a
+                # restricted ceiling would have to read
+                # "count(*) FILTER (...) AS count" instead. The separate
+                # FILTERed tally alongside it only feeds the error message.
                 self.assertIn("count(*) AS count", capacity_query)
-                self.assertNotIn("FILTER (WHERE status", capacity_query)
                 self.assertFalse(
                     any("INSERT INTO" in text for text in statements(cursor))
                 )
+
+    def test_alias_limit_explains_slots_held_by_hidden_retired_rows(self):
+        # Retired rows still reserve a slot but no longer appear in list(), so
+        # the limit would otherwise look inexplicable to an operator counting
+        # what they can see.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "count": MAX_ALIASES,
+            "retired": 7,
+            "exists": False,
+        }
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.register(registration(), "admin")
+
+        self.assertIn("7", str(raised.exception))
+        self.assertIn("retired", str(raised.exception))
 
     def test_list_is_bounded_by_the_registry_ceiling(self):
         cursor = MagicMock()
@@ -1031,6 +1057,442 @@ class FederationAliasStoreTests(unittest.TestCase):
             self.assertIn(option, create_server)
         self.assertNotIn("sslcert", create_server)
         self.assertNotIn("sslkey", create_server)
+
+    def test_retire_revokes_before_archiving_and_keeps_the_row(self):
+        # Revoking is what actually stops the source serving rows. A rename
+        # alone does not: PostgreSQL tracks dependencies by oid, so an
+        # existing grant simply follows the object to its new name.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        revokes = [text for text in executed if "REVOKE" in text]
+        renames = [text for text in executed if "RENAME TO" in text]
+        self.assertTrue(revokes, "retire must revoke access")
+        self.assertTrue(renames, "retire must archive rather than drop")
+        self.assertLess(
+            executed.index(revokes[0]),
+            executed.index(renames[0]),
+            "revoke must precede the rename",
+        )
+        # Archive, never delete -- but user mappings are the deliberate
+        # exception, so this cannot assert on "DROP " generally. retire()
+        # issues DROP USER MAPPING because a mapping is a live plaintext
+        # credential rather than audit evidence; asserting otherwise passed
+        # only because this fixture yields no mappings, and would have fought
+        # the next maintainer who gave it a realistic one. The drop is covered
+        # by test_retire_drops_the_user_mappings_it_archives_around.
+        self.assertFalse(any("DROP SCHEMA" in text for text in executed))
+        self.assertFalse(any("DROP SERVER" in text for text in executed))
+        self.assertFalse(any("DELETE FROM" in text for text in executed))
+        # Both consumer roles lose access, matching the grant loop that
+        # _persist_observation uses.
+        self.assertTrue(any("mapp_reader" in text for text in revokes))
+        self.assertTrue(any("mapp_derived" in text for text in revokes))
+
+    def test_retire_archives_under_a_name_that_cannot_exceed_the_identifier_limit(self):
+        # PostgreSQL truncates identifiers at 63 bytes silently, which would
+        # let two archives of long-named aliases collide.
+        long_alias = "a" * 56
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(alias=long_alias, status="retired"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire(long_alias, "admin")
+
+        renames = [text for text in statements(cursor) if "RENAME TO" in text]
+        self.assertEqual(2, len(renames), "schema and server are both archived")
+        for text in renames:
+            target = re.findall(r"Identifier\('([^']+)'\)", text)[-1]
+            self.assertLessEqual(len(target), 63, target)
+            self.assertTrue(target.startswith("retired-"), target)
+
+    def test_archive_names_cannot_be_registered_as_aliases(self):
+        # The real invariant behind the hyphen, asserted against validate_alias
+        # rather than a prefix string. With "retired_" the archive name for a
+        # short alias was itself a legal alias -- 32 + len(alias) characters,
+        # so legal for any alias of 24 or fewer -- and registering it created a
+        # live server holding the exact name retirement would later need,
+        # leaving the original un-retirable until the squatter was retired.
+        for alias in ("foo", "a", "x" * 24):
+            cursor = MagicMock()
+            cursor.fetchone.side_effect = [
+                {"status": "active", "provisioned_at": OBSERVED_AT},
+                {"owned": True},
+                {"exists": 1},
+                alias_row(alias=alias, status="retired"),
+            ]
+            store = self.store_with_cursor(cursor)
+
+            store.retire(alias, "admin")
+
+            renames = [
+                text for text in statements(cursor) if "RENAME TO" in text
+            ]
+            self.assertEqual(2, len(renames))
+            for text in renames:
+                archived = re.findall(r"Identifier\('([^']+)'\)", text)[-1]
+                with self.assertRaises(
+                    FederationSchemaError,
+                    msg=f"{archived!r} is registerable as an alias",
+                ):
+                    validate_alias(archived)
+                # The server name is what actually collided: a live alias
+                # named <archive> would own exactly <archive>_srv.
+                with self.assertRaises(FederationSchemaError):
+                    validate_alias(archived.removesuffix("_srv"))
+
+    def test_retire_of_an_unprovisioned_alias_touches_no_physical_objects(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "pending", "provisioned_at": None},
+            None,
+            alias_row(status="retired"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertFalse(any("RENAME TO" in text for text in executed))
+        self.assertFalse(any("REVOKE" in text for text in executed))
+        self.assertTrue(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_is_refused_twice(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "status": "retired",
+            "provisioned_at": OBSERVED_AT,
+        }
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.retire("leeds_ext", "admin")
+
+        self.assertEqual("federation.already_retired", raised.exception.code)
+        self.assertFalse(
+            any("RENAME TO" in text for text in statements(cursor))
+        )
+
+    def test_observe_cannot_resurrect_a_retired_alias(self):
+        # retire() deliberately leaves provisioned_at set, so without an
+        # explicit guard the status CASE would rewrite 'retired' to active or
+        # unavailable on the next observe — and a later provision would then
+        # reinstate access to a source somebody had removed.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            registry_state(),
+            {"id": OBSERVATION_ID},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store._persist_observation(
+            cursor,
+            "leeds_ext",
+            observation(),
+            SOURCE_URL,
+            PHYSICAL_IDENTITY,
+            OBSERVED_AT,
+            REMOTE_COLUMN_SHAPES,
+        )
+
+        status_update = next(
+            text for text in statements(cursor) if "status = CASE" in text
+        )
+        self.assertIn("WHEN status = 'retired' THEN 'retired'", status_update)
+
+    def test_provision_refuses_a_retired_alias(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = provision_row(
+            status="retired",
+            provisionedAt=OBSERVED_AT,
+        )
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            self.provision(store)
+
+        self.assertEqual("federation.alias_retired", raised.exception.code)
+
+    def test_retire_records_the_retirement_when_nothing_is_left_to_archive(self):
+        # "Provisioned but locally absent" is a modelled state elsewhere in
+        # this class; retirement must not be the one operation that gets
+        # permanently stuck on it.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            None,
+            None,
+            alias_row(status="retired"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertFalse(any("RENAME TO" in text for text in executed))
+        self.assertFalse(any("REVOKE" in text for text in executed))
+        self.assertTrue(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_refuses_a_schema_owned_by_another_role(self):
+        # Skipping the revokes here while still marking the alias retired
+        # would leave both consumer roles holding the USAGE and SELECT that
+        # provisioning granted, on a source reported as decommissioned.
+        # provision() already calls this state local_state_invalid.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": False},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            store.retire("leeds_ext", "admin")
+
+        self.assertEqual(
+            "federation.local_state_invalid", raised.exception.code
+        )
+        executed = statements(cursor)
+        self.assertFalse(any("RENAME TO" in text for text in executed))
+        self.assertFalse(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_drops_the_user_mappings_it_archives_around(self):
+        # The archive preserves the audit trail, but a user mapping is not
+        # audit evidence — it is the live remote credential, held in the
+        # catalogue in plain text. A decommissioned source must not keep one.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = [
+            {"role_name": "mapp_federation"},
+            {"role_name": "mapp_xyz"},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        dropped = [text for text in executed if "DROP USER MAPPING" in text]
+        self.assertEqual(2, len(dropped))
+        # The server itself is still archived, not dropped.
+        self.assertTrue(
+            any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
+        )
+
+    def test_alias_reconciliation_locks_before_reading_the_status(self):
+        # The status has to be read under the lock, not before it. Reading
+        # first would reintroduce exactly the window this closes.
+        order = []
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda *a, **k: order.append(
+            "lock" if "pg_advisory_xact_lock" in str(a[0]) else "status"
+        )
+        cursor.fetchone.return_value = {"status": "active"}
+        store = self.store_with_cursor(cursor)
+
+        with store.alias_reconciliation("leeds_ext") as status:
+            self.assertEqual("active", status)
+
+        self.assertEqual(["lock", "status"], order)
+
+    def test_alias_reconciliation_reports_a_missing_row_as_none(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        store = self.store_with_cursor(cursor)
+
+        with store.alias_reconciliation("leeds_ext") as status:
+            self.assertIsNone(status)
+
+    def test_mark_unverifiable_revokes_both_consumer_roles(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        self.assertTrue(store.mark_unverifiable("leeds_ext"))
+
+        executed = statements(cursor)
+        self.assertTrue(any("FOR UPDATE" in text for text in executed))
+        self.assertTrue(any("SET status = 'unavailable'" in text for text in executed))
+        # Rendered psycopg SQL is Composed([SQL('REVOKE ...'), ...]), so match
+        # on containment rather than the start of the string.
+        revokes = [text for text in executed if "REVOKE" in text]
+        # USAGE and SELECT, for each of the two consumer roles.
+        self.assertEqual(4, len(revokes))
+        self.assertFalse(any("GRANT" in text for text in executed))
+
+    def test_mark_unverifiable_leaves_a_retired_alias_alone(self):
+        # Retirement already revoked and is terminal; touching it would be the
+        # resurrection the status CASE exists to prevent.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "status": "retired", "provisioned_at": OBSERVED_AT,
+        }
+        store = self.store_with_cursor(cursor)
+
+        self.assertFalse(store.mark_unverifiable("leeds_ext"))
+
+        executed = statements(cursor)
+        self.assertFalse(any("REVOKE" in text for text in executed))
+        # Not "UPDATE": the row lock is SELECT ... FOR UPDATE, which contains
+        # it. The write is what must not happen.
+        self.assertFalse(any("SET status" in text for text in executed))
+
+    def test_mark_unverifiable_reports_no_change_when_already_unavailable(self):
+        # So a de-configured source does not warn on every pass forever.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "unavailable", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+        ]
+        store = self.store_with_cursor(cursor)
+
+        self.assertFalse(store.mark_unverifiable("leeds_ext"))
+        # It still re-revokes: reporting "no change" is about logging, not
+        # about leaving access in place.
+        self.assertTrue(any("REVOKE" in t for t in statements(cursor)))
+
+    def test_retire_records_the_archived_server_name(self):
+        # The audit must never derive this name. Deriving it from
+        # archived_schema is wrong because the alias is truncated four
+        # characters further for the server, and identifying it by a
+        # "retired_" prefix is wrong because ALIAS_RE permits an alias
+        # literally called retired_sites, whose live server would then read as
+        # an archive. Recording it is what lets verify.sh assert the archive
+        # still exists at all.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        renamed = [
+            text for text in executed
+            if "ALTER SERVER" in text and "RENAME TO" in text
+        ]
+        self.assertEqual(1, len(renamed))
+        archived_server = re.findall(r"Identifier\('([^']+)'\)", renamed[0])[-1]
+        update = next(
+            call for call in cursor.execute.call_args_list
+            if "archived_server" in str(call.args[0])
+        )
+        self.assertIn(archived_server, update.args[1])
+
+    def test_retire_records_no_archived_server_when_none_existed(self):
+        # A server removed by hand must not make the alias un-retirable, and
+        # must not leave the registry pointing at a name that never existed --
+        # verify.sh treats a recorded name as something it can demand to find.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            None,
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        self.assertFalse(
+            any("ALTER SERVER" in text for text in statements(cursor))
+        )
+        update = next(
+            call for call in cursor.execute.call_args_list
+            if "archived_server" in str(call.args[0])
+        )
+        self.assertIn(None, update.args[1])
+
+    def test_retire_still_drops_credentials_when_the_schema_is_already_gone(self):
+        # The server and its mappings are archived under a gate independent of
+        # the schema. Tying them together left a decommissioned source holding
+        # live credentials whenever the schema had been removed by hand — the
+        # exact state retirement deliberately tolerates.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            None,
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = [{"role_name": "mapp_federation"}]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertTrue(any("DROP USER MAPPING" in text for text in executed))
+        self.assertTrue(
+            any("ALTER SERVER" in text and "RENAME TO" in text for text in executed)
+        )
+        # No schema to revoke on, so no schema statements at all.
+        self.assertFalse(any("ALTER SCHEMA" in text for text in executed))
+        self.assertFalse(any("REVOKE" in text for text in executed))
+
+    def test_retire_tolerates_a_server_that_is_already_gone(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            None,
+            alias_row(status="retired"),
+        ]
+        cursor.fetchall.return_value = []
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        executed = statements(cursor)
+        self.assertFalse(any("ALTER SERVER" in text for text in executed))
+        self.assertTrue(any("status = 'retired'" in text for text in executed))
+
+    def test_retire_raises_not_found_for_an_unknown_alias(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FileNotFoundError):
+            store.retire("leeds_ext", "admin")
+
+    def test_retire_locks_the_alias_row(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            {"status": "active", "provisioned_at": OBSERVED_AT},
+            {"owned": True},
+            {"exists": 1},
+            alias_row(status="retired"),
+        ]
+        store = self.store_with_cursor(cursor)
+
+        store.retire("leeds_ext", "admin")
+
+        self.assertIn("FOR UPDATE", statements(cursor)[0])
 
 
 if __name__ == "__main__":
