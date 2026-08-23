@@ -582,14 +582,6 @@ read -r pair_count allocated_total distinct_results <<<"${allocation}"
 printf 'area-weighted census: %s pairs, %s allocated, identical both sides\n' \
   "${pair_count}" "${allocated_total}"
 
-step "Periodic verification revokes on outage and restores on recovery"
-# The behaviour the timer exists for, and the one that justified accepting
-# observe()'s revoke semantics for the periodic path: an outage costs access
-# automatically, and recovery returns it automatically. Asserted rather than
-# argued, because the whole design rests on the second half being true.
-#
-# The tick is called directly instead of waiting out the interval. That runs
-# the real function the thread runs; waiting 15 minutes would test the clock.
 verifier_tick() {
   # Scoped to this alias. The stage below stops the shared source, and an
   # unscoped pass would revoke every other alias pointing at it while teardown
@@ -599,6 +591,92 @@ import app
 print(app.verify_federation_sources(only='${ALIAS}'))
 " 2>/dev/null
 }
+
+step "Seeding a semantic profile bound to the probe source"
+# Registered directly rather than through the sync route, which would need
+# SEMANTIC_SOURCE_ALLOWLIST widened permanently in .env for a test. This still
+# proves the mirror against a real asset over real HTTP; the sync path itself
+# is exercised by normal use.
+#
+# A fixed eventId makes it idempotent at the store: apply_event replays the
+# stored response for a repeated id, so repeat runs do not accumulate assets
+# and no disposal step is needed -- which matters, because the semantic store
+# has no delete, only an operator-confirmed archive.
+"${compose[@]}" exec -T config-ui python3 - "${ALIAS}" "${PROBE_RELATION#*.}" <<'SEED'
+import sys
+import app
+from semantic_sources import source_asset_id
+
+alias, relation = sys.argv[1], sys.argv[2]
+schema = f"source_{alias}"
+event = {
+    "eventId": "federation-e2e-probe-semantic-seed",
+    "assetId": source_asset_id("MAPP", schema, relation),
+    "type": "register",
+    "generation": 1,
+    "generated": {
+        "kind": "foreign-table",
+        "name": relation,
+        "qualifiedName": f"{schema}.{relation}",
+        "binding": {
+            "adapter": "postgresql",
+            "alias": "MAPP",
+            "schema": schema,
+            "relation": relation,
+        },
+        "fields": [
+            {"name": "object_id", "type": "bigint", "nullable": False},
+        ],
+    },
+}
+result = app.SEMANTIC.request(
+    "/v1/events", method="POST", payload=event,
+    actor="federation-e2e", scopes=["semantic:admin"],
+)
+print(
+    "semantic profile "
+    + ("already present" if result["event"].get("idempotent") else "registered")
+)
+SEED
+
+# What the catalog reports for that profile: available, unavailable, or missing.
+probe_source_state() {
+  "${compose[@]}" exec -T config-ui python3 - "${ALIAS}" "${PROBE_RELATION#*.}" <<'STATE'
+import sys
+import app
+from semantic_sources import source_asset_id
+
+alias, relation = sys.argv[1], sys.argv[2]
+asset_id = source_asset_id("MAPP", f"source_{alias}", relation)
+catalog = app.SEMANTIC.request(
+    "/v1/catalog", actor="federation-e2e", scopes=["semantic:inspect"],
+)
+for asset in catalog.get("assets") or []:
+    if asset.get("id") == asset_id:
+        print(asset.get("sourceState") or "available")
+        break
+else:
+    print("missing")
+STATE
+}
+
+# A previous run retires this alias, which correctly leaves the asset flagged.
+# The alias has just been provisioned and is active, so one pass settles the
+# mirror to match -- and it does so through the feature itself rather than the
+# harness asserting a state it has forced.
+verifier_tick >/dev/null
+seeded_state="$(probe_source_state)"
+[[ "${seeded_state}" == "available" ]] \
+  || fail "a pass did not settle the seeded profile to available (got ${seeded_state})"
+
+step "Periodic verification revokes on outage and restores on recovery"
+# The behaviour the timer exists for, and the one that justified accepting
+# observe()'s revoke semantics for the periodic path: an outage costs access
+# automatically, and recovery returns it automatically. Asserted rather than
+# argued, because the whole design rests on the second half being true.
+#
+# The tick is called directly instead of waiting out the interval. That runs
+# the real function the thread runs; waiting 15 minutes would test the clock.
 
 alias_status() {
   platform_sql "SELECT status FROM federation._aliases WHERE alias = '${ALIAS}'"
@@ -623,8 +701,11 @@ outage_status="$(alias_status)"
 outage_access="$(owner_can_read)"
 [[ "${outage_status}" == "unavailable" ]]   || fail "an unreachable source left the alias ${outage_status}, expected unavailable"
 [[ "${outage_access}" == "f" ]]   || fail "an unreachable source kept the derived owner readable"
-printf 'outage: status=%s, derived owner access revoked
-' "${outage_status}"
+outage_semantics="$(probe_source_state)"
+[[ "${outage_semantics}" == "unavailable" ]] \
+  || fail "the semantic profile reads ${outage_semantics} during an outage, expected unavailable"
+printf 'outage: status=%s, access revoked, semantics=%s\n' \
+  "${outage_status}" "${outage_semantics}"
 
 "${compose[@]}" start source-db >/dev/null 2>&1
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
@@ -636,8 +717,11 @@ recovered_status="$(alias_status)"
 recovered_access="$(owner_can_read)"
 [[ "${recovered_status}" == "active" ]]   || fail "recovery left the alias ${recovered_status}, expected active"
 [[ "${recovered_access}" == "t" ]]   || fail "recovery did not restore the derived owner grant"
-printf 'recovery: status=%s, derived owner access restored
-' "${recovered_status}"
+recovered_semantics="$(probe_source_state)"
+[[ "${recovered_semantics}" == "available" ]] \
+  || fail "the semantic profile stayed ${recovered_semantics} after recovery"
+printf 'recovery: status=%s, access restored, semantics=%s\n' \
+  "${recovered_status}" "${recovered_semantics}"
 
 step "A replaced source database must not provision"
 # Dropping and recreating the relation keeps every name and column identical
@@ -889,5 +973,6 @@ rm -f "${verify_log}"
 printf 'verify.sh passes with a retired, archived alias present\n'
 
 printf '\nPASS: federation register, observe, provision, cross-schema H3 aggregation, '
-printf 'replacement refusal, retirement, archival and privilege audit verified '
+printf 'replacement refusal, semantic degradation and recovery, '
+printf 'retirement, archival and privilege audit verified '
 printf 'against a real source.\n'
