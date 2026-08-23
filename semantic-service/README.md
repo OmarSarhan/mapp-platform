@@ -24,4 +24,4 @@ docker build --tag mapp-semantic-service:test semantic-service
 
 The platform CI runs both commands. The external API/CLI compatibility and
 pagination declaration lives at
-[`contracts/api-compatibility-v1.4.json`](../contracts/api-compatibility-v1.4.json).
+[`contracts/api-compatibility-v1.6.json`](../contracts/api-compatibility-v1.6.json).

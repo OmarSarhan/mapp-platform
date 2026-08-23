@@ -173,7 +173,7 @@ dashboard from validating against a different database from the one XYZ uses.
 
 | Variable | Purpose |
 | --- | --- |
-| `MAPP_DATABASE_MODE` | `bundled` starts the included PostGIS sample database; `external` starts only the platform services. |
+| `MAPP_DATABASE_MODE` | `bundled` and `federated` start the included PostGIS sample database and behave identically; `external` starts only the platform services. See [Federated PostgreSQL sources](docs/federation.md) for what `federated` is for. |
 | `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Replace the complete URI for an external PostGIS server. |
 | `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
 | `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role used by the default bundled `DBS_MAPP`. |
@@ -427,6 +427,7 @@ acceptance result.
 - [Architecture](docs/architecture.md)
 - [Semantic metadata control plane](docs/semantic-layer.md)
 - [Managed derived layers](docs/derived-layers.md)
+- [Federated PostgreSQL sources](docs/federation.md)
 - [External XYZ plugins](docs/external-plugins.md)
 - [Deployment](docs/deployment.md)
 - [External PostgreSQL administrator handoff](docs/external-postgresql.md)

@@ -45,6 +45,28 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_contract_advertises_exactly_the_federation_cli_commands(self):
+        # This assertion used to be the inverse: advertising a command the CLI
+        # cannot run is a lie, and the CLI refuses anything unadvertised with
+        # capability.missing, so the two repositories have to move together.
+        # It stays an equality rather than a subset so a route added here
+        # without a CLI command still fails.
+        self.assertEqual(
+            [
+                "federation list",
+                "federation show",
+                "federation register",
+                "federation observe",
+                "federation provision",
+                "federation retire",
+            ],
+            [
+                command
+                for command in contract("instance")["commands"]
+                if command.startswith("federation ")
+            ],
+        )
+
     def test_contract_advertises_every_stable_cli_exit_code(self):
         self.assertEqual(
             {
@@ -84,8 +106,8 @@ class ControlApiTests(unittest.TestCase):
         payload = capabilities("instance")
         actions = {item["id"]: item for item in payload["actions"]}
         self.assertEqual("instance", payload["instanceId"])
-        self.assertEqual("1.4", payload["apiVersion"])
-        self.assertEqual("1.4", payload["contractVersion"])
+        self.assertEqual("1.6", payload["apiVersion"])
+        self.assertEqual("1.6", payload["contractVersion"])
         self.assertEqual(
             ["revision", "operations"],
             actions["proposals.check"]["inputSchema"]["required"],
@@ -98,6 +120,35 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(
             "proposal.screenshot",
             actions["proposals.screenshot"]["operationKind"],
+        )
+        self.assertNotIn("querySchema", actions["federation.aliases.list"])
+        allowed_relations = actions["federation.aliases.register"][
+            "inputSchema"
+        ]["properties"]["allowedRelations"]
+        self.assertEqual(100, allowed_relations["maxItems"])
+        self.assertEqual(127, allowed_relations["items"]["maxLength"])
+        self.assertEqual(
+            "^[A-Za-z_][A-Za-z0-9_]{0,62}\\."
+            "[A-Za-z_][A-Za-z0-9_]{0,62}$",
+            allowed_relations["items"]["pattern"],
+        )
+        self.assertEqual(
+            "^[A-Za-z][A-Za-z0-9_]{0,55}$",
+            actions["federation.aliases.register"]["inputSchema"][
+                "properties"
+            ]["alias"]["pattern"],
+        )
+        provision_schema = actions["federation.aliases.provision"][
+            "inputSchema"
+        ]
+        self.assertEqual(["expectedObservationId"], provision_schema["required"])
+        self.assertEqual(
+            {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9223372036854775807,
+            },
+            provision_schema["properties"]["expectedObservationId"],
         )
         screenshot_properties = actions["proposals.screenshot"]["inputSchema"][
             "properties"
@@ -206,6 +257,10 @@ class ControlApiTests(unittest.TestCase):
         )
         self.assertFalse(
             source_sync["inputSchema"]["additionalProperties"]
+        )
+        self.assertEqual(
+            "^[A-Za-z][A-Za-z0-9_-]{0,62}$",
+            source_sync["inputSchema"]["properties"]["alias"]["pattern"],
         )
         for action_id, path_key, path in (
             (
@@ -604,6 +659,8 @@ class ControlApiTests(unittest.TestCase):
                 "semantic:generate", "semantic:data",
                 "semantic:propose",
                 "semantic:apply", "semantic:admin",
+                "federation:register", "federation:provision",
+                "federation:observe",
             },
             set(authentication["scopes"]),
         )
