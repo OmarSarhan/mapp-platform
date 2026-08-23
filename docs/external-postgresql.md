@@ -301,12 +301,13 @@ environment file:
 MAPP_DATABASE_MODE=external
 DBS_MAPP=postgresql://mapp_runtime_reader:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
 DERIVED_DATABASE_URL=postgresql://mapp_derived_owner:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
+DERIVED_OWNER_ROLE=mapp_derived_owner
 DERIVED_READER_ROLE=mapp_runtime_reader
 ```
 
-`DERIVED_READER_ROLE` is a PostgreSQL role identifier, not a URI. It must name
-the runtime role from `DBS_MAPP` so the service can grant that role access to
-published outputs.
+`DERIVED_OWNER_ROLE` and `DERIVED_READER_ROLE` are PostgreSQL role identifiers,
+not URIs. They must name the login in `DERIVED_DATABASE_URL` and the runtime
+role from `DBS_MAPP`, respectively, so grants target explicit identities.
 
 Percent-encode URI-reserved characters in usernames and passwords. For private
 certificate authorities or client certificates, both application images need

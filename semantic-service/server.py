@@ -850,6 +850,45 @@ class SemanticHandler(BaseHTTPRequestHandler):
             )
 
     def _route_post(self, path: str, body: dict[str, Any]) -> None:
+        if path == "/v1/source-state":
+            # semantic:admin, the same scope /v1/events needs. This changes
+            # whether assets are treated as usable, so it belongs with the
+            # mutating routes rather than the reading ones -- even though the
+            # caller is the platform's own verifier rather than a person.
+            self._require_any_scope({"semantic:admin"})
+            schema = body.get("schema")
+            if not isinstance(schema, str) or not schema.strip():
+                raise SemanticError(
+                    "invalid_request",
+                    "schema must be a non-empty string.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            available = body.get("available")
+            if not isinstance(available, bool):
+                # Explicitly not truthiness. A missing or misspelled property
+                # would otherwise read as false and quietly mark a healthy
+                # source unusable.
+                raise SemanticError(
+                    "invalid_request",
+                    "available must be a boolean.",
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            unexpected = sorted(set(body) - {"schema", "available", "actor"})
+            if unexpected:
+                raise SemanticError(
+                    "invalid_request",
+                    "Unknown properties: " + ", ".join(unexpected),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            changed = self.server.store.mark_source_state(
+                schema.strip(), available=available
+            )
+            # The changed list, not a count, so a caller can log which assets
+            # moved and stay silent when a pass changes nothing.
+            self._send_json(
+                HTTPStatus.OK, {"schema": schema.strip(), "changed": changed}
+            )
+            return
         if path == "/v1/events":
             self._require_any_scope({"semantic:admin"})
             body["actor"] = self._actor()

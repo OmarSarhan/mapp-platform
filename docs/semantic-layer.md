@@ -1,6 +1,6 @@
 # Semantic metadata control plane
 
-Semantic service `1.1.0` is a metadata control plane beside the data plane. It gives
+Semantic service `1.2.0` is a metadata control plane beside the data plane. It gives
 the dashboard, standalone CLI, and approved agents a durable description of a
 data asset without making the semantic service a database proxy. In v1, the
 private semantic service stores generated source facts and reviewed human

@@ -245,6 +245,32 @@ artifact retention, storage quotas, or host-level resource controls.
   operation errors expose safe user guidance and keep database diagnostics out
   of the primary message; an uncertain commit is marked indeterminate rather
   than claiming the state is unchanged.
+- Treat `FEDERATION_DATABASE_URL` as a separate provisioner credential. Its
+  role alone owns the `federation` registry, registered `source_<alias>`
+  schemas, foreign servers, and foreign tables. It has database `CREATE` and
+  `postgres_fdw` `USAGE` solely to create those reviewed objects; the derived
+  owner and runtime reader receive only `USAGE`/`SELECT` on active source
+  schemas and tables. The provisioner must not own or access `derived_layers`
+  or source-data schemas such as `leeds`, and the derived owner must not retain
+  database `CREATE` or FDW `USAGE`.
+- Treat each `FEDERATION_DBS_<REF>` value as a remote-source credential. The
+  configuration service resolves it only for federation Observe/Provision;
+  the separate namespace deliberately keeps it out of ordinary `DBS_*`
+  catalog, layer, workspace, and semantic discovery.
+- A source column using `pg_catalog.default` is importable only when the
+  source and federation databases have the same attested provider, locale,
+  encoding, and matching recorded/actual version. An unversioned default is
+  accepted only for libc `C`/`POSIX`; built-in defaults also require the same
+  PostgreSQL major. Explicit `C` and `POSIX` remain portable when database
+  encodings match; other source collations are unsupported.
+- Every platform caller uses the same mapped remote federation identity.
+  Do not register user-private, recipient-filtered, or end-to-end-encrypted
+  message/key relations. Catalog RLS detection cannot attest application-level
+  filtering; expose only a dedicated remote view that is safe for every caller.
+- Federation `active` status is point-in-time evidence from the last explicit
+  Observe/Provision, not continuous remote attestation. The manual freshness
+  strategy trusts source administrators to preserve approved relation semantics
+  between observations; rerun Observe after source schema or view releases.
 - Treat `SEMANTIC_INTERNAL_TOKEN` as a service credential. Only
   `config-ui` and `semantic-service` receive it. It must be random, at least 32
   characters in production, and distinct from database and user credentials.

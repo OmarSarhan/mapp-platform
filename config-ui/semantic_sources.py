@@ -18,7 +18,9 @@ from psycopg.rows import dict_row
 DEFAULT_ALLOWLIST = "MAPP:leeds.*"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # Must match DB_KEY in workspace_schema.py and databaseKey in
-# schema/workspace.schema.json — one alias grammar, not three.
+# schema/workspace.schema.json. Federation aliases are intentionally narrower
+# because they become local PostgreSQL identifiers; ordinary connection aliases
+# do not share that implementation constraint.
 ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,62}$")
 SYSTEM_SCHEMAS = {"information_schema", "derived_layers"}
 SOURCE_NAMESPACE = uuid.UUID("b2228ad9-b2cb-5ed1-a906-901d8bb128bf")
@@ -600,12 +602,48 @@ class PostgresSemanticSources:
                 row_factory=dict_row,
             ) as connection:
                 with connection.cursor() as cursor:
-                    self._begin_read_only(cursor)
-                    cursor.execute(
-                        sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
-                            sql.Identifier(schema, relation)
+                    if schema.startswith("source_") and ALIAS_RE.fullmatch(
+                        schema[len("source_"):]
+                    ):
+                        federation_alias = schema[len("source_"):]
+                        cursor.execute(
+                            "SELECT pg_try_advisory_lock(hashtext(%s)) AS locked",
+                            (f"federation:observe:{federation_alias}",),
                         )
+                        if not cursor.fetchone()["locked"]:
+                            raise SemanticSourceError(
+                                "The federated source is being reprovisioned. "
+                                "Retry the sync.",
+                                status=HTTPStatus.CONFLICT,
+                                code="semantic.source_changed",
+                            )
+                        # The session lock survives this commit and conflicts
+                        # with FederationAliasStore's per-alias transaction
+                        # lock. Acquire it before starting REPEATABLE READ so a
+                        # concurrent reprovision cannot leave this sync on a
+                        # stale snapshot; closing this dedicated connection
+                        # releases it after the caller publishes the yielded data.
+                        connection.commit()
+                    self._begin_read_only(cursor)
+                    # Foreign tables cannot be locked ("This operation is
+                    # not supported for foreign tables") — skip the lock
+                    # for them. Every other relkind we support still takes
+                    # it; REPEATABLE READ's own snapshot already fixes the
+                    # view for the pair of queries below regardless.
+                    cursor.execute(
+                        "SELECT c.relkind FROM pg_catalog.pg_class AS c "
+                        "JOIN pg_catalog.pg_namespace AS n "
+                        "ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = %s AND c.relname = %s",
+                        (schema, relation),
                     )
+                    precheck = cursor.fetchone()
+                    if precheck is None or precheck["relkind"] != "f":
+                        cursor.execute(
+                            sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
+                                sql.Identifier(schema, relation)
+                            )
+                        )
                     cursor.execute(self._FIELDS_SQL, (schema, relation))
                     rows = cursor.fetchall()
                     if not rows:

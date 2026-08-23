@@ -1,0 +1,71 @@
+# Opt-in overlay for federation FDW testing only. Not included in
+# ./bin/mapp's runtime_services and not started by `./bin/mapp serve`.
+# Bring up manually alongside the bundled stack, e.g.:
+#   docker compose --project-directory . --env-file .env \
+#     --file compose.yaml --file compose.bundled-db.yaml \
+#     --file compose.federation-test.yaml up -d source-db config-ui
+#   ./docker/source-db/seed.sh
+#
+# config-ui must be named alongside source-db here even if it's already
+# running from the base stack — `up -d <service>` only starts/recreates
+# the services it's given, so an already-running config-ui started without
+# this overlay never picks up the FEDERATION_DBS_LEEDS_EXT entry below, and
+# Observe fails with federation.connection_ref_not_found.
+#
+# Deliberately plain postgis/postgis, not the custom mapp-postgis-h3 image —
+# a real independently-operated external source would not have MAPP's own
+# H3 extension installed (docs/federation-architecture-waypoint.md).
+services:
+  # config-ui only sees FEDERATION_DBS_<REF> vars explicitly listed here —
+  # Compose's `environment:` block does not forward arbitrary .env keys.
+  config-ui:
+    environment:
+      FEDERATION_DBS_LEEDS_EXT: ${FEDERATION_DBS_LEEDS_EXT:?Set FEDERATION_DBS_LEEDS_EXT in .env}
+
+  source-db:
+    image: postgis/postgis:17-3.5-alpine@sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB:?Set SOURCE_POSTGRES_DB in .env}
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:?Set SOURCE_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD:?Set SOURCE_POSTGRES_PASSWORD in .env}
+      SOURCE_READER_USER: ${SOURCE_READER_USER:?Set SOURCE_READER_USER in .env}
+      SOURCE_READER_PASSWORD: ${SOURCE_READER_PASSWORD:?Set SOURCE_READER_PASSWORD in .env}
+    volumes:
+      - source_postgres_data:/var/lib/postgresql/data
+      - ./docker/source-db/init/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    # Registration accepts only require/verify-ca/verify-full, and
+    # Observe/Provision now enforce that policy before connecting
+    # (config-ui/federation_schema.py's enforce_tls_policy) — a source-db
+    # with no TLS configured at all can never satisfy any of them, making
+    # this rig unusable for its documented purpose. Generates a fresh
+    # self-signed cert on every start rather than committing one: a
+    # private key has no reason to live in the repo (or its history) when
+    # a throwaway local container can make its own in under a second, and
+    # sslmode=require never validates it against a CA anyway.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -subj "/CN=source-db" -addext "subjectAltName=DNS:source-db" \
+          -keyout /tmp/server.key -out /tmp/server.crt
+        chmod 600 /tmp/server.key
+        chown postgres:postgres /tmp/server.crt /tmp/server.key
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/tmp/server.crt \
+          -c ssl_key_file=/tmp/server.key
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U ${SOURCE_POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - backend
+
+volumes:
+  source_postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_source_postgres_data

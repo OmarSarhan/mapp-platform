@@ -19,12 +19,12 @@ If verification finds stale or unresolved container environment values, run
 `./bin/mapp up --force-recreate` to replace the runtime containers while
 preserving named volumes, then verify again.
 
-`MAPP_DATABASE_MODE=bundled` includes the local PostGIS service. With
-`MAPP_DATABASE_MODE=external`, `serve` starts only XYZ, the configuration
-service, semantic service, browser runner, and Caddy; `DBS_MAPP` supplies the
-database clients' shared external connection. The semantic service has no
-database credential. The external database lifecycle is not managed by this
-wrapper.
+`MAPP_DATABASE_MODE=bundled` and `federated` include the local PostGIS
+service. With `MAPP_DATABASE_MODE=external`, `serve` starts only XYZ, the
+configuration service, semantic service, browser runner, and Caddy;
+`DBS_MAPP` supplies the database clients' shared external connection. The
+semantic service has no database credential. The external database lifecycle
+is not managed by this wrapper.
 Before switching an existing bundled deployment to external mode, take a
 backup and run `./bin/mapp down`; otherwise its already-running `db` container
 is outside the newly selected service set and remains untouched.
@@ -514,8 +514,8 @@ backups, and role changes remain the external operator's responsibility.
 ## Routine checks
 
 - Confirm all services are healthy.
-- In bundled mode, confirm recent ETL runs succeeded and expected row counts,
-  including Census when loaded, are plausible.
+- With a local database, confirm recent ETL runs succeeded and expected row
+  counts, including Census when loaded, are plausible.
 - Confirm the semantic service responds, the catalog revision is readable, and
   managed profiles are not unexpectedly stuck in `registering` or
   `repair_required`.
