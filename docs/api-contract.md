@@ -536,6 +536,49 @@ removed fields are retained as orphans instead of silently reassigned.
 See [Semantic metadata control plane](semantic-layer.md) for the storage and
 trust boundaries.
 
+## Federated PostgreSQL sources
+
+Available only where `MAPP_DATABASE_MODE=bundled`; the routes return
+`federation.not_configured` otherwise. There are no CLI commands for these and
+no dashboard UI — they are API-only. See
+[Federated PostgreSQL sources](federation.md) for the operator procedure.
+
+| Route | Capability action ID | Required scope |
+| --- | --- | --- |
+| `GET /api/federation/aliases` | `federation.aliases.list` | `federation:observe` |
+| `GET /api/federation/aliases/{alias}` | `federation.aliases.show` | `federation:observe` |
+| `POST /api/federation/aliases` | `federation.aliases.register` | `federation:register` |
+| `POST /api/federation/aliases/{alias}/observe` | `federation.aliases.observe` | `federation:provision` |
+| `POST /api/federation/aliases/{alias}/provision` | `federation.aliases.provision` | `federation:provision` |
+| `POST /api/federation/aliases/{alias}/retire` | `federation.aliases.retire` | `federation:provision` |
+
+Observe requires `federation:provision` rather than `federation:observe`
+because it opens an outbound connection to a third-party database. The
+`federation:*` scopes are peer to each other and non-hierarchical, and are not
+reachable from any other scope.
+
+The alias list is bounded by the 100-alias registry ceiling and returns one
+response with no cursor; retired aliases are omitted from it while
+`GET /api/federation/aliases/{alias}` still returns them by exact name, along
+with their archive location and full observation history.
+
+Each alias record carries `acceptedEvidenceComplete`. It is false for an alias
+approved before the current accepted-evidence columns existed; such an alias
+cannot satisfy the currency test and needs reprovisioning rather than waiting
+for verification to fix it.
+
+`POST .../provision` requires `expectedObservationId` and refuses when it does
+not match the latest observation. Three conditions each need their own
+explicit boolean — `acknowledge_row_level_security`,
+`acknowledge_schema_change`, `acknowledge_physical_rebind` — and are refused
+rather than assumed.
+
+Federation errors use `federation.*` codes in the standard error shape. The
+full list, with meanings, is in
+[Federated PostgreSQL sources](federation.md#error-codes). Two are worth noting
+here because they are retryable rather than terminal and are reported as `409`:
+`federation.derived_layers_busy` and `federation.verification_in_progress`.
+
 ## Mutations
 
 Managed derived-layer database actions are separate from workspace proposals:
