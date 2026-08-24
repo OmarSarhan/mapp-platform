@@ -118,6 +118,12 @@ describe('Scoped token administration', () => {
         'semantic:apply',
         'semantic:admin',
       ],
+      'federation-observer': ['federation:observe'],
+      'federation-operator': [
+        'federation:observe',
+        'federation:register',
+        'federation:provision',
+      ],
       full: ['full'],
     });
     expect(TOKEN_ACCESS_PRESETS.find(item => item.id === 'full')).toMatchObject({
@@ -138,6 +144,9 @@ describe('Scoped token administration', () => {
       'semantic:propose',
       'semantic:apply',
       'semantic:admin',
+      'federation:observe',
+      'federation:register',
+      'federation:provision',
     ]);
   });
 

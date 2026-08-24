@@ -47,9 +47,28 @@ and Python guards while missing one inside an embedded script is exactly how
 the runtime-reader probes were once skipped under `federated`, leaving a
 reader that could not serve the sample tables passing `verify`.
 
-There is **no dashboard UI** for any part of the lifecycle. Every step below
-is shown as an HTTP call, and each has an equivalent `config-cli` subcommand
-that carries the profile, token, and contract handshake for you:
+The lifecycle is split deliberately, along the line where a **secret** enters
+the system. Registration introduces a credential, so it belongs in the
+environment and is driven from the CLI; it is not offered in the dashboard,
+and a form there would either need the environment variable anyway or accept
+the credential over HTTP, which would be worse. Everything after that is state
+the dashboard shows and an exposure switch it can flip:
+
+| Step | Where |
+| --- | --- |
+| Register | CLI only, against a `FEDERATION_DBS_<REF>` already in the environment |
+| Observe, provision, retire | CLI, or the dashboard's **Federated sources** panel |
+
+Mint the CLI credential from the dashboard's scoped-token form. The
+**Federation operator** preset grants exactly `federation:observe`,
+`federation:register`, and `federation:provision`; **Federation observer**
+grants read-only. Prefer either over a `full` token: `federation:provision` is
+the only scope that can serve a third-party database, and a full token carries
+every other authority for thirty days as well.
+
+Every step below is shown as an HTTP call, and each has an equivalent
+`config-cli` subcommand that carries the profile, token, and contract
+handshake for you:
 
 ```bash
 config-cli federation list

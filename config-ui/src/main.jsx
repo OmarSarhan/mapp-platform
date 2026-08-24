@@ -532,6 +532,9 @@ export const TOKEN_SCOPE_OPTIONS=[
  {id:'semantic:propose',group:'Semantic',label:'Propose semantic changes',help:'Check, create, and decline curated semantic proposals.'},
  {id:'semantic:apply',group:'Semantic',label:'Apply semantic proposals',help:'Apply an explicitly reviewed curated semantic proposal.'},
  {id:'semantic:admin',group:'Semantic',label:'Administer semantic delivery',help:'Inspect delivery failures and explicitly retry retained events.'},
+ {id:'federation:observe',group:'Federation',label:'Inspect federated sources',help:'Read the source registry, each alias status, and the accepted evidence behind it.'},
+ {id:'federation:register',group:'Federation',label:'Register federated sources',help:'Record intent to attach a source. Opens no connection and exposes nothing.'},
+ {id:'federation:provision',group:'Federation',label:'Expose and retire federated sources',help:'Probe a source live, expose its allowed relations to the map reader, and withdraw them again. The only scope that can serve a third-party database.'},
 ];
 export const TOKEN_ACCESS_PRESETS=[
  {id:'semantic-reader',label:'Semantic reader',scopes:['semantic:inspect'],help:'Read-only semantic catalog access.'},
@@ -540,6 +543,8 @@ export const TOKEN_ACCESS_PRESETS=[
  {id:'semantic-curator',label:'Semantic curator',scopes:['semantic:inspect','semantic:propose','semantic:apply'],help:'Read, propose, review, and apply curated meaning.'},
  {id:'semantic-operator',label:'Semantic delivery operator',scopes:['semantic:inspect','semantic:admin'],help:'Read profiles, diagnose delivery blockers, and retry retained events.'},
  {id:'semantic-administrator',label:'Semantic administrator',scopes:['semantic:inspect','semantic:source','semantic:generate','semantic:data','semantic:propose','semantic:apply','semantic:admin'],help:'All semantic source, catalog, generation, bounded data-context, curation, and delivery administration capabilities.'},
+ {id:'federation-observer',label:'Federation observer',scopes:['federation:observe'],help:'Read the federated source registry and its evidence. Cannot register or expose anything.'},
+ {id:'federation-operator',label:'Federation operator',scopes:['federation:observe','federation:register','federation:provision'],help:'Run the whole source lifecycle from the CLI: register, observe, provision, retire. Includes the only scope that can serve a third-party database.'},
  {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace and semantic capability. Credential, device-approval, and audit administration remains dashboard-session-only.'},
 ];
 const FULL_TOKEN_PRESET_ID='full';
