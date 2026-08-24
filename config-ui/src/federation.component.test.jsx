@@ -183,6 +183,46 @@ describe('FederatedSources', () => {
     expect(screen.queryByText(/No active sources/)).toBeNull();
   });
 
+  test('a rebound source shows the physical mismatch it asks to approve', async () => {
+    const rebound = {
+      ...active,
+      acceptedPhysicalIdentityCurrent: false,
+      lastObservation: {
+        connectivity: 'reachable',
+        schema: 'current',
+        schemaFingerprint: '03fbe6948db8ff79241db6c4f4f6747389fa31070ceb8861',
+        acceptedSchemaCurrent: true,
+      },
+    };
+    render(<FederatedSources api={listOnly([rebound])} close={() => {}}/>);
+
+    await waitFor(() => expect(screen.getByText('Leeds external')).toBeTruthy());
+    // The schema is unchanged, so this mismatch is the ONLY signal that the
+    // source is a different database.
+    expect(screen.getByText(/Differs from the approved database/)).toBeTruthy();
+  });
+
+  test('an unaccepted baseline is not reported as a match', async () => {
+    const fresh = {
+      ...registered,
+      lastObservationId: 7,
+      lastObservation: {
+        connectivity: 'reachable',
+        schema: 'current',
+        schemaFingerprint: 'aa11bb22cc33dd44ee55ff6677889900aabbccddeeff0011',
+        // The store sets this true when no fingerprint has been accepted.
+        acceptedSchemaCurrent: true,
+      },
+    };
+    render(<FederatedSources api={listOnly([fresh])} close={() => {}}/>);
+
+    await waitFor(() => expect(
+      screen.getByRole('heading', {name: 'pending_src'}),
+    ).toBeTruthy());
+    expect(screen.getByText(/No fingerprint has been accepted yet/)).toBeTruthy();
+    expect(screen.queryByText(/Matches the accepted fingerprint/)).toBeNull();
+  });
+
   test('observe is disclosed as changing consumer access, not just probing', async () => {
     // _persist_observation() re-applies consumer access from the evidence it
     // gathers, so a drifted observation revokes the reader. Presenting Observe

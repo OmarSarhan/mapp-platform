@@ -258,8 +258,21 @@ class FederationAliasStore:
           accepted_schema_fingerprint IS NOT NULL
           AND accepted_physical_identity IS NOT NULL
           AND accepted_connection_identity IS NOT NULL
-        ) AS "acceptedEvidenceComplete"
-    """)
+        ) AS "acceptedEvidenceComplete",
+        -- The physical counterpart of lastObservation.acceptedSchemaCurrent.
+        -- Without it a client can show that the schema drifted but not that
+        -- the source is a different database, which is the condition the
+        -- physical-rebind acknowledgement exists to override. NULL means
+        -- there is nothing to compare yet, not "matches": the subquery is
+        -- empty until an observation exists and an identity has been accepted.
+        (
+          SELECT observation.physical_identity IS NOT DISTINCT FROM
+                 _aliases.accepted_physical_identity
+          FROM {schema}._observations AS observation
+          WHERE observation.id = _aliases.last_observation_id
+            AND _aliases.accepted_physical_identity IS NOT NULL
+        ) AS "acceptedPhysicalIdentityCurrent"
+    """).format(schema=sql.Identifier(SCHEMA))
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         record = validate_registration(payload)

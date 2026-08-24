@@ -75,12 +75,24 @@ function Evidence({alias}) {
     {observation.schemaFingerprint && <>
       <dt>Schema vs accepted</dt>
       <dd>
-        {observation.acceptedSchemaCurrent === false
-          ? 'Differs from the accepted fingerprint. Provisioning needs the schema-change acknowledgement.'
-          : 'Matches the accepted fingerprint.'}
+        {/* acceptedSchemaCurrent is true when nothing has been accepted yet,
+            so a never-provisioned alias would otherwise read as approved. */}
+        {!alias.provisionedAt
+          ? 'No fingerprint has been accepted yet. Provisioning would make this observation the baseline.'
+          : observation.acceptedSchemaCurrent === false
+            ? 'Differs from the accepted fingerprint. Provisioning needs the schema-change acknowledgement.'
+            : 'Matches the accepted fingerprint.'}
         <br/><small>{observation.schemaFingerprint.slice(0, 24)}…</small>
       </dd>
     </>}
+    <dt>Physical identity</dt>
+    <dd>
+      {alias.acceptedPhysicalIdentityCurrent === false
+        ? 'Differs from the approved database. This is a different physical source behind the same names, and provisioning needs the rebind acknowledgement.'
+        : alias.acceptedPhysicalIdentityCurrent === true
+          ? 'Same physical database as the one approved.'
+          : 'Nothing accepted to compare against yet.'}
+    </dd>
     {observation.rowLevelSecurityDetected !== undefined && <>
       <dt>Row-level security</dt>
       <dd>
