@@ -545,7 +545,7 @@ export const TOKEN_ACCESS_PRESETS=[
  {id:'semantic-administrator',label:'Semantic administrator',scopes:['semantic:inspect','semantic:source','semantic:generate','semantic:data','semantic:propose','semantic:apply','semantic:admin'],help:'All semantic source, catalog, generation, bounded data-context, curation, and delivery administration capabilities.'},
  {id:'federation-observer',label:'Federation observer',scopes:['federation:observe'],help:'Read the federated source registry and its evidence. Cannot register or expose anything.'},
  {id:'federation-operator',label:'Federation operator',scopes:['federation:observe','federation:register','federation:provision'],help:'Run the whole source lifecycle from the CLI: register, observe, provision, retire. Includes the only scope that can serve a third-party database.'},
- {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace and semantic capability. Credential, device-approval, and audit administration remains dashboard-session-only.'},
+ {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace, semantic and federation capability, including federation:provision, which can expose a third-party database through the platform. Credential, device-approval, and audit administration remains dashboard-session-only.'},
 ];
 const FULL_TOKEN_PRESET_ID='full';
 const ALL_NARROW_TOKEN_SCOPES=TOKEN_SCOPE_OPTIONS.map(scope=>scope.id);

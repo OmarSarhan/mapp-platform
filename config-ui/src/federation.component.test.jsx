@@ -183,6 +183,18 @@ describe('FederatedSources', () => {
     expect(screen.queryByText(/No active sources/)).toBeNull();
   });
 
+  test('observe is disclosed as changing consumer access, not just probing', async () => {
+    // _persist_observation() re-applies consumer access from the evidence it
+    // gathers, so a drifted observation revokes the reader. Presenting Observe
+    // as read-only would understate an unconfirmed action.
+    const api = listOnly([active]);
+    render(<FederatedSources api={api} close={() => {}}/>);
+
+    await waitFor(() => expect(screen.getByText('Leeds external')).toBeTruthy());
+    expect(screen.getByText(/Observe is not read-only/)).toBeTruthy();
+    expect(screen.getByText(/revokes the map reader/)).toBeTruthy();
+  });
+
   test('retirement discloses the dropped mappings and that it is terminal', async () => {
     const api = listOnly([active]);
     render(<FederatedSources api={api} close={() => {}}/>);

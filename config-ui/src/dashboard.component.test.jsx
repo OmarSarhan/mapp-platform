@@ -130,6 +130,10 @@ describe('Scoped token administration', () => {
       label: 'Full platform operator',
       help: expect.stringContaining('dashboard-session-only'),
     });
+    // "full" satisfies every required scope server-side, so the preset now
+    // carries federation authority and must say so before it is minted.
+    expect(TOKEN_ACCESS_PRESETS.find(item => item.id === 'full').help)
+      .toContain('federation:provision');
     expect(TOKEN_SCOPE_OPTIONS.map(item => item.id)).toEqual([
       'inspect',
       'propose',

@@ -1,7 +1,12 @@
 import {useState, useEffect} from 'react';
 
-// Both provision and retire change what the platform serves, so each is
-// confirmed separately rather than by a single "are you sure" for the panel.
+// Provision and retire change what the platform serves deliberately, so each
+// is confirmed separately rather than by a single "are you sure" for the
+// panel. Observe is not merely a probe: _persist_observation() re-applies
+// consumer access from the evidence it just gathered, so a drifted or failed
+// observation revokes the map reader and derived owner, and a good one
+// restores them. It stays unconfirmed because that is the correcting action,
+// but the panel says so rather than presenting it as read-only.
 const CONFIRMABLE = new Set(['provision', 'retire']);
 
 const ACKNOWLEDGEMENTS = [
@@ -202,7 +207,12 @@ export function FederatedSources({api, close}) {
           <h2>Federated sources</h2>
           <p>
             Register records intent, observe probes the source live, and provision is
-            the only step that serves its data.
+            the only step that deliberately serves its data.
+          </p>
+          <p className="muted">
+            Observe is not read-only: it re-applies consumer access from what it
+            finds, so an observation that shows drift revokes the map reader and
+            derived owner, and a clean one restores them.
           </p>
         </div>
         <button disabled={busy} onClick={close}>Close</button>
