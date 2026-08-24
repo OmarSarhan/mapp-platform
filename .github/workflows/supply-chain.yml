@@ -1,9 +1,12 @@
 name: Supply-chain images
 
 on:
+  # Deliberately on demand only. This builds, pushes, signs and scans eight
+  # images; on every merge to main that is roughly twenty-four jobs, and
+  # nothing in the deployment consumes the published images -- Compose builds
+  # them locally. Run it for a release, or whenever the reviewed image set is
+  # what you actually want to refresh.
   workflow_dispatch:
-  push:
-    branches: [main]
 
 # Each runner job declares only the authority required for its phase.
 permissions: {}
