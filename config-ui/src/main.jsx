@@ -13,6 +13,7 @@ import {
   workspaceSaveStatus,
 } from './api.js';
 import {SemanticCatalog} from './semantic.jsx';
+import {FederatedSources} from './federation.jsx';
 
 let csrfToken=sessionStorage.getItem('mapp-csrf')||'';
 const AUTH_REQUIRED_EVENT='mapp-auth-required';
@@ -270,7 +271,7 @@ function PreviewSymbol({style,kind,label}) {
  return <div className="symbol-state">{symbol}<strong>{label}</strong></div>;
 }
 function Preview({layer,table}) { const normal=layer.style?.default||{},highlight=layer.style?.highlight&&typeof layer.style.highlight==='object'?{...normal,...layer.style.highlight}:null,kind=geometryKind(layer,table),theme=effectiveTheme(layer.style||{}).theme,categories=theme&&theme.type!=='basic'&&Array.isArray(theme.categories)?theme.categories:[],geometry=(layer.infoj||[]).find(entry=>entry.type==='geometry'&&entry.display!==false),geometryStyle=geometry?.style||normal;return <div className="layer-preview"><div className="symbol-preview"><strong className="preview-layer-name">{layer.name}</strong><div className={`symbol-states ${highlight?'has-highlight':''}`}><PreviewSymbol style={normal} kind={kind} label={categories.length?'Fallback':'Default'}/>{highlight&&<PreviewSymbol style={highlight} kind={kind} label="Highlighted"/>}</div><small className="muted">Effective XYZ symbology on a map-like background</small></div><div className="info-preview"><h3>Feature information preview</h3>{geometry&&<div className="info-geometry-preview"><PreviewSymbol style={geometryStyle} kind={kind} label={geometry.label||geometry.title||'Geometry'}/><span><strong>Selected geometry</strong><small>{geometry._dashboard?.styleFromLayerDefault?'Synchronized with fallback symbology':'Static information style'}</small></span></div>}{categories.length>0&&<div className="info-legend-preview"><h4>{theme.title||'Legend'}</h4>{categories.map((category,index)=><div className="info-legend-row" key={category.key??category.value??index}><PreviewSymbol style={{...(category.style||normal),...(category.icon?{icon:category.icon}:{})}} kind={kind} label=""/><span>{category.label??category.value??category.key??`Class ${index+1}`}</span></div>)}</div>}<dl>{(layer.infoj||[]).filter(e=>!['geometry','pin'].includes(e.type)&&e.display!==false).map((e,n)=>{const type=table?.columns.find(c=>c.name===e.field)?.type||'expression', example=/date|timestamp/.test(type)?'2026-07-16 12:00':/int|numeric|double|real/.test(type)?'123.45':/bool/.test(type)?'true':`Example ${e.field}`;return <div className="info-example" key={n}><dt>{e.title||e.label||e.field}</dt><dd>{example} · {type}</dd></div>})}</dl></div></div> }
-export function Dashboard({openSecurity,openDerivedLayers,openSemantic,onLogout=()=>{},derivedChange=null}){
+export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null}){
  const [ws,setWs]=useState(null),[rev,setRev]=useState(),[catalog,setCatalog]=useState([]),[databases,setDatabases]=useState([]),[icons,setIcons]=useState([]),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[derivedUpdate,setDerivedUpdate]=useState(null);
  const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving';
  const beginActivity=next=>{if(activityRef.current)return false;activityRef.current=next;setActivity(next);return true};
@@ -302,6 +303,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,onLogout=
     <span>{activityText}</span>
     <DerivedLayerHeaderMenu disabled={busy} openDerivedLayers={openDerivedLayers}/>
     <button disabled={busy} className="secondary" onClick={openSemantic}>Semantic catalog</button>
+    <button disabled={busy} className="secondary" onClick={openFederation}>Federated sources</button>
     <button disabled={busy} className="secondary" onClick={openSecurity}>Access & audit</button>
     <button disabled={busy} className="secondary" onClick={onLogout}>Logout</button>
     <button disabled={busy} className="secondary" onClick={()=>load()}>{activity==='loading'?'Refreshing…':'Reload editor'}</button>
@@ -530,6 +532,9 @@ export const TOKEN_SCOPE_OPTIONS=[
  {id:'semantic:propose',group:'Semantic',label:'Propose semantic changes',help:'Check, create, and decline curated semantic proposals.'},
  {id:'semantic:apply',group:'Semantic',label:'Apply semantic proposals',help:'Apply an explicitly reviewed curated semantic proposal.'},
  {id:'semantic:admin',group:'Semantic',label:'Administer semantic delivery',help:'Inspect delivery failures and explicitly retry retained events.'},
+ {id:'federation:observe',group:'Federation',label:'Inspect federated sources',help:'Read the source registry, each alias status, and the accepted evidence behind it.'},
+ {id:'federation:register',group:'Federation',label:'Register federated sources',help:'Record intent to attach a source. Opens no connection and exposes nothing.'},
+ {id:'federation:provision',group:'Federation',label:'Expose and retire federated sources',help:'Probe a source live, expose its allowed relations to the map reader, and withdraw them again. The only scope that can serve a third-party database.'},
 ];
 export const TOKEN_ACCESS_PRESETS=[
  {id:'semantic-reader',label:'Semantic reader',scopes:['semantic:inspect'],help:'Read-only semantic catalog access.'},
@@ -538,7 +543,9 @@ export const TOKEN_ACCESS_PRESETS=[
  {id:'semantic-curator',label:'Semantic curator',scopes:['semantic:inspect','semantic:propose','semantic:apply'],help:'Read, propose, review, and apply curated meaning.'},
  {id:'semantic-operator',label:'Semantic delivery operator',scopes:['semantic:inspect','semantic:admin'],help:'Read profiles, diagnose delivery blockers, and retry retained events.'},
  {id:'semantic-administrator',label:'Semantic administrator',scopes:['semantic:inspect','semantic:source','semantic:generate','semantic:data','semantic:propose','semantic:apply','semantic:admin'],help:'All semantic source, catalog, generation, bounded data-context, curation, and delivery administration capabilities.'},
- {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace and semantic capability. Credential, device-approval, and audit administration remains dashboard-session-only.'},
+ {id:'federation-observer',label:'Federation observer',scopes:['federation:observe'],help:'Read the federated source registry and its evidence. Cannot register or expose anything.'},
+ {id:'federation-operator',label:'Federation operator',scopes:['federation:observe','federation:register','federation:provision'],help:'Run the whole source lifecycle from the CLI: register, observe, provision, retire. Includes the only scope that can serve a third-party database.'},
+ {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace, semantic and federation capability, including federation:provision, which can expose a third-party database through the platform. Credential, device-approval, and audit administration remains dashboard-session-only.'},
 ];
 const FULL_TOKEN_PRESET_ID='full';
 const ALL_NARROW_TOKEN_SCOPES=TOKEN_SCOPE_OPTIONS.map(scope=>scope.id);
@@ -582,6 +589,6 @@ export function Security({close}){
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
  </section></div>;
 }
-export function Root(){const [authenticated,setAuthenticated]=useState(null),[identity,setIdentity]=useState(null),[security,setSecurity]=useState(false),[derived,setDerived]=useState(null),[semantic,setSemantic]=useState(false);const requireLogin=()=>{setAuthenticated(false);setIdentity(null);setSecurity(false);setDerived(null);setSemantic(false)};const check=()=>api('/api/auth/me').then(result=>{setIdentity(result);setAuthenticated(true)}).catch(()=>requireLogin());useEffect(()=>{window.addEventListener(AUTH_REQUIRED_EVENT,requireLogin);check();return()=>window.removeEventListener(AUTH_REQUIRED_EVENT,requireLogin)},[]);const logout=async()=>{try{await api('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}finally{clearAuthentication();requireLogin()}};if(authenticated===null)return <p className="loading">Checking access…</p>;if(!authenticated)return <Login onLogin={check}/>;return <><Dashboard onLogout={logout} openSecurity={()=>setSecurity(true)} openDerivedLayers={choice=>setDerived(choice||{})} openSemantic={()=>setSemantic(true)}/>{security&&<Security close={()=>setSecurity(false)}/>} {derived&&<DerivedLayers initialName={derived.name} initialAction={derived.action} close={()=>setDerived(null)}/>} {semantic&&<SemanticCatalog api={api} identity={identity} close={()=>setSemantic(false)}/>}</>}
+export function Root(){const [authenticated,setAuthenticated]=useState(null),[identity,setIdentity]=useState(null),[security,setSecurity]=useState(false),[derived,setDerived]=useState(null),[semantic,setSemantic]=useState(false),[federation,setFederation]=useState(false);const requireLogin=()=>{setAuthenticated(false);setIdentity(null);setSecurity(false);setDerived(null);setSemantic(false);setFederation(false)};const check=()=>api('/api/auth/me').then(result=>{setIdentity(result);setAuthenticated(true)}).catch(()=>requireLogin());useEffect(()=>{window.addEventListener(AUTH_REQUIRED_EVENT,requireLogin);check();return()=>window.removeEventListener(AUTH_REQUIRED_EVENT,requireLogin)},[]);const logout=async()=>{try{await api('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}finally{clearAuthentication();requireLogin()}};if(authenticated===null)return <p className="loading">Checking access…</p>;if(!authenticated)return <Login onLogin={check}/>;return <><Dashboard onLogout={logout} openSecurity={()=>setSecurity(true)} openDerivedLayers={choice=>setDerived(choice||{})} openSemantic={()=>setSemantic(true)} openFederation={()=>setFederation(true)}/>{security&&<Security close={()=>setSecurity(false)}/>} {derived&&<DerivedLayers initialName={derived.name} initialAction={derived.action} close={()=>setDerived(null)}/>} {semantic&&<SemanticCatalog api={api} identity={identity} close={()=>setSemantic(false)}/>} {federation&&<FederatedSources api={api} close={()=>setFederation(false)}/>}</>}
 const rootElement=document.getElementById('root');
 if(rootElement)createRoot(rootElement).render(<Root/>);

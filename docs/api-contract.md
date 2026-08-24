@@ -539,10 +539,13 @@ trust boundaries.
 ## Federated PostgreSQL sources
 
 Available where `MAPP_DATABASE_MODE` is `bundled` or `federated`; the routes
-return `federation.not_configured` otherwise. There is no dashboard UI; the
-lifecycle is reachable over HTTP and through `config-cli federation`,
-advertised in the contract as `federation list`, `show`, `register`,
-`observe`, `provision`, and `retire`. See
+return `federation.not_configured` otherwise. The lifecycle is reachable over
+HTTP, through `config-cli federation` — advertised in the contract as
+`federation list`, `show`, `register`, `observe`, `provision`, and `retire` —
+and, for everything except registration, through the dashboard's **Federated
+sources** panel, which observes, provisions and retires under the
+administrator session. Registration stays CLI-only because it introduces a
+credential, which belongs in the environment rather than in an HTTP form. See
 [Federated PostgreSQL sources](federation.md) for the operator procedure.
 
 | Route | Capability action ID | Required scope |
@@ -571,8 +574,8 @@ for verification to fix it.
 
 `POST .../provision` requires `expectedObservationId` and refuses when it does
 not match the latest observation. Three conditions each need their own
-explicit boolean — `acknowledge_row_level_security`,
-`acknowledge_schema_change`, `acknowledge_physical_rebind` — and are refused
+explicit boolean — `rowLevelSecurityAcknowledged`,
+`schemaChangeAcknowledged`, `physicalRebindAcknowledged` — and are refused
 rather than assumed.
 
 Federation errors use `federation.*` codes in the standard error shape. The
