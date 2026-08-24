@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 import psycopg
+from http import HTTPStatus
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -258,8 +259,21 @@ class FederationAliasStore:
           accepted_schema_fingerprint IS NOT NULL
           AND accepted_physical_identity IS NOT NULL
           AND accepted_connection_identity IS NOT NULL
-        ) AS "acceptedEvidenceComplete"
-    """)
+        ) AS "acceptedEvidenceComplete",
+        -- The physical counterpart of lastObservation.acceptedSchemaCurrent.
+        -- Without it a client can show that the schema drifted but not that
+        -- the source is a different database, which is the condition the
+        -- physical-rebind acknowledgement exists to override. NULL means
+        -- there is nothing to compare yet, not "matches": the subquery is
+        -- empty until an observation exists and an identity has been accepted.
+        (
+          SELECT observation.physical_identity IS NOT DISTINCT FROM
+                 _aliases.accepted_physical_identity
+          FROM {schema}._observations AS observation
+          WHERE observation.id = _aliases.last_observation_id
+            AND _aliases.accepted_physical_identity IS NOT NULL
+        ) AS "acceptedPhysicalIdentityCurrent"
+    """).format(schema=sql.Identifier(SCHEMA))
 
     def register(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         record = validate_registration(payload)
@@ -1288,12 +1302,34 @@ class FederationAliasStore:
                         or not column_shape_current
                     ):
                         if binding is not None:
-                            cur.execute(
-                                sql.SQL("DROP FOREIGN TABLE {}.{}").format(
-                                    sql.Identifier(schema_name),
-                                    sql.Identifier(remote_table),
+                            try:
+                                cur.execute(
+                                    sql.SQL("DROP FOREIGN TABLE {}.{}").format(
+                                        sql.Identifier(schema_name),
+                                        sql.Identifier(remote_table),
+                                    )
                                 )
-                            )
+                            except psycopg.errors.DependentObjectsStillExist as exc:
+                                # Re-provisioning re-imports the foreign table,
+                                # and a managed derived layer reading it blocks
+                                # the drop. retire() already refuses this case
+                                # by name; without this, provision surfaced a
+                                # raw psycopg error as a 502, which reads as
+                                # "the registry is down" rather than "something
+                                # still depends on this". PostgreSQL already
+                                # names the dependants, so quote it rather than
+                                # asking the derived store separately.
+                                raise FederationSchemaError(
+                                    f"Alias {alias!r} cannot be re-provisioned "
+                                    "while managed relations still read its "
+                                    "foreign tables. Drop or repoint them "
+                                    "first. PostgreSQL reported: "
+                                    + " ".join(
+                                        (exc.diag.message_detail or "").split()
+                                    ),
+                                    code="federation.alias_in_use",
+                                    status=HTTPStatus.CONFLICT,
+                                ) from exc
                         relations_to_import.append(relation)
             else:
                 server_options = [

@@ -2,10 +2,14 @@ import re
 import sys
 import unittest
 from datetime import datetime, timezone
+from http import HTTPStatus
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import psycopg
 
 from federation_schema import FederationSchemaError, validate_alias
 from federation_store import FederationAliasStore, MAX_ALIASES
@@ -1494,6 +1498,65 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         self.assertIn("FOR UPDATE", statements(cursor)[0])
 
+
+    @patch(
+        "federation_store.verify_remote_state",
+        return_value=(
+            PHYSICAL_IDENTITY, {}, True, False, "same", REMOTE_COLUMN_SHAPES
+        ),
+    )
+    @patch("federation_store.extension_versions", return_value={})
+    def test_reprovision_names_the_relations_blocking_the_reimport(
+        self, _versions, _verify
+    ):
+        """A dependent managed relation is a conflict, not an outage.
+
+        retire() already refuses this case by name. provision() re-imports the
+        foreign table, so a derived layer reading it blocks the drop; the raw
+        psycopg error surfaced as a 502, which reads as "the registry is down"
+        rather than "something still depends on this".
+        """
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [
+            provision_row(
+                provisionedAt=OBSERVED_AT,
+                accepted_schema_fingerprint="same",
+                accepted_physical_identity=PHYSICAL_IDENTITY,
+                accepted_connection_identity=CONNECTION_IDENTITY,
+                lastObservation=observation(fingerprint="same", versions={}),
+            ),
+            server_row(),
+            {"owned": True},
+        ]
+        cursor.fetchall.side_effect = [
+            [local_binding(column_shape_fingerprint="drifted")],
+        ]
+        detail = (
+            "materialized view derived_layers.smoke_control_area_ext_h3_r9 "
+            "depends on foreign table source_leeds_ext.smoke_control_orders"
+        )
+
+        # psycopg's Diagnostic.message_detail is read-only, so subclass rather
+        # than mutate; isinstance still matches what the store catches.
+        class Blocked(psycopg.errors.DependentObjectsStillExist):
+            @property
+            def diag(self):
+                return SimpleNamespace(message_detail=detail)
+
+        def execute(statement, *args, **kwargs):
+            if "DROP FOREIGN TABLE" in str(statement):
+                raise Blocked("blocked")
+            return None
+
+        cursor.execute.side_effect = execute
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as raised:
+            self.provision(store)
+
+        self.assertEqual("federation.alias_in_use", raised.exception.code)
+        self.assertEqual(HTTPStatus.CONFLICT, raised.exception.status)
+        self.assertIn("smoke_control_area_ext_h3_r9", str(raised.exception))
 
 if __name__ == "__main__":
     unittest.main()
