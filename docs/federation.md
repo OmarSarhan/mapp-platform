@@ -192,13 +192,15 @@ If anything moved in between, provisioning refuses rather than approving
 something you did not look at.
 
 Three conditions need explicit acknowledgement, each its own opt-in boolean
-alongside `expectedObservationId`:
+alongside `expectedObservationId`. These are the wire names; the snake_case
+spellings that appear in `FederationAliasStore.provision()` are internal
+keyword arguments and are rejected by the route:
 
 | Property | When you need it |
 | --- | --- |
-| `acknowledge_row_level_security` | The source has RLS, so what MAPP sees depends on the reading role. |
-| `acknowledge_schema_change` | The schema fingerprint moved since the accepted one. |
-| `acknowledge_physical_rebind` | The source is a **different physical database** than the one previously approved. |
+| `rowLevelSecurityAcknowledged` | The source has RLS, so what MAPP sees depends on the reading role. |
+| `schemaChangeAcknowledged` | The schema fingerprint moved since the accepted one. |
+| `physicalRebindAcknowledged` | The source is a **different physical database** than the one previously approved. |
 
 That last one is the important guard: a restored-from-backup or swapped source
 keeps every name and column identical while being a different database.
@@ -311,9 +313,9 @@ pretending otherwise would hide real incompatibilities.
 | `federation.tls_policy_not_met` | The connection string is weaker than the declared `tlsPolicy`. |
 | `federation.observation_not_current` | `expectedObservationId` does not match the latest observation. |
 | `federation.invalid_observation_id` | `expectedObservationId` missing or not a positive integer. |
-| `federation.schema_change_not_acknowledged` | Fingerprint moved; needs `acknowledge_schema_change`. |
-| `federation.physical_rebind_not_acknowledged` | Different physical database; needs `acknowledge_physical_rebind`. |
-| `federation.row_level_security_not_acknowledged` | Source has RLS; needs `acknowledge_row_level_security`. |
+| `federation.schema_change_not_acknowledged` | Fingerprint moved; needs `schemaChangeAcknowledged`. |
+| `federation.physical_rebind_not_acknowledged` | Different physical database; needs `physicalRebindAcknowledged`. |
+| `federation.row_level_security_not_acknowledged` | Source has RLS; needs `rowLevelSecurityAcknowledged`. |
 | `federation.import_incomplete` | Foreign-table import did not produce the expected relations. |
 | `federation.local_state_invalid` | Local objects exist but are owned by another role, or otherwise not what provisioning expects. |
 | `federation.alias_in_use` | A derived or workspace layer still reads the source. |

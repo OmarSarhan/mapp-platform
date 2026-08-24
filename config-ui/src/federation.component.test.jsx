@@ -122,7 +122,7 @@ describe('FederatedSources', () => {
     const provision = calls.find(call => call.path.endsWith('/provision'));
     expect(provision.body).toEqual({
       expectedObservationId: 88,
-      acknowledge_physical_rebind: true,
+      physicalRebindAcknowledged: true,
     });
   });
 

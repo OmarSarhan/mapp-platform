@@ -6,17 +6,17 @@ const CONFIRMABLE = new Set(['provision', 'retire']);
 
 const ACKNOWLEDGEMENTS = [
   {
-    property: 'acknowledge_physical_rebind',
+    property: 'physicalRebindAcknowledged',
     label: 'Different physical database',
     help: 'A restored backup or swapped host keeps every name and column identical. This is the only signal that the source is not the one previously approved.',
   },
   {
-    property: 'acknowledge_schema_change',
+    property: 'schemaChangeAcknowledged',
     label: 'Schema fingerprint moved',
     help: 'The relation shapes changed since the accepted observation.',
   },
   {
-    property: 'acknowledge_row_level_security',
+    property: 'rowLevelSecurityAcknowledged',
     label: 'Row-level security in force',
     help: 'What MAPP sees depends on the reading role, so the exposed rows may be a subset.',
   },

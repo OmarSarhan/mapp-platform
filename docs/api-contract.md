@@ -571,8 +571,8 @@ for verification to fix it.
 
 `POST .../provision` requires `expectedObservationId` and refuses when it does
 not match the latest observation. Three conditions each need their own
-explicit boolean — `acknowledge_row_level_security`,
-`acknowledge_schema_change`, `acknowledge_physical_rebind` — and are refused
+explicit boolean — `rowLevelSecurityAcknowledged`,
+`schemaChangeAcknowledged`, `physicalRebindAcknowledged` — and are refused
 rather than assumed.
 
 Federation errors use `federation.*` codes in the standard error shape. The
