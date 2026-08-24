@@ -55,10 +55,17 @@ Git, and PostgreSQL development packages are pinned to reviewed APK versions.
 
 ## Publication workflow
 
-`.github/workflows/supply-chain.yml` runs only for `main` (including manual
-runs selected on `main`). It publishes one `linux/amd64` GHCR image for each of
-the eight final Dockerfiles, including the Caddy wrapper, under a unique
-source/run tag. Deployment and verification must use the emitted image digest
+`.github/workflows/supply-chain.yml` runs **on demand only**, through
+`workflow_dispatch` selected on `main`. It publishes one `linux/amd64` GHCR
+image for each of the eight final Dockerfiles, including the Caddy wrapper,
+under a unique source/run tag.
+
+It previously ran on every push to `main`. That is roughly twenty-four jobs per
+merge — eight builds, eight signatures, eight scans — and nothing in the
+deployment consumes the published images, because Compose builds them locally.
+Publishing per commit was therefore paying for artefacts nobody pulled. Run it
+for a release, or whenever the reviewed image set is what you actually want to
+refresh; restoring the old behaviour is a two-line `push:` trigger. Deployment and verification must use the emitted image digest
 rather than that tag.
 
 For every image digest the workflow:
