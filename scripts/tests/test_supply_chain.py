@@ -20,8 +20,8 @@ EXPECTED_BASES = {
         "5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48",
     ),
     "docker/caddy/Dockerfile": (
-        "golang:1.26.5-alpine3.23@sha256:"
-        "622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc",
+        "golang:1.26.7-alpine3.23@sha256:"
+        "b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57",
         "caddy:2.11.4-alpine@sha256:"
         "5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648",
     ),
@@ -36,8 +36,8 @@ EXPECTED_BASES = {
         "8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c",
     ),
     "docker/postgis/Dockerfile": (
-        "golang:1.26.5-alpine3.23@sha256:"
-        "622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc",
+        "golang:1.26.7-alpine3.23@sha256:"
+        "b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57",
         "postgis/postgis:17-3.5-alpine@sha256:"
         "978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568",
     ),

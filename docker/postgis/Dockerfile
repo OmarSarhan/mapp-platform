@@ -1,4 +1,4 @@
-FROM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS gosu-builder
+FROM golang:1.26.7-alpine3.23@sha256:b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57 AS gosu-builder
 
 ARG GOSU_REPOSITORY=https://github.com/tianon/gosu.git
 ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513

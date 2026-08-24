@@ -20,7 +20,7 @@ machine-readable allowlist and must change in the same review as a Dockerfile.
 | `mcr.microsoft.com/playwright:v1.61.1-noble` | `sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48` | browser runner |
 | `caddy:2.11.4-alpine` | `sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` | Caddy edge wrapper |
 | `ubuntu/squid:6.6-24.04_edge` | `sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c` | allowlisting egress proxy |
-| `golang:1.26.5-alpine3.23` | `sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc` | reproducible Caddy and gosu builds |
+| `golang:1.26.7-alpine3.23` | `sha256:b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57` | reproducible Caddy and gosu builds |
 | `node:22.23.1-bookworm-slim` | `sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` | development container only |
 | `mcr.microsoft.com/devcontainers/python:1-3.12-bookworm` | `sha256:7876580dc67fd460fd962f004cbeb480027e9bbc0657096f1087db11f9eaff39` | development container only |
 
@@ -47,7 +47,7 @@ The PostGIS image uses the publisher's Alpine variant and replaces its stale
 `gosu` binary with a static build from gosu 1.19 commit
 `6456aaa0f3c854d199d0f037f068eb97515b7513` using the reviewed Go toolchain.
 Caddy 2.11.4 is likewise bound to commit
-`e2eee6a7fce366321294c9c2a79f3146891dcbdf`, rebuilt with Go 1.26.5,
+`e2eee6a7fce366321294c9c2a79f3146891dcbdf`, rebuilt with Go 1.26.7,
 `golang.org/x/text` 0.39.0, and `google.golang.org/grpc` 1.82.1. No
 vulnerability is ignored or allowlisted by this remediation.
 The validated Caddy checkout is the build input, and the H3 compiler, CMake,
