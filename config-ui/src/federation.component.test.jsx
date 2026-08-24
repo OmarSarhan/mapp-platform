@@ -158,13 +158,59 @@ describe('FederatedSources', () => {
     ).toBeTruthy());
   });
 
-  test('an empty registry explains that the credential comes from the environment', async () => {
+  test('an empty list says no ACTIVE sources and names the credential source', async () => {
     const api = listOnly([]);
     render(<FederatedSources api={api} close={() => {}}/>);
 
     await waitFor(() => expect(
-      screen.getByText(/No sources are registered/),
+      screen.getByText(/No active sources/),
     ).toBeTruthy());
     expect(screen.getByText(/FEDERATION_DBS_<REF>/)).toBeTruthy();
+  });
+
+  test('a failed list is not reported as an empty registry', async () => {
+    // A registry that could not be read is unknown, not empty. Saying "no
+    // sources" here would send an operator to register one while aliases
+    // they cannot see already hold the names.
+    const api = vi.fn(async () => {
+      throw new Error('The federation alias registry is unavailable.');
+    });
+    render(<FederatedSources api={api} close={() => {}}/>);
+
+    await waitFor(() => expect(
+      screen.getByText('The federation alias registry is unavailable.'),
+    ).toBeTruthy());
+    expect(screen.queryByText(/No active sources/)).toBeNull();
+  });
+
+  test('retirement discloses the dropped mappings and that it is terminal', async () => {
+    const api = listOnly([active]);
+    render(<FederatedSources api={api} close={() => {}}/>);
+    await waitFor(() => expect(screen.getByText('Leeds external')).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', {name: 'Retire'}));
+
+    expect(screen.getByText(/user mappings are dropped/i)).toBeTruthy();
+    expect(screen.getByText(/terminal/i)).toBeTruthy();
+    expect(screen.queryByText(/Nothing is dropped/)).toBeNull();
+  });
+
+  test('the evidence an acknowledgement approves is shown before it is offered', async () => {
+    const drifted = {
+      ...active,
+      lastObservation: {
+        connectivity: 'reachable',
+        schema: 'changed',
+        schemaFingerprint: '03fbe6948db8ff79241db6c4f4f6747389fa31070ceb8861',
+        acceptedSchemaCurrent: false,
+        rowLevelSecurityDetected: true,
+      },
+    };
+    const api = listOnly([drifted]);
+    render(<FederatedSources api={api} close={() => {}}/>);
+
+    await waitFor(() => expect(screen.getByText('Leeds external')).toBeTruthy());
+    expect(screen.getByText(/Differs from the accepted fingerprint/)).toBeTruthy();
+    expect(screen.getByText(/Detected on the source/)).toBeTruthy();
   });
 });

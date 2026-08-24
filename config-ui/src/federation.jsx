@@ -67,6 +67,23 @@ function Evidence({alias}) {
         : 'never observed'}
       {alias.lastObservationId ? ` · id ${alias.lastObservationId}` : ''}
     </dd>
+    {observation.schemaFingerprint && <>
+      <dt>Schema vs accepted</dt>
+      <dd>
+        {observation.acceptedSchemaCurrent === false
+          ? 'Differs from the accepted fingerprint. Provisioning needs the schema-change acknowledgement.'
+          : 'Matches the accepted fingerprint.'}
+        <br/><small>{observation.schemaFingerprint.slice(0, 24)}…</small>
+      </dd>
+    </>}
+    {observation.rowLevelSecurityDetected !== undefined && <>
+      <dt>Row-level security</dt>
+      <dd>
+        {observation.rowLevelSecurityDetected
+          ? 'Detected on the source. What MAPP sees depends on the reading role.'
+          : 'Not detected on the source.'}
+      </dd>
+    </>}
     {alias.provisionedAt && <>
       <dt>Approved</dt>
       <dd>{alias.approvedBy || 'unknown'} at {alias.approvedAt || alias.provisionedAt}</dd>
@@ -92,7 +109,9 @@ export function FederatedSources({api, close}) {
   const [notice, setNotice] = useState('');
   const [pending, setPending] = useState(null);
   const [acknowledged, setAcknowledged] = useState([]);
-  const [loaded, setLoaded] = useState(false);
+  // Distinct from 'a request finished': a failed list leaves the registry
+  // unknown, which must not render as a confirmed empty one.
+  const [listed, setListed] = useState(false);
 
   const load = async keepSelection => {
     try {
@@ -102,10 +121,10 @@ export function FederatedSources({api, close}) {
       if (!keepSelection || !items.some(item => item.alias === keepSelection)) {
         setSelectedAlias(items.length ? items[0].alias : '');
       }
-      setLoaded(true);
+      setListed(true);
     } catch (err) {
       setError(err.message);
-      setLoaded(true);
+      setListed(false);
     }
   };
 
@@ -191,8 +210,11 @@ export function FederatedSources({api, close}) {
       {error && <div className="expression-result error">{error}</div>}
       {notice && <div className="expression-result success">{notice}</div>}
 
-      {loaded && !aliases.length && <div className="panel empty">
-        No sources are registered. Register one through
+      {listed && !aliases.length && <div className="panel empty">
+        No active sources. Retired aliases are deliberately omitted here, and
+        their names stay reserved, so this is not proof the registry is empty —
+        {' '}<code>config-cli federation show &lt;alias&gt;</code> still returns a
+        retired one by exact name. To attach a source, use
         {' '}<code>config-cli federation register</code>, which needs a
         {' '}<code>FEDERATION_DBS_&lt;REF&gt;</code> credential already present in the
         environment.
@@ -249,11 +271,20 @@ export function FederatedSources({api, close}) {
 
           {pending === 'retire' && <div className="federation-confirm">
             <p>
-              Retiring revokes access and renames the schema, server, and foreign
-              tables out of the way. Nothing is dropped, and the registry row is kept.
+              Retiring revokes access, then renames the schema, server and
+              foreign tables out of the way. The registry row and its
+              observation history are kept as the audit trail.
+            </p>
+            <p>
+              <strong>The user mappings are dropped.</strong> Those hold the
+              remote credential in the PostgreSQL catalogue, so the archived
+              server cannot reach the source again. Re-attaching this data means
+              registering a new alias with a fresh credential.
             </p>
             <p className="muted">
-              It is refused while a derived or workspace layer still reads the source.
+              This is terminal: the alias leaves this list, and the same name
+              cannot be registered again. It is refused while a derived or
+              workspace layer still reads the source.
             </p>
             <div className="federation-buttons">
               <button disabled={busy} className="danger" onClick={() => run('retire', [])}>
