@@ -27,6 +27,33 @@ const ACKNOWLEDGEMENTS = [
   },
 ];
 
+// A provisioned alias whose relations have no semantic profile is a normal,
+// deliberate state rather than a fault: registering exposes the relations,
+// SEMANTIC_SOURCE_ALLOWLIST separately permits their column metadata to be
+// profiled. It is invisible until something refuses, which is what made it
+// feel like a bug, so the panel states it.
+export function semanticCoverage(alias, assets) {
+  if (!alias || !Array.isArray(assets)) return null;
+  const wanted = (alias.allowedRelations || []).map(relation => {
+    const bare = String(relation).split('.').slice(-1)[0];
+    return `source_${alias.alias}.${bare}`;
+  });
+  if (!wanted.length) return null;
+  const ready = new Set(
+    assets
+      .filter(asset => asset && asset.status === 'ready')
+      .map(asset => (asset.generated || {}).qualifiedName)
+      .filter(Boolean),
+  );
+  const missing = wanted.filter(name => !ready.has(name));
+  return {
+    total: wanted.length,
+    profiled: wanted.length - missing.length,
+    missing,
+    selector: `MAPP:source_${alias.alias}.*`,
+  };
+}
+
 export function evidenceState(alias) {
   if (!alias || alias.status === 'retired') return 'archived';
   if (!alias.provisionedAt) return 'registered';
@@ -50,7 +77,7 @@ function StatusBadge({status}) {
   return <span className={`federation-status federation-status-${status}`}>{status}</span>;
 }
 
-function Evidence({alias}) {
+function Evidence({alias, coverage}) {
   const state = evidenceState(alias);
   const observation = alias.lastObservation || {};
   return <dl className="federation-evidence">
@@ -115,6 +142,17 @@ function Evidence({alias}) {
     </>}
     <dt>Handling</dt>
     <dd>{alias.dataHandlingClassification || 'not classified'}</dd>
+    {coverage && <>
+      <dt>Semantics</dt>
+      <dd>
+        {coverage.profiled === coverage.total
+          ? `All ${coverage.total} exposed relation(s) profiled.`
+          : `${coverage.profiled} of ${coverage.total} exposed relation(s) profiled. `
+            + 'Registering exposes a relation; profiling its columns is a separate '
+            + `permission. Add ${coverage.selector} to SEMANTIC_SOURCE_ALLOWLIST, `
+            + 'restart the configuration service, then sync the source.'}
+      </dd>
+    </>}
   </dl>;
 }
 
@@ -129,6 +167,7 @@ export function FederatedSources({api, close}) {
   // Distinct from 'a request finished': a failed list leaves the registry
   // unknown, which must not render as a confirmed empty one.
   const [listed, setListed] = useState(false);
+  const [assets, setAssets] = useState(null);
 
   const load = async keepSelection => {
     try {
@@ -147,6 +186,11 @@ export function FederatedSources({api, close}) {
 
   useEffect(() => {
     load('');
+    // Best effort: an operator without semantic:inspect, or a semantic service
+    // that is down, still gets the federation panel.
+    api('/api/semantic/catalog')
+      .then(result => setAssets(result.assets || []))
+      .catch(() => setAssets(null));
   }, []);
 
   const selected = aliases.find(item => item.alias === selectedAlias) || null;
@@ -261,7 +305,7 @@ export function FederatedSources({api, close}) {
 
         {selected && <div className="federation-detail">
           <h3>{selected.alias}</h3>
-          <Evidence alias={selected}/>
+          <Evidence alias={selected} coverage={semanticCoverage(selected, assets)}/>
 
           {pending === 'provision' && <div className="federation-confirm">
             <p>

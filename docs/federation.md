@@ -301,6 +301,45 @@ The rig deliberately uses plain `postgis/postgis`, not MAPP's own H3 image — a
 genuinely third-party source would not have MAPP's extensions installed, and
 pretending otherwise would hide real incompatibilities.
 
+## Semantics are a second decision
+
+Registering an alias exposes its relations. It does **not** permit their column
+metadata to be profiled. That is `SEMANTIC_SOURCE_ALLOWLIST`, and it is
+deliberately separate: serving a relation on a map and letting its column names
+into a catalog that `semantic:generate` may send to an external model are
+different questions, and a source can reasonably be fine for the first and not
+the second.
+
+The practical consequence is that standing up a federated source is four steps,
+not one:
+
+```bash
+config-cli federation register census --connection-ref CENSUS ...   # 1. expose
+# 2. permit profiling: add MAPP:source_census.* to SEMANTIC_SOURCE_ALLOWLIST
+#    in .env, then recreate config-ui so it re-reads the variable
+config-cli semantic source sync --alias MAPP \
+  --schema source_census --relation census_2021_england_oa           # 3. profile
+config-cli federation provision census --expected-observation-id N --confirm
+```
+
+Step 2 is easy to miss because skipping it fails late and indirectly: creating
+a derived layer refuses, since every declared source must have a ready semantic
+profile. Two things now make it visible. The refusal names the exact selector
+to add:
+
+```
+The requested relation is not allowed as a semantic source.
+MAPP:source_census.census_2021_england_oa is not in SEMANTIC_SOURCE_ALLOWLIST.
+Add MAPP:source_census.* ...
+```
+
+and the dashboard's **Federated sources** panel reports coverage per alias —
+"1 of 2 exposed relation(s) profiled" — with the selector needed, so the state
+is legible before anything refuses.
+
+Exclusions still apply on top: `SEMANTIC_SOURCE_EXCLUSIONS` is subtracted from
+the allowlist, and the refusal says so when an exclusion is what is blocking.
+
 ## Predicate pushdown
 
 Provisioning declares PostGIS shippable to `postgres_fdw` — `ALTER SERVER ...

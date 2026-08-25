@@ -13,6 +13,7 @@ import {
   actionOutcome,
   evidenceState,
   expectedStatus,
+  semanticCoverage,
 } from './federation.jsx';
 
 const active = {
@@ -69,6 +70,36 @@ describe('federation evidence helpers', () => {
       .toBe('committed');
     expect(actionOutcome('observe', {alias: 'leeds_ext', status: 'active'}, 'leeds_ext'))
       .toBe('observed');
+  });
+});
+
+describe('semanticCoverage', () => {
+  const alias = {alias: 'census', allowedRelations: ['leeds.a', 'leeds.b']};
+
+  test('counts exposed relations that have a ready profile', () => {
+    const assets = [
+      {status: 'ready', generated: {qualifiedName: 'source_census.a'}},
+      {status: 'ready', generated: {qualifiedName: 'source_census.b'}},
+    ];
+    expect(semanticCoverage(alias, assets)).toMatchObject({
+      total: 2, profiled: 2, missing: [],
+    });
+  });
+
+  test('a relation with no ready profile is reported with the selector to add', () => {
+    const assets = [
+      {status: 'ready', generated: {qualifiedName: 'source_census.a'}},
+      // Present but not ready: not yet usable as a derived-layer source.
+      {status: 'registering', generated: {qualifiedName: 'source_census.b'}},
+    ];
+    expect(semanticCoverage(alias, assets)).toMatchObject({
+      total: 2, profiled: 1, missing: ['source_census.b'],
+      selector: 'MAPP:source_census.*',
+    });
+  });
+
+  test('is absent when the catalog could not be read', () => {
+    expect(semanticCoverage(alias, null)).toBeNull();
   });
 });
 

@@ -320,6 +320,39 @@ class PostgresSemanticSources:
         self.allowlist = allowlist
         self.exclusions = exclusions
 
+    def _refusal(self, alias: str, schema: str, relation: str) -> str:
+        """Why this relation is refused, and what would permit it.
+
+        The bare refusal sent an operator hunting through configuration for a
+        boundary they could not see. Federated relations feel especially
+        arbitrary: registering an alias enumerates its allowedRelations and
+        attests to their data handling, so a second declaration reads like a
+        bug rather than the narrower decision it is -- expose on the map is
+        not the same permission as profile the columns.
+        """
+        if _system_schema(schema) or _internal_relation(relation):
+            return (
+                "System and managed relations are never semantic sources."
+            )
+        excluded = any(
+            pattern.permits(alias, schema, relation)
+            for pattern in self.exclusions
+        )
+        if excluded:
+            return (
+                f"{alias}:{schema}.{relation} matches "
+                "SEMANTIC_SOURCE_EXCLUSIONS, which is subtracted from the "
+                "allowlist. Remove the exclusion to permit it."
+            )
+        return (
+            f"{alias}:{schema}.{relation} is not in "
+            f"SEMANTIC_SOURCE_ALLOWLIST. Add {alias}:{schema}.* (or the exact "
+            f"{alias}:{schema}.{relation}) and restart the configuration "
+            "service. For a federated source this is deliberately a second "
+            "decision: registering the alias exposes the relation, this "
+            "permits its column metadata to be profiled."
+        )
+
     def _permitted(self, alias: str, schema: str, relation: str) -> bool:
         return (
             not _system_schema(schema)
@@ -401,7 +434,8 @@ class PostgresSemanticSources:
     ) -> dict[str, Any]:
         if not self._permitted(alias, schema, relation):
             raise SemanticSourceError(
-                "The requested relation is not allowed as a semantic source.",
+                "The requested relation is not allowed as a semantic source. "
+                + self._refusal(alias, schema, relation),
                 status=HTTPStatus.FORBIDDEN,
                 code="semantic.source_not_allowed",
             )
@@ -590,7 +624,8 @@ class PostgresSemanticSources:
     ) -> Iterator[dict[str, Any]]:
         if not self._permitted(alias, schema, relation):
             raise SemanticSourceError(
-                "The requested relation is not allowed as a semantic source.",
+                "The requested relation is not allowed as a semantic source. "
+                + self._refusal(alias, schema, relation),
                 status=HTTPStatus.FORBIDDEN,
                 code="semantic.source_not_allowed",
             )
