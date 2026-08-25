@@ -83,6 +83,31 @@ $mapp_federation_role$;
 CREATE EXTENSION IF NOT EXISTS h3;
 CREATE EXTENSION IF NOT EXISTS h3_postgis CASCADE;
 
+-- Bring the PostGIS extension metadata up to the linked library. A volume
+-- initialised against an older image keeps its recorded extension version
+-- after the image's PostGIS moves, so extversion drifts behind
+-- PostGIS_Lib_Version(). That is not cosmetic: federation compares the two
+-- databases' postgisExtversion before declaring postgis shippable to
+-- postgres_fdw, so a stale local extension silently disables spatial
+-- pushdown and every predicate is evaluated after pulling the rows across.
+DO $mapp_postgis_upgrade$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_extension AS installed
+    JOIN pg_catalog.pg_available_extensions AS available
+      ON available.name = installed.extname
+    WHERE installed.extname LIKE 'postgis%'
+      AND installed.extversion IS DISTINCT FROM available.default_version
+  ) THEN
+    -- PostGIS's own upgrade entry point: it orders the postgis, raster,
+    -- topology and tiger extensions correctly, which separate ALTER
+    -- EXTENSION statements do not.
+    PERFORM public.postgis_extensions_upgrade();
+  END IF;
+END
+$mapp_postgis_upgrade$;
+
 DO $mapp$
 DECLARE
   routine_oid pg_catalog.oid;
