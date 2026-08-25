@@ -20,7 +20,7 @@ machine-readable allowlist and must change in the same review as a Dockerfile.
 | `node:22.23.1-alpine3.23` | `sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e` | XYZ build/runtime and config UI web build |
 | `python:3.12.13-alpine3.23` | `sha256:601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d` | config UI, semantic service, and ETL |
 | `postgis/postgis:17-3.5-alpine` | `sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568` | bundled PostgreSQL/PostGIS/H3 image |
-| `mcr.microsoft.com/playwright:v1.61.1-noble` | `sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48` | browser runner |
+| `mcr.microsoft.com/playwright:v1.62.1-noble` | `sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e` | browser runner (reviewed 2026-08-25, paired with the playwright 1.62.1 package so the image ships the matching browser build) |
 | `caddy:2.11.4-alpine` | `sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` | Caddy edge wrapper |
 | `ubuntu/squid:6.6-24.04_edge` | `sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c` | allowlisting egress proxy |
 | `golang:1.26.7-alpine3.23` | `sha256:b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57` | reproducible Caddy and gosu builds (reviewed 2026-08-24, replacing 1.26.5 for the Go stdlib advisories fixed in 1.26.6) |
