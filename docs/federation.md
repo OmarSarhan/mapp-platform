@@ -301,6 +301,54 @@ The rig deliberately uses plain `postgis/postgis`, not MAPP's own H3 image — a
 genuinely third-party source would not have MAPP's extensions installed, and
 pretending otherwise would hide real incompatibilities.
 
+## Predicate pushdown
+
+Provisioning declares PostGIS shippable to `postgres_fdw` — `ALTER SERVER ...
+OPTIONS (extensions 'postgis')` — but only when the two databases report the
+same `postgis`, `postgisExtversion`, `proj` and `geos` versions. That gate
+exists because `postgres_fdw` assumes a shippable extension's operators mean
+the same thing on both sides; two PostGIS builds that differ could evaluate
+the same predicate differently, and the wrong rows would come back with no
+error.
+
+The consequence is worth understanding, because it is invisible until you look
+at a plan. With the option set, a spatial filter executes on the source:
+
+```
+Foreign Scan
+  Remote SQL: SELECT count(*) FROM leeds.smoke_control_orders
+              WHERE ((geom_3857 OPERATOR(public.&&) '...'))
+```
+
+Without it, the same query pulls every row's geometry across the wire and
+filters locally:
+
+```
+Foreign Scan
+  Filter: (geom_3857 && '...')
+  Remote SQL: SELECT geom_3857 FROM leeds.smoke_control_orders
+```
+
+Both return the same answer. On a small allowlisted relation the difference is
+unnoticeable; on a large one it is the difference between a remote index scan
+and a full transfer.
+
+If a source stops matching versions, provisioning removes the option again
+rather than leaving a stale claim in place, and the alias keeps working at the
+slower plan. Check with:
+
+```bash
+config-cli federation show <alias>
+```
+
+and, in the local database, `SELECT srvoptions FROM pg_foreign_server`.
+
+A version drift on **MAPP's own** database has the same effect. A volume
+initialised against an older image keeps its recorded extension version after
+the image's PostGIS moves, so `extversion` falls behind
+`PostGIS_Lib_Version()` and every source stops matching. `./bin/mapp
+upgrade-derived` realigns it; `./bin/mapp verify` compares the two.
+
 ## Error codes
 
 | Code | Meaning |
