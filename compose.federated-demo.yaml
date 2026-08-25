@@ -1,0 +1,109 @@
+# Opt-in overlay for the two-source federated demo. Not in ./bin/mapp's
+# runtime_services and not started by `./bin/mapp serve`.
+#
+# The point of this arrangement: MAPP's own database stops being special. It
+# holds derived_layers, the federation registry and the source_<alias> foreign
+# tables, and every piece of demo data lives in a separate database reached
+# over postgres_fdw. A single-database deployment is then just a federation of
+# one rather than a different mode.
+#
+# Bring up alongside the bundled stack, e.g.:
+#   docker compose --project-directory . --env-file .env \
+#     --file compose.yaml --file compose.bundled-db.yaml \
+#     --file compose.federated-demo.yaml up -d census-db ops-db config-ui
+#   ./docker/demo-sources/seed.sh
+#
+# config-ui must be named alongside the databases even when already running:
+# `up -d <service>` only touches the services it is given, so a config-ui
+# started without this overlay never receives the FEDERATION_DBS_* entries and
+# Observe fails with federation.connection_ref_not_found.
+#
+# The same cuts the other way. Each overlay forwards only its own
+# FEDERATION_DBS_<REF> entries, so recreating config-ui with this file alone
+# drops LEEDS_EXT and ./bin/mapp verify fails with "connectionRef 'LEEDS_EXT'
+# is not configured". If the federation-test rig is also registered, name both
+# overlays:
+#   --file compose.federation-test.yaml --file compose.federated-demo.yaml
+#
+# Deliberately plain postgis/postgis, not mapp-postgis-h3: an independently
+# operated source would not have MAPP's own H3 extension installed. The H3
+# work happens in the host database, on rows pulled from these.
+x-demo-source: &demo-source
+  image: postgis/postgis:17-3.5-alpine@sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568
+  restart: unless-stopped
+  # Registration accepts only require/verify-ca/verify-full and Observe
+  # enforces it before connecting, so a source with no TLS can never satisfy
+  # any policy. Generates a throwaway self-signed certificate on every start
+  # rather than committing a private key to the repository; sslmode=require
+  # does not validate it against a CA in any case.
+  entrypoint: ["sh", "-c"]
+  healthcheck:
+    test: [CMD-SHELL, "pg_isready -U ${SOURCE_POSTGRES_USER:-postgres}"]
+    interval: 5s
+    timeout: 5s
+    retries: 12
+    start_period: 15s
+  networks:
+    - backend
+
+services:
+  config-ui:
+    environment:
+      FEDERATION_DBS_CENSUS: ${FEDERATION_DBS_CENSUS:?Set FEDERATION_DBS_CENSUS in .env}
+      FEDERATION_DBS_OPS: ${FEDERATION_DBS_OPS:?Set FEDERATION_DBS_OPS in .env}
+
+  census-db:
+    <<: *demo-source
+    environment:
+      POSTGRES_DB: ${CENSUS_POSTGRES_DB:?Set CENSUS_POSTGRES_DB in .env}
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:?Set SOURCE_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${CENSUS_POSTGRES_PASSWORD:?Set CENSUS_POSTGRES_PASSWORD in .env}
+      SOURCE_READER_USER: ${SOURCE_READER_USER:?Set SOURCE_READER_USER in .env}
+      SOURCE_READER_PASSWORD: ${SOURCE_READER_PASSWORD:?Set SOURCE_READER_PASSWORD in .env}
+    volumes:
+      - census_postgres_data:/var/lib/postgresql/data
+      - ./docker/source-db/init/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -subj "/CN=census-db" -addext "subjectAltName=DNS:census-db" \
+          -keyout /tmp/server.key -out /tmp/server.crt
+        chmod 600 /tmp/server.key
+        chown postgres:postgres /tmp/server.crt /tmp/server.key
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/tmp/server.crt \
+          -c ssl_key_file=/tmp/server.key
+
+  ops-db:
+    <<: *demo-source
+    environment:
+      POSTGRES_DB: ${OPS_POSTGRES_DB:?Set OPS_POSTGRES_DB in .env}
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:?Set SOURCE_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${OPS_POSTGRES_PASSWORD:?Set OPS_POSTGRES_PASSWORD in .env}
+      SOURCE_READER_USER: ${SOURCE_READER_USER:?Set SOURCE_READER_USER in .env}
+      SOURCE_READER_PASSWORD: ${SOURCE_READER_PASSWORD:?Set SOURCE_READER_PASSWORD in .env}
+    volumes:
+      - ops_postgres_data:/var/lib/postgresql/data
+      - ./docker/source-db/init/01-roles.sh:/docker-entrypoint-initdb.d/01-roles.sh:ro
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -subj "/CN=ops-db" -addext "subjectAltName=DNS:ops-db" \
+          -keyout /tmp/server.key -out /tmp/server.crt
+        chmod 600 /tmp/server.key
+        chown postgres:postgres /tmp/server.crt /tmp/server.key
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/tmp/server.crt \
+          -c ssl_key_file=/tmp/server.key
+
+volumes:
+  census_postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_census_postgres_data
+  ops_postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_ops_postgres_data
