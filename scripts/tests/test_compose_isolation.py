@@ -105,6 +105,57 @@ class ComposeIsolationTests(unittest.TestCase):
                     services[service_name].get("environment", {}),
                 )
 
+    def test_demo_source_references_are_only_given_to_config_ui(self) -> None:
+        """The two-source demo overlay must keep the same boundary as the rig.
+
+        It also proves the overlay resolves from .env.example at all: the
+        overlay shipped without its keys in the template, so `docker compose
+        config` failed with "required variable FEDERATION_DBS_CENSUS is
+        missing" and nothing could reach it.
+        """
+        model = resolved_compose(
+            "compose.bundled-db.yaml",
+            "compose.federated-demo.yaml",
+        )
+        services = model["services"]
+        config_environment = services["config-ui"]["environment"]
+
+        for reference in ("FEDERATION_DBS_CENSUS", "FEDERATION_DBS_OPS"):
+            with self.subTest(reference=reference):
+                self.assertIn(reference, config_environment)
+                # A DBS_<REF> would make the source an ordinary workspace
+                # connection, bypassing the federation registry entirely.
+                self.assertNotIn(reference.replace("FEDERATION_", ""),
+                                 config_environment)
+                for service_name in ("xyz", "xyz-preview", "semantic-service"):
+                    self.assertNotIn(
+                        reference,
+                        services[service_name].get("environment", {}),
+                    )
+
+    def test_both_opt_in_overlays_compose_together(self) -> None:
+        """Each overlay forwards only its own references.
+
+        Recreating config-ui with one overlay drops the other's, and verify
+        then fails with "connectionRef is not configured". Naming both is the
+        supported composition, so it is pinned here.
+        """
+        services = resolved_compose(
+            "compose.bundled-db.yaml",
+            "compose.federation-test.yaml",
+            "compose.federated-demo.yaml",
+        )["services"]
+        config_environment = services["config-ui"]["environment"]
+
+        for reference in (
+            "FEDERATION_DBS_LEEDS_EXT",
+            "FEDERATION_DBS_CENSUS",
+            "FEDERATION_DBS_OPS",
+        ):
+            self.assertIn(reference, config_environment)
+        for service_name in ("census-db", "ops-db", "source-db"):
+            self.assertIn(service_name, services)
+
     def test_config_ui_is_the_only_semantic_service_peer(self) -> None:
         semantic_state = str((ROOT / "var/semantic").resolve())
         for mode, model in self.models.items():

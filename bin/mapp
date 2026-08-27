@@ -309,6 +309,8 @@ init_env() {
     -e "s/CHANGEME_FEDERATION/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_SOURCE_POSTGRES/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_SOURCE_READER/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_CENSUS_POSTGRES/$(openssl rand -hex 24)/" \
+    -e "s/CHANGEME_OPS_POSTGRES/$(openssl rand -hex 24)/" \
     -e "s/CHANGEME_SEMANTIC/$(openssl rand -hex 32)/" \
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \
@@ -773,7 +775,18 @@ case "${1:-}" in
       --file "${ROOT_DIR}/compose.yaml" \
       --file "${ROOT_DIR}/compose.bundled-db.yaml" \
       config --quiet
-    printf 'Unit tests, semantic-service tests, and Compose validation for the local-database and external models passed.\n'
+    # The opt-in overlays resolve only when the template carries their own
+    # keys. Shipping an overlay nobody can resolve from .env.example is how
+    # the two-source demo arrived broken, so both are validated here.
+    docker compose \
+      --project-directory "${ROOT_DIR}" \
+      --env-file "${ROOT_DIR}/.env.example" \
+      --file "${ROOT_DIR}/compose.yaml" \
+      --file "${ROOT_DIR}/compose.bundled-db.yaml" \
+      --file "${ROOT_DIR}/compose.federation-test.yaml" \
+      --file "${ROOT_DIR}/compose.federated-demo.yaml" \
+      config --quiet
+    printf 'Unit tests, semantic-service tests, and Compose validation for the local-database, external, and opt-in overlay models passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet
