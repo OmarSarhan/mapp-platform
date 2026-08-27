@@ -54,11 +54,15 @@ fi
 
 # The same guard bin/mapp applies, repeated here because the comment above
 # claims direct invocation is covered and it was not. The compose array below
-# hardcodes compose.bundled-db.yaml, which is the only file injecting
-# FEDERATION_DATABASE_URL and DERIVED_DATABASE_URL into config-ui. Running
-# this against a deployment configured for another mode would recreate the
-# live dashboard with the FDW provisioner and derived-layer DDL surfaces
+# hardcodes compose.bundled-db.yaml, which for a local database is the file
+# injecting FEDERATION_DATABASE_URL and DERIVED_DATABASE_URL into config-ui.
+# Running this against a deployment configured for another mode would recreate
+# the live dashboard with the FDW provisioner and derived-layer DDL surfaces
 # switched on, and leave them on until the next `./bin/mapp serve`.
+#
+# external is refused even when it federates via compose.federation-external.yaml.
+# The rig seeds a source database and provisions against it, and doing that on a
+# host MAPP does not own is not a test to run behind a flag.
 DEPLOYMENT_DATABASE_MODE="$(dotenv_value MAPP_DATABASE_MODE)"
 case "${DEPLOYMENT_DATABASE_MODE}" in
   bundled|federated) ;;
@@ -261,13 +265,12 @@ step "Bringing up the federation source"
 if [[ -n "$("${compose[@]}" ps --quiet source-db 2>/dev/null)" ]]; then
   SOURCE_DB_PREEXISTING=1
 fi
-# config-ui must be named here even when already running: compose only injects
-# FEDERATION_DBS_LEEDS_EXT into the container when the overlay is applied to
-# it, and without that Observe fails with federation.connection_ref_not_found.
-"${compose[@]}" up -d source-db config-ui >/dev/null
-"${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
-
-step "Checking the deployment's other sources survive the recreate"
+step "Checking the deployment's other sources would survive the recreate"
+# Ordered before the `up -d` below, not after it. This reads the running
+# container to learn what it would lose, so running it afterwards would
+# compare a recreated container against itself, find nothing missing, and
+# pass precisely when the loss had already happened.
+#
 # Recreating config-ui with this compose set gives it only the connection
 # references these files forward. On a deployment whose other aliases get their
 # FEDERATION_DBS_<REF> from a different overlay, those references would vanish
@@ -294,6 +297,12 @@ aliases using them. Add the overlay that provides them to this harness, or run
 it on a deployment that does not need it."
   fi
 fi
+
+# config-ui must be named here even when already running: compose only injects
+# FEDERATION_DBS_LEEDS_EXT into the container when the overlay is applied to
+# it, and without that Observe fails with federation.connection_ref_not_found.
+"${compose[@]}" up -d source-db config-ui >/dev/null
+"${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
 
 step "Claiming the probe alias and relation"
 # Both names are ones an operator could legitimately be using, and the cleanup
