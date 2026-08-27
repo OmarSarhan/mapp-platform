@@ -18,6 +18,7 @@ from federation_capability import (
     _database_default_collation_identity,
     detect_capability,
     extension_versions,
+    host_capability,
     verify_remote_state,
 )
 from federation_schema import (
@@ -366,6 +367,16 @@ class FederationAliasStore:
         if not item:
             raise FileNotFoundError(alias)
         return item
+
+    def host_capability(self) -> dict[str, Any]:
+        """Whether the host can still attach sources.
+
+        Every alias observation answers "is that source reachable". Nothing
+        answered "can this database still federate at all", so a capability
+        revoked on the host surfaced only as every source failing at once.
+        """
+        with self._connect() as connection, connection.cursor() as cur:
+            return host_capability(cur, SCHEMA)
 
     def list(self) -> list[dict[str, Any]]:
         """Aliases available for normal use, newest registration state first.

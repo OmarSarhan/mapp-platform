@@ -6411,7 +6411,15 @@ class Handler(SimpleHTTPRequestHandler):
                         status=HTTPStatus.CONFLICT,
                         code="federation.alias_limit_exceeded",
                     )
-                self._json(HTTPStatus.OK, {"aliases": aliases})
+                # Host capability alongside the aliases: every entry above
+                # answers "is that source reachable", and none answers "can
+                # this database still federate". A wrapper grant revoked on
+                # the host makes every alias fail at once with nothing naming
+                # the cause.
+                self._json(HTTPStatus.OK, {
+                    "aliases": aliases,
+                    "host": FEDERATION.host_capability(),
+                })
             except FederationSchemaError as exc:
                 # FederationSchemaError subclasses ValueError, so this must
                 # precede both pagination ValueError and psycopg.Error — e.g. an

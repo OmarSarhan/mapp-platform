@@ -466,6 +466,71 @@ def _physical_identity_from_cursor(
     return f"{system_identifier}/{database_oid}/{','.join(relation_oids)}"
 
 
+def host_capability(cursor: Any, registry_schema: str) -> dict[str, Any]:
+    """Whether this database can act as a federation host.
+
+    Sources are probed by detect_capability over the wire; this is the other
+    half, and it had no runtime equivalent. verify.sh asserted the same facts,
+    but only while the audit was running, so a capability withdrawn between
+    audits was visible solely through its consequences -- every source failing
+    to provision, with nothing naming the cause.
+
+    The registry schema is passed in rather than imported: federation_store
+    imports this module, so taking its SCHEMA constant back would be a
+    circular import.
+
+    All four are properties of the host, not of any alias, and every one can be
+    revoked without touching MAPP: the extension dropped, the wrapper grant
+    removed, CREATE revoked on the database, or the registry schema taken over.
+
+    Guarded rather than direct: has_foreign_data_wrapper_privilege raises
+    undefined_object when postgres_fdw is absent, which is precisely the state
+    this is meant to report rather than crash on. Likewise to_regnamespace
+    yields NULL for a missing registry schema instead of erroring, and NULL is
+    reported as false only because the registry genuinely is unusable then --
+    the distinction is kept in registrySchemaPresent so a caller can tell
+    "absent" from "present but not writable".
+    """
+    cursor.execute("""
+        SELECT
+          EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_extension
+            WHERE extname = 'postgres_fdw'
+          ) AS "fdwInstalled",
+          COALESCE((
+            SELECT has_foreign_data_wrapper_privilege(
+              current_user, wrapper.oid, 'USAGE'
+            )
+            FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+            WHERE wrapper.fdwname = 'postgres_fdw'
+          ), false) AS "canUseFdw",
+          has_database_privilege(
+            current_user, current_database(), 'CREATE'
+          ) AS "canCreateSchemas",
+          (pg_catalog.to_regnamespace(%s) IS NOT NULL)
+            AS "registrySchemaPresent",
+          COALESCE(
+            has_schema_privilege(
+              current_user, pg_catalog.to_regnamespace(%s), 'USAGE,CREATE'
+            ),
+            false
+          ) AS "canUseRegistrySchema",
+          current_database() AS "database",
+          current_user::text AS "role"
+    """, (registry_schema, registry_schema))
+    capability = dict(cursor.fetchone())
+    # A host missing any of the first three cannot attach a source at all.
+    # The registry schema is excluded: provision() creates it on demand, so
+    # its absence is a first-run state rather than a lost capability.
+    capability["federationReady"] = bool(
+        capability["fdwInstalled"]
+        and capability["canUseFdw"]
+        and capability["canCreateSchemas"]
+    )
+    return capability
+
+
 def detect_capability(
     connection_url: str,
     *,

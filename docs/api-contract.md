@@ -551,6 +551,17 @@ credential, which belongs in the environment rather than in an HTTP form. See
 | Route | Capability action ID | Required scope |
 | --- | --- | --- |
 | `GET /api/federation/aliases` | `federation.aliases.list` | `federation:observe` |
+
+The list response carries a `host` object beside `aliases`: `fdwInstalled`,
+`canUseFdw`, `canCreateSchemas`, `registrySchemaPresent`,
+`canUseRegistrySchema`, `database`, `role`, and a `federationReady` summary.
+Each alias entry answers whether that source is reachable; `host` answers
+whether this database can attach a source at all. A wrapper grant revoked on
+the host makes every alias fail at once, and without this nothing names the
+cause. `registrySchemaPresent` is reported but excluded from
+`federationReady`, because provisioning creates the registry schema on demand
+and its absence is a first-run state rather than a lost capability.
+
 | `GET /api/federation/aliases/{alias}` | `federation.aliases.show` | `federation:observe` |
 | `POST /api/federation/aliases` | `federation.aliases.register` | `federation:register` |
 | `POST /api/federation/aliases/{alias}/observe` | `federation.aliases.observe` | `federation:provision` |

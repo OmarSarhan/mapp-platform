@@ -1558,5 +1558,69 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertEqual(HTTPStatus.CONFLICT, raised.exception.status)
         self.assertIn("smoke_control_area_ext_h3_r9", str(raised.exception))
 
+    def test_host_capability_reports_what_the_host_can_still_do(self):
+        """Every alias answers "is that source reachable"; none answers
+        "can this database still federate". A wrapper grant revoked on the
+        host makes every alias fail at once with nothing naming the cause.
+        """
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "fdwInstalled": True,
+            "canUseFdw": True,
+            "canCreateSchemas": True,
+            "registrySchemaPresent": True,
+            "canUseRegistrySchema": True,
+            "database": "mapp",
+            "role": "mapp_federation",
+        }
+        store = self.store_with_cursor(cursor)
+
+        capability = store.host_capability()
+
+        self.assertTrue(capability["federationReady"])
+        statement = " ".join(statements(cursor))
+        self.assertIn("postgres_fdw", statement)
+        self.assertIn("has_foreign_data_wrapper_privilege", statement)
+        self.assertIn("has_database_privilege", statement)
+
+    def test_host_capability_is_not_ready_when_any_requirement_is_missing(self):
+        for missing in ("fdwInstalled", "canUseFdw", "canCreateSchemas"):
+            with self.subTest(missing=missing):
+                cursor = MagicMock()
+                row = {
+                    "fdwInstalled": True,
+                    "canUseFdw": True,
+                    "canCreateSchemas": True,
+                    "registrySchemaPresent": True,
+                    "canUseRegistrySchema": True,
+                    "database": "mapp",
+                    "role": "mapp_federation",
+                }
+                row[missing] = False
+                cursor.fetchone.return_value = row
+
+                capability = self.store_with_cursor(cursor).host_capability()
+
+                self.assertFalse(capability["federationReady"])
+
+    def test_host_capability_ignores_an_absent_registry_schema(self):
+        """provision() creates the registry schema on demand, so its absence
+        is a first-run state rather than a capability the host has lost.
+        """
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {
+            "fdwInstalled": True,
+            "canUseFdw": True,
+            "canCreateSchemas": True,
+            "registrySchemaPresent": False,
+            "canUseRegistrySchema": False,
+            "database": "mapp",
+            "role": "mapp_federation",
+        }
+
+        capability = self.store_with_cursor(cursor).host_capability()
+
+        self.assertTrue(capability["federationReady"])
+
 if __name__ == "__main__":
     unittest.main()
