@@ -233,19 +233,27 @@ DERIVED = (
 )
 
 
-LOCAL_DATABASE_MODES = frozenset({"bundled", "federated"})
-
-
 def federation_enabled(federation_database_url, database_mode) -> bool:
-    """Enable only where a local federation provisioner is installed.
+    """Enable wherever a federation provisioner credential was supplied.
 
-    Both bundled and federated run MAPP's own PostgreSQL and so have the
-    provisioner role; external points at a server MAPP does not administer and
-    must never try to create foreign servers on.
+    The credential is the operator declaring intent, and Compose is what
+    enforces the boundary: only compose.bundled-db.yaml and the opt-in
+    compose.federation-external.yaml forward it to this service, so a default
+    external deployment never receives one and this returns False without
+    needing to inspect the mode.
+
+    The mode is therefore not consulted. It described where the host database
+    ran, which was a good proxy for "MAPP administers it" only while the host
+    was always MAPP's own container. An external host whose operator has
+    provisioned the role and granted USAGE on the wrapper is a federation host;
+    one that has not is refused by PostgreSQL, and host_capability() reports
+    which before anything is attempted.
+
+    database_mode is kept in the signature: callers pass it, and dropping the
+    parameter would silently change every call site rather than failing.
     """
-    return (
-        bool(federation_database_url) and database_mode in LOCAL_DATABASE_MODES
-    )
+    del database_mode
+    return bool(federation_database_url)
 
 
 FEDERATION = (

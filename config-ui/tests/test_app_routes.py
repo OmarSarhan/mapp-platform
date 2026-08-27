@@ -18,22 +18,35 @@ from semantic_sources import parse_exclusions
 
 
 class FederationEnabledTests(unittest.TestCase):
-    def test_requires_both_a_connection_url_and_bundled_mode(self):
+    def test_enabled_by_the_provisioner_credential(self):
         self.assertTrue(app.federation_enabled("postgresql://x", "bundled"))
 
     def test_disabled_without_a_federation_database_url(self):
         self.assertFalse(app.federation_enabled(None, "bundled"))
         self.assertFalse(app.federation_enabled("", "bundled"))
 
-    def test_disabled_outside_bundled_mode(self):
-        # The external handoff (docs/external-postgresql.md) grants
-        # ownership of derived_layers alone — not the federation schema,
-        # postgres_fdw, or the database-level CREATE that provisioning
-        # needs, so an external deployment must never see federation
-        # routes enabled even if it happens to set FEDERATION_DATABASE_URL.
-        self.assertFalse(app.federation_enabled("postgresql://x", "external"))
-        self.assertFalse(app.federation_enabled("postgresql://x", None))
-        self.assertFalse(app.federation_enabled("postgresql://x", ""))
+    def test_an_external_host_federates_when_the_operator_supplies_one(self):
+        # This assertion is the reverse of what it was, deliberately.
+        #
+        # It used to refuse external outright, reasoning that the handoff in
+        # docs/external-postgresql.md grants ownership of derived_layers alone
+        # and not the wrapper USAGE or database CREATE that provisioning needs.
+        # That is still true of the *default* handoff -- but it is a statement
+        # about which grants an operator has run, not about the mode, and an
+        # operator who follows docs/federation-external.md has run them.
+        #
+        # The mode never enforced anything here in any case: the boundary is
+        # Compose, which forwards the credential only from
+        # compose.bundled-db.yaml and the opt-in compose.federation-external.yaml
+        # (test_compose_isolation.py holds that line). A default external
+        # deployment reaches the branch below, not this one.
+        self.assertTrue(app.federation_enabled("postgresql://x", "external"))
+        self.assertTrue(app.federation_enabled("postgresql://x", None))
+
+    def test_an_external_deployment_that_was_not_opted_in_stays_disabled(self):
+        # The realistic external case: no overlay, so no credential.
+        self.assertFalse(app.federation_enabled("", "external"))
+        self.assertFalse(app.federation_enabled(None, "external"))
 
 
 class FederationAliasActionRouteTests(unittest.TestCase):

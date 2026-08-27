@@ -428,6 +428,7 @@ acceptance result.
 - [Semantic metadata control plane](docs/semantic-layer.md)
 - [Managed derived layers](docs/derived-layers.md)
 - [Federated PostgreSQL sources](docs/federation.md)
+- [Federating an external host database](docs/federation-external.md)
 - [External XYZ plugins](docs/external-plugins.md)
 - [Deployment](docs/deployment.md)
 - [External PostgreSQL administrator handoff](docs/external-postgresql.md)

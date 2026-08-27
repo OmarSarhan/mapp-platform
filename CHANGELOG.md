@@ -8,6 +8,22 @@ first release.
 
 ### Added
 
+- Added federation for external host databases. `MAPP_DATABASE_MODE=external`
+  no longer refuses the alias registry outright; a deployment whose operator
+  has provisioned a federation role on the host they administer opts in with
+  `compose.federation-external.yaml`, which `./bin/mapp` and `verify` apply
+  automatically when `FEDERATION_DATABASE_URL` is set. Federation is now gated
+  on that credential rather than on the deployment mode, which never enforced
+  anything: Compose has always been the boundary, and only those two overlays
+  forward it. `docs/federation-external.md` documents the provisioning SQL,
+  the privileges it grants, and the `pg_user_mappings` exposure that attaching
+  a source implies.
+- `./bin/mapp verify` now reports an absent `federation` registry schema as its
+  own failure, naming the `CREATE SCHEMA` statement that fixes it, rather than
+  aborting the audit with `invalid_schema_name`. The bundled database creates
+  the schema at initialisation; an external host is the first place it can
+  legitimately be missing.
+
 - Added federated PostgreSQL source retirement, which archives the schema,
   server and foreign tables under a name no alias can occupy rather than
   dropping them, drops only the user mappings because those are live

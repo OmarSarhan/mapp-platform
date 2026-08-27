@@ -538,8 +538,11 @@ trust boundaries.
 
 ## Federated PostgreSQL sources
 
-Available where `MAPP_DATABASE_MODE` is `bundled` or `federated`; the routes
-return `federation.not_configured` otherwise. The lifecycle is reachable over
+Available wherever a federation provisioner credential reaches the
+configuration service; the routes return `federation.not_configured`
+otherwise. `bundled` and `federated` always have one. `external` has one only
+if its operator provisioned the role and opted in, per
+[federation-external.md](federation-external.md). The lifecycle is reachable over
 HTTP, through `config-cli federation` — advertised in the contract as
 `federation list`, `show`, `register`, `observe`, `provision`, and `retire` —
 and, for everything except registration, through the dashboard's **Federated
@@ -558,9 +561,14 @@ The list response carries a `host` object beside `aliases`: `fdwInstalled`,
 Each alias entry answers whether that source is reachable; `host` answers
 whether this database can attach a source at all. A wrapper grant revoked on
 the host makes every alias fail at once, and without this nothing names the
-cause. `registrySchemaPresent` is reported but excluded from
-`federationReady`, because provisioning creates the registry schema on demand
-and its absence is a first-run state rather than a lost capability.
+cause. `registrySchemaPresent` is reported but excluded from `federationReady`
+because it is a different kind of problem with a different fix: the three
+privileges are grants, whereas the registry schema is a `CREATE SCHEMA`
+statement an administrator runs once. It is created by the role-setup scripts
+on a bundled database and by the administrator on an external one -- **not**
+on demand by provisioning, which creates only the per-alias `source_<alias>`
+schema. `./bin/mapp verify` reports its absence separately, naming the
+statement.
 
 | `GET /api/federation/aliases/{alias}` | `federation.aliases.show` | `federation:observe` |
 | `POST /api/federation/aliases` | `federation.aliases.register` | `federation:register` |

@@ -11,10 +11,30 @@ approved once, verified continuously, and can be withdrawn.
 
 ## Before you start
 
-Federation needs a **local database**, which means
-`MAPP_DATABASE_MODE=bundled` or `federated`. The configuration service
-disables the alias registry entirely under `external`, because MAPP does not
-administer that server and must not create foreign servers on it.
+Federation needs a **host database** with a role that can create foreign
+servers. What decides whether you have one is not the deployment mode but
+whether `FEDERATION_DATABASE_URL` reaches the configuration service; the alias
+registry is enabled if it does and absent if it does not.
+
+That means all three modes can federate, by two different routes:
+
+| Mode | How the host gets a provisioner |
+|---|---|
+| `bundled`, `federated` | Automatically. `compose.bundled-db.yaml` creates the `mapp_federation` role in MAPP's own PostgreSQL and forwards the credential. Nothing to do. |
+| `external` | Only if you provision it yourself, then opt in with `compose.federation-external.yaml`. See **[Federating an external host](federation-external.md)**. |
+
+`external` is opt-in rather than automatic because MAPP does not administer
+that server. The default handoff in [external-postgresql.md](external-postgresql.md)
+grants ownership of `derived_layers` and nothing more — not `USAGE` on
+`postgres_fdw`, not `CREATE` on the database — so a default external
+deployment has no provisioner and the registry stays off. Supplying one is a
+deliberate act by whoever owns that database.
+
+Opting in is safe to get wrong. The overlay hands over a credential; it cannot
+grant privileges on somebody else's server. If the grants were not actually
+run, `GET /api/federation/aliases` reports `host.federationReady: false` and
+names what is missing, and provisioning is refused by PostgreSQL rather than
+half-completed.
 
 `federated` is currently **identical to bundled in every respect**. It exists
 so a deployment can name the intent to attach federated sources before doing
@@ -430,7 +450,7 @@ upgrade-derived` realigns it; `./bin/mapp verify` compares the two.
 
 | Code | Meaning |
 | --- | --- |
-| `federation.not_configured` | Not a local-database mode (`bundled` or `federated`), or no federation database. Permanent for that deployment. |
+| `federation.not_configured` | No `FEDERATION_DATABASE_URL` reached the service, so this deployment has no federation host. Permanent until it is configured — under `external`, see [federation-external.md](federation-external.md). |
 | `federation.invalid_request` | Malformed or unknown properties in the body. |
 | `federation.alias_limit_reached` | Registering would exceed the 100-alias ceiling, retired ones included. |
 | `federation.alias_limit_exceeded` | The registry already holds more aliases than the ceiling allows — only reachable if rows were written directly to the database. |

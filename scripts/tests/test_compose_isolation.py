@@ -57,6 +57,9 @@ class ComposeIsolationTests(unittest.TestCase):
                 "compose.bundled-db.yaml",
                 "compose.production.yaml",
             ),
+            "external-federated": resolved_compose(
+                "compose.federation-external.yaml",
+            ),
         }
 
     def test_semantic_service_remains_private_and_storage_isolated(self) -> None:
@@ -211,7 +214,15 @@ class ComposeIsolationTests(unittest.TestCase):
                     self.assertNotIn("GEMINI_APIKEY", environment, name)
                     self.assertNotIn("GEMINI_MODEL", environment, name)
 
-    def test_federation_provisioner_credential_is_isolated(self) -> None:
+    def test_federation_provisioner_credential_is_opt_in(self) -> None:
+        """External gets no provisioner credential unless asked for one.
+
+        The mode no longer gates federation -- app.federation_enabled() reads
+        the credential alone -- so this is where the default boundary lives
+        now. If compose.yaml ever forwards FEDERATION_DATABASE_URL, every
+        external deployment starts offering to create foreign servers on a
+        database MAPP does not administer, and nothing else would catch it.
+        """
         for mode in ("external", "external-production"):
             with self.subTest(mode=mode):
                 environment = self.models[mode]["services"]["config-ui"].get(
@@ -242,6 +253,53 @@ class ComposeIsolationTests(unittest.TestCase):
                     environment = service.get("environment", {})
                     self.assertNotIn("FEDERATION_DATABASE_URL", environment)
                     self.assertNotIn("FEDERATION_DB_PASSWORD", environment)
+
+        # ...and the opt-in overlay is what reverses it, for external only.
+        # The credential is all that reaches the service: no db service, no
+        # FEDERATION_DB_PASSWORD, because the host is not ours to provision.
+        federated = self.models["external-federated"]["services"]["config-ui"]
+        self.assertEqual(
+            "mapp_federation", federated["environment"]["FEDERATION_DB_USER"]
+        )
+        self.assertIn(
+            "mapp_federation", federated["environment"]["FEDERATION_DATABASE_URL"]
+        )
+        self.assertNotIn("db", self.models["external-federated"]["services"])
+
+    def test_the_federation_overlay_adds_nothing_but_the_credential(self) -> None:
+        """The overlay must not smuggle in a service, port or volume.
+
+        It is the one file that hands a third-party database a role capable of
+        DDL, so its blast radius should be exactly two environment keys. A
+        future edit that also mounted something or opened a port would be a
+        materially different grant wearing the same name.
+        """
+        base = self.models["external"]
+        federated = self.models["external-federated"]
+        self.assertEqual(
+            sorted(base["services"]), sorted(federated["services"])
+        )
+        self.assertEqual(
+            sorted(base.get("volumes") or {}),
+            sorted(federated.get("volumes") or {}),
+        )
+        for name, service in federated["services"].items():
+            with self.subTest(service=name):
+                difference = {
+                    key: value
+                    for key, value in service.get("environment", {}).items()
+                    if base["services"][name].get("environment", {}).get(key)
+                    != value
+                }
+                expected = (
+                    {"FEDERATION_DATABASE_URL", "FEDERATION_DB_USER"}
+                    if name == "config-ui"
+                    else set()
+                )
+                self.assertEqual(expected, set(difference))
+                self.assertEqual(
+                    base["services"][name].get("ports"), service.get("ports")
+                )
 
     def test_browser_egress_is_only_available_through_allowlisting_proxy(self) -> None:
         expected_allowlist = str(

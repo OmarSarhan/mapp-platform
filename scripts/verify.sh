@@ -84,6 +84,14 @@ case "${database_mode}" in
     ;;
   external)
     required_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+    # Mirror bin/mapp: an external host that was given a provisioner role runs
+    # with compose.federation-external.yaml, so the model verified here has to
+    # include it too. Without this the audit below resolves a config-ui with no
+    # FEDERATION_DATABASE_URL and then reports the running service as stale
+    # against its own incomplete model.
+    if [[ -n "$(dotenv_value FEDERATION_DATABASE_URL)" ]]; then
+      compose+=(--file "${ROOT_DIR}/compose.federation-external.yaml")
+    fi
     ;;
   *)
     printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
@@ -2157,8 +2165,20 @@ if federation_database_url:
                     FROM pg_catalog.pg_namespace AS namespace
                     WHERE namespace.nspname = $$federation$$
                   ) AS "ownsFederationSchema",
-                  has_schema_privilege($$federation$$, $$CREATE$$)
-                    AS "canCreateFederation",
+                  -- to_regnamespace yields NULL rather than raising for an
+                  -- absent schema. The bundled database creates federation at
+                  -- init; an external host federating for the first time may
+                  -- legitimately not have it yet, and a bare
+                  -- has_schema_privilege($$federation$$, ...) would abort the
+                  -- whole audit with invalid_schema_name rather than report it.
+                  (pg_catalog.to_regnamespace($$federation$$) IS NOT NULL)
+                    AS "federationSchemaPresent",
+                  COALESCE(
+                    has_schema_privilege(
+                      pg_catalog.to_regnamespace($$federation$$), $$CREATE$$
+                    ),
+                    false
+                  ) AS "canCreateFederation",
                   has_schema_privilege(
                     $$derived_layers$$, $$USAGE,CREATE$$
                   ) AS "hasDerivedSchemaPrivilege",
@@ -2292,6 +2312,16 @@ if federation_database_url:
                 WHERE role.rolname = current_user
             """)
             federation_audit = cursor.fetchone()
+            # Reported separately from the privilege check below because it is
+            # a different instruction: create the schema, not fix a grant.
+            if federation_audit and not federation_audit["federationSchemaPresent"]:
+                fail(
+                    "The federation registry schema does not exist on the "
+                    "host database. The bundled database creates it at init; "
+                    "an external host needs an administrator to run "
+                    "CREATE SCHEMA federation AUTHORIZATION <FEDERATION_DB_USER>. "
+                    "See docs/federation-external.md."
+                )
             # Same invariant as the derived owner above, for the same reason.
             if (
                 not federation_audit

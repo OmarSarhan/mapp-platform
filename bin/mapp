@@ -394,6 +394,15 @@ case "${database_mode}" in
     ;;
   external)
     runtime_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+    # An external host federates only if its operator provisioned a role for
+    # it, and setting FEDERATION_DATABASE_URL is how they say so. Without this
+    # the overlay would have to be passed by hand on every invocation, and the
+    # first `mapp serve` after a working setup would quietly recreate config-ui
+    # without the credential -- federation would vanish with no error, which is
+    # the worst of the available failures. See docs/federation-external.md.
+    if [[ -n "$(dotenv_value FEDERATION_DATABASE_URL)" ]]; then
+      compose+=(--file "${ROOT_DIR}/compose.federation-external.yaml")
+    fi
     ;;
   *)
     printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
