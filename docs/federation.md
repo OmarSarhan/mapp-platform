@@ -301,6 +301,44 @@ The rig deliberately uses plain `postgis/postgis`, not MAPP's own H3 image — a
 genuinely third-party source would not have MAPP's extensions installed, and
 pretending otherwise would hide real incompatibilities.
 
+## The two-source demo
+
+A worked example of the arrangement this document describes: census data in one
+database, the operational layers in another, both reached over `postgres_fdw`,
+and MAPP's own database holding only derived output, the registry and the
+`source_<alias>` foreign tables.
+
+```bash
+./bin/mapp init          # writes .env, including the demo keys and secrets
+./bin/mapp all           # bundled stack plus sample data
+
+docker compose --project-directory . --env-file .env \
+  --file compose.yaml --file compose.bundled-db.yaml \
+  --file compose.federated-demo.yaml up -d census-db ops-db config-ui
+
+./docker/demo-sources/seed.sh     # copy sample data into the two sources
+./docker/demo-sources/layers.sh   # register, observe, profile, provision, publish
+./bin/mapp verify
+```
+
+`seed.sh` copies rather than moves, so the bundled schema stays intact and the
+whole arrangement reverses by dropping the `census_postgres_data` and
+`ops_postgres_data` volumes.
+
+`layers.sh` is idempotent: every step tolerates its own prior success, so a
+partial run can be repeated rather than unpicked. It mints a short-lived
+scoped token, does the work, and revokes it on exit even if a step fails.
+
+The derived layers it builds read `source_census.*` and `source_ops.*` rather
+than any local schema, and reproduce the equivalent local computation exactly
+— 18,251 H3 cells and 1,951,531 people for the census layer, 3,453 cells and
+297,881,600 m² for smoke control. That equality is the point: the same answer,
+from two separate database servers.
+
+If the federation-test rig is also registered, name both overlays when
+recreating `config-ui`, since each forwards only its own
+`FEDERATION_DBS_<REF>`.
+
 ## Semantics are a second decision
 
 Registering an alias exposes its relations. It does **not** permit their column

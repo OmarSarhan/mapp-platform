@@ -1,0 +1,166 @@
+{
+  "Fed_census_population_h3_r9": {
+    "name": "Population \u2014 from census-db",
+    "display": true,
+    "format": "mvt",
+    "table": "derived_layers.fed_census_population_h3_r9",
+    "geom": "geom_3857",
+    "srid": "3857",
+    "qID": "h3_id",
+    "zIndex": 40,
+    "group": "Federated: census-db",
+    "infoj": [
+      {
+        "type": "numeric",
+        "field": "population_total",
+        "label": "Usual residents"
+      },
+      {
+        "type": "numeric",
+        "field": "households_no_car",
+        "label": "Households, no car"
+      },
+      {
+        "type": "numeric",
+        "field": "deprived_four_dimensions",
+        "label": "Deprived in 4 dimensions"
+      },
+      {
+        "type": "text",
+        "field": "h3_id",
+        "label": "H3 cell"
+      }
+    ],
+    "style": {
+      "default": {
+        "fillColor": "#eff3ff",
+        "fillOpacity": 0.75,
+        "strokeColor": "#08306b",
+        "strokeOpacity": 0.25,
+        "strokeWidth": 0.4
+      },
+      "theme": {
+        "type": "graduated",
+        "title": "Usual residents per H3 r9 cell",
+        "field": "population_total",
+        "graduated_breaks": "less_than",
+        "categories": [
+          {
+            "value": 5,
+            "label": "Under 5",
+            "style": {
+              "fillColor": "#eff3ff"
+            }
+          },
+          {
+            "value": 25,
+            "label": "5 to 25",
+            "style": {
+              "fillColor": "#c6dbef"
+            }
+          },
+          {
+            "value": 100,
+            "label": "25 to 100",
+            "style": {
+              "fillColor": "#9ecae1"
+            }
+          },
+          {
+            "value": 250,
+            "label": "100 to 250",
+            "style": {
+              "fillColor": "#6baed6"
+            }
+          },
+          {
+            "value": 500,
+            "label": "250 to 500",
+            "style": {
+              "fillColor": "#3182bd"
+            }
+          },
+          {
+            "value": 2300,
+            "label": "500 or more",
+            "style": {
+              "fillColor": "#08519c"
+            }
+          }
+        ]
+      },
+      "elements": [
+        "theme",
+        "hover",
+        "opacitySlider"
+      ],
+      "opacitySlider": true,
+      "hover": {
+        "display": true,
+        "field": "population_total",
+        "title": "Usual residents (census-db)"
+      }
+    }
+  },
+  "Fed_smoke_control_h3_r9": {
+    "name": "Smoke control \u2014 from ops-db",
+    "display": true,
+    "format": "mvt",
+    "table": "derived_layers.fed_smoke_control_h3_r9",
+    "geom": "geom_3857",
+    "srid": "3857",
+    "qID": "h3_id",
+    "zIndex": 41,
+    "group": "Federated: ops-db",
+    "infoj": [
+      {
+        "type": "numeric",
+        "field": "smoke_control_area_m2",
+        "label": "Smoke control area (m2)"
+      },
+      {
+        "type": "text",
+        "field": "h3_id",
+        "label": "H3 cell"
+      }
+    ],
+    "style": {
+      "default": {
+        "fillColor": "#1b7837",
+        "fillOpacity": 0.4,
+        "strokeColor": "#00441b",
+        "strokeOpacity": 1,
+        "strokeWidth": 1.2,
+        "lineDash": [
+          4,
+          3
+        ]
+      },
+      "theme": {
+        "type": "basic",
+        "label": "Smoke control (ops-db, via postgres_fdw)",
+        "style": {
+          "fillColor": "#1b7837",
+          "fillOpacity": 0.4,
+          "strokeColor": "#00441b",
+          "strokeWidth": 1.2,
+          "lineDash": [
+            4,
+            3
+          ]
+        }
+      },
+      "elements": [
+        "theme",
+        "hover",
+        "opacitySlider"
+      ],
+      "opacitySlider": true,
+      "hover": {
+        "display": true,
+        "field": "smoke_control_area_m2",
+        "title": "Smoke control area (ops-db)"
+      }
+    }
+  }
+}
