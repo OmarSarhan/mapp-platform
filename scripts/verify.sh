@@ -2228,6 +2228,16 @@ if federation_database_url:
                         ELSE false
                       END
                   ) AS "hasBaseObjectPrivilege",
+                  (
+                    SELECT pg_catalog.count(*)
+                    FROM pg_catalog.pg_class AS probed
+                    JOIN pg_catalog.pg_namespace AS probed_namespace
+                      ON probed_namespace.oid = probed.relnamespace
+                    WHERE probed_namespace.nspname = $$leeds$$
+                      AND probed.relkind IN (
+                        $$r$$, $$p$$, $$v$$, $$m$$, $$f$$, $$S$$
+                      )
+                  ) AS "baseRelationsProbed",
                   EXISTS (
                     SELECT 1
                     FROM pg_catalog.pg_class AS relation
@@ -2317,6 +2327,21 @@ if federation_database_url:
                 fail(
                     "FEDERATION_DATABASE_URL is not the required isolated "
                     "FDW provisioner."
+                )
+
+            # hasBaseSchemaPrivilege and hasBaseObjectPrivilege both report
+            # "no privilege" when there is nothing to look at:
+            # to_regnamespace yields NULL for an absent schema and the
+            # COALESCE reads that as false, while the EXISTS is empty for a
+            # schema holding no relations. So the two assertions above pass
+            # most confidently exactly when the base data has gone. Confirm
+            # they examined something before believing them.
+            if federation_audit["baseRelationsProbed"] == 0:
+                fail(
+                    "The federation provisioner base-data isolation check "
+                    "examined no relations, so it proves nothing. Expected "
+                    "relations in the base schema audited by "
+                    "hasBaseSchemaPrivilege and hasBaseObjectPrivilege."
                 )
 
             cursor.execute("""

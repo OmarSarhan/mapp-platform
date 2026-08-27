@@ -907,6 +907,33 @@ class DatabaseAccessContractTests(unittest.TestCase):
 
         self.assertEqual(offenders, [])
 
+    def test_federation_base_isolation_cannot_pass_vacuously(self) -> None:
+        """Both base-data assertions read "no privilege" when nothing exists.
+
+        to_regnamespace returns NULL for an absent schema, has_schema_privilege
+        then returns NULL, and the COALESCE reads that as false. The companion
+        EXISTS is empty for a schema holding no relations. So the pair passes
+        most confidently exactly when the base data has gone -- which is the
+        state a host/sources migration produces. The counter proves the probe
+        examined something before its verdict is believed.
+        """
+        source = self.normalized("scripts/verify.sh")
+
+        self.assertIn('AS "baseRelationsProbed"', source)
+        self.assertIn(
+            'federation_audit["baseRelationsProbed"] == 0', source
+        )
+        self.assertIn("examined no relations, so it proves nothing", source)
+
+        # The counter must not share the verdict of the assertions it guards:
+        # an empty probe is "this proved nothing", not "the role has excess
+        # privilege", and the two want different messages.
+        privilege_failure = source.index(
+            "FEDERATION_DATABASE_URL is not the required isolated"
+        )
+        vacuity_failure = source.index("examined no relations")
+        self.assertLess(privilege_failure, vacuity_failure)
+
     def test_external_handoff_revokes_public_database_defaults(self) -> None:
         source = (
             ROOT / "docs/external-postgresql.md"
