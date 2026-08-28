@@ -58,6 +58,12 @@ seed_one() {
 
   printf 'Seeding %s with %d table(s)...\n' "${service}" "${#tables[@]}"
 
+  # The source containers install openssl and generate a certificate before
+  # postgres starts, and their healthcheck is a socket-local pg_isready that
+  # can report healthy while docker-entrypoint-initdb.d is still running. Wait
+  # for the server itself rather than for the container.
+  "${compose[@]}" exec -T "${service}" sh -c 'until pg_isready -q; do sleep 1; done'
+
   "${compose[@]}" exec -T "${service}" psql \
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
     --command "CREATE SCHEMA IF NOT EXISTS leeds;" >/dev/null

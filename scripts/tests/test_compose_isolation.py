@@ -276,6 +276,24 @@ class ComposeIsolationTests(unittest.TestCase):
                 self.assertIn("compose.federated-demo.yaml", block)
                 self.assertIn("census-db ops-db", block)
 
+    def test_the_demo_provisions_before_it_profiles(self) -> None:
+        """Profiling reads foreign tables that provisioning creates.
+
+        layers.sh had these the other way round, which could never have worked:
+        source_<alias> does not exist until provision() creates it, and
+        provision() is also what grants the consumer roles access to it. Every
+        call in that script swallowed its errors, so the step failed silently on
+        every run and the script still reported success.
+        """
+        source = (ROOT / "docker/demo-sources/layers.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertLess(
+            source.index('step "Provisioning'),
+            source.index('step "Profiling'),
+        )
+
     def test_browser_egress_is_only_available_through_allowlisting_proxy(self) -> None:
         expected_allowlist = str(
             (ROOT / "instance/browser-egress-allowlist.txt").resolve()

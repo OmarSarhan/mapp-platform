@@ -78,11 +78,11 @@ PY
 api() { # method path [json-body]
   local method="$1" path="$2" body="${3:-}"
   if [ -n "${body}" ]; then
-    curl -sS -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
       --data-binary "${body}" "${BASE}${path}"
   else
-    curl -sS -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" "${BASE}${path}"
   fi
 }
@@ -98,8 +98,11 @@ step() { printf '\n== %s\n' "$*"; }
 # ---------------------------------------------------------------- register --
 step "Registering the two demo sources"
 register() { # alias display connectionRef relations-json classification
-  local existing
-  existing="$(api GET "/api/federation/aliases/$1" | jqp "print((d.get('alias') or {}).get('status') or d.get('code'))")"
+  local existing probe
+  # The only call whose failure is the expected answer: an unregistered alias
+  # is a 404 carrying federation.alias_not_found, which is what we are asking.
+  probe="$(api GET "/api/federation/aliases/$1" || true)"
+  existing="$(printf '%s' "${probe}" | jqp "print((d.get('alias') or {}).get('status') or d.get('code'))")"
   if [ "${existing}" != "federation.alias_not_found" ]; then
     printf '  %-8s already registered (%s)\n' "$1" "${existing}"
     return 0
@@ -129,11 +132,31 @@ for alias in census ops; do
     | jqp "a=d.get('alias') or {}; o=a.get('lastObservation') or {}; print(f\"  ${alias}: {d.get('code') or o.get('connectivity')} obs={a.get('lastObservationId')}\")"
 done
 
+# --------------------------------------------------------------- provision --
+step "Provisioning (the only step that serves data)"
+for alias in census ops; do
+  observation="$(api GET "/api/federation/aliases/${alias}" | jqp "print((d.get('alias') or {}).get('lastObservationId'))")"
+  # seed.sh replaces the source relations by design (pg_dump --clean), so on
+  # any rebuild the physical identity and the schema fingerprint have both
+  # moved and provisioning refuses without an explicit acknowledgement. That
+  # refusal is correct -- it is the guard against a source being silently
+  # repointed at a different database -- and running this script IS the
+  # operator saying "rebuild the demo". It is acknowledged here and nowhere
+  # else.
+  api POST "/api/federation/aliases/${alias}/provision" \
+    "{\"expectedObservationId\": ${observation}, \
+      \"physicalRebindAcknowledged\": true, \
+      \"schemaChangeAcknowledged\": true}" \
+    | jqp "print(f\"  ${alias}: {d.get('code') or (d.get('alias') or {}).get('status')}\")"
+done
+
 # ---------------------------------------------------------------- semantic --
-# A derived layer cannot be created from a relation with no ready profile, and
-# registering an alias does not grant that. SEMANTIC_SOURCE_ALLOWLIST must
-# already name source_census.* and source_ops.* -- .env.example ships with
-# them, so a fresh ./bin/mapp init needs no edit here.
+# Must follow provisioning, not precede it. Profiling reads the source_<alias>
+# foreign tables, and provision() is what creates them and grants the consumer
+# roles access -- so before it there is nothing to profile, and re-seeding an
+# already-provisioned source withdraws that access until it is provisioned
+# again. SEMANTIC_SOURCE_ALLOWLIST must already name source_census.* and
+# source_ops.*; .env.example ships with them.
 step "Profiling the exposed relations"
 sync_one() {
   api POST /api/semantic/source/sync \
@@ -146,20 +169,11 @@ for relation in bus_stops definitive_paths smoke_control_orders planning_applica
   sync_one source_ops "${relation}"
 done
 
-# --------------------------------------------------------------- provision --
-step "Provisioning (the only step that serves data)"
-for alias in census ops; do
-  observation="$(api GET "/api/federation/aliases/${alias}" | jqp "print((d.get('alias') or {}).get('lastObservationId'))")"
-  api POST "/api/federation/aliases/${alias}/provision" \
-    "{\"expectedObservationId\": ${observation}}" \
-    | jqp "print(f\"  ${alias}: {d.get('code') or (d.get('alias') or {}).get('status')}\")"
-done
-
 # ----------------------------------------------------------------- derived --
 step "Building derived layers from the federated relations"
 for recipe in "${RECIPES}"/*.json; do
   name="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "${recipe}")"
-  if api GET "/api/derived-layers/${name}" | grep -q '"derivedLayer"'; then
+  if api GET "/api/derived-layers/${name}" 2>/dev/null | grep -q '"derivedLayer"'; then
     printf '  %-32s already exists\n' "${name}"
     continue
   fi

@@ -66,14 +66,26 @@ compose=(
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
 required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
-# The demo databases join every subcommand once the key is set, so down, ps and
-# logs keep working on a demo install. Deliberately NOT added to the exported-
-# value conflict guard that MAPP_ENVIRONMENT uses: no compose file interpolates
-# MAPP_DEMO_SOURCES, so an exported value cannot reach the resolved model.
+# An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
+# an alias using them could be registered, or recreating config-ui silently
+# strips the reference and the periodic verifier withdraws that source. One
+# rule, applied to both opt-in overlays.
+#
+# The demo overlay also starts its two databases, because turning the demo on
+# means running it. The federation-test rig does not: its source-db is started
+# by ./bin/mapp federation-test alone, so this only carries its reference
+# through to config-ui.
+#
+# Deliberately NOT added to the exported-value conflict guard that
+# MAPP_ENVIRONMENT uses: no compose file interpolates MAPP_DEMO_SOURCES, so an
+# exported value cannot reach the resolved model.
 demo_sources="$(dotenv_value MAPP_DEMO_SOURCES)"
 if [[ -n "${demo_sources}" ]]; then
   compose+=(--file "${ROOT_DIR}/compose.federated-demo.yaml")
   required_services+=(census-db ops-db)
+fi
+if [[ -n "$(dotenv_value FEDERATION_DBS_LEEDS_EXT)" ]]; then
+  compose+=(--file "${ROOT_DIR}/compose.federation-test.yaml")
 fi
 deployment_environment="$(dotenv_value MAPP_ENVIRONMENT)"
 if [[ -v MAPP_ENVIRONMENT && "${MAPP_ENVIRONMENT}" != "${deployment_environment}" ]]; then
