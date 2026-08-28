@@ -4157,6 +4157,39 @@ class SemanticDerivedIntegrationTests(unittest.TestCase):
                 app.archive_derived_semantics_before_reset(reset_owner)
         derived.queue_semantic_archives.assert_not_called()
 
+    def test_reset_proceeds_past_a_profile_that_cannot_be_repaired(self):
+        """A repair_required profile with no event is terminal, not transient.
+
+        repair_semantic_profile() refuses a layer with no repair_required
+        event, and recover_reset_semantic_profiles() does not select one, so
+        nothing can move the status. Waiting for it to reach ready spends the
+        whole preflight budget and then fails reset-data -- permanently, since
+        the next run finds the same state. The archive queued here is what
+        clears it: an asset the catalogue no longer holds answers 404, which
+        semantic_archive_already_absent() records as delivered.
+        """
+        reset_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
+        derived = self.derived("ready")
+        derived.semantic_outbox_blockers.return_value = []
+        stuck = {"name": "definitive_paths_h3_r9", "status": "repair_required"}
+        archived = {**stuck, "status": "archived", "revision": "12"}
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "SEMANTIC", Mock()
+        ), patch.object(app, "drain_semantic_outbox"), patch.object(
+            app,
+            "derived_semantic_profiles",
+            side_effect=[[stuck], [archived]],
+        ):
+            result = app.archive_derived_semantics_before_reset(
+                reset_owner,
+                timeout_seconds=0,
+            )
+
+        derived.queue_semantic_archives.assert_called_once_with(
+            "system:reset-data"
+        )
+        self.assertEqual(1, result["archived"])
+
     def test_explicit_force_recovery_rebinds_interrupted_reset_profiles(self):
         derived = Mock()
         derived.recover_reset_semantic_profiles.return_value = {

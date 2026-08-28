@@ -3982,9 +3982,6 @@ class DerivedLayerStore:
                         **profile,
                     })
                     continue
-                if profile["status"] == "repair_required":
-                    queued.append({"name": name, **profile})
-                    continue
                 if profile["status"] == "pending_archive":
                     queued.append({"name": name, **profile})
                     continue

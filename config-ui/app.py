@@ -1487,9 +1487,21 @@ def archive_derived_semantics_before_reset(
                 "Semantic reset preflight found repair_required events for: "
                 + ", ".join(repairs)
             )
+        # A profile in repair_required has no route to ready. The operator
+        # route out, repair_semantic_profile(), works from the outbox event,
+        # and a profile can be left in this state with no event at all -- a
+        # recovery pass rebinds the definition to a fresh asset id, and any
+        # later failure that does not enqueue leaves the status behind with
+        # nothing to retry. Waiting is then a guaranteed timeout on the one
+        # command whose job is to destroy what it is waiting for. The archive
+        # stage queues these like any other profile; where the catalogue no
+        # longer holds the asset the archive 404s and
+        # semantic_archive_already_absent() absorbs it. A repair_required
+        # *event* still refuses above: that one is retryable, so the operator
+        # has somewhere to go.
         nonready = [
             profile for profile in profiles
-            if profile["status"] != "ready"
+            if profile["status"] not in ("ready", "repair_required")
         ]
         if not blockers and not nonready:
             break

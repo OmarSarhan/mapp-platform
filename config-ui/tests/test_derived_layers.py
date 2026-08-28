@@ -3443,6 +3443,49 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertNotIn("DROP VIEW", statements)
         self.assertNotIn("DROP MATERIALIZED VIEW", statements)
 
+    def test_reset_archives_a_profile_left_in_repair_required(self):
+        """The archive is what unsticks it, so it must be queued, not skipped.
+
+        Skipping left the profile in repair_required, which the second
+        preflight loop then waited on until it timed out.
+        """
+        asset_id = "9cdd129c-2399-44c3-829d-2c5bab2c0d6c"
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{"name": "definitive_paths_h3_r9"}]
+        cursor.fetchone.return_value = None
+        store = self.store_with_cursor(cursor)
+        stuck = {
+            "name": "definitive_paths_h3_r9",
+            "semanticProfile": {
+                "assetId": asset_id,
+                "generation": 1,
+                "status": "repair_required",
+                "revision": None,
+            },
+        }
+        pending = {
+            **stuck,
+            "semanticProfile": {
+                **stuck["semanticProfile"],
+                "generation": 2,
+                "status": "pending_archive",
+            },
+        }
+        store.get_in_transaction = MagicMock(side_effect=[stuck, pending])
+        store._semantic_fields = MagicMock(return_value=[])
+        store._enqueue_semantic_event = MagicMock()
+
+        profiles = store.queue_semantic_archives("system:reset-data")
+
+        self.assertEqual("pending_archive", profiles[0]["status"])
+        store._enqueue_semantic_event.assert_called_once_with(
+            cursor,
+            pending,
+            "archive",
+            "system:reset-data",
+            [],
+        )
+
     def test_reset_gate_is_durable_and_serializes_reset_attempts(self):
         reset_owner = "289d495d-6642-4525-8a63-bb5e4f0c764c"
         cursor = MagicMock()
