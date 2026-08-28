@@ -104,7 +104,11 @@ register() { # alias display connectionRef relations-json classification
   local existing probe
   # The only call whose failure is the expected answer: an unregistered alias
   # is a 404 carrying federation.alias_not_found, which is what we are asking.
-  probe="$(api GET "/api/federation/aliases/$1" || true)"
+  # curl announces that 404 on stderr, and on a first run -- where every alias
+  # is unregistered -- that is the first thing the operator sees, so silence
+  # it here and read the answer from the body. A curl that fails for any other
+  # reason still stops the script, at the jqp below, on an empty body.
+  probe="$(api GET "/api/federation/aliases/$1" 2>/dev/null || true)"
   existing="$(printf '%s' "${probe}" | jqp "print((d.get('alias') or {}).get('status') or d.get('code'))")"
   if [ "${existing}" != "federation.alias_not_found" ]; then
     printf '  %-8s already registered (%s)\n' "$1" "${existing}"
