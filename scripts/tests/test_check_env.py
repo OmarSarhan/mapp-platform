@@ -52,11 +52,13 @@ class CheckEnvironmentTests(unittest.TestCase):
             self.assertEqual(len(assignments["PASSWORD"]), 48)
             self.assertNotIn("CHANGEME", assignments["PASSWORD"])
 
-    def test_bundled_start_reports_missing_federation_settings_before_docker(self):
+    def test_start_reports_missing_federation_settings_before_docker(self):
+        # An empty env file: every deployment needs the federation settings
+        # now, so there is no mode to opt into the requirement.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             environment = root / ".env"
-            environment.write_text("MAPP_DATABASE_MODE=bundled\n", encoding="utf-8")
+            environment.write_text("", encoding="utf-8")
             docker_marker = root / "docker-invoked"
             docker = root / "docker"
             docker.write_text(

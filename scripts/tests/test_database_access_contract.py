@@ -876,6 +876,40 @@ class DatabaseAccessContractTests(unittest.TestCase):
 
         compile(source[start:end], "verify-derived-session", "exec")
 
+    def test_the_database_mode_axis_is_gone(self) -> None:
+        """No file may reason about which database a deployment runs.
+
+        The MAPP database is packaged in every deployment, so there is nothing
+        left to branch on. This asserts absence over a named file list rather
+        than matching a syntax, because the syntax it would have matched no
+        longer exists anywhere -- a pattern-based check would pass by finding
+        nothing rather than by the property holding.
+
+        It is the only mechanism in either repository that can catch a missed
+        has_bundled_database call site. An undefined function inside an "if !"
+        condition is not fatal under set -euo pipefail: bash returns 127, the
+        negation inverts it, and the caller proceeds as though the check had
+        passed. bin/mapp:455 guarded the database upgrade that way, so a missed
+        site there would make every serve and up skip the upgrade and exit 0.
+
+        The list grows as each remaining file is cleared.
+        """
+        offenders = []
+        for relative_path in (
+            "bin/mapp",
+            "scripts/production_acceptance.py",
+        ):
+            lines = (ROOT / relative_path).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            for index, line in enumerate(lines):
+                if "MAPP_DATABASE_MODE" in line or "has_bundled_database" in line:
+                    offenders.append(
+                        f"{relative_path}:{index + 1}:{line.strip()}"
+                    )
+
+        self.assertEqual(offenders, [])
+
     def test_every_bundled_mode_comparison_admits_federated(self) -> None:
         """Both local-database modes must be widened together.
 
