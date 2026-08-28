@@ -16,7 +16,7 @@ usage() {
     "Usage: ./bin/mapp <command>" \
     "" \
     "  init         create a private .env from .env.example" \
-    "  up [--force-recreate] build/start the configured database mode and platform services" \
+    "  up [--force-recreate] build/start the database and platform services" \
     "  serve [--force-recreate] start platform services without running bundled ETL" \
     "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
     "  config-ui    build/start the workspace configuration dashboard" \
@@ -24,12 +24,12 @@ usage() {
     "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  load sample and Census data in a local-database mode" \
+    "  etl [layer]  load sample and Census data" \
     "  census-etl   load the reviewed England Census 2021 OA dataset" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-data --confirm remove the bundled database and reload configured ETL data" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
-    "  all          start a local-database mode, load bundled ETL data, then verify it" \
+    "  all          start the platform, load bundled ETL data, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
     "  production-acceptance [options] collect redacted production readiness evidence" \
@@ -710,7 +710,7 @@ case "${1:-}" in
       --file "${ROOT_DIR}/compose.federation-test.yaml" \
       --file "${ROOT_DIR}/compose.federated-demo.yaml" \
       config --quiet
-    printf 'Unit tests, semantic-service tests, and Compose validation for the local-database, external, and opt-in overlay models passed.\n'
+    printf 'Unit tests, semantic-service tests, and Compose validation for the base, packaged-database, and opt-in overlay models passed.\n'
     ;;
   config)
     "${compose[@]}" config --quiet
