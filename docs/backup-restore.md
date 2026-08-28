@@ -22,8 +22,7 @@ access, and record checksums and retention dates.
 
 ## Database backup
 
-The command below applies to the local-database modes,
-`MAPP_DATABASE_MODE=bundled` and `federated`:
+The command below backs up the packaged database:
 
 Before an image, schema, state-boundary, or PostgreSQL change:
 
@@ -38,11 +37,10 @@ docker compose --env-file .env -f compose.yaml \
 Use the actual configured database and administrator names when they differ.
 Protect the dump as sensitive data.
 
-For `MAPP_DATABASE_MODE=external`, do not use the platform's local `db`
-command or volume. Back up and restore the database through the external
-service's approved tooling, retention policy, and recovery process. Coordinate
-database and platform-state recovery points so the restored workspace still
-matches the restored schemas and relations.
+Federated source databases are backed up by whoever operates them, through
+their own approved tooling, retention policy, and recovery process. Coordinate
+those recovery points with this one so the restored workspace still matches the
+restored schemas and relations.
 
 A filesystem copy of a running PostgreSQL volume is not automatically
 consistent. Prefer `pg_dump`, a database-aware snapshot, or a documented

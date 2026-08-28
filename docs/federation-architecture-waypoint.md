@@ -1,5 +1,15 @@
 # Federation architecture waypoint
 
+> **Superseded, retained as the record of how the design was reached.**
+> This document argued for a `federated` value of `MAPP_DATABASE_MODE` and a
+> phased cutover to a dedicated federation database. Neither happened. The key
+> was deleted instead: MAPP packages one database that holds the derived
+> layers, the federation registry and the control plane, and every spatial
+> source is external and reached over `postgres_fdw`. Federation is a
+> capability of that packaged host, not a deployment topology. References to
+> the mode below describe the plan as it stood, not the system as it is.
+
+
 ## Status and purpose
 
 This document is a north-star architecture and development handoff. It is not

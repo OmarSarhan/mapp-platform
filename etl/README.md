@@ -2,9 +2,7 @@
 
 This is a deliberately small, one-shot sample-data loader for three public
 Leeds layers. It is not required by the MAPP runtime and does not mirror the
-whole `Public` folder. The supported wrapper enables it only in the
-local-database modes, `MAPP_DATABASE_MODE=bundled` and `federated`; an
-external PostGIS deployment is expected to manage its own data. The
+whole `Public` folder. Federated source databases are expected to manage their own data. The
 runtime image contains the code and a baked example manifest; deployment
 uses `/config/layers.json`, mounted from `instance/etl/layers.json` on the
 host.

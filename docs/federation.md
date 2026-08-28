@@ -12,60 +12,21 @@ approved once, verified continuously, and can be withdrawn.
 ## Before you start
 
 Federation needs a **host database** with a role that can create foreign
-servers. What decides whether you have one is not the deployment mode but
-whether `FEDERATION_DATABASE_URL` reaches the configuration service; the alias
-registry is enabled if it does and absent if it does not.
+servers. MAPP packages that database and provisions that role, so there is
+nothing to configure: `compose.bundled-db.yaml` creates `mapp_federation` and
+forwards `FEDERATION_DATABASE_URL` to the configuration service, and the alias
+registry is available in every deployment.
 
-That means all three modes can federate, by two different routes:
+The credential is required rather than optional. `verify` exits 2 without it,
+even with no aliases registered, because the registry schema and the audit that
+proves the provisioner is properly isolated both depend on it. An empty
+registry is a fully supported steady state — the alias audit is a loop over
+provisioned aliases, so zero aliases satisfies it trivially.
 
-| Mode | How the host gets a provisioner |
-|---|---|
-| `bundled`, `federated` | Automatically. `compose.bundled-db.yaml` creates the `mapp_federation` role in MAPP's own PostgreSQL and forwards the credential. Nothing to do. |
-| every deployment | Automatically. `compose.bundled-db.yaml` creates the `mapp_federation` role in the packaged PostgreSQL and forwards the credential. Nothing to do. |
-
-`external` is opt-in rather than automatic because MAPP does not administer
-that server. The default handoff in [external-postgresql.md](external-postgresql.md)
-grants ownership of `derived_layers` and nothing more — not `USAGE` on
-`postgres_fdw`, not `CREATE` on the database — so a default external
-deployment has no provisioner and the registry stays off. Supplying one is a
-deliberate act by whoever owns that database.
-
-Opting in is safe to get wrong. The overlay hands over a credential; it cannot
-grant privileges on somebody else's server. If the grants were not actually
-run, `GET /api/federation/aliases` reports `host.federationReady: false` and
-names what is missing, and provisioning is refused by PostgreSQL rather than
-half-completed.
-
-`federated` is currently **identical to bundled in every respect**. It exists
-so a deployment can name the intent to attach federated sources before doing
-so; it will grow its own behaviour only when it needs different behaviour.
-
-Switching mode is one line, and a `federated` deployment with **no registered
-aliases** is a fully supported steady state, not a half-migrated one:
-
-```bash
-sed -i 's/^MAPP_DATABASE_MODE=bundled$/MAPP_DATABASE_MODE=federated/' .env
-./bin/mapp up
-./bin/mapp verify
-```
-
-Both modes resolve the same Compose files and the same service list, so
-`docker compose config` differs only in the mode value itself, and `verify`
-produces the same output. Note that zero aliases does not mean zero
-configuration: any local database still requires `FEDERATION_DATABASE_URL`
-and `FEDERATION_DB_USER`, and `verify` exits 2 without them. The alias audit
-itself is a loop over provisioned aliases, so an empty registry satisfies it
-trivially. This equivalence is what makes the mode safe to
-adopt before any source exists — you are not committing to a migration by
-naming it. `./bin/mapp federation-test` runs under either mode.
-
-The equivalence is pinned by a test rather than left to habit
-(`test_every_bundled_mode_comparison_admits_federated` in
-`scripts/tests/test_database_access_contract.py`): any comparison against the
-literal `bundled` mode must name `federated` alongside it. Widening the shell
-and Python guards while missing one inside an embedded script is exactly how
-the runtime-reader probes were once skipped under `federated`, leaving a
-reader that could not serve the sample tables passing `verify`.
+Every source is external by definition. MAPP administers only its own database;
+the servers it attaches belong to somebody else, and the only identity it holds
+on them is a read-only reader. Nothing you do here grants MAPP write access to
+a source.
 
 The lifecycle is split deliberately, along the line where a **secret** enters
 the system. Registration introduces a credential, so it belongs in the
@@ -312,8 +273,8 @@ against the same computation run locally, a replaced-database refusal, semantic
 degradation and recovery, retirement, archival, and the privilege audit. It is
 repeatable and cleans up after itself.
 
-It refuses to run when `MAPP_ENVIRONMENT=production` or `MAPP_DATABASE_MODE`
-is neither `bundled` nor `federated`, aborts rather than destroying a
+It refuses to run when `MAPP_ENVIRONMENT=production`, aborts rather than
+destroying a
 pre-existing `e2e_probe` alias or probe relation, and refuses if recreating
 `config-ui` would strip connection references the running container has.
 

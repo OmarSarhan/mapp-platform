@@ -156,8 +156,7 @@ HTTP origins, loopback binding, non-standard public ports, placeholder domains,
 an unmonitored ACME email, and root application IDs. Initialize and operate the
 deployment as a dedicated unprivileged host account. Local
 `http://localhost:3000` remains available
-only when `MAPP_ENVIRONMENT=development`. The two topology keys
-`MAPP_ENVIRONMENT` and `MAPP_DATABASE_MODE` are authoritative in the selected
+only when `MAPP_ENVIRONMENT=development`. `MAPP_ENVIRONMENT` is authoritative in the selected
 env file; conflicting shell exports are rejected. Use `MAPP_ENV_FILE` to select
 a different reviewed env file. Conflicting exported database connection,
 role, and password variables are also rejected so Compose cannot silently
@@ -173,7 +172,6 @@ dashboard from validating against a different database from the one XYZ uses.
 
 | Variable | Purpose |
 | --- | --- |
-| `MAPP_DATABASE_MODE` | `bundled` and `federated` start the included PostGIS sample database and behave identically; `external` starts only the platform services. See [Federated PostgreSQL sources](docs/federation.md) for what `federated` is for. |
 | `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Replace the complete URI for an external PostGIS server. |
 | `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
 | `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role used by the default bundled `DBS_MAPP`. |
@@ -185,7 +183,6 @@ dashboard from validating against a different database from the one XYZ uses.
 The default created by `./bin/mapp init` is the bundled sample arrangement:
 
 ```dotenv
-MAPP_DATABASE_MODE=bundled
 DBS_MAPP=postgresql://${XYZ_DB_USER}:${XYZ_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
 ETL_DATABASE_URL=postgresql://${ETL_DB_USER}:${ETL_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
 ```
@@ -217,33 +214,13 @@ in external-database mode and require their explicit `--confirm` guards.
 Source availability can change independently; treat a non-zero ETL exit as a
 failed refresh and inspect the recorded run before retrying.
 
-To use an externally managed PostGIS database, replace the complete runtime
-URI and change the mode:
+Externally managed PostGIS data is attached as a **federated source** rather
+than by repointing `DBS_MAPP`: MAPP always runs its own database for derived
+layers, the federation registry and the control plane, and reaches source data
+over `postgres_fdw`. See [Federated PostgreSQL sources](docs/federation.md) for
+the register, observe and provision sequence.
 
-```dotenv
-MAPP_DATABASE_MODE=external
-DBS_MAPP=postgresql://mapp_reader:PERCENT_ENCODED_PASSWORD@postgis.internal.example:5432/production_maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
-```
-
-When converting an existing bundled installation, take a database backup and
-run `./bin/mapp down` before changing the mode. This removes the old service
-topology without deleting its named PostgreSQL volume; external mode does not
-start or automatically remove a previously running bundled `db` container.
-
-Then use:
-
-```sh
-./bin/mapp doctor
-./bin/mapp config
-./bin/mapp serve
-./bin/mapp verify
-```
-
-In external mode the wrapper does not start the bundled `db` service and
-rejects `etl`, `all`, and `db`, preventing the sample loader and local database
-tools from being mistaken for production operations. It also rejects the
-bundled hostname `db`, localhost names, and loopback addresses in `DBS_MAPP`.
-The external server must:
+A source server must:
 
 - be reachable from containers on the Compose backend network; do not use
   `localhost`, which would mean the individual application container;

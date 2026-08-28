@@ -19,12 +19,9 @@ If verification finds stale or unresolved container environment values, run
 `./bin/mapp up --force-recreate` to replace the runtime containers while
 preserving named volumes, then verify again.
 
-`MAPP_DATABASE_MODE=bundled` and `federated` include the local PostGIS
-service. With `MAPP_DATABASE_MODE=external`, `serve` starts only XYZ, the
-configuration service, semantic service, browser runner, and Caddy;
-`DBS_MAPP` supplies the database clients' shared external connection. The
-semantic service has no database credential. The external database lifecycle
-is not managed by this wrapper.
+Every deployment includes the packaged PostGIS service. `DBS_MAPP` supplies
+the database clients' shared connection to it, and the semantic service has no
+database credential.
 Before switching an existing bundled deployment to external mode, take a
 backup and run `./bin/mapp down`; otherwise its already-running `db` container
 is outside the newly selected service set and remains untouched.

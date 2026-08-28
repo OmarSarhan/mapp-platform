@@ -302,7 +302,6 @@ The MAPP operator stores the connection URIs in the deployment's private
 environment file:
 
 ```dotenv
-MAPP_DATABASE_MODE=external
 DBS_MAPP=postgresql://mapp_runtime_reader:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
 DERIVED_DATABASE_URL=postgresql://mapp_derived_owner:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
 DERIVED_OWNER_ROLE=mapp_derived_owner

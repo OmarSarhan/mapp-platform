@@ -43,8 +43,8 @@ The wrapper includes `compose.production.yaml` for every command, validates
 the production-only public settings, and forces secure dashboard cookies.
 Because `MAPP_ENVIRONMENT=production` is stored in `.env`, subsequent wrapper
 commands retain the HTTPS topology without needing a shell export. The wrapper
-treats `MAPP_ENVIRONMENT` and `MAPP_DATABASE_MODE` in the selected env file as
-authoritative and rejects conflicting same-name shell variables. Select a
+treats `MAPP_ENVIRONMENT` in the selected env file as authoritative and rejects
+conflicting same-name shell variables. Select a
 different reviewed file explicitly with `MAPP_ENV_FILE` rather than changing
 topology ambiently. Port 80 exists only for Caddy's redirect and
 automatic-certificate workflow; the application services remain unpublished
@@ -87,11 +87,9 @@ At minimum, set and review:
   only necessary internal names. Do not use a wildcard or trailing-dot name.
 - The resolved `CONFIG_SECURE_COOKIES=true`; the production overlay enforces
   this even though the development value in `.env` remains `false`.
-- All PostgreSQL, ETL, and XYZ role passwords when using the bundled sample
-  database; the external `DBS_MAPP` credential otherwise.
-- `MAPP_DATABASE_MODE` and `DBS_MAPP`. For `external`, the URI must identify a
-  container-reachable PostGIS server and a least-privilege read role; the
-  wrapper will not start the bundled database or permit bundled ETL.
+- All PostgreSQL, ETL, and XYZ role passwords for the packaged database.
+- `DBS_MAPP`, which must identify a container-reachable PostGIS server and a
+  least-privilege read role.
 - `CONFIG_UID` and `CONFIG_GID`: positive, non-root IDs for the dedicated owner
   of writable live state.
 - `SEMANTIC_INTERNAL_TOKEN`: a random service-to-service secret of at least 32
@@ -140,11 +138,9 @@ queries, and ongoing responsibilities. The derived role is optional; do not
 reuse a source owner or database administrator account for either application
 connection.
 
-With `MAPP_DATABASE_MODE=external`, the resolved Compose model omits both `db`
-and `etl`, so their role variables are unused. Keep the full generated `.env`
-key set for consistent drift checks, or supply an externally managed env file
-containing the platform settings and `DBS_MAPP`. The wrapper rejects `db`,
-localhost names, and loopback addresses as external database hosts.
+The resolved Compose model always contains `db`, and `etl` under the tools
+profile. Keep the full generated `.env` key set so drift checks stay
+meaningful.
 
 For a publicly trusted server, use an explicit common trust path so Node `pg`
 and libpq/psycopg apply the same verification policy:
@@ -177,7 +173,7 @@ trusted headers, binding, TLS, and health checks; do not bypass the validator.
 ./bin/mapp etl definitive_paths
 ./bin/mapp etl smoke_control_orders
 
-# Or, with MAPP_DATABASE_MODE=external:
+# Or, without loading sample data:
 ./bin/mapp serve
 ./bin/mapp verify
 ```
