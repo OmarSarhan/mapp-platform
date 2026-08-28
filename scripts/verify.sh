@@ -64,40 +64,8 @@ compose=(
   --env-file "${ENV_FILE}"
   --file "${ROOT_DIR}/compose.yaml"
 )
-database_mode="$(dotenv_value MAPP_DATABASE_MODE)"
-if [[ -v MAPP_DATABASE_MODE && "${MAPP_DATABASE_MODE}" != "${database_mode}" ]]; then
-  printf 'Exported MAPP_DATABASE_MODE conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
-    "${ENV_FILE}" >&2
-  exit 2
-fi
-# Whether this deployment runs MAPP's own PostgreSQL. Both bundled and
-# federated do; external points at somebody else's server. Every check below
-# that compared against "bundled" was asking this, not asking about bundled.
-has_bundled_database() {
-  [[ "${database_mode}" == "bundled" || "${database_mode}" == "federated" ]]
-}
-
-case "${database_mode}" in
-  bundled|federated)
-    compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-    required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
-    ;;
-  external)
-    required_services=(semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
-    # Mirror bin/mapp: an external host that was given a provisioner role runs
-    # with compose.federation-external.yaml, so the model verified here has to
-    # include it too. Without this the audit below resolves a config-ui with no
-    # FEDERATION_DATABASE_URL and then reports the running service as stale
-    # against its own incomplete model.
-    if [[ -n "$(dotenv_value FEDERATION_DATABASE_URL)" ]]; then
-      compose+=(--file "${ROOT_DIR}/compose.federation-external.yaml")
-    fi
-    ;;
-  *)
-    printf 'MAPP_DATABASE_MODE must be bundled, federated, or external.\n' >&2
-    exit 2
-    ;;
-esac
+compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
+required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
 deployment_environment="$(dotenv_value MAPP_ENVIRONMENT)"
 if [[ -v MAPP_ENVIRONMENT && "${MAPP_ENVIRONMENT}" != "${deployment_environment}" ]]; then
   printf 'Exported MAPP_ENVIRONMENT conflicts with the authoritative value in %s; unset it or update the env file deliberately.\n' \
@@ -184,21 +152,9 @@ if [[ -z "${resolved_federation_dbs}" && -n "${resolved_federation_role}" ]] \
   printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be configured or both be empty.\n' >&2
   exit 2
 fi
-if has_bundled_database && [[ -z "${resolved_federation_dbs}" ]]; then
+if [[ -z "${resolved_federation_dbs}" ]]; then
   printf 'FEDERATION_DATABASE_URL and FEDERATION_DB_USER are required with a local database.\n' >&2
   exit 2
-fi
-if [[ "${database_mode}" == "external" ]]; then
-  printf '%s' "${resolved_dbs}" \
-    | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
-  if [[ -n "${resolved_derived_dbs}" ]]; then
-    printf '%s' "${resolved_derived_dbs}" \
-      | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
-  fi
-  if [[ -n "${resolved_federation_dbs}" ]]; then
-    printf '%s' "${resolved_federation_dbs}" \
-      | python3 "${ROOT_DIR}/scripts/validate_database_url.py"
-  fi
 fi
 
 for service in "${required_services[@]}"; do
@@ -330,775 +286,773 @@ if ! "${compose[@]}" exec -T browser-runner \
   exit 1
 fi
 
-if has_bundled_database; then
-  "${compose[@]}" exec -T db \
-    sh /usr/local/bin/mapp-prepare-spatial-indexes check
-  "${compose[@]}" exec -T \
-    -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
-    -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
-    db sh -c \
-    'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
-      --set ON_ERROR_STOP=1 \
-      --set=etl_db_user="$ETL_DB_USER" \
-      --set=xyz_db_user="$XYZ_DB_USER" \
-      --set=derived_db_user="$DERIVED_DB_USER" \
-      --set=census_geometry_sha256="$MAPP_VERIFY_CENSUS_GEOMETRY_SHA256" \
-      --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON"' <<'SQL'
+"${compose[@]}" exec -T db \
+  sh /usr/local/bin/mapp-prepare-spatial-indexes check
+"${compose[@]}" exec -T \
+  -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
+  -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
+  db sh -c \
+  'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+    --set ON_ERROR_STOP=1 \
+    --set=etl_db_user="$ETL_DB_USER" \
+    --set=xyz_db_user="$XYZ_DB_USER" \
+    --set=derived_db_user="$DERIVED_DB_USER" \
+    --set=census_geometry_sha256="$MAPP_VERIFY_CENSUS_GEOMETRY_SHA256" \
+    --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON"' <<'SQL'
 SELECT postgis_full_version();
 SELECT set_config('mapp.verify.etl_db_user', :'etl_db_user', false);
 SELECT set_config('mapp.verify.xyz_db_user', :'xyz_db_user', false);
 SELECT set_config(
-  'mapp.verify.derived_db_user',
-  :'derived_db_user',
-  false
+'mapp.verify.derived_db_user',
+:'derived_db_user',
+false
 );
 SELECT set_config(
-  'mapp.verify.census_geometry_sha256',
-  :'census_geometry_sha256',
-  false
+'mapp.verify.census_geometry_sha256',
+:'census_geometry_sha256',
+false
 );
 SELECT set_config(
-  'mapp.verify.census_topic_hashes_json',
-  :'census_topic_hashes_json',
-  false
+'mapp.verify.census_topic_hashes_json',
+:'census_topic_hashes_json',
+false
 );
 
 DO $$
 DECLARE
-  mismatch_count integer;
+mismatch_count integer;
 BEGIN
-  SELECT count(*) INTO mismatch_count
-  FROM (VALUES
-    ('bus_stops', 'created_at', 'timestamp with time zone'),
-    ('definitive_paths', 'length_metres', 'double precision'),
-    ('smoke_control_orders', 'source_id', 'integer'),
-    ('smoke_control_orders', 'description', 'text'),
-    ('smoke_control_orders', 'area_square_metres', 'double precision'),
-    ('smoke_control_orders', 'registered_at', 'timestamp with time zone')
-  ) AS expected(table_name, column_name, data_type)
-  LEFT JOIN information_schema.columns actual
-    ON actual.table_schema = 'leeds'
-   AND actual.table_name = expected.table_name
-   AND actual.column_name = expected.column_name
-   AND actual.data_type = expected.data_type
-  WHERE actual.column_name IS NULL;
+SELECT count(*) INTO mismatch_count
+FROM (VALUES
+  ('bus_stops', 'created_at', 'timestamp with time zone'),
+  ('definitive_paths', 'length_metres', 'double precision'),
+  ('smoke_control_orders', 'source_id', 'integer'),
+  ('smoke_control_orders', 'description', 'text'),
+  ('smoke_control_orders', 'area_square_metres', 'double precision'),
+  ('smoke_control_orders', 'registered_at', 'timestamp with time zone')
+) AS expected(table_name, column_name, data_type)
+LEFT JOIN information_schema.columns actual
+  ON actual.table_schema = 'leeds'
+ AND actual.table_name = expected.table_name
+ AND actual.column_name = expected.column_name
+ AND actual.data_type = expected.data_type
+WHERE actual.column_name IS NULL;
 
-  IF mismatch_count <> 0 THEN
-    RAISE EXCEPTION '% representative typed ETL columns are missing or mismatched', mismatch_count;
-  END IF;
+IF mismatch_count <> 0 THEN
+  RAISE EXCEPTION '% representative typed ETL columns are missing or mismatched', mismatch_count;
+END IF;
 END
 $$;
 
 DO $$
 DECLARE
-  table_present integer;
-  guard_event_trigger_count integer;
+table_present integer;
+guard_event_trigger_count integer;
 BEGIN
-  SELECT count(*) INTO table_present
-  FROM pg_catalog.pg_class AS relation
-  JOIN pg_catalog.pg_namespace AS ns
-    ON ns.oid = relation.relnamespace
-  WHERE ns.nspname = 'public'
-    AND relation.relname = 'mapp_platform_layer_dependencies';
-  IF table_present = 0 THEN
-    RAISE EXCEPTION 'Layer dependency guard table public.mapp_platform_layer_dependencies is missing.';
-  END IF;
+SELECT count(*) INTO table_present
+FROM pg_catalog.pg_class AS relation
+JOIN pg_catalog.pg_namespace AS ns
+  ON ns.oid = relation.relnamespace
+WHERE ns.nspname = 'public'
+  AND relation.relname = 'mapp_platform_layer_dependencies';
+IF table_present = 0 THEN
+  RAISE EXCEPTION 'Layer dependency guard table public.mapp_platform_layer_dependencies is missing.';
+END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_proc AS proc
-    JOIN pg_catalog.pg_namespace AS ns
-      ON ns.oid = proc.pronamespace
-    WHERE proc.proname = 'mapp_sync_platform_layer_dependencies'
-      AND ns.nspname = 'public'
-  ) THEN
-    RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies is missing.';
-  END IF;
-
-  IF to_regprocedure('public.mapp_sync_platform_layer_dependencies(text, jsonb)') IS NULL THEN
-    RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies(text, jsonb) is missing.';
-  END IF;
-
-  IF NOT has_function_privilege(
-    'public',
-    'public.mapp_sync_platform_layer_dependencies(text, jsonb)',
-    'execute'
-  ) THEN
-    RAISE EXCEPTION 'PUBLIC does not have execute permission on public.mapp_sync_platform_layer_dependencies(text, jsonb).';
-  END IF;
-
-  SELECT count(*) INTO guard_event_trigger_count
-  FROM pg_catalog.pg_event_trigger AS trigger
-  JOIN pg_catalog.pg_proc AS proc
-    ON proc.oid = trigger.evtfoid
+IF NOT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_proc AS proc
   JOIN pg_catalog.pg_namespace AS ns
     ON ns.oid = proc.pronamespace
-  WHERE trigger.evtname = 'mapp_block_platform_layer_drops'
-    AND proc.proname = 'mapp_block_platform_layer_drops'
+  WHERE proc.proname = 'mapp_sync_platform_layer_dependencies'
     AND ns.nspname = 'public'
-  ;
-  IF guard_event_trigger_count <> 1 THEN
-    RAISE EXCEPTION 'Layer drop guard event trigger mapp_block_platform_layer_drops is missing.';
+) THEN
+  RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies is missing.';
+END IF;
+
+IF to_regprocedure('public.mapp_sync_platform_layer_dependencies(text, jsonb)') IS NULL THEN
+  RAISE EXCEPTION 'Layer dependency sync function public.mapp_sync_platform_layer_dependencies(text, jsonb) is missing.';
+END IF;
+
+IF NOT has_function_privilege(
+  'public',
+  'public.mapp_sync_platform_layer_dependencies(text, jsonb)',
+  'execute'
+) THEN
+  RAISE EXCEPTION 'PUBLIC does not have execute permission on public.mapp_sync_platform_layer_dependencies(text, jsonb).';
+END IF;
+
+SELECT count(*) INTO guard_event_trigger_count
+FROM pg_catalog.pg_event_trigger AS trigger
+JOIN pg_catalog.pg_proc AS proc
+  ON proc.oid = trigger.evtfoid
+JOIN pg_catalog.pg_namespace AS ns
+  ON ns.oid = proc.pronamespace
+WHERE trigger.evtname = 'mapp_block_platform_layer_drops'
+  AND proc.proname = 'mapp_block_platform_layer_drops'
+  AND ns.nspname = 'public'
+;
+IF guard_event_trigger_count <> 1 THEN
+  RAISE EXCEPTION 'Layer drop guard event trigger mapp_block_platform_layer_drops is missing.';
+END IF;
+
+IF NOT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_proc AS proc
+  JOIN pg_catalog.pg_namespace AS ns
+    ON ns.oid = proc.pronamespace
+  WHERE proc.proname = 'mapp_block_platform_layer_drops'
+    AND ns.nspname = 'public'
+) THEN
+  RAISE EXCEPTION 'Layer drop guard function public.mapp_block_platform_layer_drops is missing.';
+END IF;
+END
+$$;
+
+DO $$
+DECLARE
+relation text;
+row_total bigint;
+bad_geom bigint;
+BEGIN
+FOREACH relation IN ARRAY ARRAY[
+  'leeds.bus_stops',
+  'leeds.definitive_paths',
+  'leeds.smoke_control_orders'
+] LOOP
+  IF to_regclass(relation) IS NULL THEN
+    RAISE EXCEPTION 'Missing ETL relation: %', relation;
   END IF;
 
+  EXECUTE format('SELECT count(*) FROM %s', relation) INTO row_total;
+  IF row_total = 0 THEN
+    RAISE EXCEPTION 'ETL relation is empty: %', relation;
+  END IF;
+
+  EXECUTE format(
+    'SELECT count(*) FROM %s WHERE geom IS NOT NULL AND (ST_SRID(geom) <> 4326 OR ST_SRID(geom_3857) <> 3857 OR NOT ST_IsValid(geom))',
+    relation
+  ) INTO bad_geom;
+  IF bad_geom <> 0 THEN
+    RAISE EXCEPTION 'Invalid geometry/SRID rows in %: %', relation, bad_geom;
+  END IF;
+
+  RAISE NOTICE '%: % rows verified', relation, row_total;
+END LOOP;
+END
+$$;
+
+DO $$
+DECLARE
+census_relation regclass := to_regclass(
+  'leeds.census_2021_england_oa'
+);
+checked_relation regclass;
+etl_role name := current_setting('mapp.verify.etl_db_user');
+xyz_role name := current_setting('mapp.verify.xyz_db_user');
+derived_role name := current_setting('mapp.verify.derived_db_user');
+row_total bigint;
+distinct_code_count bigint;
+invalid_code_count bigint;
+invalid_geometry_count bigint;
+statistic_column_count integer;
+invalid_statistic_column_count integer;
+variable_metadata_count integer;
+variable_topic_count integer;
+unmatched_variable_count integer;
+dataset_metadata_count integer;
+matching_dataset_metadata_count integer;
+matching_last_run_count integer;
+xyz_default_select boolean;
+derived_default_select boolean;
+unsafe_table_default boolean;
+unsafe_sequence_default boolean;
+unsafe_sequence_grant boolean;
+public_connect boolean;
+public_temporary boolean;
+generated_kind text;
+expected_geometry_sha256 text :=
+  current_setting('mapp.verify.census_geometry_sha256');
+expected_topic_hashes jsonb :=
+  current_setting('mapp.verify.census_topic_hashes_json')::jsonb;
+expected_topic_hash_count integer;
+variable_topic_hash_mismatch_count integer;
+dataset_topic_hash_count integer;
+dataset_topic_hash_mismatch_count integer;
+BEGIN
+IF xyz_role = derived_role THEN
+  RAISE EXCEPTION
+    'Bundled runtime reader and derived owner must be separate roles';
+END IF;
+
+SELECT
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_default_acl AS defaults
+    JOIN pg_catalog.pg_roles AS owner
+      ON owner.oid = defaults.defaclrole
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = defaults.defaclnamespace
+    CROSS JOIN LATERAL
+      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+    JOIN pg_catalog.pg_roles AS grantee
+      ON grantee.oid = privilege.grantee
+    WHERE owner.rolname = etl_role
+      AND namespace.nspname = 'leeds'
+      AND defaults.defaclobjtype = 'r'
+      AND grantee.rolname = xyz_role
+      AND privilege.privilege_type = 'SELECT'
+      AND NOT privilege.is_grantable
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_default_acl AS defaults
+    JOIN pg_catalog.pg_roles AS owner
+      ON owner.oid = defaults.defaclrole
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = defaults.defaclnamespace
+    CROSS JOIN LATERAL
+      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+    JOIN pg_catalog.pg_roles AS grantee
+      ON grantee.oid = privilege.grantee
+    WHERE owner.rolname = etl_role
+      AND namespace.nspname = 'leeds'
+      AND defaults.defaclobjtype = 'r'
+      AND grantee.rolname = derived_role
+      AND privilege.privilege_type = 'SELECT'
+      AND NOT privilege.is_grantable
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_default_acl AS defaults
+    JOIN pg_catalog.pg_roles AS owner
+      ON owner.oid = defaults.defaclrole
+    LEFT JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = defaults.defaclnamespace
+    CROSS JOIN LATERAL
+      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+    WHERE owner.rolname = etl_role
+      AND (
+        defaults.defaclnamespace = 0
+        OR namespace.nspname = 'leeds'
+      )
+      AND defaults.defaclobjtype = 'r'
+      AND CASE
+        WHEN privilege.grantee = 0 THEN true
+        ELSE
+          pg_has_role(xyz_role, privilege.grantee, 'MEMBER')
+          OR pg_has_role(
+            derived_role,
+            privilege.grantee,
+            'MEMBER'
+          )
+      END
+      AND (
+        privilege.privilege_type <> 'SELECT'
+        OR privilege.is_grantable
+      )
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_default_acl AS defaults
+    JOIN pg_catalog.pg_roles AS owner
+      ON owner.oid = defaults.defaclrole
+    LEFT JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = defaults.defaclnamespace
+    CROSS JOIN LATERAL
+      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+    WHERE owner.rolname = etl_role
+      AND (
+        defaults.defaclnamespace = 0
+        OR namespace.nspname = 'leeds'
+      )
+      AND defaults.defaclobjtype = 'S'
+      AND CASE
+        WHEN privilege.grantee = 0 THEN true
+        ELSE
+          pg_has_role(xyz_role, privilege.grantee, 'MEMBER')
+          OR pg_has_role(
+            derived_role,
+            privilege.grantee,
+            'MEMBER'
+          )
+      END
+      AND privilege.privilege_type IN ('USAGE', 'UPDATE')
+  )
+INTO
+  xyz_default_select,
+  derived_default_select,
+  unsafe_table_default,
+  unsafe_sequence_default;
+
+IF NOT xyz_default_select OR NOT derived_default_select THEN
+  RAISE EXCEPTION
+    'ETL table default privileges must grant SELECT to both the runtime reader and derived owner';
+END IF;
+IF unsafe_table_default THEN
+  RAISE EXCEPTION
+    'Runtime reader and derived owner default privileges must be non-grantable SELECT only';
+END IF;
+IF unsafe_sequence_default THEN
+  RAISE EXCEPTION
+    'Runtime reader and derived owner defaults must not permit sequence mutation';
+END IF;
+
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_class AS relation
+  JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = relation.relnamespace
+  WHERE namespace.nspname = 'leeds'
+    AND relation.relkind = 'S'
+    AND (
+      has_sequence_privilege(xyz_role, relation.oid, 'USAGE')
+      OR has_sequence_privilege(xyz_role, relation.oid, 'UPDATE')
+      OR has_sequence_privilege(
+        derived_role,
+        relation.oid,
+        'USAGE'
+      )
+      OR has_sequence_privilege(
+        derived_role,
+        relation.oid,
+        'UPDATE'
+      )
+    )
+)
+INTO unsafe_sequence_grant;
+
+IF unsafe_sequence_grant THEN
+  RAISE EXCEPTION
+    'Runtime reader and derived owner must not mutate Leeds sequences';
+END IF;
+
+SELECT
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_database AS database
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(
+        database.datacl,
+        pg_catalog.acldefault('d', database.datdba)
+      )
+    ) AS privilege
+    WHERE database.datname = current_database()
+      AND privilege.grantee = 0
+      AND privilege.privilege_type = 'CONNECT'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_database AS database
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+      COALESCE(
+        database.datacl,
+        pg_catalog.acldefault('d', database.datdba)
+      )
+    ) AS privilege
+    WHERE database.datname = current_database()
+      AND privilege.grantee = 0
+      AND privilege.privilege_type = 'TEMPORARY'
+  )
+INTO public_connect, public_temporary;
+
+IF public_connect OR public_temporary THEN
+  RAISE EXCEPTION
+    'Bundled database CONNECT and TEMPORARY must be revoked from PUBLIC';
+END IF;
+IF has_database_privilege(
+     etl_role,
+     current_database(),
+     'CONNECT'
+   ) IS NOT TRUE
+   OR has_database_privilege(
+     etl_role,
+     current_database(),
+     'TEMPORARY'
+   ) IS NOT TRUE
+   OR has_database_privilege(
+     xyz_role,
+     current_database(),
+     'CONNECT'
+   ) IS NOT TRUE
+   OR has_database_privilege(
+     derived_role,
+     current_database(),
+     'CONNECT'
+   ) IS NOT TRUE
+   OR has_database_privilege(
+     xyz_role,
+     current_database(),
+     'TEMPORARY'
+   )
+   OR has_database_privilege(
+     derived_role,
+     current_database(),
+     'TEMPORARY'
+   ) THEN
+  RAISE EXCEPTION
+    'Bundled database must grant CONNECT+TEMP only to ETL and CONNECT only to runtime/derived roles';
+END IF;
+IF has_schema_privilege(xyz_role, 'leeds', 'CREATE')
+   OR has_schema_privilege(derived_role, 'leeds', 'CREATE') THEN
+  RAISE EXCEPTION
+    'Runtime reader and derived owner must not create objects in the Leeds source schema';
+END IF;
+
+IF census_relation IS NULL THEN
+  RAISE NOTICE 'Optional Census relation leeds.census_2021_england_oa is absent; skipped Census verification';
+  RETURN;
+END IF;
+
+FOREACH checked_relation IN ARRAY ARRAY[
+  census_relation,
+  to_regclass('leeds.census_datasets'),
+  to_regclass('leeds.census_variables'),
+  to_regclass('leeds._census_etl_runs')
+] LOOP
+  IF checked_relation IS NULL THEN
+    RAISE EXCEPTION
+      'A required Census relation or metadata relation is missing';
+  END IF;
   IF NOT EXISTS (
     SELECT 1
-    FROM pg_catalog.pg_proc AS proc
-    JOIN pg_catalog.pg_namespace AS ns
-      ON ns.oid = proc.pronamespace
-    WHERE proc.proname = 'mapp_block_platform_layer_drops'
-      AND ns.nspname = 'public'
-  ) THEN
-    RAISE EXCEPTION 'Layer drop guard function public.mapp_block_platform_layer_drops is missing.';
-  END IF;
-END
-$$;
-
-DO $$
-DECLARE
-  relation text;
-  row_total bigint;
-  bad_geom bigint;
-BEGIN
-  FOREACH relation IN ARRAY ARRAY[
-    'leeds.bus_stops',
-    'leeds.definitive_paths',
-    'leeds.smoke_control_orders'
-  ] LOOP
-    IF to_regclass(relation) IS NULL THEN
-      RAISE EXCEPTION 'Missing ETL relation: %', relation;
-    END IF;
-
-    EXECUTE format('SELECT count(*) FROM %s', relation) INTO row_total;
-    IF row_total = 0 THEN
-      RAISE EXCEPTION 'ETL relation is empty: %', relation;
-    END IF;
-
-    EXECUTE format(
-      'SELECT count(*) FROM %s WHERE geom IS NOT NULL AND (ST_SRID(geom) <> 4326 OR ST_SRID(geom_3857) <> 3857 OR NOT ST_IsValid(geom))',
-      relation
-    ) INTO bad_geom;
-    IF bad_geom <> 0 THEN
-      RAISE EXCEPTION 'Invalid geometry/SRID rows in %: %', relation, bad_geom;
-    END IF;
-
-    RAISE NOTICE '%: % rows verified', relation, row_total;
-  END LOOP;
-END
-$$;
-
-DO $$
-DECLARE
-  census_relation regclass := to_regclass(
-    'leeds.census_2021_england_oa'
-  );
-  checked_relation regclass;
-  etl_role name := current_setting('mapp.verify.etl_db_user');
-  xyz_role name := current_setting('mapp.verify.xyz_db_user');
-  derived_role name := current_setting('mapp.verify.derived_db_user');
-  row_total bigint;
-  distinct_code_count bigint;
-  invalid_code_count bigint;
-  invalid_geometry_count bigint;
-  statistic_column_count integer;
-  invalid_statistic_column_count integer;
-  variable_metadata_count integer;
-  variable_topic_count integer;
-  unmatched_variable_count integer;
-  dataset_metadata_count integer;
-  matching_dataset_metadata_count integer;
-  matching_last_run_count integer;
-  xyz_default_select boolean;
-  derived_default_select boolean;
-  unsafe_table_default boolean;
-  unsafe_sequence_default boolean;
-  unsafe_sequence_grant boolean;
-  public_connect boolean;
-  public_temporary boolean;
-  generated_kind text;
-  expected_geometry_sha256 text :=
-    current_setting('mapp.verify.census_geometry_sha256');
-  expected_topic_hashes jsonb :=
-    current_setting('mapp.verify.census_topic_hashes_json')::jsonb;
-  expected_topic_hash_count integer;
-  variable_topic_hash_mismatch_count integer;
-  dataset_topic_hash_count integer;
-  dataset_topic_hash_mismatch_count integer;
-BEGIN
-  IF xyz_role = derived_role THEN
-    RAISE EXCEPTION
-      'Bundled runtime reader and derived owner must be separate roles';
-  END IF;
-
-  SELECT
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_default_acl AS defaults
-      JOIN pg_catalog.pg_roles AS owner
-        ON owner.oid = defaults.defaclrole
-      JOIN pg_catalog.pg_namespace AS namespace
-        ON namespace.oid = defaults.defaclnamespace
-      CROSS JOIN LATERAL
-        pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-      JOIN pg_catalog.pg_roles AS grantee
-        ON grantee.oid = privilege.grantee
-      WHERE owner.rolname = etl_role
-        AND namespace.nspname = 'leeds'
-        AND defaults.defaclobjtype = 'r'
-        AND grantee.rolname = xyz_role
-        AND privilege.privilege_type = 'SELECT'
-        AND NOT privilege.is_grantable
-    ),
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_default_acl AS defaults
-      JOIN pg_catalog.pg_roles AS owner
-        ON owner.oid = defaults.defaclrole
-      JOIN pg_catalog.pg_namespace AS namespace
-        ON namespace.oid = defaults.defaclnamespace
-      CROSS JOIN LATERAL
-        pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-      JOIN pg_catalog.pg_roles AS grantee
-        ON grantee.oid = privilege.grantee
-      WHERE owner.rolname = etl_role
-        AND namespace.nspname = 'leeds'
-        AND defaults.defaclobjtype = 'r'
-        AND grantee.rolname = derived_role
-        AND privilege.privilege_type = 'SELECT'
-        AND NOT privilege.is_grantable
-    ),
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_default_acl AS defaults
-      JOIN pg_catalog.pg_roles AS owner
-        ON owner.oid = defaults.defaclrole
-      LEFT JOIN pg_catalog.pg_namespace AS namespace
-        ON namespace.oid = defaults.defaclnamespace
-      CROSS JOIN LATERAL
-        pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-      WHERE owner.rolname = etl_role
-        AND (
-          defaults.defaclnamespace = 0
-          OR namespace.nspname = 'leeds'
-        )
-        AND defaults.defaclobjtype = 'r'
-        AND CASE
-          WHEN privilege.grantee = 0 THEN true
-          ELSE
-            pg_has_role(xyz_role, privilege.grantee, 'MEMBER')
-            OR pg_has_role(
-              derived_role,
-              privilege.grantee,
-              'MEMBER'
-            )
-        END
-        AND (
-          privilege.privilege_type <> 'SELECT'
-          OR privilege.is_grantable
-        )
-    ),
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_default_acl AS defaults
-      JOIN pg_catalog.pg_roles AS owner
-        ON owner.oid = defaults.defaclrole
-      LEFT JOIN pg_catalog.pg_namespace AS namespace
-        ON namespace.oid = defaults.defaclnamespace
-      CROSS JOIN LATERAL
-        pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-      WHERE owner.rolname = etl_role
-        AND (
-          defaults.defaclnamespace = 0
-          OR namespace.nspname = 'leeds'
-        )
-        AND defaults.defaclobjtype = 'S'
-        AND CASE
-          WHEN privilege.grantee = 0 THEN true
-          ELSE
-            pg_has_role(xyz_role, privilege.grantee, 'MEMBER')
-            OR pg_has_role(
-              derived_role,
-              privilege.grantee,
-              'MEMBER'
-            )
-        END
-        AND privilege.privilege_type IN ('USAGE', 'UPDATE')
-    )
-  INTO
-    xyz_default_select,
-    derived_default_select,
-    unsafe_table_default,
-    unsafe_sequence_default;
-
-  IF NOT xyz_default_select OR NOT derived_default_select THEN
-    RAISE EXCEPTION
-      'ETL table default privileges must grant SELECT to both the runtime reader and derived owner';
-  END IF;
-  IF unsafe_table_default THEN
-    RAISE EXCEPTION
-      'Runtime reader and derived owner default privileges must be non-grantable SELECT only';
-  END IF;
-  IF unsafe_sequence_default THEN
-    RAISE EXCEPTION
-      'Runtime reader and derived owner defaults must not permit sequence mutation';
-  END IF;
-
-  SELECT EXISTS (
-    SELECT 1
     FROM pg_catalog.pg_class AS relation
-    JOIN pg_catalog.pg_namespace AS namespace
-      ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = 'leeds'
-      AND relation.relkind = 'S'
-      AND (
-        has_sequence_privilege(xyz_role, relation.oid, 'USAGE')
-        OR has_sequence_privilege(xyz_role, relation.oid, 'UPDATE')
-        OR has_sequence_privilege(
-          derived_role,
-          relation.oid,
-          'USAGE'
-        )
-        OR has_sequence_privilege(
-          derived_role,
-          relation.oid,
-          'UPDATE'
-        )
-      )
-  )
-  INTO unsafe_sequence_grant;
-
-  IF unsafe_sequence_grant THEN
+    JOIN pg_catalog.pg_roles AS owner
+      ON owner.oid = relation.relowner
+    WHERE relation.oid = checked_relation
+      AND owner.rolname = etl_role
+  ) THEN
     RAISE EXCEPTION
-      'Runtime reader and derived owner must not mutate Leeds sequences';
+      'ETL role must own Census relation %',
+      checked_relation;
   END IF;
-
-  SELECT
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_database AS database
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(
-          database.datacl,
-          pg_catalog.acldefault('d', database.datdba)
-        )
-      ) AS privilege
-      WHERE database.datname = current_database()
-        AND privilege.grantee = 0
-        AND privilege.privilege_type = 'CONNECT'
-    ),
-    EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_database AS database
-      CROSS JOIN LATERAL pg_catalog.aclexplode(
-        COALESCE(
-          database.datacl,
-          pg_catalog.acldefault('d', database.datdba)
-        )
-      ) AS privilege
-      WHERE database.datname = current_database()
-        AND privilege.grantee = 0
-        AND privilege.privilege_type = 'TEMPORARY'
-    )
-  INTO public_connect, public_temporary;
-
-  IF public_connect OR public_temporary THEN
-    RAISE EXCEPTION
-      'Bundled database CONNECT and TEMPORARY must be revoked from PUBLIC';
-  END IF;
-  IF has_database_privilege(
-       etl_role,
-       current_database(),
-       'CONNECT'
-     ) IS NOT TRUE
-     OR has_database_privilege(
-       etl_role,
-       current_database(),
-       'TEMPORARY'
-     ) IS NOT TRUE
-     OR has_database_privilege(
+  IF has_schema_privilege(xyz_role, 'leeds', 'USAGE') IS NOT TRUE
+     OR has_table_privilege(
        xyz_role,
-       current_database(),
-       'CONNECT'
+       checked_relation,
+       'SELECT'
      ) IS NOT TRUE
-     OR has_database_privilege(
+     OR has_schema_privilege(derived_role, 'leeds', 'USAGE') IS NOT TRUE
+     OR has_table_privilege(
        derived_role,
-       current_database(),
-       'CONNECT'
-     ) IS NOT TRUE
-     OR has_database_privilege(
-       xyz_role,
-       current_database(),
-       'TEMPORARY'
+       checked_relation,
+       'SELECT'
+     ) IS NOT TRUE THEN
+    RAISE EXCEPTION
+      'Runtime reader and derived owner must both read %',
+      checked_relation;
+  END IF;
+  IF has_table_privilege(xyz_role, checked_relation, 'INSERT')
+     OR has_table_privilege(xyz_role, checked_relation, 'UPDATE')
+     OR has_table_privilege(xyz_role, checked_relation, 'DELETE')
+     OR has_table_privilege(xyz_role, checked_relation, 'TRUNCATE')
+     OR has_table_privilege(xyz_role, checked_relation, 'REFERENCES')
+     OR has_table_privilege(xyz_role, checked_relation, 'TRIGGER')
+     OR has_table_privilege(derived_role, checked_relation, 'INSERT')
+     OR has_table_privilege(derived_role, checked_relation, 'UPDATE')
+     OR has_table_privilege(derived_role, checked_relation, 'DELETE')
+     OR has_table_privilege(derived_role, checked_relation, 'TRUNCATE')
+     OR has_table_privilege(
+       derived_role,
+       checked_relation,
+       'REFERENCES'
      )
-     OR has_database_privilege(
+     OR has_table_privilege(
        derived_role,
-       current_database(),
-       'TEMPORARY'
+       checked_relation,
+       'TRIGGER'
+     )
+     OR has_any_column_privilege(
+       xyz_role,
+       checked_relation,
+       'INSERT'
+     )
+     OR has_any_column_privilege(
+       xyz_role,
+       checked_relation,
+       'UPDATE'
+     )
+     OR has_any_column_privilege(
+       xyz_role,
+       checked_relation,
+       'REFERENCES'
+     )
+     OR has_any_column_privilege(
+       derived_role,
+       checked_relation,
+       'INSERT'
+     )
+     OR has_any_column_privilege(
+       derived_role,
+       checked_relation,
+       'UPDATE'
+     )
+     OR has_any_column_privilege(
+       derived_role,
+       checked_relation,
+       'REFERENCES'
      ) THEN
     RAISE EXCEPTION
-      'Bundled database must grant CONNECT+TEMP only to ETL and CONNECT only to runtime/derived roles';
+      'Runtime reader and derived owner must not mutate Census relation %',
+      checked_relation;
   END IF;
-  IF has_schema_privilege(xyz_role, 'leeds', 'CREATE')
-     OR has_schema_privilege(derived_role, 'leeds', 'CREATE') THEN
-    RAISE EXCEPTION
-      'Runtime reader and derived owner must not create objects in the Leeds source schema';
-  END IF;
+END LOOP;
 
-  IF census_relation IS NULL THEN
-    RAISE NOTICE 'Optional Census relation leeds.census_2021_england_oa is absent; skipped Census verification';
-    RETURN;
-  END IF;
+SELECT
+  count(*)::bigint,
+  count(DISTINCT oa21cd)::bigint,
+  count(*) FILTER (
+    WHERE oa21cd IS NULL OR oa21cd !~ '^E[0-9]{8}$'
+  )::bigint,
+  count(*) FILTER (
+    WHERE geom IS NULL
+       OR ST_SRID(geom) <> 4326
+       OR ST_IsEmpty(geom)
+       OR NOT ST_IsValid(geom)
+       OR geom_3857 IS NULL
+       OR ST_SRID(geom_3857) <> 3857
+       OR ST_IsEmpty(geom_3857)
+       OR NOT ST_IsValid(geom_3857)
+  )::bigint
+INTO
+  row_total,
+  distinct_code_count,
+  invalid_code_count,
+  invalid_geometry_count
+FROM leeds.census_2021_england_oa;
 
-  FOREACH checked_relation IN ARRAY ARRAY[
-    census_relation,
-    to_regclass('leeds.census_datasets'),
-    to_regclass('leeds.census_variables'),
-    to_regclass('leeds._census_etl_runs')
-  ] LOOP
-    IF checked_relation IS NULL THEN
-      RAISE EXCEPTION
-        'A required Census relation or metadata relation is missing';
-    END IF;
-    IF NOT EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_class AS relation
-      JOIN pg_catalog.pg_roles AS owner
-        ON owner.oid = relation.relowner
-      WHERE relation.oid = checked_relation
-        AND owner.rolname = etl_role
-    ) THEN
-      RAISE EXCEPTION
-        'ETL role must own Census relation %',
-        checked_relation;
-    END IF;
-    IF has_schema_privilege(xyz_role, 'leeds', 'USAGE') IS NOT TRUE
-       OR has_table_privilege(
-         xyz_role,
-         checked_relation,
-         'SELECT'
-       ) IS NOT TRUE
-       OR has_schema_privilege(derived_role, 'leeds', 'USAGE') IS NOT TRUE
-       OR has_table_privilege(
-         derived_role,
-         checked_relation,
-         'SELECT'
-       ) IS NOT TRUE THEN
-      RAISE EXCEPTION
-        'Runtime reader and derived owner must both read %',
-        checked_relation;
-    END IF;
-    IF has_table_privilege(xyz_role, checked_relation, 'INSERT')
-       OR has_table_privilege(xyz_role, checked_relation, 'UPDATE')
-       OR has_table_privilege(xyz_role, checked_relation, 'DELETE')
-       OR has_table_privilege(xyz_role, checked_relation, 'TRUNCATE')
-       OR has_table_privilege(xyz_role, checked_relation, 'REFERENCES')
-       OR has_table_privilege(xyz_role, checked_relation, 'TRIGGER')
-       OR has_table_privilege(derived_role, checked_relation, 'INSERT')
-       OR has_table_privilege(derived_role, checked_relation, 'UPDATE')
-       OR has_table_privilege(derived_role, checked_relation, 'DELETE')
-       OR has_table_privilege(derived_role, checked_relation, 'TRUNCATE')
-       OR has_table_privilege(
-         derived_role,
-         checked_relation,
-         'REFERENCES'
-       )
-       OR has_table_privilege(
-         derived_role,
-         checked_relation,
-         'TRIGGER'
-       )
-       OR has_any_column_privilege(
-         xyz_role,
-         checked_relation,
-         'INSERT'
-       )
-       OR has_any_column_privilege(
-         xyz_role,
-         checked_relation,
-         'UPDATE'
-       )
-       OR has_any_column_privilege(
-         xyz_role,
-         checked_relation,
-         'REFERENCES'
-       )
-       OR has_any_column_privilege(
-         derived_role,
-         checked_relation,
-         'INSERT'
-       )
-       OR has_any_column_privilege(
-         derived_role,
-         checked_relation,
-         'UPDATE'
-       )
-       OR has_any_column_privilege(
-         derived_role,
-         checked_relation,
-         'REFERENCES'
-       ) THEN
-      RAISE EXCEPTION
-        'Runtime reader and derived owner must not mutate Census relation %',
-        checked_relation;
-    END IF;
-  END LOOP;
+IF row_total <> 178605 THEN
+  RAISE EXCEPTION
+    'Census relation has % rows, expected 178605',
+    row_total;
+END IF;
+IF invalid_code_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census relation has % invalid England OA codes',
+    invalid_code_count;
+END IF;
+IF distinct_code_count <> row_total THEN
+  RAISE EXCEPTION
+    'Census relation has duplicate England OA codes';
+END IF;
+IF invalid_geometry_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census relation has % invalid, empty, or incorrectly projected geometries',
+    invalid_geometry_count;
+END IF;
 
-  SELECT
-    count(*)::bigint,
-    count(DISTINCT oa21cd)::bigint,
-    count(*) FILTER (
-      WHERE oa21cd IS NULL OR oa21cd !~ '^E[0-9]{8}$'
-    )::bigint,
-    count(*) FILTER (
-      WHERE geom IS NULL
-         OR ST_SRID(geom) <> 4326
-         OR ST_IsEmpty(geom)
-         OR NOT ST_IsValid(geom)
-         OR geom_3857 IS NULL
-         OR ST_SRID(geom_3857) <> 3857
-         OR ST_IsEmpty(geom_3857)
-         OR NOT ST_IsValid(geom_3857)
-    )::bigint
-  INTO
-    row_total,
-    distinct_code_count,
-    invalid_code_count,
-    invalid_geometry_count
-  FROM leeds.census_2021_england_oa;
+SELECT attribute.attgenerated::text
+INTO generated_kind
+FROM pg_catalog.pg_attribute AS attribute
+WHERE attribute.attrelid = census_relation
+  AND attribute.attname = 'geom_3857'
+  AND attribute.attnum > 0
+  AND NOT attribute.attisdropped;
+IF generated_kind IS DISTINCT FROM 's' THEN
+  RAISE EXCEPTION
+    'Census geom_3857 must be a stored generated column';
+END IF;
 
-  IF row_total <> 178605 THEN
-    RAISE EXCEPTION
-      'Census relation has % rows, expected 178605',
-      row_total;
-  END IF;
-  IF invalid_code_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census relation has % invalid England OA codes',
-      invalid_code_count;
-  END IF;
-  IF distinct_code_count <> row_total THEN
-    RAISE EXCEPTION
-      'Census relation has duplicate England OA codes';
-  END IF;
-  IF invalid_geometry_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census relation has % invalid, empty, or incorrectly projected geometries',
-      invalid_geometry_count;
-  END IF;
+SELECT
+  count(*)::integer,
+  count(*) FILTER (
+    WHERE data_type <> 'double precision'
+       OR column_name !~ '^ts[0-9]{3}a?_[0-9]{4}$'
+  )::integer
+INTO statistic_column_count, invalid_statistic_column_count
+FROM information_schema.columns
+WHERE table_schema = 'leeds'
+  AND table_name = 'census_2021_england_oa'
+  AND column_name LIKE 'ts%';
 
-  SELECT attribute.attgenerated::text
-  INTO generated_kind
-  FROM pg_catalog.pg_attribute AS attribute
-  WHERE attribute.attrelid = census_relation
-    AND attribute.attname = 'geom_3857'
-    AND attribute.attnum > 0
-    AND NOT attribute.attisdropped;
-  IF generated_kind IS DISTINCT FROM 's' THEN
-    RAISE EXCEPTION
-      'Census geom_3857 must be a stored generated column';
-  END IF;
+IF statistic_column_count <> 467
+   OR invalid_statistic_column_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census statistic column contract failed (columns=%, invalid=%; expected 467 double-precision reviewed names)',
+    statistic_column_count,
+    invalid_statistic_column_count;
+END IF;
 
-  SELECT
-    count(*)::integer,
-    count(*) FILTER (
-      WHERE data_type <> 'double precision'
-         OR column_name !~ '^ts[0-9]{3}a?_[0-9]{4}$'
-    )::integer
-  INTO statistic_column_count, invalid_statistic_column_count
+SELECT
+  count(*)::integer,
+  count(DISTINCT topic_id)::integer
+INTO variable_metadata_count, variable_topic_count
+FROM leeds.census_variables
+WHERE dataset_key = 'census_2021_england_oa';
+
+SELECT count(*)::integer
+INTO unmatched_variable_count
+FROM (
+  SELECT column_name
   FROM information_schema.columns
   WHERE table_schema = 'leeds'
     AND table_name = 'census_2021_england_oa'
-    AND column_name LIKE 'ts%';
-
-  IF statistic_column_count <> 467
-     OR invalid_statistic_column_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census statistic column contract failed (columns=%, invalid=%; expected 467 double-precision reviewed names)',
-      statistic_column_count,
-      invalid_statistic_column_count;
-  END IF;
-
-  SELECT
-    count(*)::integer,
-    count(DISTINCT topic_id)::integer
-  INTO variable_metadata_count, variable_topic_count
+    AND column_name LIKE 'ts%'
+) AS statistic
+FULL OUTER JOIN (
+  SELECT column_name
   FROM leeds.census_variables
-  WHERE dataset_key = 'census_2021_england_oa';
+  WHERE dataset_key = 'census_2021_england_oa'
+) AS variable
+  ON variable.column_name = statistic.column_name
+WHERE statistic.column_name IS NULL
+   OR variable.column_name IS NULL;
 
-  SELECT count(*)::integer
-  INTO unmatched_variable_count
-  FROM (
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = 'leeds'
-      AND table_name = 'census_2021_england_oa'
-      AND column_name LIKE 'ts%'
-  ) AS statistic
-  FULL OUTER JOIN (
-    SELECT column_name
-    FROM leeds.census_variables
-    WHERE dataset_key = 'census_2021_england_oa'
-  ) AS variable
-    ON variable.column_name = statistic.column_name
-  WHERE statistic.column_name IS NULL
-     OR variable.column_name IS NULL;
+IF variable_metadata_count <> 467
+   OR variable_topic_count <> 47
+   OR unmatched_variable_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census variable metadata contract failed (variables=%, topics=%, unmatched=%; expected 467/47/0)',
+    variable_metadata_count,
+    variable_topic_count,
+    unmatched_variable_count;
+END IF;
 
-  IF variable_metadata_count <> 467
-     OR variable_topic_count <> 47
-     OR unmatched_variable_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census variable metadata contract failed (variables=%, topics=%, unmatched=%; expected 467/47/0)',
-      variable_metadata_count,
-      variable_topic_count,
-      unmatched_variable_count;
-  END IF;
+SELECT
+  count(*)::integer,
+  count(*) FILTER (
+    WHERE target_table = 'census_2021_england_oa'
+      AND oa_count = 178605
+      AND variable_count = 467
+      AND geometry_repairs BETWEEN 0 AND 64
+      AND geometry_source_url =
+        'https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Output_Areas_2021_EW_BGC_V2/FeatureServer/0'
+      AND geometry_source_sha256 = expected_geometry_sha256
+      AND source_metadata #>> '{geometry,sha256}' =
+        expected_geometry_sha256
+      AND jsonb_typeof(
+        source_metadata #> '{geometry,repairs}'
+      ) = 'number'
+      AND source_metadata #>> '{geometry,repairs}' =
+        geometry_repairs::text
+  )::integer
+INTO dataset_metadata_count, matching_dataset_metadata_count
+FROM leeds.census_datasets
+WHERE dataset_key = 'census_2021_england_oa';
 
+IF dataset_metadata_count <> 1
+   OR matching_dataset_metadata_count <> 1 THEN
+  RAISE EXCEPTION
+    'Census dataset metadata contract failed (rows=%, matching=%; expected 1/1)',
+    dataset_metadata_count,
+    matching_dataset_metadata_count;
+END IF;
+
+WITH expected AS (
+  SELECT key AS topic_id, value AS source_sha256
+  FROM jsonb_each_text(expected_topic_hashes)
+),
+loaded AS (
   SELECT
-    count(*)::integer,
-    count(*) FILTER (
-      WHERE target_table = 'census_2021_england_oa'
-        AND oa_count = 178605
-        AND variable_count = 467
-        AND geometry_repairs BETWEEN 0 AND 64
-        AND geometry_source_url =
-          'https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Output_Areas_2021_EW_BGC_V2/FeatureServer/0'
-        AND geometry_source_sha256 = expected_geometry_sha256
-        AND source_metadata #>> '{geometry,sha256}' =
-          expected_geometry_sha256
-        AND jsonb_typeof(
-          source_metadata #> '{geometry,repairs}'
-        ) = 'number'
-        AND source_metadata #>> '{geometry,repairs}' =
-          geometry_repairs::text
-    )::integer
-  INTO dataset_metadata_count, matching_dataset_metadata_count
-  FROM leeds.census_datasets
-  WHERE dataset_key = 'census_2021_england_oa';
+    topic_id,
+    min(source_sha256) AS source_sha256,
+    count(DISTINCT source_sha256) AS distinct_hash_count
+  FROM leeds.census_variables
+  WHERE dataset_key = 'census_2021_england_oa'
+  GROUP BY topic_id
+)
+SELECT
+  (SELECT count(*)::integer FROM expected),
+  count(*) FILTER (
+    WHERE expected.topic_id IS NULL
+       OR loaded.topic_id IS NULL
+       OR loaded.distinct_hash_count <> 1
+       OR loaded.source_sha256 IS DISTINCT FROM expected.source_sha256
+  )::integer
+INTO
+  expected_topic_hash_count,
+  variable_topic_hash_mismatch_count
+FROM expected
+FULL OUTER JOIN loaded USING (topic_id);
 
-  IF dataset_metadata_count <> 1
-     OR matching_dataset_metadata_count <> 1 THEN
-    RAISE EXCEPTION
-      'Census dataset metadata contract failed (rows=%, matching=%; expected 1/1)',
-      dataset_metadata_count,
-      matching_dataset_metadata_count;
-  END IF;
-
-  WITH expected AS (
-    SELECT key AS topic_id, value AS source_sha256
-    FROM jsonb_each_text(expected_topic_hashes)
-  ),
-  loaded AS (
-    SELECT
-      topic_id,
-      min(source_sha256) AS source_sha256,
-      count(DISTINCT source_sha256) AS distinct_hash_count
-    FROM leeds.census_variables
-    WHERE dataset_key = 'census_2021_england_oa'
-    GROUP BY topic_id
-  )
-  SELECT
-    (SELECT count(*)::integer FROM expected),
-    count(*) FILTER (
-      WHERE expected.topic_id IS NULL
-         OR loaded.topic_id IS NULL
-         OR loaded.distinct_hash_count <> 1
-         OR loaded.source_sha256 IS DISTINCT FROM expected.source_sha256
-    )::integer
-  INTO
+IF expected_topic_hash_count <> 47
+   OR variable_topic_hash_mismatch_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census variable source hashes do not match the 47 pinned topic archives (expected_topics=%, mismatches=%)',
     expected_topic_hash_count,
-    variable_topic_hash_mismatch_count
-  FROM expected
-  FULL OUTER JOIN loaded USING (topic_id);
+    variable_topic_hash_mismatch_count;
+END IF;
 
-  IF expected_topic_hash_count <> 47
-     OR variable_topic_hash_mismatch_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census variable source hashes do not match the 47 pinned topic archives (expected_topics=%, mismatches=%)',
-      expected_topic_hash_count,
-      variable_topic_hash_mismatch_count;
-  END IF;
-
-  WITH expected AS (
-    SELECT key AS topic_id, value AS source_sha256
-    FROM jsonb_each_text(expected_topic_hashes)
-  ),
-  loaded AS (
-    SELECT
-      topic.value ->> 'topic_id' AS topic_id,
-      min(topic.value ->> 'archive_sha256') AS source_sha256,
-      count(*) AS entry_count,
-      count(
-        DISTINCT topic.value ->> 'archive_sha256'
-      ) AS distinct_hash_count
-    FROM leeds.census_datasets AS dataset
-    CROSS JOIN LATERAL jsonb_array_elements(
-      dataset.source_metadata -> 'topics'
-    ) WITH ORDINALITY AS topic(value, ordinal)
-    WHERE dataset.dataset_key = 'census_2021_england_oa'
-    GROUP BY topic.value ->> 'topic_id'
-  )
+WITH expected AS (
+  SELECT key AS topic_id, value AS source_sha256
+  FROM jsonb_each_text(expected_topic_hashes)
+),
+loaded AS (
   SELECT
-    (SELECT sum(entry_count)::integer FROM loaded),
-    count(*) FILTER (
-      WHERE expected.topic_id IS NULL
-         OR loaded.topic_id IS NULL
-         OR loaded.entry_count <> 1
-         OR loaded.distinct_hash_count <> 1
-         OR loaded.source_sha256 IS DISTINCT FROM expected.source_sha256
-    )::integer
-  INTO dataset_topic_hash_count, dataset_topic_hash_mismatch_count
-  FROM expected
-  FULL OUTER JOIN loaded USING (topic_id);
-
-  IF dataset_topic_hash_count <> 47
-     OR dataset_topic_hash_mismatch_count <> 0 THEN
-    RAISE EXCEPTION
-      'Census dataset source metadata does not match the 47 pinned topic archive hashes (topics=%, mismatches=%)',
-      dataset_topic_hash_count,
-      dataset_topic_hash_mismatch_count;
-  END IF;
-
-  SELECT count(*)::integer
-  INTO matching_last_run_count
+    topic.value ->> 'topic_id' AS topic_id,
+    min(topic.value ->> 'archive_sha256') AS source_sha256,
+    count(*) AS entry_count,
+    count(
+      DISTINCT topic.value ->> 'archive_sha256'
+    ) AS distinct_hash_count
   FROM leeds.census_datasets AS dataset
-  JOIN leeds._census_etl_runs AS run
-    ON run.run_id = dataset.last_successful_run_id
+  CROSS JOIN LATERAL jsonb_array_elements(
+    dataset.source_metadata -> 'topics'
+  ) WITH ORDINALITY AS topic(value, ordinal)
   WHERE dataset.dataset_key = 'census_2021_england_oa'
-    AND run.dataset_key = dataset.dataset_key
-    AND run.target_table = dataset.target_table
-    AND run.status = 'succeeded'
-    AND run.finished_at IS NOT NULL
-    AND run.geometry_rows = 178605
-    AND run.geometry_repairs = dataset.geometry_repairs
-    AND run.topics_loaded = 47
-    AND run.error IS NULL;
+  GROUP BY topic.value ->> 'topic_id'
+)
+SELECT
+  (SELECT sum(entry_count)::integer FROM loaded),
+  count(*) FILTER (
+    WHERE expected.topic_id IS NULL
+       OR loaded.topic_id IS NULL
+       OR loaded.entry_count <> 1
+       OR loaded.distinct_hash_count <> 1
+       OR loaded.source_sha256 IS DISTINCT FROM expected.source_sha256
+  )::integer
+INTO dataset_topic_hash_count, dataset_topic_hash_mismatch_count
+FROM expected
+FULL OUTER JOIN loaded USING (topic_id);
 
-  IF matching_last_run_count <> 1 THEN
-    RAISE EXCEPTION
-      'Census last-successful-run contract failed; expected one succeeded 178605-row, 47-topic run';
-  END IF;
+IF dataset_topic_hash_count <> 47
+   OR dataset_topic_hash_mismatch_count <> 0 THEN
+  RAISE EXCEPTION
+    'Census dataset source metadata does not match the 47 pinned topic archive hashes (topics=%, mismatches=%)',
+    dataset_topic_hash_count,
+    dataset_topic_hash_mismatch_count;
+END IF;
 
-  RAISE NOTICE
-    'leeds.census_2021_england_oa: 178605 rows, 467 variables, and 47 topics verified';
+SELECT count(*)::integer
+INTO matching_last_run_count
+FROM leeds.census_datasets AS dataset
+JOIN leeds._census_etl_runs AS run
+  ON run.run_id = dataset.last_successful_run_id
+WHERE dataset.dataset_key = 'census_2021_england_oa'
+  AND run.dataset_key = dataset.dataset_key
+  AND run.target_table = dataset.target_table
+  AND run.status = 'succeeded'
+  AND run.finished_at IS NOT NULL
+  AND run.geometry_rows = 178605
+  AND run.geometry_repairs = dataset.geometry_repairs
+  AND run.topics_loaded = 47
+  AND run.error IS NULL;
+
+IF matching_last_run_count <> 1 THEN
+  RAISE EXCEPTION
+    'Census last-successful-run contract failed; expected one succeeded 178605-row, 47-topic run';
+END IF;
+
+RAISE NOTICE
+  'leeds.census_2021_england_oa: 178605 rows, 467 variables, and 47 topics verified';
 END
 $$;
 
 SELECT
-  layers.layer_key,
-  layers.target_table,
-  layers.geometry_type,
-  layers.source_srid,
-  runs.expected_count,
-  runs.rows_seen,
-  runs.rows_deleted,
-  runs.finished_at
+layers.layer_key,
+layers.target_table,
+layers.geometry_type,
+layers.source_srid,
+runs.expected_count,
+runs.rows_seen,
+runs.rows_deleted,
+runs.finished_at
 FROM leeds._etl_layers AS layers
 JOIN leeds._etl_runs AS runs
-  ON runs.run_id = layers.last_successful_run_id
+ON runs.run_id = layers.last_successful_run_id
 WHERE runs.status = 'succeeded'
 ORDER BY layers.layer_key;
 SQL
-fi
 
 "${compose[@]}" exec -T \
   -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
@@ -2994,9 +2948,8 @@ if ((icon_count < 1)); then
 fi
 curl --fail --silent --show-error "${map_headers[@]}" "${map_url}/instance/svg/bus.svg" >/dev/null
 
-if has_bundled_database; then
-  mvt_query="$(
-    "${compose[@]}" exec -T config-ui python - <<'PY'
+mvt_query="$(
+  "${compose[@]}" exec -T config-ui python - <<'PY'
 from urllib.parse import urlencode
 
 from app import read_workspace
@@ -3005,46 +2958,45 @@ from control_api import effective_locales
 _, workspace, _ = read_workspace()
 selected = None
 for locale_key, locale in effective_locales(workspace).items():
-    layers = locale.get("layers")
-    if not isinstance(layers, dict):
-        continue
-    for layer_key, layer in layers.items():
-        if not isinstance(layer, dict) or layer.get("format") != "mvt":
-            continue
-        table = layer.get("table")
-        geom = layer.get("geom")
-        if isinstance(table, str) and table and isinstance(geom, str) and geom:
-            selected = {
-                "template": "mvt",
-                "locale": locale_key,
-                "layer": layer_key,
-                "table": table,
-                "geom": geom,
-                "x": 1015,
-                "y": 659,
-                "z": 11,
-            }
-            break
-    if selected:
-        break
+  layers = locale.get("layers")
+  if not isinstance(layers, dict):
+      continue
+  for layer_key, layer in layers.items():
+      if not isinstance(layer, dict) or layer.get("format") != "mvt":
+          continue
+      table = layer.get("table")
+      geom = layer.get("geom")
+      if isinstance(table, str) and table and isinstance(geom, str) and geom:
+          selected = {
+              "template": "mvt",
+              "locale": locale_key,
+              "layer": layer_key,
+              "table": table,
+              "geom": geom,
+              "x": 1015,
+              "y": 659,
+              "z": 11,
+          }
+          break
+  if selected:
+      break
 
 if selected:
-    print(urlencode(selected), end="")
+  print(urlencode(selected), end="")
 PY
-  )"
-  if [[ -n "${mvt_query}" ]]; then
-    mvt_file="$(mktemp)"
-    trap 'rm -f "${mvt_file}"' EXIT
-    curl --fail --silent --show-error "${map_headers[@]}" \
-      "${map_url}/api/query?${mvt_query}" \
-      --output "${mvt_file}"
-    if [[ ! -s "${mvt_file}" ]]; then
-      printf 'XYZ returned an empty MVT response for a current workspace layer.\n' >&2
-      exit 1
-    fi
-  else
-    printf 'Workspace has no database-backed MVT layer; skipped the live MVT render probe.\n'
+)"
+if [[ -n "${mvt_query}" ]]; then
+  mvt_file="$(mktemp)"
+  trap 'rm -f "${mvt_file}"' EXIT
+  curl --fail --silent --show-error "${map_headers[@]}" \
+    "${map_url}/api/query?${mvt_query}" \
+    --output "${mvt_file}"
+  if [[ ! -s "${mvt_file}" ]]; then
+    printf 'XYZ returned an empty MVT response for a current workspace layer.\n' >&2
+    exit 1
   fi
+else
+  printf 'Workspace has no database-backed MVT layer; skipped the live MVT render probe.\n'
 fi
 
 blocked_status="$(curl --silent "${map_headers[@]}" --output /dev/null --write-out '%{http_code}' "${map_url}/api/provider/file?url=../../proc/self/environ")"
@@ -3078,8 +3030,4 @@ if [[ "${internal_automation_status}" != "404" ]]; then
   exit 1
 fi
 
-if has_bundled_database; then
-  printf 'PASS: bundled PostGIS and sample data, service health, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards.\n'
-else
-  printf 'PASS: external PostGIS connectivity, service health, catalog discovery, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards. Run layer-specific visual tests for the external workspace.\n'
-fi
+printf 'PASS: bundled PostGIS and sample data, service health, public config identity, browser-runner health, shared SVG icons, XYZ, and Caddy guards.\n'

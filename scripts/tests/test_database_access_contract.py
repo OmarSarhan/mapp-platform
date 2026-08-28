@@ -897,6 +897,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
         offenders = []
         for relative_path in (
             "bin/mapp",
+            "scripts/verify.sh",
             "scripts/production_acceptance.py",
         ):
             lines = (ROOT / relative_path).read_text(
