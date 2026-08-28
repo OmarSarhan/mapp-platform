@@ -96,6 +96,19 @@ def main() -> int:
                 encoding="utf-8",
             )
 
+            # These are bind-mounted into containers that run as their own
+            # unprivileged users -- squid is uid 13 -- and write_text honours
+            # the caller umask. ./bin/mapp sets umask 077 in init_state before
+            # dispatching any subcommand, so under the wrapper every fixture
+            # lands 0600 and squid aborts with "Unable to open configuration
+            # file: (13) Permission denied". Directory mode is irrelevant: the
+            # daemon resolves the bind-mount path as root, and only the file
+            # mode is visible inside the container. Nothing here is secret.
+            for name in (
+                "squid.conf", "allowlist.txt", "index.html", "Caddyfile",
+            ):
+                (fixture / name).chmod(0o644)
+
             command(
                 "docker", "run", "--detach",
                 "--name", origin,
