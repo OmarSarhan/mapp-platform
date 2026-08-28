@@ -24,12 +24,10 @@ usage() {
     "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
-    "  etl [layer]  load sample and Census data" \
-    "  census-etl   load the reviewed England Census 2021 OA dataset" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-data --confirm remove the bundled database and reload configured ETL data" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
-    "  all          start the platform, load bundled ETL data, then verify it" \
+    "  all          start the platform, then verify it" \
     "  test         run local unit and configuration tests" \
     "  doctor [--add-missing] report .env key drift; optionally add safe defaults" \
     "  production-acceptance [options] collect redacted production readiness evidence" \
@@ -459,16 +457,6 @@ case "${deployment_environment}" in
     exit 2
     ;;
 esac
-run_sample_etl() {
-  run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl
-}
-
-run_census_etl() {
-  run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl \
-    python -m leeds_arcgis_etl.census_main \
-    --config /config/census.json
-}
-
 prepare_spatial_indexes() {
   "${compose[@]}" exec -T db sh /usr/local/bin/mapp-prepare-spatial-indexes
 }
@@ -477,13 +465,6 @@ ensure_bundled_database_upgraded() {
   run_with_buildkit_lease_retry \
     "${compose[@]}" up --detach --build --no-deps --wait db
   "${compose[@]}" exec -T db sh /usr/local/bin/mapp-upgrade-derived
-}
-
-run_all_etl() {
-  run_sample_etl
-  prepare_spatial_indexes
-  run_census_etl
-  prepare_spatial_indexes
 }
 
 edge_bindings() {
@@ -577,24 +558,6 @@ case "${1:-}" in
   reload-xyz)
     "${compose[@]}" exec -T config-ui python -c \
       'from app import WORKSPACE; from control_api import request_reload, wait_reload, workspace_fingerprint; fingerprint = workspace_fingerprint(WORKSPACE.read_bytes()); result = request_reload(fingerprint); status = wait_reload(result["requestedGeneration"], fingerprint); completed = status["completed"]; print("XYZ reload generation {} {} for workspace {}.".format(result["requestedGeneration"], "completed" if completed else "did not complete", fingerprint)); raise SystemExit(0 if completed else 1)'
-    ;;
-  etl)
-    ensure_bundled_database_upgraded
-    if [[ -n "${2:-}" ]]; then
-      run_with_buildkit_lease_retry "${compose[@]}" run --rm --build -e "ETL_LAYER=${2}" etl
-      prepare_spatial_indexes
-    else
-      run_all_etl
-    fi
-    ;;
-  census-etl)
-    if [[ -n "${2:-}" ]]; then
-      printf 'Usage: ./bin/mapp census-etl\n' >&2
-      exit 2
-    fi
-    ensure_bundled_database_upgraded
-    run_census_etl
-    prepare_spatial_indexes
     ;;
   census-check)
     if [[ -n "${3:-}" ]]; then
@@ -699,10 +662,9 @@ case "${1:-}" in
     install -m 0600 "${ROOT_DIR}/instance/workspace.seed.json" "${PREVIEW_DIR}/workspace.json"
     printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
-    run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     printf '%s\n' \
-      'Bundled database reset completed, all configured ETL sources including Census were loaded, and the seed workspace was restored.'
+      'Database reset completed and the seed workspace was restored. Spatial data lives in the source databases; reload it with ./bin/mapp demo.'
     ;;
   upgrade-derived)
     run_with_buildkit_lease_retry "${compose[@]}" build db
@@ -712,7 +674,6 @@ case "${1:-}" in
   all)
     ensure_bundled_database_upgraded
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
-    run_all_etl
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   verify)

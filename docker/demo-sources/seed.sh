@@ -29,8 +29,6 @@ compose=(
   --file "${ROOT_DIR}/compose.federated-demo.yaml"
 )
 
-BUNDLED_USER="$(dotenv_value POSTGRES_USER)"
-BUNDLED_DB="$(dotenv_value POSTGRES_DB)"
 SOURCE_USER="$(dotenv_value SOURCE_POSTGRES_USER)"
 READER_USER="$(dotenv_value SOURCE_READER_USER)"
 CENSUS_DB="$(dotenv_value CENSUS_POSTGRES_DB)"
@@ -51,18 +49,18 @@ OPS_TABLES=(
   leeds.bus_stops
   leeds.definitive_paths
   leeds.smoke_control_orders
-  leeds.planning_applications_recent
-  # Back the ETL run-record report that verify now runs against this database.
+  # Created by the ETL itself, and read by the run-record report that verify
+  # runs against this database.
   leeds._etl_layers
   leeds._etl_runs
 )
 
 seed_one() {
-  local service="$1" database="$2"
-  shift 2
+  local service="$1" database="$2" password="$3" etl_command="$4"
+  shift 4
   local tables=("$@")
 
-  printf 'Seeding %s with %d table(s)...\n' "${service}" "${#tables[@]}"
+  printf 'Loading %s from source...\n' "${service}"
 
   # The source containers install openssl and generate a certificate before
   # postgres starts, and their healthcheck is a socket-local pg_isready that
@@ -74,18 +72,18 @@ seed_one() {
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
     --command "CREATE SCHEMA IF NOT EXISTS leeds;" >/dev/null
 
-  local dump_args=()
   local table
-  for table in "${tables[@]}"; do
-    dump_args+=(--table="${table}")
-  done
-
-  "${compose[@]}" exec -T db pg_dump \
-    --username "${BUNDLED_USER}" --dbname "${BUNDLED_DB}" \
-    "${dump_args[@]}" --no-owner --no-privileges --clean --if-exists \
-    | "${compose[@]}" exec -T "${service}" psql \
-        --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" \
-        --dbname "${database}" >/dev/null
+  # The ETL loads this source database directly, over the network from the
+  # publishing authority, running as that database own administrator. MAPP does
+  # not own these servers; the identity it uses INTO them stays the read-only
+  # SOURCE_READER_USER granted below.
+  # shellcheck disable=SC2086
+  # --no-deps: the etl service declares depends_on the packaged database, which
+  # was right when it loaded that database and is wrong now it loads a source.
+  # Without it, seeding a source recreates and waits on MAPP own db container.
+  "${compose[@]}" run --rm --build --no-deps \
+    -e "DATABASE_URL=postgresql://${SOURCE_USER}:${password}@${service}:5432/${database}?sslmode=require" \
+    etl ${etl_command} >/dev/null
 
   for table in "${tables[@]}"; do
     "${compose[@]}" exec -T "${service}" psql \
@@ -151,7 +149,12 @@ SQL
   printf '  %s: %s\n' "${service}" "${counts}"
 }
 
-seed_one census-db "${CENSUS_DB}" "${CENSUS_TABLES[@]}"
-seed_one ops-db "${OPS_DB}" "${OPS_TABLES[@]}"
+# The sample layers use the ETL default entrypoint and its layers.json; the
+# census dataset has its own module and config.
+seed_one ops-db "${OPS_DB}" "$(dotenv_value OPS_POSTGRES_PASSWORD)" "" \
+  "${OPS_TABLES[@]}"
+seed_one census-db "${CENSUS_DB}" "$(dotenv_value CENSUS_POSTGRES_PASSWORD)" \
+  "python -m leeds_arcgis_etl.census_main --config /config/census.json" \
+  "${CENSUS_TABLES[@]}"
 
 printf 'Seeded both demo sources and granted %s read access.\n' "${READER_USER}"

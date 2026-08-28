@@ -821,9 +821,12 @@ class DatabaseAccessContractTests(unittest.TestCase):
             wrapper,
         )
         self.assertIn("ensure_bundled_database_upgraded()", wrapper)
+        # One definition and four call sites: up, serve --force-recreate,
+        # config-ui and all. It was six until the etl and census-etl
+        # subcommands were deleted -- nothing loads into this database now.
         self.assertGreaterEqual(
             wrapper.count("ensure_bundled_database_upgraded"),
-            6,
+            5,
         )
         self.assertIn(
             'exec -T db sh /usr/local/bin/mapp-upgrade-derived',

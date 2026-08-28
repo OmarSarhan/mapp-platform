@@ -122,7 +122,7 @@ register census "Census 2021 (federated)" CENSUS \
   '["leeds.census_2021_england_oa","leeds.census_variables"]' \
   "ONS Census 2021 open data, OGL v3."
 register ops "Leeds operational data (federated)" OPS \
-  '["leeds.bus_stops","leeds.definitive_paths","leeds.smoke_control_orders","leeds.planning_applications_recent"]' \
+  '["leeds.bus_stops","leeds.definitive_paths","leeds.smoke_control_orders"]' \
   "Leeds council open data, OGL v3."
 
 # ----------------------------------------------------------------- observe --
@@ -165,7 +165,7 @@ sync_one() {
 }
 sync_one source_census census_2021_england_oa
 sync_one source_census census_variables
-for relation in bus_stops definitive_paths smoke_control_orders planning_applications_recent; do
+for relation in bus_stops definitive_paths smoke_control_orders; do
   sync_one source_ops "${relation}"
 done
 

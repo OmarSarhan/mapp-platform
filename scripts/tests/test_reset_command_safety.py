@@ -85,13 +85,6 @@ class ResetCommandSafetyTests(unittest.TestCase):
             self.script,
         )
 
-    def test_full_bundled_etl_includes_census(self) -> None:
-        self.assertIn("run_all_etl()", self.script)
-        self.assertIn("run_sample_etl", self.script)
-        self.assertIn("run_census_etl", self.script)
-        self.assertIn("including Census", self.script)
-        self.assertNotIn("reload only configured ETL data", self.script)
-
     def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
         self.assertIn("is_buildkit_lease_failure()", self.script)
         self.assertIn("run_with_buildkit_lease_retry()", self.script)
