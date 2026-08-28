@@ -870,7 +870,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
         marker = '"${compose[@]}" exec -T config-ui python -c \'\n'
         start = source.rindex(marker) + len(marker)
         end = source.index(
-            "\n' \"${database_mode}\" \"$(dotenv_value DERIVED_DB_USER)\"",
+            "\n' \"$(dotenv_value DERIVED_DB_USER)\"",
             start,
         )
 

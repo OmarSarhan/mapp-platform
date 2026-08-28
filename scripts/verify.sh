@@ -1379,18 +1379,15 @@ fi
       WHERE login_role.rolname = current_user
     `);
     const audit = result.rows[0];
-    const declaredReader = process.argv[2];
-    const bundledReader = process.argv[3];
-    const hasBundledDatabase = process.argv[1] === "bundled"
-      || process.argv[1] === "federated";
+    const declaredReader = process.argv[1];
+    const bundledReader = process.argv[2];
     if (
       !audit
       || !audit.postgis
       || audit.currentUser !== audit.sessionUser
       || audit.currentUser !== uriUser
       || (declaredReader && audit.currentUser !== declaredReader)
-      || (hasBundledDatabase
-        && audit.currentUser !== bundledReader)
+      || audit.currentUser !== bundledReader
       || !audit.canLogin
       || audit.superuser
       || audit.canCreateDatabase
@@ -1410,14 +1407,12 @@ fi
       fail("The active DBS_MAPP session is not the required read-only runtime identity.");
     }
 
-    if (hasBundledDatabase) {
-      for (const relation of [
-        "leeds.bus_stops",
-        "leeds.definitive_paths",
-        "leeds.smoke_control_orders",
-      ]) {
-        await pool.query(`SELECT 1 FROM ${relation} LIMIT 0`);
-      }
+    for (const relation of [
+      "leeds.bus_stops",
+      "leeds.definitive_paths",
+      "leeds.smoke_control_orders",
+    ]) {
+      await pool.query(`SELECT 1 FROM ${relation} LIMIT 0`);
     }
 
     const relation = await pool.query(
@@ -1503,7 +1498,7 @@ fi
   } finally {
     await pool.end();
   }
-' "${database_mode}" "${resolved_derived_reader}" "$(dotenv_value XYZ_DB_USER)"
+' "${resolved_derived_reader}" "$(dotenv_value XYZ_DB_USER)"
 
 "${compose[@]}" exec -T config-ui python -c '
 import os
@@ -1564,8 +1559,7 @@ derived_resource_limits = {
 }
 
 
-database_mode = sys.argv[1]
-bundled_derived_role = sys.argv[2]
+bundled_derived_role = sys.argv[1]
 database_url = os.environ.get("DERIVED_DATABASE_URL", "")
 derived_role = os.environ.get("DERIVED_OWNER_ROLE", "")
 reader_role = os.environ.get("DERIVED_READER_ROLE", "")
@@ -1590,10 +1584,7 @@ if bool(federation_database_url) != bool(federation_role):
         "FEDERATION_DATABASE_URL and FEDERATION_DB_USER must either both be "
         "configured or both be empty."
     )
-# Both bundled and federated run MAPP own PostgreSQL, so both require the
-# federation provisioner URL; external does not.
-local_database = database_mode in ("bundled", "federated")
-if local_database and not federation_database_url:
+if not federation_database_url:
     fail("A local database requires FEDERATION_DATABASE_URL.")
 
 try:
@@ -2066,10 +2057,7 @@ with psycopg.connect(
             or audit["currentUser"] != uri_user
             or audit["currentUser"] != derived_role
             or audit["currentUser"] == reader_role
-            or (
-                database_mode in ("bundled", "federated")
-                and audit["currentUser"] != bundled_derived_role
-            )
+            or audit["currentUser"] != bundled_derived_role
             or not audit["canLogin"]
             or audit["superuser"]
             or audit["canCreateDatabase"]
@@ -2099,27 +2087,26 @@ with psycopg.connect(
                 "and timeout limits."
             )
 
-        if database_mode in ("bundled", "federated"):
-            for relation in (
-                "leeds.bus_stops",
-                "leeds.definitive_paths",
-                "leeds.smoke_control_orders",
-            ):
-                cursor.execute(f"SELECT 1 FROM {relation} LIMIT 0")
+        for relation in (
+            "leeds.bus_stops",
+            "leeds.definitive_paths",
+            "leeds.smoke_control_orders",
+        ):
+            cursor.execute(f"SELECT 1 FROM {relation} LIMIT 0")
+        cursor.execute(
+            "SELECT to_regclass(%s)::text AS name",
+            ("leeds.census_2021_england_oa",),
+        )
+        if cursor.fetchone()["name"]:
             cursor.execute(
-                "SELECT to_regclass(%s)::text AS name",
-                ("leeds.census_2021_england_oa",),
+                "SELECT count(*)::bigint AS row_count "
+                "FROM leeds.census_2021_england_oa"
             )
-            if cursor.fetchone()["name"]:
-                cursor.execute(
-                    "SELECT count(*)::bigint AS row_count "
-                    "FROM leeds.census_2021_england_oa"
+            if cursor.fetchone()["row_count"] != 178605:
+                fail(
+                    "The derived owner did not observe the reviewed "
+                    "Census row count."
                 )
-                if cursor.fetchone()["row_count"] != 178605:
-                    fail(
-                        "The derived owner did not observe the reviewed "
-                        "Census row count."
-                    )
 
 if federation_database_url:
     with psycopg.connect(
@@ -2912,7 +2899,7 @@ print(
     "Runtime, derived, and federation PostgreSQL identities and privileges "
     "verified."
 )
-' "${database_mode}" "$(dotenv_value DERIVED_DB_USER)"
+' "$(dotenv_value DERIVED_DB_USER)"
 
 published_http="$("${compose[@]}" port caddy 80 | tail -n 1)"
 published_http="${published_http/#0.0.0.0:/127.0.0.1:}"
