@@ -51,6 +51,20 @@ first release.
   so a demo build could report complete success with no showcase present. The
   calls now fail their pipeline, and rebuilding acknowledges the physical
   rebind that re-seeding legitimately causes.
+- `./bin/mapp reset-data` could be blocked permanently by a derived layer whose
+  semantic profile sat in `repair_required`. Nothing could move that status --
+  the repair route works from an outbox event, and a profile can be left in
+  this state with no event -- so the preflight waited out its budget and
+  failed, every run. The preflight now queues an archive for such a profile
+  rather than waiting for it, which is what clears it: an asset the catalogue
+  no longer holds answers 404, and that is recorded as delivered.
+- `./bin/mapp verify` read `leeds.bus_stops`, `leeds.definitive_paths`,
+  `leeds.smoke_control_orders` and the whole Census manifest from the packaged
+  database through the runtime reader and the derived owner. Those relations
+  moved to the source databases, so the checks could not pass on a database
+  that never had the schema -- which is what `reset-data` leaves behind. They
+  are deleted rather than retargeted; the Census assertions already run against
+  `census-db`.
 - `docker/demo-sources/seed.sh` ran `psql` against the source databases with no
   readiness wait, while those containers install openssl and generate a
   certificate before PostgreSQL starts.
