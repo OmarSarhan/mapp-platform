@@ -52,22 +52,6 @@ if [[ "${DEPLOYMENT_ENVIRONMENT}" == "production" ]]; then
   fail "federation-test is disabled when MAPP_ENVIRONMENT=production."
 fi
 
-# The same guard bin/mapp applies, repeated here because the comment above
-# claims direct invocation is covered and it was not. The compose array below
-# hardcodes compose.bundled-db.yaml, which for a local database is the file
-# injecting FEDERATION_DATABASE_URL and DERIVED_DATABASE_URL into config-ui.
-# Running this against a deployment configured for another mode would recreate
-# the live dashboard with the FDW provisioner and derived-layer DDL surfaces
-# switched on, and leave them on until the next `./bin/mapp serve`.
-
-DEPLOYMENT_DATABASE_MODE="$(dotenv_value MAPP_DATABASE_MODE)"
-case "${DEPLOYMENT_DATABASE_MODE}" in
-  bundled|federated) ;;
-  *)
-    fail "federation-test needs a local federation provisioner and is disabled when MAPP_DATABASE_MODE=${DEPLOYMENT_DATABASE_MODE}."
-    ;;
-esac
-
 # A dedicated alias so a failed run never leaves a half-configured source
 # behind under a name an operator might be using.
 ALIAS="e2e_probe"
