@@ -720,104 +720,84 @@ IF has_schema_privilege(xyz_role, 'leeds', 'CREATE')
     'Runtime reader and derived owner must not create objects in the Leeds source schema';
 END IF;
 
+END
+$$;
+
+SELECT
+layers.layer_key,
+layers.target_table,
+layers.geometry_type,
+layers.source_srid,
+runs.expected_count,
+runs.rows_seen,
+runs.rows_deleted,
+runs.finished_at
+FROM leeds._etl_layers AS layers
+JOIN leeds._etl_runs AS runs
+ON runs.run_id = layers.last_successful_run_id
+WHERE runs.status = 'succeeded'
+ORDER BY layers.layer_key;
+SQL
+
+# The census content assertions run against the database that holds the data.
+# census_config.py pins TARGET_SCHEMA to leeds and rejects any other value, so
+# the schema name is identical on both sides and every assertion below is the
+# same SQL it was when it ran against the packaged database -- only the
+# container changed. The MAPP-role ownership and grant checks that used to wrap
+# these did not move: source relations are owned by the source admin, and the
+# roles they named do not exist here.
+if [[ -n "${demo_sources}" ]]; then
+  "${compose[@]}" exec -T \
+    -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
+    -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
+    census-db sh -c \
+    'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      --set ON_ERROR_STOP=1 \
+      --set=census_geometry_sha256="$MAPP_VERIFY_CENSUS_GEOMETRY_SHA256" \
+      --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON"' <<'CENSUS_SQL'
+SELECT set_config(
+'mapp.verify.census_geometry_sha256',
+:'census_geometry_sha256',
+false
+);
+SELECT set_config(
+'mapp.verify.census_topic_hashes_json',
+:'census_topic_hashes_json',
+false
+);
+
+DO $$
+DECLARE
+census_relation regclass := to_regclass(
+  'leeds.census_2021_england_oa'
+);
+row_total bigint;
+distinct_code_count bigint;
+invalid_code_count bigint;
+invalid_geometry_count bigint;
+statistic_column_count integer;
+invalid_statistic_column_count integer;
+variable_metadata_count integer;
+variable_topic_count integer;
+unmatched_variable_count integer;
+dataset_metadata_count integer;
+dataset_topic_hash_count integer;
+dataset_topic_hash_mismatch_count integer;
+matching_dataset_metadata_count integer;
+matching_last_run_count integer;
+generated_kind text;
+expected_geometry_sha256 text :=
+  current_setting('mapp.verify.census_geometry_sha256');
+expected_topic_hashes jsonb :=
+  current_setting('mapp.verify.census_topic_hashes_json')::jsonb;
+expected_topic_hash_count integer;
+variable_topic_hash_mismatch_count integer;
+BEGIN
 IF census_relation IS NULL THEN
   RAISE NOTICE 'Optional Census relation leeds.census_2021_england_oa is absent; skipped Census verification';
   RETURN;
 END IF;
 
-FOREACH checked_relation IN ARRAY ARRAY[
-  census_relation,
-  to_regclass('leeds.census_datasets'),
-  to_regclass('leeds.census_variables'),
-  to_regclass('leeds._census_etl_runs')
-] LOOP
-  IF checked_relation IS NULL THEN
-    RAISE EXCEPTION
-      'A required Census relation or metadata relation is missing';
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_class AS relation
-    JOIN pg_catalog.pg_roles AS owner
-      ON owner.oid = relation.relowner
-    WHERE relation.oid = checked_relation
-      AND owner.rolname = etl_role
-  ) THEN
-    RAISE EXCEPTION
-      'ETL role must own Census relation %',
-      checked_relation;
-  END IF;
-  IF has_schema_privilege(xyz_role, 'leeds', 'USAGE') IS NOT TRUE
-     OR has_table_privilege(
-       xyz_role,
-       checked_relation,
-       'SELECT'
-     ) IS NOT TRUE
-     OR has_schema_privilege(derived_role, 'leeds', 'USAGE') IS NOT TRUE
-     OR has_table_privilege(
-       derived_role,
-       checked_relation,
-       'SELECT'
-     ) IS NOT TRUE THEN
-    RAISE EXCEPTION
-      'Runtime reader and derived owner must both read %',
-      checked_relation;
-  END IF;
-  IF has_table_privilege(xyz_role, checked_relation, 'INSERT')
-     OR has_table_privilege(xyz_role, checked_relation, 'UPDATE')
-     OR has_table_privilege(xyz_role, checked_relation, 'DELETE')
-     OR has_table_privilege(xyz_role, checked_relation, 'TRUNCATE')
-     OR has_table_privilege(xyz_role, checked_relation, 'REFERENCES')
-     OR has_table_privilege(xyz_role, checked_relation, 'TRIGGER')
-     OR has_table_privilege(derived_role, checked_relation, 'INSERT')
-     OR has_table_privilege(derived_role, checked_relation, 'UPDATE')
-     OR has_table_privilege(derived_role, checked_relation, 'DELETE')
-     OR has_table_privilege(derived_role, checked_relation, 'TRUNCATE')
-     OR has_table_privilege(
-       derived_role,
-       checked_relation,
-       'REFERENCES'
-     )
-     OR has_table_privilege(
-       derived_role,
-       checked_relation,
-       'TRIGGER'
-     )
-     OR has_any_column_privilege(
-       xyz_role,
-       checked_relation,
-       'INSERT'
-     )
-     OR has_any_column_privilege(
-       xyz_role,
-       checked_relation,
-       'UPDATE'
-     )
-     OR has_any_column_privilege(
-       xyz_role,
-       checked_relation,
-       'REFERENCES'
-     )
-     OR has_any_column_privilege(
-       derived_role,
-       checked_relation,
-       'INSERT'
-     )
-     OR has_any_column_privilege(
-       derived_role,
-       checked_relation,
-       'UPDATE'
-     )
-     OR has_any_column_privilege(
-       derived_role,
-       checked_relation,
-       'REFERENCES'
-     ) THEN
-    RAISE EXCEPTION
-      'Runtime reader and derived owner must not mutate Census relation %',
-      checked_relation;
-  END IF;
-END LOOP;
 
 SELECT
   count(*)::bigint,
@@ -1058,22 +1038,8 @@ RAISE NOTICE
   'leeds.census_2021_england_oa: 178605 rows, 467 variables, and 47 topics verified';
 END
 $$;
-
-SELECT
-layers.layer_key,
-layers.target_table,
-layers.geometry_type,
-layers.source_srid,
-runs.expected_count,
-runs.rows_seen,
-runs.rows_deleted,
-runs.finished_at
-FROM leeds._etl_layers AS layers
-JOIN leeds._etl_runs AS runs
-ON runs.run_id = layers.last_successful_run_id
-WHERE runs.status = 'succeeded'
-ORDER BY layers.layer_key;
-SQL
+CENSUS_SQL
+fi
 
 "${compose[@]}" exec -T \
   -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \

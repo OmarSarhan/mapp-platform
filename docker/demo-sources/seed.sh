@@ -43,6 +43,9 @@ CENSUS_TABLES=(
   leeds.census_2021_england_oa
   leeds.census_variables
   leeds.census_datasets
+  # The run-bookkeeping table backs the last-successful-run contract that
+  # verify now asserts against this database rather than the packaged one.
+  leeds._census_etl_runs
 )
 OPS_TABLES=(
   leeds.bus_stops

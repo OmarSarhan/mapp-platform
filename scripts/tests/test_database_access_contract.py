@@ -590,7 +590,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "defaults.defaclobjtype = 'r'",
             "Bundled database CONNECT and TEMPORARY must be revoked from PUBLIC",
             "Runtime reader and derived owner defaults must not permit sequence mutation",
-            "Runtime reader and derived owner must both read %",
             'AS "canUseFdw"',
             'AS "canCreateSchema"',
             'AS "canCreateDatabaseObject"',
