@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production_acceptance import (
+    ROOT,
+    compose_command,
     environment_checks,
     rehearsal_check,
     write_evidence,
@@ -18,7 +20,6 @@ def valid_environment(path: Path) -> None:
         "\n".join(
             (
                 "MAPP_ENVIRONMENT=production",
-                "MAPP_DATABASE_MODE=bundled",
                 "PRODUCTION_MAP_SITE=https://maps.company.co.uk",
                 "PRODUCTION_CONFIG_SITE=https://config.company.co.uk",
                 "PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui",
@@ -38,6 +39,21 @@ def valid_environment(path: Path) -> None:
 
 
 class ProductionAcceptanceTests(unittest.TestCase):
+    def test_the_bundled_database_is_always_in_the_verified_model(self):
+        """An empty values mapping must still resolve the database overlay.
+
+        This is the shape acceptance sees once MAPP_DATABASE_MODE is gone from
+        .env: any mode lookup returns None, and a lookup-guarded overlay would
+        drop out silently, leaving production acceptance reporting green over a
+        model with no database service in it.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / ".env"
+            environment.write_text("", encoding="utf-8")
+            command = compose_command(environment, {})
+
+        self.assertIn(str(ROOT / "compose.bundled-db.yaml"), command)
+
     def test_environment_is_validated_without_exposing_values(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = Path(directory) / ".env"
