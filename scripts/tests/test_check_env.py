@@ -29,6 +29,31 @@ class CheckEnvironmentTests(unittest.TestCase):
         )
         self.assertEqual(placeholders, generated)
 
+    def test_init_rejects_an_unknown_argument_without_writing_anything(self):
+        """init took no arguments and silently ignored any it was given.
+
+        Now that --demo changes what the file says, a typo must not be
+        swallowed: an operator who writes --dem0 should be told, not handed a
+        non-demo install that looks like a demo one.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / ".env"
+            process_environment = os.environ.copy()
+            process_environment["MAPP_ENV_FILE"] = str(environment)
+
+            result = subprocess.run(
+                [ROOT / "bin/mapp", "init", "--dem0"],
+                cwd=ROOT,
+                env=process_environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("init [--demo]", result.stderr)
+        self.assertFalse(environment.exists())
+
     def test_add_missing_defaults_generates_secret_placeholders(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

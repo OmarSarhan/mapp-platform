@@ -15,7 +15,7 @@ usage() {
   printf '%s\n' \
     "Usage: ./bin/mapp <command>" \
     "" \
-    "  init         create a private .env from .env.example" \
+    "  init [--demo] create a private .env from .env.example" \
     "  up [--force-recreate] build/start the database and platform services" \
     "  serve [--force-recreate] start platform services without running bundled ETL" \
     "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
@@ -46,7 +46,11 @@ usage() {
   printf '%s\n' \
     "" \
     "Set MAPP_ENVIRONMENT=production in .env to include compose.production.yaml and" \
-    "enforce production-only HTTPS host settings for every wrapper command."
+    "enforce production-only HTTPS host settings for every wrapper command." \
+    "" \
+    "Set MAPP_DEMO_SOURCES in .env, or run init --demo, to include" \
+    "compose.federated-demo.yaml and start the two Leeds source databases." \
+    "Populate them with ./bin/mapp demo."
 }
 
 require_docker() {
@@ -264,7 +268,40 @@ init_state() {
   fi
 }
 
+# Every one of these is required-variable syntax in compose.federated-demo.yaml,
+# so turning the demo on without them breaks every later subcommand -- including
+# down, ps and logs. Refuse rather than let an operator brick their teardown by
+# switching a demo on.
+enable_demo_sources() {
+  local key
+  local -a missing=()
+  for key in \
+    CENSUS_POSTGRES_DB CENSUS_POSTGRES_PASSWORD \
+    OPS_POSTGRES_DB OPS_POSTGRES_PASSWORD \
+    SOURCE_POSTGRES_USER SOURCE_READER_USER SOURCE_READER_PASSWORD \
+    FEDERATION_DBS_CENSUS FEDERATION_DBS_OPS
+  do
+    if [[ -z "$(dotenv_value "${key}")" ]]; then
+      missing+=("${key}")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf 'The demo sources need settings missing from %s: %s\n' \
+      "${ENV_FILE}" "${missing[*]}" >&2
+    printf 'Run ./bin/mapp doctor --add-missing, then retry.\n' >&2
+    exit 2
+  fi
+  if grep -q '^MAPP_DEMO_SOURCES=' "${ENV_FILE}"; then
+    sed -i 's/^MAPP_DEMO_SOURCES=.*/MAPP_DEMO_SOURCES=leeds/' "${ENV_FILE}"
+  else
+    printf 'MAPP_DEMO_SOURCES=leeds\n' >>"${ENV_FILE}"
+  fi
+  printf 'Enabled the demo sources in %s. Populate them with ./bin/mapp demo.\n' \
+    "${ENV_FILE}"
+}
+
 init_env() {
+  local demo_flag="${1:-}"
   init_state
   if [[ ! -f "${CONTROL_DIR}/auth.json" ]]; then
     command -v openssl >/dev/null 2>&1 || {
@@ -278,6 +315,10 @@ init_env() {
           --password-stdin
   fi
   if [[ -e "${ENV_FILE}" ]]; then
+    if [[ "${demo_flag}" == "--demo" ]]; then
+      enable_demo_sources
+      return
+    fi
     printf 'Initialization skipped: %s already exists and was left unchanged.\n' "${ENV_FILE}"
     return
   fi
@@ -293,26 +334,34 @@ init_env() {
   }
 
   umask 077
-  sed \
-    -e "s/CHANGEME_POSTGRES/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_ETL/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_DERIVED/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_FEDERATION/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_SOURCE_POSTGRES/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_SOURCE_READER/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_CENSUS_POSTGRES/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_OPS_POSTGRES/$(openssl rand -hex 24)/" \
-    -e "s/CHANGEME_SEMANTIC/$(openssl rand -hex 32)/" \
-    -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/" \
-    -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/" \
-    "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
+  local -a template_edits=(
+    -e "s/CHANGEME_POSTGRES/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_ETL/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_XYZ/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_DERIVED/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_FEDERATION/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_SOURCE_POSTGRES/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_SOURCE_READER/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_CENSUS_POSTGRES/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_OPS_POSTGRES/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_SEMANTIC/$(openssl rand -hex 32)/"
+    -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/"
+    -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/"
+  )
+  if [[ "${demo_flag}" == "--demo" ]]; then
+    template_edits+=(-e "s/^MAPP_DEMO_SOURCES=.*/MAPP_DEMO_SOURCES=leeds/")
+  fi
+  sed "${template_edits[@]}" "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
   printf 'Created %s with URL-safe local passwords.\n' "${ENV_FILE}"
 }
 
 if [[ "${1:-}" == "init" ]]; then
-  init_env
+  if [[ -n "${3:-}" ]] || [[ -n "${2:-}" && "${2}" != "--demo" ]]; then
+    printf 'Usage: ./bin/mapp init [--demo]\n' >&2
+    exit 2
+  fi
+  init_env "${2:-}"
   exit 0
 fi
 
