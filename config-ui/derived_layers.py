@@ -3869,6 +3869,36 @@ class DerivedLayerStore:
             ))
             return True
 
+    def requeue_reset_semantic_repairs(self) -> list[str]:
+        """Re-queue repair_required archive events during owned reset recovery.
+
+        Without this, reset recovery deadlocks. reset-data holds a maintenance
+        gate while it archives; if an archive fails the event becomes
+        repair_required, recovery refuses to finish while any such event
+        exists, and repair_semantic_profile -- the operator route out -- is
+        itself refused by the gate reset-data is still holding.
+
+        Scoped deliberately to archive events only; the caller establishes
+        gate ownership first. A failed register or replace is a different
+        problem and still needs a human.
+        """
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA,))
+            cur.execute(sql.SQL("""
+                UPDATE {}._semantic_outbox
+                SET status = 'pending',
+                    attempts = 0,
+                    available_at = clock_timestamp(),
+                    last_error = NULL,
+                    claim_id = NULL,
+                    claimed_until = NULL,
+                    updated_at = clock_timestamp()
+                WHERE status = 'repair_required'
+                  AND event_type = 'archive'
+                RETURNING payload #>> '{{generated,name}}' AS name
+            """).format(sql.Identifier(SCHEMA)))
+            return [row["name"] for row in cur.fetchall() if row["name"]]
+
     def repair_semantic_profile(self, name: str) -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")

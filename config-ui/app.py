@@ -1034,6 +1034,29 @@ def validate_semantic_event_ack(
     return revision
 
 
+def semantic_archive_already_absent(event: dict, exc: Exception) -> bool:
+    """Is this an archive whose target the catalogue does not hold?
+
+    Archive is idempotent by intent: the event asks for the asset to be gone,
+    and a 404 says it already is. Every other 4xx stays permanent.
+    """
+    if not isinstance(exc, SemanticClientError):
+        return False
+    if exc.status != HTTPStatus.NOT_FOUND:
+        return False
+    payload = event.get("payload")
+    event_type = event.get("type") or (payload or {}).get("type")
+    if event_type != "archive":
+        return False
+    payload_body = getattr(exc, "payload", None) or {}
+    # The service nests its error body: {"error": {"code": ..., ...}}. Read the
+    # flat form too, which is what the client raises for locally-built errors.
+    code = payload_body.get("code") or (
+        payload_body.get("error") or {}
+    ).get("code")
+    return code in {"asset_not_found", "semantic.asset_not_found"}
+
+
 def drain_semantic_outbox(limit: int = 50) -> dict:
     result = {"delivered": 0, "retried": 0, "repairRequired": 0}
     if not DERIVED or not SEMANTIC:
@@ -1068,6 +1091,23 @@ def drain_semantic_outbox(limit: int = 50) -> dict:
                     result["delivered"] += 1
             except Exception as exc:
                 attempts = int(event.get("attempts") or 0) + 1
+                if semantic_archive_already_absent(event, exc):
+                    # Archiving an asset the catalogue does not hold has
+                    # already achieved what the event asks for. Treating that
+                    # 404 as a permanent failure strands the event in
+                    # repair_required, and because reset-data refuses to run
+                    # while any such event exists, it locks the deployment out
+                    # of resetting with no operator route back.
+                    if DERIVED.mark_semantic_delivered(
+                        event["eventId"],
+                        event["claimId"],
+                        current_semantic_revision(
+                            str((event.get("payload") or {}).get("actor")
+                                or "system")
+                        ),
+                    ):
+                        result["delivered"] += 1
+                    continue
                 permanent = (
                     isinstance(exc, SemanticClientError)
                     and exc.status is not None
@@ -1568,6 +1608,14 @@ def recover_interrupted_reset_semantics(
             "profiles": [],
             "gateOwned": gate_owned,
         }
+    # An archive that failed because the catalogue never held the asset is now
+    # delivered rather than repaired, but an event stranded before that fix --
+    # or by a genuinely transient failure -- still blocks this loop forever,
+    # and repair_semantic_profile cannot clear it because reset-data is still
+    # holding the maintenance gate. Re-queue archives once, here, where gate
+    # ownership has already been established.
+    DERIVED.requeue_reset_semantic_repairs()
+
     deadline = time.monotonic() + timeout_seconds
     while True:
         drain_semantic_outbox()
