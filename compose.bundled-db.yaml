@@ -1,7 +1,7 @@
-# Bundled sample-data overlay. The supported wrapper includes this file in the
-# local-database modes, so when MAPP_DATABASE_MODE is bundled or federated.
-# External mode has no local database or ETL service in its resolved Compose
-# model.
+# The packaged database overlay. The supported wrapper always includes this
+# file: MAPP ships its own PostgreSQL, which holds the derived layers, the
+# federation registry and the control plane. Spatial source data lives in
+# separate databases reached over postgres_fdw.
 services:
   db:
     image: ${POSTGIS_IMAGE:-mapp-postgis-h3:17-3.5-4.2.3}

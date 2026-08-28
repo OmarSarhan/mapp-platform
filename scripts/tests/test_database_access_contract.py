@@ -899,6 +899,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "bin/mapp",
             "scripts/verify.sh",
             "scripts/production_acceptance.py",
+            "compose.yaml",
+            ".env.example",
         ):
             lines = (ROOT / relative_path).read_text(
                 encoding="utf-8"

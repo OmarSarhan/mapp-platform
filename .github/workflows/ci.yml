@@ -83,7 +83,6 @@ jobs:
             | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="1234:2345"; assert all(services[name]["user"] == expected for name in ("xyz","config-ui","browser-runner")); assert services["xyz"]["environment"]["DBS_MAPP"] == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" in services["xyz"]["depends_on"] and "db" in services["config-ui"]["depends_on"]'
           docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml -f compose.db-port.yaml config --quiet
           DBS_MAPP='postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require' \
-            MAPP_DATABASE_MODE=external \
             docker compose --env-file /dev/null -f compose.yaml config --format json \
             | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=require"; assert services["xyz"]["environment"]["DBS_MAPP"] == expected == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" not in services and "etl" not in services; assert "db" not in services["xyz"].get("depends_on", {}); assert set(services["config-ui"].get("depends_on", {})) == {"semantic-service"}'
           export PRODUCTION_MAP_SITE=https://maps.company.co.uk
@@ -96,5 +95,4 @@ jobs:
           python scripts/validate_production_env.py --environment .env.example
           docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml -f compose.production.yaml config --quiet
           DBS_MAPP='postgresql://reader:encoded@postgis.internal.example:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt' \
-            MAPP_DATABASE_MODE=external \
             docker compose --env-file /dev/null -f compose.yaml -f compose.production.yaml config --quiet
