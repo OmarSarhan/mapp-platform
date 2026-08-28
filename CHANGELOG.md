@@ -22,6 +22,14 @@ first release.
 
 ### Added
 
+- Added `MAPP_DEMO_SOURCES` and `./bin/mapp init --demo`, which turn the
+  two-source Leeds showcase on for a deployment. Every wrapper command then
+  applies `compose.federated-demo.yaml` and starts `census-db` and `ops-db`
+  alongside the platform, and `./bin/mapp demo` seeds both source databases and
+  publishes the map layers built from them. Existing installs will see
+  `./bin/mapp doctor` report `MAPP_DEMO_SOURCES` as missing until
+  `./bin/mapp doctor --add-missing` adds it; the added value is empty, which is
+  the non-demo setting.
 - `./bin/mapp verify` now reports an absent `federation` registry schema as its
   own failure, naming the `CREATE SCHEMA` statement that fixes it, rather than
   aborting the audit with `invalid_schema_name`.
