@@ -30,6 +30,24 @@ first release.
   `./bin/mapp doctor` report `MAPP_DEMO_SOURCES` as missing until
   `./bin/mapp doctor --add-missing` adds it; the added value is empty, which is
   the non-demo setting.
+
+### Fixed
+
+- `docker/demo-sources/layers.sh` profiled the exposed relations before
+  provisioning them. Profiling reads the `source_<alias>` foreign tables that
+  provisioning creates, so the step could never have succeeded on a first run.
+  It failed silently because every call used `curl -sS` without `--fail` and
+  piped the response into a helper that printed the error code and exited 0 --
+  so a demo build could report complete success with no showcase present. The
+  calls now fail their pipeline, and rebuilding acknowledges the physical
+  rebind that re-seeding legitimately causes.
+- `docker/demo-sources/seed.sh` ran `psql` against the source databases with no
+  readiness wait, while those containers install openssl and generate a
+  certificate before PostgreSQL starts.
+- `./bin/mapp` and `./bin/mapp verify` now apply `compose.federation-test.yaml`
+  when its connection reference is configured, so recreating `config-ui` no
+  longer strips `FEDERATION_DBS_LEEDS_EXT` and leaves aliases using it
+  unverifiable.
 - `./bin/mapp verify` now reports an absent `federation` registry schema as its
   own failure, naming the `CREATE SCHEMA` statement that fixes it, rather than
   aborting the audit with `invalid_schema_name`.
