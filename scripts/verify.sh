@@ -339,31 +339,6 @@ SELECT set_config(
 false
 );
 
-DO $$
-DECLARE
-mismatch_count integer;
-BEGIN
-SELECT count(*) INTO mismatch_count
-FROM (VALUES
-  ('bus_stops', 'created_at', 'timestamp with time zone'),
-  ('definitive_paths', 'length_metres', 'double precision'),
-  ('smoke_control_orders', 'source_id', 'integer'),
-  ('smoke_control_orders', 'description', 'text'),
-  ('smoke_control_orders', 'area_square_metres', 'double precision'),
-  ('smoke_control_orders', 'registered_at', 'timestamp with time zone')
-) AS expected(table_name, column_name, data_type)
-LEFT JOIN information_schema.columns actual
-  ON actual.table_schema = 'leeds'
- AND actual.table_name = expected.table_name
- AND actual.column_name = expected.column_name
- AND actual.data_type = expected.data_type
-WHERE actual.column_name IS NULL;
-
-IF mismatch_count <> 0 THEN
-  RAISE EXCEPTION '% representative typed ETL columns are missing or mismatched', mismatch_count;
-END IF;
-END
-$$;
 
 DO $$
 DECLARE
@@ -430,38 +405,6 @@ END IF;
 END
 $$;
 
-DO $$
-DECLARE
-relation text;
-row_total bigint;
-bad_geom bigint;
-BEGIN
-FOREACH relation IN ARRAY ARRAY[
-  'leeds.bus_stops',
-  'leeds.definitive_paths',
-  'leeds.smoke_control_orders'
-] LOOP
-  IF to_regclass(relation) IS NULL THEN
-    RAISE EXCEPTION 'Missing ETL relation: %', relation;
-  END IF;
-
-  EXECUTE format('SELECT count(*) FROM %s', relation) INTO row_total;
-  IF row_total = 0 THEN
-    RAISE EXCEPTION 'ETL relation is empty: %', relation;
-  END IF;
-
-  EXECUTE format(
-    'SELECT count(*) FROM %s WHERE geom IS NOT NULL AND (ST_SRID(geom) <> 4326 OR ST_SRID(geom_3857) <> 3857 OR NOT ST_IsValid(geom))',
-    relation
-  ) INTO bad_geom;
-  IF bad_geom <> 0 THEN
-    RAISE EXCEPTION 'Invalid geometry/SRID rows in %: %', relation, bad_geom;
-  END IF;
-
-  RAISE NOTICE '%: % rows verified', relation, row_total;
-END LOOP;
-END
-$$;
 
 DO $$
 DECLARE
@@ -723,20 +666,6 @@ END IF;
 END
 $$;
 
-SELECT
-layers.layer_key,
-layers.target_table,
-layers.geometry_type,
-layers.source_srid,
-runs.expected_count,
-runs.rows_seen,
-runs.rows_deleted,
-runs.finished_at
-FROM leeds._etl_layers AS layers
-JOIN leeds._etl_runs AS runs
-ON runs.run_id = layers.last_successful_run_id
-WHERE runs.status = 'succeeded'
-ORDER BY layers.layer_key;
 SQL
 
 # The census content assertions run against the database that holds the data.
@@ -1039,6 +968,90 @@ RAISE NOTICE
 END
 $$;
 CENSUS_SQL
+fi
+
+# The sample-layer assertions run against the database that holds those layers.
+# Both blocks are portable as they stand: they name only leeds relations and
+# information_schema, never a MAPP role, so nothing had to be dropped to move
+# them.
+if [[ -n "${demo_sources}" ]]; then
+  "${compose[@]}" exec -T ops-db sh -c \
+    'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      --set ON_ERROR_STOP=1' <<'OPS_SQL'
+DO $$
+DECLARE
+mismatch_count integer;
+BEGIN
+SELECT count(*) INTO mismatch_count
+FROM (VALUES
+  ('bus_stops', 'created_at', 'timestamp with time zone'),
+  ('definitive_paths', 'length_metres', 'double precision'),
+  ('smoke_control_orders', 'source_id', 'integer'),
+  ('smoke_control_orders', 'description', 'text'),
+  ('smoke_control_orders', 'area_square_metres', 'double precision'),
+  ('smoke_control_orders', 'registered_at', 'timestamp with time zone')
+) AS expected(table_name, column_name, data_type)
+LEFT JOIN information_schema.columns actual
+  ON actual.table_schema = 'leeds'
+ AND actual.table_name = expected.table_name
+ AND actual.column_name = expected.column_name
+ AND actual.data_type = expected.data_type
+WHERE actual.column_name IS NULL;
+
+IF mismatch_count <> 0 THEN
+  RAISE EXCEPTION '% representative typed ETL columns are missing or mismatched', mismatch_count;
+END IF;
+END
+$$;
+
+DO $$
+DECLARE
+relation text;
+row_total bigint;
+bad_geom bigint;
+BEGIN
+FOREACH relation IN ARRAY ARRAY[
+  'leeds.bus_stops',
+  'leeds.definitive_paths',
+  'leeds.smoke_control_orders'
+] LOOP
+  IF to_regclass(relation) IS NULL THEN
+    RAISE EXCEPTION 'Missing ETL relation: %', relation;
+  END IF;
+
+  EXECUTE format('SELECT count(*) FROM %s', relation) INTO row_total;
+  IF row_total = 0 THEN
+    RAISE EXCEPTION 'ETL relation is empty: %', relation;
+  END IF;
+
+  EXECUTE format(
+    'SELECT count(*) FROM %s WHERE geom IS NOT NULL AND (ST_SRID(geom) <> 4326 OR ST_SRID(geom_3857) <> 3857 OR NOT ST_IsValid(geom))',
+    relation
+  ) INTO bad_geom;
+  IF bad_geom <> 0 THEN
+    RAISE EXCEPTION 'Invalid geometry/SRID rows in %: %', relation, bad_geom;
+  END IF;
+
+  RAISE NOTICE '%: % rows verified', relation, row_total;
+END LOOP;
+END
+$$;
+
+SELECT
+layers.layer_key,
+layers.target_table,
+layers.geometry_type,
+layers.source_srid,
+runs.expected_count,
+runs.rows_seen,
+runs.rows_deleted,
+runs.finished_at
+FROM leeds._etl_layers AS layers
+JOIN leeds._etl_runs AS runs
+ON runs.run_id = layers.last_successful_run_id
+WHERE runs.status = 'succeeded'
+ORDER BY layers.layer_key;
+OPS_SQL
 fi
 
 "${compose[@]}" exec -T \

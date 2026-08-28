@@ -52,6 +52,9 @@ OPS_TABLES=(
   leeds.definitive_paths
   leeds.smoke_control_orders
   leeds.planning_applications_recent
+  # Back the ETL run-record report that verify now runs against this database.
+  leeds._etl_layers
+  leeds._etl_runs
 )
 
 seed_one() {
