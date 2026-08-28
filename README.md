@@ -54,8 +54,6 @@ var/                              ignored mutable runtime state
 │   └── artifacts/               visual reports and screenshots
 ├── preview/
 │   └── workspace.json           private proposal-preview workspace
-├── semantic/
-│   └── semantic.sqlite3         generated and curated semantic catalog
 ├── reload/                       narrow live XYZ reload coordination
 └── preview-reload/               isolated preview XYZ reload coordination
 ```
@@ -75,8 +73,9 @@ The intended mount boundary is:
 - Configuration service: live and preview workspaces, control state, and both
   reload channels read/write; public SVGs read-only; private access to the
   semantic service.
-- Semantic service: only `var/semantic` read/write; no database credential or
-  public network.
+- Semantic service: no mounts and no public network. Its catalog is the
+  `semantic` schema in the packaged database, reached through one read-only
+  role and one role that owns that schema and nothing else.
 - Browser runner: only `var/control/artifacts` read/write.
 - ETL: only `instance/etl` read-only.
 

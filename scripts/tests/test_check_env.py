@@ -21,9 +21,14 @@ class CheckEnvironmentTests(unittest.TestCase):
         placeholders = set(
             re.findall(r"=(CHANGEME_[A-Z0-9_]+)$", template, re.MULTILINE)
         )
+        # The trailing $ is required, not incidental: CHANGEME_SEMANTIC is a
+        # prefix of CHANGEME_SEMANTIC_CRUD and CHANGEME_SEMANTIC_READER, and
+        # an unanchored expression rewrote their heads and left a password of
+        # <hex>_CRUD. Requiring the anchor here means a new placeholder that
+        # collides with an existing one fails this test rather than shipping.
         generated = set(
             re.findall(
-                r's/(CHANGEME_[A-Z0-9_]+)/\$\(openssl rand -hex \d+\)/',
+                r's/(CHANGEME_[A-Z0-9_]+)\$/\$\(openssl rand -hex \d+\)/',
                 init_env,
             )
         )

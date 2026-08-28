@@ -35,6 +35,8 @@ reject_database_environment_overrides() {
     DERIVED_DB_USER DERIVED_DB_PASSWORD DERIVED_DATABASE_URL \
     DERIVED_OWNER_ROLE DERIVED_READER_ROLE \
     FEDERATION_DB_USER FEDERATION_DB_PASSWORD FEDERATION_DATABASE_URL \
+    SEMANTIC_DB_USER SEMANTIC_DB_PASSWORD SEMANTIC_DATABASE_URL \
+    SEMANTIC_READER_DB_USER SEMANTIC_READER_DB_PASSWORD SEMANTIC_READER_DATABASE_URL \
     SOURCE_POSTGRES_DB SOURCE_POSTGRES_USER SOURCE_POSTGRES_PASSWORD \
     SOURCE_READER_USER SOURCE_READER_PASSWORD
   do
@@ -161,6 +163,22 @@ resolved_federation_role="$(
   "${compose[@]}" config --format json \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"].get("FEDERATION_DB_USER", ""), end="")'
 )"
+resolved_semantic_dbs="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["semantic-service"]["environment"]["SEMANTIC_DATABASE_URL"], end="")'
+)"
+resolved_semantic_reader_dbs="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["semantic-service"]["environment"]["SEMANTIC_READER_DATABASE_URL"], end="")'
+)"
+if [[ -z "${resolved_semantic_dbs}" || -z "${resolved_semantic_reader_dbs}" ]]; then
+  printf 'SEMANTIC_DATABASE_URL and SEMANTIC_READER_DATABASE_URL are required with a local database.\n' >&2
+  exit 2
+fi
+if [[ "${resolved_semantic_dbs}" == "${resolved_semantic_reader_dbs}" ]]; then
+  printf 'SEMANTIC_DATABASE_URL and SEMANTIC_READER_DATABASE_URL must be distinct connections: the reader is the read-only backstop for the CRUD role.\n' >&2
+  exit 2
+fi
 if [[ -z "${resolved_derived_dbs}" \
       && ( -n "${resolved_derived_owner}" || -n "${resolved_derived_reader}" ) ]] \
   || [[ -n "${resolved_derived_dbs}" \
@@ -282,6 +300,29 @@ if [[ "${running_federation_role}" != "${resolved_federation_role}" ]]; then
   printf 'config-ui is not running with the FEDERATION_DB_USER value resolved from the current environment. Recreate the service before verification.\n' >&2
   exit 1
 fi
+running_semantic_dbs="$(
+  "${compose[@]}" exec -T semantic-service sh -c \
+    'printf %s "$SEMANTIC_DATABASE_URL"'
+)"
+if [[ "${running_semantic_dbs}" != "${resolved_semantic_dbs}" ]]; then
+  printf 'semantic-service is not running with the SEMANTIC_DATABASE_URL value resolved from the current environment. Recreate the service before verification.\n' >&2
+  exit 1
+fi
+running_semantic_reader_dbs="$(
+  "${compose[@]}" exec -T semantic-service sh -c \
+    'printf %s "$SEMANTIC_READER_DATABASE_URL"'
+)"
+if [[ "${running_semantic_reader_dbs}" != "${resolved_semantic_reader_dbs}" ]]; then
+  printf 'semantic-service is not running with the SEMANTIC_READER_DATABASE_URL value resolved from the current environment. Recreate the service before verification.\n' >&2
+  exit 1
+fi
+running_semantic_state="$(
+  "${compose[@]}" exec -T semantic-service sh -c 'printf %s "${STATE_DIR-}"'
+)"
+if [[ -n "${running_semantic_state}" ]]; then
+  printf 'semantic-service is still running with STATE_DIR set. The catalogue lives in the packaged database now; recreate the service before verification.\n' >&2
+  exit 1
+fi
 
 plugin_hashes() {
   local service="$1" root="$2"
@@ -309,12 +350,17 @@ fi
 
 "${compose[@]}" exec -T db \
   sh /usr/local/bin/mapp-prepare-spatial-indexes check
-"${compose[@]}" exec -T db sh -c \
+"${compose[@]}" exec -T \
+  -e "SEMANTIC_DB_USER=$(dotenv_value SEMANTIC_DB_USER)" \
+  -e "SEMANTIC_READER_DB_USER=$(dotenv_value SEMANTIC_READER_DB_USER)" \
+  db sh -c \
   'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
     --set ON_ERROR_STOP=1 \
     --set=etl_db_user="$ETL_DB_USER" \
     --set=xyz_db_user="$XYZ_DB_USER" \
-    --set=derived_db_user="$DERIVED_DB_USER"' <<'SQL'
+    --set=derived_db_user="$DERIVED_DB_USER" \
+    --set=semantic_db_user="$SEMANTIC_DB_USER" \
+    --set=semantic_reader_db_user="$SEMANTIC_READER_DB_USER"' <<'SQL'
 SELECT postgis_full_version();
 SELECT set_config('mapp.verify.etl_db_user', :'etl_db_user', false);
 SELECT set_config('mapp.verify.xyz_db_user', :'xyz_db_user', false);
@@ -546,6 +592,123 @@ END IF;
 END
 $$;
 
+
+SELECT set_config(
+$$mapp.verify.semantic_db_user$$, :'semantic_db_user', false
+);
+SELECT set_config(
+$$mapp.verify.semantic_reader_db_user$$, :'semantic_reader_db_user', false
+);
+
+-- The semantic catalogue lives in this database now, reached by two login
+-- roles rather than by a file the service alone could open. Before the move
+-- semantic-service held no credential and had no route to the database, so
+-- its containment was topological and needed no audit. It is now entirely
+-- grant-based, and a later edit to 10-roles.sh could loosen it silently.
+-- That is why this block exists rather than being a nice-to-have.
+DO $mapp_semantic$
+DECLARE
+crud_role text := current_setting($$mapp.verify.semantic_db_user$$);
+reader_role text := current_setting($$mapp.verify.semantic_reader_db_user$$);
+role_name text;
+role_row record;
+writable_count integer;
+readable_count integer;
+BEGIN
+IF crud_role = reader_role THEN
+  RAISE EXCEPTION
+    $$Semantic CRUD and reader roles must be separate: %$$, crud_role;
+END IF;
+
+FOREACH role_name IN ARRAY ARRAY[crud_role, reader_role] LOOP
+  SELECT
+    role.rolsuper, role.rolcreatedb, role.rolcreaterole,
+    role.rolreplication, role.rolbypassrls
+  INTO role_row
+  FROM pg_catalog.pg_roles AS role
+  WHERE role.rolname = role_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION $$Semantic role % does not exist$$, role_name;
+  END IF;
+  IF role_row.rolsuper OR role_row.rolcreatedb OR role_row.rolcreaterole
+     OR role_row.rolreplication OR role_row.rolbypassrls THEN
+    RAISE EXCEPTION $$Semantic role % has unsafe attributes$$, role_name;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_auth_members AS membership
+    JOIN pg_catalog.pg_roles AS member ON member.oid = membership.member
+    WHERE member.rolname = role_name
+  ) THEN
+    RAISE EXCEPTION $$Semantic role % holds a role membership$$, role_name;
+  END IF;
+  IF has_database_privilege(role_name, current_database(), $$CREATE$$)
+     OR has_database_privilege(role_name, current_database(), $$TEMPORARY$$)
+  THEN
+    RAISE EXCEPTION
+      $$Semantic role % has CREATE or TEMPORARY on the database$$, role_name;
+  END IF;
+  IF NOT has_database_privilege(role_name, current_database(), $$CONNECT$$)
+  THEN
+    RAISE EXCEPTION $$Semantic role % cannot connect$$, role_name;
+  END IF;
+  IF has_schema_privilege(role_name, $$derived_layers$$, $$USAGE$$)
+     OR has_schema_privilege(role_name, $$federation$$, $$USAGE$$)
+     OR has_schema_privilege(role_name, $$public$$, $$CREATE$$)
+  THEN
+    RAISE EXCEPTION
+      $$Semantic role % can reach derived_layers, federation, or create in public$$,
+      role_name;
+  END IF;
+  IF has_foreign_data_wrapper_privilege(role_name, $$postgres_fdw$$, $$USAGE$$)
+  THEN
+    RAISE EXCEPTION $$Semantic role % can use postgres_fdw$$, role_name;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_namespace AS space
+    WHERE space.nspname LIKE $$source\_%$$
+      AND has_schema_privilege(role_name, space.oid, $$USAGE$$)
+  ) THEN
+    RAISE EXCEPTION
+      $$Semantic role % can reach a federated source schema$$, role_name;
+  END IF;
+END LOOP;
+
+IF pg_get_userbyid(
+     (SELECT nspowner FROM pg_catalog.pg_namespace WHERE nspname = $$semantic$$)
+   ) IS DISTINCT FROM crud_role THEN
+  RAISE EXCEPTION $$Schema semantic is not owned by %$$, crud_role;
+END IF;
+
+-- The separation is the whole reason there are two roles. An audit that
+-- checks the reader can read, without checking it cannot write, proves
+-- nothing: a reader silently granted INSERT would pass.
+SELECT
+  count(*) FILTER (
+    WHERE has_table_privilege(reader_role, relation.oid, $$INSERT$$)
+       OR has_table_privilege(reader_role, relation.oid, $$UPDATE$$)
+       OR has_table_privilege(reader_role, relation.oid, $$DELETE$$)
+       OR has_table_privilege(reader_role, relation.oid, $$TRUNCATE$$)
+  ),
+  count(*) FILTER (
+    WHERE has_table_privilege(reader_role, relation.oid, $$SELECT$$)
+  )
+INTO writable_count, readable_count
+FROM pg_catalog.pg_class AS relation
+JOIN pg_catalog.pg_namespace AS space ON space.oid = relation.relnamespace
+WHERE space.nspname = $$semantic$$ AND relation.relkind = $$r$$;
+
+IF writable_count > 0 THEN
+  RAISE EXCEPTION
+    $$Semantic reader % can write % catalogue table(s)$$,
+    reader_role, writable_count;
+END IF;
+
+RAISE NOTICE
+  $$Semantic catalogue: % table(s) readable by %, none writable$$,
+  readable_count, reader_role;
+END $mapp_semantic$;
 SQL
 
 # The census content assertions run against the database that holds the data.

@@ -23,9 +23,13 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
   browser-egress network. Unlisted hostnames are rejected without DNS lookup;
   reviewed names are then resolved and rejected if they map to private,
   loopback, link-local, or reserved space.
-- The semantic service shares only the internal `semantic-control` network
-  with the configuration service. It has no public route, database network, or
-  database credential.
+- The semantic service has no public route. It shares the internal
+  `semantic-control` network with the configuration service and joins the
+  backend network solely to reach the packaged database, where its catalog now
+  lives. It holds two database credentials, both confined to the `semantic`
+  schema: one role that may only `SELECT` from it and one role that owns it and
+  can reach nothing else. **Semantic catalog roles** below states what that
+  changed and what it cost.
 - The map and configuration service use separate hostnames.
 - The standalone CLI runs on another computer and is untrusted until its
   bearer token is authenticated.
@@ -34,11 +38,13 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
 
 ## Filesystem isolation
 
-XYZ must never receive `var/control` or `var/semantic`. Its readable inputs are
-limited to the live workspace and explicitly public instance assets. The
-configuration service receives only the writable paths needed for atomic
-workspace saves, control records, artifacts, and reload coordination. The
-semantic service receives only `var/semantic` as writable state.
+XYZ must never receive `var/control`. Its readable inputs are limited to the
+live workspace and explicitly public instance assets. The configuration
+service receives only the writable paths needed for atomic workspace saves,
+control records, artifacts, and reload coordination. The semantic service now
+has no writable state at all: `var/semantic` and the `/state` mount that
+carried it are gone, its container root is read-only, and its only durable
+state is a schema in the packaged database.
 
 This matters because the pinned XYZ version has a local file-provider surface
 that this deployment does not need. Caddy blocks its HTTP route as defence in
@@ -46,6 +52,53 @@ depth, but a narrow mount remains the primary containment boundary.
 
 Do not store credentials, private source data, API keys, or confidential SQL
 samples in the workspace or `instance/public`.
+
+## Semantic catalog roles
+
+The semantic catalog moved out of a SQLite file and into the packaged
+database, in a schema named `semantic`. That is a reduction in the service's
+isolation and is stated here rather than left implicit: a compromised semantic
+service previously held no database credential and could reach no database at
+all, and it can now authenticate to the platform database.
+
+What bounds that reach is the grant model, not the network:
+
+| Role | Default name | Authority |
+| --- | --- | --- |
+| Catalog owner | `mapp_semantic` | Owns schema `semantic`, writes it, `CONNECT` on the database |
+| Catalog reader | `mapp_semantic_reader` | `USAGE` on schema `semantic`, `SELECT` on its tables, `CONNECT` on the database |
+
+Every catalog read uses the reader role and every write uses the owner role.
+Neither is a superuser, may create databases or roles, may replicate, or
+bypasses row-level security. Neither has `TEMPORARY` or `CREATE` on the
+database. Neither holds `postgres_fdw` `USAGE`, any privilege on
+`derived_layers`, `federation`, `public`, or any `source_<alias>` schema, or
+membership of any other role. Both pin `search_path` to `pg_catalog, semantic`
+and are limited to four connections. The reader holds no `INSERT`, `UPDATE`,
+`DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, or sequence privilege; its
+`SELECT` is extended to later tables by `ALTER DEFAULT PRIVILEGES FOR ROLE
+mapp_semantic IN SCHEMA semantic`, so a table the store adds in a future
+migration is readable without a new grant and still not writable.
+
+The honest form of the trade is this. The blast radius of a compromised
+semantic service is the semantic catalog: generated profiles, curated
+annotations, semantic proposals, history, and archive tombstones. That is the
+same data a compromise of the SQLite file already yielded, so the value at risk
+is unchanged. What changed is that reaching it is now an authenticated database
+session rather than a file read, and that containment rests on grants instead
+of on the absence of any credential. Grants are auditable where file-absence
+was merely obvious, but grants can also drift, and drift is silent. Treat the
+semantic grants as a verification target: today they are asserted only where
+they are created, in `docker/postgis/init/10-roles.sh`, and `./bin/mapp verify`
+does not yet check them the way it checks the runtime, derived, and federation
+roles.
+
+The API and CLI semantic scopes remain the primary authorization gate.
+`semantic:inspect` reads; `semantic:propose`, `semantic:apply`, and
+`semantic:admin` change. The roles are the structural backstop behind those
+checks, not a substitute for them: a defect in scope enforcement on a read path
+still cannot write the catalog, because the connection that path runs on cannot
+write anything.
 
 ## Authentication and authorization
 
@@ -271,6 +324,13 @@ artifact retention, storage quotas, or host-level resource controls.
   Observe/Provision, not continuous remote attestation. The manual freshness
   strategy trusts source administrators to preserve approved relation semantics
   between observations; rerun Observe after source schema or view releases.
+- Treat `SEMANTIC_DATABASE_URL` and `SEMANTIC_READER_DATABASE_URL` as two
+  separate catalog credentials. Only `semantic-service` receives them, and
+  neither is a platform-wide database credential: the first writes the
+  `semantic` schema, the second can only read it, and the database refuses
+  both everything else. Rotate them together with the roles themselves, and
+  keep them out of Compose renderings and diagnostics as with every other
+  connection string.
 - Treat `SEMANTIC_INTERNAL_TOKEN` as a service credential. Only
   `config-ui` and `semantic-service` receive it. It must be random, at least 32
   characters in production, and distinct from database and user credentials.
@@ -291,10 +351,13 @@ The application containers use read-only roots where practical,
 `no-new-privileges`, dropped capabilities, dedicated non-root users, bounded
 temporary filesystems, and internal networks. The configuration service and
 CLI do not require Docker socket access; do not add it.
-The semantic service follows the same hardening and has only its narrow state
-mount. A future data/function executor must be a separate container with its
-own least-privilege credential rather than adding database access to the
-metadata service.
+The semantic service follows the same hardening and now has no state mount at
+all; its root is read-only and its catalog is in the database. It joins the
+backend network for that connection, which is the one boundary the catalog move
+widened, and it still has no public route. A future data/function executor must
+be a separate container with its own least-privilege credential: the metadata
+service's two roles are deliberately confined to the `semantic` schema, and
+widening either to reach source data would collapse that separation.
 Initialize and operate production as a dedicated unprivileged host account.
 Production validation rejects `CONFIG_UID=0` or `CONFIG_GID=0` so a root-run
 initialization cannot silently make the application services run as root.

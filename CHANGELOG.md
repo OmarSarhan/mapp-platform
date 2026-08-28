@@ -22,6 +22,19 @@ first release.
 
 ### Added
 
+- The semantic catalogue moved out of the SQLite file at `var/semantic` and
+  into the packaged database, in a schema named `semantic`. Two new login
+  roles carry it: `SEMANTIC_DB_USER` (default `mapp_semantic`) owns the schema
+  and performs every write, and `SEMANTIC_READER_DB_USER` (default
+  `mapp_semantic_reader`) holds `USAGE` and `SELECT` and nothing else, which
+  every read goes through. The API and CLI semantic scopes remain the primary
+  gate; the roles are the structural backstop behind them. Six new environment
+  keys -- the two users, their passwords, and the two DSNs -- so an existing
+  install needs `./bin/mapp doctor --add-missing` and a fresh database volume,
+  because the roles and schema are created by the init script that only runs
+  on an empty one. Catalogue contents are not migrated from the old SQLite
+  file.
+
 - Added `MAPP_DEMO_SOURCES` and `./bin/mapp init --demo`, which turn the
   two-source Leeds showcase on for a deployment. Every wrapper command then
   applies `compose.federated-demo.yaml` and starts `census-db` and `ops-db`
@@ -30,6 +43,15 @@ first release.
   `./bin/mapp doctor` report `MAPP_DEMO_SOURCES` as missing until
   `./bin/mapp doctor --add-missing` adds it; the added value is empty, which is
   the non-demo setting.
+- `./bin/mapp test` now stands up a scratch database for the semantic-service
+  suite. Those tests need a real server, and without one every test in the
+  suite skipped while the run still reported success.
+- `./bin/mapp demo` now generates every semantic draft with the bounded data
+  context -- sample rows and column statistics -- rather than from column
+  names alone. The dashboard offers these per generation and defaults them
+  off, because sending rows to a model is a judgement about the data in front
+  of you; the demo makes that judgement once, on published government open
+  data.
 - `./bin/mapp demo` now describes the exposed relations and their fields with
   Gemini, so the catalogue reads as prose rather than as a list of column
   names. It is on whenever `GEMINI_APIKEY` is set; `./bin/mapp demo
@@ -42,6 +64,13 @@ first release.
   the output rather than applied silently.
 
 ### Fixed
+
+- Requesting sample rows or column statistics for a **federated** relation
+  always failed with `semantic.generation_context_unavailable`, so the
+  dashboard's data-context option looked unsupported for federated sources
+  rather than broken. The read issued `LOCK TABLE`, which PostgreSQL refuses
+  on a foreign table. The profiling path already excluded foreign tables from
+  that lock; this call site never got the same guard.
 
 - `docker/demo-sources/layers.sh` profiled the exposed relations before
   provisioning them. Profiling reads the `source_<alias>` foreign tables that

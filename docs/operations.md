@@ -20,8 +20,10 @@ If verification finds stale or unresolved container environment values, run
 preserving named volumes, then verify again.
 
 Every deployment includes the packaged PostGIS service. `DBS_MAPP` supplies
-the database clients' shared connection to it, and the semantic service has no
-database credential.
+the database clients' shared connection to it. The semantic service now holds
+two credentials of its own: `SEMANTIC_READER_DATABASE_URL` for every catalog
+read and `SEMANTIC_DATABASE_URL` for every catalog write. Both reach only the
+`semantic` schema of that same database, which is where the catalog lives.
 Before switching an existing bundled deployment to external mode, take a
 backup and run `./bin/mapp down`; otherwise its already-running `db` container
 is outside the newly selected service set and remains untouched.
@@ -93,9 +95,18 @@ the configured ETL datasets, use the explicitly destructive command:
 It stops the stack, removes only the named bundled PostgreSQL volume, replaces
 the live and preview workspaces with `instance/workspace.seed.json`, starts a
 fresh database, and runs the unrestricted ETL. This clears workspace layers
-which depended on deleted derived or custom relations. Dashboard authentication,
-audit records, proposals, semantic history, artifacts, and public assets are
-not reset.
+which depended on deleted derived or custom relations. Dashboard
+authentication, audit records, proposals, artifacts, and public assets live
+under `var` and are not reset.
+
+The semantic catalog no longer survives a reset. It is a schema in the bundled
+database, so removing that volume destroys generated profiles, curated
+annotations, semantic proposals, history, and archive tombstones with it. The
+archival choreography described below still runs, but on the successful path
+its result is deleted with everything else; it now protects only the aborted
+path, where the volume still exists and the catalog must be left consistent
+with a database that was never removed. Take a `pg_dump` first if the curated
+metadata matters.
 
 Before deleting the database volume, the command starts only the bundled
 database and private control-plane services and installs a durable maintenance
@@ -209,6 +220,28 @@ authenticated API. Generated profiles are lifecycle records and read-only;
 curated metadata follows a separate check, create, explicit approval, and
 apply workflow bound to the asset's current version.
 
+The catalog is stored in the packaged database, in a schema named `semantic`,
+and is reached only by the private semantic service. Two login roles separate
+the two directions of that access:
+
+| Key | Default role | Authority |
+| --- | --- | --- |
+| `SEMANTIC_DB_USER` | `mapp_semantic` | Owns schema `semantic` and is the only identity that may write it |
+| `SEMANTIC_READER_DB_USER` | `mapp_semantic_reader` | `USAGE` on that schema and `SELECT` on its tables, nothing else |
+
+`SEMANTIC_DATABASE_URL` and `SEMANTIC_READER_DATABASE_URL` are the connection
+strings built from them. The API and CLI semantic scopes still decide who may
+read or change the catalog; the roles are a structural backstop behind that
+decision, not a replacement for it. Neither role can reach `derived_layers`,
+`federation`, `public`, or any `source_<alias>` schema, and neither holds
+`postgres_fdw` `USAGE` or any role membership.
+
+Both roles and the schema are created by the bundled database's initialization
+scripts, which run only on an empty data directory. An installation predating
+this change needs `./bin/mapp doctor --add-missing` for the six new keys and a
+fresh database volume; adding keys to `.env` does not create roles in a volume
+that already exists.
+
 Ordinary allowlisted PostgreSQL sources are discovered and synchronized with
 `semantic:inspect + semantic:source`. The source action reads relation/column
 catalog metadata and standard comments only, under the configured `DBS_*`
@@ -260,10 +293,11 @@ administrator list exposes a separate `deliveryBlockers` entry. It can be
 retried by the retained name from the dashboard or CLI and reports
 `pending_archive` while queued.
 
-Do not edit `derived_layers._semantic_outbox` or
-`var/semantic/semantic.sqlite3` manually. A retained event has a stable ID and
-payload hash, so retry is idempotent; hand-editing either store can break that
-evidence. The route named `repair` only requeues the retained event and cannot
+Do not edit `derived_layers._semantic_outbox` or the `semantic` schema
+manually. They are now schemas in one database, but they remain separate stores
+written by separate roles in separate transactions. A retained event has a
+stable ID and payload hash, so retry is idempotent; hand-editing either schema
+can break that evidence. The route named `repair` only requeues the retained event and cannot
 correct a deterministic 4xx, corrupt event, or invalid acknowledgement. Check
 `semantic-service` and `config-ui` logs without copying the internal token,
 database URLs, or curated data into an issue.
@@ -445,7 +479,9 @@ production use.
 seven-day cleanup policy. It lists completed browser artifact run directories
 and abandoned atomic-write temporary files, but preserves the live workspace,
 authentication, audit history, proposals, the semantic database and history,
-and reload state. Review the JSON candidate list, then run
+and reload state. It only ever inspects `var`; the semantic catalog is a
+schema in the packaged database and is out of its reach entirely. Review the
+JSON candidate list, then run
 `./bin/mapp cleanup-temp --confirm` to remove exactly those disposable paths.
 Unrecognized directories and trees containing symlinks or special files are
 left untouched for manual review.
@@ -501,7 +537,10 @@ the submitted scopes.
 These commands affect configuration-service authentication only. They do not
 change PostgreSQL passwords. Changing `.env` passwords also does not rotate
 roles in an existing PostgreSQL volume; perform database password rotation
-explicitly and update dependent services together.
+explicitly and update dependent services together. That now includes
+`SEMANTIC_DB_PASSWORD` and `SEMANTIC_READER_DB_PASSWORD`: change the role in
+the database and the matching connection string in `.env` in one maintenance
+window, then recreate `semantic-service` so both connections are re-established.
 
 XYZ and configuration discovery intentionally share the exact `DBS_MAPP`
 connection. For an external database, rotate that URI through the approved

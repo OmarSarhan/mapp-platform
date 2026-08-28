@@ -83,8 +83,9 @@ Each hook must:
 - perform the assertions below rather than merely completing a command.
 
 The backup hook must create a fresh database-aware backup plus protected,
-coordinated copies of `var/workspace`, `var/control`, `var/semantic`, Caddy
-state, and the release identity. It must verify archive readability, private
+coordinated copies of `var/workspace`, `var/control`, Caddy state, and the
+release identity; the semantic catalog is inside the database backup rather
+than beside it. It must verify archive readability, private
 permissions, checksums, and the off-host destination.
 
 The restore hook must restore that exact backup into new storage and verify

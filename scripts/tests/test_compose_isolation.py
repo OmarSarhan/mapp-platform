@@ -6,6 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,27 +60,62 @@ class ComposeIsolationTests(unittest.TestCase):
             ),
         }
 
-    def test_semantic_service_remains_private_and_storage_isolated(self) -> None:
-        expected_state = str((ROOT / "var/semantic").resolve())
+    def test_semantic_service_remains_private_and_holds_only_its_own_roles(
+        self,
+    ) -> None:
+        """The catalogue moved from a bind-mounted SQLite file into the database.
+
+        Before the move semantic-service held no database credential and had
+        no route to one, so its containment was topological. Now it holds two
+        login roles and sits on the backend network, and the bound is entirely
+        grants -- which scripts/verify.sh audits. What this test still pins is
+        the compose half: it is given the semantic roles and no other, it is
+        still unreachable from outside, and its state no longer lives in a
+        file on the host.
+        """
+        template = dict(
+            line.split("=", 1)
+            for line in (ROOT / ".env.example").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if "=" in line and not line.startswith("#")
+        )
         for mode, model in self.models.items():
             with self.subTest(mode=mode):
                 service = model["services"]["semantic-service"]
-                self.assertEqual(
-                    {
-                        "PORT",
-                        "SEMANTIC_INTERNAL_TOKEN",
-                        "STATE_DIR",
-                    },
-                    set(service.get("environment", {})),
-                )
-                volumes = service.get("volumes", [])
-                self.assertEqual(1, len(volumes))
-                self.assertEqual("bind", volumes[0].get("type"))
-                self.assertEqual(expected_state, volumes[0].get("source"))
-                self.assertEqual("/state", volumes[0].get("target"))
+                environment = service.get("environment", {})
+                expected = {"PORT", "SEMANTIC_INTERNAL_TOKEN"}
+                if "bundled" in mode:
+                    expected |= {
+                        "SEMANTIC_DATABASE_URL",
+                        "SEMANTIC_READER_DATABASE_URL",
+                    }
+                self.assertEqual(expected, set(environment))
+
+                # The credential it is handed must be its own. A DSN carrying
+                # any other role would hand the catalogue service the reach of
+                # that role, and no grant audit downstream would notice. The
+                # username is parsed rather than searched for: every role name
+                # here shares the POSTGRES_USER prefix, so a substring test
+                # passes on any of them.
+                for key, user in (
+                    ("SEMANTIC_DATABASE_URL", "SEMANTIC_DB_USER"),
+                    ("SEMANTIC_READER_DATABASE_URL", "SEMANTIC_READER_DB_USER"),
+                ):
+                    url = environment.get(key)
+                    if url is None:
+                        continue
+                    self.assertEqual(
+                        template[user],
+                        urlsplit(url).username,
+                        key,
+                    )
+
+                # No bind mount: the SQLite file it used to hold is gone.
+                self.assertFalse(service.get("volumes"))
                 self.assertFalse(service.get("ports"))
                 self.assertEqual(
-                    {"semantic-control"},
+                    {"semantic-control", "backend"},
                     set(service.get("networks", {})),
                 )
                 self.assertTrue(model["networks"]["semantic-control"]["internal"])

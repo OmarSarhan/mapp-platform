@@ -1,63 +1,65 @@
 from __future__ import annotations
 
-import os
-import sqlite3
 import sys
-import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import psycopg
+
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVICE_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from database_fixture import (  # noqa: E402
+    connect,
+    fresh_store,
+    open_store,
+    requires_database,
+    reset_schema,
+)
 from semantic_store import SemanticError, SemanticStore  # noqa: E402
 
 
+@requires_database
 class SemanticStoreTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.temporary_directory.name) / "semantic.sqlite3"
-        self.store = SemanticStore(self.db_path)
-
-    def tearDown(self) -> None:
-        self.temporary_directory.cleanup()
+        self.store = fresh_store()
 
     @contextmanager
-    def hide_asset_after_first_connection(self, asset_id: str):
+    def hide_asset_before_write_transaction(self, asset_id: str):
+        """Hide an asset between a caller's pre-check read and its write.
+
+        create_proposal, apply_proposal and decline_proposal each resolve
+        visibility on the reader connection and only then open the single
+        write transaction, so hiding the asset as that transaction opens is
+        exactly the race the recheck inside it exists to lose.
+        """
         original_connection = self.store._connection
-        connection_count = 0
+        hidden = False
 
         @contextmanager
-        def connection_with_visibility_change():
-            nonlocal connection_count
-            connection_count += 1
-            current_connection = connection_count
+        def connection_hiding_the_asset_first():
+            nonlocal hidden
+            if not hidden:
+                hidden = True
+                with original_connection() as connection:
+                    # Autocommit, so this lands before the caller's
+                    # transaction below has taken any lock on the row.
+                    connection.execute(
+                        "UPDATE assets SET visibility = 'admin'"
+                        " WHERE asset_id = %s",
+                        (asset_id,),
+                    )
             with original_connection() as connection:
                 yield connection
-            if current_connection == 1:
-                with original_connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        connection.execute(
-                            """
-                            UPDATE assets
-                            SET visibility = 'admin'
-                            WHERE asset_id = ?
-                            """,
-                            (asset_id,),
-                        )
-                        connection.execute("COMMIT")
-                    except Exception:
-                        connection.execute("ROLLBACK")
-                        raise
 
         with patch.object(
             self.store,
             "_connection",
-            connection_with_visibility_change,
+            connection_hiding_the_asset_first,
         ):
             yield
 
@@ -93,33 +95,46 @@ class SemanticStoreTest(unittest.TestCase):
             event["predecessorAssetId"] = predecessor_asset_id
         return self.store.apply_event(event)
 
-    def test_database_is_migrated_and_restrictive(self) -> None:
+    def test_migration_builds_the_whole_schema_and_is_repeatable(self) -> None:
         settings = self.store.database_settings()
         self.assertEqual(settings["schemaVersion"], 5)
-        self.assertEqual(settings["journalMode"].lower(), "wal")
-        self.assertEqual(settings["foreignKeys"], 1)
-        self.assertEqual(settings["synchronous"], 2)  # FULL
-        self.assertEqual(settings["busyTimeout"], 5000)
-        self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
+        with connect() as connection:
+            tables = {
+                row["tablename"]
+                for row in connection.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'semantic'"
+                )
+            }
         self.assertEqual(
-            os.stat(self.db_path.parent).st_mode & 0o777,
-            0o700,
+            tables,
+            {
+                "schema_migrations",
+                "metadata",
+                "assets",
+                "asset_history",
+                "processed_events",
+                "proposals",
+            },
         )
 
-        reopened = SemanticStore(self.db_path)
+        # A second service starting against the same schema must find every
+        # migration applied rather than try to build it again.
+        reopened = open_store()
+        self.assertEqual(reopened.database_settings()["schemaVersion"], 5)
         self.assertEqual(reopened.status()["catalogRevision"], 0)
 
-    def test_v1_database_is_upgraded_without_losing_proposals(self) -> None:
-        legacy_path = (
-            Path(self.temporary_directory.name) / "semantic-v1.sqlite3"
-        )
-        connection = sqlite3.connect(legacy_path, isolation_level=None)
+    def test_v1_schema_is_upgraded_without_losing_proposals(self) -> None:
+        # Only migration 1 is applied, then rows are written the way that
+        # release wrote them, so the remaining migrations run against real
+        # data rather than against an empty schema.
+        reset_schema()
+        connection = connect()
         try:
             connection.execute(
                 """
-                CREATE TABLE schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
+                CREATE TABLE semantic.schema_migrations (
+                    version bigint PRIMARY KEY,
+                    applied_at text NOT NULL
                 )
                 """
             )
@@ -130,8 +145,8 @@ class SemanticStoreTest(unittest.TestCase):
                     asset_id, version, generation, status, visibility,
                     generated_json, curated_json, orphans_json,
                     catalog_revision, created_at, updated_at, archived_at
-                ) VALUES(?, 1, 1, 'ready', 'inspect', '{}', '{}', '[]',
-                         1, ?, ?, NULL)
+                ) VALUES(%s, 1, 1, 'ready', 'inspect', '{}', '{}', '[]',
+                         1, %s, %s, NULL)
                 """,
                 (
                     "asset:legacy",
@@ -145,8 +160,8 @@ class SemanticStoreTest(unittest.TestCase):
                     proposal_id, state, asset_id, base_version,
                     operations_json, fingerprint, diff_json, explanation,
                     actor, reason, created_at, updated_at, applied_version
-                ) VALUES(?, 'declined', ?, 1, '[]', ?, '[]', ?,
-                         ?, 'Legacy decision', ?, ?, NULL)
+                ) VALUES(%s, 'declined', %s, 1, '[]', %s, '[]', %s,
+                         %s, 'Legacy decision', %s, %s, NULL)
                 """,
                 (
                     "proposal:legacy",
@@ -161,7 +176,7 @@ class SemanticStoreTest(unittest.TestCase):
         finally:
             connection.close()
 
-        upgraded = SemanticStore(legacy_path)
+        upgraded = open_store()
         self.assertEqual(upgraded.database_settings()["schemaVersion"], 5)
         proposal = upgraded.get_proposal(
             "proposal:legacy",
@@ -179,8 +194,48 @@ class SemanticStoreTest(unittest.TestCase):
             ]
         )
 
-        reopened = SemanticStore(legacy_path)
+        reopened = open_store()
         self.assertEqual(reopened.database_settings()["schemaVersion"], 5)
+
+    def test_read_snapshot_holds_one_revision_and_refuses_to_write(self) -> None:
+        # A paginated response is assembled from several statements on this
+        # connection and every one of them has to see the revision reported
+        # beside it.  Under PostgreSQL's default READ COMMITTED each statement
+        # would take its own snapshot, so a response could be built out of two
+        # catalogue revisions; the transaction is opened REPEATABLE READ
+        # READ ONLY precisely to stop that.
+        self.register()
+        with self.store.read_snapshot() as (connection, revision):
+            self.assertEqual(revision, 1)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT current_setting('transaction_isolation') AS level,"
+                    " current_setting('transaction_read_only') AS read_only"
+                ).fetchone(),
+                {"level": "repeatable read", "read_only": "on"},
+            )
+
+            # A writer commits a whole new revision underneath the open
+            # snapshot.
+            self.register(event_id="event-2", asset_id="asset:derived/rail")
+
+            self.assertEqual(self.store.catalog_revision(connection), 1)
+            self.assertEqual(
+                [
+                    asset["id"]
+                    for asset in self.store.list_assets(
+                        is_admin=False, connection=connection
+                    )
+                ],
+                ["asset:derived/roads"],
+            )
+            with self.assertRaises(psycopg.errors.ReadOnlySqlTransaction):
+                connection.execute(
+                    "UPDATE metadata SET value = '99'"
+                    " WHERE key = 'catalog_revision'"
+                )
+
+        self.assertEqual(self.store.catalog_revision(), 2)
 
     def test_generated_event_lifecycle_is_idempotent(self) -> None:
         first = self.register()
@@ -279,37 +334,43 @@ class SemanticStoreTest(unittest.TestCase):
         self.assertEqual(after, self.store.catalog_revision())
 
     def test_source_state_leaves_nothing_half_applied(self) -> None:
-        # The connection is opened with isolation_level=None, so without one
-        # explicit transaction each row would commit on its own and a failure
-        # midway would strand the schema in a mixed state.
+        # The connection is opened with autocommit on, so without one explicit
+        # transaction each statement would commit on its own and a failure
+        # midway would strand the schema in a mixed state: the revision
+        # already burned, and the rows it was stamped on never flagged.
         self._federated("asset:a", "source_leeds", event_id="e-a")
         self._federated("asset:b", "source_leeds", event_id="e-b")
         before_revision = self.store.catalog_revision()
 
-        real_connect = self.store._connect
+        real_open = self.store._open
 
         class FailsOnBatch:
-            """Delegates everything but the batch update.
+            """Delegates every statement but the one that flags the rows.
 
-            sqlite3.Connection attributes are read-only, so the failure has to
-            be injected by wrapping rather than by patching a method onto it.
+            It has to fail after the revision has been taken, because that is
+            the only point at which a non-transactional version of this would
+            leave the schema visibly half changed.
             """
 
-            def __init__(self, inner: sqlite3.Connection) -> None:
+            def __init__(self, inner: psycopg.Connection) -> None:
                 self._inner = inner
 
             def __getattr__(self, name: str):
                 return getattr(self._inner, name)
 
-            def executemany(self, *args, **kwargs):
-                raise sqlite3.OperationalError("disk I/O error")
+            def execute(self, statement, *args, **kwargs):
+                if str(statement).startswith("UPDATE assets SET source_state"):
+                    raise psycopg.OperationalError("connection lost")
+                return self._inner.execute(statement, *args, **kwargs)
 
-        self.store._connect = lambda: FailsOnBatch(real_connect())
+        self.store._open = lambda database_url: FailsOnBatch(
+            real_open(database_url)
+        )
         try:
-            with self.assertRaises(sqlite3.OperationalError):
+            with self.assertRaises(psycopg.OperationalError):
                 self.store.mark_source_state("source_leeds", available=False)
         finally:
-            self.store._connect = real_connect
+            self.store._open = real_open
 
         assets = self.store.assets_for_source_schema("source_leeds")
         self.assertTrue(
@@ -340,7 +401,7 @@ class SemanticStoreTest(unittest.TestCase):
 
     def test_event_idempotency_survives_service_restart(self) -> None:
         first = self.register()
-        self.store = SemanticStore(self.db_path)
+        self.store = open_store()
         replay = self.register()
         self.assertTrue(replay["event"]["idempotent"])
         self.assertEqual(replay["asset"], first["asset"])
@@ -838,7 +899,8 @@ class SemanticStoreTest(unittest.TestCase):
         )["asset"]
         with self.store._connection() as connection:
             connection.execute(
-                "UPDATE assets SET visibility = 'inspect' WHERE asset_id = ?",
+                "UPDATE assets SET visibility = 'inspect'"
+                " WHERE asset_id = %s",
                 (archived["id"],),
             )
 
@@ -961,16 +1023,19 @@ class SemanticStoreTest(unittest.TestCase):
             is_admin=False,
         )
         original_connection = self.store._connection
-        connection_count = 0
+        refreshed = False
 
         @contextmanager
         def connection_with_post_commit_refresh():
-            nonlocal connection_count
-            connection_count += 1
-            current_connection = connection_count
+            # apply_proposal resolves visibility on the reader connection and
+            # then opens exactly one write connection, so the refresh below
+            # lands the instant that transaction commits and before the
+            # response built inside it is returned.
+            nonlocal refreshed
             with original_connection() as connection:
                 yield connection
-            if current_connection == 2:
+            if not refreshed:
+                refreshed = True
                 self.store.apply_event(
                     {
                         "eventId": "event-after-apply-commit",
@@ -1014,7 +1079,7 @@ class SemanticStoreTest(unittest.TestCase):
         }
         check = self.store.check_proposal(request, is_admin=False)
 
-        with self.hide_asset_after_first_connection(asset["id"]):
+        with self.hide_asset_before_write_transaction(asset["id"]):
             with self.assertRaises(SemanticError) as error:
                 self.store.create_proposal(
                     {**request, "fingerprint": check["fingerprint"]},
@@ -1050,7 +1115,7 @@ class SemanticStoreTest(unittest.TestCase):
             is_admin=False,
         )
 
-        with self.hide_asset_after_first_connection(asset["id"]):
+        with self.hide_asset_before_write_transaction(asset["id"]):
             with self.assertRaises(SemanticError) as error:
                 self.store.apply_proposal(
                     proposal["id"],
@@ -1089,7 +1154,7 @@ class SemanticStoreTest(unittest.TestCase):
             is_admin=False,
         )
 
-        with self.hide_asset_after_first_connection(asset["id"]):
+        with self.hide_asset_before_write_transaction(asset["id"]):
             with self.assertRaises(SemanticError) as error:
                 self.store.decline_proposal(
                     proposal["id"],
@@ -1241,6 +1306,41 @@ class SemanticStoreTest(unittest.TestCase):
             asset["id"],
         )
 
+    def test_search_folds_case_the_way_postgresql_lower_does(self) -> None:
+        # SQLite folded the haystack through a Python casefold() user
+        # function, which mapped "Straße" and "STRASSE" onto one string.
+        # PostgreSQL has no casefold, so both sides are folded with lower()
+        # instead and the German sharp s no longer matches "ss".  Ordinary
+        # case-insensitive search is unchanged; this is the case that moved.
+        for index, description in enumerate(("Strasse", "Straße")):
+            self.register(
+                event_id=f"event-fold-{index}",
+                asset_id=f"asset:fold-{index}",
+                generated={
+                    "kind": "managed-derived",
+                    "name": f"fold_{index}",
+                    "description": description,
+                },
+            )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.store.search_assets(
+                    "STRASSE", limit=None, is_admin=False
+                )
+            ],
+            ["asset:fold-0"],
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.store.search_assets(
+                    "straße", limit=None, is_admin=False
+                )
+            ],
+            ["asset:fold-1"],
+        )
+
     def test_growing_collections_use_bounded_keyset_fetches(self) -> None:
         assets = []
         for index, asset_id in enumerate(("asset:a", "asset:b", "asset:c")):
@@ -1250,7 +1350,7 @@ class SemanticStoreTest(unittest.TestCase):
                 generated={
                     "kind": "managed-derived",
                     "name": f"roads_{index}",
-                    "description": "Straße" if index == 1 else "Roads",
+                    "description": "Strasse" if index == 1 else "Roads",
                     "binding": {
                         "schema": "derived_layers",
                         "relation": f"roads_{index}",

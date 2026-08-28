@@ -411,8 +411,9 @@ strings.
 - Monitor expensive ordinary views and materialized refreshes.
 - Back up the complete `derived_layers` schema, including its private semantic
   outbox, with the external database. Coordinate that recovery point with the
-  MAPP operator's `var/semantic` snapshot so retained events and delivered
-  semantic profiles can reconcile after restore.
+  MAPP operator's packaged-database dump, which now holds the `semantic`
+  catalog schema, so retained events and delivered semantic profiles can
+  reconcile after restore.
 - Rotate both login secrets through the approved deployment procedure.
 - Re-run permission and visual checks after database migrations, role changes,
   PostGIS upgrades, or restore operations.

@@ -74,12 +74,9 @@ services:
     user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
     environment:
       PORT: 8080
-      STATE_DIR: /state
       SEMANTIC_INTERNAL_TOKEN: ${SEMANTIC_INTERNAL_TOKEN:?Set SEMANTIC_INTERNAL_TOKEN in .env}
     expose:
       - "8080"
-    volumes:
-      - ./var/semantic:/state
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -88,6 +85,9 @@ services:
     cap_drop:
       - ALL
     networks:
+      # The catalog lives in the platform database, so the service needs the
+      # backend network as well as the private control link to config-ui.
+      - backend
       - semantic-control
 
   config-ui:

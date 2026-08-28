@@ -7,10 +7,9 @@ images and the versioned `instance` directory are not sufficient.
 
 | Data | Location | Reason |
 | --- | --- | --- |
-| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database |
+| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database; the `semantic` catalog schema holding generated and curated profiles, proposals, event receipts, history, and archive tombstones |
 | Live workspace | `var/workspace` | Current configuration and previous atomic save |
 | Control state | `var/control` | Authentication and device state, token records, audit, proposals, durable operations, artifacts |
-| Semantic state | `var/semantic` | Generated and curated profiles, proposals, event receipts, history, and archive tombstones |
 | Reload state | `var/reload` | Useful for consistent recovery diagnostics; can be regenerated cautiously |
 | Preview scratch state | `var/preview`, `var/preview-reload` | Ephemeral proposal rendering state; recreate it from the restored live workspace rather than treating it as authoritative |
 | Deployment secrets | `.env` and external secret-store records | Database and service credentials |
@@ -49,18 +48,17 @@ physical-backup process.
 ## State backup
 
 For the strongest consistency, pause configuration and derived-layer writes
-while copying `var/workspace`, `var/control`, and `var/semantic`. Stop
-`config-ui` first so it cannot commit another PostgreSQL outbox event, then
-stop `semantic-service` before copying its directory. The semantic database
-uses SQLite write-ahead logging; copy the complete directory while the service
-is stopped rather than copying only `semantic.sqlite3` from a running service.
+while copying `var/workspace` and `var/control`. Stop `config-ui` first so it
+cannot commit another PostgreSQL outbox event.
 
 Take the PostgreSQL dump or coordinated external snapshot during the same
-write-quiesced interval. The derived definition and semantic outbox live in
-PostgreSQL, while delivered profiles and event receipts live in SQLite. A
-coordinated recovery point lets pending events replay idempotently after
-restore; unrelated snapshots can instead claim that an event was delivered
-when the restored semantic catalog does not contain it.
+write-quiesced interval. The derived definition, the semantic outbox, and the
+delivered profiles and event receipts now all live in that one database, so a
+single dump is internally consistent across the bridge and the old failure
+mode is gone: a snapshot can no longer claim an event was delivered while a
+separately copied semantic catalog does not contain it. What still has to be
+quiesced is the filesystem state beside the database, because the workspace and
+control records must come from the same interval as the dump.
 
 Preserve file modes and ownership. Proposal records contain complete original
 and candidate workspaces; device authorization, durable operation, audit,
@@ -77,9 +75,10 @@ not place it in the same unencrypted archive as public release files.
 2. Restore `.env` from the approved secret store without committing it.
 3. Restore the PostgreSQL dump into a fresh compatible bundled volume, or have
    the external operator restore the target PostGIS database and connection.
-4. Restore `var/workspace`, `var/control`, and the matching `var/semantic`
-   snapshot, including durable operation records, with the configured host
-   UID/GID and restrictive modes. Do not restore stale `var/preview` scratch
+4. Restore `var/workspace` and `var/control`, including durable operation
+   records, with the configured host UID/GID and restrictive modes. The
+   semantic catalog needs no separate step; it returned with the database in
+   step 3. Do not restore stale `var/preview` scratch
    state; leave it absent so initialization seeds it from the restored live
    workspace.
 5. Restore Caddy data if retaining the existing certificate state is

@@ -4,7 +4,6 @@ import hashlib
 import http.client
 import json
 import sys
-import tempfile
 import threading
 import unittest
 from http import HTTPStatus
@@ -15,11 +14,13 @@ from urllib.parse import quote
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVICE_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from semantic_store import SemanticStore  # noqa: E402
+from database_fixture import fresh_store, requires_database  # noqa: E402
 from server import SemanticHTTPServer  # noqa: E402
 
 
+@requires_database
 class SemanticServerTest(unittest.TestCase):
     TOKEN = "test-internal-token"
     CALLER_TOKEN_SCOPES = (
@@ -39,10 +40,7 @@ class SemanticServerTest(unittest.TestCase):
     )
 
     def setUp(self) -> None:
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        store = SemanticStore(
-            Path(self.temporary_directory.name) / "semantic.sqlite3"
-        )
+        store = fresh_store()
         self.store = store
         self.server = SemanticHTTPServer(
             ("127.0.0.1", 0),
@@ -58,7 +56,6 @@ class SemanticServerTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
-        self.temporary_directory.cleanup()
 
     def request(
         self,

@@ -982,10 +982,15 @@ class SemanticHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    state_dir = Path(os.environ.get("STATE_DIR", "/state"))
-    db_path = Path(
-        os.environ.get("SEMANTIC_DB_PATH", str(state_dir / "semantic.sqlite3"))
-    )
+    # Both DSNs are required: the store reads as the read-only semantic role
+    # and writes as the role owning the schema, and neither identity has a
+    # usable default to fall back to.
+    database_url = os.environ.get("SEMANTIC_DATABASE_URL", "")
+    if not database_url:
+        raise SystemExit("SEMANTIC_DATABASE_URL is required")
+    reader_database_url = os.environ.get("SEMANTIC_READER_DATABASE_URL", "")
+    if not reader_database_url:
+        raise SystemExit("SEMANTIC_READER_DATABASE_URL is required")
     token = os.environ.get("SEMANTIC_INTERNAL_TOKEN", "")
     if not token:
         raise SystemExit("SEMANTIC_INTERNAL_TOKEN is required")
@@ -998,7 +1003,7 @@ def main() -> None:
         raise SystemExit("PORT and SEMANTIC_MAX_BODY_BYTES must be integers") from exc
     if not 1 <= port <= 65535 or max_body < 1024:
         raise SystemExit("PORT or SEMANTIC_MAX_BODY_BYTES is out of range")
-    store = SemanticStore(db_path)
+    store = SemanticStore(database_url, reader_database_url)
     server = SemanticHTTPServer(
         ("0.0.0.0", port), store, token, max_body_bytes=max_body
     )

@@ -13,14 +13,15 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
 import re
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Iterator
+
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
 
 
 SCHEMA_VERSION = 4
@@ -32,6 +33,17 @@ MAX_FIELD_ANNOTATION_PROPERTIES = 64
 MAX_COLLECTION_FETCH = 101
 _MISSING = object()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+SCHEMA = "semantic"
+# One name for the store-wide advisory lock that stands in for SQLite's
+# BEGIN IMMEDIATE.  Every writer that publishes a new catalog revision takes
+# it first, so those writers never interleave and can never acquire the
+# metadata and asset row locks in opposing orders.
+STORE_LOCK = "semantic"
+
+# Rows arrive as dictionaries, so `row["asset_id"]` reads exactly as it did
+# under sqlite3.Row.
+StoreConnection = psycopg.Connection[dict[str, Any]]
 
 
 class SemanticError(Exception):
@@ -72,10 +84,6 @@ def utc_now() -> str:
     )
 
 
-def _sqlite_casefold(value: Any) -> str:
-    return str(value or "").casefold()
-
-
 def _require_object(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SemanticError("invalid_request", f"{name} must be a JSON object.")
@@ -112,63 +120,92 @@ def _closed_object(
 class SemanticStore:
     def __init__(
         self,
-        db_path: str | os.PathLike[str],
+        database_url: str,
+        reader_database_url: str,
         *,
         clock: Callable[[], str] = utc_now,
     ) -> None:
-        self.db_path = Path(db_path)
+        self.database_url = database_url
+        self.reader_database_url = reader_database_url
         self.clock = clock
-        self._prepare_path()
         self._migrate()
 
-    def _prepare_path(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.db_path.parent, 0o700)
-        if self.db_path.exists():
-            os.chmod(self.db_path, 0o600)
-        else:
-            descriptor = os.open(
-                self.db_path,
-                os.O_CREAT | os.O_EXCL | os.O_RDWR,
-                0o600,
+    @staticmethod
+    def _open(database_url: str) -> StoreConnection:
+        connection = psycopg.connect(
+            database_url,
+            autocommit=True,
+            connect_timeout=5,
+            row_factory=dict_row,
+        )
+        try:
+            # pg_catalog first, so nothing in the semantic schema can shadow a
+            # built-in, and the semantic schema after it, so every unqualified
+            # table name below resolves there.  Both login roles carry the same
+            # setting; this repeats it because the store's SQL is only correct
+            # under it.  Autocommit is on and transactions are opened by hand,
+            # which is what sqlite3's isolation_level=None gave and what lets
+            # read_snapshot state its own isolation level.
+            connection.execute(
+                sql.SQL("SET SESSION search_path = pg_catalog, {schema}").format(
+                    schema=sql.Identifier(SCHEMA)
+                )
             )
-            os.close(descriptor)
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.db_path,
-            isolation_level=None,
-            timeout=5,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.create_function(
-            "mapp_casefold",
-            1,
-            _sqlite_casefold,
-            deterministic=True,
-        )
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA synchronous = FULL")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        if self.db_path.exists():
-            os.chmod(self.db_path, 0o600)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def _connection(self) -> Iterator[StoreConnection]:
+        """Connect as the role allowed to write the semantic schema."""
+        connection = self._open(self.database_url)
         try:
             yield connection
         finally:
             connection.close()
 
     @contextmanager
+    def _reader_connection(self) -> Iterator[StoreConnection]:
+        """Connect as the role allowed only to read the semantic schema.
+
+        Reads use their own login role so that a mistake on a read path is
+        refused by PostgreSQL rather than only by this module.
+        """
+        connection = self._open(self.reader_database_url)
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _lock_store(connection: StoreConnection) -> None:
+        """Serialise catalogue-wide writers, as BEGIN IMMEDIATE used to.
+
+        Held until the transaction ends.  Only the writers that publish a new
+        catalog revision take it, so they run one at a time and the row locks
+        they take afterwards are always acquired in the same order.
+        """
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (STORE_LOCK,)
+        )
+
+    @contextmanager
     def read_snapshot(
         self,
-    ) -> Iterator[tuple[sqlite3.Connection, int]]:
+    ) -> Iterator[tuple[StoreConnection, int]]:
         """Yield one connection pinned to the returned catalog revision."""
-        with self._connection() as connection:
-            connection.execute("BEGIN")
+        with self._reader_connection() as connection:
+            # REPEATABLE READ deliberately, and not PostgreSQL's default.  A
+            # paginated response is assembled from several statements on this
+            # connection and every one of them has to see the revision
+            # reported beside it; under READ COMMITTED each statement would
+            # take its own snapshot and one response could be built out of two
+            # catalogue revisions.  READ ONLY states the intent and lets the
+            # server reject a stray write here.
+            connection.execute(
+                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
             try:
                 revision = self.catalog_revision(connection)
                 yield connection, revision
@@ -179,163 +216,176 @@ class SemanticStore:
 
     def _migrate(self) -> None:
         with self._connection() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
+            connection.execute("BEGIN")
+            try:
+                # One lock and one transaction for the whole ladder.
+                # PostgreSQL DDL is transactional, so a second service
+                # starting at the same moment waits here and then finds every
+                # migration already recorded instead of racing CREATE TABLE.
+                self._lock_store(connection)
+                connection.execute(
+                    sql.SQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
+                            version bigint PRIMARY KEY,
+                            applied_at text NOT NULL
+                        )
+                        """
+                    ).format(schema=sql.Identifier(SCHEMA))
                 )
+                applied = {
+                    row["version"]
+                    for row in connection.execute(
+                        "SELECT version FROM schema_migrations"
+                    )
+                }
+                if 1 not in applied:
+                    self._migration_1(connection)
+                if 2 not in applied:
+                    self._migration_2(connection)
+                if 3 not in applied:
+                    self._migration_3(connection)
+                if 4 not in applied:
+                    self._migration_4(connection)
+                if 5 not in applied:
+                    self._migration_5(connection)
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _record_migration(connection: StoreConnection, version: int) -> None:
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES(%s, %s)",
+            (version, utc_now()),
+        )
+
+    @staticmethod
+    def _migration_1(connection: StoreConnection) -> None:
+        # The *_json columns are text rather than jsonb on purpose.  The store
+        # fingerprints canonical JSON, and jsonb reorders object keys and
+        # rewrites whitespace, which would change every stored fingerprint and
+        # break the proposal evidence check in apply_proposal.
+        connection.execute(
+            sql.SQL(
                 """
-            )
-            applied = {
-                row["version"]
-                for row in connection.execute(
-                    "SELECT version FROM schema_migrations"
-                )
-            }
-            if 1 not in applied:
-                self._migration_1(connection)
-            if 2 not in applied:
-                self._migration_2(connection)
-            if 3 not in applied:
-                self._migration_3(connection)
-            if 4 not in applied:
-                self._migration_4(connection)
-            if 5 not in applied:
-                self._migration_5(connection)
-        os.chmod(self.db_path, 0o600)
+                CREATE TABLE {schema}.metadata (
+                    key text PRIMARY KEY,
+                    value text NOT NULL
+                );
+                INSERT INTO {schema}.metadata(key, value)
+                    VALUES('catalog_revision', '0');
+
+                CREATE TABLE {schema}.assets (
+                    asset_id text PRIMARY KEY,
+                    version bigint NOT NULL CHECK(version >= 1),
+                    generation bigint NOT NULL CHECK(generation >= 1),
+                    status text NOT NULL CHECK(status IN ('ready', 'archived')),
+                    visibility text NOT NULL
+                        CHECK(visibility IN ('inspect', 'admin')),
+                    generated_json text NOT NULL,
+                    curated_json text NOT NULL,
+                    orphans_json text NOT NULL,
+                    catalog_revision bigint NOT NULL,
+                    created_at text NOT NULL,
+                    updated_at text NOT NULL,
+                    archived_at text
+                );
+
+                CREATE TABLE {schema}.asset_history (
+                    history_id bigint GENERATED BY DEFAULT AS IDENTITY
+                        PRIMARY KEY,
+                    asset_id text NOT NULL,
+                    version bigint NOT NULL,
+                    generation bigint NOT NULL,
+                    catalog_revision bigint NOT NULL,
+                    change_type text NOT NULL,
+                    event_id text,
+                    proposal_id text,
+                    actor text NOT NULL,
+                    snapshot_json text NOT NULL,
+                    changed_at text NOT NULL,
+                    FOREIGN KEY(asset_id) REFERENCES {schema}.assets(asset_id)
+                );
+                CREATE INDEX asset_history_asset_idx
+                    ON {schema}.asset_history(asset_id, history_id);
+
+                CREATE TABLE {schema}.processed_events (
+                    event_id text PRIMARY KEY,
+                    payload_hash text NOT NULL,
+                    generation bigint NOT NULL,
+                    response_json text NOT NULL,
+                    processed_at text NOT NULL
+                );
+
+                CREATE TABLE {schema}.proposals (
+                    proposal_id text PRIMARY KEY,
+                    state text NOT NULL CHECK(
+                        state IN ('pending', 'applied', 'declined')
+                    ),
+                    asset_id text NOT NULL,
+                    base_version bigint NOT NULL,
+                    operations_json text NOT NULL,
+                    fingerprint text NOT NULL,
+                    diff_json text NOT NULL,
+                    explanation text,
+                    actor text NOT NULL,
+                    reason text,
+                    created_at text NOT NULL,
+                    updated_at text NOT NULL,
+                    applied_version bigint,
+                    FOREIGN KEY(asset_id) REFERENCES {schema}.assets(asset_id)
+                );
+                CREATE INDEX proposals_asset_idx
+                    ON {schema}.proposals(asset_id, created_at);
+                CREATE INDEX proposals_state_idx
+                    ON {schema}.proposals(state, created_at);
+                """
+            ).format(schema=sql.Identifier(SCHEMA))
+        )
+        SemanticStore._record_migration(connection, 1)
 
     @staticmethod
-    def _migration_1(connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            BEGIN IMMEDIATE;
-
-            CREATE TABLE metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            INSERT INTO metadata(key, value) VALUES('catalog_revision', '0');
-
-            CREATE TABLE assets (
-                asset_id TEXT PRIMARY KEY,
-                version INTEGER NOT NULL CHECK(version >= 1),
-                generation INTEGER NOT NULL CHECK(generation >= 1),
-                status TEXT NOT NULL CHECK(status IN ('ready', 'archived')),
-                visibility TEXT NOT NULL CHECK(visibility IN ('inspect', 'admin')),
-                generated_json TEXT NOT NULL,
-                curated_json TEXT NOT NULL,
-                orphans_json TEXT NOT NULL,
-                catalog_revision INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                archived_at TEXT
-            );
-
-            CREATE TABLE asset_history (
-                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asset_id TEXT NOT NULL,
-                version INTEGER NOT NULL,
-                generation INTEGER NOT NULL,
-                catalog_revision INTEGER NOT NULL,
-                change_type TEXT NOT NULL,
-                event_id TEXT,
-                proposal_id TEXT,
-                actor TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL,
-                changed_at TEXT NOT NULL,
-                FOREIGN KEY(asset_id) REFERENCES assets(asset_id)
-            );
-            CREATE INDEX asset_history_asset_idx
-                ON asset_history(asset_id, history_id);
-
-            CREATE TABLE processed_events (
-                event_id TEXT PRIMARY KEY,
-                payload_hash TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                response_json TEXT NOT NULL,
-                processed_at TEXT NOT NULL
-            );
-
-            CREATE TABLE proposals (
-                proposal_id TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK(
-                    state IN ('pending', 'applied', 'declined')
-                ),
-                asset_id TEXT NOT NULL,
-                base_version INTEGER NOT NULL,
-                operations_json TEXT NOT NULL,
-                fingerprint TEXT NOT NULL,
-                diff_json TEXT NOT NULL,
-                explanation TEXT,
-                actor TEXT NOT NULL,
-                reason TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                applied_version INTEGER,
-                FOREIGN KEY(asset_id) REFERENCES assets(asset_id)
-            );
-            CREATE INDEX proposals_asset_idx
-                ON proposals(asset_id, created_at);
-            CREATE INDEX proposals_state_idx
-                ON proposals(state, created_at);
-
-            INSERT INTO schema_migrations(version, applied_at)
-                VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-            COMMIT;
-            """
+    def _migration_2(connection: StoreConnection) -> None:
+        connection.execute(
+            sql.SQL(
+                """
+                ALTER TABLE {schema}.proposals ADD COLUMN decided_by text;
+                ALTER TABLE {schema}.proposals ADD COLUMN decided_at text;
+                """
+            ).format(schema=sql.Identifier(SCHEMA))
         )
+        SemanticStore._record_migration(connection, 2)
 
     @staticmethod
-    def _migration_2(connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            BEGIN IMMEDIATE;
-
-            ALTER TABLE proposals ADD COLUMN decided_by TEXT;
-            ALTER TABLE proposals ADD COLUMN decided_at TEXT;
-
-            INSERT INTO schema_migrations(version, applied_at)
-                VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-            COMMIT;
-            """
+    def _migration_3(connection: StoreConnection) -> None:
+        connection.execute(
+            sql.SQL(
+                """
+                ALTER TABLE {schema}.assets
+                    ADD COLUMN predecessor_asset_id text
+                    REFERENCES {schema}.assets(asset_id);
+                """
+            ).format(schema=sql.Identifier(SCHEMA))
         )
+        SemanticStore._record_migration(connection, 3)
 
     @staticmethod
-    def _migration_3(connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            BEGIN IMMEDIATE;
-
-            ALTER TABLE assets
-                ADD COLUMN predecessor_asset_id TEXT
-                REFERENCES assets(asset_id);
-
-            INSERT INTO schema_migrations(version, applied_at)
-                VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-            COMMIT;
-            """
+    def _migration_4(connection: StoreConnection) -> None:
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE INDEX IF NOT EXISTS proposals_created_page_idx
+                    ON {schema}.proposals(created_at, proposal_id);
+                CREATE INDEX IF NOT EXISTS proposals_asset_page_idx
+                    ON {schema}.proposals(asset_id, created_at, proposal_id);
+                CREATE INDEX IF NOT EXISTS proposals_state_page_idx
+                    ON {schema}.proposals(state, created_at, proposal_id);
+                """
+            ).format(schema=sql.Identifier(SCHEMA))
         )
-
-    @staticmethod
-    def _migration_4(connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            BEGIN IMMEDIATE;
-
-            CREATE INDEX IF NOT EXISTS proposals_created_page_idx
-                ON proposals(created_at, proposal_id);
-            CREATE INDEX IF NOT EXISTS proposals_asset_page_idx
-                ON proposals(asset_id, created_at, proposal_id);
-            CREATE INDEX IF NOT EXISTS proposals_state_page_idx
-                ON proposals(state, created_at, proposal_id);
-
-            INSERT INTO schema_migrations(version, applied_at)
-                VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-            COMMIT;
-            """
-        )
+        SemanticStore._record_migration(connection, 4)
 
     @staticmethod
     def _validated_fetch_limit(fetch_limit: int | None) -> int | None:
@@ -353,50 +403,53 @@ class SemanticStore:
         return fetch_limit
 
     def database_settings(self) -> dict[str, Any]:
-        with self._connection() as connection:
-            return {
-                "journalMode": connection.execute(
-                    "PRAGMA journal_mode"
-                ).fetchone()[0],
-                "foreignKeys": connection.execute(
-                    "PRAGMA foreign_keys"
-                ).fetchone()[0],
-                "synchronous": connection.execute(
-                    "PRAGMA synchronous"
-                ).fetchone()[0],
-                "busyTimeout": connection.execute(
-                    "PRAGMA busy_timeout"
-                ).fetchone()[0],
-                "schemaVersion": connection.execute(
-                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-                ).fetchone()[0],
-            }
+        """Report the applied schema version.
 
-    def catalog_revision(self, connection: sqlite3.Connection | None = None) -> int:
+        The journal mode, foreign-key, synchronous and busy-timeout keys this
+        returned under SQLite described PRAGMAs that no longer exist; they had
+        no PostgreSQL counterpart worth reporting and nothing read them.  The
+        one key `status()` publishes is unchanged.
+        """
+        with self._reader_connection() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS schema_version"
+                " FROM schema_migrations"
+            ).fetchone()
+            return {"schemaVersion": row["schema_version"]}
+
+    def catalog_revision(self, connection: StoreConnection | None = None) -> int:
         if connection is not None:
             return int(
                 connection.execute(
                     "SELECT value FROM metadata WHERE key = 'catalog_revision'"
-                ).fetchone()[0]
+                ).fetchone()["value"]
             )
-        with self._connection() as own_connection:
+        with self._reader_connection() as own_connection:
             return self.catalog_revision(own_connection)
 
-    def _next_catalog_revision(self, connection: sqlite3.Connection) -> int:
-        revision = self.catalog_revision(connection) + 1
+    def _next_catalog_revision(self, connection: StoreConnection) -> int:
+        # Reads the row FOR UPDATE rather than through catalog_revision, which
+        # must stay usable inside a read-only transaction.  SQLite's
+        # BEGIN IMMEDIATE serialised every writer and PostgreSQL does not:
+        # without the row lock two transactions could read the same revision
+        # and both write its successor, publishing two different catalogue
+        # states under one number.
+        current = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'catalog_revision'"
+            " FOR UPDATE"
+        ).fetchone()
+        revision = int(current["value"]) + 1
         connection.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'catalog_revision'",
+            "UPDATE metadata SET value = %s WHERE key = 'catalog_revision'",
             (str(revision),),
         )
         return revision
 
     @staticmethod
-    def _migration_5(connection: sqlite3.Connection) -> None:
+    def _migration_5(connection: StoreConnection) -> None:
         """Record that an asset's underlying source is not currently usable.
 
-        A separate column rather than a new `status` value, for two reasons.
-        SQLite cannot alter a CHECK constraint without rebuilding the table,
-        and `assets` is referenced by foreign keys. More importantly the two
+        A separate column rather than a new `status` value, because the two
         facts are independent: `archived` is an operator's deliberate,
         confirmed decision, while this is an observation about the world that
         reverses itself when the source comes back. An archived asset whose
@@ -404,21 +457,18 @@ class SemanticStore:
 
         NULL means the source is fine, which is what every existing row means.
         """
-        connection.executescript(
-            """
-            BEGIN IMMEDIATE;
-
-            ALTER TABLE assets ADD COLUMN source_state TEXT
-                CHECK(source_state IS NULL OR source_state = 'unavailable');
-
-            INSERT INTO schema_migrations(version, applied_at)
-                VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-            COMMIT;
-            """
+        connection.execute(
+            sql.SQL(
+                """
+                ALTER TABLE {schema}.assets ADD COLUMN source_state text
+                    CHECK(source_state IS NULL OR source_state = 'unavailable');
+                """
+            ).format(schema=sql.Identifier(SCHEMA))
         )
+        SemanticStore._record_migration(connection, 5)
 
     @staticmethod
-    def _asset_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _asset_from_row(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": row["asset_id"],
             "version": row["version"],
@@ -455,21 +505,22 @@ class SemanticStore:
         """
         state = None if available else "unavailable"
         with self._connection() as connection:
-            # One explicit write transaction over the select and every update.
-            # The connection is opened with isolation_level=None, so without
-            # this each row would commit on its own: a reader could catch a
-            # schema half marked, and an error midway would leave it that way
+            # One explicit write transaction over the select and the update.
+            # The connection is opened with autocommit on, so without this each
+            # statement would commit on its own: a reader could catch a schema
+            # half marked, and an error midway would leave it that way
             # permanently. The observation is about the schema, so it has to
             # land for the whole schema or not at all.
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             try:
+                self._lock_store(connection)
                 rows = connection.execute(
                     """
                     SELECT asset_id FROM assets
-                    WHERE json_extract(generated_json, '$.binding.schema') = ?
-                      AND json_extract(generated_json, '$.binding.adapter')
+                    WHERE generated_json::jsonb -> 'binding' ->> 'schema' = %s
+                      AND generated_json::jsonb -> 'binding' ->> 'adapter'
                           = 'postgresql'
-                      AND source_state IS NOT ?
+                      AND source_state IS DISTINCT FROM %s
                     """,
                     (schema, state),
                 ).fetchall()
@@ -486,13 +537,10 @@ class SemanticStore:
                 # the batch, stamped on every row it touched.
                 revision = self._next_catalog_revision(connection)
                 changed_at = utc_now()
-                connection.executemany(
-                    "UPDATE assets SET source_state = ?, updated_at = ?, "
-                    "catalog_revision = ? WHERE asset_id = ?",
-                    [
-                        (state, changed_at, revision, asset_id)
-                        for asset_id in changed
-                    ],
+                connection.execute(
+                    "UPDATE assets SET source_state = %s, updated_at = %s, "
+                    "catalog_revision = %s WHERE asset_id = ANY(%s)",
+                    (state, changed_at, revision, changed),
                 )
                 connection.execute("COMMIT")
                 return changed
@@ -502,14 +550,14 @@ class SemanticStore:
 
     def assets_for_source_schema(self, schema: str) -> list[dict[str, Any]]:
         """Assets bound to one schema, whatever their status or source state."""
-        with self._connection() as connection:
+        with self._reader_connection() as connection:
             return [
                 self._asset_from_row(row)
                 for row in connection.execute(
                     """
                     SELECT * FROM assets
-                    WHERE json_extract(generated_json, '$.binding.schema') = ?
-                      AND json_extract(generated_json, '$.binding.adapter')
+                    WHERE generated_json::jsonb -> 'binding' ->> 'schema' = %s
+                      AND generated_json::jsonb -> 'binding' ->> 'adapter'
                           = 'postgresql'
                     ORDER BY asset_id
                     """,
@@ -518,11 +566,11 @@ class SemanticStore:
             ]
 
     @staticmethod
-    def _visible(row: sqlite3.Row, is_admin: bool) -> bool:
+    def _visible(row: dict[str, Any], is_admin: bool) -> bool:
         return row["visibility"] == "inspect" or is_admin
 
     @classmethod
-    def _asset_visible(cls, row: sqlite3.Row, is_admin: bool) -> bool:
+    def _asset_visible(cls, row: dict[str, Any], is_admin: bool) -> bool:
         if row["status"] == "archived":
             return is_admin
         return cls._visible(row, is_admin)
@@ -532,18 +580,18 @@ class SemanticStore:
         asset_id: str,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
     ) -> dict[str, Any]:
         _require_string(asset_id, "assetId")
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.get_asset(
                     asset_id,
                     is_admin=is_admin,
                     connection=own_connection,
                 )
         row = connection.execute(
-            "SELECT * FROM assets WHERE asset_id = ?", (asset_id,)
+            "SELECT * FROM assets WHERE asset_id = %s", (asset_id,)
         ).fetchone()
         if row is None or not self._asset_visible(row, is_admin):
             raise SemanticError(
@@ -555,7 +603,7 @@ class SemanticStore:
         self,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
         after_asset_id: str | None = None,
         fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -563,7 +611,7 @@ class SemanticStore:
         if after_asset_id is not None:
             _require_string(after_asset_id, "afterAssetId")
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.list_assets(
                     is_admin=is_admin,
                     connection=own_connection,
@@ -575,14 +623,14 @@ class SemanticStore:
         if not is_admin:
             clauses.append("visibility = 'inspect'")
         if after_asset_id is not None:
-            clauses.append("asset_id > ?")
+            clauses.append("asset_id > %s")
             values.append(after_asset_id)
         statement = (
             f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
             "ORDER BY asset_id"
         )
         if fetch_limit is not None:
-            statement += " LIMIT ?"
+            statement += " LIMIT %s"
             values.append(fetch_limit)
         rows = connection.execute(statement, values).fetchall()
         return [self._asset_from_row(row) for row in rows]
@@ -593,7 +641,7 @@ class SemanticStore:
         *,
         limit: int | None,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
         after_asset_id: str | None = None,
         fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -617,7 +665,7 @@ class SemanticStore:
         if after_asset_id is not None:
             _require_string(after_asset_id, "afterAssetId")
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.search_assets(
                     query,
                     limit=limit,
@@ -626,18 +674,23 @@ class SemanticStore:
                     after_asset_id=after_asset_id,
                     fetch_limit=fetch_limit,
                 )
-        needle = query.casefold().strip()
+        # lower() on both sides, not casefold().  The haystack is folded by
+        # PostgreSQL and PostgreSQL has no casefold, so folding the needle in
+        # Python with str.casefold would leave the two disagreeing: casefold
+        # maps "STRASSE" and "Straße" onto the same string and lower()
+        # does not.
+        needle = query.lower().strip()
         clauses = ["status = 'ready'"]
         values: list[Any] = []
         if not is_admin:
             clauses.append("visibility = 'inspect'")
         if after_asset_id is not None:
-            clauses.append("asset_id > ?")
+            clauses.append("asset_id > %s")
             values.append(after_asset_id)
         if needle:
             clauses.append(
-                "instr(mapp_casefold(asset_id || ' ' || generated_json || ' ' || "
-                "curated_json), ?) > 0"
+                "position(%s in lower(asset_id || ' ' || generated_json "
+                "|| ' ' || curated_json)) > 0"
             )
             values.append(needle)
         effective_limit = fetch_limit if fetch_limit is not None else limit
@@ -646,7 +699,7 @@ class SemanticStore:
             "ORDER BY asset_id"
         )
         if effective_limit is not None:
-            statement += " LIMIT ?"
+            statement += " LIMIT %s"
             values.append(effective_limit)
         rows = connection.execute(statement, values).fetchall()
         results: list[dict[str, Any]] = []
@@ -677,7 +730,7 @@ class SemanticStore:
         asset_id: str,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
         after_history_id: int | None = None,
         fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -707,10 +760,10 @@ class SemanticStore:
             is_admin=is_admin,
             connection=connection,
         )
-        clauses = ["asset_id = ?"]
+        clauses = ["asset_id = %s"]
         values: list[Any] = [asset_id]
         if after_history_id is not None:
-            clauses.append("history_id > ?")
+            clauses.append("history_id > %s")
             values.append(after_history_id)
         statement = f"""
             SELECT history_id, version, generation, catalog_revision, change_type,
@@ -720,7 +773,7 @@ class SemanticStore:
              ORDER BY history_id
             """
         if fetch_limit is not None:
-            statement += " LIMIT ?"
+            statement += " LIMIT %s"
             values.append(fetch_limit)
         rows = connection.execute(statement, values).fetchall()
         return [
@@ -960,10 +1013,18 @@ class SemanticStore:
         now = self.clock()
         response: dict[str, Any]
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             try:
+                # Store-wide, because this is the one writer that can create
+                # an asset row: there is nothing to lock FOR UPDATE until it
+                # has decided whether the asset exists, and the same is true
+                # of the processed_events row that makes a replay idempotent.
+                # Without it two deliveries of one event would both find no
+                # prior row and the loser would fail on the primary key
+                # instead of returning the recorded response.
+                self._lock_store(connection)
                 prior_event = connection.execute(
-                    "SELECT * FROM processed_events WHERE event_id = ?",
+                    "SELECT * FROM processed_events WHERE event_id = %s",
                     (validated["eventId"],),
                 ).fetchone()
                 if prior_event is not None:
@@ -985,7 +1046,7 @@ class SemanticStore:
                     return response
 
                 row = connection.execute(
-                    "SELECT * FROM assets WHERE asset_id = ?",
+                    "SELECT * FROM assets WHERE asset_id = %s",
                     (validated["assetId"],),
                 ).fetchone()
                 event_type = validated["type"]
@@ -1002,7 +1063,7 @@ class SemanticStore:
                     predecessor = None
                     if predecessor_asset_id is not None:
                         predecessor = connection.execute(
-                            "SELECT * FROM assets WHERE asset_id = ?",
+                            "SELECT * FROM assets WHERE asset_id = %s",
                             (predecessor_asset_id,),
                         ).fetchone()
                         if predecessor is None:
@@ -1147,7 +1208,9 @@ class SemanticStore:
                             generated_json, curated_json, orphans_json,
                             catalog_revision, created_at, updated_at, archived_at,
                             predecessor_asset_id
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES(
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
                         """,
                         (
                             validated["assetId"],
@@ -1169,18 +1232,18 @@ class SemanticStore:
                     connection.execute(
                         """
                         UPDATE assets
-                           SET version = ?, generation = ?, status = ?,
-                               visibility = ?, generated_json = ?,
-                               curated_json = ?, orphans_json = ?,
-                               catalog_revision = ?, updated_at = ?,
-                               archived_at = ?
-                         WHERE asset_id = ?
+                           SET version = %s, generation = %s, status = %s,
+                               visibility = %s, generated_json = %s,
+                               curated_json = %s, orphans_json = %s,
+                               catalog_revision = %s, updated_at = %s,
+                               archived_at = %s
+                         WHERE asset_id = %s
                         """,
                         values,
                     )
 
                 updated_row = connection.execute(
-                    "SELECT * FROM assets WHERE asset_id = ?",
+                    "SELECT * FROM assets WHERE asset_id = %s",
                     (validated["assetId"],),
                 ).fetchone()
                 asset = self._asset_from_row(updated_row)
@@ -1190,7 +1253,7 @@ class SemanticStore:
                         asset_id, version, generation, catalog_revision,
                         change_type, event_id, proposal_id, actor,
                         snapshot_json, changed_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                    ) VALUES(%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s)
                     """,
                     (
                         asset["id"],
@@ -1218,7 +1281,7 @@ class SemanticStore:
                     INSERT INTO processed_events(
                         event_id, payload_hash, generation,
                         response_json, processed_at
-                    ) VALUES(?, ?, ?, ?, ?)
+                    ) VALUES(%s, %s, %s, %s, %s)
                     """,
                     (
                         validated["eventId"],
@@ -1407,7 +1470,7 @@ class SemanticStore:
         request: dict[str, Any],
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
     ) -> dict[str, Any]:
         request = _require_object(request, "request")
         _closed_object(
@@ -1510,13 +1573,18 @@ class SemanticStore:
         now = self.clock()
         proposal_id = str(uuid.uuid4())
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             try:
+                # FOR UPDATE on the asset alone, not the store-wide lock: this
+                # writer publishes no catalog revision, and all it needs is
+                # that the version it validated against cannot move between
+                # the check below and the insert.
                 row = connection.execute(
                     """
                     SELECT version, status, visibility
                     FROM assets
-                    WHERE asset_id = ?
+                    WHERE asset_id = %s
+                    FOR UPDATE
                     """,
                     (check["assetId"],),
                 ).fetchone()
@@ -1545,7 +1613,10 @@ class SemanticStore:
                         operations_json, fingerprint, diff_json,
                         explanation, actor, reason, created_at, updated_at,
                         applied_version
-                    ) VALUES(?, 'pending', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
+                    ) VALUES(
+                        %s, 'pending', %s, %s, %s, %s, %s, %s, %s, NULL,
+                        %s, %s, NULL
+                    )
                     """,
                     (
                         proposal_id,
@@ -1567,7 +1638,7 @@ class SemanticStore:
         return self.get_proposal(proposal_id, is_admin=is_admin)
 
     @staticmethod
-    def _proposal_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _proposal_from_row(row: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": row["proposal_id"],
             "state": row["state"],
@@ -1591,11 +1662,11 @@ class SemanticStore:
         proposal_id: str,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
     ) -> dict[str, Any]:
         _require_string(proposal_id, "proposalId")
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.get_proposal(
                     proposal_id,
                     is_admin=is_admin,
@@ -1606,7 +1677,7 @@ class SemanticStore:
             SELECT p.*, a.visibility
               FROM proposals p
               JOIN assets a ON a.asset_id = p.asset_id
-             WHERE p.proposal_id = ?
+             WHERE p.proposal_id = %s
             """,
             (proposal_id,),
         ).fetchone()
@@ -1624,7 +1695,7 @@ class SemanticStore:
         state: str | None,
         asset_id: str | None,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
         after: tuple[str, str] | None = None,
         fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -1645,22 +1716,22 @@ class SemanticStore:
         clauses: list[str] = []
         values: list[Any] = []
         if state is not None:
-            clauses.append("p.state = ?")
+            clauses.append("p.state = %s")
             values.append(state)
         if asset_id is not None:
-            clauses.append("p.asset_id = ?")
+            clauses.append("p.asset_id = %s")
             values.append(asset_id)
         if not is_admin:
             clauses.append("a.visibility = 'inspect'")
         if after is not None:
             clauses.append(
-                "(p.created_at > ? OR "
-                "(p.created_at = ? AND p.proposal_id > ?))"
+                "(p.created_at > %s OR "
+                "(p.created_at = %s AND p.proposal_id > %s))"
             )
             values.extend((after[0], after[0], after[1]))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.list_proposals(
                     state=state,
                     asset_id=asset_id,
@@ -1677,7 +1748,7 @@ class SemanticStore:
              ORDER BY p.created_at, p.proposal_id
             """
         if fetch_limit is not None:
-            statement += " LIMIT ?"
+            statement += " LIMIT %s"
             values.append(fetch_limit)
         rows = connection.execute(statement, values).fetchall()
         return [self._proposal_from_row(row) for row in rows]
@@ -1693,10 +1764,18 @@ class SemanticStore:
         self.get_proposal(proposal_id, is_admin=is_admin)
         now = self.clock()
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             try:
+                # Store-wide, because this publishes a catalog revision, plus
+                # FOR UPDATE on the proposal and on the asset it changes.  The
+                # row lock on the proposal is what excludes decline_proposal,
+                # which takes no store-wide lock: without it a decline could
+                # commit between the state check here and the update below and
+                # the proposal would end up both declined and applied.
+                self._lock_store(connection)
                 proposal_row = connection.execute(
-                    "SELECT * FROM proposals WHERE proposal_id = ?",
+                    "SELECT * FROM proposals WHERE proposal_id = %s"
+                    " FOR UPDATE",
                     (proposal_id,),
                 ).fetchone()
                 if proposal_row["state"] != "pending":
@@ -1706,7 +1785,7 @@ class SemanticStore:
                         status=409,
                     )
                 asset_row = connection.execute(
-                    "SELECT * FROM assets WHERE asset_id = ?",
+                    "SELECT * FROM assets WHERE asset_id = %s FOR UPDATE",
                     (proposal_row["asset_id"],),
                 ).fetchone()
                 if asset_row is None or not self._visible(
@@ -1746,9 +1825,9 @@ class SemanticStore:
                 connection.execute(
                     """
                     UPDATE assets
-                       SET version = ?, curated_json = ?, catalog_revision = ?,
-                           updated_at = ?
-                     WHERE asset_id = ?
+                       SET version = %s, curated_json = %s,
+                           catalog_revision = %s, updated_at = %s
+                     WHERE asset_id = %s
                     """,
                     (
                         version,
@@ -1761,20 +1840,20 @@ class SemanticStore:
                 connection.execute(
                     """
                     UPDATE proposals
-                       SET state = 'applied', updated_at = ?,
-                           applied_version = ?, decided_by = ?,
-                           decided_at = ?
-                     WHERE proposal_id = ?
+                       SET state = 'applied', updated_at = %s,
+                           applied_version = %s, decided_by = %s,
+                           decided_at = %s
+                     WHERE proposal_id = %s
                     """,
                     (now, version, actor, now, proposal_id),
                 )
                 updated_proposal_row = connection.execute(
-                    "SELECT * FROM proposals WHERE proposal_id = ?",
+                    "SELECT * FROM proposals WHERE proposal_id = %s",
                     (proposal_id,),
                 ).fetchone()
                 proposal = self._proposal_from_row(updated_proposal_row)
                 updated_row = connection.execute(
-                    "SELECT * FROM assets WHERE asset_id = ?",
+                    "SELECT * FROM assets WHERE asset_id = %s",
                     (asset_row["asset_id"],),
                 ).fetchone()
                 asset = self._asset_from_row(updated_row)
@@ -1784,7 +1863,7 @@ class SemanticStore:
                         asset_id, version, generation, catalog_revision,
                         change_type, event_id, proposal_id, actor,
                         snapshot_json, changed_at
-                    ) VALUES(?, ?, ?, ?, 'curated', NULL, ?, ?, ?, ?)
+                    ) VALUES(%s, %s, %s, %s, 'curated', NULL, %s, %s, %s, %s)
                     """,
                     (
                         asset["id"],
@@ -1821,14 +1900,19 @@ class SemanticStore:
             )
         now = self.clock()
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN")
             try:
+                # FOR UPDATE OF p, so only the proposal row is locked and the
+                # joined asset is left alone.  This writer publishes no
+                # catalog revision, so it needs no store-wide lock; the row
+                # lock is what makes it exclusive with apply_proposal.
                 row = connection.execute(
                     """
                     SELECT p.state, a.visibility
                     FROM proposals AS p
                     JOIN assets AS a ON a.asset_id = p.asset_id
-                    WHERE p.proposal_id = ?
+                    WHERE p.proposal_id = %s
+                    FOR UPDATE OF p
                     """,
                     (proposal_id,),
                 ).fetchone()
@@ -1847,9 +1931,9 @@ class SemanticStore:
                 connection.execute(
                     """
                     UPDATE proposals
-                       SET state = 'declined', reason = ?, updated_at = ?,
-                           decided_by = ?, decided_at = ?
-                     WHERE proposal_id = ?
+                       SET state = 'declined', reason = %s, updated_at = %s,
+                           decided_by = %s, decided_at = %s
+                     WHERE proposal_id = %s
                     """,
                     (reason, now, actor, now, proposal_id),
                 )
@@ -1863,7 +1947,7 @@ class SemanticStore:
         self,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
         after_asset_id: str | None = None,
         fetch_limit: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -1871,7 +1955,7 @@ class SemanticStore:
         if after_asset_id is not None:
             _require_string(after_asset_id, "afterAssetId")
         if connection is None:
-            with self._connection() as own_connection:
+            with self._reader_connection() as own_connection:
                 return self.derived_profiles(
                     is_admin=is_admin,
                     connection=own_connection,
@@ -1880,22 +1964,22 @@ class SemanticStore:
                 )
         clauses = [
             "status = 'ready'",
-            "(json_extract(generated_json, '$.binding.schema') = 'derived_layers' "
-            "OR instr(mapp_casefold(json_extract(generated_json, '$.kind')), "
-            "'derived') > 0)",
+            "(generated_json::jsonb -> 'binding' ->> 'schema' "
+            "= 'derived_layers' OR position('derived' in "
+            "lower(generated_json::jsonb ->> 'kind')) > 0)",
         ]
         values: list[Any] = []
         if not is_admin:
             clauses.append("visibility = 'inspect'")
         if after_asset_id is not None:
-            clauses.append("asset_id > ?")
+            clauses.append("asset_id > %s")
             values.append(after_asset_id)
         statement = (
             f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
             "ORDER BY asset_id"
         )
         if fetch_limit is not None:
-            statement += " LIMIT ?"
+            statement += " LIMIT %s"
             values.append(fetch_limit)
         rows = connection.execute(statement, values).fetchall()
         return [self._asset_from_row(row) for row in rows]
@@ -1919,7 +2003,7 @@ class SemanticStore:
         name: str,
         *,
         is_admin: bool,
-        connection: sqlite3.Connection | None = None,
+        connection: StoreConnection | None = None,
     ) -> dict[str, Any]:
         _require_string(name, "name")
         for asset in self.derived_profiles(

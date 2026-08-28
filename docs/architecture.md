@@ -32,8 +32,8 @@ deployment contract described on this page.
                          ▼          ▼
                         XYZ     config dashboard/API
                          │       │       ├── browser runner
-                         └──┬────┘       └── semantic service ──> SQLite
-                            ▼
+                         └──┬────┘       └── semantic service ──> semantic schema
+                            ▼                                     in that database
               bundled or external PostgreSQL/PostGIS
                             ▲
                             │ bundled sample mode only
@@ -55,9 +55,10 @@ direct route to arbitrary destinations. The runner does not join the
 database/backend or public edge networks and holds no platform credential.
 Browser navigation uses a guarded,
 un-published Caddy listener on port 8081; the `caddy` hostname is denied on the
-published HTTP listener. The semantic service is on a separate internal
-network shared only with the configuration service. It has neither a public
-route nor a database credential.
+published HTTP listener. The semantic service reaches the configuration
+service over a separate internal network shared only with it, and reaches the
+packaged database over the backend network. It has no public route, and its two
+database roles are confined to the `semantic` catalog schema.
 
 ## Components
 
@@ -68,7 +69,7 @@ route nor a database credential.
 | XYZ | Map UI, MVT and feature queries | `var/workspace/workspace.json`, `instance/xyz.env`, public assets |
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
 | Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
-| Semantic service | Durable generated facts, curated annotations, per-asset proposals, history, and archive tombstones | `var/semantic/semantic.sqlite3` |
+| Semantic service | Durable generated facts, curated annotations, per-asset proposals, history, and archive tombstones | Schema `semantic` in the packaged database, read through a read-only role and written through the role that owns it |
 | Browser runner | Authenticated visual validation with bounded map origin and isolated outbound asset access | `var/control/artifacts` |
 | Caddy | TLS, host routing, response headers, upstream file-provider guard | Caddy named volumes |
 | Standalone CLI | Remote inspection, proposals, application and verification | State on the separate client computer |
@@ -126,9 +127,11 @@ semantic service or returning it to the browser/CLI:
 5. A new workspace reference to a derived relation is publishable only after
    the matching semantic generation is ready.
 
-The derived-layer PostgreSQL outbox is the atomic bridge; SQLite does not
-participate in the PostgreSQL transaction. Stable event IDs make delivery
-idempotent. Workers atomically take expiring PostgreSQL claims with
+The derived-layer PostgreSQL outbox is the atomic bridge. The catalog is now
+in the same database but not in the same transaction: the configuration service
+commits the outbox row as the derived owner, and the semantic service writes
+the profile afterwards as the catalog owner, over a separate connection and
+after an HTTP hop. Stable event IDs make delivery idempotent. Workers atomically take expiring PostgreSQL claims with
 `SKIP LOCKED`; only the matching claimant can commit delivery, retry, or repair
 state, while lease expiry recovers abandoned work. Event envelopes, payload
 hashes, and acknowledgements are validated, and events are delivered in order

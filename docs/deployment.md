@@ -181,7 +181,8 @@ trusted headers, binding, TLS, and health checks; do not bypass the validator.
 `serve` starts the long-running services without changing database rows.
 This includes the private `semantic-service` in every database mode. The
 service is reachable only from `config-ui` on the internal
-`semantic-control` network and persists its SQLite state in `var/semantic`.
+`semantic-control` network; it joins the backend network solely to persist its
+catalog in the `semantic` schema of the packaged database.
 The `all` command loads the full ETL, including Census, before verification
 in either local-database mode.
 In external mode, `etl`, `all`, and the local `db` command are disabled;

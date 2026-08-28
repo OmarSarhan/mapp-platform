@@ -313,7 +313,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'REVOKE CREATE ON DATABASE :"DBNAME" '
-            'FROM :"xyz_db_user", :"derived_db_user";',
+            'FROM :"xyz_db_user", :"derived_db_user", '
+            ':"semantic_db_user", :"semantic_reader_db_user";',
             normalized,
         )
         self.assertIn(
@@ -323,12 +324,14 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             'REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw '
-            'FROM :"xyz_db_user", :"derived_db_user";',
+            'FROM :"xyz_db_user", :"derived_db_user", '
+            ':"semantic_db_user", :"semantic_reader_db_user";',
             normalized,
         )
         self.assertIn(
             'REVOKE ALL ON SCHEMA federation '
-            'FROM :"xyz_db_user", :"derived_db_user";',
+            'FROM :"xyz_db_user", :"derived_db_user", '
+            ':"semantic_db_user", :"semantic_reader_db_user";',
             normalized,
         )
         self.assertIn(

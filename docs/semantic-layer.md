@@ -4,8 +4,9 @@ Semantic service `1.2.0` is a metadata control plane beside the data plane. It g
 the dashboard, standalone CLI, and approved agents a durable description of a
 data asset without making the semantic service a database proxy. In v1, the
 private semantic service stores generated source facts and reviewed human
-meaning; it has no database credential and never executes source queries or
-exposes source rows. The public configuration service can separately read the
+meaning in the packaged database, in a schema named `semantic`; it holds a
+credential for that schema and for nothing else, and it never executes source
+queries or exposes source rows. The public configuration service can separately read the
 strictly bounded sample or statistics described under **On-demand Gemini
 drafts**, but only for an explicitly authorized generation request. Those
 values go to Gemini and are not added to the semantic catalog or returned to
@@ -27,17 +28,23 @@ dashboard / standalone CLI
           │                    │ same transaction
           │                    └── derived definition + semantic outbox
           │
-          └── internal token ──> semantic service ──> var/semantic/semantic.sqlite3
+          └── internal token ──> semantic service ──> schema semantic
+                                             reader role reads,
+                                             owner role writes
 ```
 
 Only the configuration service is public through Caddy. It authenticates the
 dashboard session or CLI bearer token, enforces semantic scopes, and forwards
 the trusted actor and effective scopes. The semantic service is attached only
-to the internal `semantic-control` Compose network. It has:
+to the internal `semantic-control` and `backend` Compose networks. It has:
 
 - no published host port;
-- no PostgreSQL credential or database network;
-- a read-only container root and a single writable `var/semantic` mount; and
+- two PostgreSQL credentials, both confined to schema `semantic`: a read-only
+  role used for every catalog read, and the role owning that schema used for
+  every catalog write;
+- no privilege on `derived_layers`, `federation`, `public`, or any
+  `source_<alias>` schema, no `postgres_fdw` `USAGE`, and no role membership;
+- a read-only container root and no writable mount; and
 - one internal bearer token shared only with the configuration service.
 
 The internal token authenticates service-to-service traffic. It is not a user
@@ -460,18 +467,25 @@ commands; no CLI implementation belongs in this repository.
 
 ## Deployment and operations
 
-Persistent semantic state lives under ignored runtime state:
+Persistent semantic state lives in the packaged database:
 
 ```text
-var/semantic/
-└── semantic.sqlite3       generated, curated, proposal, event, and history state
+semantic                   schema owned by SEMANTIC_DB_USER
+├── metadata               catalog revision and store-wide state
+├── assets                 generated and curated profiles
+├── asset_history          immutable per-asset history
+├── processed_events       delivered source event receipts
+├── proposals              revision-bound curated proposals
+└── schema_migrations      applied store migration versions
 ```
 
-SQLite uses a write-ahead log while the service is running, so treat the whole
-directory as one state unit. Preserve owner-only directory and database modes.
-Do not commit it, add it to a container build context, or mount it into XYZ.
-Durable does not mean backup-free: v1 has no automatic history pruning,
-off-host replication, or retention scheduler.
+There is no directory to copy any more: an ordinary database backup covers the
+catalog, and nothing else does. JSON is stored as `text` holding canonical JSON
+rather than `jsonb`, because the store fingerprints that exact text and `jsonb`
+would reorder keys and normalize whitespace. An operator inspecting the tables
+directly should connect as the reader role, which can only `SELECT`. Durable
+does not mean backup-free: v1 has no automatic history pruning, off-host
+replication, or retention scheduler.
 
 Useful operational checks are:
 
@@ -487,14 +501,18 @@ For Gemini drafts, also check the `capabilities.generation` status object.
 is invalid. Rate limits and timeouts are reported distinctly and do not trigger
 an automatic retry.
 
-Do not edit the SQLite database or `_semantic_outbox` manually. First allow
+Do not edit the `semantic` schema or `_semantic_outbox` manually. First allow
 automatic retry. For `repair_required`, identify and correct the underlying
 cause, then use the confirmed administrator retry. The retained event remains
 unchanged, so retrying without correcting a deterministic failure will
 reproduce it. Recovery is not permission to invent curated annotations.
 
-The destructive bundled-database `reset-data --confirm` operation preserves
-this history. Beginning reset installs a durable PostgreSQL maintenance gate
+The destructive bundled-database `reset-data --confirm` operation no longer
+preserves this history: the catalog is a schema in the volume that reset
+removes, so the archived tombstones and the curated metadata they carry are
+deleted with it. The choreography below therefore protects the aborted path,
+where the volume survives and the catalog must be left consistent with it, not
+the successful one. Beginning reset installs a durable PostgreSQL maintenance gate
 with a unique operation owner under the same advisory lock used by derived
 mutations. New creates, replacements, refreshes, drops, and confirmed
 administrator delivery retries are rejected while the gate is active,
@@ -546,12 +564,12 @@ If the database volume has already been removed, semantic compensation is no
 longer safe or applicable; run the confirmed reset again to finish
 initialization.
 
-Back up the semantic directory together with PostgreSQL, the workspace, and
-control state. Stop configuration writes and the semantic service before
-copying the SQLite directory so the database and any WAL files form one
-consistent unit. Coordinate the PostgreSQL dump or external snapshot from the
-same write-quiesced interval because the derived outbox is the recovery bridge
-between the two stores. The detailed sequence is in
+The catalog is now inside the PostgreSQL backup rather than beside it. One
+dump captures the derived outbox and the delivered profiles together, so the
+two ends of the recovery bridge can no longer come from different moments.
+Still quiesce configuration writes before taking it, so no outbox event is
+committed after the profile answering it was captured, and back up the
+workspace and control state from the same interval. The detailed sequence is in
 [Backup and restore](backup-restore.md).
 
 ## V1 boundary and future optionality
@@ -560,7 +578,8 @@ V1 deliberately provides metadata and governance, not a universal analytics
 engine. It does not:
 
 - execute user queries, metrics, functions, or semantic expressions;
-- hold database credentials or return source rows;
+- hold source-database credentials or return source rows; its two roles reach
+  the `semantic` catalog schema and nothing else;
 - infer business meaning with embeddings or an AI model;
 - provide a generic connector framework for arbitrary data systems;
 - implement row- or column-level data authorization; or

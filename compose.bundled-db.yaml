@@ -24,6 +24,10 @@ services:
       DERIVED_DB_PASSWORD: ${DERIVED_DB_PASSWORD:?Set DERIVED_DB_PASSWORD in .env}
       FEDERATION_DB_USER: ${FEDERATION_DB_USER:?Set FEDERATION_DB_USER in .env}
       FEDERATION_DB_PASSWORD: ${FEDERATION_DB_PASSWORD:?Set FEDERATION_DB_PASSWORD in .env}
+      SEMANTIC_DB_USER: ${SEMANTIC_DB_USER:?Set SEMANTIC_DB_USER in .env}
+      SEMANTIC_DB_PASSWORD: ${SEMANTIC_DB_PASSWORD:?Set SEMANTIC_DB_PASSWORD in .env}
+      SEMANTIC_READER_DB_USER: ${SEMANTIC_READER_DB_USER:?Set SEMANTIC_READER_DB_USER in .env}
+      SEMANTIC_READER_DB_PASSWORD: ${SEMANTIC_READER_DB_PASSWORD:?Set SEMANTIC_READER_DB_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgis/init/05-h3.sql:/docker-entrypoint-initdb.d/80-mapp-h3.sql:ro
@@ -48,6 +52,14 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+  semantic-service:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SEMANTIC_DATABASE_URL: ${SEMANTIC_DATABASE_URL:?Set SEMANTIC_DATABASE_URL in .env}
+      SEMANTIC_READER_DATABASE_URL: ${SEMANTIC_READER_DATABASE_URL:?Set SEMANTIC_READER_DATABASE_URL in .env}
 
   config-ui:
     depends_on:
