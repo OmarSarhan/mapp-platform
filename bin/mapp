@@ -33,7 +33,7 @@ usage() {
     "  production-acceptance [options] collect redacted production readiness evidence" \
     "  cleanup-temp [--confirm] list or remove disposable state older than seven days" \
     "  verify       run end-to-end acceptance checks" \
-    "  demo         seed the demo source databases and publish their map layers" \
+    "  demo [--no-semantics] seed the demo sources and publish their map layers" \
     "  federation-test run the federation lifecycle against the test source" \
     "  config       validate the Compose configuration" \
     "  build-xyz    rebuild the pinned XYZ image" \
@@ -684,8 +684,22 @@ case "${1:-}" in
       printf 'Set MAPP_DEMO_SOURCES first, with ./bin/mapp init --demo.\n' >&2
       exit 2
     fi
+    demo_semantics=1
+    case "${2:-}" in
+      "") ;;
+      --no-semantics) demo_semantics=0 ;;
+      *)
+        printf 'Usage: ./bin/mapp demo [--no-semantics]\n' >&2
+        exit 2
+        ;;
+    esac
+    if [[ -n "${3:-}" ]]; then
+      printf 'Usage: ./bin/mapp demo [--no-semantics]\n' >&2
+      exit 2
+    fi
     "${ROOT_DIR}/docker/demo-sources/seed.sh"
-    "${ROOT_DIR}/docker/demo-sources/layers.sh"
+    MAPP_DEMO_SEMANTICS="${demo_semantics}" \
+      "${ROOT_DIR}/docker/demo-sources/layers.sh"
     ;;
   federation-test)
     "${ROOT_DIR}/scripts/federation-e2e.sh"

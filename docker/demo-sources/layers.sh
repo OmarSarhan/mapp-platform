@@ -57,6 +57,7 @@ token, record = store.create_token(
         "derive",
         "semantic:inspect",
         "semantic:source",
+        "semantic:generate",
         "federation:register",
         "federation:observe",
         "federation:provision",
@@ -163,11 +164,64 @@ sync_one() {
     "{\"alias\":\"MAPP\",\"schema\":\"$1\",\"relation\":\"$2\"}" \
     | jqp "a=d.get('asset') or {}; print(f\"  $1.$2: {d.get('code') or a.get('status')}\")"
 }
+# Describing a relation and its fields is what makes the catalogue readable
+# rather than a list of column names, and it needs a model. On by default when
+# GEMINI_APIKEY is set; ./bin/mapp demo --no-semantics turns it off, and an
+# empty key skips it rather than failing, so the demo still builds without one.
+GEMINI_KEY="$(dotenv_value GEMINI_APIKEY)"
+DESCRIBE_FIELD_LIMIT="${MAPP_DEMO_FIELD_LIMIT:-40}"
+DESCRIBE=1
+if [ "${MAPP_DEMO_SEMANTICS:-1}" = "0" ]; then
+  DESCRIBE=0
+  printf '  (descriptions disabled by --no-semantics)\n'
+elif [ -z "${GEMINI_KEY}" ]; then
+  DESCRIBE=0
+  printf '  (no GEMINI_APIKEY configured; skipping descriptions)\n'
+fi
+
+describe_one() { # schema relation
+  local asset id
+  asset="$(api POST /api/semantic/source/sync \
+    "{\"alias\":\"MAPP\",\"schema\":\"$1\",\"relation\":\"$2\"}")"
+  id="$(printf '%s' "${asset}" | jqp "print((d.get('asset') or {}).get('id') or '')")"
+  [ -n "${id}" ] || return 0
+  api POST /api/semantic/generate \
+    "{\"assetId\":\"${id}\",\"target\":{\"kind\":\"table\"}}" \
+    | jqp "print(f\"    $1.$2 table: {d.get('code') or 'described'}\")"
+  # One model call per field, sequentially. census_2021_england_oa has 470
+  # columns, which would take hours and is not what a demo is for, so wide
+  # relations get their table described and their fields left to the profile.
+  # The cap is announced rather than applied silently.
+  local total field
+  total="$(printf '%s' "${asset}" | jqp \
+    "print(len(((d.get('asset') or {}).get('generated') or {}).get('fields', [])))")"
+  if [ "${total}" -gt "${DESCRIBE_FIELD_LIMIT}" ]; then
+    printf '    %s.%s: %s fields, over the %s limit; fields not described\n' \
+      "$1" "$2" "${total}" "${DESCRIBE_FIELD_LIMIT}"
+    return 0
+  fi
+  for field in $(printf '%s' "${asset}" | jqp \
+    "print(' '.join(f['id'] for f in ((d.get('asset') or {}).get('generated') or {}).get('fields', []) if f.get('id')))"); do
+    api POST /api/semantic/generate \
+      "{\"assetId\":\"${id}\",\"target\":{\"kind\":\"field\",\"fieldId\":\"${field}\"}}" >/dev/null
+  done
+  printf '    %s.%s: %s fields described\n' "$1" "$2" "${total}"
+}
+
 sync_one source_census census_2021_england_oa
 sync_one source_census census_variables
 for relation in bus_stops definitive_paths smoke_control_orders; do
   sync_one source_ops "${relation}"
 done
+
+if [ "${DESCRIBE}" = "1" ]; then
+  step "Describing the relations and their fields"
+  describe_one source_census census_2021_england_oa
+  describe_one source_census census_variables
+  for relation in bus_stops definitive_paths smoke_control_orders; do
+    describe_one source_ops "${relation}"
+  done
+fi
 
 # ----------------------------------------------------------------- derived --
 step "Building derived layers from the federated relations"
