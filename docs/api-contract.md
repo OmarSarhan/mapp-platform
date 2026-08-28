@@ -538,11 +538,10 @@ trust boundaries.
 
 ## Federated PostgreSQL sources
 
-Available wherever a federation provisioner credential reaches the
-configuration service; the routes return `federation.not_configured`
-otherwise. `bundled` and `federated` always have one. `external` has one only
-if its operator provisioned the role and opted in, per
-[federation-external.md](federation-external.md). The lifecycle is reachable over
+Available in every deployment: the packaged database is the federation host
+and always carries the provisioner credential. The routes return
+`federation.not_configured` only if the service was started from a Compose
+model that omits it. The lifecycle is reachable over
 HTTP, through `config-cli federation` — advertised in the contract as
 `federation list`, `show`, `register`, `observe`, `provision`, and `retire` —
 and, for everything except registration, through the dashboard's **Federated

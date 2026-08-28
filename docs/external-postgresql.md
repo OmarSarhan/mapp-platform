@@ -71,12 +71,9 @@ If managed derived layers are not required, provision only the runtime reader,
 leave `DERIVED_DATABASE_URL` and `DERIVED_READER_ROLE` empty, and skip all
 `derived_layers` statements below.
 
-A third role exists but is **not** part of this handoff. Attaching further
-read-only databases to MAPP over `postgres_fdw` needs a federation provisioner
-with `USAGE` on the wrapper and `CREATE` on this database — a real escalation
-over the two roles here, and deliberately absent unless you choose to grant it.
-Everything below works without it. See
-[federation-external.md](federation-external.md) if that capability is wanted.
+MAPP attaches read-only databases like this one over `postgres_fdw` from its
+own packaged database, so no federation provisioner is needed here. The two
+roles below are the whole handoff.
 
 ## Example provisioning SQL
 

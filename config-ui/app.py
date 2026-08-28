@@ -233,39 +233,16 @@ DERIVED = (
 )
 
 
-def federation_enabled(federation_database_url, database_mode) -> bool:
-    """Enable wherever a federation provisioner credential was supplied.
-
-    The credential is the operator declaring intent, and Compose is what
-    enforces the boundary: only compose.bundled-db.yaml and the opt-in
-    compose.federation-external.yaml forward it to this service, so a default
-    external deployment never receives one and this returns False without
-    needing to inspect the mode.
-
-    The mode is therefore not consulted. It described where the host database
-    ran, which was a good proxy for "MAPP administers it" only while the host
-    was always MAPP's own container. An external host whose operator has
-    provisioned the role and granted USAGE on the wrapper is a federation host;
-    one that has not is refused by PostgreSQL, and host_capability() reports
-    which before anything is attempted.
-
-    database_mode is kept in the signature: callers pass it, and dropping the
-    parameter would silently change every call site rather than failing.
-    """
-    del database_mode
-    return bool(federation_database_url)
-
-
+# The packaged database is always the federation host, so the credential is
+# always forwarded. The guard remains only so importing this module without an
+# environment -- as the tests do -- does not raise.
 FEDERATION = (
     FederationAliasStore(
         os.environ["FEDERATION_DATABASE_URL"],
         os.environ["DERIVED_READER_ROLE"],
         os.environ["DERIVED_OWNER_ROLE"],
     )
-    if federation_enabled(
-        os.environ.get("FEDERATION_DATABASE_URL"),
-        os.environ.get("MAPP_DATABASE_MODE"),
-    )
+    if os.environ.get("FEDERATION_DATABASE_URL")
     else None
 )
 

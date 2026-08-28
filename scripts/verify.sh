@@ -2259,9 +2259,9 @@ if federation_database_url:
                 fail(
                     "The federation registry schema does not exist on the "
                     "host database. The bundled database creates it at init; "
-                    "an external host needs an administrator to run "
-                    "CREATE SCHEMA federation AUTHORIZATION <FEDERATION_DB_USER>. "
-                    "See docs/federation-external.md."
+                    "docker/postgis/init/10-roles.sh creates it, so a "
+                    "database predating that script needs "
+                    "CREATE SCHEMA federation AUTHORIZATION <FEDERATION_DB_USER>."
                 )
             # Same invariant as the derived owner above, for the same reason.
             if (

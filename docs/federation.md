@@ -21,7 +21,7 @@ That means all three modes can federate, by two different routes:
 | Mode | How the host gets a provisioner |
 |---|---|
 | `bundled`, `federated` | Automatically. `compose.bundled-db.yaml` creates the `mapp_federation` role in MAPP's own PostgreSQL and forwards the credential. Nothing to do. |
-| `external` | Only if you provision it yourself, then opt in with `compose.federation-external.yaml`. See **[Federating an external host](federation-external.md)**. |
+| every deployment | Automatically. `compose.bundled-db.yaml` creates the `mapp_federation` role in the packaged PostgreSQL and forwards the credential. Nothing to do. |
 
 `external` is opt-in rather than automatic because MAPP does not administer
 that server. The default handoff in [external-postgresql.md](external-postgresql.md)
@@ -450,7 +450,7 @@ upgrade-derived` realigns it; `./bin/mapp verify` compares the two.
 
 | Code | Meaning |
 | --- | --- |
-| `federation.not_configured` | No `FEDERATION_DATABASE_URL` reached the service, so this deployment has no federation host. Permanent until it is configured — under `external`, see [federation-external.md](federation-external.md). |
+| `federation.not_configured` | No `FEDERATION_DATABASE_URL` reached the service. The packaged overlay always supplies it, so this means the service was started from an incomplete Compose model. |
 | `federation.invalid_request` | Malformed or unknown properties in the body. |
 | `federation.alias_limit_reached` | Registering would exceed the 100-alias ceiling, retired ones included. |
 | `federation.alias_limit_exceeded` | The registry already holds more aliases than the ceiling allows — only reachable if rows were written directly to the database. |

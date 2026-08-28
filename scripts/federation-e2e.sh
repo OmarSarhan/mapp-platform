@@ -59,10 +59,7 @@ fi
 # Running this against a deployment configured for another mode would recreate
 # the live dashboard with the FDW provisioner and derived-layer DDL surfaces
 # switched on, and leave them on until the next `./bin/mapp serve`.
-#
-# external is refused even when it federates via compose.federation-external.yaml.
-# The rig seeds a source database and provisions against it, and doing that on a
-# host MAPP does not own is not a test to run behind a flag.
+
 DEPLOYMENT_DATABASE_MODE="$(dotenv_value MAPP_DATABASE_MODE)"
 case "${DEPLOYMENT_DATABASE_MODE}" in
   bundled|federated) ;;
