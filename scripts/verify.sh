@@ -408,9 +408,6 @@ $$;
 
 DO $$
 DECLARE
-census_relation regclass := to_regclass(
-  'leeds.census_2021_england_oa'
-);
 checked_relation regclass;
 etl_role name := current_setting('mapp.verify.etl_db_user');
 xyz_role name := current_setting('mapp.verify.xyz_db_user');
@@ -427,11 +424,8 @@ unmatched_variable_count integer;
 dataset_metadata_count integer;
 matching_dataset_metadata_count integer;
 matching_last_run_count integer;
-xyz_default_select boolean;
-derived_default_select boolean;
 unsafe_table_default boolean;
 unsafe_sequence_default boolean;
-unsafe_sequence_grant boolean;
 public_connect boolean;
 public_temporary boolean;
 generated_kind text;
@@ -455,51 +449,12 @@ SELECT
     FROM pg_catalog.pg_default_acl AS defaults
     JOIN pg_catalog.pg_roles AS owner
       ON owner.oid = defaults.defaclrole
-    JOIN pg_catalog.pg_namespace AS namespace
-      ON namespace.oid = defaults.defaclnamespace
-    CROSS JOIN LATERAL
-      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-    JOIN pg_catalog.pg_roles AS grantee
-      ON grantee.oid = privilege.grantee
-    WHERE owner.rolname = etl_role
-      AND namespace.nspname = 'leeds'
-      AND defaults.defaclobjtype = 'r'
-      AND grantee.rolname = xyz_role
-      AND privilege.privilege_type = 'SELECT'
-      AND NOT privilege.is_grantable
-  ),
-  EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_default_acl AS defaults
-    JOIN pg_catalog.pg_roles AS owner
-      ON owner.oid = defaults.defaclrole
-    JOIN pg_catalog.pg_namespace AS namespace
-      ON namespace.oid = defaults.defaclnamespace
-    CROSS JOIN LATERAL
-      pg_catalog.aclexplode(defaults.defaclacl) AS privilege
-    JOIN pg_catalog.pg_roles AS grantee
-      ON grantee.oid = privilege.grantee
-    WHERE owner.rolname = etl_role
-      AND namespace.nspname = 'leeds'
-      AND defaults.defaclobjtype = 'r'
-      AND grantee.rolname = derived_role
-      AND privilege.privilege_type = 'SELECT'
-      AND NOT privilege.is_grantable
-  ),
-  EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_default_acl AS defaults
-    JOIN pg_catalog.pg_roles AS owner
-      ON owner.oid = defaults.defaclrole
     LEFT JOIN pg_catalog.pg_namespace AS namespace
       ON namespace.oid = defaults.defaclnamespace
     CROSS JOIN LATERAL
       pg_catalog.aclexplode(defaults.defaclacl) AS privilege
     WHERE owner.rolname = etl_role
-      AND (
-        defaults.defaclnamespace = 0
-        OR namespace.nspname = 'leeds'
-      )
+      AND defaults.defaclnamespace = 0
       AND defaults.defaclobjtype = 'r'
       AND CASE
         WHEN privilege.grantee = 0 THEN true
@@ -526,10 +481,7 @@ SELECT
     CROSS JOIN LATERAL
       pg_catalog.aclexplode(defaults.defaclacl) AS privilege
     WHERE owner.rolname = etl_role
-      AND (
-        defaults.defaclnamespace = 0
-        OR namespace.nspname = 'leeds'
-      )
+      AND defaults.defaclnamespace = 0
       AND defaults.defaclobjtype = 'S'
       AND CASE
         WHEN privilege.grantee = 0 THEN true
@@ -544,15 +496,9 @@ SELECT
       AND privilege.privilege_type IN ('USAGE', 'UPDATE')
   )
 INTO
-  xyz_default_select,
-  derived_default_select,
   unsafe_table_default,
   unsafe_sequence_default;
 
-IF NOT xyz_default_select OR NOT derived_default_select THEN
-  RAISE EXCEPTION
-    'ETL table default privileges must grant SELECT to both the runtime reader and derived owner';
-END IF;
 IF unsafe_table_default THEN
   RAISE EXCEPTION
     'Runtime reader and derived owner default privileges must be non-grantable SELECT only';
@@ -560,35 +506,6 @@ END IF;
 IF unsafe_sequence_default THEN
   RAISE EXCEPTION
     'Runtime reader and derived owner defaults must not permit sequence mutation';
-END IF;
-
-SELECT EXISTS (
-  SELECT 1
-  FROM pg_catalog.pg_class AS relation
-  JOIN pg_catalog.pg_namespace AS namespace
-    ON namespace.oid = relation.relnamespace
-  WHERE namespace.nspname = 'leeds'
-    AND relation.relkind = 'S'
-    AND (
-      has_sequence_privilege(xyz_role, relation.oid, 'USAGE')
-      OR has_sequence_privilege(xyz_role, relation.oid, 'UPDATE')
-      OR has_sequence_privilege(
-        derived_role,
-        relation.oid,
-        'USAGE'
-      )
-      OR has_sequence_privilege(
-        derived_role,
-        relation.oid,
-        'UPDATE'
-      )
-    )
-)
-INTO unsafe_sequence_grant;
-
-IF unsafe_sequence_grant THEN
-  RAISE EXCEPTION
-    'Runtime reader and derived owner must not mutate Leeds sequences';
 END IF;
 
 SELECT
@@ -656,11 +573,6 @@ IF has_database_privilege(
    ) THEN
   RAISE EXCEPTION
     'Bundled database must grant CONNECT+TEMP only to ETL and CONNECT only to runtime/derived roles';
-END IF;
-IF has_schema_privilege(xyz_role, 'leeds', 'CREATE')
-   OR has_schema_privilege(derived_role, 'leeds', 'CREATE') THEN
-  RAISE EXCEPTION
-    'Runtime reader and derived owner must not create objects in the Leeds source schema';
 END IF;
 
 END
@@ -2152,53 +2064,6 @@ if federation_database_url:
                         ELSE false
                       END
                   ) AS "hasDerivedObjectPrivilege",
-                  COALESCE(
-                    has_schema_privilege(
-                      current_user,
-                      pg_catalog.to_regnamespace($$leeds$$),
-                      $$USAGE,CREATE$$
-                    ),
-                    false
-                  ) AS "hasBaseSchemaPrivilege",
-                  EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_class AS base_object
-                    JOIN pg_catalog.pg_namespace AS base_namespace
-                      ON base_namespace.oid = base_object.relnamespace
-                    WHERE base_namespace.nspname = $$leeds$$
-                      AND CASE
-                        WHEN base_object.relkind = $$S$$
-                        THEN has_sequence_privilege(
-                          current_user,
-                          base_object.oid,
-                          $$USAGE,SELECT,UPDATE$$
-                        )
-                        WHEN base_object.relkind IN (
-                          $$r$$, $$p$$, $$v$$, $$m$$, $$f$$
-                        ) THEN
-                          has_table_privilege(
-                            current_user,
-                            base_object.oid,
-                            $$SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER$$
-                          )
-                          OR has_any_column_privilege(
-                            current_user,
-                            base_object.oid,
-                            $$SELECT,INSERT,UPDATE,REFERENCES$$
-                          )
-                        ELSE false
-                      END
-                  ) AS "hasBaseObjectPrivilege",
-                  (
-                    SELECT pg_catalog.count(*)
-                    FROM pg_catalog.pg_class AS probed
-                    JOIN pg_catalog.pg_namespace AS probed_namespace
-                      ON probed_namespace.oid = probed.relnamespace
-                    WHERE probed_namespace.nspname = $$leeds$$
-                      AND probed.relkind IN (
-                        $$r$$, $$p$$, $$v$$, $$m$$, $$f$$, $$S$$
-                      )
-                  ) AS "baseRelationsProbed",
                   EXISTS (
                     SELECT 1
                     FROM pg_catalog.pg_class AS relation
@@ -2286,8 +2151,6 @@ if federation_database_url:
                 or not federation_audit["canCreateFederation"]
                 or federation_audit["hasDerivedSchemaPrivilege"]
                 or federation_audit["hasDerivedObjectPrivilege"]
-                or federation_audit["hasBaseSchemaPrivilege"]
-                or federation_audit["hasBaseObjectPrivilege"]
                 or federation_audit["hasUnownedRegistryObject"]
                 or federation_audit["hasMembership"]
                 or federation_audit["searchPath"] != "pg_catalog, public"
@@ -2300,20 +2163,6 @@ if federation_database_url:
                     "FDW provisioner."
                 )
 
-            # hasBaseSchemaPrivilege and hasBaseObjectPrivilege both report
-            # "no privilege" when there is nothing to look at:
-            # to_regnamespace yields NULL for an absent schema and the
-            # COALESCE reads that as false, while the EXISTS is empty for a
-            # schema holding no relations. So the two assertions above pass
-            # most confidently exactly when the base data has gone. Confirm
-            # they examined something before believing them.
-            if federation_audit["baseRelationsProbed"] == 0:
-                fail(
-                    "The federation provisioner base-data isolation check "
-                    "examined no relations, so it proves nothing. Expected "
-                    "relations in the base schema audited by "
-                    "hasBaseSchemaPrivilege and hasBaseObjectPrivilege."
-                )
 
             cursor.execute("""
                 WITH blocked_roles(role_name) AS (

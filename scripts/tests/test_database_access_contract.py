@@ -296,14 +296,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
             source,
         )
-        self.assertIn(
-            'GRANT SELECT ON TABLES TO :"xyz_db_user";',
-            source,
-        )
-        self.assertIn(
-            'GRANT SELECT ON TABLES TO :"derived_db_user";',
-            source,
-        )
         self.assertNotIn("ON SEQUENCES", source)
         self.assert_resource_role_defaults("docker/postgis/init/10-roles.sh")
         self.assert_federation_role_defaults("docker/postgis/init/10-roles.sh")
@@ -337,20 +329,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
         self.assertIn(
             'REVOKE ALL ON SCHEMA federation '
             'FROM :"xyz_db_user", :"derived_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
-            'FROM :"federation_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
-            'FROM :"federation_db_user";',
             normalized,
         )
         self.assertIn(
@@ -390,25 +368,8 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
             source,
         )
-        self.assertIn(
-            'GRANT SELECT ON ALL TABLES IN SCHEMA leeds '
-            'TO :"xyz_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'GRANT SELECT ON TABLES TO :"xyz_db_user";',
-            source,
-        )
         self.assertIn("BEGIN;", source)
         self.assertIn("COMMIT;", source)
-        self.assertIn(
-            "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds",
-            source,
-        )
-        self.assertIn(
-            "REVOKE ALL PRIVILEGES ON SEQUENCES",
-            source,
-        )
         self.assert_resource_role_defaults("docker/postgis/upgrade-derived.sh")
         self.assert_federation_role_defaults(
             "docker/postgis/upgrade-derived.sh"
@@ -457,20 +418,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIn(
             "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA federation",
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds '
-            'FROM :"federation_db_user";',
-            normalized,
-        )
-        self.assertIn(
-            'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds '
-            'FROM :"xyz_db_user", :"federation_db_user";',
             normalized,
         )
         self.assert_h3_sql_wrapper_hardening(
@@ -661,10 +608,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
         self.assertIn(
             'federation_audit["hasDerivedObjectPrivilege"]', normalized
         )
-        self.assertIn('federation_audit["hasBaseSchemaPrivilege"]', normalized)
-        self.assertIn(
-            'federation_audit["hasBaseObjectPrivilege"]', normalized
-        )
         self.assertIn('AS "hasRegistrySchemaAccess"', normalized)
         self.assertIn('AS "hasRegistryObjectAccess"', normalized)
         self.assertIn("has_any_column_privilege(", normalized)
@@ -785,7 +728,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         for contract in (
             "prepare|ensure|check",
-            "namespace.nspname IN ('leeds', 'derived_layers')",
             "type.typname IN ('geometry', 'geography')",
             "access_method.amname = 'gist'",
             "public.ST_Transform(%I, 4326)",
@@ -915,33 +857,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
                     )
 
         self.assertEqual(offenders, [])
-
-    def test_federation_base_isolation_cannot_pass_vacuously(self) -> None:
-        """Both base-data assertions read "no privilege" when nothing exists.
-
-        to_regnamespace returns NULL for an absent schema, has_schema_privilege
-        then returns NULL, and the COALESCE reads that as false. The companion
-        EXISTS is empty for a schema holding no relations. So the pair passes
-        most confidently exactly when the base data has gone -- which is the
-        state a host/sources migration produces. The counter proves the probe
-        examined something before its verdict is believed.
-        """
-        source = self.normalized("scripts/verify.sh")
-
-        self.assertIn('AS "baseRelationsProbed"', source)
-        self.assertIn(
-            'federation_audit["baseRelationsProbed"] == 0', source
-        )
-        self.assertIn("examined no relations, so it proves nothing", source)
-
-        # The counter must not share the verdict of the assertions it guards:
-        # an empty probe is "this proved nothing", not "the role has excess
-        # privilege", and the two want different messages.
-        privilege_failure = source.index(
-            "FEDERATION_DATABASE_URL is not the required isolated"
-        )
-        vacuity_failure = source.index("examined no relations")
-        self.assertLess(privilege_failure, vacuity_failure)
 
     def test_external_handoff_revokes_public_database_defaults(self) -> None:
         source = (

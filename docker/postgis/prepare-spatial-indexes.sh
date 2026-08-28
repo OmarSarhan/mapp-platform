@@ -66,7 +66,7 @@ BEGIN
       ON type.oid = attribute.atttypid
     JOIN pg_catalog.pg_namespace AS type_namespace
       ON type_namespace.oid = type.typnamespace
-    WHERE namespace.nspname IN ('leeds', 'derived_layers')
+    WHERE namespace.nspname = 'derived_layers'
       AND relation.relkind IN ('r', 'p', 'm')
       AND type_namespace.nspname = 'public'
       AND type.typname IN ('geometry', 'geography')

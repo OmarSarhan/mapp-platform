@@ -256,15 +256,6 @@ REVOKE CREATE ON DATABASE :"DBNAME"
   FROM :"xyz_db_user", :"derived_db_user";
 GRANT CREATE ON DATABASE :"DBNAME" TO :"federation_db_user";
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-GRANT USAGE ON SCHEMA leeds TO :"xyz_db_user";
-GRANT USAGE ON SCHEMA leeds TO :"derived_db_user";
-GRANT SELECT ON ALL TABLES IN SCHEMA leeds TO :"xyz_db_user";
-GRANT SELECT ON ALL TABLES IN SCHEMA leeds TO :"derived_db_user";
-REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds
-  FROM :"federation_db_user";
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds
-  FROM :"xyz_db_user", :"federation_db_user";
 
 SELECT format(
   'CREATE SCHEMA derived_layers AUTHORIZATION %I',
@@ -496,13 +487,6 @@ REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA federation
   FROM :"xyz_db_user", :"derived_db_user";
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA federation
   FROM :"xyz_db_user", :"derived_db_user";
-
-ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
-  GRANT SELECT ON TABLES TO :"xyz_db_user";
-ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
-  GRANT SELECT ON TABLES TO :"derived_db_user";
-ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
-  REVOKE ALL PRIVILEGES ON SEQUENCES FROM :"xyz_db_user";
 
 CREATE TABLE IF NOT EXISTS public.mapp_platform_layer_dependencies (
   alias text NOT NULL,

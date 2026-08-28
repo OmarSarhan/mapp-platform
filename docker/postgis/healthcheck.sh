@@ -28,12 +28,6 @@ SELECT CASE WHEN
   AND EXISTS (
     SELECT 1
     FROM pg_namespace
-    WHERE nspname = 'leeds'
-      AND nspowner = (SELECT oid FROM pg_roles WHERE rolname = :'etl_db_user')
-  )
-  AND EXISTS (
-    SELECT 1
-    FROM pg_namespace
     WHERE nspname = 'derived_layers'
       AND nspowner = (SELECT oid FROM pg_roles WHERE rolname = :'derived_db_user')
   )

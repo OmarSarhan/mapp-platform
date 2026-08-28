@@ -88,15 +88,6 @@ REVOKE CREATE ON DATABASE :"DBNAME"
 GRANT CREATE ON DATABASE :"DBNAME" TO :"federation_db_user";
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-CREATE SCHEMA leeds AUTHORIZATION :"etl_db_user";
-GRANT USAGE ON SCHEMA leeds TO :"xyz_db_user";
-GRANT USAGE ON SCHEMA leeds TO :"derived_db_user";
-REVOKE ALL ON SCHEMA leeds FROM :"federation_db_user";
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA leeds
-  FROM :"federation_db_user";
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA leeds
-  FROM :"federation_db_user";
-
 CREATE SCHEMA derived_layers AUTHORIZATION :"derived_db_user";
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
 GRANT USAGE ON SCHEMA derived_layers TO :"xyz_db_user";
@@ -118,10 +109,5 @@ CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw
   FROM :"xyz_db_user", :"derived_db_user";
 GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO :"federation_db_user";
-
-ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
-  GRANT SELECT ON TABLES TO :"xyz_db_user";
-ALTER DEFAULT PRIVILEGES FOR ROLE :"etl_db_user" IN SCHEMA leeds
-  GRANT SELECT ON TABLES TO :"derived_db_user";
 
 SQL

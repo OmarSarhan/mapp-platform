@@ -15,7 +15,10 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 
-DEFAULT_ALLOWLIST = "MAPP:leeds.*"
+# No default: the packaged database holds no source data, and a federated
+# source schema cannot be wildcarded because parse_allowlist requires a
+# literal schema identifier. Deployments name their sources explicitly.
+DEFAULT_ALLOWLIST = ""
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # Must match DB_KEY in workspace_schema.py and databaseKey in
 # schema/workspace.schema.json. Federation aliases are intentionally narrower
