@@ -22,6 +22,17 @@ class ProductionEnvironmentTests(unittest.TestCase):
     def test_accepts_distinct_https_origins(self):
         self.assertEqual([], validate(production_values()))
 
+    def test_demo_sources_are_refused_in_production(self):
+        # The demo databases generate a throwaway self-signed certificate on
+        # every start. Production acceptance deliberately does not resolve the
+        # demo overlay, so this refusal is what keeps the two apart.
+        values = production_values()
+        values["MAPP_DEMO_SOURCES"] = "leeds"
+
+        self.assertTrue(
+            any("MAPP_DEMO_SOURCES" in error for error in validate(values))
+        )
+
     def test_rejects_http_local_and_identical_origins(self):
         values = production_values()
         values["PRODUCTION_MAP_SITE"] = "http://localhost"

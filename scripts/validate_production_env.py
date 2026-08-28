@@ -136,6 +136,12 @@ def validate(values: dict[str, str]) -> list[str]:
     if missing:
         errors.extend(f"{key} is required for production." for key in missing)
         return errors
+    if values.get("MAPP_DEMO_SOURCES", "").strip():
+        errors.append(
+            "MAPP_DEMO_SOURCES must be empty in production. The demo source "
+            "databases generate a throwaway self-signed certificate on every "
+            "start and hold sample data."
+        )
     if values["HTTP_PORT"].strip() != "80":
         errors.append(
             "HTTP_PORT must be 80 so Caddy can redirect HTTP and complete standard ACME challenges."

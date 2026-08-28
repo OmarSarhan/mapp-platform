@@ -253,6 +253,29 @@ class ComposeIsolationTests(unittest.TestCase):
                     self.assertNotIn("FEDERATION_DATABASE_URL", environment)
                     self.assertNotIn("FEDERATION_DB_PASSWORD", environment)
 
+    def test_the_demo_overlay_is_applied_only_when_it_is_switched_on(
+        self,
+    ) -> None:
+        """The demo overlay must stay behind MAPP_DEMO_SOURCES in both files.
+
+        compose.federated-demo.yaml declares nine required variables, so
+        applying it unconditionally would make every one of them mandatory for
+        every install -- including for `down`, `ps` and `logs`. bin/mapp and
+        verify.sh must agree, because verify resolves the model it audits and
+        would otherwise report a healthy demo deployment as stale.
+        """
+        for relative_path in ("bin/mapp", "scripts/verify.sh"):
+            with self.subTest(path=relative_path):
+                source = (ROOT / relative_path).read_text(encoding="utf-8")
+                guard = source.index('demo_sources="$(dotenv_value MAPP_DEMO_SOURCES)"')
+                conditional = source.index(
+                    'if [[ -n "${demo_sources}" ]]; then', guard
+                )
+                end = source.index("\nfi\n", conditional)
+                block = source[conditional:end]
+                self.assertIn("compose.federated-demo.yaml", block)
+                self.assertIn("census-db ops-db", block)
+
     def test_browser_egress_is_only_available_through_allowlisting_proxy(self) -> None:
         expected_allowlist = str(
             (ROOT / "instance/browser-egress-allowlist.txt").resolve()
