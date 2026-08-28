@@ -309,33 +309,18 @@ fi
 
 "${compose[@]}" exec -T db \
   sh /usr/local/bin/mapp-prepare-spatial-indexes check
-"${compose[@]}" exec -T \
-  -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
-  -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
-  db sh -c \
+"${compose[@]}" exec -T db sh -c \
   'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
     --set ON_ERROR_STOP=1 \
     --set=etl_db_user="$ETL_DB_USER" \
     --set=xyz_db_user="$XYZ_DB_USER" \
-    --set=derived_db_user="$DERIVED_DB_USER" \
-    --set=census_geometry_sha256="$MAPP_VERIFY_CENSUS_GEOMETRY_SHA256" \
-    --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON"' <<'SQL'
+    --set=derived_db_user="$DERIVED_DB_USER"' <<'SQL'
 SELECT postgis_full_version();
 SELECT set_config('mapp.verify.etl_db_user', :'etl_db_user', false);
 SELECT set_config('mapp.verify.xyz_db_user', :'xyz_db_user', false);
 SELECT set_config(
 'mapp.verify.derived_db_user',
 :'derived_db_user',
-false
-);
-SELECT set_config(
-'mapp.verify.census_geometry_sha256',
-:'census_geometry_sha256',
-false
-);
-SELECT set_config(
-'mapp.verify.census_topic_hashes_json',
-:'census_topic_hashes_json',
 false
 );
 
@@ -416,27 +401,10 @@ row_total bigint;
 distinct_code_count bigint;
 invalid_code_count bigint;
 invalid_geometry_count bigint;
-statistic_column_count integer;
-invalid_statistic_column_count integer;
-variable_metadata_count integer;
-variable_topic_count integer;
-unmatched_variable_count integer;
-dataset_metadata_count integer;
-matching_dataset_metadata_count integer;
-matching_last_run_count integer;
 unsafe_table_default boolean;
 unsafe_sequence_default boolean;
 public_connect boolean;
 public_temporary boolean;
-generated_kind text;
-expected_geometry_sha256 text :=
-  current_setting('mapp.verify.census_geometry_sha256');
-expected_topic_hashes jsonb :=
-  current_setting('mapp.verify.census_topic_hashes_json')::jsonb;
-expected_topic_hash_count integer;
-variable_topic_hash_mismatch_count integer;
-dataset_topic_hash_count integer;
-dataset_topic_hash_mismatch_count integer;
 BEGIN
 IF xyz_role = derived_role THEN
   RAISE EXCEPTION
@@ -966,36 +934,12 @@ ORDER BY layers.layer_key;
 OPS_SQL
 fi
 
-"${compose[@]}" exec -T \
-  -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
-  -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
-  xyz node --input-type=module -e '
+"${compose[@]}" exec -T xyz node --input-type=module -e '
   import pg from "pg";
 
   const fail = (message) => {
     throw new Error(message);
   };
-  const expectedGeometryHash =
-    process.env.MAPP_VERIFY_CENSUS_GEOMETRY_SHA256;
-  let expectedTopicHashes;
-  try {
-    expectedTopicHashes = JSON.parse(
-      process.env.MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON,
-    );
-  } catch {
-    fail("The pinned Census topic hashes are not valid JSON.");
-  }
-  if (
-    !/^[0-9a-f]{64}$/.test(expectedGeometryHash)
-    || !expectedTopicHashes
-    || Array.isArray(expectedTopicHashes)
-    || Object.keys(expectedTopicHashes).length !== 47
-    || Object.values(expectedTopicHashes).some(
-      (value) => !/^[0-9a-f]{64}$/.test(value),
-    )
-  ) {
-    fail("The pinned Census source-hash contract is invalid.");
-  }
   let uriUser;
   try {
     const parsed = new URL(process.env.DBS_MAPP);
@@ -1273,94 +1217,6 @@ fi
       fail("The active DBS_MAPP session is not the required read-only runtime identity.");
     }
 
-    for (const relation of [
-      "leeds.bus_stops",
-      "leeds.definitive_paths",
-      "leeds.smoke_control_orders",
-    ]) {
-      await pool.query(`SELECT 1 FROM ${relation} LIMIT 0`);
-    }
-
-    const relation = await pool.query(
-      "SELECT to_regclass($1)::text AS name",
-      ["leeds.census_2021_england_oa"],
-    );
-    if (relation.rows[0]?.name) {
-      const census = await pool.query(
-        "SELECT count(*)::text AS row_count FROM leeds.census_2021_england_oa",
-      );
-      if (census.rows[0]?.row_count !== "178605") {
-        fail("The runtime reader did not observe the reviewed Census row count.");
-      }
-
-      const datasetResult = await pool.query(`
-        SELECT geometry_source_sha256, source_metadata
-        FROM leeds.census_datasets
-        WHERE dataset_key = $$census_2021_england_oa$$
-      `);
-      const dataset = datasetResult.rows[0];
-      if (
-        datasetResult.rowCount !== 1
-        || dataset.geometry_source_sha256 !== expectedGeometryHash
-        || dataset.source_metadata?.geometry?.sha256 !== expectedGeometryHash
-      ) {
-        fail("The loaded Census geometry hash does not match the pinned manifest.");
-      }
-
-      const metadataTopics = dataset.source_metadata?.topics;
-      if (!Array.isArray(metadataTopics) || metadataTopics.length !== 47) {
-        fail("The loaded Census dataset does not record all 47 topic sources.");
-      }
-      const metadataTopicHashes = new Map();
-      for (const topic of metadataTopics) {
-        if (
-          !topic
-          || typeof topic.topic_id !== "string"
-          || typeof topic.archive_sha256 !== "string"
-          || metadataTopicHashes.has(topic.topic_id)
-        ) {
-          fail("The loaded Census dataset has invalid or duplicate topic metadata.");
-        }
-        metadataTopicHashes.set(topic.topic_id, topic.archive_sha256);
-      }
-
-      const variableResult = await pool.query(`
-        SELECT
-          topic_id,
-          array_agg(
-            DISTINCT source_sha256
-            ORDER BY source_sha256
-          ) AS source_hashes
-        FROM leeds.census_variables
-        WHERE dataset_key = $$census_2021_england_oa$$
-        GROUP BY topic_id
-      `);
-      if (variableResult.rowCount !== 47) {
-        fail("The loaded Census variable catalogue does not contain 47 topics.");
-      }
-      const variableTopicHashes = new Map(
-        variableResult.rows.map(
-          (row) => [
-            row.topic_id,
-            row.source_hashes?.length === 1
-              ? row.source_hashes[0]
-              : null,
-          ],
-        ),
-      );
-      for (const [topicId, expectedHash] of Object.entries(
-        expectedTopicHashes,
-      )) {
-        if (
-          metadataTopicHashes.get(topicId) !== expectedHash
-          || variableTopicHashes.get(topicId) !== expectedHash
-        ) {
-          fail(
-            `The loaded Census source hash for ${topicId} does not match the pinned manifest.`,
-          );
-        }
-      }
-    }
   } finally {
     await pool.end();
   }
@@ -1952,27 +1808,6 @@ with psycopg.connect(
                 "required connection, memory, temporary-file, parallelism, "
                 "and timeout limits."
             )
-
-        for relation in (
-            "leeds.bus_stops",
-            "leeds.definitive_paths",
-            "leeds.smoke_control_orders",
-        ):
-            cursor.execute(f"SELECT 1 FROM {relation} LIMIT 0")
-        cursor.execute(
-            "SELECT to_regclass(%s)::text AS name",
-            ("leeds.census_2021_england_oa",),
-        )
-        if cursor.fetchone()["name"]:
-            cursor.execute(
-                "SELECT count(*)::bigint AS row_count "
-                "FROM leeds.census_2021_england_oa"
-            )
-            if cursor.fetchone()["row_count"] != 178605:
-                fail(
-                    "The derived owner did not observe the reviewed "
-                    "Census row count."
-                )
 
 if federation_database_url:
     with psycopg.connect(

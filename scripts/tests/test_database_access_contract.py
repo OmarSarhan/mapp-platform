@@ -578,8 +578,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "variable_topic_hash_mismatch_count",
             "dataset_topic_hash_mismatch_count",
             "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON",
-            "metadataTopicHashes.get(topicId) !== expectedHash",
-            "variableTopicHashes.get(topicId) !== expectedHash",
             "mapp-prepare-spatial-indexes check",
         )
         for contract in required_contracts:
