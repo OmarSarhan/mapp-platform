@@ -294,6 +294,29 @@ class ComposeIsolationTests(unittest.TestCase):
             source.index('step "Profiling'),
         )
 
+    def test_the_demo_applies_the_drafts_it_generates(self) -> None:
+        """/api/semantic/generate persists nothing; its own response says so.
+
+        It answers with "proposalCreated": false. A describe step that stops
+        there spends one model call per field, leaves the catalogue exactly as
+        it found it, and prints that it described them -- which is what the
+        first version of this step did. The draft only reaches the catalogue
+        once it is checked, proposed and applied, and applying needs the two
+        semantic proposal scopes on the minted token.
+        """
+        source = (ROOT / "docker/demo-sources/layers.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for required in (
+            '"/api/semantic/proposals/check"',
+            '"/api/semantic/proposals",',
+            '/apply" % proposal["id"]',
+            '"semantic:propose"',
+            '"semantic:apply"',
+        ):
+            self.assertIn(required, source)
+
     def test_browser_egress_is_only_available_through_allowlisting_proxy(self) -> None:
         expected_allowlist = str(
             (ROOT / "instance/browser-egress-allowlist.txt").resolve()

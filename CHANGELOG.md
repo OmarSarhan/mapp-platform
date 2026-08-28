@@ -30,6 +30,16 @@ first release.
   `./bin/mapp doctor` report `MAPP_DEMO_SOURCES` as missing until
   `./bin/mapp doctor --add-missing` adds it; the added value is empty, which is
   the non-demo setting.
+- `./bin/mapp demo` now describes the exposed relations and their fields with
+  Gemini, so the catalogue reads as prose rather than as a list of column
+  names. It is on whenever `GEMINI_APIKEY` is set; `./bin/mapp demo
+  --no-semantics` turns it off, and an absent key skips the step rather than
+  failing the build. Descriptions are drafted and applied without review, which
+  each proposal's recorded explanation says. Relations wider than
+  `MAPP_DEMO_FIELD_LIMIT` (40) get their table described and their fields left
+  to the structural profile -- `census_2021_england_oa` has 470 columns, and
+  one model call per field is not what a demo is for. The cap is announced in
+  the output rather than applied silently.
 
 ### Fixed
 

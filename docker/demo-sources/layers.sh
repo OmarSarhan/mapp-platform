@@ -58,6 +58,8 @@ token, record = store.create_token(
         "semantic:inspect",
         "semantic:source",
         "semantic:generate",
+        "semantic:propose",
+        "semantic:apply",
         "federation:register",
         "federation:observe",
         "federation:provision",
@@ -179,33 +181,145 @@ elif [ -z "${GEMINI_KEY}" ]; then
   printf '  (no GEMINI_APIKEY configured; skipping descriptions)\n'
 fi
 
-describe_one() { # schema relation
-  local asset id
-  asset="$(api POST /api/semantic/source/sync \
-    "{\"alias\":\"MAPP\",\"schema\":\"$1\",\"relation\":\"$2\"}")"
-  id="$(printf '%s' "${asset}" | jqp "print((d.get('asset') or {}).get('id') or '')")"
-  [ -n "${id}" ] || return 0
-  api POST /api/semantic/generate \
-    "{\"assetId\":\"${id}\",\"target\":{\"kind\":\"table\"}}" \
-    | jqp "print(f\"    $1.$2 table: {d.get('code') or 'described'}\")"
-  # One model call per field, sequentially. census_2021_england_oa has 470
-  # columns, which would take hours and is not what a demo is for, so wide
-  # relations get their table described and their fields left to the profile.
-  # The cap is announced rather than applied silently.
-  local total field
-  total="$(printf '%s' "${asset}" | jqp \
-    "print(len(((d.get('asset') or {}).get('generated') or {}).get('fields', [])))")"
-  if [ "${total}" -gt "${DESCRIBE_FIELD_LIMIT}" ]; then
-    printf '    %s.%s: %s fields, over the %s limit; fields not described\n' \
-      "$1" "$2" "${total}" "${DESCRIBE_FIELD_LIMIT}"
-    return 0
-  fi
-  for field in $(printf '%s' "${asset}" | jqp \
-    "print(' '.join(f['id'] for f in ((d.get('asset') or {}).get('generated') or {}).get('fields', []) if f.get('id')))"); do
-    api POST /api/semantic/generate \
-      "{\"assetId\":\"${id}\",\"target\":{\"kind\":\"field\",\"fieldId\":\"${field}\"}}" >/dev/null
-  done
-  printf '    %s.%s: %s fields described\n' "$1" "$2" "${total}"
+describe_relations() { # schema relation [schema relation ...]
+  MAPP_BASE="${BASE}" MAPP_HOST="${CONFIG_HOST}" MAPP_TOKEN="${TOKEN}" \
+    MAPP_FIELD_LIMIT="${DESCRIBE_FIELD_LIMIT}" python3 - "$@" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+
+BASE = os.environ["MAPP_BASE"]
+LIMIT = int(os.environ["MAPP_FIELD_LIMIT"])
+HEADERS = {
+    "Host": os.environ["MAPP_HOST"],
+    "Authorization": "Bearer " + os.environ["MAPP_TOKEN"],
+    "Content-Type": "application/json",
+}
+
+
+def call(method, path, body=None):
+    request = urllib.request.Request(
+        BASE + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+    )
+    for name, value in HEADERS.items():
+        request.add_header(name, value)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # Error bodies are flat in some handlers and nested under "error" in
+        # others; normalise so one caller check covers both.
+        payload = json.loads(error.read() or b"{}")
+        nested = payload.get("error")
+        payload["code"] = (
+            payload.get("code")
+            or (nested.get("code") if isinstance(nested, dict) else None)
+            or "http_%d" % error.code
+        )
+        return payload
+
+
+def fail(message):
+    print("    " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def drafted_operations(asset_id, target):
+    """Draft one annotation. Returns (operations, baseVersion), or (None, None)
+    when the model reproduced what is already curated -- the idempotent case,
+    which is how a repeated demo run reports an already-described relation."""
+    result = call(
+        "POST", "/api/semantic/generate",
+        {"assetId": asset_id, "target": target},
+    )
+    if result.get("code") == "semantic.generation_no_change":
+        return None, None
+    draft = result.get("draft")
+    if not isinstance(draft, dict):
+        fail("generate %s: %s" % (target["kind"], result.get("code")))
+    return draft["operations"], draft["baseVersion"]
+
+
+def apply_operations(asset_id, base_version, operations, explanation):
+    """Generation only drafts -- "proposalCreated": false. Nothing reaches the
+    catalogue until the draft is checked, proposed and applied, so the demo
+    applies its own drafts unreviewed. That is right for a showcase and wrong
+    for curated content; the explanation recorded on each proposal says so."""
+    request = {
+        "assetId": asset_id,
+        "baseVersion": base_version,
+        "operations": operations,
+        "explanation": explanation,
+    }
+    checked = call("POST", "/api/semantic/proposals/check", request)
+    check = checked.get("check")
+    if not isinstance(check, dict):
+        fail("check: %s" % checked.get("code"))
+    created = call(
+        "POST", "/api/semantic/proposals",
+        dict(request, fingerprint=check["fingerprint"]),
+    )
+    proposal = created.get("proposal") or {}
+    if not proposal.get("id"):
+        fail("propose: %s" % created.get("code"))
+    applied = call(
+        "POST", "/api/semantic/proposals/%s/apply" % proposal["id"],
+        {"confirmed": True},
+    )
+    if (applied.get("proposal") or {}).get("state") != "applied":
+        fail("apply: %s" % applied.get("code"))
+
+
+arguments = sys.argv[1:]
+for schema, relation in zip(arguments[::2], arguments[1::2]):
+    synced = call(
+        "POST", "/api/semantic/source/sync",
+        {"alias": "MAPP", "schema": schema, "relation": relation},
+    )
+    asset = synced.get("asset") or {}
+    asset_id = asset.get("id")
+    if not asset_id:
+        fail("%s.%s: %s" % (schema, relation, synced.get("code")))
+    fields = [
+        field for field in (asset.get("generated") or {}).get("fields") or []
+        if field.get("id")
+    ]
+    # One model call per field, sequentially. census_2021_england_oa has 470
+    # columns, which would take hours and is not what a demo is for, so wide
+    # relations get their table described and their fields left to the
+    # structural profile. The cap is announced rather than applied silently.
+    over_limit = len(fields) > LIMIT
+    targets = [{"kind": "table"}] + ([] if over_limit else [
+        {"kind": "field", "fieldId": field["id"]} for field in fields
+    ])
+    operations = []
+    base_version = None
+    for target in targets:
+        drafted, version = drafted_operations(asset_id, target)
+        if drafted is None:
+            continue
+        if base_version is None:
+            base_version = version
+        elif version != base_version:
+            # Nothing is applied inside this loop, so the asset version cannot
+            # move under it. If it did, something else is writing concurrently
+            # and the accumulated operations no longer describe one state.
+            fail("%s.%s: asset changed mid-description" % (schema, relation))
+        operations.extend(drafted)
+    if operations:
+        apply_operations(asset_id, base_version, operations, (
+            "Gemini drafts for the demo showcase, applied without review by "
+            "./bin/mapp demo. Treat them as a starting point, not as curated "
+            "content."
+        ))
+    scope = "table" if over_limit else "table and %d fields" % len(fields)
+    print("    %s.%s: %s%s" % (
+        schema, relation,
+        ("%s described" % scope) if operations else "already described",
+        (", %d fields over the %d limit not described" % (len(fields), LIMIT))
+        if over_limit else "",
+    ))
+PY
 }
 
 sync_one source_census census_2021_england_oa
@@ -216,11 +330,12 @@ done
 
 if [ "${DESCRIBE}" = "1" ]; then
   step "Describing the relations and their fields"
-  describe_one source_census census_2021_england_oa
-  describe_one source_census census_variables
-  for relation in bus_stops definitive_paths smoke_control_orders; do
-    describe_one source_ops "${relation}"
-  done
+  describe_relations \
+    source_census census_2021_england_oa \
+    source_census census_variables \
+    source_ops bus_stops \
+    source_ops definitive_paths \
+    source_ops smoke_control_orders
 fi
 
 # ----------------------------------------------------------------- derived --
