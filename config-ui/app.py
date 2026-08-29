@@ -45,8 +45,12 @@ from derived_layers import (
     validate_definition,
     validate_spatial_scope,
 )
-from federation_schema import FederationSchemaError, enforce_tls_policy
-from federation_store import MAX_ALIASES, FederationAliasStore
+from federation_schema import (
+    FederationSchemaError,
+    enforce_tls_policy,
+    validate_group_membership,
+)
+from federation_store import MAX_ALIASES, MAX_GROUPS, FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
@@ -5591,6 +5595,18 @@ class Handler(SimpleHTTPRequestHandler):
             ):
                 return "federation:provision"
             return "federation:register"
+        # Group labels grant nothing and open no connection, so reading them
+        # is federation:observe and defining or deleting one is
+        # federation:register -- never federation:provision, which is reserved
+        # for actions that connect to a third-party database. Written as an
+        # exact match plus a trailing slash rather than a bare startswith, so
+        # a future /api/federation/groupsomething does not inherit this.
+        if path == "/api/federation/groups" or path.startswith(
+            "/api/federation/groups/"
+        ):
+            return "federation:observe" if method == "GET" else (
+                "federation:register"
+            )
         if method == "GET":
             if re.fullmatch(r"/api/layers/[^/]+/(values|statistics)", path):
                 return "derive"
@@ -6443,6 +6459,37 @@ class Handler(SimpleHTTPRequestHandler):
                 # outage; folding it into the generic 502 below would
                 # make a contract-driven client retry a mode that will
                 # never become available and lose the actionable code.
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except psycopg.Error as exc:
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "The federation alias registry is unavailable.",
+                        "code": "federation.registry_unavailable",
+                        "detail": str(exc),
+                    },
+                )
+        elif path == "/api/federation/groups":
+            try:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                groups = FEDERATION.list_groups()
+                if len(groups) > MAX_GROUPS:
+                    raise FederationSchemaError(
+                        "Federation group registry exceeds its supported "
+                        f"limit of {MAX_GROUPS} groups.",
+                        status=HTTPStatus.CONFLICT,
+                        code="federation.group_limit_exceeded",
+                    )
+                self._json(HTTPStatus.OK, {"groups": groups})
+            except FederationSchemaError as exc:
+                # Before psycopg.Error, and for the same reason as the alias
+                # collection above: FederationSchemaError subclasses
+                # ValueError, and a deployment with no federation credential
+                # is a permanent fact rather than a transient outage.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
             except psycopg.Error as exc:
                 self._json(
@@ -7492,6 +7539,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/derived-layers",
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             "/api/federation/aliases",
+            "/api/federation/groups",
         }
         derived_action_path = re.fullmatch(
             r"/api/derived-layers/([a-z][a-z0-9_]{0,62})/(refresh|replace|drop)",
@@ -7514,6 +7562,17 @@ class Handler(SimpleHTTPRequestHandler):
             r"(observe|provision|retire)",
             request_path,
         )
+        # Two more patterns rather than widening the one above: it is unpacked
+        # with .groups() into an (alias, action) pair, so a third group there
+        # would break every alias action.
+        federation_alias_groups_path = re.fullmatch(
+            r"/api/federation/aliases/([A-Za-z][A-Za-z0-9_]{0,55})/groups",
+            request_path,
+        )
+        federation_group_delete_path = re.fullmatch(
+            r"/api/federation/groups/([A-Za-z][A-Za-z0-9_]{0,55})/delete",
+            request_path,
+        )
         if (
             request_path not in allowed
             and not proposal_action_path
@@ -7521,6 +7580,8 @@ class Handler(SimpleHTTPRequestHandler):
             and not proposal_visual_path
             and not derived_action_path
             and not federation_alias_action_path
+            and not federation_alias_groups_path
+            and not federation_group_delete_path
         ):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -7869,6 +7930,104 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 )
                 self._json(HTTPStatus.CREATED, {"alias": result})
+                return
+            if request_path == "/api/federation/groups":
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                # psycopg.Error only, matching the alias routes: a
+                # FederationSchemaError already carries the status and code
+                # the outer chain routes correctly, and only a raw local
+                # database failure needs a federation-specific translation.
+                try:
+                    group = FEDERATION.define_group(payload, actor)
+                except psycopg.Error as exc:
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": "The federation alias registry is unavailable.",
+                            "code": "federation.registry_unavailable",
+                            "detail": str(exc),
+                        },
+                    )
+                    return
+                CONTROL.audit(
+                    "federation_group.defined",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={"name": group["name"]},
+                )
+                self._json(HTTPStatus.CREATED, {"group": group})
+                return
+            if federation_group_delete_path:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                if payload:
+                    raise FederationSchemaError(
+                        "Unknown delete properties: "
+                        + ", ".join(sorted(payload)),
+                        code="federation.invalid_request",
+                    )
+                try:
+                    group = FEDERATION.delete_group(
+                        federation_group_delete_path.group(1)
+                    )
+                except psycopg.Error as exc:
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": "The federation alias registry is unavailable.",
+                            "code": "federation.registry_unavailable",
+                            "detail": str(exc),
+                        },
+                    )
+                    return
+                # The detached aliases are in the audit record because this is
+                # the only place they are reported: nothing else records that
+                # a label vanished from a source.
+                CONTROL.audit(
+                    "federation_group.deleted",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={
+                        "name": group["name"],
+                        "detachedAliases": group["detachedAliases"],
+                    },
+                )
+                self._json(HTTPStatus.OK, {"group": group})
+                return
+            if federation_alias_groups_path:
+                if not FEDERATION:
+                    raise FederationSchemaError(
+                        "Federation alias registry is not configured.",
+                        code="federation.not_configured",
+                    )
+                alias_name = federation_alias_groups_path.group(1)
+                groups = validate_group_membership(payload)
+                try:
+                    record = FEDERATION.set_alias_groups(alias_name, groups)
+                except psycopg.Error as exc:
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": "The federation alias registry is unavailable.",
+                            "code": "federation.registry_unavailable",
+                            "detail": str(exc),
+                        },
+                    )
+                    return
+                CONTROL.audit(
+                    "federation_alias.groups_set",
+                    actor=actor,
+                    remote=self._remote(),
+                    details={"alias": alias_name, "groups": list(groups)},
+                )
+                self._json(HTTPStatus.OK, {"alias": record})
                 return
             if federation_alias_action_path:
                 if not FEDERATION:

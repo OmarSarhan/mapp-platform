@@ -17,6 +17,140 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class FederationGroupRouteTests(unittest.TestCase):
+    """The three group routes. A group is a label: nothing here connects to a
+    source database or changes a privilege, so the failure modes are the
+    registry being unreachable and the payload being wrong."""
+
+    @staticmethod
+    def handler(path, *, actor="admin", payload=None):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: {} if payload is None else payload
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_defining_a_group_returns_it_and_audits_the_name(self):
+        federation = MagicMock()
+        federation.define_group.return_value = {
+            "name": "leeds", "description": None,
+            "createdBy": "admin", "createdAt": "2026-08-29T00:00:00+00:00",
+            "memberCount": 0,
+        }
+        control = MagicMock()
+        handler, responses = self.handler(
+            "/api/federation/groups", payload={"name": "leeds"}
+        )
+
+        with patch.object(app, "FEDERATION", federation), \
+                patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(
+            (HTTPStatus.CREATED, "leeds"),
+            (responses[0][0], responses[0][1]["group"]["name"]),
+        )
+        self.assertEqual(
+            "federation_group.defined", control.audit.call_args.args[0]
+        )
+
+    def test_deleting_a_group_reports_the_aliases_it_detached(self):
+        """The audit record is the only place this is reported.
+
+        Nothing else says a label vanished from a source, so an operator
+        reviewing the trail would otherwise see a group deleted and have no
+        way to tell which sources changed.
+        """
+        federation = MagicMock()
+        federation.delete_group.return_value = {
+            "name": "leeds", "detachedAliases": ["census", "ops"],
+        }
+        control = MagicMock()
+        handler, responses = self.handler(
+            "/api/federation/groups/leeds/delete"
+        )
+
+        with patch.object(app, "FEDERATION", federation), \
+                patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(
+            ["census", "ops"], responses[0][1]["group"]["detachedAliases"]
+        )
+        self.assertEqual(
+            ["census", "ops"],
+            control.audit.call_args.kwargs["details"]["detachedAliases"],
+        )
+
+    def test_setting_alias_groups_returns_the_whole_alias_record(self):
+        """Same shape as observe/provision/retire return.
+
+        The CLI and the dashboard already know how to render an alias record;
+        returning a bespoke shape here would make them special-case a route
+        that changes less than the others do.
+        """
+        federation = MagicMock()
+        federation.set_alias_groups.return_value = {
+            "alias": "census", "groups": ["leeds"],
+        }
+        control = MagicMock()
+        handler, responses = self.handler(
+            "/api/federation/aliases/census/groups",
+            payload={"groups": ["leeds"]},
+        )
+
+        with patch.object(app, "FEDERATION", federation), \
+                patch.object(app, "CONTROL", control):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual("census", responses[0][1]["alias"]["alias"])
+        federation.set_alias_groups.assert_called_once_with(
+            "census", ("leeds",)
+        )
+
+    def test_a_delete_body_is_refused_rather_than_ignored(self):
+        federation = MagicMock()
+        handler, responses = self.handler(
+            "/api/federation/groups/leeds/delete", payload={"cascade": True}
+        )
+
+        with patch.object(app, "FEDERATION", federation), \
+                patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        self.assertEqual(
+            "federation.invalid_request", responses[0][1]["code"]
+        )
+        federation.delete_group.assert_not_called()
+
+    def test_an_unreachable_registry_is_a_502_with_the_federation_code(self):
+        import psycopg
+
+        federation = MagicMock()
+        federation.define_group.side_effect = psycopg.OperationalError(
+            "could not connect to server"
+        )
+        handler, responses = self.handler(
+            "/api/federation/groups", payload={"name": "leeds"}
+        )
+
+        with patch.object(app, "FEDERATION", federation), \
+                patch.object(app, "CONTROL", MagicMock()):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, responses[0][0])
+        self.assertEqual(
+            "federation.registry_unavailable", responses[0][1]["code"]
+        )
+
+
 class FederationAliasActionRouteTests(unittest.TestCase):
     """POST /api/federation/aliases/<alias>/(observe|provision) must
     translate a raw local-database failure into the same
@@ -7240,11 +7374,17 @@ class AuthorizationScopeTests(unittest.TestCase):
             # actions, so it falls to federation:register.
             ("POST", "/api/federation/aliases/census/groups"):
                 "federation:register",
-            # Not yet routed. These become federation:observe and
-            # federation:register when the group routes land.
-            ("GET", "/api/federation/groups"): "inspect",
-            ("POST", "/api/federation/groups"): "full",
-            ("POST", "/api/federation/groups/leeds/delete"): "full",
+            # Reading labels is observation; defining and deleting them is
+            # registration. Never federation:provision -- no group route
+            # opens a connection to anything.
+            ("GET", "/api/federation/groups"): "federation:observe",
+            ("POST", "/api/federation/groups"): "federation:register",
+            ("POST", "/api/federation/groups/leeds/delete"):
+                "federation:register",
+            # The branch matches the exact path or a trailing slash, so a
+            # longer name that merely starts with it does not inherit the
+            # federation scopes.
+            ("GET", "/api/federation/groupsomething"): "inspect",
         }
         for (method, path), expected in cases.items():
             with self.subTest(method=method, path=path):
