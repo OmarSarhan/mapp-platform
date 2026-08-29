@@ -7212,6 +7212,47 @@ class AuthorizationScopeTests(unittest.TestCase):
                     denied._json.call_args.args[1]["requiredScope"],
                 )
 
+    def test_federation_routes_use_narrow_scopes(self):
+        """The federation scope map, pinned before group routes are added.
+
+        The alias routes are the invariant: a live outbound connection is the
+        platform's most dangerous capability, so observe/provision/retire all
+        require federation:provision even though one of them is spelled
+        "observe". Registration is an intent record and connects to nothing.
+
+        The group paths are here for what they return *today*, before the
+        group routes exist, so that adding them is a visible change rather
+        than a silent one. Group membership is metadata: it grants nothing, so
+        it must never reach federation:provision.
+        """
+        cases = {
+            ("GET", "/api/federation/aliases"): "federation:observe",
+            ("GET", "/api/federation/aliases/census"): "federation:observe",
+            ("POST", "/api/federation/aliases"): "federation:register",
+            ("POST", "/api/federation/aliases/census/observe"):
+                "federation:provision",
+            ("POST", "/api/federation/aliases/census/provision"):
+                "federation:provision",
+            ("POST", "/api/federation/aliases/census/retire"):
+                "federation:provision",
+            # Already correct without a new branch: the path is under
+            # /api/federation/aliases/ and is not one of the three connecting
+            # actions, so it falls to federation:register.
+            ("POST", "/api/federation/aliases/census/groups"):
+                "federation:register",
+            # Not yet routed. These become federation:observe and
+            # federation:register when the group routes land.
+            ("GET", "/api/federation/groups"): "inspect",
+            ("POST", "/api/federation/groups"): "full",
+            ("POST", "/api/federation/groups/leeds/delete"): "full",
+        }
+        for (method, path), expected in cases.items():
+            with self.subTest(method=method, path=path):
+                self.assertEqual(
+                    expected,
+                    app.Handler._required_scope(path, method),
+                )
+
     def test_every_token_scope_is_isolated_at_each_narrow_route_gate(self):
         required_scopes = TOKEN_SCOPES - {"full"}
         for required in sorted(required_scopes):
