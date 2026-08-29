@@ -1650,6 +1650,56 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "scope": "federation:provision",
         "inputSchema": {"type": "object", "additionalProperties": False},
     },
+    # Group labels. Every risk here is "inspect" or "federation-register" and
+    # never "federation-provision": a label grants nothing, revokes nothing,
+    # and opens no connection. Cross-database querying already works between
+    # any two provisioned sources, so a group could only ever restrict it, and
+    # these deliberately do not.
+    "federation.groups.list": {
+        "method": "GET",
+        "path": "/api/federation/groups",
+        "risk": "inspect",
+        "scope": "federation:observe",
+    },
+    "federation.groups.define": {
+        "method": "POST",
+        "path": "/api/federation/groups",
+        "risk": "federation-register",
+        "scope": "federation:register",
+        "inputSchema": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": ["string", "null"]},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "federation.groups.delete": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/groups/{name}/delete",
+        "risk": "federation-register",
+        # Deletion, not archival: retire archives because an alias names a
+        # physical attachment whose history is evidence. A label names nothing
+        # and exposes nothing, so the audit event is the whole record.
+        "scope": "federation:register",
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    "federation.aliases.set-groups": {
+        "method": "POST",
+        "pathTemplate": "/api/federation/aliases/{alias}/groups",
+        "risk": "federation-register",
+        "scope": "federation:register",
+        "inputSchema": {
+            "type": "object",
+            "required": ["groups"],
+            "properties": {
+                "groups": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -1694,6 +1744,8 @@ def contract(instance_id: str) -> dict[str, Any]:
             "federation list", "federation show", "federation register",
             "federation observe", "federation provision",
             "federation retire",
+            "federation groups", "federation group-define",
+            "federation group-delete", "federation set-groups",
             "semantic status",
             "semantic catalog export", "semantic catalog search",
             "semantic catalog show", "semantic catalog history",

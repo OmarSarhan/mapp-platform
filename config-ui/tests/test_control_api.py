@@ -59,6 +59,10 @@ class ControlApiTests(unittest.TestCase):
                 "federation observe",
                 "federation provision",
                 "federation retire",
+                "federation groups",
+                "federation group-define",
+                "federation group-delete",
+                "federation set-groups",
             ],
             [
                 command
