@@ -59,6 +59,7 @@ containers; nothing is installed on the host.
 ```sh
 cd mapp-platform
 ./bin/mapp init --demo     # write .env, generate secrets, turn the demo on
+# optional: put a Gemini key in .env before the next step — see below
 ./bin/mapp all             # build and start the platform, then verify it
 ./bin/mapp demo            # load two real open-data sources and publish a map
 ```
@@ -68,6 +69,28 @@ two throwaway source databases to the deployment — this is the one flag that
 makes the platform stand up databases of its own, and it exists so you have
 something real to look at.
 
+### One key `init` cannot generate
+
+`init` leaves `GEMINI_APIKEY=` empty in `.env`, because it is the one value
+that has to come from you:
+
+```sh
+GEMINI_APIKEY=your-key-here
+```
+
+Set it before running `demo` if you want the relations described. Without it
+the demo still completes — it prints `(no GEMINI_APIKEY configured; skipping
+descriptions)` and carries on — and everything else works: the sources load,
+attach and profile, the derived layers build, and the map is published.
+
+What you lose is the *meaning*. Profiling records a relation's structure —
+columns, types, keys, geometry — with no model involved. Descriptions are what
+turn that structure into something readable, and they need one. A catalogue
+without them is a list of column names.
+
+You can add the key later and run `./bin/mapp demo` again to fill them in;
+nothing needs rebuilding first.
+
 `demo` takes about fifteen minutes, most of it downloading the England Census
 2021 Output Area dataset. It is doing four separate things, and the output
 names each one:
@@ -76,7 +99,7 @@ names each one:
 | --- | --- |
 | Loading sources | Two source databases are populated straight from their publishers: Leeds City Council's ArcGIS feeds into `ops-db`, ONS Census 2021 into `census-db` |
 | Registering and provisioning | Both are attached to MAPP as federated sources |
-| Profiling and describing | Each exposed relation is profiled, then described by a model |
+| Profiling and describing | Each exposed relation is profiled; with a Gemini key set, each is also described by a model |
 | Building and publishing | Two derived layers are computed across both sources and put on the map |
 
 Then open:
@@ -203,8 +226,10 @@ and records it as a *generated* profile. No row values are read. This is what
 It never overwrites the generated facts; the two are stored separately, so a
 re-profile after a schema change cannot silently discard what somebody wrote.
 
-**Generating** asks a model to draft that curated meaning. It produces a
-*draft* and persists nothing. To reach the catalogue a draft must be checked,
+**Generating** asks a model to draft that curated meaning. It needs
+`GEMINI_APIKEY` in `.env` — the one secret `init` cannot generate for you — and
+without it the platform simply offers no drafts. It produces a *draft* and
+persists nothing. To reach the catalogue a draft must be checked,
 proposed and applied — three explicit steps, so nothing a model wrote lands
 without somebody agreeing to it.
 
