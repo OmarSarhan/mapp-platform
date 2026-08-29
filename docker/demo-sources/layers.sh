@@ -60,6 +60,7 @@ token, record = store.create_token(
         "semantic:generate",
         "semantic:propose",
         "semantic:apply",
+        "semantic:data",
         "federation:register",
         "federation:observe",
         "federation:provision",
@@ -174,6 +175,8 @@ sync_one() {
 # rather than a list of column names, and it needs a model. On by default when
 # GEMINI_APIKEY is set; ./bin/mapp demo --no-semantics turns it off, and an
 # empty key skips it rather than failing, so the demo still builds without one.
+# Every draft is generated with the bounded data context -- sample rows and
+# column statistics -- rather than from metadata alone.
 GEMINI_KEY="$(dotenv_value GEMINI_APIKEY)"
 DESCRIBE_FIELD_LIMIT="${MAPP_DEMO_FIELD_LIMIT:-40}"
 DESCRIBE=1
@@ -234,7 +237,19 @@ def drafted_operations(asset_id, target):
     which is how a repeated demo run reports an already-described relation."""
     result = call(
         "POST", "/api/semantic/generate",
-        {"assetId": asset_id, "target": target},
+        {
+            "assetId": asset_id,
+            "target": target,
+            # The dashboard offers these per generation and defaults them off,
+            # because sending rows and statistics to a model is a decision
+            # about the data in front of you. The demo makes it for you: its
+            # sources are published government open data, and a description
+            # drafted from column names alone reads like a restatement of the
+            # column names. sampleRows and statistics are both sent for both
+            # kinds of target -- the server scopes the statistics to the one
+            # column when the target is a field.
+            "contextOptions": {"sampleRows": True, "statistics": True},
+        },
     )
     if result.get("code") == "semantic.generation_no_change":
         return None, None

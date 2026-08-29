@@ -985,11 +985,29 @@ def postgres_generation_context(
         ) as connection:
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
+                # Same foreign-table exclusion the profiling path already
+                # makes: LOCK TABLE is refused on a foreign table, and this
+                # call site never got the guard, so asking for sample rows or
+                # statistics from any federated source raised psycopg.Error
+                # and was reported as semantic.generation_context_unavailable
+                # -- the dashboard option looked unsupported for federated
+                # relations rather than broken. The read is already inside a
+                # read-only REPEATABLE READ transaction, and the lock only
+                # ever guarded against concurrent DDL on a local relation.
                 cursor.execute(
-                    sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
-                        relation_identifier
-                    )
+                    "SELECT c.relkind FROM pg_catalog.pg_class AS c "
+                    "JOIN pg_catalog.pg_namespace AS n "
+                    "ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s",
+                    (schema, relation),
                 )
+                precheck = cursor.fetchone()
+                if precheck is None or precheck["relkind"] != "f":
+                    cursor.execute(
+                        sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
+                            relation_identifier
+                        )
+                    )
                 live_fields = _verified_live_fields(
                     cursor,
                     schema=schema,
