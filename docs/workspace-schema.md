@@ -621,3 +621,79 @@ catalog probe. These checks cannot all be expressed portably in JSON Schema.
 
 The optional `layer._dashboard.generated` object records which values were
 inferred by the configuration dashboard. XYZ ignores this provenance object.
+
+---
+
+## Configuring the workspace
+
+The dashboard edits the live workspace through server-side validation. It
+discovers PostGIS relations visible to the read-only XYZ role, validates
+geometry and feature identifiers, checks calculated information expressions,
+and runs a bounded render probe before saving. Every successful dashboard save
+atomically replaces the live workspace, requests an XYZ restart, and waits for
+the XYZ supervisor to report TCP readiness with the exact saved workspace
+fingerprint. The dashboard shows the restart in progress and then confirms
+that connection readiness; operators do not need to issue a second reload.
+
+The top-level `locale` remains XYZ's default rendered locale even when
+`locales` is present. XYZ composes that default into each named locale except a
+named key literally called `locale`, because that name resolves the top-level
+default rather than a distinct alternative. XYZ's rules include conditional
+array concatenation/replacement and are not equivalent to a generic deep
+merge. The dashboard, API, and CLI select the top-level default when no name is
+requested and resolve named alternatives with the same composition semantics.
+If raw `workspace.locale` is absent, XYZ synthesizes an empty
+`{"layers": {}}` default; neither an omitted locale nor the name `locale`
+auto-selects a sole named alternative.
+Because a composed value may be inherited from several raw properties, named
+effective locales are inspectable in the dashboard and testable through the
+server API/CLI, but read-only in dashboard controls. Use focused
+`config-cli`/API proposal operations against the raw named override to edit one
+without flattening inherited content.
+
+XYZ also supports external renderers, templates, inline features, zoom-keyed
+tables/geometries, icon arrays, and named style references. The platform
+preserves those advanced forms. The dashboard keeps their ordinary
+database-specific controls read-only and exposes their complete JSON for
+expert editing, because they cannot be represented safely as one catalog
+relation. When such a layer is viewed through a composed named locale, its
+entire dashboard editor remains read-only under the named-locale rule above.
+
+Use the dashboard for interactive administration. Use the separately installed
+`config-cli` for remote, JSON-first automation:
+
+1. Inspect the server identity, contract, current revision, layer, schema,
+   rules, and catalog.
+2. Create the smallest revision-bound proposal.
+3. Present the explanation, focused diff, warnings, and visual evidence.
+   Top-level visual commands inspect the current live workspace; when the
+   server advertises proposal preview commands, use them to render the stored
+   pending candidate in the isolated preview process before approval.
+4. Apply only after explicit approval. A successful apply automatically
+   requests and waits for the same fingerprint-matched XYZ reload.
+5. Check the returned XYZ reload status and run a post-apply visual test.
+
+Do not directly edit a remote `workspace.json`. The platform API is the remote
+write boundary, records proposal and audit state, and is what triggers the
+managed reload. Direct filesystem edits are intentionally not watched. Prefer
+scoped, expiring device credentials for agents; legacy full tokens remain
+available for operators and migration as documented in
+[Security](security.md).
+
+The dashboard's **Semantic catalog** exposes generated and curated profiles,
+orphaned annotations, immutable per-asset history, and the reviewed semantic
+proposal workflow. **Access and audit** offers named least-privilege semantic
+token presets or exact custom scope selection. Gemini drafting is metadata-only
+by default, with separate `semantic:data` opt-ins for bounded samples or
+statistics. Source exclusions are deployment configuration; administrators can
+archive matching existing profiles or one selected profile without changing
+the database, while retained exact-ID history remains auditable.
+
+The public custom SVG catalog is versioned under
+[`instance/public/svg`](../instance/public/svg). SVGs are exposed as
+`/instance/svg/<filename>.svg` after bounded safety checks.
+
+The machine-readable workspace schema is
+[`config-ui/schema/workspace.schema.json`](../config-ui/schema/workspace.schema.json).
+See [Workspace schema](workspace-schema.md) and the
+[XYZ field audit](xyz-workspace-field-audit.md).

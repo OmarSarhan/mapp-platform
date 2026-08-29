@@ -240,3 +240,105 @@ Application rollback should restore the previous accepted images while
 preserving PostgreSQL and `var`. Database schema or PostgreSQL major-version
 changes require their own tested restore or migration plan; do not assume that
 recreating an older container reverses them.
+
+---
+
+## Database configuration
+
+
+All database routing is consolidated in the private `.env`. XYZ and the
+configuration dashboard receive the exact same `DBS_MAPP` connection string,
+which corresponds to `"dbs": "MAPP"` in the workspace. This prevents the
+dashboard from validating against a different database from the one XYZ uses.
+
+| Variable | Purpose |
+| --- | --- |
+| `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Points at the packaged database and is not repointed: external data is attached by federating it, not by aiming the runtime reader elsewhere. |
+| `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
+| `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role `DBS_MAPP` uses against the packaged database. |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the bundled sample database only. They are not passed to XYZ or the dashboard. |
+| `DB_BIND_ADDRESS`, `DB_PORT` | Optional host publication of the bundled database through `compose.db-port.yaml`; these do not select an external server. |
+
+The default created by `./bin/mapp init` is the bundled sample arrangement:
+
+```dotenv
+DBS_MAPP=postgresql://${XYZ_DB_USER}:${XYZ_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+ETL_DATABASE_URL=postgresql://${ETL_DB_USER}:${ETL_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+```
+
+Use `./bin/mapp all` to load and verify every configured bundled sample source.
+
+To remove the complete bundled PostgreSQL volume and rebuild it with only the
+configured ETL sources, run:
+
+```sh
+./bin/mapp reset-data --confirm
+```
+
+This deletes the packaged database and everything in it: derived layers, the
+federation registry with its aliases and group labels, and the whole semantic
+catalogue -- generated profiles, curated meaning, semantic proposals and their
+history. Back the database up first if any of that matters; the catalogue
+moved into PostgreSQL and is no longer a separate file. It replaces the live
+and preview workspaces with `instance/workspace.seed.json`, clearing layer
+configuration that depended on deleted data.
+
+The source databases are not touched, so the spatial data survives and
+`./bin/mapp demo` rebuilds the showcase from them. Nor is anything under
+`var`: dashboard authentication, the audit log, workspace proposals,
+artifacts, and public assets are preserved. Before archiving, the command installs an owner-fenced
+maintenance gate and waits for every current semantic profile to be `ready`
+with no undelivered outbox blocker. It then archives every active profile and
+checks the outbox again; a `repair_required` event or timeout aborts before
+volume deletion.
+
+A handled interruption compensates only the reset operation's own gate. If the
+host or process stops before compensation, confirm that no `reset-data`
+process remains and run `./bin/mapp recover-reset-data --confirm`; ordinary
+service startup does not force reset recovery. Both commands are unavailable
+in external-database mode and require their explicit `--confirm` guards.
+Source availability can change independently; treat a non-zero ETL exit as a
+failed refresh and inspect the recorded run before retrying.
+
+Externally managed PostGIS data is attached as a **federated source** rather
+than by repointing `DBS_MAPP`: MAPP always runs its own database for derived
+layers, the federation registry and the control plane, and reaches source data
+over `postgres_fdw`. See [Federated PostgreSQL sources](federation.md) for
+the register, observe and provision sequence.
+
+A source server must:
+
+- be reachable from containers on the Compose backend network; do not use
+  `localhost`, which would mean the individual application container;
+- have PostGIS installed;
+- grant the URI role `CONNECT` on the database, `USAGE` on every mapped schema,
+  and `SELECT` on the relations used by the workspace; and
+- expose geometry columns, SRIDs, primary/feature identifiers, and calculated
+  fields compatible with the configured workspace layers.
+
+Percent-encode URI-reserved characters in database usernames and passwords.
+Choose an appropriate PostgreSQL `sslmode`; production external connections
+should normally validate TLS rather than use the bundled default of `disable`.
+The example explicitly points both database clients at the system CA bundle
+present in both application images. This is needed because Node `pg` and
+libpq/psycopg do not otherwise use the same default root-certificate path. A
+private CA or client certificate needs a reviewed read-only mount at the same
+absolute path in both `xyz` and `config-ui`, plus matching PostgreSQL URI
+parameters; do not weaken verification to work around missing trust material.
+
+Keep `.env` mode `0600`, outside version control, logs, screenshots, and support
+messages.
+
+Changing `DBS_MAPP` changes the database, not the layer definitions. Before the
+first initialization, edit `instance/workspace.seed.json` for the external
+schemas, tables, geometry columns, and identifiers. For an existing instance,
+the authoritative configuration is `var/workspace/workspace.json`; update it
+through the dashboard or a revision-bound `config-cli` proposal. The ArcGIS ETL
+manifest remains separate under `instance/etl/layers.json` and is irrelevant to
+normal external-database operation.
+
+For production, do not rely on the local defaults. Read
+[Deployment](deployment.md), [Security](security.md), and
+[Backup and restore](backup-restore.md) first. The shipped direct
+production topology requires distinct public HTTPS DNS hostnames for map and
+configuration traffic, with Caddy directly bound to ports 80 and 443.

@@ -206,3 +206,18 @@ notices as triggers for an immediate refresh.
   for signatures, SBOMs, and provenance attached to an image digest.
 - Canonical: [the maintained `ubuntu/squid` image](https://hub.docker.com/r/ubuntu/squid).
 - Docker Official Images: [the maintained Caddy image](https://hub.docker.com/_/caddy).
+
+---
+
+## XYZ framework policy
+
+This repository does not vendor or alter the GEOLYTIX XYZ framework. The XYZ
+Dockerfile clones the configured upstream release, verifies its full commit,
+builds it, and layers only the deployment supervisor and instance mappings
+around it. Upgrade work should change the pinned reference and commit, build a
+new image, and verify the platform; it should not patch the framework source in
+this repository.
+
+Because the upstream installation is not fully dependency-locked, an accepted
+production image should be retained and deployed by immutable digest. That
+release hardening is still outstanding.

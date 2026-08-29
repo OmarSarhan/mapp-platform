@@ -1,431 +1,109 @@
 # MAPP Platform
 
-MAPP Platform is the deployable server half of the project. It runs a pinned
-GEOLYTIX XYZ build against PostgreSQL/PostGIS, the workspace configuration
-dashboard and API, a private semantic metadata service, server-side browser
-validation, and Caddy. An optional one-shot ETL container can populate the
-bundled database with small Leeds samples or the reviewed England Census 2021
-Output Area dataset.
+MAPP publishes maps from PostgreSQL data that lives somewhere else.
 
-The remote [`config-cli`](https://github.com/OmarSarhan/mapp-config-cli) is a
-separate project. It is installed on an operator or AI-agent computer and
-communicates with this platform over the authenticated configuration API; it
-is not bundled into the platform image or source tree.
+You point it at PostgreSQL databases you already have. It attaches them
+read-only, records what it knows about their relations, lets you build
+aggregated layers across them, and serves the result through a pinned GEOLYTIX
+XYZ build — with a configuration dashboard, a private semantic metadata
+service, server-side browser validation, and Caddy in front.
 
-This directory is repository-ready source, not proof of a
-history-preserving Git split. Publish it only after repeating the separation
-from the canonical clone, retaining relevant history and tags, and scanning
-the complete history as described in
-[Repository split](docs/repository-split.md).
+**MAPP does not hold your spatial data.** It packages one PostgreSQL database
+for its own state: the layers it derives, the registry of sources it has
+attached, and what it knows about their columns. Your data stays where it is.
 
-```text
-optional one-shot ETL ──> bundled PostGIS ─────┐
-                                               ├─ DBS_MAPP ─┬─> XYZ
-external operator-managed PostGIS ─────────────┘            └─> config API ──> semantic service
+---
 
-browser ── HTTPS ──> Caddy ──> XYZ
-                           └─> config API <── standalone config-cli
-                                               on a separate computer
-```
+## Try it
 
-## Repository and state layout
-
-The repository separates reviewed deployment inputs from mutable live state:
-
-```text
-instance/                         versioned deployment inputs
-├── workspace.seed.json          initial workspace only
-├── xyz.env                      non-secret XYZ runtime settings
-├── etl/layers.json              Leeds sample source and field manifest
-├── etl/census.json              pinned England Census 2021 manifest
-└── public/
-    ├── svg/                     public custom map icons
-    └── plugins/                 trusted manifest-backed XYZ plugins
-
-var/                              ignored mutable runtime state
-├── workspace/
-│   ├── workspace.json           authoritative live workspace
-│   └── workspace.json.bak       previous atomic-save version
-├── control/
-│   ├── auth.json                authentication, session, token, and device state
-│   ├── audit.jsonl              security and change audit
-│   ├── proposals/               revision-bound proposal lifecycle records
-│   ├── operations/              durable bounded long-action records
-│   └── artifacts/               visual reports and screenshots
-├── preview/
-│   └── workspace.json           private proposal-preview workspace
-├── reload/                       narrow live XYZ reload coordination
-└── preview-reload/               isolated preview XYZ reload coordination
-```
-
-`instance/workspace.seed.json` is copied to the live workspace only when no
-live workspace exists. Normal dashboard or API saves update
-`var/workspace/workspace.json`; they do not rewrite the seed. Treat `var` as
-host-owned operational data: do not commit it, include it in container build
-contexts, or place it under XYZ's general file-resource path.
-
-The intended mount boundary is:
-
-- XYZ: live workspace read-only, `instance/public` read-only, reload channel
-  read/write.
-- XYZ preview: private preview workspace read-only, `instance/public`
-  read-only, preview reload channel read/write.
-- Configuration service: live and preview workspaces, control state, and both
-  reload channels read/write; public SVGs read-only; private access to the
-  semantic service.
-- Semantic service: no mounts and no public network. Its catalog is the
-  `semantic` schema in the packaged database, reached through one read-only
-  role and one role that owns that schema and nothing else.
-- Browser runner: only `var/control/artifacts` read/write.
-- ETL: only `instance/etl` read-only.
-
-See [Architecture](docs/architecture.md), [Semantic metadata control
-plane](docs/semantic-layer.md), and [Security](docs/security.md) for the
-complete trust boundary.
-
-## Quick start
-
-Docker Engine, Docker Compose v2, Python 3, and OpenSSL are required. The test
-entry point runs frontend and component checks in Docker; a host Node
-installation or project-level npm install is not required.
-
-For isolated development, open this repository directory (not its parent split
-workspace) in VS Code and choose **Dev Containers: Reopen in Container**. The
-repository-local container runs its own Docker daemon and publishes the MAPP
-gateway on host port `3000`; it does not mount the host Docker socket. Keep the
-standalone CLI open in its own repository and dev container.
+Docker with Compose, and about 4 GB free. Nothing is installed on the host.
 
 ```sh
-./bin/mapp init --demo
+./bin/mapp init --demo     # write .env and generate every secret
+./bin/mapp all             # build, start, and verify the platform
+./bin/mapp demo            # load two real open-data sources and publish a map
+```
+
+`demo` takes around fifteen minutes, most of it downloading the England Census
+2021 Output Area dataset. Then open:
+
+- the map — <http://localhost:3000>
+- the dashboard — <http://config.localhost:3000>
+
+The dashboard password was printed by `init`; `./bin/mapp reset-config-password`
+issues a new one if you have lost it.
+
+What you get is two independent PostgreSQL servers holding real open data,
+attached read-only, with layers computed by joining across both of them.
+
+**Next: [the guide](docs/guide.md).** It starts here and builds up to attaching
+your own sources, so it is the right second thing to read.
+
+## Without the demo
+
+```sh
+./bin/mapp init
 ./bin/mapp all
-./bin/mapp demo
 ```
 
-Initialization creates a private `.env`, initializes control-plane
-authentication, and creates the live workspace from the versioned seed when
-needed. It must preserve existing `.env`, database, workspace, audit, proposal,
-and artifact state.
-
-Development-only local defaults:
-
-- Map: <http://localhost:3000>
-- Configuration dashboard: <http://config.localhost:3000>
-
-`./bin/mapp serve` starts the long-running services and loads nothing. There
-is no packaged ETL: spatial data lives in source databases the platform
-federates, and `./bin/mapp demo` is what loads the Leeds showcase into its two
-source databases straight from their publishers and publishes the map layers
-built from them. To check a Census source without loading it, use
-`./bin/mapp census-check TS001`, which reads the publisher and touches no
-database.
-
-The broken recent-planning sample was replaced with Leeds Smoke Control Orders,
-a healthy bounded polygon source. The replacement has its own table and
-workspace mapping; the loader deliberately leaves any old
-`leeds.planning_applications_recent` table untouched. Expected ArcGIS service
-failures now produce a concise error, preserve deletion safety, and still
-return non-zero for automation. See the
-[ETL polygon-source note](etl/README.md#polygon-source-selection).
-
-## HTTPS-first live deployment
-
-Caddy is the only public endpoint, and HTTPS is the primary live-server
-topology. Persist the production choice and public origins in the private
-`.env` rather than relying on a shell export:
-
-```dotenv
-MAPP_ENVIRONMENT=production
-EDGE_BIND_ADDRESS=0.0.0.0
-HTTP_PORT=80
-HTTPS_PORT=443
-PRODUCTION_MAP_SITE=https://maps.company.co.uk
-PRODUCTION_CONFIG_SITE=https://config.company.co.uk
-PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui
-PRODUCTION_CADDY_EMAIL=operations@company.co.uk
-```
-
-Point both DNS names at the server and allow inbound TCP 80 and TCP/UDP 443.
-Caddy obtains and renews the certificates, redirects ordinary HTTP traffic to
-HTTPS, and retains its ACME state in the named Caddy volumes. Port 80 is kept
-only for redirect and certificate automation; XYZ and the configuration
-service remain unpublished behind Caddy.
-
-Run `./bin/mapp config` before `./bin/mapp serve`; production validation rejects
-HTTP origins, loopback binding, non-standard public ports, placeholder domains,
-an unmonitored ACME email, and root application IDs. Initialize and operate the
-deployment as a dedicated unprivileged host account. Local
-`http://localhost:3000` remains available
-only when `MAPP_ENVIRONMENT=development`. `MAPP_ENVIRONMENT` is authoritative in the selected
-env file; conflicting shell exports are rejected. Use `MAPP_ENV_FILE` to select
-a different reviewed env file. Conflicting exported database connection,
-role, and password variables are also rejected so Compose cannot silently
-replace the reviewed database target. See [Deployment](docs/deployment.md) for
-firewall, backup, and acceptance requirements.
-
-## Database configuration
-
-All database routing is consolidated in the private `.env`. XYZ and the
-configuration dashboard receive the exact same `DBS_MAPP` connection string,
-which corresponds to `"dbs": "MAPP"` in the workspace. This prevents the
-dashboard from validating against a different database from the one XYZ uses.
-
-| Variable | Purpose |
-| --- | --- |
-| `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Points at the packaged database and is not repointed: external data is attached by federating it, not by aiming the runtime reader elsewhere. |
-| `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
-| `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role `DBS_MAPP` uses against the packaged database. |
-| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the bundled sample database only. They are not passed to XYZ or the dashboard. |
-| `ETL_DB_USER`, `ETL_DB_PASSWORD` | Writer role for bundled ETL provisioning only. |
-| `ETL_DATABASE_URL` | Separate ETL destination; it is never used by XYZ or the dashboard. |
-| `DB_BIND_ADDRESS`, `DB_PORT` | Optional host publication of the bundled database through `compose.db-port.yaml`; these do not select an external server. |
-
-The default created by `./bin/mapp init` is the bundled sample arrangement:
-
-```dotenv
-DBS_MAPP=postgresql://${XYZ_DB_USER}:${XYZ_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
-ETL_DATABASE_URL=postgresql://${ETL_DB_USER}:${ETL_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
-```
-
-Use `./bin/mapp all` to load and verify every configured bundled sample source.
-
-To remove the complete bundled PostgreSQL volume and rebuild it with only the
-configured ETL sources, run:
-
-```sh
-./bin/mapp reset-data --confirm
-```
-
-This deletes the packaged database and everything in it: derived layers, the
-federation registry with its aliases and group labels, and the whole semantic
-catalogue -- generated profiles, curated meaning, semantic proposals and their
-history. Back the database up first if any of that matters; the catalogue
-moved into PostgreSQL and is no longer a separate file. It replaces the live
-and preview workspaces with `instance/workspace.seed.json`, clearing layer
-configuration that depended on deleted data.
-
-The source databases are not touched, so the spatial data survives and
-`./bin/mapp demo` rebuilds the showcase from them. Nor is anything under
-`var`: dashboard authentication, the audit log, workspace proposals,
-artifacts, and public assets are preserved. Before archiving, the command installs an owner-fenced
-maintenance gate and waits for every current semantic profile to be `ready`
-with no undelivered outbox blocker. It then archives every active profile and
-checks the outbox again; a `repair_required` event or timeout aborts before
-volume deletion.
-
-A handled interruption compensates only the reset operation's own gate. If the
-host or process stops before compensation, confirm that no `reset-data`
-process remains and run `./bin/mapp recover-reset-data --confirm`; ordinary
-service startup does not force reset recovery. Both commands are unavailable
-in external-database mode and require their explicit `--confirm` guards.
-Source availability can change independently; treat a non-zero ETL exit as a
-failed refresh and inspect the recorded run before retrying.
-
-Externally managed PostGIS data is attached as a **federated source** rather
-than by repointing `DBS_MAPP`: MAPP always runs its own database for derived
-layers, the federation registry and the control plane, and reaches source data
-over `postgres_fdw`. See [Federated PostgreSQL sources](docs/federation.md) for
-the register, observe and provision sequence.
-
-A source server must:
-
-- be reachable from containers on the Compose backend network; do not use
-  `localhost`, which would mean the individual application container;
-- have PostGIS installed;
-- grant the URI role `CONNECT` on the database, `USAGE` on every mapped schema,
-  and `SELECT` on the relations used by the workspace; and
-- expose geometry columns, SRIDs, primary/feature identifiers, and calculated
-  fields compatible with the configured workspace layers.
-
-Percent-encode URI-reserved characters in database usernames and passwords.
-Choose an appropriate PostgreSQL `sslmode`; production external connections
-should normally validate TLS rather than use the bundled default of `disable`.
-The example explicitly points both database clients at the system CA bundle
-present in both application images. This is needed because Node `pg` and
-libpq/psycopg do not otherwise use the same default root-certificate path. A
-private CA or client certificate needs a reviewed read-only mount at the same
-absolute path in both `xyz` and `config-ui`, plus matching PostgreSQL URI
-parameters; do not weaken verification to work around missing trust material.
-
-Keep `.env` mode `0600`, outside version control, logs, screenshots, and support
-messages.
-
-Changing `DBS_MAPP` changes the database, not the layer definitions. Before the
-first initialization, edit `instance/workspace.seed.json` for the external
-schemas, tables, geometry columns, and identifiers. For an existing instance,
-the authoritative configuration is `var/workspace/workspace.json`; update it
-through the dashboard or a revision-bound `config-cli` proposal. The ArcGIS ETL
-manifest remains separate under `instance/etl/layers.json` and is irrelevant to
-normal external-database operation.
-
-For production, do not rely on the local defaults. Read
-[Deployment](docs/deployment.md), [Security](docs/security.md), and
-[Backup and restore](docs/backup-restore.md) first. The shipped direct
-production topology requires distinct public HTTPS DNS hostnames for map and
-configuration traffic, with Caddy directly bound to ports 80 and 443.
-
-## Configuring the workspace
-
-The dashboard edits the live workspace through server-side validation. It
-discovers PostGIS relations visible to the read-only XYZ role, validates
-geometry and feature identifiers, checks calculated information expressions,
-and runs a bounded render probe before saving. Every successful dashboard save
-atomically replaces the live workspace, requests an XYZ restart, and waits for
-the XYZ supervisor to report TCP readiness with the exact saved workspace
-fingerprint. The dashboard shows the restart in progress and then confirms
-that connection readiness; operators do not need to issue a second reload.
-
-The top-level `locale` remains XYZ's default rendered locale even when
-`locales` is present. XYZ composes that default into each named locale except a
-named key literally called `locale`, because that name resolves the top-level
-default rather than a distinct alternative. XYZ's rules include conditional
-array concatenation/replacement and are not equivalent to a generic deep
-merge. The dashboard, API, and CLI select the top-level default when no name is
-requested and resolve named alternatives with the same composition semantics.
-If raw `workspace.locale` is absent, XYZ synthesizes an empty
-`{"layers": {}}` default; neither an omitted locale nor the name `locale`
-auto-selects a sole named alternative.
-Because a composed value may be inherited from several raw properties, named
-effective locales are inspectable in the dashboard and testable through the
-server API/CLI, but read-only in dashboard controls. Use focused
-`config-cli`/API proposal operations against the raw named override to edit one
-without flattening inherited content.
-
-XYZ also supports external renderers, templates, inline features, zoom-keyed
-tables/geometries, icon arrays, and named style references. The platform
-preserves those advanced forms. The dashboard keeps their ordinary
-database-specific controls read-only and exposes their complete JSON for
-expert editing, because they cannot be represented safely as one catalog
-relation. When such a layer is viewed through a composed named locale, its
-entire dashboard editor remains read-only under the named-locale rule above.
-
-Use the dashboard for interactive administration. Use the separately installed
-`config-cli` for remote, JSON-first automation:
-
-1. Inspect the server identity, contract, current revision, layer, schema,
-   rules, and catalog.
-2. Create the smallest revision-bound proposal.
-3. Present the explanation, focused diff, warnings, and visual evidence.
-   Top-level visual commands inspect the current live workspace; when the
-   server advertises proposal preview commands, use them to render the stored
-   pending candidate in the isolated preview process before approval.
-4. Apply only after explicit approval. A successful apply automatically
-   requests and waits for the same fingerprint-matched XYZ reload.
-5. Check the returned XYZ reload status and run a post-apply visual test.
-
-Do not directly edit a remote `workspace.json`. The platform API is the remote
-write boundary, records proposal and audit state, and is what triggers the
-managed reload. Direct filesystem edits are intentionally not watched. Prefer
-scoped, expiring device credentials for agents; legacy full tokens remain
-available for operators and migration as documented in
-[Security](docs/security.md).
-
-The dashboard's **Semantic catalog** exposes generated and curated profiles,
-orphaned annotations, immutable per-asset history, and the reviewed semantic
-proposal workflow. **Access and audit** offers named least-privilege semantic
-token presets or exact custom scope selection. Gemini drafting is metadata-only
-by default, with separate `semantic:data` opt-ins for bounded samples or
-statistics. Source exclusions are deployment configuration; administrators can
-archive matching existing profiles or one selected profile without changing
-the database, while retained exact-ID history remains auditable.
-
-The public custom SVG catalog is versioned under
-[`instance/public/svg`](instance/public/svg). SVGs are exposed as
-`/instance/svg/<filename>.svg` after bounded safety checks.
-
-The machine-readable workspace schema is
-[`config-ui/schema/workspace.schema.json`](config-ui/schema/workspace.schema.json).
-See [Workspace schema](docs/workspace-schema.md) and the
-[XYZ field audit](docs/xyz-workspace-field-audit.md).
-
-## XYZ framework policy
-
-This repository does not vendor or alter the GEOLYTIX XYZ framework. The XYZ
-Dockerfile clones the configured upstream release, verifies its full commit,
-builds it, and layers only the deployment supervisor and instance mappings
-around it. Upgrade work should change the pinned reference and commit, build a
-new image, and verify the platform; it should not patch the framework source in
-this repository.
-
-Because the upstream installation is not fully dependency-locked, an accepted
-production image should be retained and deployed by immutable digest. That
-release hardening is still outstanding.
+That gives you the platform and nothing in it. Attach your own PostgreSQL
+database with the [`config-cli`](https://github.com/OmarSarhan/mapp-config-cli)
+client, or through the dashboard's federation panel — the guide's
+[federation section](docs/guide.md#4-federation-attaching-a-source) walks the
+lifecycle, and [`docs/external-postgresql.md`](docs/external-postgresql.md)
+covers preparing the source database itself.
 
 ## Common commands
 
-```sh
-./bin/mapp serve
-./bin/mapp demo
-./bin/mapp census-check TS001
-./bin/mapp test
-./bin/mapp doctor
-./bin/mapp verify
-./bin/mapp ps
-./bin/mapp logs
-./bin/mapp db
-./bin/mapp reload-xyz
-./bin/mapp reset-config-password
-./bin/mapp stop
-./bin/mapp down
-```
+| Command | What it does |
+| --- | --- |
+| `./bin/mapp all` | Start everything, then verify it |
+| `./bin/mapp serve` | Start the long-running services and load nothing |
+| `./bin/mapp demo` | Load the two demo sources and publish their map layers |
+| `./bin/mapp verify` | End-to-end acceptance checks against the running stack |
+| `./bin/mapp test` | Unit, contract and frontend suites |
+| `./bin/mapp doctor` | Report `.env` key drift; `--add-missing` fills safe defaults |
+| `./bin/mapp ps`, `logs` | Service state and logs |
+| `./bin/mapp stop`, `down` | Stop, or remove containers and keep the data |
+| `./bin/mapp reset-data --confirm` | Remove the packaged database; read the warning first |
 
-`down` removes containers and networks but is intended to preserve the named
-PostgreSQL and Caddy volumes. Always take a backup before database image,
-schema, or deployment-boundary changes.
+`./bin/mapp` with no arguments lists all of them.
 
-`reset-config-password` generates and displays a new configuration-dashboard
-administrator password once, invalidating existing dashboard sessions without
-restarting the service. It does not revoke CLI tokens or change database
-credentials. See [Credentials](docs/operations.md#credentials) for recovery,
-custom environment-file, and token-revocation instructions.
+## Layout
 
-## Verification
+| Path | Contents |
+| --- | --- |
+| `bin/mapp` | The wrapper every operation goes through |
+| `config-ui/` | Configuration dashboard and API |
+| `semantic-service/` | Private semantic catalogue service |
+| `etl/` | Loader used by the demo to populate source databases |
+| `docker/` | Image definitions and database initialisation |
+| `scripts/` | `verify.sh`, acceptance and contract test helpers |
+| `instance/` | Reviewed, versioned inputs — seed workspace, public assets |
+| `var/` | Runtime state: authentication, audit, proposals, artifacts |
+| `docs/` | [Documentation](docs/guide.md) |
 
-Available checks include:
-
-```sh
-./bin/mapp test
-./bin/mapp doctor
-./bin/mapp config
-./bin/mapp verify
-```
-
-`test` builds controlled component images, runs the component Python suites,
-frontend tests/build/audit and JavaScript syntax checks in containers, then
-runs standard-library wrapper/production helper tests and Compose validation
-from the host. `doctor` compares environment key names without printing their
-values. The last command is a runtime check and requires the stack, the packaged
-PostGIS connection, and at least one discoverable relation. It verifies the
-runtime, derived and federation identities and their privileges, service
-health, the catalog, tiles, and the gateway guards. Where `MAPP_DEMO_SOURCES`
-is set it also checks the demo content in `census-db` and `ops-db`, which is
-where that data lives. Finish acceptance with layer-specific visual tests for
-the workspace.
-Dated results and their exact scope are recorded in
-[`docs/validation-log.md`](docs/validation-log.md). Treat only the checks
-explicitly recorded there as evidence; source restructuring alone is not an
-acceptance result.
+`instance/` is checked in and reviewed. `var/` is generated, private, and
+excluded from Git.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Semantic metadata control plane](docs/semantic-layer.md)
-- [Managed derived layers](docs/derived-layers.md)
-- [Federated PostgreSQL sources](docs/federation.md)
-- [External XYZ plugins](docs/external-plugins.md)
-- [Deployment](docs/deployment.md)
-- [External PostgreSQL administrator handoff](docs/external-postgresql.md)
-- [Operations](docs/operations.md)
-- [Security](docs/security.md)
-- [Backup and restore](docs/backup-restore.md)
-- [Configuration API contract](docs/api-contract.md)
-- [Repository split](docs/repository-split.md)
-- [Workspace schema](docs/workspace-schema.md)
-- [Validation history](docs/validation-log.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security reporting](SECURITY.md)
-- [Licensing status](LICENSING.md)
+**[docs/guide.md](docs/guide.md)** is the entry point. It explains the mental
+model, walks the first twenty minutes, and adds depth as it goes, linking to
+every reference document in the right place.
 
-Project code is licensed under the [MIT License](LICENSE). Bundled and
-downloaded data or third-party assets retain their own terms; review
-[`LICENSING.md`](LICENSING.md) and
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before redistribution.
+If you already know what you are looking for, its
+[reference index](docs/guide.md#10-reference-index) lists all of them with a
+line each.
+
+## The remote client
+
+[`config-cli`](https://github.com/OmarSarhan/mapp-config-cli) is a separate
+repository. It is installed on an operator or AI-agent computer and reaches
+this platform only through the authenticated configuration API — it is not
+bundled into any image here. That separation is the trust boundary, so keep it.
+
+## Contributing
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the development container, the
+suites, and what a change is expected to carry before it lands.
