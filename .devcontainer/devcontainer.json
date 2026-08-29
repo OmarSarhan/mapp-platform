@@ -1,49 +1,55 @@
 {
   "name": "MAPP Platform",
-  "build": {
-    "dockerfile": "Dockerfile"
-  },
-  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
+  // A base environment to run the platform FROM, not one that contains it.
+  // Everything MAPP runs -- PostgreSQL, XYZ, the dashboard, the semantic
+  // service, the demo's source databases -- runs in containers started by
+  // ./bin/mapp. This container only needs the handful of tools that wrapper
+  // uses on the host: docker, python3, openssl and curl. The image already
+  // provides the last three, so there is nothing to build.
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+
   "features": {
+    // Docker-in-docker, deliberately, not docker-outside-of-docker. The
+    // Compose model bind-mounts ./var, ./instance and ./docker, and those
+    // paths only resolve correctly if the daemon shares this container's
+    // filesystem. The trade is that MAPP's volumes live inside this
+    // container: rebuilding it discards the database and you start again
+    // with ./bin/mapp init --demo.
     "ghcr.io/devcontainers/features/docker-in-docker:4.0.0": {}
   },
-  "containerEnv": {
-    "EDGE_BIND_ADDRESS": "0.0.0.0"
-  },
-  "postCreateCommand": "python -m pip install --requirement config-ui/requirements.txt && npm --prefix config-ui ci",
-  "runArgs": [
-    "--publish",
-    "0.0.0.0:3000:3000",
-    "--publish",
-    "0.0.0.0:3443:3443"
-  ],
-  "forwardPorts": [
-    3000,
-    3443
-  ],
+
+  // HTTP_PORT from .env.example. The map is served here, and the dashboard
+  // on the same port under the config.localhost host name -- most browsers
+  // resolve any *.localhost name to the loopback address, so both work once
+  // this port is forwarded.
+  "forwardPorts": [3000],
   "portsAttributes": {
     "3000": {
-      "label": "MAPP gateway",
-      "onAutoForward": "ignore"
-    },
-    "3443": {
-      "label": "MAPP gateway HTTPS",
-      "onAutoForward": "ignore"
+      "label": "MAPP (map, and dashboard at config.localhost:3000)",
+      "onAutoForward": "notify"
     }
   },
+
+  // uid 1000, matching CONFIG_UID/CONFIG_GID in the Compose model. The
+  // services run as that uid and write to ./var, so a mismatch here leaves
+  // the wrapper unable to read the state it just created.
+  "remoteUser": "vscode",
+
   "customizations": {
     "vscode": {
       "extensions": [
-        "openai.chatgpt",
         "ms-python.python",
         "ms-python.vscode-pylance"
       ],
       "settings": {
         "terminal.integrated.cwd": "${workspaceFolder}",
-        "python.defaultInterpreterPath": "/usr/local/bin/python",
-        "python.terminal.useEnvFile": true
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
       }
     }
   },
-  "remoteUser": "vscode"
+
+  "postAttachCommand": {
+    "next-steps": "printf '\\nMAPP Platform. To stand up the demo:\\n  ./bin/mapp init --demo\\n  ./bin/mapp all\\n  ./bin/mapp demo\\nThen open http://localhost:3000 and http://config.localhost:3000\\nGuide: docs/guide.md\\n\\n'"
+  }
 }
