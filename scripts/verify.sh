@@ -711,6 +711,79 @@ RAISE NOTICE
 END $mapp_semantic$;
 SQL
 
+# The audit above proves the configured role NAMES have a narrow grant shape
+# in this database. It does not prove the semantic service uses those roles,
+# or that its DSNs reach this database at all -- a hand-edited .env can leave
+# the named roles perfectly restricted while handing the service a different,
+# broader login somewhere else entirely. So the identity is read here and
+# every core connection is required to match it. Comparing database names is
+# not identity: two servers can both have a database called mapp.
+packaged_identity="$("${compose[@]}" exec -T db sh -c \
+  'exec psql -tA -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'IDENT_SQL'
+SELECT (SELECT system_identifier FROM pg_control_system())
+       || $$ $$
+       || (SELECT oid FROM pg_database WHERE datname = current_database());
+IDENT_SQL
+)"
+packaged_identity="$(printf %s "${packaged_identity}" | tr -d "\r" | tail -n 1)"
+[[ -n "${packaged_identity}" ]] \
+  || fail "could not read the packaged database identity"
+
+"${compose[@]}" exec -T \
+  -e "MAPP_EXPECTED_IDENTITY=${packaged_identity}" \
+  -e "MAPP_SEMANTIC_USER=$(dotenv_value SEMANTIC_DB_USER)" \
+  -e "MAPP_SEMANTIC_READER_USER=$(dotenv_value SEMANTIC_READER_DB_USER)" \
+  -e "MAPP_SEMANTIC_URL=$("${compose[@]}" exec -T semantic-service printenv SEMANTIC_DATABASE_URL | tr -d "\r")" \
+  -e "MAPP_SEMANTIC_READER_URL=$("${compose[@]}" exec -T semantic-service printenv SEMANTIC_READER_DATABASE_URL | tr -d "\r")" \
+  config-ui python3 - <<'IDENT_PY'
+import os
+import sys
+
+import psycopg
+from psycopg.rows import dict_row
+
+expected = os.environ["MAPP_EXPECTED_IDENTITY"].strip()
+connections = (
+    ("SEMANTIC_DATABASE_URL", "MAPP_SEMANTIC_URL", "MAPP_SEMANTIC_USER"),
+    (
+        "SEMANTIC_READER_DATABASE_URL",
+        "MAPP_SEMANTIC_READER_URL",
+        "MAPP_SEMANTIC_READER_USER",
+    ),
+)
+for label, url_key, user_key in connections:
+    url = os.environ.get(url_key, "").strip()
+    role = os.environ.get(user_key, "").strip()
+    if not url or not role:
+        print(f"{label} or its role name is missing", file=sys.stderr)
+        raise SystemExit(1)
+    with psycopg.connect(url, connect_timeout=10, row_factory=dict_row) as c:
+        session = c.execute(
+            "SELECT current_user::text AS role,"
+            " (SELECT system_identifier FROM pg_control_system())::text"
+            "   || $$ $$ ||"
+            " (SELECT oid FROM pg_database"
+            "  WHERE datname = current_database())::text AS identity"
+        ).fetchone()
+    if session["role"] != role:
+        print(
+            f"{label} authenticates as {session['role']}, expected {role}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if session["identity"] != expected:
+        print(
+            f"{label} reaches a different PostgreSQL database than the"
+            f" packaged one ({session['identity']} != {expected})",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+print(
+    "Semantic service DSNs authenticate as their own roles on the packaged"
+    " database."
+)
+IDENT_PY
+
 # The census content assertions run against the database that holds the data.
 # census_config.py pins TARGET_SCHEMA to leeds and rejects any other value, so
 # the schema name is identical on both sides and every assertion below is the
