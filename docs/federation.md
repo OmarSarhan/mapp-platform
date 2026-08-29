@@ -220,6 +220,44 @@ The one thing retirement does delete is the **user mappings**. A mapping is not
 audit evidence — it is a live credential held in the catalogue in plain text —
 and a decommissioned source has no business keeping working credentials.
 
+## Groups are labels
+
+A group is a name, an optional description, and who created it. A source
+belongs to zero or more. Membership is **metadata**: it grants nothing,
+revokes nothing, and changes no PostgreSQL privilege. It records which sources
+are meant to be used together.
+
+That is a deliberate design decision rather than an unfinished one, and the
+reason is worth stating because the obvious expectation is the opposite.
+Every provisioned source becomes a foreign table in the **one** packaged
+database, so a cross-database join already works between any two of them with
+no group concept at all — proven live, joining two separate PostgreSQL servers
+through `source_census` and `source_ops`. Grouping therefore cannot *enable*
+cross-database querying. It could only restrict it, and restriction through
+group membership does not hold either: a source in two groups bridges them, so
+the isolation an operator would assume they were buying is not there to buy.
+
+```
+config-cli federation group-define leeds --description "Leeds showcase sources."
+config-cli federation set-groups census --group leeds
+config-cli federation groups
+config-cli federation group-delete leeds --confirm
+```
+
+`set-groups` replaces the whole set, so omitting `--group` entirely is how a
+source's labels are cleared. A group must be defined before it can be
+assigned; deleting one detaches it from every source, retired ones included,
+and the audit event is the only record of which sources changed.
+
+Reading labels needs `federation:observe`, and defining, deleting or assigning
+them needs `federation:register`. Never `federation:provision` — nothing about
+a label opens a connection to anything.
+
+If you ever want group membership to *enforce* something, the scope vocabulary
+is duplicated in five places — `control_plane.py`, `control_api.py`,
+`main.jsx`, and the CLI's `cli.py` and its tests, two of them in the other
+repository — so budget for that before proposing a `federation:group` scope.
+
 ## Continuous verification
 
 Once a source is provisioned, a background pass re-observes it **every 15
@@ -415,6 +453,10 @@ upgrade-derived` realigns it; `./bin/mapp verify` compares the two.
 | `federation.invalid_request` | Malformed or unknown properties in the body. |
 | `federation.alias_limit_reached` | Registering would exceed the 100-alias ceiling, retired ones included. |
 | `federation.alias_limit_exceeded` | The registry already holds more aliases than the ceiling allows — only reachable if rows were written directly to the database. |
+| `federation.group_exists` | A group of that name is already defined. |
+| `federation.group_not_found` | A named group is not defined, either on delete or when assigning it to a source. |
+| `federation.group_limit` | Defining would exceed the 50-group ceiling. |
+| `federation.group_limit_exceeded` | The registry already holds more groups than the ceiling allows — only reachable if rows were written directly to the database. |
 | `federation.connection_ref_not_found` | No `FEDERATION_DBS_<REF>` for that reference. |
 | `federation.tls_policy_not_met` | The connection string is weaker than the declared `tlsPolicy`. |
 | `federation.observation_not_current` | `expectedObservationId` does not match the latest observation. |

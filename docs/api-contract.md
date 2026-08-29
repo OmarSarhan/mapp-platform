@@ -574,6 +574,10 @@ statement.
 | `POST /api/federation/aliases/{alias}/observe` | `federation.aliases.observe` | `federation:provision` |
 | `POST /api/federation/aliases/{alias}/provision` | `federation.aliases.provision` | `federation:provision` |
 | `POST /api/federation/aliases/{alias}/retire` | `federation.aliases.retire` | `federation:provision` |
+| `GET /api/federation/groups` | `federation.groups.list` | `federation:observe` |
+| `POST /api/federation/groups` | `federation.groups.define` | `federation:register` |
+| `POST /api/federation/groups/{name}/delete` | `federation.groups.delete` | `federation:register` |
+| `POST /api/federation/aliases/{alias}/groups` | `federation.aliases.set-groups` | `federation:register` |
 
 Observe requires `federation:provision` rather than `federation:observe`
 because it opens an outbound connection to a third-party database. The
