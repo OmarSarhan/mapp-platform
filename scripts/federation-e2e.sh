@@ -291,7 +291,7 @@ fi
 # config-ui must be named here even when already running: compose only injects
 # FEDERATION_DBS_LEEDS_EXT into the container when the overlay is applied to
 # it, and without that Observe fails with federation.connection_ref_not_found.
-"${compose[@]}" up -d source-db config-ui >/dev/null
+"${compose[@]}" up -d --wait source-db config-ui >/dev/null
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
 
 step "Claiming the probe alias and relation"
@@ -594,7 +594,7 @@ readable="$(platform_sql "
   || fail "foreign table returned ${readable} rows, expected ${seeded}"
 printf 'derived owner reads %s rows through the foreign table\n' "${readable}"
 
-step "Cross-schema H3 aggregation: federated polygons against local data"
+step "Geometry survives the federation boundary, and H3 runs over it"
 # The source relation is a copy of the bundled one, so the federated result
 # must equal the local result exactly. That is a far stronger assertion than
 # any fixed expected number: it proves the FDW path returns the same geometry
@@ -659,6 +659,132 @@ import app
 print(app.verify_federation_sources(only='${ALIAS}'))
 " 2>/dev/null
 }
+
+step "Group labels round-trip through the real registry"
+# The only test in either repository that runs the group SQL against a real
+# database. The store tests drive MagicMock cursors, so they cannot see a
+# missing ADD COLUMN, an array operator that does not exist, or a member count
+# that counts the wrong rows -- and the migration is the one line whose
+# absence breaks every alias read, not just this feature.
+"${compose[@]}" exec -T config-ui python3 - "${ALIAS}" <<'PY'
+import datetime as dt
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from control_plane import ControlStore
+
+alias = sys.argv[1]
+base = "http://127.0.0.1:8080"
+store = ControlStore(Path(os.environ["CONTROL_DIR"]))
+expires = (
+    dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15)
+).isoformat()
+token, record = store.create_token(
+    "federation-e2e-groups",
+    expires,
+    ["federation:register", "federation:observe"],
+)
+
+
+def call(method, path, payload=None, expect=200):
+    request = urllib.request.Request(
+        base + path,
+        method=method,
+        data=None if payload is None else json.dumps(payload).encode(),
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            status, body = response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        status, body = error.code, error.read().decode()
+    parsed = json.loads(body) if body else {}
+    if status != expect:
+        raise SystemExit(
+            f"{method} {path} returned {status}, expected {expect}: {body}"
+        )
+    return parsed
+
+
+def alias_groups():
+    for item in call("GET", "/api/federation/aliases")["aliases"]:
+        if item["alias"] == alias:
+            return item.get("groups")
+    raise SystemExit(f"alias {alias} vanished from the registry")
+
+
+try:
+    # Reading the collection at all proves the ADD COLUMN ran: _SELECT_COLUMNS
+    # names groups unconditionally, so without the migration this is an
+    # UndefinedColumn 502 rather than a list.
+    if alias_groups() != []:
+        raise SystemExit("a freshly provisioned alias should carry no labels")
+
+    call(
+        "POST",
+        "/api/federation/groups",
+        {"name": "e2e_probe", "description": "End-to-end probe label."},
+        expect=201,
+    )
+    duplicate = call(
+        "POST", "/api/federation/groups", {"name": "e2e_probe"}, expect=409
+    )
+    if duplicate.get("code") != "federation.group_exists":
+        raise SystemExit(f"unexpected duplicate code: {duplicate}")
+
+    missing = call(
+        "POST",
+        f"/api/federation/aliases/{alias}/groups",
+        {"groups": ["e2e_probe", "never_defined"]},
+        expect=404,
+    )
+    if missing.get("code") != "federation.group_not_found":
+        raise SystemExit(f"unexpected missing-group code: {missing}")
+    if alias_groups() != []:
+        raise SystemExit("a refused assignment must change nothing")
+
+    call(
+        "POST",
+        f"/api/federation/aliases/{alias}/groups",
+        {"groups": ["e2e_probe"]},
+    )
+    if alias_groups() != ["e2e_probe"]:
+        raise SystemExit("the label did not survive the round trip")
+
+    groups = {
+        item["name"]: item
+        for item in call("GET", "/api/federation/groups")["groups"]
+    }
+    if groups["e2e_probe"]["memberCount"] != 1:
+        raise SystemExit(f"member count is wrong: {groups['e2e_probe']}")
+
+    deleted = call(
+        "POST", "/api/federation/groups/e2e_probe/delete", {}
+    )["group"]
+    if deleted["detachedAliases"] != [alias]:
+        raise SystemExit(f"deletion did not report the detachment: {deleted}")
+    if alias_groups() != []:
+        raise SystemExit("array_remove left the label attached")
+    print("group labels defined, assigned, counted, and detached on delete")
+finally:
+    # Best effort, because a failure between defining the group and deleting
+    # it would otherwise leave e2e_probe in the registry and the next run
+    # would fail at its own duplicate check -- the rig tripping over its own
+    # residue, which is exactly what OWNS_PROBE_RELATION exists to prevent
+    # elsewhere in this file.
+    try:
+        call("POST", "/api/federation/groups/e2e_probe/delete", {})
+    except BaseException:
+        pass
+    store.revoke_token(record["id"])
+PY
 
 step "Seeding a semantic profile bound to the probe source"
 # Registered directly rather than through the sync route, which would need
@@ -1022,123 +1148,6 @@ try:
             f"an observe resurrected a retired alias to {body['alias']['status']}"
         )
     print("still retired after observe")
-finally:
-    store.revoke_token(record["id"])
-PY
-
-step "Group labels round-trip through the real registry"
-# The only test in either repository that runs the group SQL against a real
-# database. The store tests drive MagicMock cursors, so they cannot see a
-# missing ADD COLUMN, an array operator that does not exist, or a member count
-# that counts the wrong rows -- and the migration is the one line whose
-# absence breaks every alias read, not just this feature.
-"${compose[@]}" exec -T config-ui python3 - "${ALIAS}" <<'PY'
-import datetime as dt
-import json
-import os
-import sys
-import urllib.error
-import urllib.request
-from pathlib import Path
-
-from control_plane import ControlStore
-
-alias = sys.argv[1]
-base = "http://127.0.0.1:8080"
-store = ControlStore(Path(os.environ["CONTROL_DIR"]))
-expires = (
-    dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15)
-).isoformat()
-token, record = store.create_token(
-    "federation-e2e-groups",
-    expires,
-    ["federation:register", "federation:observe"],
-)
-
-
-def call(method, path, payload=None, expect=200):
-    request = urllib.request.Request(
-        base + path,
-        method=method,
-        data=None if payload is None else json.dumps(payload).encode(),
-        headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            status, body = response.status, response.read().decode()
-    except urllib.error.HTTPError as error:
-        status, body = error.code, error.read().decode()
-    parsed = json.loads(body) if body else {}
-    if status != expect:
-        raise SystemExit(
-            f"{method} {path} returned {status}, expected {expect}: {body}"
-        )
-    return parsed
-
-
-def alias_groups():
-    for item in call("GET", "/api/federation/aliases")["aliases"]:
-        if item["alias"] == alias:
-            return item.get("groups")
-    raise SystemExit(f"alias {alias} vanished from the registry")
-
-
-try:
-    # Reading the collection at all proves the ADD COLUMN ran: _SELECT_COLUMNS
-    # names groups unconditionally, so without the migration this is an
-    # UndefinedColumn 502 rather than a list.
-    if alias_groups() != []:
-        raise SystemExit("a freshly provisioned alias should carry no labels")
-
-    call(
-        "POST",
-        "/api/federation/groups",
-        {"name": "e2e_probe", "description": "End-to-end probe label."},
-        expect=201,
-    )
-    duplicate = call(
-        "POST", "/api/federation/groups", {"name": "e2e_probe"}, expect=409
-    )
-    if duplicate.get("code") != "federation.group_exists":
-        raise SystemExit(f"unexpected duplicate code: {duplicate}")
-
-    missing = call(
-        "POST",
-        f"/api/federation/aliases/{alias}/groups",
-        {"groups": ["e2e_probe", "never_defined"]},
-        expect=404,
-    )
-    if missing.get("code") != "federation.group_not_found":
-        raise SystemExit(f"unexpected missing-group code: {missing}")
-    if alias_groups() != []:
-        raise SystemExit("a refused assignment must change nothing")
-
-    call(
-        "POST",
-        f"/api/federation/aliases/{alias}/groups",
-        {"groups": ["e2e_probe"]},
-    )
-    if alias_groups() != ["e2e_probe"]:
-        raise SystemExit("the label did not survive the round trip")
-
-    groups = {
-        item["name"]: item
-        for item in call("GET", "/api/federation/groups")["groups"]
-    }
-    if groups["e2e_probe"]["memberCount"] != 1:
-        raise SystemExit(f"member count is wrong: {groups['e2e_probe']}")
-
-    deleted = call(
-        "POST", "/api/federation/groups/e2e_probe/delete", {}
-    )["group"]
-    if deleted["detachedAliases"] != [alias]:
-        raise SystemExit(f"deletion did not report the detachment: {deleted}")
-    if alias_groups() != []:
-        raise SystemExit("array_remove left the label attached")
-    print("group labels defined, assigned, counted, and detached on delete")
 finally:
     store.revoke_token(record["id"])
 PY
