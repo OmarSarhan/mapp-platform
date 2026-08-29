@@ -42,9 +42,15 @@ XYZ must never receive `var/control`. Its readable inputs are limited to the
 live workspace and explicitly public instance assets. The configuration
 service receives only the writable paths needed for atomic workspace saves,
 control records, artifacts, and reload coordination. The semantic service now
-has no writable state at all: `var/semantic` and the `/state` mount that
-carried it are gone, its container root is read-only, and its only durable
-state is a schema in the packaged database.
+has no writable state at all: the `/state` mount that carried `var/semantic`
+is gone, its container root is read-only, and its only durable state is a
+schema in the packaged database.
+
+An installation that predates the move still has `var/semantic/semantic.sqlite3`
+on the host. Nothing reads or writes it any more and nothing removes it, but it
+holds the whole previous catalogue -- generated source facts, curated meaning,
+proposals and history -- at file permissions only. Delete it once the database
+holds what you need; it is not migrated, so confirm that first.
 
 This matters because the pinned XYZ version has a local file-provider surface
 that this deployment does not need. Caddy blocks its HTTP route as defence in
