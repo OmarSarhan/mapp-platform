@@ -480,12 +480,27 @@ class FederationAliasStore:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"{SCHEMA}:groups",),
             )
+            # Existence is resolved in the same query as the count, and
+            # answered first. Checking the ceiling alone meant that at exactly
+            # MAX_GROUPS, redefining a group that already existed reported
+            # federation.group_limit -- automation would go and delete an
+            # unrelated group to make room for one already there.
             cur.execute(
-                sql.SQL("SELECT count(*) AS count FROM {}._groups").format(
-                    sql.Identifier(SCHEMA)
-                )
+                sql.SQL(
+                    "SELECT count(*) AS count,"
+                    " count(*) FILTER (WHERE name = %s) AS taken"
+                    " FROM {}._groups"
+                ).format(sql.Identifier(SCHEMA)),
+                (definition["name"],),
             )
-            if cur.fetchone()["count"] >= MAX_GROUPS:
+            registry = cur.fetchone()
+            if registry["taken"]:
+                raise FederationSchemaError(
+                    f"Federation group {definition['name']!r} already exists.",
+                    status=HTTPStatus.CONFLICT,
+                    code="federation.group_exists",
+                )
+            if registry["count"] >= MAX_GROUPS:
                 raise FederationSchemaError(
                     f"Federation group limit ({MAX_GROUPS}) reached.",
                     status=HTTPStatus.CONFLICT,

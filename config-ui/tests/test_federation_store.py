@@ -1638,7 +1638,7 @@ class FederationGroupTests(unittest.TestCase):
         # FileExistsError would reach app.py's generic handler, which answers
         # 409 with no code, and the CLI branches on the code.
         cursor = MagicMock()
-        cursor.fetchone.side_effect = [{"count": 1}, None]
+        cursor.fetchone.side_effect = [{"count": 1, "taken": 1}]
         store = self.store_with_cursor(cursor)
 
         with self.assertRaises(FederationSchemaError) as error:
@@ -1649,13 +1649,29 @@ class FederationGroupTests(unittest.TestCase):
 
     def test_the_registry_wide_group_limit_is_enforced(self):
         cursor = MagicMock()
-        cursor.fetchone.side_effect = [{"count": MAX_GROUPS}]
+        cursor.fetchone.side_effect = [{"count": MAX_GROUPS, "taken": 0}]
         store = self.store_with_cursor(cursor)
 
         with self.assertRaises(FederationSchemaError) as error:
             store.define_group({"name": "leeds"}, "admin")
 
         self.assertEqual("federation.group_limit", error.exception.code)
+
+    def test_a_full_registry_still_reports_a_duplicate_as_a_duplicate(self):
+        """At exactly the ceiling, both conditions hold and only one is useful.
+
+        Reporting federation.group_limit for a group that already exists sends
+        automation off to delete an unrelated group to make room for one that
+        is already there.
+        """
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [{"count": MAX_GROUPS, "taken": 1}]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as error:
+            store.define_group({"name": "leeds"}, "admin")
+
+        self.assertEqual("federation.group_exists", error.exception.code)
 
     def test_assigning_an_undefined_group_names_it_and_refuses(self):
         """Define-before-assign, because an array cannot carry a foreign key.

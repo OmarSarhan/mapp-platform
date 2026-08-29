@@ -7,7 +7,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psycopg
+from federation_schema import (
+    ALIAS_PATTERN,
+    MAX_GROUPS_PER_ALIAS,
+    MAX_GROUP_DESCRIPTION,
+    FederationSchemaError,
+    validate_group_definition,
+)
 from control_api import (
+    ACTION_SCHEMAS,
     CollectionPaginationError,
     RULES,
     VisualPlanningDatabaseError,
@@ -1680,3 +1688,53 @@ class ControlApiTests(unittest.TestCase):
         self.assertIsNone(
             raised.exception.effective_dataset["representativeFeature"]
         )
+
+
+class FederationGroupSchemaParityTests(unittest.TestCase):
+    """The advertised schema must refuse what the validator refuses.
+
+    A schema-driven client reads inputSchema to decide whether a request is
+    worth sending. When the advertised shape is looser than the runtime
+    validator, that client approves requests the server then refuses
+    deterministically -- the API stays secure and the client stays wrong.
+    """
+
+    @staticmethod
+    def rejected_by_validator(payload):
+        try:
+            validate_group_definition(payload)
+        except FederationSchemaError:
+            return True
+        return False
+
+    def test_the_name_grammar_and_bounds_are_advertised(self):
+        schema = ACTION_SCHEMAS["federation.groups.define"]["inputSchema"]
+
+        self.assertEqual(
+            ALIAS_PATTERN, schema["properties"]["name"]["pattern"]
+        )
+        self.assertEqual(
+            MAX_GROUP_DESCRIPTION,
+            schema["properties"]["description"]["maxLength"],
+        )
+        # Each of these is refused at runtime, so each must be refusable from
+        # the advertised schema alone.
+        for payload in (
+            {"name": "has-a-hyphen"},
+            {"name": "1leading_digit"},
+            {"name": "a" * 57},
+            {"name": "leeds", "description": ""},
+            {"name": "leeds", "description": "x" * 201},
+        ):
+            with self.subTest(payload=payload):
+                self.assertTrue(self.rejected_by_validator(payload))
+
+    def test_membership_bounds_and_uniqueness_are_advertised(self):
+        schema = ACTION_SCHEMAS["federation.aliases.set-groups"]["inputSchema"]
+        membership = schema["properties"]["groups"]
+
+        self.assertEqual(ALIAS_PATTERN, membership["items"]["pattern"])
+        self.assertEqual(MAX_GROUPS_PER_ALIAS, membership["maxItems"])
+        self.assertTrue(membership["uniqueItems"])
+        # An empty set is valid: it is how a source's labels are cleared.
+        self.assertNotIn("minItems", membership)

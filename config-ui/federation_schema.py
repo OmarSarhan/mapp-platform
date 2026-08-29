@@ -25,7 +25,11 @@ from relation_identity import IDENTIFIER_PART_RE, parse_relation
 # derived_layers.py's IDENTIFIER_PART_RE) — those already reject hyphens,
 # so an alias containing one could register and provision but never be
 # synced into the semantic catalog or used as a derived-layer source.
-ALIAS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,55}$")
+ALIAS_PATTERN = r"^[A-Za-z][A-Za-z0-9_]{0,55}$"
+ALIAS_RE = re.compile(ALIAS_PATTERN)
+# The grammar's own bound, published so the advertised contract schema can
+# mirror the validator instead of restating it.
+MAX_ALIAS_NAME = 56
 
 ALIAS_KINDS = frozenset({"postgresql"})
 ALIAS_STATUSES = frozenset({"pending", "active", "unavailable", "retired"})

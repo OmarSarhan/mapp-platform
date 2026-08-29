@@ -20,6 +20,12 @@ from typing import Any
 from urllib.parse import unquote
 
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
+from federation_schema import (
+    ALIAS_PATTERN as GROUP_NAME_PATTERN,
+    MAX_ALIAS_NAME as MAX_GROUP_NAME,
+    MAX_GROUPS_PER_ALIAS,
+    MAX_GROUP_DESCRIPTION,
+)
 from relation_identity import parse_relation
 from workspace_schema import expression_error
 
@@ -1683,8 +1689,20 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "required": ["name"],
             "properties": {
-                "name": {"type": "string"},
-                "description": {"type": ["string", "null"]},
+                # Mirrors validate_group_name and _bounded_text in
+                # federation_schema. A looser advertised schema lets a
+                # schema-driven client approve a request the server then
+                # refuses deterministically.
+                "name": {
+                    "type": "string",
+                    "pattern": GROUP_NAME_PATTERN,
+                    "maxLength": MAX_GROUP_NAME,
+                },
+                "description": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": MAX_GROUP_DESCRIPTION,
+                },
             },
             "additionalProperties": False,
         },
@@ -1708,7 +1726,20 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "required": ["groups"],
             "properties": {
-                "groups": {"type": "array", "items": {"type": "string"}},
+                # Mirrors _normalized_group_membership: named groups follow
+                # the same grammar, repeats are refused rather than absorbed,
+                # and the set is bounded. An empty array is valid and is how a
+                # source's labels are cleared.
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "pattern": GROUP_NAME_PATTERN,
+                        "maxLength": MAX_GROUP_NAME,
+                    },
+                    "maxItems": MAX_GROUPS_PER_ALIAS,
+                    "uniqueItems": True,
+                },
             },
             "additionalProperties": False,
         },
