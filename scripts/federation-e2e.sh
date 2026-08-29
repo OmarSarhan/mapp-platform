@@ -71,6 +71,15 @@ compose=(
   --file "${ROOT_DIR}/compose.bundled-db.yaml"
   --file "${ROOT_DIR}/compose.federation-test.yaml"
 )
+# Naming one opt-in overlay drops the other's FEDERATION_DBS_* from config-ui,
+# so on a demo deployment this harness would recreate the service without the
+# demo credentials and the startup verification pass would withdraw consumer
+# access from both demo sources. The guard below catches that and refuses; it
+# is more useful to compose the overlays than to be unrunnable wherever the
+# demo is on.
+if [[ -n "$(dotenv_value MAPP_DEMO_SOURCES)" ]]; then
+  compose+=(--file "${ROOT_DIR}/compose.federated-demo.yaml")
+fi
 
 POSTGRES_USER="$(dotenv_value POSTGRES_USER)"
 POSTGRES_DB="$(dotenv_value POSTGRES_DB)"
