@@ -52,6 +52,38 @@ class CheckEnvironmentTests(unittest.TestCase):
         # And nothing after the boundary may build, or the guarantee is void.
         self.assertNotIn("--build", reset[removal:])
 
+    def test_init_demo_refuses_a_production_environment(self):
+        """init runs ahead of the production environment gate.
+
+        validate_production_env refuses a non-empty MAPP_DEMO_SOURCES, and
+        that gate runs for every wrapper command -- so writing one into a
+        production .env left a deployment where down, ps and logs all failed
+        until the file was hand-edited back. The initializer's own stated goal
+        is that a demo opt-in cannot brick teardown.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / ".env"
+            environment.write_text(
+                (ROOT / ".env.example").read_text(encoding="utf-8")
+                .replace("MAPP_ENVIRONMENT=development", "MAPP_ENVIRONMENT=production"),
+                encoding="utf-8",
+            )
+            before = environment.read_text(encoding="utf-8")
+            process_environment = os.environ.copy()
+            process_environment["MAPP_ENV_FILE"] = str(environment)
+
+            result = subprocess.run(
+                [ROOT / "bin/mapp", "init", "--demo"],
+                capture_output=True,
+                text=True,
+                env=process_environment,
+            )
+
+            self.assertEqual(2, result.returncode, result.stderr)
+            self.assertIn("production", result.stderr)
+            # Refused before anything is written, not rolled back after.
+            self.assertEqual(before, environment.read_text(encoding="utf-8"))
+
     def test_every_documented_wrapper_command_exists(self):
         """Copy-pasteable commands must be commands.
 

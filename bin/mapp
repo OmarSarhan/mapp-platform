@@ -272,6 +272,17 @@ init_state() {
 enable_demo_sources() {
   local key
   local -a missing=()
+  # Refused before anything is written. init runs ahead of the production
+  # environment gate below, and validate_production_env refuses a non-empty
+  # MAPP_DEMO_SOURCES -- so writing one here would leave a production
+  # deployment where every wrapper command, teardown and log reading
+  # included, fails until somebody hand-edits the file back.
+  if [[ "$(dotenv_value MAPP_ENVIRONMENT)" == "production" ]]; then
+    printf 'Refusing to enable demo sources: %s is a production environment.\n' \
+      "${ENV_FILE}" >&2
+    printf 'The demo stands up throwaway self-signed source databases; production refuses them.\n' >&2
+    exit 2
+  fi
   for key in \
     CENSUS_POSTGRES_DB CENSUS_POSTGRES_PASSWORD \
     OPS_POSTGRES_DB OPS_POSTGRES_PASSWORD \

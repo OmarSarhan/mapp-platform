@@ -17,6 +17,70 @@ from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
 
+class FederationHostDiagnosticRouteTests(unittest.TestCase):
+    """An unusable registry must still be able to say why."""
+
+    @staticmethod
+    def handler():
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/federation/aliases"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "admin"
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_a_failed_registry_read_still_reports_host_capability(self):
+        """The capability object is the diagnostic for this exact failure.
+
+        The registry living in a schema the provisioner can no longer use is
+        one of the ways host capability is lost, and it makes the alias read
+        raise. Answering with a bare "registry unavailable" leaves the caller
+        no way to learn which capability went missing -- and the host object
+        was previously only built after the read that fails.
+        """
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.side_effect = psycopg.errors.InvalidSchemaName(
+            "schema federation does not exist"
+        )
+        federation.host_capability.return_value = {
+            "federationReady": False,
+            "registrySchemaPresent": False,
+            "fdwInstalled": True,
+        }
+        handler, responses = self.handler()
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+        self.assertFalse(body["host"]["registrySchemaPresent"])
+
+    def test_a_host_that_cannot_answer_either_still_refuses_cleanly(self):
+        import psycopg
+
+        federation = MagicMock()
+        federation.list.side_effect = psycopg.OperationalError("no server")
+        federation.host_capability.side_effect = psycopg.OperationalError(
+            "no server"
+        )
+        handler, responses = self.handler()
+
+        with patch.object(app, "FEDERATION", federation):
+            handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("federation.registry_unavailable", body["code"])
+        self.assertNotIn("host", body)
+
+
 class FederationGroupRouteTests(unittest.TestCase):
     """The three group routes. A group is a label: nothing here connects to a
     source database or changes a privilege, so the failure modes are the

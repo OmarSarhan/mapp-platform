@@ -1588,7 +1588,13 @@ class FederationAliasStoreTests(unittest.TestCase):
         self.assertIn("has_database_privilege", statement)
 
     def test_host_capability_is_not_ready_when_any_requirement_is_missing(self):
-        for missing in ("fdwInstalled", "canUseFdw", "canCreateSchemas"):
+        for missing in (
+            "fdwInstalled",
+            "canUseFdw",
+            "canCreateSchemas",
+            "registrySchemaPresent",
+            "canUseRegistrySchema",
+        ):
             with self.subTest(missing=missing):
                 cursor = MagicMock()
                 row = {
@@ -1607,9 +1613,13 @@ class FederationAliasStoreTests(unittest.TestCase):
 
                 self.assertFalse(capability["federationReady"])
 
-    def test_host_capability_ignores_an_absent_registry_schema(self):
-        """provision() creates the registry schema on demand, so its absence
-        is a first-run state rather than a capability the host has lost.
+    def test_an_absent_registry_schema_is_not_a_ready_host(self):
+        """This used to report ready, on the grounds that provision() creates
+        the registry on demand. It does not: provision() creates the per-alias
+        source_<alias> schemas, and the registry schema is created once by
+        docker/postgis/init/10-roles.sh. An absent or unwritable registry is a
+        lost capability, and reporting ready sends an agent -- the CLI tells it
+        to read this field -- into work that cannot succeed.
         """
         cursor = MagicMock()
         cursor.fetchone.return_value = {
@@ -1624,7 +1634,10 @@ class FederationAliasStoreTests(unittest.TestCase):
 
         capability = self.store_with_cursor(cursor).host_capability()
 
-        self.assertTrue(capability["federationReady"])
+        self.assertFalse(capability["federationReady"])
+        # The individual bits stay, so a caller can still see which one it is.
+        self.assertFalse(capability["registrySchemaPresent"])
+        self.assertTrue(capability["fdwInstalled"])
 
 
 class FederationGroupTests(unittest.TestCase):

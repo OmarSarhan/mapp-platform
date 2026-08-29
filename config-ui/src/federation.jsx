@@ -32,26 +32,68 @@ const ACKNOWLEDGEMENTS = [
 // SEMANTIC_SOURCE_ALLOWLIST separately permits their column metadata to be
 // profiled. It is invisible until something refuses, which is what made it
 // feel like a bug, so the panel states it.
+// Twenty pages of 100. Large enough for any catalogue this panel is used
+// against, small enough that a runaway cursor cannot spin the dashboard.
+const CATALOG_PAGE_BUDGET = 20;
+
 export function semanticCoverage(alias, assets) {
-  if (!alias || !Array.isArray(assets)) return null;
+  if (!alias) return null;
   const wanted = (alias.allowedRelations || []).map(relation => {
     const bare = String(relation).split('.').slice(-1)[0];
     return `source_${alias.alias}.${bare}`;
   });
   if (!wanted.length) return null;
-  const ready = new Set(
+  // A catalog that could not be read is unknown, not uncovered. Returning
+  // nothing here made the whole row vanish, which reads as "no coverage
+  // problem" -- the opposite of what a failed read means.
+  if (!Array.isArray(assets)) {
+    return {total: wanted.length, unknown: true, missing: [], profiled: 0};
+  }
+  const byName = new Map(
     assets
-      .filter(asset => asset && asset.status === 'ready')
-      .map(asset => (asset.generated || {}).qualifiedName)
-      .filter(Boolean),
+      .filter(asset => asset && (asset.generated || {}).qualifiedName)
+      .map(asset => [asset.generated.qualifiedName, asset]),
   );
-  const missing = wanted.filter(name => !ready.has(name));
+  // sourceState is what require_semantic_derived_sources checks: a ready
+  // profile whose source is not currently usable is refused at planning time,
+  // so counting it as covered here promises something the platform declines.
+  const usable = name => {
+    const asset = byName.get(name);
+    return !!asset && asset.status === 'ready' && !asset.sourceState;
+  };
+  const missing = wanted.filter(name => !usable(name));
   return {
     total: wanted.length,
     profiled: wanted.length - missing.length,
     missing,
     selector: `MAPP:source_${alias.alias}.*`,
+    // The remedy differs by reason, and guessing one remedy for all of them
+    // sends an operator to edit an allowlist that already names the relation.
+    reasons: missing.map(name => {
+      const asset = byName.get(name);
+      if (!asset) return {name, reason: 'unprofiled'};
+      if (asset.sourceState) return {name, reason: 'source-unavailable'};
+      return {name, reason: 'not-ready', status: asset.status};
+    }),
   };
+}
+
+export function semanticRemedy(coverage) {
+  const reasons = coverage.reasons || [];
+  if (reasons.some(item => item.reason === 'source-unavailable')) {
+    return 'At least one profile exists but its source is not currently '
+      + 'reachable, so planning refuses it. Nothing to configure: it returns '
+      + 'when the source does.';
+  }
+  if (reasons.some(item => item.reason === 'not-ready')) {
+    return 'At least one profile exists but is not ready. Sync the source '
+      + 'again and check the semantic panel for its state.';
+  }
+  return 'Registering exposes a relation; profiling its columns is a separate '
+    + `permission. If ${coverage.selector} is not already in `
+    + 'SEMANTIC_SOURCE_ALLOWLIST, add it and recreate the configuration '
+    + 'service -- an environment change needs a new container, not a restart '
+    + '-- then sync the source.';
 }
 
 export function evidenceState(alias) {
@@ -153,12 +195,13 @@ function Evidence({alias, coverage}) {
     {coverage && <>
       <dt>Semantics</dt>
       <dd>
-        {coverage.profiled === coverage.total
-          ? `All ${coverage.total} exposed relation(s) profiled.`
-          : `${coverage.profiled} of ${coverage.total} exposed relation(s) profiled. `
-            + 'Registering exposes a relation; profiling its columns is a separate '
-            + `permission. Add ${coverage.selector} to SEMANTIC_SOURCE_ALLOWLIST, `
-            + 'restart the configuration service, then sync the source.'}
+        {coverage.unknown
+          ? 'Coverage unknown: the semantic catalog could not be read.'
+          : coverage.profiled === coverage.total
+            ? `All ${coverage.total} exposed relation(s) profiled.`
+            : `${coverage.profiled} of ${coverage.total} exposed relation(s) `
+              + 'usable as derived-layer sources. '
+              + semanticRemedy(coverage)}
       </dd>
     </>}
   </dl>;
@@ -196,8 +239,30 @@ export function FederatedSources({api, close}) {
     load('');
     // Best effort: an operator without semantic:inspect, or a semantic service
     // that is down, still gets the federation panel.
-    api('/api/semantic/catalog')
-      .then(result => setAssets(result.assets || []))
+    // Paginated, because the semantic service refuses an unpaginated
+    // collection over 100 items. Asking for the whole catalog meant that on
+    // any deployment past that size the request failed and coverage silently
+    // became unknown -- exactly where an operator most needs it.
+    (async () => {
+      const collected = [];
+      let cursor = '';
+      for (let page = 0; page < CATALOG_PAGE_BUDGET; page += 1) {
+        const query = cursor
+          ? `?limit=100&cursor=${encodeURIComponent(cursor)}`
+          : '?limit=100';
+        // eslint-disable-next-line no-await-in-loop
+        const result = await api(`/api/semantic/catalog${query}`);
+        collected.push(...(result.assets || []));
+        cursor = (result.pagination || {}).nextCursor || '';
+        if (!cursor) return collected;
+      }
+      // A catalog past the budget is not an answer about coverage, so say so
+      // rather than reporting the prefix as if it were the whole thing.
+      throw new Error('semantic catalog exceeds this panel\u2019s page budget');
+    })()
+      .then(setAssets)
+      // Best effort: an operator without semantic:inspect, or a semantic
+      // service that is down, still gets the federation panel.
       .catch(() => setAssets(null));
   }, []);
 

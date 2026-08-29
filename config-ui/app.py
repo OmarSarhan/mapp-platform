@@ -6432,6 +6432,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "Federation alias registry is not configured.",
                         code="federation.not_configured",
                     )
+                # Host capability first, because it is the diagnostic for
+                # the read below failing. The registry living in a schema this
+                # role can no longer use makes FEDERATION.list() raise, and
+                # answering with a bare "registry unavailable" leaves the
+                # caller no way to learn which capability went missing.
+                host = FEDERATION.host_capability()
                 aliases = FEDERATION.list()
                 if len(aliases) > MAX_ALIASES:
                     raise FederationSchemaError(
@@ -6447,7 +6453,7 @@ class Handler(SimpleHTTPRequestHandler):
                 # the cause.
                 self._json(HTTPStatus.OK, {
                     "aliases": aliases,
-                    "host": FEDERATION.host_capability(),
+                    "host": host,
                 })
             except FederationSchemaError as exc:
                 # FederationSchemaError subclasses ValueError, so this must
@@ -6461,14 +6467,19 @@ class Handler(SimpleHTTPRequestHandler):
                 # never become available and lose the actionable code.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
             except psycopg.Error as exc:
-                self._json(
-                    HTTPStatus.BAD_GATEWAY,
-                    {
-                        "error": "The federation alias registry is unavailable.",
-                        "code": "federation.registry_unavailable",
-                        "detail": str(exc),
-                    },
-                )
+                unavailable = {
+                    "error": "The federation alias registry is unavailable.",
+                    "code": "federation.registry_unavailable",
+                    "detail": str(exc),
+                }
+                # Best effort: if the host is reachable enough to answer, the
+                # capability object names what is missing. If it is not, the
+                # bare refusal above is the whole story anyway.
+                try:
+                    unavailable["host"] = FEDERATION.host_capability()
+                except psycopg.Error:
+                    pass
+                self._json(HTTPStatus.BAD_GATEWAY, unavailable)
         elif path == "/api/federation/groups":
             try:
                 if not FEDERATION:

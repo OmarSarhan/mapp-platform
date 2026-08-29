@@ -479,8 +479,8 @@ def host_capability(cursor: Any, registry_schema: str) -> dict[str, Any]:
     imports this module, so taking its SCHEMA constant back would be a
     circular import.
 
-    All four are properties of the host, not of any alias, and every one can be
-    revoked without touching MAPP: the extension dropped, the wrapper grant
+    All of them are properties of the host, not of any alias, and every one can
+    be revoked without touching MAPP: the extension dropped, the wrapper grant
     removed, CREATE revoked on the database, or the registry schema taken over.
 
     Guarded rather than direct: has_foreign_data_wrapper_privilege raises
@@ -520,13 +520,21 @@ def host_capability(cursor: Any, registry_schema: str) -> dict[str, Any]:
           current_user::text AS "role"
     """, (registry_schema, registry_schema))
     capability = dict(cursor.fetchone())
-    # A host missing any of the first three cannot attach a source at all.
-    # The registry schema is excluded: provision() creates it on demand, so
-    # its absence is a first-run state rather than a lost capability.
+    # All five, because a host missing any of them cannot attach a source.
+    # The registry was excluded on the grounds that provision() creates it on
+    # demand. It does not: provision() creates the per-alias source_<alias>
+    # schemas, and the registry schema itself is created once by
+    # docker/postgis/init/10-roles.sh. So an absent or unwritable registry is
+    # a lost capability, not a first-run state, and reporting ready while the
+    # registry cannot be read tells an agent to go ahead with work that will
+    # fail. The individual bits stay in the payload so a caller can still tell
+    # which one is missing.
     capability["federationReady"] = bool(
         capability["fdwInstalled"]
         and capability["canUseFdw"]
         and capability["canCreateSchemas"]
+        and capability["registrySchemaPresent"]
+        and capability["canUseRegistrySchema"]
     )
     return capability
 

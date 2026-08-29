@@ -14,6 +14,7 @@ import {
   evidenceState,
   expectedStatus,
   semanticCoverage,
+  semanticRemedy,
 } from './federation.jsx';
 
 const active = {
@@ -98,8 +99,50 @@ describe('semanticCoverage', () => {
     });
   });
 
-  test('is absent when the catalog could not be read', () => {
-    expect(semanticCoverage(alias, null)).toBeNull();
+  test('an unreadable catalog is unknown, not uncovered', () => {
+    // Returning null made the whole row vanish, which reads as "no coverage
+    // problem" -- the opposite of what a failed read means.
+    expect(semanticCoverage(alias, null)).toMatchObject({
+      total: 2, unknown: true,
+    });
+  });
+
+  test('a ready profile whose source is unavailable does not count', () => {
+    // require_semantic_derived_sources skips exactly these, so counting one
+    // as covered promises a derived layer the planner then refuses.
+    const assets = [
+      {status: 'ready', generated: {qualifiedName: 'source_census.a'}},
+      {
+        status: 'ready',
+        sourceState: 'unavailable',
+        generated: {qualifiedName: 'source_census.b'},
+      },
+    ];
+    expect(semanticCoverage(alias, assets)).toMatchObject({
+      total: 2, profiled: 1, missing: ['source_census.b'],
+    });
+  });
+
+  test('the remedy names the reason rather than always the allowlist', () => {
+    const unavailable = semanticCoverage(alias, [
+      {status: 'ready', generated: {qualifiedName: 'source_census.a'}},
+      {
+        status: 'ready',
+        sourceState: 'unavailable',
+        generated: {qualifiedName: 'source_census.b'},
+      },
+    ]);
+    expect(semanticRemedy(unavailable)).toMatch(/not currently reachable/);
+    expect(semanticRemedy(unavailable)).not.toMatch(/ALLOWLIST/);
+
+    const unprofiled = semanticCoverage(alias, [
+      {status: 'ready', generated: {qualifiedName: 'source_census.a'}},
+    ]);
+    // An environment change needs a new container, so the old instruction to
+    // restart the service was not enough to make the change take effect.
+    expect(semanticRemedy(unprofiled)).toMatch(/recreate the configuration/);
+    expect(semanticRemedy(unprofiled))
+      .not.toMatch(/restart the configuration service,/);
   });
 });
 
