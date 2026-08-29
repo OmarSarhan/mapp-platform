@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,13 +21,55 @@ from database_fixture import (  # noqa: E402
     requires_database,
     reset_schema,
 )
-from semantic_store import SemanticError, SemanticStore  # noqa: E402
+from semantic_store import (  # noqa: E402
+    MAX_CONCURRENT_CONNECTIONS,
+    SemanticError,
+    SemanticStore,
+)
 
 
 @requires_database
 class SemanticStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = fresh_store()
+
+    def test_concurrent_reads_queue_instead_of_exhausting_the_role(self) -> None:
+        """Both semantic roles hold CONNECTION LIMIT 4.
+
+        The server is a ThreadingHTTPServer that opens one connection per
+        request with no pool, so before the store bounded itself the fifth
+        concurrent read was refused by PostgreSQL with "too many connections
+        for role" and surfaced as an HTTP 500. Eight parallel healthchecks
+        were enough to trigger it, and one supported dashboard action fans out
+        to 25. Twelve overlapping readers here must all complete.
+        """
+        readers = 12
+        start = threading.Barrier(readers)
+        failures: list[BaseException] = []
+
+        def read_once() -> None:
+            try:
+                start.wait(timeout=30)
+                with self.store.read_snapshot() as (connection, revision):
+                    self.assertIsInstance(revision, int)
+                    # Hold the slot long enough that the readers genuinely
+                    # overlap; fast local queries would otherwise serialise
+                    # and the test would pass without the bound.
+                    connection.execute("SELECT pg_sleep(0.05)")
+            except BaseException as error:  # noqa: BLE001 - reported below
+                failures.append(error)
+
+        threads = [threading.Thread(target=read_once) for _ in range(readers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual([], [repr(error) for error in failures])
+        self.assertFalse(
+            [thread for thread in threads if thread.is_alive()],
+            "a reader never finished, so the gate is not releasing its slot",
+        )
 
     @contextmanager
     def hide_asset_before_write_transaction(self, asset_id: str):

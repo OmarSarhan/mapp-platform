@@ -277,6 +277,49 @@ class DatabaseAccessContractTests(unittest.TestCase):
                         "conflicts with the authoritative value", result.stderr
                     )
 
+    def test_the_semantic_store_stays_under_its_role_connection_limit(self) -> None:
+        """The store's own gate must sit below the DDL's CONNECTION LIMIT.
+
+        These two numbers live in different repositories-worth of file and are
+        only correct together. The service is a ThreadingHTTPServer opening one
+        connection per request with no pool, so if the gate is ever raised
+        above the role limit -- or the role limit lowered beneath it -- the
+        excess requests are refused by PostgreSQL with "too many connections
+        for role" and surface as HTTP 500s. Eight parallel healthchecks were
+        enough to reproduce that before the gate existed.
+
+        The semantic-service suite cannot catch this: its scratch database
+        connects as an unrestricted role, so the limit is not in play there.
+        """
+        roles = (ROOT / "docker/postgis/init/10-roles.sh").read_text(
+            encoding="utf-8"
+        )
+        store = (ROOT / "semantic-service/semantic_store.py").read_text(
+            encoding="utf-8"
+        )
+
+        limits = {
+            int(value)
+            for value in re.findall(
+                r'ALTER ROLE :"semantic(?:_reader)?_db_user" '
+                r"CONNECTION LIMIT (\d+);",
+                roles,
+            )
+        }
+        self.assertEqual(
+            2, len(re.findall(r'semantic(?:_reader)?_db_user" CONNECTION LIMIT', roles)),
+            "expected a connection limit on both semantic roles",
+        )
+        gate = re.search(r"^MAX_CONCURRENT_CONNECTIONS = (\d+)$", store, re.M)
+        self.assertIsNotNone(gate, "the store declares no connection gate")
+
+        self.assertTrue(limits, "no semantic CONNECTION LIMIT found")
+        self.assertLess(
+            int(gate.group(1)),
+            min(limits),
+            "the store may open more connections than its role allows",
+        )
+
     def test_new_database_reader_has_only_table_select_defaults(self) -> None:
         source = (
             ROOT / "docker/postgis/init/10-roles.sh"

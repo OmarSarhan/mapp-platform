@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import re
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -35,6 +36,16 @@ _MISSING = object()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 SCHEMA = "semantic"
+
+# Both semantic roles are created with CONNECTION LIMIT 4 in
+# docker/postgis/init/10-roles.sh, and the server is a ThreadingHTTPServer that
+# opens one connection per request with no pool. Without this the fifth
+# concurrent request -- reachable from a single supported dashboard action, and
+# from eight parallel healthchecks -- is refused by PostgreSQL with "too many
+# connections for role" and surfaces as an HTTP 500. Requests queue here
+# instead. One slot below the role limit is left free deliberately, so an
+# operator can still psql in as the role while the service is saturated.
+MAX_CONCURRENT_CONNECTIONS = 3
 # One name for the store-wide advisory lock that stands in for SQLite's
 # BEGIN IMMEDIATE.  Every writer that publishes a new catalog revision takes
 # it first, so those writers never interleave and can never acquire the
@@ -128,6 +139,15 @@ class SemanticStore:
         self.database_url = database_url
         self.reader_database_url = reader_database_url
         self.clock = clock
+        # One gate per role rather than one shared gate: a request holds a
+        # single connection at a time, so separate gates cannot deadlock
+        # against each other, and a saturated reader never blocks a write.
+        self._writer_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_CONNECTIONS
+        )
+        self._reader_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_CONNECTIONS
+        )
         self._migrate()
 
     @staticmethod
@@ -159,11 +179,8 @@ class SemanticStore:
     @contextmanager
     def _connection(self) -> Iterator[StoreConnection]:
         """Connect as the role allowed to write the semantic schema."""
-        connection = self._open(self.database_url)
-        try:
+        with self._slot(self._writer_slots, self.database_url) as connection:
             yield connection
-        finally:
-            connection.close()
 
     @contextmanager
     def _reader_connection(self) -> Iterator[StoreConnection]:
@@ -172,11 +189,29 @@ class SemanticStore:
         Reads use their own login role so that a mistake on a read path is
         refused by PostgreSQL rather than only by this module.
         """
-        connection = self._open(self.reader_database_url)
+        with self._slot(self._reader_slots, self.reader_database_url) as connection:
+            yield connection
+
+    @contextmanager
+    def _slot(
+        self,
+        slots: threading.BoundedSemaphore,
+        database_url: str,
+    ) -> Iterator[StoreConnection]:
+        """Hold one of the role's connection slots for the whole session."""
+        slots.acquire()
+        try:
+            connection = self._open(database_url)
+        except BaseException:
+            slots.release()
+            raise
         try:
             yield connection
         finally:
-            connection.close()
+            try:
+                connection.close()
+            finally:
+                slots.release()
 
     @staticmethod
     def _lock_store(connection: StoreConnection) -> None:
