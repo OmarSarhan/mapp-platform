@@ -44,6 +44,12 @@ MAX_DISPLAY_NAME = 200
 MAX_CONNECTION_REF = 200
 MAX_DATA_HANDLING_CLASSIFICATION = 2000
 MAX_ALLOWED_RELATIONS = 100
+
+# A source may carry a handful of labels; ten is generous for a fact that
+# grants nothing. MAX_GROUP_DESCRIPTION matches MAX_DISPLAY_NAME above --
+# both bound a short human sentence in a payload.
+MAX_GROUPS_PER_ALIAS = 10
+MAX_GROUP_DESCRIPTION = 200
 MAX_IDENTIFIER_PART = 63
 MAX_SOURCE_VERSION = 200
 
@@ -118,6 +124,79 @@ def validate_alias(value: Any) -> str:
             "numbers, or underscores (56 characters max)."
         )
     return value
+
+
+def validate_group_name(value: Any) -> str:
+    """Validate a federation group label.
+
+    Reuses ALIAS_RE unmodified. The 56-character bound is inherited rather
+    than derived: an alias is bounded because it becomes a source_<alias>
+    schema and "source_" spends 7 of PostgreSQL's 63 bytes, whereas a group
+    name becomes no database identifier at all. One grammar, because the name
+    is a URL path segment and the route patterns reuse this body verbatim --
+    a second grammar would let the regex and the validator drift.
+
+    Case-sensitive, matching alias handling: "leeds" and "Leeds" are distinct.
+    """
+    if not isinstance(value, str) or not ALIAS_RE.fullmatch(value):
+        raise FederationSchemaError(
+            "group name must start with a letter and contain only letters, "
+            "numbers, or underscores (56 characters max)."
+        )
+    return value
+
+
+def _normalized_group_membership(value: Any) -> tuple[str, ...]:
+    """Normalise an alias's whole label set.
+
+    Unlike allowedRelations this may be empty -- an empty label set is the
+    normal state and the only way to clear one. Duplicates are refused rather
+    than absorbed: repeating a name is an operator mistake worth surfacing.
+    Sorted at write, so the stored array renders and compares deterministically.
+    """
+    if not isinstance(value, list) or isinstance(value, (str, bytes)):
+        raise FederationSchemaError("groups must be a list of group names.")
+    if len(value) > MAX_GROUPS_PER_ALIAS:
+        raise FederationSchemaError(
+            f"groups must name at most {MAX_GROUPS_PER_ALIAS} groups."
+        )
+    names = [validate_group_name(item) for item in value]
+    if len(set(names)) != len(names):
+        raise FederationSchemaError("groups must not repeat a group name.")
+    return tuple(sorted(names))
+
+
+def validate_group_membership(payload: Any) -> tuple[str, ...]:
+    fields = _closed_object(
+        payload,
+        label="Group membership",
+        required=frozenset({"groups"}),
+    )
+    return _normalized_group_membership(fields["groups"])
+
+
+def validate_group_definition(payload: Any) -> dict[str, Any]:
+    fields = _closed_object(
+        payload,
+        label="Group definition",
+        required=frozenset({"name"}),
+        optional=frozenset({"description"}),
+    )
+    description = fields.get("description")
+    return {
+        "name": validate_group_name(fields["name"]),
+        # None is stored as SQL NULL; "" is a 400 rather than a silent NULL,
+        # because _bounded_text rejects empty and whitespace-only text.
+        "description": (
+            None
+            if description is None
+            else _bounded_text(
+                description,
+                label="description",
+                maximum=MAX_GROUP_DESCRIPTION,
+            )
+        ),
+    }
 
 
 def _normalized_allowed_relations(value: Any) -> tuple[str, ...]:

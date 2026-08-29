@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import psycopg
 
 from federation_schema import FederationSchemaError, validate_alias
-from federation_store import FederationAliasStore, MAX_ALIASES
+from federation_store import (
+    FederationAliasStore,
+    MAX_ALIASES,
+    MAX_GROUPS,
+)
 
 
 OBSERVATION_ID = 41
@@ -1621,6 +1625,70 @@ class FederationAliasStoreTests(unittest.TestCase):
         capability = self.store_with_cursor(cursor).host_capability()
 
         self.assertTrue(capability["federationReady"])
+
+
+class FederationGroupTests(unittest.TestCase):
+    """Group labels: metadata that grants, revokes and enforces nothing."""
+
+    store_with_cursor = staticmethod(
+        FederationAliasStoreTests.store_with_cursor
+    )
+
+    def test_defining_a_group_that_exists_is_a_coded_conflict(self):
+        # FileExistsError would reach app.py's generic handler, which answers
+        # 409 with no code, and the CLI branches on the code.
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [{"count": 1}, None]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as error:
+            store.define_group({"name": "leeds"}, "admin")
+
+        self.assertEqual("federation.group_exists", error.exception.code)
+        self.assertEqual(HTTPStatus.CONFLICT, error.exception.status)
+
+    def test_the_registry_wide_group_limit_is_enforced(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [{"count": MAX_GROUPS}]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as error:
+            store.define_group({"name": "leeds"}, "admin")
+
+        self.assertEqual("federation.group_limit", error.exception.code)
+
+    def test_assigning_an_undefined_group_names_it_and_refuses(self):
+        """Define-before-assign, because an array cannot carry a foreign key.
+
+        Silently accepting an undefined name would leave a label nothing can
+        list, which is the one way a metadata-only feature can still lie.
+        """
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{"name": "leeds"}]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as error:
+            store.set_alias_groups("census", ("leeds", "typo"))
+
+        self.assertEqual("federation.group_not_found", error.exception.code)
+        self.assertIn("typo", str(error.exception))
+
+    def test_deleting_a_group_detaches_it_from_every_alias(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [{"name": "leeds"}]
+        cursor.fetchall.return_value = [{"alias": "ops"}, {"alias": "census"}]
+        store = self.store_with_cursor(cursor)
+
+        result = store.delete_group("leeds")
+
+        self.assertEqual(
+            {"name": "leeds", "detachedAliases": ["census", "ops"]}, result
+        )
+        detach = [
+            call for call in cursor.execute.call_args_list
+            if "array_remove" in str(call)
+        ]
+        self.assertTrue(detach, "expected the membership to be stripped")
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,12 +25,19 @@ from federation_schema import (
     FederationSchemaError,
     enforce_tls_policy,
     validate_alias,
+    validate_group_definition,
+    validate_group_name,
     validate_registration,
 )
 
 SCHEMA = "federation"
 
 MAX_ALIASES = 100
+
+# GET /api/federation/groups is unpaginated, so the registry-wide count is
+# bounded here for the same reason MAX_ALIASES bounds the alias list. Groups
+# create no alias rows, so the two limits do not interact.
+MAX_GROUPS = 50
 
 
 class FederationAliasStore:
@@ -111,7 +118,8 @@ class FederationAliasStore:
               retired_at timestamptz,
               retired_by text,
               archived_schema text,
-              archived_server text
+              archived_server text,
+              groups text[] NOT NULL DEFAULT '{{}}'
             )
         """).format(sql.Identifier(SCHEMA)))
         # Retirement archives rather than deletes: the alias row and its whole
@@ -150,6 +158,16 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
             "row_level_security_acknowledged boolean NOT NULL DEFAULT false"
+        ).format(sql.Identifier(SCHEMA)))
+        # Group labels. This migration is load-bearing well beyond groups:
+        # _SELECT_COLUMNS names the column unconditionally, so omitting it
+        # fails every alias read with UndefinedColumn -- the federation panel,
+        # federation list/show, and the periodic verifier alike. verify.sh
+        # carries a first-party comment recording that exact failure for
+        # archived_schema, which is why it probes information_schema first.
+        cur.execute(sql.SQL(
+            "ALTER TABLE {}._aliases ADD COLUMN IF NOT EXISTS "
+            "groups text[] NOT NULL DEFAULT '{{}}'"
         ).format(sql.Identifier(SCHEMA)))
         # NULL until a successful provision() explicitly accepts a live
         # schema_fingerprint (see provision()'s docstring) — deliberately
@@ -236,6 +254,25 @@ class FederationAliasStore:
         cur.execute(sql.SQL(
             "REVOKE ALL ON {}._approvals FROM PUBLIC"
         ).format(sql.Identifier(SCHEMA)))
+        # Group definitions. A group is a label: a name, an optional
+        # description, and who created it. It grants nothing, revokes nothing,
+        # and changes no PostgreSQL privilege. No CHECK on the name -- every
+        # CHECK in this schema is a value enumeration, and the name grammar
+        # lives in federation_schema.py beside the alias grammar. No foreign
+        # key from _aliases.groups either: PostgreSQL has no array-element
+        # foreign keys, so define-before-assign and delete-detaches are
+        # enforced by the store.
+        cur.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {}._groups (
+              name text PRIMARY KEY,
+              description text,
+              created_by text NOT NULL,
+              created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+        """).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL(
+            "REVOKE ALL ON {}._groups FROM PUBLIC"
+        ).format(sql.Identifier(SCHEMA)))
 
     _SELECT_COLUMNS = sql.SQL("""
         alias, display_name AS "displayName", kind,
@@ -256,6 +293,7 @@ class FederationAliasStore:
         retired_by AS "retiredBy",
         archived_schema AS "archivedSchema",
         archived_server AS "archivedServer",
+        groups,
         (
           accepted_schema_fingerprint IS NOT NULL
           AND accepted_physical_identity IS NOT NULL
@@ -396,6 +434,162 @@ class FederationAliasStore:
                 (MAX_ALIASES + 1,),
             )
             return list(cur.fetchall())
+
+    _GROUP_COLUMNS = sql.SQL("""
+        name, description,
+        created_by AS "createdBy", created_at AS "createdAt",
+        (
+          SELECT count(*)
+          FROM {}._aliases AS labelled
+          WHERE labelled.status <> 'retired'
+            AND _groups.name = ANY (labelled.groups)
+        ) AS "memberCount"
+    """)
+
+    def list_groups(self) -> list[dict[str, Any]]:
+        """Defined group labels with live, non-retired member counts.
+
+        Membership is metadata: this count says how many sources an operator
+        labelled, never what anybody may read. Retired aliases are excluded to
+        match list()'s archive contract, so the count and the panel agree.
+        """
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT {} FROM {}._groups ORDER BY name LIMIT %s"
+                ).format(
+                    self._GROUP_COLUMNS.format(sql.Identifier(SCHEMA)),
+                    sql.Identifier(SCHEMA),
+                ),
+                (MAX_GROUPS + 1,),
+            )
+            return list(cur.fetchall())
+
+    def define_group(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Create a label.
+
+        Grants nothing, revokes nothing, and changes no PostgreSQL privilege.
+        It records which sources are meant to be used together; cross-database
+        querying already works between any two provisioned sources, because
+        they are foreign tables in one host database, so a group could only
+        ever restrict that and this one deliberately does not.
+        """
+        definition = validate_group_definition(payload)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:groups",),
+            )
+            cur.execute(
+                sql.SQL("SELECT count(*) AS count FROM {}._groups").format(
+                    sql.Identifier(SCHEMA)
+                )
+            )
+            if cur.fetchone()["count"] >= MAX_GROUPS:
+                raise FederationSchemaError(
+                    f"Federation group limit ({MAX_GROUPS}) reached.",
+                    status=HTTPStatus.CONFLICT,
+                    code="federation.group_limit",
+                )
+            cur.execute(
+                sql.SQL(
+                    "INSERT INTO {}._groups (name, description, created_by)"
+                    " VALUES (%s, %s, %s)"
+                    " ON CONFLICT (name) DO NOTHING RETURNING name"
+                ).format(sql.Identifier(SCHEMA)),
+                (definition["name"], definition["description"], actor),
+            )
+            if cur.fetchone() is None:
+                # A coded error, not FileExistsError: app.py answers that with
+                # a 409 carrying no code, and the CLI branches on the code.
+                raise FederationSchemaError(
+                    f"Federation group {definition['name']!r} already exists.",
+                    status=HTTPStatus.CONFLICT,
+                    code="federation.group_exists",
+                )
+            cur.execute(
+                sql.SQL(
+                    "SELECT {} FROM {}._groups WHERE name = %s"
+                ).format(
+                    self._GROUP_COLUMNS.format(sql.Identifier(SCHEMA)),
+                    sql.Identifier(SCHEMA),
+                ),
+                (definition["name"],),
+            )
+            return cur.fetchone()
+
+    def delete_group(self, name: str) -> dict[str, Any]:
+        """Delete a label and detach it from every alias, retired ones included.
+
+        Deletion, not archival: retire() archives because an alias names a real
+        physical attachment whose history is evidence. A label names nothing
+        and exposes nothing, so there is no trail to preserve beyond the audit
+        event the route records.
+        """
+        name = validate_group_name(name)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:groups",),
+            )
+            cur.execute(
+                sql.SQL(
+                    "DELETE FROM {}._groups WHERE name = %s RETURNING name"
+                ).format(sql.Identifier(SCHEMA)),
+                (name,),
+            )
+            if cur.fetchone() is None:
+                raise FederationSchemaError(
+                    f"Federation group {name!r} is not defined.",
+                    status=HTTPStatus.NOT_FOUND,
+                    code="federation.group_not_found",
+                )
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {}._aliases SET groups = array_remove(groups, %s)"
+                    " WHERE %s = ANY (groups) RETURNING alias"
+                ).format(sql.Identifier(SCHEMA)),
+                (name, name),
+            )
+            detached = sorted(row["alias"] for row in cur.fetchall())
+            return {"name": name, "detachedAliases": detached}
+
+    def set_alias_groups(
+        self, alias: str, groups: tuple[str, ...]
+    ) -> dict[str, Any]:
+        """Replace an alias's whole label set. Changes no privilege."""
+        alias = validate_alias(alias)
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{SCHEMA}:groups",),
+            )
+            if groups:
+                cur.execute(
+                    sql.SQL(
+                        "SELECT name FROM {}._groups WHERE name = ANY (%s)"
+                    ).format(sql.Identifier(SCHEMA)),
+                    (list(groups),),
+                )
+                defined = {row["name"] for row in cur.fetchall()}
+                missing = sorted(set(groups) - defined)
+                if missing:
+                    raise FederationSchemaError(
+                        "Federation groups are not defined: "
+                        + ", ".join(missing),
+                        status=HTTPStatus.NOT_FOUND,
+                        code="federation.group_not_found",
+                    )
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {}._aliases SET groups = %s WHERE alias = %s"
+                    " RETURNING alias"
+                ).format(sql.Identifier(SCHEMA)),
+                (list(groups), alias),
+            )
+            if cur.fetchone() is None:
+                raise FileNotFoundError(alias)
+            return self._get_with_cursor(cur, alias)
 
     def observe(
         self,

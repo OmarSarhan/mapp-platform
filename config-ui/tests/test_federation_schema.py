@@ -3,8 +3,12 @@ from math import inf, nan
 
 from federation_schema import (
     FederationSchemaError,
+    MAX_GROUPS_PER_ALIAS,
     enforce_tls_policy,
     validate_alias,
+    validate_group_definition,
+    validate_group_membership,
+    validate_group_name,
     validate_observation,
     validate_registration,
 )
@@ -417,3 +421,55 @@ class EnforceTlsPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GroupValidationTests(unittest.TestCase):
+    def test_a_group_name_follows_the_alias_grammar(self):
+        self.assertEqual("leeds_open", validate_group_name("leeds_open"))
+        for rejected in ("", "1leeds", "leeds-open", "a" * 57, None, 7):
+            with self.subTest(value=rejected):
+                with self.assertRaises(FederationSchemaError):
+                    validate_group_name(rejected)
+
+    def test_names_are_case_sensitive_like_aliases(self):
+        """validate_alias does not fold case, so neither does this.
+
+        Folding here would make "leeds" and "Leeds" the same label while the
+        alias they sit beside treats them as different, which is a worse
+        surprise than two labels an operator can see and delete.
+        """
+        self.assertEqual("Leeds", validate_group_name("Leeds"))
+
+    def test_membership_may_be_empty_and_is_sorted(self):
+        # Empty is how a label set is cleared, so unlike allowedRelations it
+        # is a valid value rather than a refusal.
+        self.assertEqual((), validate_group_membership({"groups": []}))
+        self.assertEqual(
+            ("alpha", "beta"),
+            validate_group_membership({"groups": ["beta", "alpha"]}),
+        )
+
+    def test_membership_refuses_duplicates_and_overflow(self):
+        with self.assertRaises(FederationSchemaError):
+            validate_group_membership({"groups": ["leeds", "leeds"]})
+        with self.assertRaises(FederationSchemaError):
+            validate_group_membership(
+                {"groups": [f"g{index}" for index in range(MAX_GROUPS_PER_ALIAS + 1)]}
+            )
+
+    def test_a_definition_is_closed_and_its_description_optional(self):
+        self.assertEqual(
+            {"name": "leeds", "description": None},
+            validate_group_definition({"name": "leeds"}),
+        )
+        self.assertEqual(
+            {"name": "leeds", "description": "Leeds showcase sources."},
+            validate_group_definition(
+                {"name": "leeds", "description": "Leeds showcase sources."}
+            ),
+        )
+        # An empty description is a refusal, not a silent NULL.
+        with self.assertRaises(FederationSchemaError):
+            validate_group_definition({"name": "leeds", "description": "  "})
+        with self.assertRaises(FederationSchemaError):
+            validate_group_definition({"name": "leeds", "unexpected": 1})
