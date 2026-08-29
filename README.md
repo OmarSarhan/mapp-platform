@@ -195,11 +195,18 @@ configured ETL sources, run:
 ./bin/mapp reset-data --confirm
 ```
 
-This deletes derived layers and every other non-ETL database object. It
-replaces the live and preview workspaces with `instance/workspace.seed.json`,
-clearing layer configuration that depended on deleted data. Dashboard
-authentication, audit, proposal, semantic-history, artifact, and public-asset
-state is preserved. Before archiving, the command installs an owner-fenced
+This deletes the packaged database and everything in it: derived layers, the
+federation registry with its aliases and group labels, and the whole semantic
+catalogue -- generated profiles, curated meaning, semantic proposals and their
+history. Back the database up first if any of that matters; the catalogue
+moved into PostgreSQL and is no longer a separate file. It replaces the live
+and preview workspaces with `instance/workspace.seed.json`, clearing layer
+configuration that depended on deleted data.
+
+The source databases are not touched, so the spatial data survives and
+`./bin/mapp demo` rebuilds the showcase from them. Nor is anything under
+`var`: dashboard authentication, the audit log, workspace proposals,
+artifacts, and public assets are preserved. Before archiving, the command installs an owner-fenced
 maintenance gate and waits for every current semantic profile to be `ready`
 with no undelivered outbox blocker. It then archives every active profile and
 checks the outbox again; a `repair_required` event or timeout aborts before

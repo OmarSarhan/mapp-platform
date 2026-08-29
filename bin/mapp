@@ -596,8 +596,9 @@ case "${1:-}" in
   reset-data)
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
       printf '%s\n' \
-        'This permanently removes the bundled PostgreSQL database, including derived layers and any non-ETL tables.' \
-        'Active derived semantic profiles are archived first. The live workspace is replaced by instance/workspace.seed.json; dashboard authentication, audit records, proposals, semantic history, and public assets are preserved.' \
+        'This permanently removes the packaged PostgreSQL database and everything in it: derived layers, the federation registry and its group labels, and the whole semantic catalogue -- generated profiles, curated meaning, semantic proposals and their history.' \
+        'Back the database up first if any of that matters. Active derived semantic profiles are archived beforehand, but archival records the state, it does not survive the volume.' \
+        'Not touched: the source databases holding the spatial data, and everything under var -- dashboard authentication, the audit log, workspace proposals, artifacts and public assets. The live workspace is replaced by instance/workspace.seed.json.' \
         'Run ./bin/mapp reset-data --confirm to continue.' >&2
       exit 2
     fi

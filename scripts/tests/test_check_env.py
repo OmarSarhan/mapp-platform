@@ -34,6 +34,40 @@ class CheckEnvironmentTests(unittest.TestCase):
         )
         self.assertEqual(placeholders, generated)
 
+    def test_reset_data_names_what_it_destroys_before_asking(self):
+        """The warning is where consent is obtained, so it must be true.
+
+        It said semantic history was preserved. That was correct while the
+        catalogue was a SQLite file under var; it stopped being correct the
+        moment the catalogue moved into the packaged database, which is the
+        volume this command removes. An operator reading it would have agreed
+        to something other than what happens.
+        """
+        result = subprocess.run(
+            [ROOT / "bin/mapp", "reset-data"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(2, result.returncode)
+        warning = result.stderr.lower()
+        for destroyed in (
+            "semantic catalogue",
+            "curated meaning",
+            "semantic proposals",
+            "federation registry",
+            "derived layers",
+        ):
+            with self.subTest(destroyed=destroyed):
+                self.assertIn(destroyed, warning)
+        # The claim that started this: semantic state must never be listed
+        # among what survives.
+        self.assertNotIn("semantic history, and public", warning)
+        self.assertNotIn("semantic-history", warning)
+        for preserved in ("source databases", "audit log", "artifacts"):
+            with self.subTest(preserved=preserved):
+                self.assertIn(preserved, warning)
+
     def test_init_rejects_an_unknown_argument_without_writing_anything(self):
         """init took no arguments and silently ignored any it was given.
 
