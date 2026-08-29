@@ -429,27 +429,53 @@ if [[ "${probe_usage_missing}" == "1" ]]; then
   PROBE_USAGE_GRANTED=1
 fi
 
-# Move real MultiPolygons across so the aggregation below exercises genuine
-# geometry, not synthetic squares. Streamed through a plain SELECT rather than
-# pg_dump so it does not depend on dump formatting across versions.
-"${compose[@]}" exec -T db psql --quiet --tuples-only --no-align \
-  --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" --command "
-    COPY (
-      SELECT object_id, council_reference, ST_AsEWKT(geom)
-      FROM leeds.smoke_control_orders
-    ) TO STDOUT
-  " \
-  | "${compose[@]}" exec -T source-db psql --quiet \
-      --username "${SOURCE_POSTGRES_USER}" --dbname "${SOURCE_POSTGRES_DB}" \
-      --command "COPY ${PROBE_RELATION} (object_id, reference, geom) FROM STDIN"
+# Geometry is generated in the source database rather than copied from the
+# packaged one. It used to be copied from leeds.smoke_control_orders, which no
+# longer exists there: spatial data lives in source databases now, so the
+# harness cannot assume the host holds any. Generated rather than synthetic
+# squares -- ST_Buffer on a segmented line yields irregular rings with enough
+# vertices that H3 expansion, ST_Intersects and the FDW round trip all do real
+# work.
+PROBE_ROWS=40
+source_sql "
+  INSERT INTO ${PROBE_RELATION} (object_id, reference, geom)
+  SELECT
+    n,
+    'E2E-' || lpad(n::text, 4, '0'),
+    ST_Multi(
+      ST_Buffer(
+        ST_Segmentize(
+          ST_SetSRID(
+            ST_MakeLine(
+              ST_MakePoint(-1.6 + n * 0.004, 53.75 + n * 0.002),
+              ST_MakePoint(-1.5 + n * 0.004, 53.82 + n * 0.002)
+            ),
+            4326
+          ),
+          0.004
+        ),
+        0.006 + (n % 5) * 0.001,
+        3
+      )
+    )::public.geometry(MultiPolygon, 4326)
+  FROM generate_series(1, ${PROBE_ROWS}) AS n
+" >/dev/null
 
 seeded="$(source_sql "SELECT count(*) FROM ${PROBE_RELATION}")"
-expected="$(platform_sql "SELECT count(*) FROM leeds.smoke_control_orders")"
-[[ "${seeded}" -gt 0 ]] || fail "probe relation seeded no rows"
-# A partial transfer would still satisfy every assertion below while quietly
-# comparing two different datasets, so the equality proof would prove nothing.
-[[ "${seeded}" == "${expected}" ]] \
-  || fail "seeded ${seeded} rows but the local source has ${expected}"
+[[ "${seeded}" == "${PROBE_ROWS}" ]] \
+  || fail "probe relation holds ${seeded} rows, expected ${PROBE_ROWS}"
+# Geometry that is valid and genuinely multi-vertex, so the comparisons below
+# are exercising PostGIS rather than agreeing about trivia.
+geometry_shape="$(source_sql "
+  SELECT count(*) FILTER (WHERE NOT ST_IsValid(geom))
+      || ' ' || min(ST_NPoints(geom))
+  FROM ${PROBE_RELATION}
+")"
+read -r invalid_geometries min_vertices <<<"${geometry_shape}"
+[[ "${invalid_geometries}" == "0" ]] \
+  || fail "${invalid_geometries} generated probe geometries are invalid"
+[[ "${min_vertices}" -ge 16 ]] \
+  || fail "generated probe geometry is too simple: ${min_vertices} vertices"
 printf 'seeded %s polygons into the source database\n' "${seeded}"
 
 step "Driving register, observe and provision over HTTP"
@@ -573,69 +599,56 @@ step "Cross-schema H3 aggregation: federated polygons against local data"
 # must equal the local result exactly. That is a far stronger assertion than
 # any fixed expected number: it proves the FDW path returns the same geometry
 # PostGIS and H3 see locally, rather than merely returning something.
-aggregation="$(platform_sql "
+# What the federation layer must never do is alter geometry in transit, and
+# the source database deliberately has no H3 extension -- it models a real
+# external source, which would not have MAPP's -- so the comparison is on the
+# geometry itself rather than on cells computed twice. Byte-for-byte EWKB
+# digests over the same rows, one side read through postgres_fdw from another
+# database, the other read in the database that owns them.
+federated_geometry="$(platform_sql "
   SET ROLE ${DERIVED_OWNER_ROLE};
-  WITH federated_cells AS (
+  SELECT count(*)
+      || ' ' || coalesce(
+           md5(string_agg(encode(ST_AsEWKB(geom), 'hex'), ',' ORDER BY object_id)),
+           ''
+         )
+  FROM source_${ALIAS}.e2e_probe_orders
+" | tail -n 1)"
+source_geometry="$(source_sql "
+  SELECT count(*)
+      || ' ' || coalesce(
+           md5(string_agg(encode(ST_AsEWKB(geom), 'hex'), ',' ORDER BY object_id)),
+           ''
+         )
+  FROM ${PROBE_RELATION}
+" | tail -n 1)"
+read -r federated_rows federated_digest <<<"${federated_geometry}"
+read -r source_rows source_digest <<<"${source_geometry}"
+[[ "${federated_rows}" == "${source_rows}" ]] \
+  || fail "row count differs across the boundary: federated=${federated_rows} source=${source_rows}"
+[[ -n "${federated_digest}" && "${federated_digest}" == "${source_digest}" ]] \
+  || fail "geometry differs across the federation boundary"
+printf 'geometry: %s rows identical byte-for-byte across the boundary\n' \
+  "${federated_rows}"
+
+# H3 over the foreign table, because that is the derived-layer workload and
+# it is the host's own extension doing the work on rows it did not store.
+federated_cells="$(platform_sql "
+  SET ROLE ${DERIVED_OWNER_ROLE};
+  SELECT count(*) FROM (
     SELECT DISTINCT public.h3_polygon_to_cells(geom, 8) AS cell
     FROM source_${ALIAS}.e2e_probe_orders
-  ),
-  local_cells AS (
-    SELECT DISTINCT public.h3_polygon_to_cells(geom, 8) AS cell
-    FROM leeds.smoke_control_orders
-  )
-  SELECT (SELECT count(*) FROM federated_cells)
-      || ' ' || (SELECT count(*) FROM local_cells)
-      || ' ' || (SELECT count(*) FROM (
-           SELECT cell FROM federated_cells
-           EXCEPT SELECT cell FROM local_cells) AS d)
-      || ' ' || (SELECT count(*) FROM (
-           SELECT cell FROM local_cells
-           EXCEPT SELECT cell FROM federated_cells) AS d)
+  ) AS expanded
 " | tail -n 1)"
-read -r federated_cells local_cells federated_only local_only <<<"${aggregation}"
 [[ "${federated_cells}" -gt 0 ]] || fail "federated H3 expansion produced no cells"
-[[ "${federated_cells}" == "${local_cells}" ]] \
-  || fail "H3 cell count differs: federated=${federated_cells} local=${local_cells}"
-[[ "${federated_only}" == "0" && "${local_only}" == "0" ]] \
-  || fail "H3 cell sets differ: federated_only=${federated_only} local_only=${local_only}"
-printf 'H3 r8: %s cells, identical federated and local\n' "${federated_cells}"
+printf 'H3 r8 over the foreign table: %s cells\n' "${federated_cells}"
 
-# The heavier, more representative workload: intersect the federated polygons
-# with the 178k-row local census table and area-weight a measure into an
-# equal-area projection. Intersecting in the native SRID keeps the census GiST
-# index usable; transforming the indexed side inside the join instead turns
-# this from seconds into minutes.
-allocation="$(platform_sql "
-  SET ROLE ${DERIVED_OWNER_ROLE};
-  WITH pairs AS (
-    SELECT 'federated' AS side, c.ts001_0001 AS measure,
-           ST_Transform(ST_Intersection(f.geom, c.geom), 3035) AS overlap,
-           ST_Transform(c.geom, 3035) AS whole
-    FROM source_${ALIAS}.e2e_probe_orders AS f
-    JOIN leeds.census_2021_england_oa AS c ON ST_Intersects(f.geom, c.geom)
-    UNION ALL
-    SELECT 'local', c.ts001_0001,
-           ST_Transform(ST_Intersection(f.geom, c.geom), 3035),
-           ST_Transform(c.geom, 3035)
-    FROM leeds.smoke_control_orders AS f
-    JOIN leeds.census_2021_england_oa AS c ON ST_Intersects(f.geom, c.geom)
-  ),
-  allocated AS (
-    SELECT side, count(*) AS pairs,
-           round(sum(measure * (ST_Area(overlap)
-                 / NULLIF(ST_Area(whole), 0)))::numeric, 6) AS total
-    FROM pairs GROUP BY side
-  )
-  SELECT (SELECT pairs FROM allocated WHERE side = 'federated')
-      || ' ' || (SELECT total FROM allocated WHERE side = 'federated')
-      || ' ' || (SELECT count(DISTINCT (pairs, total)) FROM allocated)
-" | tail -n 1)"
-read -r pair_count allocated_total distinct_results <<<"${allocation}"
-[[ "${pair_count}" -gt 0 ]] || fail "census intersection produced no pairs"
-[[ "${distinct_results}" == "1" ]] \
-  || fail "area-weighted allocation differs between federated and local sources"
-printf 'area-weighted census: %s pairs, %s allocated, identical both sides\n' \
-  "${pair_count}" "${allocated_total}"
+# The area-weighted census allocation that used to sit here joined
+# leeds.census_2021_england_oa in the packaged database, which no longer holds
+# spatial data. It is not rebuilt here: docker/demo-sources/layers.sh already
+# runs the area-weighted-h3 recipe across source_census and source_ops, and
+# scripts/verify.sh asserts the derived owner reads both -- the same workload
+# against two real federated sources rather than one synthetic one.
 
 verifier_tick() {
   # Scoped to this alias. The stage below stops the shared source, and an
