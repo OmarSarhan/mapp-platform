@@ -588,7 +588,15 @@ class FederationAliasStore:
                 (list(groups), alias),
             )
             if cur.fetchone() is None:
-                raise FileNotFoundError(alias)
+                # Coded, not FileNotFoundError: the generic handler answers
+                # that with a 404 whose body is the alias name and no code at
+                # all, and the CLI branches on codes. The alias GET route
+                # already reports a missing alias this way.
+                raise FederationSchemaError(
+                    f"The federation alias {alias!r} does not exist.",
+                    status=HTTPStatus.NOT_FOUND,
+                    code="federation.alias_not_found",
+                )
             return self._get_with_cursor(cur, alias)
 
     def observe(

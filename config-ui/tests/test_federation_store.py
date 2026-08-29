@@ -1673,6 +1673,24 @@ class FederationGroupTests(unittest.TestCase):
         self.assertEqual("federation.group_not_found", error.exception.code)
         self.assertIn("typo", str(error.exception))
 
+    def test_labelling_a_missing_alias_reports_a_coded_404(self):
+        """FileNotFoundError here answers 404 with the alias name and no code.
+
+        The CLI branches on codes, and the alias GET route already reports a
+        missing alias as federation.alias_not_found, so this route agreeing
+        with it is the difference between an actionable error and a bare
+        string.
+        """
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [None]
+        store = self.store_with_cursor(cursor)
+
+        with self.assertRaises(FederationSchemaError) as error:
+            store.set_alias_groups("nosuch", ())
+
+        self.assertEqual("federation.alias_not_found", error.exception.code)
+        self.assertEqual(HTTPStatus.NOT_FOUND, error.exception.status)
+
     def test_deleting_a_group_detaches_it_from_every_alias(self):
         cursor = MagicMock()
         cursor.fetchone.side_effect = [{"name": "leeds"}]
