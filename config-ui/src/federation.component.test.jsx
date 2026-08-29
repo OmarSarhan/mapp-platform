@@ -120,6 +120,29 @@ describe('FederatedSources', () => {
     expect(screen.getByText(/reachable · schema current/)).toBeTruthy();
   });
 
+  test('group labels are shown, and a server without them does not crash', async () => {
+    // The groups column arrives only from a server that has run the migration.
+    // Rendering alias.groups without a guard turns a missing key into
+    // "Cannot read properties of undefined", which takes down the whole panel
+    // -- including the aliases an operator needs to see to fix it.
+    const labelled = {...active, groups: ['leeds', 'showcase']};
+    render(<FederatedSources api={listOnly([labelled, registered])} close={() => {}}/>);
+
+    await waitFor(() => expect(screen.getByText('Leeds external')).toBeTruthy());
+    expect(screen.getByText('leeds, showcase')).toBeTruthy();
+
+    cleanup();
+    // `registered` carries no groups key at all, standing in for a server
+    // predating the migration.
+    render(<FederatedSources api={listOnly([registered])} close={() => {}}/>);
+    await waitFor(() => expect(
+      screen.getByRole('heading', {name: 'pending_src'}),
+    ).toBeTruthy());
+    // Relations and Groups are both empty here, so both read "none". The
+    // assertion that matters is that the panel rendered at all.
+    expect(screen.getAllByText('none')).toHaveLength(2);
+  });
+
   test('provision is unavailable until the source has been observed', async () => {
     const api = listOnly([registered]);
     render(<FederatedSources api={api} close={() => {}}/>);

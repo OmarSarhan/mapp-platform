@@ -532,8 +532,8 @@ export const TOKEN_SCOPE_OPTIONS=[
  {id:'semantic:propose',group:'Semantic',label:'Propose semantic changes',help:'Check, create, and decline curated semantic proposals.'},
  {id:'semantic:apply',group:'Semantic',label:'Apply semantic proposals',help:'Apply an explicitly reviewed curated semantic proposal.'},
  {id:'semantic:admin',group:'Semantic',label:'Administer semantic delivery',help:'Inspect delivery failures and explicitly retry retained events.'},
- {id:'federation:observe',group:'Federation',label:'Inspect federated sources',help:'Read the source registry, each alias status, and the accepted evidence behind it.'},
- {id:'federation:register',group:'Federation',label:'Register federated sources',help:'Record intent to attach a source. Opens no connection and exposes nothing.'},
+ {id:'federation:observe',group:'Federation',label:'Inspect federated sources',help:'Read the source registry, the defined group labels, each alias status, and the accepted evidence behind it.'},
+ {id:'federation:register',group:'Federation',label:'Register and label federated sources',help:'Record intent to attach a source, and manage the group labels sources carry. Opens no connection and exposes nothing.'},
  {id:'federation:provision',group:'Federation',label:'Expose and retire federated sources',help:'Probe a source live, expose its allowed relations to the map reader, and withdraw them again. The only scope that can serve a third-party database.'},
 ];
 export const TOKEN_ACCESS_PRESETS=[

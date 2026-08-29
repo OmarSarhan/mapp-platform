@@ -92,6 +92,14 @@ function Evidence({alias, coverage}) {
     <dd>{alias.connectionRef} · TLS {alias.tlsPolicy}</dd>
     <dt>Relations</dt>
     <dd>{(alias.allowedRelations || []).join(', ') || 'none'}</dd>
+    <dt>Groups</dt>
+    {/* Labels only. Membership records which sources are meant to be used
+        together; it grants nothing and restricts nothing, and every
+        provisioned source can already be joined to every other. The || []
+        guard matters: a server that has not yet run the groups migration
+        sends no such key, and .join on undefined takes the whole panel
+        down. */}
+    <dd>{(alias.groups || []).join(', ') || 'none'}</dd>
     <dt>Last observation</dt>
     <dd>
       {observation.connectivity
