@@ -87,6 +87,27 @@ class BaseImagePolicyTests(unittest.TestCase):
             )
         )
 
+    def test_ci_runs_the_semantic_suite_against_a_real_database(self) -> None:
+        """Without a database every semantic test skips and the job passes.
+
+        The store's tests are SQL against a real server; mocked cursors cannot
+        fail the way PostgreSQL fails when it parses a statement or applies a
+        migration. ./bin/mapp test provisions a scratch database for exactly
+        this reason and says so in a comment, and the workflow did not get the
+        same treatment -- so the two entry points disagreed about whether the
+        suite ran at all.
+        """
+        workflow = (
+            REPOSITORY_ROOT / ".github/workflows/ci.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("SEMANTIC_TEST_DATABASE_URL", workflow)
+        self.assertRegex(workflow, r"services:\s")
+        self.assertRegex(workflow, r"image: postgres:\d+")
+        # A skip is the failure this step exists to catch, so it must not be
+        # allowed to report success.
+        self.assertIn('grep -q "skipped=" /tmp/semantic-tests.log', workflow)
+
     def test_runtime_vulnerability_remediation_is_preserved(self) -> None:
         xyz = (REPOSITORY_ROOT / "docker/xyz/Dockerfile").read_text(
             encoding="utf-8",
