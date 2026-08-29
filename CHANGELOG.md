@@ -22,6 +22,19 @@ first release.
 
 ### Added
 
+- Federation groups, as labels. A group is a name, an optional description and
+  who created it; a source belongs to zero or more. Membership grants nothing,
+  revokes nothing, and changes no PostgreSQL privilege -- it records which
+  sources are meant to be used together. `config-cli federation groups`,
+  `group-define`, `group-delete` and `set-groups` manage them, and the
+  federation panel shows each source's labels. Labels rather than enforcement
+  because every provisioned source is already a foreign table in one packaged
+  database, so cross-database joins work between any two of them regardless;
+  grouping could only restrict that, and a source in two groups bridges them
+  anyway. Reading needs `federation:observe`; defining, deleting and assigning
+  need `federation:register`. Existing databases gain the column by migration
+  on the next start.
+
 - The semantic catalogue moved out of the SQLite file at `var/semantic` and
   into the packaged database, in a schema named `semantic`. Two new login
   roles carry it: `SEMANTIC_DB_USER` (default `mapp_semantic`) owns the schema
