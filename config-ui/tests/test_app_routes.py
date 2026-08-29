@@ -587,7 +587,8 @@ class FederationAliasReadRouteTests(unittest.TestCase):
     """GET /api/federation/aliases(/<alias>) must preserve a
     FederationSchemaError's own status/code (round 26 finding) — e.g.
     federation.not_configured, a permanent configuration fact when
-    FEDERATION is unset outside bundled mode, must never be folded into
+    FEDERATION is unset without a federation credential, must never be
+    folded into
     the generic 502 federation.registry_unavailable a real psycopg.Error
     still gets, or a contract-driven client would retry a deployment mode
     that will never become available."""
@@ -7988,7 +7989,8 @@ class FederationVerificationTickTests(unittest.TestCase):
         self.assertEqual({"observed": 1, "failed": 0, "skipped": 0, "deferred": 0}, summary)
 
     def test_is_inert_when_federation_is_not_configured(self):
-        # Outside bundled mode FEDERATION is None; the tick must be safe to
+        # Without a federation credential FEDERATION is None; the tick must
+        # be safe to
         # call rather than raising into a background thread.
         with patch.object(app, "FEDERATION", None):
             self.assertEqual(

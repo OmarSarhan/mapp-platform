@@ -387,12 +387,13 @@ Available checks include:
 frontend tests/build/audit and JavaScript syntax checks in containers, then
 runs standard-library wrapper/production helper tests and Compose validation
 from the host. `doctor` compares environment key names without printing their
-values. The last command is a mode-aware runtime check and requires the stack,
-the selected PostGIS connection, and at least one discoverable relation. In
-bundled mode it additionally verifies the ETL relations, optional Census
-snapshot when present, and tile; in external mode it verifies generic
-connectivity, catalog, service, and gateway gates. Finish external acceptance
-with layer-specific visual tests for that workspace.
+values. The last command is a runtime check and requires the stack, the packaged
+PostGIS connection, and at least one discoverable relation. It verifies the
+runtime, derived and federation identities and their privileges, service
+health, the catalog, tiles, and the gateway guards. Where `MAPP_DEMO_SOURCES`
+is set it also checks the demo content in `census-db` and `ops-db`, which is
+where that data lives. Finish acceptance with layer-specific visual tests for
+the workspace.
 Dated results and their exact scope are recorded in
 [`docs/validation-log.md`](docs/validation-log.md). Treat only the checks
 explicitly recorded there as evidence; source restructuring alone is not an

@@ -245,10 +245,6 @@ def enforce_collection_payload(
     )
 
 
-def pagination_requested(query: dict[str, list[str]]) -> bool:
-    return "limit" in query or "cursor" in query
-
-
 def pagination_parameters(
     query: dict[str, list[str]],
     *,

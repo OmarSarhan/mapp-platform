@@ -753,25 +753,6 @@ def semantic_proxy_path(path: str, query: str = "") -> str | None:
     return target + (f"?{query}" if query else "")
 
 
-def paginated_collection_payload(
-    key: str,
-    items: list,
-    query: dict[str, list[str]],
-    *,
-    scope: str,
-) -> dict:
-    if not query:
-        return {key: items}
-    limit, cursor = pagination_parameters(query)
-    page_items, pagination = paginate_collection(
-        items,
-        limit=limit,
-        cursor=cursor,
-        scope=scope,
-    )
-    return {key: page_items, "pagination": pagination}
-
-
 def derived_semantic_profiles(
     *,
     include_delivery_diagnostics: bool = False,
@@ -3559,19 +3540,6 @@ def proposal_feature_info_evidence(
         "original": side(original_layer, original_entries),
         "candidate": side(candidate_layer, candidate_entries),
     }
-
-
-def proposal_changes_feature_info(
-    proposal: dict,
-    layer_key: str,
-    locale_key: str,
-) -> bool:
-    """Whether this proposal changes feature information for the rendered layer."""
-    return proposal_feature_info_evidence(
-        proposal,
-        layer_key,
-        locale_key,
-    )["changed"]
 
 
 def expected_info_panel_text(payload: dict) -> list[str]:
@@ -6469,7 +6437,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # FederationSchemaError subclasses ValueError, so this must
                 # precede both pagination ValueError and psycopg.Error — e.g. an
                 # intentionally-disabled deployment (FEDERATION is None
-                # outside bundled mode) raises federation.not_configured
+                # without a federation credential) raises
+                # federation.not_configured
                 # here, a permanent configuration fact, not a transient
                 # outage; folding it into the generic 502 below would
                 # make a contract-driven client retry a mode that will
@@ -10135,7 +10104,8 @@ if __name__ == "__main__":
         name="semantic-outbox",
         daemon=True,
     ).start()
-    # Only where a registry exists: outside bundled mode FEDERATION is None,
+    # Only where a registry exists: without FEDERATION_DATABASE_URL
+    # FEDERATION is None,
     # and a thread whose every pass is a no-op is just a thread to explain.
     if FEDERATION:
         threading.Thread(

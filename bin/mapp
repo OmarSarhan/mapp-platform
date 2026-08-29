@@ -24,7 +24,7 @@ usage() {
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
-    "  reset-data --confirm remove the bundled database and reload configured ETL data" \
+    "  reset-data --confirm remove the packaged database and restore the seed workspace" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
     "  all          start the platform, then verify it" \
     "  test         run local unit and configuration tests" \
@@ -574,7 +574,12 @@ case "${1:-}" in
     if [[ -n "${2:-}" ]]; then
       census_check_args+=(--topic "${2}")
     fi
-    run_with_buildkit_lease_retry "${compose[@]}" run --rm --build etl "${census_check_args[@]}"
+    # --no-deps: the check reads the publisher over the network and never
+    # touches a database, but the etl service declares depends_on db, so
+    # without this it starts the packaged PostgreSQL to validate a remote
+    # source.
+    run_with_buildkit_lease_retry "${compose[@]}" run --rm --build --no-deps \
+      etl "${census_check_args[@]}"
     ;;
   recover-reset-data)
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then

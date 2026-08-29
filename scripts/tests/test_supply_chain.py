@@ -108,8 +108,18 @@ class BaseImagePolicyTests(unittest.TestCase):
         self.assertIn("gstreamer1.0-plugins-bad", browser)
         self.assertIn("/usr/lib/node_modules/npm", browser)
         self.assertIn("--only-upgrade", egress)
-        self.assertIn("libssl3t64=3.0.13-0ubuntu3.12", egress)
-        self.assertIn("openssl=3.0.13-0ubuntu3.12", egress)
+        # The remediation is "pinned to a security build at or above the one
+        # that fixed this", not one exact string. Ubuntu withdraws superseded
+        # versions from the archive, so pinning the literal here made the test
+        # fail -- and the image stop building -- every time a new security
+        # update shipped. 3.12 was the original remediation floor.
+        for package in ("libssl3t64", "openssl"):
+            with self.subTest(package=package):
+                pinned = re.search(
+                    rf"{package}=3\.0\.13-0ubuntu3\.(\d+)", egress
+                )
+                self.assertIsNotNone(pinned, f"{package} is not pinned")
+                self.assertGreaterEqual(int(pinned.group(1)), 12)
         self.assertIn(
             "CADDY_COMMIT=e2eee6a7fce366321294c9c2a79f3146891dcbdf",
             caddy,
