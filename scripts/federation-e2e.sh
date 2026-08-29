@@ -720,6 +720,14 @@ def alias_groups():
     raise SystemExit(f"alias {alias} vanished from the registry")
 
 
+# Ownership, recorded the same way OWNS_PROBE_RELATION is for the probe
+# relation. Without it a pre-existing operator group of this name makes the
+# create below return 409 and raise -- and the cleanup in finally would then
+# delete the operator's group and strip the label from every alias carrying
+# it. A collision must make this rig refuse, not tidy away somebody else's
+# object.
+owns_group = False
+
 try:
     # Reading the collection at all proves the ADD COLUMN ran: _SELECT_COLUMNS
     # names groups unconditionally, so without the migration this is an
@@ -733,6 +741,7 @@ try:
         {"name": "e2e_probe", "description": "End-to-end probe label."},
         expect=201,
     )
+    owns_group = True
     duplicate = call(
         "POST", "/api/federation/groups", {"name": "e2e_probe"}, expect=409
     )
@@ -779,10 +788,11 @@ finally:
     # would fail at its own duplicate check -- the rig tripping over its own
     # residue, which is exactly what OWNS_PROBE_RELATION exists to prevent
     # elsewhere in this file.
-    try:
-        call("POST", "/api/federation/groups/e2e_probe/delete", {})
-    except BaseException:
-        pass
+    if owns_group:
+        try:
+            call("POST", "/api/federation/groups/e2e_probe/delete", {})
+        except BaseException:
+            pass
     store.revoke_token(record["id"])
 PY
 
