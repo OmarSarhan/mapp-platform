@@ -112,6 +112,18 @@ register() { # alias display connectionRef relations-json classification
   probe="$(api GET "/api/federation/aliases/$1" 2>/dev/null || true)"
   existing="$(printf '%s' "${probe}" | jqp "print((d.get('alias') or {}).get('status') or d.get('code'))")"
   if [ "${existing}" != "federation.alias_not_found" ]; then
+    # An alias with this name is not necessarily this demo's alias. census and
+    # ops are ordinary words, and adopting somebody else's source would
+    # observe it, provision it, profile its relations and -- with semantics on
+    # -- send its sample rows and column statistics to a model. The connection
+    # reference is what identifies it: the demo owns exactly the two the
+    # overlay supplies.
+    local existing_ref
+    existing_ref="$(printf '%s' "${probe}" \
+      | jqp "print((d.get('alias') or {}).get('connectionRef') or '')")"
+    if [ "${existing_ref}" != "$3" ]; then
+      fail "alias '$1' already exists and points at connectionRef '${existing_ref}', not the demo's '$3'. Retire or rename it before running the demo."
+    fi
     printf '  %-8s already registered (%s)\n' "$1" "${existing}"
     return 0
   fi
