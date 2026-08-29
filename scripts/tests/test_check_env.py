@@ -34,6 +34,24 @@ class CheckEnvironmentTests(unittest.TestCase):
         )
         self.assertEqual(placeholders, generated)
 
+    def test_reset_builds_every_runtime_image_before_it_destroys_anything(self):
+        """A build failure must not be discovered after the volume is gone.
+
+        The rebuild after deletion used to be the first time several images
+        were built, so an unrelated build failure -- a withdrawn distribution
+        package, which is what actually happened -- left the deployment
+        deleted and half-rebuilt.
+        """
+        script = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+        start = script.index("  reset-data)")
+        reset = script[start : script.index("\n  upgrade-derived)", start)]
+
+        build_all = reset.index('build "${runtime_services[@]}"')
+        removal = reset.index('docker volume rm "${database_volume}"')
+        self.assertLess(build_all, removal)
+        # And nothing after the boundary may build, or the guarantee is void.
+        self.assertNotIn("--build", reset[removal:])
+
     def test_reset_data_names_what_it_destroys_before_asking(self):
         """The warning is where consent is obtained, so it must be true.
 

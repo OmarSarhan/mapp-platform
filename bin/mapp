@@ -644,8 +644,16 @@ case "${1:-}" in
     trap 'recover_interrupted_reset $?' ERR
     trap 'recover_interrupted_reset 130' INT
     trap 'recover_interrupted_reset 143' TERM
+    # Every runtime image is built before anything is destroyed. The rebuild
+    # after the volume goes used to be the first time some of these were
+    # built, so a build failure that had nothing to do with the reset -- a
+    # withdrawn distribution package, say, which is exactly what happened --
+    # left the deployment deleted and half-rebuilt. Discovering it here costs
+    # a few minutes; discovering it after costs the database.
+    printf 'Building every runtime image before anything is removed.\n'
+    run_with_buildkit_lease_retry "${compose[@]}" build "${runtime_services[@]}"
     printf 'Starting the private control plane to archive derived semantic profiles.\n'
-    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --wait db semantic-service config-ui
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --no-build --wait db semantic-service config-ui
     reset_gate_may_be_owned=1
     "${compose[@]}" exec -T \
       -e "MAPP_RESET_GATE_OWNER=${reset_gate_owner}" \
@@ -669,7 +677,8 @@ case "${1:-}" in
     install -m 0644 "${ROOT_DIR}/instance/workspace.seed.json" "${WORKSPACE_DIR}/workspace.json"
     install -m 0600 "${ROOT_DIR}/instance/workspace.seed.json" "${PREVIEW_DIR}/workspace.json"
     printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
-    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    # --no-build: everything was built before the destructive boundary above.
+    "${compose[@]}" up --detach --no-build "${runtime_services[@]}"
     "${ROOT_DIR}/scripts/verify.sh"
     printf '%s\n' \
       'Database reset completed and the seed workspace was restored. Spatial data lives in the source databases; reload it with ./bin/mapp demo.'
