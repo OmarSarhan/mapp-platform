@@ -24,7 +24,7 @@ DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 100
 LEGACY_SEARCH_LIMIT = 20
-LEGACY_COLLECTION_FETCH = MAX_PAGE_LIMIT + 1
+UNPAGINATED_FETCH = MAX_PAGE_LIMIT + 1
 MAX_PAGE_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_PAGE_ITEMS_BYTES = 15 * 1024 * 1024
 SERVICE_VERSION = (
@@ -413,12 +413,20 @@ class SemanticHandler(BaseHTTPRequestHandler):
         )
         return page_items, {"limit": limit, "nextCursor": next_cursor}
 
-    def _legacy_collection(
+    def _unpaginated_collection(
         self,
         fetched: list[Any],
         *,
         public_item: Callable[[Any], Any] | None = None,
     ) -> list[Any]:
+        """Bound a response for a caller that asked for no page.
+
+        A supported request shape, not a deprecated one: without limit or
+        cursor this returns the whole collection when it fits and refuses,
+        naming pagination, when it does not. The `maxLegacyItems` detail key
+        keeps the older word because it rides in an error body clients may
+        branch on.
+        """
         if len(fetched) > MAX_PAGE_LIMIT:
             raise SemanticError(
                 "pagination_required",
@@ -530,7 +538,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     connection=connection,
                     after_asset_id=after,
                     fetch_limit=(
-                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                        limit + 1 if paginated else UNPAGINATED_FETCH
                     ),
                 )
             payload = {"catalogRevision": revision, "assets": assets}
@@ -543,7 +551,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 )
                 payload.update({"assets": assets, "pagination": pagination})
             else:
-                payload["assets"] = self._legacy_collection(assets)
+                payload["assets"] = self._unpaginated_collection(assets)
             self._send_json(HTTPStatus.OK, payload)
             return
         if path == "/v1/search":
@@ -574,7 +582,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     connection=connection,
                     after_asset_id=after,
                     fetch_limit=(
-                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                        limit + 1 if paginated else UNPAGINATED_FETCH
                     ),
                 )
             payload = {
@@ -594,8 +602,8 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 if len(results) > MAX_PAGE_LIMIT:
                     # Detect growth past the platform-wide legacy threshold,
                     # while retaining search's established 20-result shape.
-                    self._legacy_collection(results)
-                payload["results"] = self._legacy_collection(
+                    self._unpaginated_collection(results)
+                payload["results"] = self._unpaginated_collection(
                     results[:LEGACY_SEARCH_LIMIT]
                 )
             self._send_json(HTTPStatus.OK, payload)
@@ -619,7 +627,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     connection=connection,
                     after_asset_id=after,
                     fetch_limit=(
-                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                        limit + 1 if paginated else UNPAGINATED_FETCH
                     ),
                 )
             payload = {
@@ -637,7 +645,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     {"derivedProfiles": profiles, "pagination": pagination}
                 )
             else:
-                payload["derivedProfiles"] = self._legacy_collection(profiles)
+                payload["derivedProfiles"] = self._unpaginated_collection(profiles)
             self._send_json(HTTPStatus.OK, payload)
             return
         derived_prefix = "/v1/derived-profiles/"
@@ -691,7 +699,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                     connection=connection,
                     after=after,
                     fetch_limit=(
-                        limit + 1 if paginated else LEGACY_COLLECTION_FETCH
+                        limit + 1 if paginated else UNPAGINATED_FETCH
                     ),
                 )
             payload = {
@@ -707,7 +715,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 )
                 payload.update({"proposals": proposals, "pagination": pagination})
             else:
-                payload["proposals"] = self._legacy_collection(proposals)
+                payload["proposals"] = self._unpaginated_collection(proposals)
             self._send_json(HTTPStatus.OK, payload)
             return
         asset_prefix = "/v1/assets/"
@@ -743,7 +751,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                         fetch_limit=(
                             limit + 1
                             if paginated
-                            else LEGACY_COLLECTION_FETCH
+                            else UNPAGINATED_FETCH
                         ),
                     )
                 payload = {
@@ -767,7 +775,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                         {"history": history_items, "pagination": pagination}
                     )
                 else:
-                    payload["history"] = self._legacy_collection(
+                    payload["history"] = self._unpaginated_collection(
                         history_items,
                         public_item=lambda item: {
                             key: value

@@ -23,7 +23,7 @@ from control_api import (
     enforce_collection_payload,
     examples,
     is_probeable_database_layer,
-    legacy_collection,
+    unpaginated_collection,
     paginate_collection,
     paginate_keyset_page,
     pagination_parameters,
@@ -551,7 +551,7 @@ class ControlApiTests(unittest.TestCase):
 
     def test_collection_pages_apply_count_and_byte_bounds(self):
         with self.assertRaises(CollectionPaginationError) as required:
-            legacy_collection([{"id": index} for index in range(101)])
+            unpaginated_collection([{"id": index} for index in range(101)])
         self.assertEqual("pagination.required", required.exception.code)
         self.assertEqual(HTTPStatus.CONFLICT, required.exception.status)
 
@@ -578,7 +578,7 @@ class ControlApiTests(unittest.TestCase):
                 position=lambda item: item["id"],
             )
             with self.assertRaises(CollectionPaginationError) as legacy:
-                legacy_collection(items)
+                unpaginated_collection(items)
         self.assertEqual([items[0]], page)
         self.assertIsNotNone(pagination["nextCursor"])
         self.assertEqual("pagination.required", legacy.exception.code)

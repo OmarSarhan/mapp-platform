@@ -179,7 +179,7 @@ class ControlStore:
         os.chmod(self.process_lock_path, 0o600)
         self._last_failed_token_audit = 0.0
         self._secure_existing_state()
-        self._purge_legacy_device_credentials()
+        self._remove_persisted_device_tokens()
 
     @contextlib.contextmanager
     def _locked(self):
@@ -213,8 +213,21 @@ class ControlStore:
             if operation_path.is_file() and not operation_path.is_symlink():
                 os.chmod(operation_path, 0o600)
 
-    def _purge_legacy_device_credentials(self) -> None:
-        """Remove raw device tokens persisted by the earlier staged format."""
+    def _remove_persisted_device_tokens(self) -> None:
+        """Strip raw device tokens from state, and revoke what they matched.
+
+        Not dead code, despite the older name: it runs on every store
+        construction, and what it removes is a usable credential sitting in
+        auth.json in the clear. Deleting it would leave any state still in the
+        earlier staged format holding readable tokens that also still work.
+
+        The `legacyCredentialPurged` marker and the
+        `device.legacy_credential_purged` audit event keep the older word
+        deliberately. The first is written into persisted records, so renaming
+        it orphans every record already carrying it; the second names events
+        already in the audit history, and splitting that history across two
+        names to improve a word is a poor trade.
+        """
         if not self.state_path.exists():
             return
         changed = False

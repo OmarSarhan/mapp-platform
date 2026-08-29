@@ -88,7 +88,7 @@ from control_api import (
     decode_position_cursor,
     effective_layer_filter, effective_locales, enforce_collection_payload,
     is_probeable_database_layer,
-    legacy_collection, paginate_collection, paginate_keyset_page,
+    unpaginated_collection, paginate_collection, paginate_keyset_page,
     pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
     reload_status, reload_timeout, request_reload, visual_hover_plan,
@@ -5926,11 +5926,11 @@ class Handler(SimpleHTTPRequestHandler):
                                 profiles,
                                 delivery_blockers,
                             )
-                        profiles = legacy_collection(profiles)
+                        profiles = unpaginated_collection(profiles)
                         payload = {"derivedProfiles": profiles}
                     payload["catalogRevision"] = revision
                     if include_delivery_diagnostics:
-                        payload["deliveryBlockers"] = legacy_collection(
+                        payload["deliveryBlockers"] = unpaginated_collection(
                             unmatched_semantic_delivery_blockers(
                                 profiles, unmatched_blockers,
                             )
@@ -6023,7 +6023,7 @@ class Handler(SimpleHTTPRequestHandler):
                         after=None,
                         fetch_limit=MAX_PAGE_LIMIT + 1,
                     )
-                    payload = {"relations": legacy_collection(relations)}
+                    payload = {"relations": unpaginated_collection(relations)}
                 enforce_collection_payload(
                     payload,
                     paginated=bool(query),
@@ -6736,7 +6736,7 @@ class Handler(SimpleHTTPRequestHandler):
                         CONTROL,
                         fetch_limit=MAX_PAGE_LIMIT + 1,
                     )
-                    payload = {"proposals": legacy_collection(proposals)}
+                    payload = {"proposals": unpaginated_collection(proposals)}
                 enforce_collection_payload(
                     payload,
                     paginated=bool(query),

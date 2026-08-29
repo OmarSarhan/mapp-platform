@@ -184,7 +184,20 @@ def _bounded_collection_items(
     return bounded, has_more
 
 
-def legacy_collection(items: list[Any]) -> list[Any]:
+def unpaginated_collection(items: list[Any]) -> list[Any]:
+    """Bound a response for a caller that asked for no page.
+
+    Not a deprecated path, despite what the wire field names below suggest.
+    A request without `limit` or `cursor` is a supported request shape, and
+    this is what serves it: the whole collection when it fits, and a refusal
+    naming pagination when it does not, rather than a silent truncation.
+
+    The `maxLegacyItems` and `legacyMaxItems` keys keep the older word because
+    they are published -- `legacyMaxItems` is in every contracts/
+    api-compatibility artifact and asserted by test_contract_artifact, and
+    `maxLegacyItems` rides in an error body clients may branch on. Renaming
+    either is a contract change and is not one this rename makes.
+    """
     if len(items) > MAX_PAGE_LIMIT:
         raise CollectionPaginationError(
             "pagination.required",
