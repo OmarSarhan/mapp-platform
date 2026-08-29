@@ -171,11 +171,11 @@ continues to use read-only `DBS_MAPP`; it can select managed outputs but cannot
 create, refresh, or drop them. Ordinary views use `security_invoker=true` and
 `security_barrier=true`.
 
-New bundled volumes receive the roles, schema, H3 extensions, grants, and the
-restricted-path setting required by the H3 PostGIS polygon SQL wrappers
-automatically. Bundled ETL completion also prepares every managed geometry and
-geography source column with native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
-cross-cast GiST indexes, then refreshes planner statistics. On an existing
+A new packaged volume receives the roles, schema, H3 extensions, grants, and
+the restricted-path setting required by the H3 PostGIS polygon SQL wrappers
+automatically. MAPP also prepares every managed geometry and geography column
+it owns with native, EPSG:4326, EPSG:3857, EPSG:27700, and safe cross-cast
+GiST indexes, then refreshes planner statistics. On an existing
 bundled volume, normal startup runs the same idempotent derived-role/H3 upgrade
 and ensures missing source and materialized spatial indexes before application
 services start. The explicit maintenance equivalent is:

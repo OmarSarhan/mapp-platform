@@ -110,8 +110,8 @@ class CheckEnvironmentTests(unittest.TestCase):
         for document in documents:
             if not document.exists():
                 continue
-            # Historical records state what was true when they were written.
-            if document.name in {"CHANGELOG.md", "validation-log.md"}:
+            # The changelog states what was true when each entry was written.
+            if document.name == "CHANGELOG.md":
                 continue
             if "Superseded" in document.read_text(encoding="utf-8")[:400]:
                 continue

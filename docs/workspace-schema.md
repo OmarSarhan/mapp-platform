@@ -470,7 +470,7 @@ function with the complete layer object; this layer hook is not awaited.
 Use `/api/plugins` or `config-cli plugins list/show/validate/usage` for the
 connected server's exact built-in and external registry. External manifest
 schemas are composed into `/api/schema`; proposals and preview evidence bind
-to the catalogue fingerprint. See [External XYZ plugins](external-plugins.md).
+to the catalogue fingerprint. See [External XYZ plugins](#external-xyz-plugins) below.
 
 The dashboard exposes top-level templates and advanced locale/layer values as JSON object
 editors. The configuration API and standalone CLI expose the same values
@@ -696,4 +696,176 @@ The public custom SVG catalog is versioned under
 The machine-readable workspace schema is
 [`config-ui/schema/workspace.schema.json`](../config-ui/schema/workspace.schema.json).
 See [Workspace schema](workspace-schema.md) and the
-[XYZ field audit](xyz-workspace-field-audit.md).
+[XYZ field audit](#xyz-v4234-workspace-field-audit) below.
+
+---
+
+## External XYZ plugins
+
+External plugins are reviewed deployment code stored under
+`instance/public/plugins`. They are not copied into or applied as patches to
+the pinned GEOLYTIX XYZ checkout. The same read-only directory is mounted into
+live XYZ, preview XYZ, and the configuration service.
+
+## Package format
+
+Each plugin has its own directory containing `plugin.json`, one `.mjs` or `.js`
+entry point, and optional contained assets. Discovery reads the manifest and
+hashes files; it never imports the module.
+
+The manifest declares its stable ID, semantic version, compatible XYZ version
+range, entry file, `mapp.plugins` registration key, locale/layer scope,
+dispatch modes, configuration property and closed JSON Schema, dependencies,
+prerequisites, documentation, aliases, and declarative preview assertions.
+The viewport layer-count package is the reference implementation.
+
+Modules execute as trusted same-origin browser JavaScript. They must register
+their function as a side effect on `mapp.plugins`; XYZ ignores module exports.
+Installation and code changes require source review and a deployment. The
+dashboard does not upload executable code.
+
+## Validation and lifecycle
+
+The server rejects unregistered and remote URLs, wrong-scope configuration,
+missing module/configuration pairs, undeclared synchronous dispatch, missing
+dependencies, and properties outside each plugin schema. Dependencies are
+never installed or reordered automatically.
+
+The catalogue fingerprint covers normalized manifests and entry hashes.
+Proposals and preview evidence bind to it. A plugin change makes earlier
+proposals and previews stale, requiring a new proposal and candidate preview.
+
+Preview assertions use platform-owned checks: registration, locale/layer
+dispatch with an observable selector, selector existence or visibility, and
+absence of plugin-related browser errors. Manifest-provided test code is never
+executed by the configuration service. A post-apply visual test separately
+confirms behavior against live XYZ.
+
+Authenticated callers with `inspect` can read `GET /api/plugins`. The response
+contains the pinned built-in registry, source-controlled external manifests,
+workspace usage and diagnostics, declarative preview checks, and the catalogue
+fingerprint. The standalone client exposes that same server-owned response
+through `config-cli plugins list`, `show`, `validate`, and `usage`; these are
+inspection commands and never install, upload, import, or mutate a plugin.
+Treat an absent advertised plugin command as unavailable rather than calling a
+similar route directly.
+
+`./bin/mapp doctor` validates source manifests; `./bin/mapp verify`
+additionally compares mounted plugin hashes across services.
+
+---
+
+## XYZ v4.23.4 workspace field audit
+
+This audit records the configuration surface checked against the pinned XYZ
+commit `a6f03c07dd7aaae2e9ab04087143ee0400e15cb9`. The machine-readable result is
+[`config-ui/schema/workspace.schema.json`](../config-ui/schema/workspace.schema.json).
+
+## Sources inspected
+
+- `mod/workspace/*` for workspace, locale, template, and role composition.
+- `lib/mapview/_mapview.mjs` for locale extent, view, controls, scale line,
+  plugins, and SVG templates.
+- `lib/layer/format/*` for every exported layer format.
+- `lib/layer/decorate.mjs`, `featureFields.mjs`, and `featureFormats.mjs` for
+  shared layer, query, feature, and zoom-dependent settings.
+- `lib/layer/styleParser.mjs`, `featureStyle.mjs`, `themes/*`,
+  `utils/olStyle.mjs`, and `utils/svgSymbols.mjs` for styling.
+- `lib/ui/locations/entries/*` and `infoj.mjs` for feature-information entries.
+- Upstream `tests/assets` workspaces and layer fixtures for composition cases.
+
+## Audited configuration groups
+
+| Group | Fields and variants covered |
+| --- | --- |
+| Workspace | `key`, `dbs`, `locale`, `locales`, `templates` |
+| Locale | `name`, `role`, `roles`, `srid`, `extent`, `view`, zoom limits, map controls, `ScaleLine`, plugins, sequential plugins, SVG templates, query parameters, nested locales and layers |
+| Layer composition | `template`, `templates`, `src`, included/excluded properties, roles |
+| Formats | `cluster`, `geojson`, `googleMapTiles`, `mapboxStyle`, `maplibre`, `mvt`, `tiles`, `vector`, `wkt` |
+| Database layers | `dbs`, `table`/`tables`, `geom`/`geoms`, `srid`, `qID`, `z_field`, query parameters |
+| Tile/vendor layers | `URI`, `source`, `projection`, Google `apiKey`, Mapbox `accessToken`, style URL/object, drawing-buffer option |
+| Feature loading | inline `features`, `featureFormat`, `featureSet`, `featureLookup`, lookup ID, separate WKT properties, transition, cache size, vector-image mode |
+| Clustering | mutually exclusive `distance`/`resolution`, `hexgrid`, label field |
+| Layer behavior | display, opacity, z-index, fade, promote-on-display, zoom display, filters, attribution, info ordering/skipping |
+| Feature style | fill/stroke colours and opacity, width, dash arrays, z-index, scale variants, icons and labels |
+| Layer style | default, highlight, selected, cluster, theme(s), hover(s), label(s), icon scaling, cache, layer opacity, tile context filter |
+| Themes | basic, categorized, graduated, distributed; fields, categories, category styles/icons, breaks and distributions |
+| Icons | every built-in v4.23.4 SVG symbol, custom URL/SVG/template sources, symbol-specific colours, letter, scale and anchor |
+| Feature information | the complete active and legacy type registry plus field/query/key entries, display/edit flags, groups, JSON extraction, fallback/skip behavior, formatting, dependencies, tooltips, tabs and links |
+| Layer list grouping | per-layer `group`, `groupClassList`, and `groupmeta`; XYZ creates a drawer for each shared `group` value and copies CSS classes from the first member that creates it |
+
+## Template and plugin-extension follow-up
+
+The template loader at this commit accepts provider-qualified `src` values,
+inline `template` text, `module`, and query controls including `dbs`,
+`nonblocking`, `statement_timeout`, `value_only`, and `reduce`. Locale and layer
+`template`/`templates` values are ordered composition references and may be
+keys or inline descriptor objects.
+
+Layer-panel gazetteer datasets, recursive `keyvalue_dictionary` replacement,
+and both `svgTemplates` and legacy `svg_templates` are native. Locale keys are also a
+plugin dispatch surface. The machine schema enumerates the bundled registry:
+`admin`, `consent`, `custom_theme`, `dark_mode`, `feature_info`, `fullscreen`,
+`layer_order`, `link_button`, `locator`, `login`, `test`, `userIDB`,
+`userLayer`, `userLocale`, `zoomBtn`, and `zoomToArea` (plus the legacy
+`svg_templates` dispatch). It does not advertise configuration families absent
+from this registry. Unknown keys remain permitted solely for lossless
+round-tripping, not as a support claim.
+
+The supplied `googleMaps`, `measure_distance`, `query_features`, `posthog`,
+`userSettings`, `info_panel`, `screenshot`, `coordinates`, and `streetview`
+names had no reader in the pinned `lib` or `mod` trees. `query_features` toolbar
+and table shapes and `measure_distance` route shapes likewise had no match.
+They may belong to external or older application plugins but are not pinned
+framework capabilities.
+
+The proposed locale-level `gazetteer` placement also has no consumer in this
+commit. The native panel is created from `layer.gazetteer`; it injects the
+owning layer and mapview before invoking the shared Gazetteer UI. External
+provider names are checked dynamically, but pinned core only exports database
+dataset search and coordinate-result handling.
+
+## Supplied workspace-tree verdict
+
+| Supplied area | Verdict at v4.23.4 | Effective behavior |
+| --- | --- | --- |
+| Root `dbs` | Native | Default `DBS_<key>` connection inherited by templates/locales/layers when no nearer override exists. |
+| Root `templates` | Native | Lookup registry for queries and object composition. `src` is lazy-loaded; inline `template` is content; query flags control connection, response shape, timeout, and nonblocking execution. |
+| Locale `name`, `roles` | Native | Name labels and composes nested locales. Roles gate access; `*` is unrestricted, `!role` is negated, and matching object values merge role-specific overrides. |
+| Locale `extent`, `view`, `minZoom`, `maxZoom`, `ScaleLine` | Native | Builds the OpenLayers projection/centre/zoom/extent; optional extent mask adds a world-minus-extent overlay; scale units normalize to metric unless exactly imperial. |
+| Locale `queryparams` | Native | Shallow-merged into each resolved layer's own query parameters. |
+| Locale `plugins`, `syncPlugins` | Native loader | Module references load first; named synchronous plugins execute in order; remaining locale keys matching registered plugin functions execute concurrently. |
+| Locale `svg_templates` | Native legacy alias | Copied to preferred `svgTemplates`; source URLs are fetched before synchronous feature-style use. |
+| Locale `template`, `templates[]` | Native composition | A key or descriptor is resolved and merged. Multiple entries apply in order with XYZ's merge and role rules; they are not generic runtime query includes. |
+| Locale `test`, `zoomBtn`, `login`, `locator`, `zoomToArea` | Bundled plugins | Implement browser tests, zoom controls, login navigation, browser location, and drag-box zoom respectively, subject to their runtime prerequisites. |
+| Locale `googleMaps` | Not found | No locale reader or bundled plugin. `googleMapTiles` exists separately as a layer format. |
+| Locale `gazetteer` | Wrong placement | Rejected. Use `layer.gazetteer` for the pinned layer drawer search panel. |
+| Locale `measure_distance`, `query_features`, `posthog` | Not found | No module, registry entry, or matching test/config consumer in the pinned trees. |
+| Locale `userSettings`, `info_panel`, `screenshot`, `coordinates`, `streetview` | Not found as locale capabilities | Some words occur in unrelated APIs, dictionary text, geometry, or comments, but no same-named locale reader/plugin implements these objects. |
+| Locale `keyvalue_dictionary` | Native | Recursively replaces matching string property/value pairs before mapview decoration, choosing the active language value, then `default`, then the original. |
+| Layer `keyvalue_dictionary` | Native | The same recursive replacement runs before layer decoration. |
+| Layer `template`, `templates`, `src`, roles, filter, style, draw and documented data/query settings | Native composition | Resolved by layer composition/decorators and the format/panel modules. The schema accepts audited layer fields and rejects unknown ones. |
+| Layer `gazetteer` | Native | Creates the Gazetteer panel; supports coordinate input and database searches using the owning layer or dataset overrides. |
+| Named layer options such as `draft_trade_zones_live`, `theme_picker`, `isurf` | Not established by their names | Only supported if an audited core reader or loaded plugin consumes them. They are not advertised merely because an old workspace contains them. |
+
+## Intentional schema behavior
+
+XYZ composes partial workspace, locale, and layer objects through templates.
+The JSON Schema permits partial objects but rejects unadvertised properties at
+contract boundaries. Named maps remain open only where arbitrary keys are part
+of the audited behavior. The dashboard's server-side validator is stricter for a concrete
+saved database layer: it checks configured `DBS_*` connections, live catalog
+columns, SRIDs, SQL expressions, and an XYZ-equivalent render probe.
+
+The pinned workspace/cache path keeps top-level `workspace.locale` as the
+default and composes it into named `workspace.locales` entries except a key
+literally called `locale`. This uses XYZ's merge helper, not a generic deep
+merge: nested objects merge, while arrays concatenate unless all source items
+are already present, in which case the source replaces the target.
+If `workspace.locale` is absent, the cache path synthesizes
+`{layers: {}}`; default selection still resolves that empty locale rather than
+auto-selecting a sole named entry.
+
+The upstream fixture workspaces under `tests/assets` were checked against the
+schema after this audit. All complete workspace fixtures validate, as does this
+project's current workspace.

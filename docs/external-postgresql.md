@@ -3,7 +3,8 @@
 Use this document when MAPP will connect to a PostgreSQL database managed
 outside this deployment. The database administrator remains responsible for
 database availability, extensions, roles, grants, TLS, backups, and recovery.
-MAPP does not create or migrate source schemas in external mode.
+MAPP does not create or migrate source schemas: it attaches them read-only
+and writes nothing.
 
 ## Information the MAPP operator must provide
 
@@ -24,9 +25,9 @@ channel.
 
 ## Required database features
 
-- A supported PostgreSQL server reachable from the `xyz` and `config-ui`
-  containers. `localhost`, loopback addresses, and the bundled hostname `db`
-  are rejected in external mode.
+- A supported PostgreSQL server reachable from the `config-ui` container.
+  `localhost`, loopback addresses, and the packaged hostname `db` are
+  rejected: a source must be a genuinely separate database.
 - PostGIS installed in the target database.
 - Source relations already populated and compatible with the workspace.
 - PostgreSQL network policy, such as `pg_hba.conf` and firewalls, permitting
@@ -291,7 +292,7 @@ PostgreSQL to use them. Index creation can lock a source relation and increases
 storage and write cost, so external operators should build these before opening
 CLI access and schedule retrofits in a maintenance window.
 
-The automatic first-start upgrade applies only to the bundled database, where
+The automatic first-start upgrade applies only to the packaged database, where
 MAPP owns the administrative role and schemas. External connections remain
 non-mutating at startup; their database administrator must apply this handoff
 before exposing the connection to configuration or derived-layer services.

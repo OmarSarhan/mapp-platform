@@ -14,7 +14,7 @@
 #
 # Deliberately plain postgis/postgis, not the custom mapp-postgis-h3 image —
 # a real independently-operated external source would not have MAPP's own
-# H3 extension installed (docs/federation-architecture-waypoint.md).
+# H3 extension installed.
 services:
   # config-ui only sees FEDERATION_DBS_<REF> vars explicitly listed here —
   # Compose's `environment:` block does not forward arbitrary .env keys.

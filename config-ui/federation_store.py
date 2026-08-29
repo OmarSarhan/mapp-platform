@@ -186,9 +186,9 @@ class FederationAliasStore:
         # Observe and Provision — never one that was already observed. This
         # column records the identity a successful provision() actually
         # accepted, so a source database replaced and then re-observed is
-        # still caught (docs/federation-architecture-waypoint.md: "The same
-        # table name at a new physical database is not the same source
-        # unless an operator performs an explicit, evidenced rebind").
+        # still caught: the same table name at a new physical database is
+        # not the same source unless an operator performs an explicit,
+        # evidenced rebind.
         # Deliberately not backfilled from physical_identity — that would
         # retroactively "accept" whatever is there now, which is exactly the
         # replacement this exists to catch.

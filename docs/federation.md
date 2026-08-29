@@ -188,7 +188,7 @@ keeps every name and column identical while being a different database.
 Provisioning refuses with `federation.physical_rebind_not_acknowledged` unless
 you say so deliberately.
 
-A successful provision creates, in the bundled database:
+A successful provision creates, in the packaged database:
 
 - a foreign server `<alias>_srv`,
 - user mappings holding the remote credential,

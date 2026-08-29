@@ -307,7 +307,9 @@ untouched, so `./bin/mapp demo` rebuilds the showcase from them afterwards.
 Production is an explicit environment setting, and it refuses configurations
 that are fine in development — the demo sources among them.
 
-Read: [`deployment.md`](deployment.md), [`production-acceptance.md`](production-acceptance.md)
+Read: [`deployment.md`](deployment.md), whose
+[production acceptance](deployment.md#production-acceptance-evidence) section covers the
+evidence a release is expected to carry.
 
 ## 9. The security model
 
@@ -351,7 +353,7 @@ Read: [`security.md`](security.md)
 | [`federation.md`](federation.md) | The full source lifecycle, error codes, traps |
 | [`semantic-layer.md`](semantic-layer.md) | Profiles, curation, generation, delivery |
 | [`derived-layers.md`](derived-layers.md) | Recipes, refresh, dependency guards |
-| [`workspace-schema.md`](workspace-schema.md) | The workspace document XYZ renders |
+| [`workspace-schema.md`](workspace-schema.md) | The workspace document XYZ renders, the audited plugin surface, and the pinned XYZ field audit |
 | [`external-postgresql.md`](external-postgresql.md) | Preparing a source database to be attached |
 
 **Operating and assuring**
@@ -360,23 +362,8 @@ Read: [`security.md`](security.md)
 | --- | --- |
 | [`security.md`](security.md) | Roles, isolation, secrets, the trust boundary |
 | [`backup-restore.md`](backup-restore.md) | What to back up and how to restore it |
-| [`production-acceptance.md`](production-acceptance.md) | Evidence collection before going live |
-| [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation |
-
-**Interfaces**
-
-| Document | What it covers |
-| --- | --- |
+| [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation, XYZ framework policy |
 | [`api-contract.md`](api-contract.md) | Every route, its scope and its shape |
-| [`external-plugins.md`](external-plugins.md) | The audited XYZ plugin surface |
-
-**History, not instructions**
-
-| Document | What it is |
-| --- | --- |
-| [`federation-architecture-waypoint.md`](federation-architecture-waypoint.md) | Superseded. The record of how the federation design was reached |
-| [`validation-log.md`](validation-log.md) | Dated results of past validation runs |
-| [`repository-split.md`](repository-split.md) | How the platform and CLI repositories were separated |
 
 ---
 

@@ -527,9 +527,7 @@ class CensusPostgresStore:
                 # Deliberately not underscore-prefixed, unlike RUN_TABLE:
                 # semantic sync excludes "_"-prefixed relations from
                 # discovery, and the federation verifier must be able to
-                # read this record (see
-                # docs/federation-architecture-waypoint.md, "Publication
-                # record"). Exactly one row — the current release —
+                # read this record. Exactly one row — the current release —
                 # enforced by the boolean singleton primary key.
                 cursor.execute(
                     sql.SQL(

@@ -564,7 +564,7 @@ cause. `registrySchemaPresent` is reported but excluded from `federationReady`
 because it is a different kind of problem with a different fix: the three
 privileges are grants, whereas the registry schema is a `CREATE SCHEMA`
 statement an administrator runs once. It is created by the role-setup scripts
-on a bundled database and by the administrator on an external one -- **not**
+on a packaged database and by the administrator on an external one -- **not**
 on demand by provisioning, which creates only the per-alias `source_<alias>`
 schema. `./bin/mapp verify` reports its absence separately, naming the
 statement.

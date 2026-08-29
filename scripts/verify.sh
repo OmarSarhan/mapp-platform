@@ -1999,14 +1999,10 @@ with psycopg.connect(
                 "The active DERIVED_DATABASE_URL owner search_path must be "
                 "exactly pg_catalog, public."
             )
-        # The databaseName comparison below is the generalized invariant from
-        # docs/federation-architecture-waypoint.md, "Relationship to the
-        # current single-database contract": the derived owner must live in
-        # the database the effective dbs alias of the workspace resolves to.
-        # compose.yaml forwards DBS_MAPP by explicit enumeration, so that
-        # alias can only resolve to this reader connection, and federated mode
-        # repoints reader and derived owner in the same step by design. Do not
-        # relax it when federated mode gains its own database.
+        # The invariant: the derived owner must live in the database the
+        # effective dbs alias of the workspace resolves to. compose.yaml
+        # forwards DBS_MAPP by explicit enumeration, so that alias can only
+        # resolve to this reader connection.
         if (
             not audit
             or not audit["postgis"]

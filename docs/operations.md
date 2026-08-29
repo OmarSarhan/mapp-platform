@@ -24,9 +24,6 @@ the database clients' shared connection to it. The semantic service now holds
 two credentials of its own: `SEMANTIC_READER_DATABASE_URL` for every catalog
 read and `SEMANTIC_DATABASE_URL` for every catalog write. Both reach only the
 `semantic` schema of that same database, which is where the catalog lives.
-Before switching an existing bundled deployment to external mode, take a
-backup and run `./bin/mapp down`; otherwise its already-running `db` container
-is outside the newly selected service set and remains untouched.
 
 Live deployments keep `MAPP_ENVIRONMENT=production` in `.env`. Caddy is their
 only published application endpoint: TCP 80 is redirect/ACME traffic and
@@ -59,19 +56,19 @@ layers built across them. It is idempotent: rerunning it reloads the sources
 and republishes. A demo that goes wrong is reset and rebuilt with it rather
 than repaired.
 
-Before full ETL or `census-etl`, confirm database-volume headroom. The raw
+Before running `./bin/mapp demo`, confirm headroom on the census-db volume. The raw
 statistic values alone are approximately 636 MiB (667 MB), while PostgreSQL
 staging, the old and new snapshots, indexes, geometry, and WAL can coexist. Use
 6 GiB free only as a minimum planning floor, provision additional operational
 headroom, and monitor the database volume during the run. Container `/tmp`
 capacity does not replace database-volume capacity.
 
-After bundled ETL publication, MAPP idempotently prepares native, EPSG:4326,
-EPSG:3857, EPSG:27700, and safe geometry/geography cross-cast GiST indexes and
-runs `ANALYZE`. Include this index set in capacity estimates. Existing bundled
-volumes receive the complete idempotent role, H3, and spatial-index upgrade
-automatically before `up`, `serve`, `config-ui`, `etl`, `census-etl`, or `all`
-starts application/database work. The automatic index ensure analyzes a
+MAPP idempotently prepares native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
+geometry/geography cross-cast GiST indexes on the relations it owns, and runs
+`ANALYZE`. Include this index set in capacity estimates. An existing packaged
+volume receives the complete idempotent role, H3, and spatial-index upgrade
+automatically before `up`, `serve`, `config-ui` or `all` starts
+application/database work. The automatic index ensure analyzes a
 relation only when it creates a missing index. `./bin/mapp upgrade-derived`
 remains the explicit maintenance entry point, and `./bin/mapp verify` audits
 the result without changing database state. Verification also checks the
@@ -88,7 +85,7 @@ authoritative year in the required OS copyright statement and configure the
 complete ONS/OS `layer.attribution`. The `[year]` placeholder is a
 display-and-redistribution release gate, not a value to infer.
 
-To rebuild the bundled database from its initialization scripts and leave only
+To rebuild the packaged database from its initialization scripts and leave only
 the configured ETL datasets, use the explicitly destructive command:
 
 ```sh
@@ -167,10 +164,10 @@ volume was already removed, do not attempt semantic compensation; run the
 confirmed reset again to finish initialization. External-database mode rejects
 both reset and reset-recovery commands.
 
-The ETL is optional data provisioning for the bundled database, not a
-continuously running or required platform service. The wrapper disables it in
-external mode. If the sample stack needs regular refreshes, schedule it with
-the host's approved scheduler. Prevent overlapping invocations at the
+The ETL loads the demo's source databases, not the packaged one, and is not a
+continuously running or required platform service. If the demo sources need
+regular refreshes, schedule `./bin/mapp demo` with the host's approved
+scheduler. Prevent overlapping invocations at the
 scheduler level even though each target also uses a PostgreSQL advisory lock.
 
 `./bin/mapp demo` loads all three configured sample sources into `ops-db`. A
@@ -239,7 +236,7 @@ decision, not a replacement for it. Neither role can reach `derived_layers`,
 `federation`, `public`, or any `source_<alias>` schema, and neither holds
 `postgres_fdw` `USAGE` or any role membership.
 
-Both roles and the schema are created by the bundled database's initialization
+Both roles and the schema are created by the packaged database's initialization
 scripts, which run only on an empty data directory. An installation predating
 this change needs `./bin/mapp doctor --add-missing` for the six new keys and a
 fresh database volume; adding keys to `.env` does not create roles in a volume

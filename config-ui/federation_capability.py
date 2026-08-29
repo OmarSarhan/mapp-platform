@@ -141,9 +141,9 @@ def extension_versions(cursor: Any) -> dict[str, str]:
     """PostgreSQL/PostGIS/PROJ/GEOS versions visible on `cursor`'s own
     connection. Used both for a remote alias (Discover/Observe evidence)
     and for the federation database itself (federation_store.py's
-    version-match gate for postgres_fdw's `extensions` option — see
-    docs/federation-architecture-waypoint.md's "Decided" pushdown-safety
-    rule)."""
+    version-match gate for postgres_fdw's `extensions` option, which
+    declares postgis shippable only when both databases report the same
+    version)."""
     cursor.execute("SELECT current_setting('server_version') AS version")
     versions = {"postgresql": cursor.fetchone()["version"]}
 

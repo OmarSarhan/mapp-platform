@@ -154,8 +154,8 @@ CREATE SCHEMA derived_layers AUTHORIZATION :"derived_db_user";
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
 GRANT USAGE ON SCHEMA derived_layers TO :"xyz_db_user";
 
--- Federation alias registry (docs/federation-architecture-waypoint.md,
--- Control schema). Not workspace-visible: no grant to xyz_db_user.
+-- Federation alias registry, its observation history and group labels.
+-- Not workspace-visible: no grant to xyz_db_user.
 CREATE SCHEMA federation AUTHORIZATION :"federation_db_user";
 REVOKE ALL ON SCHEMA federation FROM PUBLIC;
 REVOKE ALL ON SCHEMA federation

@@ -2,7 +2,7 @@
 set -eu
 
 # This container plays the part of an independently-operated external
-# source database for federation testing (docs/federation-architecture-waypoint.md).
+# source database for federation testing.
 # It deliberately runs plain postgis/postgis, not MAPP's own H3-enabled image
 # — a real external source would not have MAPP's extensions installed.
 

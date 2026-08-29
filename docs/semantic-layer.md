@@ -507,7 +507,7 @@ cause, then use the confirmed administrator retry. The retained event remains
 unchanged, so retrying without correcting a deterministic failure will
 reproduce it. Recovery is not permission to invent curated annotations.
 
-The destructive bundled-database `reset-data --confirm` operation no longer
+The destructive `reset-data --confirm` operation no longer
 preserves this history: the catalog is a schema in the volume that reset
 removes, so the archived tombstones and the curated metadata they carry are
 deleted with it. The choreography below therefore protects the aborted path,

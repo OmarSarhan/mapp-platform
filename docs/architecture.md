@@ -16,11 +16,6 @@ MAPP Platform owns the live server and its configuration API. The standalone
 `config-cli` is an external client and should be released, installed, and
 secured independently.
 
-The proposed multi-source execution model is recorded separately as the
-[federation architecture waypoint](federation-architecture-waypoint.md). It is
-a north-star development handoff, not part of the currently implemented
-deployment contract described on this page.
-
 ```text
                          public network
                               │
@@ -34,20 +29,21 @@ deployment contract described on this page.
                          │       │       ├── browser runner
                          └──┬────┘       └── semantic service ──> semantic schema
                             ▼                                     in that database
-              bundled or external PostgreSQL/PostGIS
+              packaged PostgreSQL/PostGIS
                             ▲
-                            │ bundled sample mode only
-                    optional one-shot ETL
+                            │ postgres_fdw, read-only
+              source PostgreSQL databases
                          ▲        ▲
               Leeds ArcGIS   ONS/Nomis Census
+                 (loaded by the demo, straight from the publishers)
 
 external config-cli ── HTTPS/bearer token ──> config API
 ```
 
-Caddy is the only platform service intended to publish host ports. Bundled
-PostgreSQL, XYZ, the configuration service, and the browser runner communicate
-over private Compose networks; external PostGIS traffic leaves the backend
-network for the operator-managed endpoint. The browser runner shares only the
+Caddy is the only platform service intended to publish host ports. The
+packaged PostgreSQL, XYZ, the configuration service, and the browser runner
+communicate over private Compose networks; traffic to a federated source
+leaves the backend network for the database that operator runs. The browser runner shares only the
 internal automation network with the configuration service, Caddy, and an
 allowlisting Squid proxy. Only that unprivileged proxy joins the dedicated
 external network, so Chromium can fetch reviewed basemap assets without a
@@ -64,8 +60,9 @@ database roles are confined to the `semantic` catalog schema.
 
 | Component | Responsibility | Persistent inputs/state |
 | --- | --- | --- |
-| PostgreSQL/PostGIS | Application data and spatial indexes; either bundled sample data or an externally managed server | Named PostgreSQL volume in the local-database modes; external operator in external mode |
-| ETL | Optional Leeds sample and reviewed England Census 2021 provisioning through bounded, validated source reads | `instance/etl/layers.json`, `instance/etl/census.json`; local-database modes through the wrapper |
+| PostgreSQL/PostGIS | The packaged database: derived layers, the federation registry, the semantic catalogue, and the foreign tables of every provisioned source | Named PostgreSQL volume |
+| Source databases | Independently operated PostgreSQL servers holding the spatial data, attached read-only through `postgres_fdw` | Owned by whoever runs them; the demo overlay stands up two throwaway ones |
+| ETL | Loads the demo's two source databases from their publishers. Not a packaged loader: it writes to source databases, never to the packaged one | `instance/etl/layers.json`, `instance/etl/census.json` |
 | XYZ | Map UI, MVT and feature queries | `var/workspace/workspace.json`, `instance/xyz.env`, public assets |
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
 | Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
@@ -141,7 +138,7 @@ instead of discarding the source change or guessing. The confirmed
 administrator action only requeues the same retained event and payload; it
 cannot correct a deterministic conflict by itself.
 
-Bundled database reset owns a fenced maintenance gate. It first uses automatic
+Packaged database reset owns a fenced maintenance gate. It first uses automatic
 delivery to reach a completely ready, blocker-free preflight state, then
 archives and verifies every current asset before volume removal. A handled
 interruption can compensate only its own gate. Recovery gives each definition
@@ -189,19 +186,18 @@ the result to its proposal ID and candidate hash.
 
 ## Database roles
 
-- "The bundled database" throughout this documentation means the PostgreSQL
-  instance MAPP runs itself, from `compose.bundled-db.yaml`. Both
-  local-database modes, `bundled` and `federated`, use it; only `external`
-  has none. Statements about it apply to both unless they name a mode.
+- "The packaged database" throughout this documentation means the PostgreSQL
+  instance MAPP runs itself, from `compose.bundled-db.yaml`. Every deployment
+  has exactly one. It holds the platform's own state -- derived layers, the
+  federation registry, the semantic catalogue -- and never your spatial data.
 - `DBS_MAPP` is the single runtime connection shared by XYZ and configuration
   discovery/validation. Its role should have only the read privileges required
   by mapped workspace layers.
-- With a local database, the bootstrap PostgreSQL role initializes the sample
-  database and is not passed to application services. The ETL role owns its
-  sample schema and the XYZ role reads it.
-- In external mode, roles, PostGIS installation, schema privileges, TLS,
-  backup, and recovery are owned by the external database operator. The
-  bundled bootstrap and ETL roles are unused.
+- The bootstrap PostgreSQL role initialises the packaged database and is not
+  passed to any application service.
+- In a source database, roles, PostGIS installation, schema privileges, TLS,
+  backup and recovery are owned by whoever operates it. MAPP holds one
+  read-only credential into it and writes nothing.
 
 Managed derived layers deliberately use a separate `DERIVED_DATABASE_URL`.
 Only the configuration service receives this narrow identity, which owns

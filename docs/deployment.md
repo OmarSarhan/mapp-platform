@@ -154,10 +154,10 @@ the same absolute paths in both `xyz` and `config-ui`, plus corresponding URI
 parameters. Never commit that material or downgrade TLS verification to
 compensate for a missing mount.
 
-When changing an existing deployment from `bundled` to `external`, back up the
-bundled database and run `./bin/mapp down` before editing the mode and URI.
-This removes the old containers and networks but preserves the named database
-volume; external mode does not destroy it or manage its retention.
+External data is attached by federating the database that holds it, not by
+repointing `DBS_MAPP`. See [federation.md](federation.md) for the lifecycle
+and [external-postgresql.md](external-postgresql.md) for preparing the source
+database.
 
 The shipped production overlay models Caddy as the direct HTTPS endpoint. A
 deployment behind another reverse proxy or on a non-standard public port is a
@@ -177,13 +177,12 @@ This includes the private `semantic-service` in every database mode. The
 service is reachable only from `config-ui` on the internal
 `semantic-control` network; it joins the backend network solely to persist its
 catalog in the `semantic` schema of the packaged database.
-The `all` command loads the full ETL, including Census, before verification
-in either local-database mode.
-In external mode, `etl`, `all`, and the local `db` command are disabled;
-`verify` checks the external PostGIS connection and catalog plus the generic
-platform and gateway gates, including the platform layer-dependency guard
-objects that block manual drops of actively referenced relations. Complete
-external acceptance with layer-specific visual tests for that workspace.
+`./bin/mapp all` starts the platform and verifies it; it loads no data.
+`verify` checks the packaged PostGIS connection and catalogue plus the
+platform and gateway gates, including the layer-dependency guard objects that
+block manual drops of actively referenced relations. Where the demo is on it
+also checks the demo content in the source databases that hold it. Complete
+acceptance with layer-specific visual tests for the workspace.
 
 Use `./bin/mapp ps` and `./bin/mapp logs` from the same repository with its
 production `.env` while bringing up the release. Confirm both public hostnames,
@@ -196,7 +195,7 @@ restoration, and the browser runner's outbound asset policy. Review
 mirror assets locally when an external origin is not acceptable.
 
 Collect the production-host and rehearsal results through the
-[production acceptance evidence workflow](production-acceptance.md). The
+[production acceptance evidence workflow](#production-acceptance-evidence). The
 generated report distinguishes observed passes from external or not-yet-run
 items; it does not treat a documented prerequisite as evidence that it exists.
 
@@ -233,7 +232,7 @@ administrator-session-only.
 7. Recreate application containers for production.
 
 Use the explicit upgrade and rollback rehearsal hooks described in
-[production acceptance evidence](production-acceptance.md) against an isolated
+[production acceptance evidence](#production-acceptance-evidence) against an isolated
 restore before production promotion.
 
 Application rollback should restore the previous accepted images while
@@ -254,19 +253,20 @@ dashboard from validating against a different database from the one XYZ uses.
 | Variable | Purpose |
 | --- | --- |
 | `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Points at the packaged database and is not repointed: external data is attached by federating it, not by aiming the runtime reader elsewhere. |
-| `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
+| `POSTGRES_DB` | Database name created by the packaged database overlay and referenced by its default connection strings. |
 | `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role `DBS_MAPP` uses against the packaged database. |
-| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the bundled sample database only. They are not passed to XYZ or the dashboard. |
-| `DB_BIND_ADDRESS`, `DB_PORT` | Optional host publication of the bundled database through `compose.db-port.yaml`; these do not select an external server. |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the packaged database only. They are not passed to XYZ or the dashboard. |
+| `DB_BIND_ADDRESS`, `DB_PORT` | Optional host publication of the packaged database through `compose.db-port.yaml`; these do not select an external server. |
 
-The default created by `./bin/mapp init` is the bundled sample arrangement:
+The default created by `./bin/mapp init` is the packaged arrangement:
 
 ```dotenv
 DBS_MAPP=postgresql://${XYZ_DB_USER}:${XYZ_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
 ETL_DATABASE_URL=postgresql://${ETL_DB_USER}:${ETL_DB_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
 ```
 
-Use `./bin/mapp all` to load and verify every configured bundled sample source.
+Use `./bin/mapp all` to start and verify the platform, and `./bin/mapp demo`
+to load the demo sources.
 
 To remove the complete bundled PostgreSQL volume and rebuild it with only the
 configured ETL sources, run:
@@ -342,3 +342,138 @@ For production, do not rely on the local defaults. Read
 [Backup and restore](backup-restore.md) first. The shipped direct
 production topology requires distinct public HTTPS DNS hostnames for map and
 configuration traffic, with Caddy directly bound to ports 80 and 443.
+
+---
+
+## Production acceptance evidence
+
+Production acceptance is an observed release exercise, not a checklist that can
+be completed from repository contents. The evidence command records what it
+could verify and leaves unobservable controls `pending` with a reason:
+
+```sh
+./bin/mapp production-acceptance
+```
+
+The default report is
+`var/acceptance/production-evidence.json`. It is created atomically with mode
+`0600` under a mode-`0700` directory and must not be committed. The report
+contains check identifiers, statuses, concise results, and safe reasons. It
+does not copy environment values or hook output.
+
+The basic run validates:
+
+- private environment-file permissions and the production-only settings;
+- selection of the production topology;
+- the resolved production Compose model when Docker is available;
+- whether live service, DNS, TLS, HTTP, and host checks still require a
+  production-host run;
+- whether backup, isolated restore, upgrade, and rollback rehearsals still
+  require explicit hooks.
+
+A failed check exits `1`. Pending checks are evidence gaps rather than
+successes. They exit `0` by default so a preparation run can write its report;
+use `--require-complete` to exit `3` when any check is pending.
+
+## Live production-host run
+
+After the reviewed release is running, execute:
+
+```sh
+./bin/mapp production-acceptance --live --require-complete
+```
+
+The live run queries both public DNS names, verifies their system-trusted TLS
+chains and hostnames, requests the public endpoints, reads Compose health, and
+attempts to read a supported host firewall (`ufw`, `firewall-cmd`, or `nft`).
+It never changes DNS, certificates, firewall rules, containers, or data.
+
+A readable host firewall is evidence of observability, not evidence that its
+policy is correct. Review the captured host policy separately and record the
+provider load-balancer, security-group, or network-firewall review in the
+release record. Those external controls cannot be inferred by this process.
+Confirm that only the intended SSH administration path and public TCP 80,
+TCP 443, and UDP 443 are reachable; PostgreSQL and application container ports
+must remain unpublished.
+
+Successful TLS inspection proves that a currently valid public chain and
+hostname were presented. It does not prove future ACME renewal. Exercise
+renewal against staging or monitor a real automatic renewal, then retain the
+Caddy event and certificate-expiry evidence with the release record.
+
+## Backup, isolated restore, upgrade, and rollback
+
+Rehearsals are deployment-specific and potentially destructive. The harness
+will not guess their targets or run arbitrary commands from `.env`. Supply
+reviewed, executable, argument-free hook files explicitly:
+
+```sh
+./bin/mapp production-acceptance \
+  --live \
+  --run-rehearsals \
+  --backup-hook /approved/hooks/create-backup \
+  --restore-hook /approved/hooks/restore-isolated \
+  --upgrade-hook /approved/hooks/upgrade-isolated \
+  --rollback-hook /approved/hooks/rollback-isolated \
+  --require-complete
+```
+
+Each hook must:
+
+- fail closed with a non-zero exit status;
+- operate against an explicitly isolated host, project name, DNS namespace,
+  database, volumes, and `var` copy;
+- enforce its own target guard before changing state;
+- avoid printing secrets; stdout and stderr are suppressed from the evidence
+  report and represented only by a SHA-256 digest;
+- clean up only resources it created;
+- perform the assertions below rather than merely completing a command.
+
+The backup hook must create a fresh database-aware backup plus protected,
+coordinated copies of `var/workspace`, `var/control`, Caddy state, and the
+release identity; the semantic catalog is inside the database backup rather
+than beside it. It must verify archive readability, private
+permissions, checksums, and the off-host destination.
+
+The restore hook must restore that exact backup into new storage and verify
+database/PostGIS health, representative data, workspace revision and
+fingerprint, authentication state, audit readability, semantic catalog
+revision and derived-profile readiness, proposal/artifact access, XYZ reload
+status, and representative visual behavior. It must never restore over the
+live deployment.
+
+The upgrade hook must start the candidate release against the isolated restored
+state, record accepted image digests, and run `./bin/mapp verify` plus the
+release's configuration and visual checks.
+
+The rollback hook must restore the previous accepted application images
+against the isolated state, then repeat health, configuration, reload, and
+visual checks. If an upgrade changes a database schema or PostgreSQL major
+version, the hook must exercise the separately reviewed data rollback or
+restore plan; container recreation alone is not a rollback.
+
+Passing hook evidence means the exact executable returned success during this
+run. Preserve the reviewed hook source, its output in an access-controlled
+operator log, the report, backup checksums, release/image digests, timestamps,
+operator identity, and measured recovery time outside the deployment host.
+
+## Acceptance record
+
+Do not promote a release until the evidence has no failures and every pending
+item has either been directly rerun successfully or is accompanied by a named,
+dated external review. Record:
+
+- release/tag and immutable image digests;
+- production and restored workspace revisions/fingerprints;
+- production and restored semantic catalog revisions;
+- database and PostGIS versions;
+- backup identifiers, checksums, recovery point, and retention destination;
+- restore start/end times and measured recovery time;
+- DNS answers, certificate expiry and renewal evidence;
+- host and provider firewall review;
+- upgrade and rollback rehearsal identifiers;
+- service, reload, API, and representative visual results;
+- operator/reviewer identities and unresolved exceptions.
+
+Never edit the JSON to turn a pending or failed observation into a pass. Rerun
+the check or attach the separate, attributable external evidence.

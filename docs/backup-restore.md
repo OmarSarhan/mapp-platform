@@ -129,7 +129,7 @@ Until automated schedules exist, record:
 Retention automation and periodic restore testing remain production-readiness
 items.
 
-The [production acceptance evidence workflow](production-acceptance.md)
+The [production acceptance evidence workflow](deployment.md#production-acceptance-evidence)
 provides explicit backup and isolated-restore hook points. A hook pass records
 that the reviewed executable succeeded; retain its protected operator log and
 backup checksums because hook output is deliberately excluded from the
