@@ -35,26 +35,29 @@ Do not publish XYZ or `config-ui` directly. Conflicting exported topology modes
 are rejected; use `MAPP_ENV_FILE` when deliberately selecting another complete
 environment.
 
-## ETL
+## Loading source data
 
 ```sh
-./bin/mapp etl bus_stops
-./bin/mapp etl definitive_paths
-./bin/mapp etl smoke_control_orders
 ./bin/mapp census-check TS001
-./bin/mapp census-etl
+./bin/mapp demo
 ```
 
-`census-check` validates the pinned Nomis archive hashes and performs a complete
-ordered scan of all 178,605 Output Area features against the pinned geometry
-hash without writing PostgreSQL; omit the topic to check all 47 reviewed
-England topic tables. `census-etl` provisions their 467 measures and matching
-2021 Output Area geometries. The full `./bin/mapp etl`, `./bin/mapp all`, and
-`./bin/mapp reset-data --confirm` workflows run the sample feeds first and then
-this Census load; use `./bin/mapp census-etl` only when you need to refresh
-Census by itself. When the optional Census snapshot is present, `./bin/mapp
-verify` compares its recorded geometry and all 47 topic source hashes with
-`instance/etl/census.json`.
+There is no packaged ETL. The platform database holds derived layers, the
+federation registry, the control plane and the semantic catalogue; spatial
+data lives in source databases it federates.
+
+`census-check` validates the pinned Nomis archive hashes and performs a
+complete ordered scan of all 178,605 Output Area features against the pinned
+geometry hash. It reads the publisher over the network and writes to no
+database; omit the topic to check all 47 reviewed England topic tables.
+
+`./bin/mapp demo` loads the Leeds showcase into its two source databases
+directly from their publishers -- the sample ArcGIS feeds into `ops-db` and
+the reviewed England Census 2021 topics into `census-db` -- then registers,
+observes and provisions both as federated sources and publishes the map
+layers built across them. It is idempotent: rerunning it reloads the sources
+and republishes. A demo that goes wrong is reset and rebuilt with it rather
+than repaired.
 
 Before full ETL or `census-etl`, confirm database-volume headroom. The raw
 statistic values alone are approximately 636 MiB (667 MB), while PostgreSQL
@@ -170,9 +173,9 @@ external mode. If the sample stack needs regular refreshes, schedule it with
 the host's approved scheduler. Prevent overlapping invocations at the
 scheduler level even though each target also uses a PostgreSQL advisory lock.
 
-The unrestricted `./bin/mapp etl` loads all three configured sources. A known
-ArcGIS rejection is logged concisely and still returns non-zero; unexpected
-errors retain their traceback. In either case the failed run is recorded and
+`./bin/mapp demo` loads all three configured sample sources into `ops-db`. A
+known ArcGIS rejection is logged concisely and still returns non-zero;
+unexpected errors retain their traceback. In either case the failed run is recorded and
 deletion reconciliation is skipped. See the
 [ETL polygon-source note](../etl/README.md#polygon-source-selection) for the
 reviewed replacement of the former planning sample.

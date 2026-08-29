@@ -96,10 +96,9 @@ gateway on host port `3000`; it does not mount the host Docker socket. Keep the
 standalone CLI open in its own repository and dev container.
 
 ```sh
-./bin/mapp init
-./bin/mapp serve
-./bin/mapp etl bus_stops
-./bin/mapp etl definitive_paths
+./bin/mapp init --demo
+./bin/mapp all
+./bin/mapp demo
 ```
 
 Initialization creates a private `.env`, initializes control-plane
@@ -112,12 +111,13 @@ Development-only local defaults:
 - Map: <http://localhost:3000>
 - Configuration dashboard: <http://config.localhost:3000>
 
-`./bin/mapp serve` starts the long-running services without running bundled
-ETL. In bundled-database mode, `./bin/mapp etl` loads every sample layer and
-then the reviewed England Census 2021 OA dataset; `./bin/mapp etl bus_stops`
-selects one configured sample layer. To work with Census alone, validate one
-source with `./bin/mapp census-check TS001`, or provision all reviewed topics
-with `./bin/mapp census-etl`.
+`./bin/mapp serve` starts the long-running services and loads nothing. There
+is no packaged ETL: spatial data lives in source databases the platform
+federates, and `./bin/mapp demo` is what loads the Leeds showcase into its two
+source databases straight from their publishers and publishes the map layers
+built from them. To check a Census source without loading it, use
+`./bin/mapp census-check TS001`, which reads the publisher and touches no
+database.
 
 The broken recent-planning sample was replaced with Leeds Smoke Control Orders,
 a healthy bounded polygon source. The replacement has its own table and
@@ -171,9 +171,9 @@ dashboard from validating against a different database from the one XYZ uses.
 
 | Variable | Purpose |
 | --- | --- |
-| `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Replace the complete URI for an external PostGIS server. |
+| `DBS_MAPP` | PostgreSQL URI used by both XYZ and the configuration dashboard. Points at the packaged database and is not repointed: external data is attached by federating it, not by aiming the runtime reader elsewhere. |
 | `POSTGRES_DB` | Database name created by the bundled database overlay and referenced by its default connection strings. |
-| `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role used by the default bundled `DBS_MAPP`. |
+| `XYZ_DB_USER`, `XYZ_DB_PASSWORD` | Read-only role `DBS_MAPP` uses against the packaged database. |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | Bootstrap administrator for the bundled sample database only. They are not passed to XYZ or the dashboard. |
 | `ETL_DB_USER`, `ETL_DB_PASSWORD` | Writer role for bundled ETL provisioning only. |
 | `ETL_DATABASE_URL` | Separate ETL destination; it is never used by XYZ or the dashboard. |
@@ -354,9 +354,8 @@ release hardening is still outstanding.
 
 ```sh
 ./bin/mapp serve
-./bin/mapp etl bus_stops
+./bin/mapp demo
 ./bin/mapp census-check TS001
-./bin/mapp census-etl
 ./bin/mapp test
 ./bin/mapp doctor
 ./bin/mapp verify

@@ -167,13 +167,7 @@ trusted headers, binding, TLS, and health checks; do not bypass the validator.
 ## Start and load
 
 ```sh
-# Bundled database:
-./bin/mapp serve
-./bin/mapp etl bus_stops
-./bin/mapp etl definitive_paths
-./bin/mapp etl smoke_control_orders
-
-# Or, without loading sample data:
+# Platform only. Nothing is loaded: spatial data lives in source databases.
 ./bin/mapp serve
 ./bin/mapp verify
 ```

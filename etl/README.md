@@ -51,17 +51,18 @@ Validate all pinned sources, or one topic, without changing the database:
 ./bin/mapp census-check TS001
 ```
 
-Run the complete load explicitly:
+Run the complete load through the demo, which loads it into the `census-db`
+source database rather than into the platform's own:
 
 ```sh
-./bin/mapp census-etl
+./bin/mapp demo
 ```
 
-Both commands use the bundled ETL tool and are unavailable in external-database
-mode. Census data is intentionally optional: `./bin/mapp etl`,
-`./bin/mapp reset-data --confirm`, and `./bin/mapp all` do not download or load
-it. A confirmed database reset therefore removes a previously loaded Census
-snapshot; run `./bin/mapp census-etl` again afterward if it is still wanted.
+`census-check` reads the publisher and writes to no database, so it works
+whatever state the sources are in. The platform database holds no spatial data
+at all, so `./bin/mapp reset-data --confirm` does not remove the Census
+snapshot: it lives in the `census-db` volume and survives. Rerun
+`./bin/mapp demo` when you want the sources reloaded from their publishers.
 The 47 topic archives alone are approximately 152 MiB compressed, before the
 boundary download and working space. The 467 double-precision values for
 178,605 rows require approximately 636 MiB (667 MB) before PostgreSQL row,

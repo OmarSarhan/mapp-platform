@@ -52,6 +52,49 @@ class CheckEnvironmentTests(unittest.TestCase):
         # And nothing after the boundary may build, or the guarantee is void.
         self.assertNotIn("--build", reset[removal:])
 
+    def test_every_documented_wrapper_command_exists(self):
+        """Copy-pasteable commands must be commands.
+
+        Removing the packaged ETL left `./bin/mapp etl` and `census-etl` in
+        the README and three other documents, through several documentation
+        sweeps, because each sweep corrected the places it was looking at
+        rather than the places the claim appeared. An operator following the
+        README got "unknown command".
+
+        usage() is the source of truth here rather than the dispatch table:
+        it is what the wrapper tells an operator it supports.
+        """
+        script = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+        usage = script[script.index("usage() {"):]
+        usage = usage[: usage.index("\n}\n")]
+        advertised = set()
+        for match in re.finditer(r'"  ([a-z][a-z0-9|-]*)', usage):
+            advertised.update(match.group(1).split("|"))
+        self.assertIn("verify", advertised, "usage parsing found nothing")
+
+        documents = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md"))
+        documents.append(ROOT / "etl/README.md")
+        unknown: dict[str, set[str]] = {}
+        for document in documents:
+            if not document.exists():
+                continue
+            # Historical records state what was true when they were written.
+            if document.name in {"CHANGELOG.md", "validation-log.md"}:
+                continue
+            if "Superseded" in document.read_text(encoding="utf-8")[:400]:
+                continue
+            for match in re.finditer(
+                r"\./bin/mapp ([a-z][a-z0-9-]*)",
+                document.read_text(encoding="utf-8"),
+            ):
+                if match.group(1) not in advertised:
+                    unknown.setdefault(match.group(1), set()).add(document.name)
+
+        self.assertEqual(
+            {},
+            {name: sorted(files) for name, files in unknown.items()},
+        )
+
     def test_reset_data_names_what_it_destroys_before_asking(self):
         """The warning is where consent is obtained, so it must be true.
 
