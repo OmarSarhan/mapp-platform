@@ -704,6 +704,9 @@ class SemanticSourceContractTests(unittest.TestCase):
         cursor = FakeCursor(
             [],
             fetchall_results=[live_fields, sample_rows],
+            # The relkind precheck that decides whether LOCK TABLE
+            # applies runs first; a foreign table would answer 'f'.
+            fetchone_results=[{"relkind": "r"}],
             one={"QUERY PLAN": [{"Plan": {"Plan Rows": 178605}}]},
         )
         fields = [
@@ -755,6 +758,46 @@ class SemanticSourceContractTests(unittest.TestCase):
         self.assertIn("LOCK TABLE", sql_text)
         self.assertEqual("postgresql://runtime-reader", connect.call_args.args[0])
 
+    def test_generation_context_does_not_lock_a_foreign_table(self):
+        """PostgreSQL refuses LOCK TABLE on a foreign table.
+
+        Every federated source is a foreign table, so issuing the lock made
+        asking for sample rows or statistics from one fail with
+        semantic.generation_context_unavailable -- the dashboard control
+        looked unsupported for federated relations rather than broken. The
+        profiling path already skipped the lock for relkind 'f'; this one did
+        not.
+        """
+        cursor = FakeCursor(
+            [],
+            fetchall_results=[
+                [{"name": "label", "type": "text", "baseType": "text"}],
+                [{"label": "City centre"}],
+            ],
+            fetchone_results=[{"relkind": "f"}],
+            one={"QUERY PLAN": [{"Plan": {"Plan Rows": 200}}]},
+        )
+
+        with patch(
+            "semantic_sources.psycopg.connect",
+            return_value=FakeConnection(cursor),
+        ):
+            postgres_generation_context(
+                "postgresql://runtime-reader",
+                schema="source_ops",
+                relation="smoke_control_orders",
+                fields=[{"name": "label", "type": "text", "nullable": True}],
+                target_kind="table",
+                sample_rows=True,
+                statistics=True,
+            )
+
+        sql_text = "\n".join(query for query, _ in cursor.executed)
+        self.assertNotIn("LOCK TABLE", sql_text)
+        # The read still happens, and still under a read-only transaction.
+        self.assertIn("SET TRANSACTION", sql_text)
+        self.assertIn("random() < ", sql_text)
+
     def test_generation_field_statistics_are_bounded_and_value_free(self):
         cursor = FakeCursor(
             [],
@@ -762,6 +805,9 @@ class SemanticSourceContractTests(unittest.TestCase):
                 {"name": "label", "type": "text", "baseType": "text"},
                 {"name": "other", "type": "text", "baseType": "text"},
             ]],
+            # The relkind precheck that decides whether LOCK TABLE
+            # applies runs first; a foreign table would answer 'f'.
+            fetchone_results=[{"relkind": "r"}],
             one={
                 "sampledRows": 850,
                 "nonNullCount": 830,
@@ -975,6 +1021,9 @@ class NoWriteContractTests(unittest.TestCase):
         cursor = FakeCursor(
             [],
             fetchall_results=[live_fields, sample_rows],
+            # The relkind precheck that decides whether LOCK TABLE
+            # applies runs first; a foreign table would answer 'f'.
+            fetchone_results=[{"relkind": "r"}],
             one={"QUERY PLAN": [{"Plan": {"Plan Rows": 178605}}]},
         )
         fields = [
