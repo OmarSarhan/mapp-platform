@@ -90,7 +90,7 @@ demo_sources="$(dotenv_value MAPP_DEMO_SOURCES)"
 # whether it holds the relation before asserting anything about it, and say so
 # when it does not. Skipping silently would be worse than the failure it
 # replaces: a demo that never loaded would report a clean verify.
-demo_relation_present() { # service relation
+relation_present() { # service relation
   local present
   present="$(
     "${compose[@]}" exec -T -e "MAPP_PROBE_RELATION=$2" "$1" sh -c \
@@ -812,7 +812,7 @@ IDENT_PY
 # these did not move: source relations are owned by the source admin, and the
 # roles they named do not exist here.
 if [[ -n "${demo_sources}" ]] \
-  && ! demo_relation_present census-db leeds.census_2021_england_oa; then
+  && ! relation_present census-db leeds.census_2021_england_oa; then
   printf 'Demo sources are configured but census-db holds no census content; skipping its content checks. Load it with ./bin/mapp demo.\n'
 elif [[ -n "${demo_sources}" ]]; then
   "${compose[@]}" exec -T \
@@ -1114,7 +1114,7 @@ fi
 # information_schema, never a MAPP role, so nothing had to be dropped to move
 # them.
 if [[ -n "${demo_sources}" ]] \
-  && ! demo_relation_present ops-db leeds.bus_stops; then
+  && ! relation_present ops-db leeds.bus_stops; then
   printf 'Demo sources are configured but ops-db holds no sample layers; skipping their content checks. Load them with ./bin/mapp demo.\n'
 elif [[ -n "${demo_sources}" ]]; then
   "${compose[@]}" exec -T ops-db sh -c \
@@ -2951,6 +2951,48 @@ if selected:
   print(urlencode(selected), end="")
 PY
 )"
+# The render probe above takes the first MVT layer it finds and stops, so a
+# workspace whose first layer is fine reports a clean verify while every later
+# layer 500s. That is exactly how a map serving nothing but errors passed here.
+# Checking that each published layer has a relation behind it is cheap, and it
+# catches the failure this deployment actually hits: var/ is a bind mount and
+# the database is a volume, so layers published by an earlier demo outlive the
+# tables they read across a database rebuild.
+published_mvt_layers="$(
+  "${compose[@]}" exec -T config-ui python - <<'PY'
+from app import read_workspace
+from control_api import effective_locales
+
+_, workspace, _ = read_workspace()
+seen = set()
+for locale in effective_locales(workspace).values():
+    layers = locale.get("layers")
+    if not isinstance(layers, dict):
+        continue
+    for layer_key, layer in layers.items():
+        if not isinstance(layer, dict) or layer.get("format") != "mvt":
+            continue
+        table = layer.get("table")
+        if isinstance(table, str) and table and (layer_key, table) not in seen:
+            seen.add((layer_key, table))
+            print(layer_key, table, sep="\t")
+PY
+)"
+missing_layers=()
+while IFS=$'\t' read -r layer_key layer_table; do
+  [[ -n "${layer_table}" ]] || continue
+  relation_present db "${layer_table}" || missing_layers+=("  ${layer_key} -> ${layer_table}")
+done <<<"${published_mvt_layers}"
+if ((${#missing_layers[@]} > 0)); then
+  printf 'Published map layers have no table behind them in the packaged database:\n' >&2
+  printf '%s\n' "${missing_layers[@]}" >&2
+  printf 'The map returns HTTP 500 for each of these. The workspace under var/ is a\n' >&2
+  printf 'bind mount and the database is a Docker volume, so layers published by an\n' >&2
+  printf 'earlier run outlive their tables when the database is rebuilt.\n' >&2
+  printf 'Run ./bin/mapp demo to rebuild them.\n' >&2
+  exit 1
+fi
+
 if [[ -n "${mvt_query}" ]]; then
   mvt_file="$(mktemp)"
   trap 'rm -f "${mvt_file}"' EXIT
