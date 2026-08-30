@@ -2,6 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Build single-manifest images, not manifest lists.
+#
+# buildx attaches provenance attestations by default, which turns even a
+# single-platform local build into an attestation manifest plus a manifest
+# list. Exporting that into the containerd image store fails inside
+# docker-in-docker:
+#
+#   exporting attestation manifest sha256:...
+#   exporting manifest list sha256:...
+#   unpacking to docker.io/library/mapp-postgis-h3:...
+#   failed to extract layer sha256:...: content digest sha256:... not found
+#
+# It looks like a corrupted cache and survives clearing one, because the
+# corruption is being created by the export. MAPP builds local images for one
+# platform and consumes them on the same daemon, so the attestations buy
+# nothing here. Overridable, for anyone who does want them.
+export BUILDX_NO_DEFAULT_ATTESTATIONS="${BUILDX_NO_DEFAULT_ATTESTATIONS:-1}"
 ENV_FILE="${MAPP_ENV_FILE:-${ROOT_DIR}/.env}"
 STATE_DIR="${ROOT_DIR}/var"
 WORKSPACE_DIR="${STATE_DIR}/workspace"
