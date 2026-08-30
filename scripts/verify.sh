@@ -82,6 +82,26 @@ required_services=(db semantic-service xyz xyz-preview config-ui browser-runner 
 # MAPP_ENVIRONMENT uses: no compose file interpolates MAPP_DEMO_SOURCES, so an
 # exported value cannot reach the resolved model.
 demo_sources="$(dotenv_value MAPP_DEMO_SOURCES)"
+
+# MAPP_DEMO_SOURCES says the demo is switched on, not that it has been loaded.
+# ./bin/mapp init --demo sets it, and ./bin/mapp all runs this script before
+# ./bin/mapp demo has put anything in either source database -- which is the
+# documented order. The content assertions below therefore ask the source
+# whether it holds the relation before asserting anything about it, and say so
+# when it does not. Skipping silently would be worse than the failure it
+# replaces: a demo that never loaded would report a clean verify.
+demo_relation_present() { # service relation
+  local present
+  present="$(
+    "${compose[@]}" exec -T -e "MAPP_PROBE_RELATION=$2" "$1" sh -c \
+      'exec psql --tuples-only --no-align --username "$POSTGRES_USER" \
+        --dbname "$POSTGRES_DB" --set relation="$MAPP_PROBE_RELATION"' \
+      <<'PROBE_SQL' 2>/dev/null
+SELECT to_regclass(:'relation') IS NOT NULL;
+PROBE_SQL
+  )"
+  [[ "$(printf %s "${present}" | tr -d "[:space:]")" == "t" ]]
+}
 if [[ -n "${demo_sources}" ]]; then
   compose+=(--file "${ROOT_DIR}/compose.federated-demo.yaml")
   required_services+=(census-db ops-db)
@@ -791,7 +811,10 @@ IDENT_PY
 # container changed. The MAPP-role ownership and grant checks that used to wrap
 # these did not move: source relations are owned by the source admin, and the
 # roles they named do not exist here.
-if [[ -n "${demo_sources}" ]]; then
+if [[ -n "${demo_sources}" ]] \
+  && ! demo_relation_present census-db leeds.census_2021_england_oa; then
+  printf 'Demo sources are configured but census-db holds no census content; skipping its content checks. Load it with ./bin/mapp demo.\n'
+elif [[ -n "${demo_sources}" ]]; then
   "${compose[@]}" exec -T \
     -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
     -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
@@ -1090,7 +1113,10 @@ fi
 # Both blocks are portable as they stand: they name only leeds relations and
 # information_schema, never a MAPP role, so nothing had to be dropped to move
 # them.
-if [[ -n "${demo_sources}" ]]; then
+if [[ -n "${demo_sources}" ]] \
+  && ! demo_relation_present ops-db leeds.bus_stops; then
+  printf 'Demo sources are configured but ops-db holds no sample layers; skipping their content checks. Load them with ./bin/mapp demo.\n'
+elif [[ -n "${demo_sources}" ]]; then
   "${compose[@]}" exec -T ops-db sh -c \
     'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
       --set ON_ERROR_STOP=1' <<'OPS_SQL'
