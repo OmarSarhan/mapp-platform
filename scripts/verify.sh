@@ -2954,11 +2954,29 @@ PY
 if [[ -n "${mvt_query}" ]]; then
   mvt_file="$(mktemp)"
   trap 'rm -f "${mvt_file}"' EXIT
-  curl --fail --silent --show-error "${map_headers[@]}" \
-    "${map_url}/api/query?${mvt_query}" \
-    --output "${mvt_file}"
+  # Named, because curl --fail reported only "The requested URL returned
+  # error: 500" here. The most likely reason for that 500 is a workspace
+  # naming a relation the database does not have -- the state you are left in
+  # when the database is recreated without restoring the seed workspace, which
+  # reset-data does and a devcontainer rebuild does not -- and the operator
+  # needs to know which layer to be able to act on it.
+  mvt_status="$(curl --silent --show-error "${map_headers[@]}" \
+    --output "${mvt_file}" --write-out '%{http_code}' \
+    "${map_url}/api/query?${mvt_query}")"
+  if [[ "${mvt_status}" != 2* ]]; then
+    printf 'The live MVT render probe returned HTTP %s.\n' "${mvt_status}" >&2
+    printf '  query: %s\n' "${mvt_query}" >&2
+    if [[ -s "${mvt_file}" ]]; then
+      printf '  response: %s\n' "$(head -c 400 "${mvt_file}" | tr -d "\r\n")" >&2
+    fi
+    printf '  The workspace names a layer XYZ could not render. If the database\n' >&2
+    printf '  was recreated without restoring the seed workspace, the layer points\n' >&2
+    printf '  at a relation that no longer exists; ./bin/mapp logs xyz shows which.\n' >&2
+    exit 1
+  fi
   if [[ ! -s "${mvt_file}" ]]; then
     printf 'XYZ returned an empty MVT response for a current workspace layer.\n' >&2
+    printf '  query: %s\n' "${mvt_query}" >&2
     exit 1
   fi
 else
