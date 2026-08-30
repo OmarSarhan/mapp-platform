@@ -91,15 +91,19 @@ without them is a list of column names.
 You can add the key later and run `./bin/mapp demo` again to fill them in;
 nothing needs rebuilding first.
 
-`demo` takes about fifteen minutes, most of it downloading the England Census
-2021 Output Area dataset. It is doing four separate things, and the output
+`demo` takes about fifteen minutes without a Gemini key, most of it
+downloading the England Census 2021 Output Area dataset. With one it takes
+considerably longer, because every field of every relation is described in its
+own model call and `census_2021_england_oa` alone has 470 columns. Set
+`MAPP_DEMO_FIELD_LIMIT=40` to cap that if you want the demo sooner; the
+relations are still described, their fields are not. It is doing four separate things, and the output
 names each one:
 
 | Step | What happens |
 | --- | --- |
 | Loading sources | Two source databases are populated straight from their publishers: Leeds City Council's ArcGIS feeds into `ops-db`, ONS Census 2021 into `census-db` |
 | Registering and provisioning | Both are attached to MAPP as federated sources |
-| Profiling and describing | Each exposed relation is profiled; with a Gemini key set, each is also described by a model |
+| Profiling and describing | Each exposed relation is profiled; with a Gemini key set, every relation and field is also described by a model |
 | Building and publishing | Two derived layers are computed across both sources and put on the map |
 
 Then open:

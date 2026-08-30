@@ -141,11 +141,28 @@ GRANT SELECT ON ALL TABLES IN SCHEMA leeds TO :"reader_user";
 SQL
 
   local counts
+  # Exact counts, not reltuples. reltuples is the planner's estimate and is
+  # -1 on a table that has never been analysed, so this line reported
+  # "bus_stops=-1" straight after loading 4,233 rows into it -- which reads as
+  # a failure at the exact moment somebody is deciding whether the load
+  # worked. The largest table here is 178,605 rows; counting is free.
   counts="$("${compose[@]}" exec -T "${service}" psql --tuples-only --no-align \
-    --username "${SOURCE_USER}" --dbname "${database}" \
-    --command "SELECT c.relname || '=' || c.reltuples::bigint
-               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-               WHERE n.nspname = 'leeds' AND c.relkind = 'r' ORDER BY c.relname" | tr '\n' ' ')"
+    --username "${SOURCE_USER}" --dbname "${database}" <<'COUNT_SQL' | tr '\n' ' '
+SELECT c.relname || '=' || (
+         xpath(
+           '/row/count/text()',
+           query_to_xml(
+             format('SELECT count(*) AS count FROM leeds.%I', c.relname),
+             false, true, ''
+           )
+         )
+       )[1]::text::bigint
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = 'leeds' AND c.relkind = 'r'
+ORDER BY c.relname;
+COUNT_SQL
+)"
   printf '  %s: %s\n' "${service}" "${counts}"
 }
 

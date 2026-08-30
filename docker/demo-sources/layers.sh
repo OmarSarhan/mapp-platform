@@ -190,7 +190,12 @@ sync_one() {
 # Every draft is generated with the bounded data context -- sample rows and
 # column statistics -- rather than from metadata alone.
 GEMINI_KEY="$(dotenv_value GEMINI_APIKEY)"
-DESCRIBE_FIELD_LIMIT="${MAPP_DEMO_FIELD_LIMIT:-40}"
+# No cap by default: the point of the demo is a catalogue that reads as
+# meaning rather than column names, and a capped one is half that. Set
+# MAPP_DEMO_FIELD_LIMIT to a number to cap it -- worth doing if you want the
+# demo quickly, because census_2021_england_oa alone has 470 columns and every
+# field is one sequential model call.
+DESCRIBE_FIELD_LIMIT="${MAPP_DEMO_FIELD_LIMIT:-0}"
 DESCRIBE=1
 if [ "${MAPP_DEMO_SEMANTICS:-1}" = "0" ]; then
   DESCRIBE=0
@@ -319,7 +324,14 @@ for schema, relation in zip(arguments[::2], arguments[1::2]):
     # columns, which would take hours and is not what a demo is for, so wide
     # relations get their table described and their fields left to the
     # structural profile. The cap is announced rather than applied silently.
-    over_limit = len(fields) > LIMIT
+    over_limit = LIMIT > 0 and len(fields) > LIMIT
+    if not over_limit and len(fields) > 60:
+        print(
+            "    %s.%s: describing %d fields, one model call each; set"
+            " MAPP_DEMO_FIELD_LIMIT to cap this"
+            % (schema, relation, len(fields)),
+            flush=True,
+        )
     targets = [{"kind": "table"}] + ([] if over_limit else [
         {"kind": "field", "fieldId": field["id"]} for field in fields
     ])
