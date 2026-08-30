@@ -401,7 +401,21 @@ if d.get('code'):
     raise SystemExit(1)
 print(json.dumps(d['recipePlan']['createRequest']))")"
   api POST /api/derived-layers "${create}" \
-    | jqp "print(f\"  {d.get('code') or (d.get('derivedLayer') or {}).get('name')}\")"
+    | jqp "
+name = (d.get('derivedLayer') or {}).get('name')
+if not name:
+    raise SystemExit('  create refused: %s %s' % (d.get('code'), (d.get('error') or '')[:160]))
+print('  %-32s created' % name)"
+  # Read it back. The create response is the server describing what it did,
+  # and printing a name out of it is not evidence the relation is there --
+  # which is how this step came to report two layers it had not left behind.
+  api GET "/api/derived-layers/${name}" \
+    | jqp "
+layer = d.get('derivedLayer') or {}
+if not layer.get('name'):
+    raise SystemExit('  %s is absent after a create that reported success: %s'
+                     % ('${name}', d.get('code')))" \
+    || fail "derived layer '${name}' was not created"
 done
 
 # --------------------------------------------------------------- workspace --
