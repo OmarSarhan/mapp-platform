@@ -2969,9 +2969,19 @@ if [[ -n "${mvt_query}" ]]; then
     if [[ -s "${mvt_file}" ]]; then
       printf '  response: %s\n' "$(head -c 400 "${mvt_file}" | tr -d "\r\n")" >&2
     fi
-    printf '  The workspace names a layer XYZ could not render. If the database\n' >&2
-    printf '  was recreated without restoring the seed workspace, the layer points\n' >&2
-    printf '  at a relation that no longer exists; ./bin/mapp logs xyz shows which.\n' >&2
+    printf '  The workspace names a layer XYZ could not render.\n' >&2
+    if [[ -n "${demo_sources}" ]]; then
+      printf '  The demo is configured, so the usual cause is a workspace that\n' >&2
+      printf '  outlived the database it was published against -- var/ is a bind\n' >&2
+      printf '  mount and survives a database that is recreated. Run\n' >&2
+      printf '  ./bin/mapp demo to rebuild the layers and republish it.\n' >&2
+    else
+      printf '  If the database was recreated without restoring the seed\n' >&2
+      printf '  workspace, the layer points at a relation that no longer exists.\n' >&2
+      printf '  Restore it with:\n' >&2
+      printf '    cp instance/workspace.seed.json var/workspace/workspace.json\n' >&2
+    fi
+    printf '  ./bin/mapp logs xyz names the relation it could not read.\n' >&2
     exit 1
   fi
   if [[ ! -s "${mvt_file}" ]]; then
