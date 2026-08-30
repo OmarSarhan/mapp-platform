@@ -2863,11 +2863,35 @@ if [[ "${production}" == true ]]; then
     exit 1
   fi
 fi
-curl --fail --silent --show-error "${map_headers[@]}" "${map_url}/" >/dev/null
-curl --fail --silent --show-error "${map_headers[@]}" "${map_url}/api/workspace/locales" >/dev/null
+# Named, because curl --fail alone reports only "The requested URL returned
+# error: 500" -- no URL, no body -- and these four are the first checks a new
+# deployment reaches, so an unhelpful failure here is the worst place for one.
+probe_endpoint() { # label headers-array-name url
+  local label="$1" headers_name="$2" url="$3"
+  local -n headers="${headers_name}"
+  local body status
+  body="$(mktemp)"
+  status="$(curl --silent --show-error "${headers[@]}" \
+    --output "${body}" --write-out '%{http_code}' "${url}")"
+  if [[ "${status}" != 2* ]]; then
+    printf '%s returned HTTP %s.\n  %s\n' "${label}" "${status}" "${url}" >&2
+    if [[ -s "${body}" ]]; then
+      printf '  response: %s\n' "$(head -c 400 "${body}" | tr -d "\r\n")" >&2
+    fi
+    printf '  service logs: ./bin/mapp logs\n' >&2
+    rm -f "${body}"
+    exit 1
+  fi
+  rm -f "${body}"
+}
 
-curl --fail --silent --show-error "${config_headers[@]}" "${config_url}/healthz" >/dev/null
-curl --fail --silent --show-error "${config_headers[@]}" "${config_url}/api/public/identity" >/dev/null
+probe_endpoint "The map root" map_headers "${map_url}/"
+probe_endpoint "The map workspace locales API" map_headers \
+  "${map_url}/api/workspace/locales"
+probe_endpoint "The configuration service health check" config_headers \
+  "${config_url}/healthz"
+probe_endpoint "The configuration service public identity" config_headers \
+  "${config_url}/api/public/identity"
 traversal_status="$(
   curl --path-as-is --silent "${config_headers[@]}" \
     --output /dev/null --write-out '%{http_code}' \
