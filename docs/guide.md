@@ -69,6 +69,12 @@ two throwaway source databases to the deployment — this is the one flag that
 makes the platform stand up databases of its own, and it exists so you have
 something real to look at.
 
+On a new instance, `init` prints the configuration administrator password to
+the console once. Save it in your password manager before continuing; it is
+stored only as a hash and cannot be printed again. If credentials already
+exist, `init` leaves them unchanged and tells you to use
+`./bin/mapp reset-config-password` if the password has been lost.
+
 ### One key `init` cannot generate
 
 `init` leaves `GEMINI_APIKEY=` empty in `.env`, because it is the one value
@@ -94,10 +100,15 @@ nothing needs rebuilding first.
 `demo` takes about fifteen minutes without a Gemini key, most of it
 downloading the England Census 2021 Output Area dataset. With one it takes
 considerably longer, because every field of every relation is described in its
-own model call and `census_2021_england_oa` alone has 470 columns. Set
-`MAPP_DEMO_FIELD_LIMIT=40` to cap that if you want the demo sooner; the
-relations are still described, their fields are not. It is doing four separate things, and the output
-names each one:
+own model call and `census_2021_england_oa` alone has 470 columns.
+`MAPP_DEMO_FIELD_LIMIT` in `.env` is the source of truth for the per-relation
+cap; a fresh environment sets it to `50`. Raise it for a fuller catalogue, set
+it to a lower positive whole number for a shorter run, or leave it empty to
+describe every field. A relation over the limit still gets its table
+described, while its fields stay at the structural profile. Before generation,
+the semantic stage prints the effective limit and exact number of Gemini calls;
+it then shows a progress bar as those calls settle. The demo is doing four
+separate things, and the output names each one:
 
 | Step | What happens |
 | --- | --- |

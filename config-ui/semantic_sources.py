@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -42,6 +43,14 @@ GENERATION_SAMPLE_MAX_BYTES = 96 * 1024
 GENERATION_SAMPLE_MAX_COLUMNS = 20
 GENERATION_SAMPLE_VALUE_MAX_CHARS = 512
 GENERATION_STATISTICS_MAX_ROWS = 1000
+# The packaged source-reader role permits four concurrent connections. Keep
+# optional semantic-generation context from exhausting that role by itself:
+# three reads proceed while additional requests wait before opening a
+# connection, leaving one slot of headroom for other source consumers.
+MAX_CONCURRENT_GENERATION_CONTEXT_READS = 3
+_GENERATION_CONTEXT_READ_SLOTS = threading.BoundedSemaphore(
+    MAX_CONCURRENT_GENERATION_CONTEXT_READS
+)
 MAX_DISCOVERY_PAGE_FETCH = 101
 _GENERATION_FIELDS_SQL = """
     SELECT a.attname AS name,
@@ -975,6 +984,36 @@ def postgres_generation_context(
         )
     if not sample_rows and not statistics:
         return {}
+    # Both configured source assets and managed derived assets use this read
+    # path. Blocking here provides one process-wide admission queue for every
+    # API caller, before any source connection is opened and before Gemini is
+    # invoked by the route.
+    with _GENERATION_CONTEXT_READ_SLOTS:
+        return _read_postgres_generation_context(
+            connection_url,
+            schema=schema,
+            relation=relation,
+            fields=fields,
+            target_kind=target_kind,
+            field_name=field_name,
+            sample_rows=sample_rows,
+            statistics=statistics,
+            sample_seed=sample_seed,
+        )
+
+
+def _read_postgres_generation_context(
+    connection_url: str,
+    *,
+    schema: str,
+    relation: str,
+    fields: list[dict[str, Any]],
+    target_kind: str,
+    field_name: str | None,
+    sample_rows: bool,
+    statistics: bool,
+    sample_seed: float,
+) -> dict[str, Any]:
     relation_identifier = sql.Identifier(schema, relation)
     context: dict[str, Any] = {}
     try:

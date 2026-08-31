@@ -7,6 +7,34 @@ const emptyContextOptions = () => ({
 });
 const PAGE_LIMIT = 100;
 const MAX_GENERATION_FIELDS = 25;
+const DATA_CONTEXT_GENERATION_CONCURRENCY = 3;
+const METADATA_GENERATION_CONCURRENCY = 10;
+
+async function settleWithConcurrency(values, concurrency, task) {
+  const settled = new Array(values.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        settled[index] = {
+          status: 'fulfilled',
+          value: await task(values[index], index),
+        };
+      } catch (reason) {
+        settled[index] = {status: 'rejected', reason};
+      }
+    }
+  };
+
+  await Promise.all(Array.from(
+    {length: Math.min(concurrency, values.length)},
+    worker,
+  ));
+  return settled;
+}
 
 const pagePath = (path, cursor = null) => (
   `${path}?limit=${PAGE_LIMIT}${cursor
@@ -664,53 +692,60 @@ export function SemanticCatalog({api, close, identity}) {
     const requestedContext = {...contextOptions};
     try {
       let completed = 0;
-      const settled = await Promise.allSettled(generationFieldIds.map(async fieldId => {
-        const target = {kind: 'field', fieldId};
-        try {
-          const result = await api('/api/semantic/generate', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-              assetId: selected.id,
-              target,
-              contextOptions: requestedContext,
-            }),
-          });
-          const draft = result?.draft;
-          const generation = result?.generation;
-          if (
-            !draft
-            || draft.assetId !== selected.id
-            || draft.baseVersion !== selected.version
-            || draft.target?.kind !== 'field'
-            || draft.target?.fieldId !== fieldId
-            || !Array.isArray(draft.operations)
-            || draft.operations.length === 0
-            || generation?.provider !== 'gemini'
-            || !generationMatchesContext(generation, requestedContext)
-            || generation.proposalCreated !== false
-          ) {
-            throw new Error('Gemini returned an invalid semantic proposal draft.');
+      const concurrency = requestedContext.sampleRows || requestedContext.statistics
+        ? DATA_CONTEXT_GENERATION_CONCURRENCY
+        : METADATA_GENERATION_CONCURRENCY;
+      const settled = await settleWithConcurrency(
+        generationFieldIds,
+        concurrency,
+        async fieldId => {
+          const target = {kind: 'field', fieldId};
+          try {
+            const result = await api('/api/semantic/generate', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                assetId: selected.id,
+                target,
+                contextOptions: requestedContext,
+              }),
+            });
+            const draft = result?.draft;
+            const generation = result?.generation;
+            if (
+              !draft
+              || draft.assetId !== selected.id
+              || draft.baseVersion !== selected.version
+              || draft.target?.kind !== 'field'
+              || draft.target?.fieldId !== fieldId
+              || !Array.isArray(draft.operations)
+              || draft.operations.length === 0
+              || generation?.provider !== 'gemini'
+              || !generationMatchesContext(generation, requestedContext)
+              || generation.proposalCreated !== false
+            ) {
+              throw new Error('Gemini returned an invalid semantic proposal draft.');
+            }
+            return {draft, generation};
+          } catch (reason) {
+            if (generationAlreadyCurrent(reason)) {
+              return {
+                draft: {operations: []},
+                generation: {model: generationCapability.model},
+                noChange: true,
+                fieldId,
+              };
+            }
+            throw reason;
+          } finally {
+            completed += 1;
+            setGenerationProgress({
+              current: completed,
+              total: generationFieldIds.length,
+            });
           }
-          return {draft, generation};
-        } catch (reason) {
-          if (generationAlreadyCurrent(reason)) {
-            return {
-              draft: {operations: []},
-              generation: {model: generationCapability.model},
-              noChange: true,
-              fieldId,
-            };
-          }
-          throw reason;
-        } finally {
-          completed += 1;
-          setGenerationProgress({
-            current: completed,
-            total: generationFieldIds.length,
-          });
-        }
-      }));
+        },
+      );
       const failure = settled.find(result => result.status === 'rejected');
       if (failure) {
         throw failure.reason;

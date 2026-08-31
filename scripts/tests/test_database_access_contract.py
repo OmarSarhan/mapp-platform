@@ -320,6 +320,44 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "the store may open more connections than its role allows",
         )
 
+    def test_semantic_context_reads_stay_under_the_source_role_limit(self) -> None:
+        """Optional data context must leave source-reader headroom.
+
+        The dashboard can request many field drafts at once, but every sample
+        or statistics request opens a source connection before Gemini runs.
+        Keep the configuration service's process-wide admission bound tied to
+        the packaged source role instead of relying on client throttling.
+        """
+        roles = (ROOT / "docker/source-db/init/01-roles.sh").read_text(
+            encoding="utf-8"
+        )
+        sources = (ROOT / "config-ui/semantic_sources.py").read_text(
+            encoding="utf-8"
+        )
+
+        role_limit = re.search(
+            r'ALTER ROLE :"reader_user" CONNECTION LIMIT (\d+);',
+            roles,
+        )
+        self.assertIsNotNone(
+            role_limit,
+            "the packaged source reader declares no connection limit",
+        )
+        admission_limit = re.search(
+            r"^MAX_CONCURRENT_GENERATION_CONTEXT_READS = (\d+)$",
+            sources,
+            re.M,
+        )
+        self.assertIsNotNone(
+            admission_limit,
+            "optional semantic context declares no server-side admission bound",
+        )
+        self.assertLess(
+            int(admission_limit.group(1)),
+            int(role_limit.group(1)),
+            "optional semantic context may exhaust the source-reader role",
+        )
+
     def test_new_database_reader_has_only_table_select_defaults(self) -> None:
         source = (
             ROOT / "docker/postgis/init/10-roles.sh"

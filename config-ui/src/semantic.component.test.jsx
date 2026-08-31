@@ -774,8 +774,14 @@ describe('SemanticCatalog', () => {
     expect(savedField.checked).toBe(true);
   });
 
-  test('generates selected fields in parallel with completed progress and ordered drafts', async () => {
-    const fieldIds = ['field:score', 'field:rank', 'field:notes'];
+  test('limits context generation to three workers with settled progress and ordered drafts', async () => {
+    const fieldIds = [
+      'field:score',
+      'field:rank',
+      'field:notes',
+      'field:area',
+      'field:count',
+    ];
     const batchAsset = {
       ...asset,
       generated: {
@@ -830,14 +836,14 @@ describe('SemanticCatalog', () => {
       name: /table\/column statistics/i,
     }));
     fireEvent.click(screen.getByRole('button', {
-      name: 'Generate drafts for 3 fields',
+      name: 'Generate drafts for 5 fields',
     }));
 
     await waitFor(() => expect(calls).toHaveLength(3));
     expect(screen.getByRole('button', {
-      name: /0\/3 completed/,
+      name: /0\/5 completed/,
     }).disabled).toBe(true);
-    expect(calls.map(call => call.target.fieldId)).toEqual(fieldIds);
+    expect(calls.map(call => call.target.fieldId)).toEqual(fieldIds.slice(0, 3));
     expect(calls.every(call => (
       call.contextOptions.sampleRows === false
       && call.contextOptions.statistics === true
@@ -850,7 +856,9 @@ describe('SemanticCatalog', () => {
         {sampleRows: false, statistics: true},
       ));
     });
-    expect(screen.getByRole('button', {name: /1\/3 completed/})).toBeTruthy();
+    await waitFor(() => expect(calls).toHaveLength(4));
+    expect(calls[3].target.fieldId).toBe('field:area');
+    expect(screen.getByRole('button', {name: /1\/5 completed/})).toBeTruthy();
 
     await act(async () => {
       pending['field:score'].resolve(fieldGenerationResult(
@@ -859,14 +867,18 @@ describe('SemanticCatalog', () => {
         {sampleRows: false, statistics: true},
       ));
     });
-    expect(screen.getByRole('button', {name: /2\/3 completed/})).toBeTruthy();
+    await waitFor(() => expect(calls).toHaveLength(5));
+    expect(calls[4].target.fieldId).toBe('field:count');
+    expect(screen.getByRole('button', {name: /2\/5 completed/})).toBeTruthy();
 
     await act(async () => {
-      pending['field:rank'].resolve(fieldGenerationResult(
-        batchAsset,
-        'field:rank',
-        {sampleRows: false, statistics: true},
-      ));
+      for (const fieldId of ['field:area', 'field:count', 'field:rank']) {
+        pending[fieldId].resolve(fieldGenerationResult(
+          batchAsset,
+          fieldId,
+          {sampleRows: false, statistics: true},
+        ));
+      }
     });
     const reviewHeading = await screen.findByRole('heading', {
       name: 'Review your draft',
@@ -875,6 +887,93 @@ describe('SemanticCatalog', () => {
       .toMatch(
         /explicitly selected bounded context: table\/column statistics/,
       );
+    const operations = JSON.parse(
+      reviewHeading.closest('section').querySelector('pre').textContent,
+    );
+    expect(operations.map(operation => operation.value)).toEqual(
+      fieldIds.map(fieldId => `Description for ${fieldId}`),
+    );
+  });
+
+  test('limits metadata-only generation to ten workers', async () => {
+    const fieldIds = Array.from(
+      {length: 12},
+      (_, index) => `field:${index + 1}`,
+    );
+    const batchAsset = {
+      ...asset,
+      generated: {
+        ...asset.generated,
+        fields: fieldIds.map(fieldId => ({
+          id: fieldId,
+          name: `column_${fieldId.slice('field:'.length)}`,
+          type: 'text',
+        })),
+      },
+    };
+    const pending = Object.fromEntries(fieldIds.map(fieldId => [
+      fieldId,
+      deferred(),
+    ]));
+    const calls = [];
+    const api = fieldBatchApi(batchAsset, request => {
+      calls.push(request);
+      return pending[request.target.fieldId].promise;
+    });
+
+    render(<SemanticCatalog
+      api={api}
+      close={() => {}}
+      identity={{actor: 'admin', scopes: []}}
+    />);
+    await openGenerationStep();
+    fireEvent.click(await screen.findByRole('button', {name: /^Specific fields/}));
+    for (let index = 1; index <= fieldIds.length; index += 1) {
+      fireEvent.click(screen.getByRole('checkbox', {name: `column_${index}`}));
+    }
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Generate drafts for 12 fields',
+    }));
+
+    await waitFor(() => expect(calls).toHaveLength(10));
+    expect(calls.map(call => call.target.fieldId)).toEqual(fieldIds.slice(0, 10));
+    expect(calls.every(call => (
+      call.contextOptions.sampleRows === false
+      && call.contextOptions.statistics === false
+    ))).toBe(true);
+
+    await act(async () => {
+      pending['field:1'].resolve(fieldGenerationResult(
+        batchAsset,
+        'field:1',
+        {sampleRows: false, statistics: false},
+      ));
+    });
+    await waitFor(() => expect(calls).toHaveLength(11));
+    expect(calls[10].target.fieldId).toBe('field:11');
+
+    await act(async () => {
+      pending['field:2'].resolve(fieldGenerationResult(
+        batchAsset,
+        'field:2',
+        {sampleRows: false, statistics: false},
+      ));
+    });
+    await waitFor(() => expect(calls).toHaveLength(12));
+    expect(calls[11].target.fieldId).toBe('field:12');
+
+    await act(async () => {
+      for (const fieldId of fieldIds.slice(2)) {
+        pending[fieldId].resolve(fieldGenerationResult(
+          batchAsset,
+          fieldId,
+          {sampleRows: false, statistics: false},
+        ));
+      }
+    });
+    const reviewHeading = await screen.findByRole('heading', {
+      name: 'Review your draft',
+    });
     const operations = JSON.parse(
       reviewHeading.closest('section').querySelector('pre').textContent,
     );

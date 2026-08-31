@@ -190,12 +190,19 @@ sync_one() {
 # Every draft is generated with the bounded data context -- sample rows and
 # column statistics -- rather than from metadata alone.
 GEMINI_KEY="$(dotenv_value GEMINI_APIKEY)"
-# No cap by default: the point of the demo is a catalogue that reads as
-# meaning rather than column names, and a capped one is half that. Set
-# MAPP_DEMO_FIELD_LIMIT to a number to cap it -- worth doing if you want the
-# demo quickly, because census_2021_england_oa alone has 470 columns and every
-# field is one sequential model call.
-DESCRIBE_FIELD_LIMIT="${MAPP_DEMO_FIELD_LIMIT:-0}"
+# Fields per relation to describe. MAPP_DEMO_FIELD_LIMIT in .env is the single
+# source of truth; empty means no cap. Fresh environments default it to 50
+# because census_2021_england_oa alone has 470 columns and each field is a
+# model call.
+DESCRIBE_FIELD_LIMIT="$(dotenv_value MAPP_DEMO_FIELD_LIMIT)"
+case "${DESCRIBE_FIELD_LIMIT}" in
+  '') ;;
+  *[!0-9]*) fail \
+    "MAPP_DEMO_FIELD_LIMIT must be a positive whole number or empty, not '${DESCRIBE_FIELD_LIMIT}'" ;;
+  *[1-9]*) ;;
+  *) fail \
+    "MAPP_DEMO_FIELD_LIMIT must be a positive whole number or empty, not '${DESCRIBE_FIELD_LIMIT}'" ;;
+esac
 DESCRIBE=1
 if [ "${MAPP_DEMO_SEMANTICS:-1}" = "0" ]; then
   DESCRIBE=0
@@ -208,15 +215,111 @@ fi
 describe_relations() { # schema relation [schema relation ...]
   MAPP_BASE="${BASE}" MAPP_HOST="${CONFIG_HOST}" MAPP_TOKEN="${TOKEN}" \
     MAPP_FIELD_LIMIT="${DESCRIBE_FIELD_LIMIT}" python3 - "$@" <<'PY'
-import json, os, sys, urllib.error, urllib.request
+import concurrent.futures
+import json, os, shutil, sys, urllib.error, urllib.request
 
 BASE = os.environ["MAPP_BASE"]
-LIMIT = int(os.environ["MAPP_FIELD_LIMIT"])
+# Empty means no cap, so it has to survive int() rather than reach it.
+LIMIT = int(os.environ["MAPP_FIELD_LIMIT"] or 0)
+# Each generation holds one of the service's ten Gemini slots, and the
+# eleventh is refused outright with semantic.generation_busy rather than
+# queued -- the acquire is non-blocking. Stay under it.
+WORKERS = 8
 HEADERS = {
     "Host": os.environ["MAPP_HOST"],
     "Authorization": "Bearer " + os.environ["MAPP_TOKEN"],
     "Content-Type": "application/json",
 }
+
+
+class DemoSemanticError(RuntimeError):
+    pass
+
+
+class ProgressBar:
+    """One in-place TTY bar or bounded newline snapshots for captured logs."""
+
+    def __init__(self, total, limit_text, stream=sys.stdout):
+        self.total = total
+        self.limit_text = limit_text
+        self.stream = stream
+        self.completed = 0
+        self.tty = stream.isatty()
+        self.active = False
+        self.last_bucket = -1
+        self.last_length = 0
+
+    def _limit_summary(self):
+        if LIMIT > 0:
+            return (
+                "MAPP_DEMO_FIELD_LIMIT=%s; relations above %s fields are "
+                "table-only" % (self.limit_text, self.limit_text)
+            )
+        return "MAPP_DEMO_FIELD_LIMIT is empty; all fields are included"
+
+    def _line(self):
+        percent = 100 if self.total == 0 else self.completed * 100 // self.total
+        columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+        suffix = "%d/%d calls (%3d%%)" % (
+            self.completed, self.total, percent,
+        )
+        available = columns - len("    Gemini descriptions [] ") - len(suffix)
+        if available < 10:
+            return "    Gemini descriptions " + suffix
+        width = min(28, available)
+        filled = width if self.total == 0 else width * self.completed // self.total
+        return "    Gemini descriptions [%s%s] %s" % (
+            "#" * filled,
+            "-" * (width - filled),
+            suffix,
+        )
+
+    def _render(self, *, final=False, force=False):
+        percent = 100 if self.total == 0 else self.completed * 100 // self.total
+        bucket = percent // 10
+        if not self.tty and not force and not final and bucket <= self.last_bucket:
+            return
+        line = self._line()
+        if self.tty:
+            padding = " " * max(0, self.last_length - len(line))
+            self.stream.write("\r" + line + padding)
+            if final:
+                self.stream.write("\n")
+            self.last_length = len(line)
+        else:
+            self.stream.write(line + "\n")
+        self.stream.flush()
+        self.last_bucket = bucket
+        if final:
+            self.active = False
+
+    def start(self):
+        self.stream.write(
+            "    Gemini descriptions: %d calls (%s).\n"
+            % (self.total, self._limit_summary())
+        )
+        self.stream.flush()
+        self.active = True
+        self._render(final=self.total == 0, force=True)
+
+    def advance(self):
+        self.completed += 1
+        if self.completed > self.total:
+            raise RuntimeError("semantic progress exceeded its planned total")
+        self._render(final=self.completed == self.total)
+
+    def close(self):
+        if not self.active:
+            return
+        if self.tty:
+            self.stream.write("\n")
+        else:
+            self.stream.write(
+                "    Gemini descriptions stopped at %d/%d calls.\n"
+                % (self.completed, self.total)
+            )
+        self.stream.flush()
+        self.active = False
 
 
 def call(method, path, body=None):
@@ -243,11 +346,6 @@ def call(method, path, body=None):
         return payload
 
 
-def fail(message):
-    print("    " + message, file=sys.stderr)
-    raise SystemExit(1)
-
-
 def drafted_operations(asset_id, target):
     """Draft one annotation. Returns (operations, baseVersion), or (None, None)
     when the model reproduced what is already curated -- the idempotent case,
@@ -272,7 +370,9 @@ def drafted_operations(asset_id, target):
         return None, None
     draft = result.get("draft")
     if not isinstance(draft, dict):
-        fail("generate %s: %s" % (target["kind"], result.get("code")))
+        raise DemoSemanticError(
+            "generate %s: %s" % (target["kind"], result.get("code"))
+        )
     return draft["operations"], draft["baseVersion"]
 
 
@@ -290,24 +390,23 @@ def apply_operations(asset_id, base_version, operations, explanation):
     checked = call("POST", "/api/semantic/proposals/check", request)
     check = checked.get("check")
     if not isinstance(check, dict):
-        fail("check: %s" % checked.get("code"))
+        raise DemoSemanticError("check: %s" % checked.get("code"))
     created = call(
         "POST", "/api/semantic/proposals",
         dict(request, fingerprint=check["fingerprint"]),
     )
     proposal = created.get("proposal") or {}
     if not proposal.get("id"):
-        fail("propose: %s" % created.get("code"))
+        raise DemoSemanticError("propose: %s" % created.get("code"))
     applied = call(
         "POST", "/api/semantic/proposals/%s/apply" % proposal["id"],
         {"confirmed": True},
     )
     if (applied.get("proposal") or {}).get("state") != "applied":
-        fail("apply: %s" % applied.get("code"))
+        raise DemoSemanticError("apply: %s" % applied.get("code"))
 
 
-arguments = sys.argv[1:]
-for schema, relation in zip(arguments[::2], arguments[1::2]):
+def prepare_relation(schema, relation):
     synced = call(
         "POST", "/api/semantic/source/sync",
         {"alias": "MAPP", "schema": schema, "relation": relation},
@@ -315,53 +414,114 @@ for schema, relation in zip(arguments[::2], arguments[1::2]):
     asset = synced.get("asset") or {}
     asset_id = asset.get("id")
     if not asset_id:
-        fail("%s.%s: %s" % (schema, relation, synced.get("code")))
+        raise DemoSemanticError(
+            "%s.%s: %s" % (schema, relation, synced.get("code"))
+        )
     fields = [
         field for field in (asset.get("generated") or {}).get("fields") or []
         if field.get("id")
     ]
-    # One model call per field, sequentially. census_2021_england_oa has 470
-    # columns, which would take hours and is not what a demo is for, so wide
-    # relations get their table described and their fields left to the
-    # structural profile. The cap is announced rather than applied silently.
+    # There is one model call per included field. census_2021_england_oa has
+    # 470 columns, so a relation above the configured threshold gets its table
+    # described while its fields remain at the structural profile.
     over_limit = LIMIT > 0 and len(fields) > LIMIT
     if not over_limit and len(fields) > 60:
         print(
-            "    %s.%s: describing %d fields, one model call each; set"
-            " MAPP_DEMO_FIELD_LIMIT to cap this"
-            % (schema, relation, len(fields)),
+            "    %s.%s: describing %d fields, %d model calls at a time; lower"
+            " MAPP_DEMO_FIELD_LIMIT in .env to cap this"
+            % (schema, relation, len(fields), WORKERS),
             flush=True,
         )
     targets = [{"kind": "table"}] + ([] if over_limit else [
         {"kind": "field", "fieldId": field["id"]} for field in fields
     ])
+    return {
+        "schema": schema,
+        "relation": relation,
+        "asset_id": asset_id,
+        "fields": fields,
+        "over_limit": over_limit,
+        "targets": targets,
+    }
+
+
+def describe_relation(plan, pool, progress):
+    targets = plan["targets"]
+    drafts = [None] * len(targets)
+    futures = {
+        pool.submit(drafted_operations, plan["asset_id"], target): index
+        for index, target in enumerate(targets)
+    }
+    # Count real completions rather than consuming pool.map in input order: a
+    # slow first field must not make the bar look stuck while later calls have
+    # already settled. Results still go back into their input slots so the
+    # combined proposal remains deterministic.
+    for future in concurrent.futures.as_completed(futures):
+        drafts[futures[future]] = future.result()
+        progress.advance()
+
     operations = []
     base_version = None
-    for target in targets:
-        drafted, version = drafted_operations(asset_id, target)
+    for drafted, version in drafts:
         if drafted is None:
             continue
         if base_version is None:
             base_version = version
         elif version != base_version:
-            # Nothing is applied inside this loop, so the asset version cannot
-            # move under it. If it did, something else is writing concurrently
-            # and the accumulated operations no longer describe one state.
-            fail("%s.%s: asset changed mid-description" % (schema, relation))
+            raise DemoSemanticError(
+                "%s.%s: asset changed mid-description"
+                % (plan["schema"], plan["relation"])
+            )
         operations.extend(drafted)
     if operations:
-        apply_operations(asset_id, base_version, operations, (
+        apply_operations(plan["asset_id"], base_version, operations, (
             "Gemini drafts for the demo showcase, applied without review by "
             "./bin/mapp demo. Treat them as a starting point, not as curated "
             "content."
         ))
-    scope = "table" if over_limit else "table and %d fields" % len(fields)
-    print("    %s.%s: %s%s" % (
-        schema, relation,
+    scope = (
+        "table" if plan["over_limit"]
+        else "table and %d fields" % len(plan["fields"])
+    )
+    return "    %s.%s: %s%s" % (
+        plan["schema"], plan["relation"],
         ("%s described" % scope) if operations else "already described",
-        (", %d fields over the %d limit not described" % (len(fields), LIMIT))
-        if over_limit else "",
-    ))
+        (", %d fields over the MAPP_DEMO_FIELD_LIMIT of %d not described"
+         % (len(plan["fields"]), LIMIT))
+        if plan["over_limit"] else "",
+    )
+
+
+arguments = sys.argv[1:]
+try:
+    if len(arguments) % 2:
+        raise DemoSemanticError("relation arguments must be schema/name pairs")
+    plans = [
+        prepare_relation(schema, relation)
+        for schema, relation in zip(arguments[::2], arguments[1::2])
+    ]
+    progress = ProgressBar(
+        sum(len(plan["targets"]) for plan in plans),
+        os.environ["MAPP_FIELD_LIMIT"],
+    )
+    summaries = []
+    progress.start()
+    try:
+        # Generation only drafts, so targets within one relation are
+        # independent. One shared pool retains the eight-request bound while
+        # each relation is still checked/proposed/applied atomically.
+        with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+            for plan in plans:
+                summaries.append(describe_relation(plan, pool, progress))
+    finally:
+        # Keyboard interrupts, request failures and invalid provider responses
+        # must never leave the next console message on the progress-bar line.
+        progress.close()
+    for summary in summaries:
+        print(summary)
+except DemoSemanticError as error:
+    print("    " + str(error), file=sys.stderr)
+    raise SystemExit(1)
 PY
 }
 
@@ -373,6 +533,17 @@ done
 
 if [ "${DESCRIBE}" = "1" ]; then
   step "Describing the relations and their fields"
+  # This is the long step, and the knob that governs it is a line in .env
+  # rather than something to discover afterwards.
+  if [ -n "${DESCRIBE_FIELD_LIMIT}" ]; then
+    printf '  MAPP_DEMO_FIELD_LIMIT=%s in .env: relations above %s fields are\n' \
+      "${DESCRIBE_FIELD_LIMIT}" "${DESCRIBE_FIELD_LIMIT}"
+    printf '  table-only; smaller relations describe every field, one model call each.\n'
+    printf '  Raise the limit for a fuller catalogue, or empty it for no limit.\n'
+  else
+    printf '  MAPP_DEMO_FIELD_LIMIT is empty in .env: describing every field.\n'
+    printf '  Set it to a number there if you want a shorter run.\n'
+  fi
   describe_relations \
     source_census census_2021_england_oa \
     source_census census_variables \

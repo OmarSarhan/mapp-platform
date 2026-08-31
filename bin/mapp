@@ -311,6 +311,11 @@ enable_demo_sources() {
       missing+=("${key}")
     fi
   done
+  # Empty deliberately means "describe every field", but the key itself must
+  # exist: .env is the source of truth for the demo field limit.
+  if ! grep -q '^MAPP_DEMO_FIELD_LIMIT=' "${ENV_FILE}"; then
+    missing+=("MAPP_DEMO_FIELD_LIMIT")
+  fi
   if (( ${#missing[@]} > 0 )); then
     printf 'The demo sources need settings missing from %s: %s\n' \
       "${ENV_FILE}" "${missing[*]}" >&2
@@ -328,17 +333,46 @@ enable_demo_sources() {
 
 init_env() {
   local demo_flag="${1:-}"
+  local admin_password=""
+  local admin_output=""
+  local admin_command="init"
   init_state
-  if [[ ! -f "${CONTROL_DIR}/auth.json" ]]; then
+  if [[ ! -f "${CONTROL_DIR}/auth.json" || "${demo_flag}" == "--demo" ]]; then
     command -v openssl >/dev/null 2>&1 || {
       printf 'openssl is required to generate the configuration administrator password.\n' >&2
       exit 127
     }
+    if [[ -f "${CONTROL_DIR}/auth.json" ]]; then
+      admin_command="reset-password"
+    fi
     admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
-    printf '%s\n' "${admin_password}" \
-      | python3 "${ROOT_DIR}/config-ui/config_admin.py" init \
+    if ! admin_output="$(printf '%s\n' "${admin_password}" \
+      | python3 "${ROOT_DIR}/config-ui/config_admin.py" "${admin_command}" \
           --root "${CONTROL_DIR}" \
-          --password-stdin
+          --password-stdin)"; then
+      printf '%s\n' "${admin_output}" >&2
+      exit 1
+    fi
+    # config_admin init refuses to overwrite an existing store. Demo init uses
+    # its explicit reset operation instead because demo credentials are meant
+    # to be disposable and the newly printed password must always work.
+    if [[ "${admin_output}" != "Admin password (shown once): ${admin_password}" ]]; then
+      admin_password=""
+      printf '%s\n' "${admin_output}"
+    fi
+  fi
+  # var/ is a bind mount, so control/auth.json outlives the database volume and
+  # an ordinary repeat init skips the block above. Saying nothing there leaves
+  # you at a login prompt with a password that only exists as a hash.
+  # Print a newly created password before any later environment work can fail.
+  # Existing stores hold only a password hash, so never pretend that a newly
+  # generated candidate replaced them.
+  if [[ -n "${admin_password}" ]]; then
+    printf 'Configuration administrator password (shown once): %s\n' \
+      "${admin_password}"
+  else
+    printf 'Configuration administrator credentials already existed and were left alone.\n'
+    printf 'Run ./bin/mapp reset-config-password if you no longer have the password.\n'
   fi
   if [[ -e "${ENV_FILE}" ]]; then
     if [[ "${demo_flag}" == "--demo" ]]; then

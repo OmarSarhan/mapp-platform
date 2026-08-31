@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +14,124 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CheckEnvironmentTests(unittest.TestCase):
+    @staticmethod
+    def isolated_mapp_root(directory: str) -> Path:
+        root = Path(directory)
+        for relative in ("bin", "config-ui", "instance"):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        for relative in (
+            ".env.example",
+            "bin/mapp",
+            "config-ui/config_admin.py",
+            "config-ui/control_plane.py",
+            "instance/workspace.seed.json",
+        ):
+            shutil.copy2(ROOT / relative, root / relative)
+        return root
+
+    @staticmethod
+    def run_isolated_init(root: Path, *arguments: str) -> subprocess.CompletedProcess:
+        process_environment = os.environ.copy()
+        process_environment.pop("MAPP_ENV_FILE", None)
+        return subprocess.run(
+            [root / "bin/mapp", "init", *arguments],
+            cwd=root,
+            env=process_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_new_demo_init_prints_its_admin_password_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.isolated_mapp_root(directory)
+
+            result = self.run_isolated_init(root, "--demo")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            matches = re.findall(
+                r"^Configuration administrator password \(shown once\): (\S+)$",
+                result.stdout,
+                re.MULTILINE,
+            )
+            self.assertEqual(1, len(matches), result.stdout)
+            self.assertGreaterEqual(len(matches[0]), 12)
+            auth = json.loads(
+                (root / "var/control/auth.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(auth["adminPassword"].startswith("pbkdf2-sha256$"))
+            self.assertNotIn(matches[0], json.dumps(auth))
+
+            assignments = dict(
+                line.split("=", 1)
+                for line in (root / ".env").read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            )
+            self.assertEqual("leeds", assignments["MAPP_DEMO_SOURCES"])
+            self.assertEqual("50", assignments["MAPP_DEMO_FIELD_LIMIT"])
+
+    def test_init_demo_preserves_the_env_field_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.isolated_mapp_root(directory)
+            initial = self.run_isolated_init(root)
+            self.assertEqual(0, initial.returncode, initial.stderr)
+            original_auth = (root / "var/control/auth.json").read_text(
+                encoding="utf-8"
+            )
+            environment = root / ".env"
+            environment.write_text(
+                environment.read_text(encoding="utf-8").replace(
+                    "MAPP_DEMO_FIELD_LIMIT=50",
+                    "MAPP_DEMO_FIELD_LIMIT=7",
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_isolated_init(root, "--demo")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            matches = re.findall(
+                r"^Configuration administrator password \(shown once\): (\S+)$",
+                result.stdout,
+                re.MULTILINE,
+            )
+            self.assertEqual(1, len(matches), result.stdout)
+            updated_auth = (root / "var/control/auth.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotEqual(original_auth, updated_auth)
+            self.assertNotIn(matches[0], updated_auth)
+            assignments = dict(
+                line.split("=", 1)
+                for line in environment.read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            )
+            self.assertEqual("leeds", assignments["MAPP_DEMO_SOURCES"])
+            self.assertEqual("7", assignments["MAPP_DEMO_FIELD_LIMIT"])
+
+    def test_demo_reads_the_field_limit_from_the_env_file(self):
+        wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
+        demo = (ROOT / "docker/demo-sources/layers.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotRegex(wrapper, r"(?m)^DEMO_FIELD_LIMIT=")
+        self.assertNotIn("s/^MAPP_DEMO_FIELD_LIMIT=", wrapper)
+        self.assertIn(
+            'DESCRIBE_FIELD_LIMIT="$(dotenv_value MAPP_DEMO_FIELD_LIMIT)"',
+            demo,
+        )
+        self.assertNotIn("${MAPP_DEMO_FIELD_LIMIT-", demo)
+        generation = demo.index("  describe_relations \\")
+        self.assertLess(
+            demo.index("MAPP_DEMO_FIELD_LIMIT=%s in .env"),
+            generation,
+        )
+        self.assertLess(
+            demo.index("MAPP_DEMO_FIELD_LIMIT is empty in .env"),
+            generation,
+        )
+
     def test_init_generates_every_template_secret(self):
         template = (ROOT / ".env.example").read_text(encoding="utf-8")
         script = (ROOT / "bin/mapp").read_text(encoding="utf-8")

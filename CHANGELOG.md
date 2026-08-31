@@ -71,12 +71,22 @@ first release.
   --no-semantics` turns it off, and an absent key skips the step rather than
   failing the build. Descriptions are drafted and applied without review, which
   each proposal's recorded explanation says. Relations wider than
-  `MAPP_DEMO_FIELD_LIMIT` (40) get their table described and their fields left
-  to the structural profile -- `census_2021_england_oa` has 470 columns, and
-  one model call per field is not what a demo is for. The cap is announced in
-  the output rather than applied silently.
+  `MAPP_DEMO_FIELD_LIMIT` (50 by default in `.env`) get their table described
+  and their fields left to the structural profile --
+  `census_2021_england_oa` has 470 columns, and one model call per field is not
+  what a demo is for. The cap is announced in the output rather than applied
+  silently. The semantic stage now also reports the exact planned Gemini call
+  count and advances a terminal-safe progress bar as concurrent calls settle.
 
 ### Fixed
+
+- Multi-field semantic generation with sample rows or statistics no longer
+  fans out enough simultaneous PostgreSQL reads to exhaust a federated
+  source reader. The configuration service now queues optional-context reads
+  behind a process-wide three-slot admission bound, leaving headroom below
+  the packaged reader's four-connection ceiling; the dashboard also schedules
+  context-enabled field requests three at a time and metadata-only requests
+  ten at a time while preserving field order and all-or-nothing review.
 
 - Requesting sample rows or column statistics for a **federated** relation
   always failed with `semantic.generation_context_unavailable`, so the

@@ -425,6 +425,11 @@ field sample. Statistics do not disclose their contributing raw values.
 The response reports the exact booleans in `generation.contextOptions` and
 sets `generation.metadataOnly` accordingly. Neither optional context nor the
 sample values are returned in the draft or stored in semantic history.
+The configuration service admits at most three optional-context database
+reads at once and queues additional authenticated requests before opening a
+connection. This server-side bound applies equally to dashboard, CLI, demo,
+and concurrent-session callers and remains below the packaged source reader's
+four-connection ceiling. It does not change the request or response schema.
 
 Applying succeeds only while the asset still has the checked `baseVersion`.
 Source registration, replacement, refresh, or another curated apply increments

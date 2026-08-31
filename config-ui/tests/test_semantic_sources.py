@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import unittest
 from http import HTTPStatus
 from unittest.mock import patch
 
 import psycopg
+import semantic_sources
 
 from semantic_sources import (
     GENERATION_SAMPLE_MAX_BYTES,
     GENERATION_SAMPLE_MAX_ROWS,
+    MAX_CONCURRENT_GENERATION_CONTEXT_READS,
     MAX_FIELD_DESCRIPTION,
     PostgresSemanticSources,
     SemanticSourceError,
@@ -107,6 +110,75 @@ class FakeConnection:
 
     def commit(self):
         self.commits += 1
+
+
+class GenerationContextAdmissionTests(unittest.TestCase):
+    def test_context_read_error_releases_its_admission_slot(self):
+        slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_GENERATION_CONTEXT_READS
+        )
+        with (
+            patch.object(
+                semantic_sources,
+                "_GENERATION_CONTEXT_READ_SLOTS",
+                slots,
+            ),
+            patch.object(
+                semantic_sources,
+                "_read_postgres_generation_context",
+                side_effect=RuntimeError("read failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "read failed"),
+        ):
+            postgres_generation_context(
+                "postgresql://reader",
+                schema="leeds",
+                relation="roads",
+                fields=[],
+                target_kind="table",
+                sample_rows=True,
+            )
+
+        acquired = [
+            slots.acquire(blocking=False)
+            for _ in range(MAX_CONCURRENT_GENERATION_CONTEXT_READS + 1)
+        ]
+        try:
+            self.assertEqual([True, True, True, False], acquired)
+        finally:
+            for did_acquire in acquired:
+                if did_acquire:
+                    slots.release()
+
+    def test_metadata_only_context_bypasses_admission(self):
+        class RefuseAdmission:
+            def __enter__(self):
+                raise AssertionError("metadata-only request entered admission")
+
+            def __exit__(self, *_args):
+                return False
+
+        with (
+            patch.object(
+                semantic_sources,
+                "_GENERATION_CONTEXT_READ_SLOTS",
+                RefuseAdmission(),
+            ),
+            patch.object(
+                semantic_sources,
+                "_read_postgres_generation_context",
+            ) as reader,
+        ):
+            context = postgres_generation_context(
+                "postgresql://reader",
+                schema="leeds",
+                relation="roads",
+                fields=[],
+                target_kind="table",
+            )
+
+        self.assertEqual({}, context)
+        reader.assert_not_called()
 
 
 class SemanticSourceContractTests(unittest.TestCase):

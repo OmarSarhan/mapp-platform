@@ -336,9 +336,12 @@ statement and lock timeouts, and an `ACCESS SHARE` lock. Before reading values,
 the locked live column names and types must exactly match the stored generated
 profile. Synced source assets are rechecked against the configured allowlist
 and exclusions. Managed derived assets must also have the same current, ready
-semantic generation and are queried under the derived reader role. Sample rows
-are sent only to Gemini: they are never returned to the browser or CLI and
-never written to the audit log.
+semantic generation and are queried under the derived reader role. The
+configuration service queues every optional-context database read behind a
+process-wide three-slot admission bound, protecting CLI and demo generation as
+well as concurrent dashboard sessions. Sample rows are sent only to Gemini:
+they are never returned to the browser or CLI and never written to the audit
+log.
 
 Gemini returns a closed structured object containing `displayName`,
 `description`, `tags`, and `caveats`. The server validates and bounds that
@@ -357,8 +360,11 @@ optional `GEMINI_APIKEY` and `GEMINI_MODEL` settings are passed only to
 browser runner, or Caddy. Provider requests are one-shot, set `store: false`,
 reject redirects, have bounded request/response sizes and timeouts, and are
 never retried automatically. A batch of up to 25 selected fields is submitted
-concurrently, progress is reported as requests complete, and the ordered draft
-is shown only after the whole batch succeeds. `store: false` does not override the Gemini
+through a bounded dashboard worker pool: at most three requests are in flight
+when row samples or statistics are selected, and at most ten are in flight for
+metadata-only generation. Progress is reported as requests settle, input order
+is retained, and the ordered draft is shown only after the whole batch
+succeeds. `store: false` does not override the Gemini
 project's data-use and retention terms; operators must select an appropriate
 billing or [zero-data-retention configuration][gemini-zdr] under the
 [Gemini API terms][gemini-terms], and grant generation only for metadata they

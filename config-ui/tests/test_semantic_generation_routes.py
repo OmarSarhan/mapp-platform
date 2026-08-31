@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from types import MethodType
 from unittest.mock import Mock, patch
 
 import app
+import semantic_sources
 from control_plane import TOKEN_SCOPES
 
 
@@ -405,6 +408,130 @@ class SemanticGenerationRouteTests(unittest.TestCase):
             statistics=False,
             sample_seed=app._semantic_generation_sample_seed(current),
         )
+
+    def test_optional_context_reads_share_one_queue_before_gemini(self):
+        source = asset()
+        source["generated"]["binding"] = {
+            "adapter": "postgresql",
+            "alias": "MAPP",
+            "schema": "leeds",
+            "relation": "roads",
+        }
+        source["id"] = app.source_asset_id("MAPP", "leeds", "roads")
+        sources = app.PostgresSemanticSources(
+            {"MAPP": "postgresql://source-reader"},
+            app.parse_semantic_source_allowlist("MAPP:leeds.roads"),
+        )
+
+        managed = asset()
+        managed["id"] = "b08f4fb6-e4ac-5963-982f-843ee00d21f3"
+        derived = Mock()
+        derived.connection_string = "postgresql://derived-reader"
+        derived.get.return_value = {
+            "semanticProfile": {
+                "assetId": managed["id"],
+                "generation": managed["generation"],
+                "status": "ready",
+            }
+        }
+
+        worker_count = 6
+        start = threading.Barrier(worker_count + 1)
+        release_reads = threading.Event()
+        three_active = threading.Event()
+        state_lock = threading.Lock()
+        state = {"active": 0, "peak": 0, "completed": 0}
+
+        class ObservedAdmissionQueue:
+            def __init__(self):
+                self._slots = threading.BoundedSemaphore(
+                    semantic_sources.MAX_CONCURRENT_GENERATION_CONTEXT_READS
+                )
+                self._attempt_lock = threading.Lock()
+                self.attempts = 0
+                self.all_attempted = threading.Event()
+
+            def __enter__(self):
+                with self._attempt_lock:
+                    self.attempts += 1
+                    if self.attempts == worker_count:
+                        self.all_attempted.set()
+                self._slots.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self._slots.release()
+                return False
+
+        admission = ObservedAdmissionQueue()
+
+        def read_context(*_args, **_kwargs):
+            with state_lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+                if (
+                    state["active"]
+                    == semantic_sources.MAX_CONCURRENT_GENERATION_CONTEXT_READS
+                ):
+                    three_active.set()
+            try:
+                if not release_reads.wait(5):
+                    raise AssertionError("queued context reads were not released")
+                return {"sampleRows": {"returnedRows": 0, "rows": []}}
+            finally:
+                with state_lock:
+                    state["active"] -= 1
+                    state["completed"] += 1
+
+        def issue(current):
+            start.wait(timeout=5)
+            return app.semantic_generation_optional_context(
+                current,
+                {"kind": "table"},
+                {"sampleRows": True, "statistics": False},
+            )
+
+        gemini = Mock()
+        assets = [source, managed, source, managed, source, managed]
+        with (
+            patch.object(app, "SEMANTIC_SOURCES", sources),
+            patch.object(app, "DERIVED", derived),
+            patch.object(app, "GEMINI", gemini),
+            patch.object(
+                semantic_sources,
+                "_GENERATION_CONTEXT_READ_SLOTS",
+                admission,
+            ),
+            patch.object(
+                semantic_sources,
+                "_read_postgres_generation_context",
+                side_effect=read_context,
+            ) as reader,
+            ThreadPoolExecutor(max_workers=worker_count) as executor,
+        ):
+            futures = [executor.submit(issue, current) for current in assets]
+            start.wait(timeout=5)
+            try:
+                self.assertTrue(admission.all_attempted.wait(5))
+                self.assertTrue(three_active.wait(5))
+                self.assertEqual(3, state["active"])
+                self.assertEqual(3, reader.call_count)
+                self.assertTrue(all(not future.done() for future in futures))
+                gemini.generate.assert_not_called()
+            finally:
+                release_reads.set()
+            results = [future.result(timeout=5) for future in futures]
+
+        self.assertEqual(6, reader.call_count)
+        self.assertEqual(3, state["peak"])
+        self.assertEqual(6, state["completed"])
+        self.assertEqual(6, len(results))
+        self.assertTrue(all("sampleRows" in result for result in results))
+        self.assertEqual(
+            ["derived_layers", "leeds"],
+            sorted({call.kwargs["schema"] for call in reader.call_args_list}),
+        )
+        gemini.generate.assert_not_called()
 
     def test_optional_context_rejects_non_ready_derived_profile(self):
         current = asset()
