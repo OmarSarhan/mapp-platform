@@ -735,6 +735,28 @@ The catalogue fingerprint covers normalized manifests and entry hashes.
 Proposals and preview evidence bind to it. A plugin change makes earlier
 proposals and previews stale, requiring a new proposal and candidate preview.
 
+### Bounded tile retries
+
+The source-controlled `tile-retry` locale plugin is enabled in the seed
+workspace. It wraps layer decoration before initial display and applies the
+same policy to rendered MVT tiles, the secondary MVT feature source, and raster
+tiles. A transport failure or HTTP `408`, `429`, `500`, `502`, `503`, or `504`
+may be retried twice with capped exponential backoff and jitter; a valid
+`Retry-After` response is honored up to 30 seconds. Other HTTP responses are
+terminal when their status is visible to the loader.
+
+Same-origin raster requests use a status-aware loader. Browsers do not expose
+the status of a cross-origin image request unless that provider permits CORS,
+so external raster sources keep OpenLayers' image loader and retry any bounded
+`tileloaderror` event twice. This fallback cannot distinguish a transient
+server response from a terminal cross-origin `4xx`. Retries improve recovery
+from brief faults but do not replace database connection admission or query
+limits.
+
+The seed affects only a workspace initialized after deployment. Add the plugin
+to an existing workspace through the normal proposal and preview flow; do not
+edit mutable `var/workspace` state directly.
+
 Preview assertions use platform-owned checks: registration, locale/layer
 dispatch with an observable selector, selector existence or visibility, and
 absence of plugin-related browser errors. Manifest-provided test code is never

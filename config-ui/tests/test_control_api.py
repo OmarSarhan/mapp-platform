@@ -120,9 +120,14 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(64, len(payload["fingerprint"]))
         external = {item["id"]: item for item in payload["external"]}
         self.assertTrue(external["viewport-layer-count"]["available"])
+        self.assertTrue(external["tile-retry"]["available"])
         self.assertEqual(
             "/instance/plugins/viewport-layer-count/index.mjs",
             external["viewport-layer-count"]["entryUrl"],
+        )
+        self.assertEqual(
+            "/instance/plugins/tile-retry/index.mjs",
+            external["tile-retry"]["entryUrl"],
         )
         self.assertIn("allSettled", payload["loading"]["failure"])
         self.assertIn("not awaited", payload["dispatch"]["layer"])

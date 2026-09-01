@@ -1,0 +1,30 @@
+{
+  "id": "tile-retry",
+  "name": "Tile request retry",
+  "version": "1.0.0",
+  "xyzVersion": ">=4.23.0 <5.0.0",
+  "entry": "index.mjs",
+  "registrationKey": "tile_retry",
+  "scope": ["locale"],
+  "dispatch": ["sync"],
+  "configurationKey": "tile_retry",
+  "configurationSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "summary": "Retries transient raster and vector tile failures with bounded backoff.",
+  "prerequisites": [
+    "OpenLayers tile sources created by XYZ"
+  ],
+  "dependencies": [],
+  "previewAssertions": [
+    {"type": "registration"},
+    {"type": "no-plugin-console-errors"}
+  ],
+  "documentation": {
+    "configuration": "Add the entry URL to locale.plugins, tile_retry to locale.syncPlugins, and set locale.tile_retry to an empty object.",
+    "behavior": "Retries transport errors and HTTP 408, 429, 500, 502, 503, and 504 at most twice with capped backoff, jitter, and Retry-After support.",
+    "security": "Runs as trusted same-origin JavaScript. Cross-origin raster sources retain their image loader because response status is unavailable without CORS."
+  }
+}

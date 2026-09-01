@@ -599,6 +599,55 @@ describe('Dashboard managed save lifecycle', () => {
     );
   });
 
+  test('keeps synchronous plugin dispatch aligned with locale plugin toggles', async () => {
+    const pluginWorkspace = {
+      ...workspace,
+      locale: {...workspace.locale, syncPlugins: ['svg_templates']},
+    };
+    const tilePlugin = {
+      id: 'tile-retry',
+      name: 'Tile request retry',
+      version: '1.0.0',
+      xyzVersion: '>=4.23.0 <5.0.0',
+      entryUrl: '/instance/plugins/tile-retry/index.mjs',
+      registrationKey: 'tile_retry',
+      configurationKey: 'tile_retry',
+      configurationSchema: {type: 'object', properties: {}, additionalProperties: false},
+      aliases: [],
+      scope: ['locale'],
+      dispatch: ['sync'],
+      previewAssertions: [{type: 'registration'}],
+      summary: 'Retries transient tile requests.',
+      available: true,
+    };
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/workspace') {
+        return response({workspace: pluginWorkspace, revision: 'rev-1'});
+      }
+      if (path === '/api/catalog') return response({tables: [], databases: ['MAPP']});
+      if (path === '/api/icons') return response({icons: []});
+      if (path === '/api/plugins') {
+        return response({plugins: {external: [tilePlugin], fingerprint: 'catalogue'}});
+      }
+      throw new Error(`Unexpected request: GET ${path}`);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByText('External plugins'));
+    fireEvent.click(screen.getByRole('checkbox', {name: /^Enable plugin/}));
+
+    let advanced = JSON.parse(screen.getByLabelText('Advanced locale JSON').value);
+    expect(advanced.plugins).toEqual(['/instance/plugins/tile-retry/index.mjs']);
+    expect(advanced.tile_retry).toEqual({});
+    expect(advanced.syncPlugins).toEqual(['svg_templates', 'tile_retry']);
+
+    fireEvent.click(screen.getByRole('checkbox', {name: /^Enable plugin/}));
+    advanced = JSON.parse(screen.getByLabelText('Advanced locale JSON').value);
+    expect(advanced.plugins).toBeUndefined();
+    expect(advanced.tile_retry).toBeUndefined();
+    expect(advanced.syncPlugins).toEqual(['svg_templates']);
+  });
+
   test('reconciles added and removed derived columns into workspace info fields', () => {
     const source = {
       ...workspace,

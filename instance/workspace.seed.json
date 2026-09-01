@@ -19,6 +19,13 @@
       "Zoom"
     ],
     "ScaleLine": "metric",
+    "plugins": [
+      "/instance/plugins/tile-retry/index.mjs"
+    ],
+    "syncPlugins": [
+      "tile_retry"
+    ],
+    "tile_retry": {},
     "layers": {
       "Open_Street_Map": {
         "name": "Open Street Map",

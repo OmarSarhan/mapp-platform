@@ -17,6 +17,12 @@ class WorkspaceJsonSchemaTests(unittest.TestCase):
         self.assertEqual({"Open_Street_Map"}, set(layers))
         self.assertEqual("tiles", layers["Open_Street_Map"]["format"])
         self.assertEqual("Open Street Map", layers["Open_Street_Map"]["name"])
+        self.assertEqual(
+            ["/instance/plugins/tile-retry/index.mjs"],
+            workspace["locale"]["plugins"],
+        )
+        self.assertEqual(["tile_retry"], workspace["locale"]["syncPlugins"])
+        self.assertEqual({}, workspace["locale"]["tile_retry"])
 
     def test_schema_covers_dashboard_xyz_symbols(self):
         schema = json.loads(

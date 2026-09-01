@@ -598,6 +598,19 @@ class WorkspaceValidationTests(unittest.TestCase):
             paths,
         )
 
+    def test_validates_global_tile_retry_plugin(self):
+        data = valid_workspace()
+        data["locale"]["plugins"] = [
+            "/instance/plugins/tile-retry/index.mjs"
+        ]
+        data["locale"]["syncPlugins"] = ["tile_retry"]
+        data["locale"]["tile_retry"] = {}
+        self.assertEqual(validate_workspace(data, {"MAPP"}), [])
+
+        data["locale"]["tile_retry"] = {"retries": 10}
+        paths = {error["path"] for error in validate_workspace(data, {"MAPP"})}
+        self.assertIn("locale.tile_retry.retries", paths)
+
     def test_validates_optional_geometry_info_symbol_metadata(self):
         data = valid_workspace()
         entry = data["locale"]["layers"]["Places"]["infoj"][0]
