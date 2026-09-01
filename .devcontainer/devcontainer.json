@@ -41,7 +41,8 @@
     "vscode": {
       "extensions": [
         "ms-python.python",
-        "ms-python.vscode-pylance"
+        "ms-python.vscode-pylance",
+        "openai.chatgpt"
       ],
       "settings": {
         "terminal.integrated.cwd": "${workspaceFolder}",
