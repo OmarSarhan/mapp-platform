@@ -513,6 +513,11 @@ in the approved password manager, then sign in to the dashboard again. The
 reset invalidates every existing dashboard session and takes effect without a
 service restart. It does not change or revoke remote CLI bearer tokens.
 
+`./bin/mapp init --demo` is a separate disposable-environment transition. On
+an existing instance it validates the demo settings first, then rotates the
+administrator password, clears dashboard sessions, and revokes every CLI API
+token and outstanding device authorization before enabling the demo sources.
+
 The wrapper uses the deployment's selected `.env`. If the deployment
 deliberately uses another environment file, select the same file used to run
 the stack:
@@ -532,7 +537,9 @@ proposal author, AI semantic author, curator, delivery operator, semantic
 administrator, or full platform operator tokens. Expand **Customize
 narrow scopes** to choose an exact workspace-and-semantic combination. Presets
 do not broaden the resulting credential: the server stores and enforces only
-the submitted scopes.
+the submitted scopes. Existing token rows expose their exact stored grants
+under **Granted permissions**. **Pending device authorizations** appears only
+while at least one unapproved request is actually pending.
 
 These commands affect configuration-service authentication only. They do not
 change PostgreSQL passwords. Changing `.env` passwords also does not rotate

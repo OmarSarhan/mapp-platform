@@ -204,6 +204,7 @@ class FakeStore:
         self.released = False
         self.published: tuple[Any, ...] | None = None
         self.geometry_repair_candidates: tuple[str, ...] = ()
+        self.repair_extent = None
         self.statistic_columns = tuple(
             column
             for selected_topic in selected_config.topics
@@ -236,7 +237,10 @@ class FakeStore:
         _stage: str,
         expected: int,
         maximum: int,
+        *,
+        repair_extent: Any = None,
     ) -> tuple[str, ...]:
+        self.repair_extent = repair_extent
         self.events.append(("validate_geometry", expected, maximum))
         return self.geometry_repair_candidates
 
@@ -321,6 +325,7 @@ class CensusPipelineTests(unittest.TestCase):
         self.assertEqual(result.geometry_repairs, 0)
         self.assertEqual(result.topic_count, 1)
         self.assertEqual(result.variable_count, 2)
+        self.assertIsNone(store.repair_extent)
         self.assertEqual(nomis.opened, ["TS001"])
         self.assertEqual(
             [event for event in store.events if event[0] == "assemble_once"],
@@ -377,6 +382,33 @@ class CensusPipelineTests(unittest.TestCase):
         )
         self.assertFalse(store.failed)
         self.assertTrue(store.released)
+
+    def test_repair_extent_is_passed_to_geometry_validation_and_metadata(
+        self,
+    ) -> None:
+        selected_config = config()
+        selected_topic = selected_config.topics[0]
+        repair_extent = (-1.85, 53.65, -1.2, 54.0)
+        nomis = FakeNomisClient(
+            {selected_topic.id: topic_context(selected_topic)}
+        )
+        store = FakeStore(selected_config)
+
+        run_census(
+            selected_config,
+            FakeArcGISClient(),  # type: ignore[arg-type]
+            nomis,  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
+            repair_extent=repair_extent,
+        )
+
+        self.assertEqual(store.repair_extent, repair_extent)
+        self.assertIsNotNone(store.published)
+        _run_id, dataset, _variables = store.published  # type: ignore[misc]
+        self.assertEqual(
+            dataset.source_metadata["geometry"]["repair_extent"],
+            list(repair_extent),
+        )
 
     def test_geometry_hash_mismatch_fails_before_spatial_validation(self) -> None:
         selected_config = config()

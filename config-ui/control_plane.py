@@ -520,6 +520,14 @@ class ControlStore:
         }
         with self._locked():
             state = self._state()
+            normalized_name = record["name"].casefold()
+            if any(
+                isinstance(existing, dict)
+                and isinstance(existing.get("name"), str)
+                and existing["name"].strip().casefold() == normalized_name
+                for existing in state["tokens"]
+            ):
+                raise ValueError("Token names must be unique.")
             state["tokens"].append(record)
             self._write(state)
         self.audit(
@@ -664,9 +672,26 @@ class ControlStore:
                 ):
                     return {"status": "invalid"}
                 raw = "mapp_" + secrets.token_urlsafe(32)
+                while True:
+                    token_id = secrets.token_hex(8)
+                    token_name = f"Device: {item['deviceName']} [{token_id}]"
+                    folded_name = token_name.casefold()
+                    if not any(
+                        isinstance(existing, dict)
+                        and (
+                            existing.get("id") == token_id
+                            or (
+                                isinstance(existing.get("name"), str)
+                                and existing["name"].strip().casefold()
+                                == folded_name
+                            )
+                        )
+                        for existing in state["tokens"]
+                    ):
+                        break
                 record = {
-                    "id": secrets.token_hex(8),
-                    "name": f"Device: {item['deviceName']}",
+                    "id": token_id,
+                    "name": token_name,
                     "hash": token_hash(raw),
                     "created": iso(current),
                     "expires": iso(
@@ -899,14 +924,49 @@ class ControlStore:
             ]
             return [_strict_json(line) for line in lines]
 
-    def reset_password(self, password: str) -> None:
+    def reset_password(self, password: str, *, revoke_tokens: bool = False) -> None:
         with self._locked():
             require_password(password)
             state = self._state()
             state["adminPassword"] = password_hash(password)
             state["sessions"] = []
+            if revoke_tokens:
+                revoked_at = iso()
+                # Keep every token record: revocation must not release its
+                # permanently reserved, case-insensitive name.
+                for item in state["tokens"]:
+                    if not item.get("revoked"):
+                        item["revoked"] = revoked_at
+                revoked_devices = 0
+                for item in state["deviceAuthorizations"]:
+                    if item.get("status") in {"pending", "approved"}:
+                        # Approved device grants can still mint a token, and
+                        # every unexpired record occupies a queue slot. Expire
+                        # both forms of outstanding authority in the same
+                        # transaction as the token revocation.
+                        item.update({
+                            "status": "revoked",
+                            "revoked": revoked_at,
+                            "expires": revoked_at,
+                        })
+                        revoked_devices += 1
             self._write(state)
             self.audit("auth.password_reset", actor="local-admin")
+            if revoke_tokens:
+                if revoked_devices:
+                    self.audit(
+                        "device.authorizations_revoked",
+                        actor="local-admin",
+                        details={
+                            "reason": "demo-init",
+                            "count": revoked_devices,
+                        },
+                    )
+                self.audit(
+                    "token.revoked_all",
+                    actor="local-admin",
+                    details={"reason": "demo-init"},
+                )
 
     def revoke_all(self) -> None:
         with self._locked():

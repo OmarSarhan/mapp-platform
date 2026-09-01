@@ -381,6 +381,32 @@ class CensusDatabaseTests(unittest.TestCase):
         self.assertIn("array_agg(oa21cd ORDER BY oa21cd)", sql_text)
         self.assertEqual(self.connection.commits, 1)
 
+    def test_geometry_repair_can_be_limited_to_workspace_extent(self) -> None:
+        self.connection.responses = [
+            (2, 0, 0, 0, 0, 1, ["E00000002"]),
+            (2, 0, 0, 0, 0, 0, []),
+        ]
+        self.connection.default_rowcount = 1
+
+        repaired = self.store.validate_geometry(
+            "census_geometry_safe",
+            2,
+            64,
+            repair_extent=(-1.85, 53.65, -1.2, 54.0),
+        )
+
+        self.assertEqual(repaired, ("E00000002",))
+        sql_text = self.rendered_sql()
+        self.assertEqual(sql_text.count("ST_MakeEnvelope(%s, %s, %s, %s, 4326)"), 5)
+        self.assertIn("geom && ST_MakeEnvelope", sql_text)
+        update_statement, update_params = next(
+            item
+            for item in self.connection.statements
+            if "UPDATE pg_temp" in item[0]
+        )
+        self.assertIn("WHERE NOT ST_IsValid(geom)", update_statement)
+        self.assertEqual(update_params, (-1.85, 53.65, -1.2, 54.0))
+
     def test_geometry_repair_limit_fails_before_any_update(self) -> None:
         self.connection.responses = [
             (2, 0, 0, 0, 0, 2, ["E00000001", "E00000002"])

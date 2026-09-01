@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ GEOMETRY_3857_COMMENT = (
     "Stored generated EPSG:3857 transform of geom for map rendering."
 )
 VARIABLE_COMMENT_MAX_CHARS = 2_000
+CensusRepairExtent = tuple[float, float, float, float]
 
 
 class CensusDatabaseError(RuntimeError):
@@ -57,6 +59,32 @@ class CensusDuplicateCodeError(CensusDatabaseError):
 
 class CensusCodeSetError(CensusDatabaseError):
     pass
+
+
+def _validate_repair_extent(
+    extent: CensusRepairExtent | None,
+) -> CensusRepairExtent | None:
+    if extent is None:
+        return None
+    if (
+        not isinstance(extent, (list, tuple))
+        or len(extent) != 4
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in extent
+        )
+    ):
+        raise CensusDatabaseError(
+            "repair_extent must be finite west, south, east, north coordinates"
+        )
+    west, south, east, north = (float(value) for value in extent)
+    if not (-180 <= west <= east <= 180 and -90 <= south <= north <= 90):
+        raise CensusDatabaseError(
+            "repair_extent must be ordered WGS84 west, south, east, north"
+        )
+    return (west, south, east, north)
 
 
 @dataclass(frozen=True)
@@ -784,13 +812,25 @@ class CensusPostgresStore:
         stage: str,
         expected_count: int,
         max_repairs: int,
+        repair_extent: CensusRepairExtent | None = None,
     ) -> tuple[str, ...]:
         _require_identifier(stage, "staging table")
         if max_repairs < 0:
             raise CensusDatabaseError("max_repairs must not be negative")
+        repair_extent = _validate_repair_extent(repair_extent)
 
         def operation() -> tuple[str, ...]:
             with self.connection.cursor() as cursor:
+                repair_filter = sql.SQL("")
+                repair_params: tuple[float, float, float, float] = ()
+                if repair_extent is not None:
+                    repair_filter = sql.SQL(
+                        """
+                        AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+                        """
+                    )
+                    repair_params = repair_extent
+
                 def inspect() -> tuple[
                     int,
                     int,
@@ -822,17 +862,24 @@ class CensusPostgresStore:
                                 count(*) FILTER (
                                     WHERE geom IS NOT NULL
                                       AND NOT ST_IsValid(geom)
+                                      {}
                                 )::bigint,
                                 COALESCE(
                                     array_agg(oa21cd ORDER BY oa21cd) FILTER (
                                         WHERE geom IS NOT NULL
                                           AND NOT ST_IsValid(geom)
+                                          {}
                                     ),
                                     ARRAY[]::text[]
                                 )
                             FROM pg_temp.{}
                             """
-                        ).format(sql.Identifier(stage))
+                        ).format(
+                            repair_filter,
+                            repair_filter,
+                            sql.Identifier(stage),
+                        ),
+                        (*repair_params, *repair_params),
                     )
                     row = cursor.fetchone()
                     if row is None:
@@ -903,8 +950,10 @@ class CensusPostgresStore:
                             ST_CollectionExtract(ST_MakeValid(geom), 3)
                         )
                         WHERE NOT ST_IsValid(geom)
+                        {}
                         """
-                    ).format(sql.Identifier(stage))
+                    ).format(sql.Identifier(stage), repair_filter),
+                    repair_params,
                 )
                 if cursor.rowcount != invalid_geometries:
                     raise CensusDatabaseError(

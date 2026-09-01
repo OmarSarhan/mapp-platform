@@ -1239,6 +1239,26 @@ class TokenAdministrationRouteTests(unittest.TestCase):
             self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
             self.assertEqual([], store.list_tokens())
 
+    def test_revoked_token_name_is_rejected_at_admin_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            _raw, record = store.create_token("CLI operator")
+            self.assertTrue(store.revoke_token(record["id"]))
+            handler, responses = self.handler({
+                "name": " cli OPERATOR ",
+                "scopes": ["inspect"],
+            })
+
+            with patch.object(app, "CONTROL", store):
+                handler.do_POST()
+
+            self.assertEqual(HTTPStatus.BAD_REQUEST, responses[0][0])
+            self.assertEqual(
+                "Token names must be unique.", responses[0][1]["error"]
+            )
+            self.assertEqual(1, len(store.list_tokens()))
+
     def test_misspelled_or_null_scopes_never_expand_to_legacy_full(self):
         invalid_requests = (
             {

@@ -116,9 +116,10 @@ run_with_buildkit_lease_retry() {
 
 dotenv_value() {
   local key="$1"
+  local source_file="${2:-${ENV_FILE}}"
   local value
   value="$(
-    sed -n "s/^${key}=//p" "${ENV_FILE}" \
+    sed -n "s/^${key}=//p" "${source_file}" \
       | tail -n 1
   )"
   value="${value%$'\r'}"
@@ -287,18 +288,25 @@ init_state() {
 # so turning the demo on without them breaks every later subcommand -- including
 # down, ps and logs. Refuse rather than let an operator brick their teardown by
 # switching a demo on.
-enable_demo_sources() {
-  local key
+validate_demo_sources() {
+  local demo_environment key
+  local source_file="${1:-${ENV_FILE}}"
   local -a missing=()
   # Refused before anything is written. init runs ahead of the production
   # environment gate below, and validate_production_env refuses a non-empty
   # MAPP_DEMO_SOURCES -- so writing one here would leave a production
   # deployment where every wrapper command, teardown and log reading
   # included, fails until somebody hand-edits the file back.
-  if [[ "$(dotenv_value MAPP_ENVIRONMENT)" == "production" ]]; then
+  demo_environment="$(dotenv_value MAPP_ENVIRONMENT "${source_file}")"
+  if [[ "${demo_environment}" == "production" ]]; then
     printf 'Refusing to enable demo sources: %s is a production environment.\n' \
-      "${ENV_FILE}" >&2
+      "${source_file}" >&2
     printf 'The demo stands up throwaway self-signed source databases; production refuses them.\n' >&2
+    exit 2
+  fi
+  if [[ "${demo_environment}" != "development" ]]; then
+    printf 'Refusing to enable demo sources: MAPP_ENVIRONMENT in %s must be development.\n' \
+      "${source_file}" >&2
     exit 2
   fi
   for key in \
@@ -307,28 +315,31 @@ enable_demo_sources() {
     SOURCE_POSTGRES_USER SOURCE_READER_USER SOURCE_READER_PASSWORD \
     FEDERATION_DBS_CENSUS FEDERATION_DBS_OPS
   do
-    if [[ -z "$(dotenv_value "${key}")" ]]; then
+    if [[ -z "$(dotenv_value "${key}" "${source_file}")" ]]; then
       missing+=("${key}")
     fi
   done
   # Empty deliberately means "describe every field", but the key itself must
   # exist: .env is the source of truth for the demo field limit.
-  if ! grep -q '^MAPP_DEMO_FIELD_LIMIT=' "${ENV_FILE}"; then
+  if ! grep -q '^MAPP_DEMO_FIELD_LIMIT=' "${source_file}"; then
     missing+=("MAPP_DEMO_FIELD_LIMIT")
   fi
   if (( ${#missing[@]} > 0 )); then
     printf 'The demo sources need settings missing from %s: %s\n' \
-      "${ENV_FILE}" "${missing[*]}" >&2
+      "${source_file}" "${missing[*]}" >&2
     printf 'Run ./bin/mapp doctor --add-missing, then retry.\n' >&2
     exit 2
   fi
+}
+
+enable_demo_sources() {
   if grep -q '^MAPP_DEMO_SOURCES=' "${ENV_FILE}"; then
     sed -i 's/^MAPP_DEMO_SOURCES=.*/MAPP_DEMO_SOURCES=leeds/' "${ENV_FILE}"
   else
     printf 'MAPP_DEMO_SOURCES=leeds\n' >>"${ENV_FILE}"
   fi
   printf 'Enabled the demo sources in %s.\n' "${ENV_FILE}"
-  printf 'Next: ./bin/mapp all to start the platform, then ./bin/mapp demo to load them.\n'
+  printf 'Next: ./bin/mapp all to start the platform, then ./bin/mapp demo to load demo data.\n'
 }
 
 init_env() {
@@ -336,6 +347,20 @@ init_env() {
   local admin_password=""
   local admin_output=""
   local admin_command="init"
+  local demo_source_file="${ENV_FILE}"
+  if [[ ! -e "${ENV_FILE}" && ! -f "${ROOT_DIR}/.env.example" ]]; then
+    # A failed init must not rotate credentials or revoke tokens retained in
+    # var/control from an earlier installation.
+    printf 'Missing initialization template: %s/.env.example\n' "${ROOT_DIR}" >&2
+    exit 2
+  fi
+  if [[ "${demo_flag}" == "--demo" ]]; then
+    # Refuse invalid demo opt-ins before rotating any existing credentials.
+    if [[ ! -e "${ENV_FILE}" ]]; then
+      demo_source_file="${ROOT_DIR}/.env.example"
+    fi
+    validate_demo_sources "${demo_source_file}"
+  fi
   init_state
   if [[ ! -f "${CONTROL_DIR}/auth.json" || "${demo_flag}" == "--demo" ]]; then
     command -v openssl >/dev/null 2>&1 || {
@@ -343,7 +368,7 @@ init_env() {
       exit 127
     }
     if [[ -f "${CONTROL_DIR}/auth.json" ]]; then
-      admin_command="reset-password"
+      admin_command="reset-demo"
     fi
     admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
     if ! admin_output="$(printf '%s\n' "${admin_password}" \
@@ -355,10 +380,14 @@ init_env() {
     fi
     # config_admin init refuses to overwrite an existing store. Demo init uses
     # its explicit reset operation instead because demo credentials are meant
-    # to be disposable and the newly printed password must always work.
+    # to be disposable: it clears sessions, revokes API tokens, and ensures the
+    # newly printed password is the only retained administrator credential.
     if [[ "${admin_output}" != "Admin password (shown once): ${admin_password}" ]]; then
       admin_password=""
       printf '%s\n' "${admin_output}"
+    fi
+    if [[ "${admin_command}" == "reset-demo" ]]; then
+      printf 'Revoked all existing CLI API tokens and outstanding device authorizations for demo mode.\n'
     fi
   fi
   # var/ is a bind mount, so control/auth.json outlives the database volume and
@@ -381,11 +410,6 @@ init_env() {
     fi
     printf 'Initialization skipped: %s already exists and was left unchanged.\n' "${ENV_FILE}"
     return
-  fi
-
-  if [[ ! -f "${ROOT_DIR}/.env.example" ]]; then
-    printf 'Missing initialization template: %s/.env.example\n' "${ROOT_DIR}" >&2
-    exit 2
   fi
 
   command -v openssl >/dev/null 2>&1 || {

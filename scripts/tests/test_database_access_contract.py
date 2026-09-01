@@ -87,6 +87,26 @@ class DatabaseAccessContractTests(unittest.TestCase):
             with self.subTest(path=relative_path, contract=contract):
                 self.assertIn(contract, source)
 
+    def test_live_test_tokens_have_failure_safe_revocation_sweeps(self) -> None:
+        """Container tests must not leave usable bearer credentials behind."""
+        contracts = {
+            "docker/demo-sources/layers.sh": (
+                '"demo-layers-" + secrets.token_hex(8)',
+                'name.startswith("demo-layers-")',
+                'then revoke_token "${TOKEN_ID}"; fi; revoke_demo_tokens\' EXIT',
+            ),
+            "scripts/federation-e2e.sh": (
+                'name.startswith("federation-e2e")',
+                "store.revoke_token(record[\"id\"])",
+                "trap cleanup EXIT",
+            ),
+        }
+        for relative_path, required in contracts.items():
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+            for contract in required:
+                with self.subTest(path=relative_path, contract=contract):
+                    self.assertIn(contract, source)
+
     def test_fresh_h3_install_hardens_catalog_owned_sql_wrappers(self) -> None:
         self.assert_h3_sql_wrapper_hardening(
             "docker/postgis/init/05-h3.sql"

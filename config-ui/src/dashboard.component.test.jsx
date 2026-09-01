@@ -6,6 +6,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 
 import {
@@ -43,6 +44,49 @@ const response = (payload, status = 200) => ({
 });
 
 describe('Scoped token administration', () => {
+  test('flashes confirmation only after the API token reaches the clipboard', async () => {
+    let finishCopy;
+    const writeText = vi.fn(() => new Promise(resolve => {
+      finishCopy = resolve;
+    }));
+    vi.stubGlobal('navigator', {...navigator, clipboard: {writeText}});
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (options.method === 'POST' && path === '/api/admin/tokens') {
+        return response({token: 'mapp_copy_me', record: {id: 'token-copy'}}, 201);
+      }
+      if (path === '/api/admin/tokens') return response({tokens: []});
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: []});
+      }
+      if (path === '/api/admin/audit') return response({events: []});
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Create scoped CLI token',
+    }));
+    const copy = await screen.findByRole('button', {name: 'Copy API token'});
+    fireEvent.click(copy);
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('mapp_copy_me'));
+    expect(copy.classList.contains('copied')).toBe(false);
+    expect(copy.getAttribute('aria-pressed')).toBe('false');
+
+    finishCopy();
+    const copied = await screen.findByRole('button', {
+      name: 'API token copied to clipboard',
+    });
+    expect(copied.textContent).toBe('Copied');
+    expect(copied.classList.contains('copied')).toBe(true);
+    expect(copied.getAttribute('aria-pressed')).toBe('true');
+    await waitFor(() => {
+      const reset = screen.getByRole('button', {name: 'Copy API token'});
+      expect(reset.classList.contains('copied')).toBe(false);
+      expect(reset.getAttribute('aria-pressed')).toBe('false');
+    }, {timeout: 1500});
+  });
+
   test('offers semantic privilege tiers and provisions the selected scopes', async () => {
     const created = [];
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
@@ -152,6 +196,70 @@ describe('Scoped token administration', () => {
       'federation:register',
       'federation:provision',
     ]);
+  });
+
+  test('hides empty pending devices and expands every stored token permission', async () => {
+    const tokens = [
+      {
+        id: 'token-narrow',
+        name: 'Narrow operator',
+        scopes: ['inspect', 'semantic:generate'],
+        expires: '2030-01-01T00:00:00Z',
+        lastUsed: null,
+        revoked: null,
+      },
+      {
+        id: 'token-full',
+        name: 'Full operator',
+        scopes: ['full'],
+        expires: null,
+        lastUsed: '2029-01-01T00:00:00Z',
+        revoked: '2029-02-01T00:00:00Z',
+      },
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/admin/tokens') return response({tokens});
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: []});
+      }
+      if (path === '/api/admin/audit') return response({events: []});
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    expect(await screen.findByText('Narrow operator')).toBeTruthy();
+    expect(screen.queryByRole('heading', {
+      name: 'Pending device authorizations',
+    })).toBe(null);
+
+    const narrowSummary = screen.getByText('Granted permissions (2)');
+    const narrowDetails = narrowSummary.closest('details');
+    expect(narrowDetails.open).toBe(false);
+    fireEvent.click(narrowSummary);
+    const narrowPermissions = within(narrowDetails);
+    expect(narrowPermissions.getAllByRole('checkbox')).toHaveLength(2);
+    for (const id of tokens[0].scopes) {
+      const scope = TOKEN_SCOPE_OPTIONS.find(option => option.id === id);
+      const checkbox = narrowPermissions.getByRole('checkbox', {
+        name: new RegExp(scope.label),
+      });
+      expect(checkbox.checked).toBe(true);
+      expect(checkbox.disabled).toBe(true);
+      expect(narrowPermissions.getByText(`${scope.id} · ${scope.help}`)).toBeTruthy();
+    }
+    expect(narrowPermissions.queryByText('Apply workspace proposals')).toBe(null);
+
+    const fullSummary = screen.getByText('Granted permission (1)');
+    const fullDetails = fullSummary.closest('details');
+    fireEvent.click(fullSummary);
+    const fullPermissions = within(fullDetails);
+    const fullPreset = TOKEN_ACCESS_PRESETS.find(option => option.id === 'full');
+    const fullCheckbox = fullPermissions.getByRole('checkbox', {
+      name: /Full platform operator/,
+    });
+    expect(fullCheckbox.checked).toBe(true);
+    expect(fullCheckbox.disabled).toBe(true);
+    expect(fullPermissions.getByText(`full · ${fullPreset.help}`)).toBeTruthy();
   });
 
   test('provisions every named access level without expanding its scopes', async () => {
@@ -278,6 +386,114 @@ describe('Scoped token administration', () => {
       extendedExpiryConfirmed: true,
     });
     expect(await screen.findByText('mapp_custom')).toBeTruthy();
+  });
+
+  test('expands every requested device permission before exact approval', async () => {
+    const approved = [];
+    const device = {
+      userCode: 'ABCD-EFGH',
+      deviceName: 'config-cli:production',
+      scopes: ['inspect', 'semantic:generate'],
+      expires: '2030-01-01T00:00:00Z',
+      status: 'pending',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (
+        options.method === 'POST'
+        && path === '/api/admin/device-authorizations/approve'
+      ) {
+        approved.push(JSON.parse(options.body));
+        return response({approved: true});
+      }
+      if (path === '/api/admin/tokens') {
+        return response({tokens: []});
+      }
+      if (path === '/api/admin/device-authorizations') {
+        return response({
+          authorizations: approved.length ? [{...device, status: 'approved'}] : [device],
+        });
+      }
+      if (path === '/api/admin/audit') {
+        return response({events: []});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    const summary = await screen.findByText('Requested permissions (2)');
+    expect(screen.getByRole('heading', {
+      name: 'Pending device authorizations',
+    })).toBeTruthy();
+    const details = summary.closest('details');
+    expect(details.open).toBe(false);
+
+    fireEvent.click(summary);
+    expect(details.open).toBe(true);
+    const requested = within(details);
+    const checkboxes = requested.getAllByRole('checkbox');
+    expect(checkboxes).toHaveLength(2);
+    for (const checkbox of checkboxes) {
+      expect(checkbox.checked).toBe(true);
+      expect(checkbox.disabled).toBe(true);
+    }
+    for (const scopeId of device.scopes) {
+      const scope = TOKEN_SCOPE_OPTIONS.find(option => option.id === scopeId);
+      expect(requested.getByRole('checkbox', {
+        name: new RegExp(scope.label),
+      })).toBeTruthy();
+      expect(requested.getByText(`${scope.id} · ${scope.help}`)).toBeTruthy();
+    }
+    expect(requested.queryByText('Apply workspace proposals')).toBe(null);
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Approve config-cli:production (ABCD-EFGH)',
+    }));
+    await waitFor(() => expect(approved).toEqual([{userCode: device.userCode}]));
+    await waitFor(() => expect(
+      screen.queryByText('Requested permissions (2)'),
+    ).toBe(null));
+    expect(screen.queryByRole('heading', {
+      name: 'Pending device authorizations',
+    })).toBe(null);
+  });
+
+  test('shows and blocks an unsupported requested device permission', async () => {
+    const device = {
+      userCode: 'WXYZ-1234',
+      deviceName: 'config-cli:legacy',
+      scopes: ['inspect', 'future:unknown'],
+      expires: '2030-01-01T00:00:00Z',
+      status: 'pending',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      if (path === '/api/admin/tokens') {
+        return response({tokens: []});
+      }
+      if (path === '/api/admin/device-authorizations') {
+        return response({authorizations: [device]});
+      }
+      if (path === '/api/admin/audit') {
+        return response({events: []});
+      }
+      throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+    }));
+
+    render(<Security close={() => {}}/>);
+    const summary = await screen.findByText('Requested permissions (2)');
+    fireEvent.click(summary);
+    const requested = within(summary.closest('details'));
+    const unknown = requested.getByRole('checkbox', {
+      name: /Unknown device permission/,
+    });
+    expect(unknown.checked).toBe(true);
+    expect(unknown.disabled).toBe(true);
+    expect(requested.getByText(
+      'future:unknown · This dashboard does not recognize this requested permission.',
+    )).toBeTruthy();
+    expect(requested.getByText(/Approval is blocked/)).toBeTruthy();
+    expect(screen.getByRole('button', {
+      name: 'Approve config-cli:legacy (WXYZ-1234)',
+    }).disabled).toBe(true);
   });
 });
 

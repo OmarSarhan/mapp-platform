@@ -34,6 +34,37 @@ READER_USER="$(dotenv_value SOURCE_READER_USER)"
 CENSUS_DB="$(dotenv_value CENSUS_POSTGRES_DB)"
 OPS_DB="$(dotenv_value OPS_POSTGRES_DB)"
 
+workspace_repair_extent() {
+  local workspace="${ROOT_DIR}/var/workspace/workspace.json"
+  if [[ ! -f "${workspace}" ]]; then
+    workspace="${ROOT_DIR}/instance/workspace.seed.json"
+  fi
+  python3 - "${workspace}" <<'PY'
+import json
+import math
+import sys
+
+try:
+    workspace = json.load(open(sys.argv[1], encoding="utf-8"))
+except OSError:
+    raise SystemExit(0)
+extent = ((workspace.get("locale") or {}).get("extent") or {})
+try:
+    west = float(extent["west"])
+    south = float(extent["south"])
+    east = float(extent["east"])
+    north = float(extent["north"])
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(0)
+if (
+    all(math.isfinite(value) for value in (west, south, east, north))
+    and -180 <= west <= east <= 180
+    and -90 <= south <= north <= 90
+):
+    print(f"{west},{south},{east},{north}")
+PY
+}
+
 # Census metadata travels with the measures: census_variables carries the ONS
 # label for every tsNNN_NNNN column, which is what makes a themed layer
 # describable rather than a wall of codes.
@@ -81,8 +112,13 @@ seed_one() {
   # --no-deps: the etl service declares depends_on the packaged database, which
   # was right when it loaded that database and is wrong now it loads a source.
   # Without it, seeding a source recreates and waits on MAPP own db container.
+  local extra_env=()
+  if [[ -n "${MAPP_CENSUS_REPAIR_EXTENT:-}" ]]; then
+    extra_env+=(-e "MAPP_CENSUS_REPAIR_EXTENT=${MAPP_CENSUS_REPAIR_EXTENT}")
+  fi
   "${compose[@]}" run --rm --build --no-deps \
     -e "DATABASE_URL=postgresql://${SOURCE_USER}:${password}@${service}:5432/${database}?sslmode=require" \
+    "${extra_env[@]}" \
     etl ${etl_command} >/dev/null
 
   for table in "${tables[@]}"; do
@@ -170,6 +206,13 @@ COUNT_SQL
 # census dataset has its own module and config.
 seed_one ops-db "${OPS_DB}" "$(dotenv_value OPS_POSTGRES_PASSWORD)" "" \
   "${OPS_TABLES[@]}"
+CENSUS_REPAIR_EXTENT="$(workspace_repair_extent)"
+if [[ -n "${CENSUS_REPAIR_EXTENT}" ]]; then
+  printf 'Limiting Census geometry repair to workspace extent %s.\n' \
+    "${CENSUS_REPAIR_EXTENT}"
+fi
+
+MAPP_CENSUS_REPAIR_EXTENT="${CENSUS_REPAIR_EXTENT}" \
 seed_one census-db "${CENSUS_DB}" "$(dotenv_value CENSUS_POSTGRES_PASSWORD)" \
   "python -m leeds_arcgis_etl.census_main --config /config/census.json" \
   "${CENSUS_TABLES[@]}"

@@ -114,7 +114,9 @@ Production must enable secure cookies and HTTPS.
 CLI tokens are shown once and stored as hashes by the platform. For device
 authorization, approval stores no usable credential: the raw token is
 generated only during the first approved device poll, returned once, and only
-its hash is committed atomically with the consumed state. Legacy `full` tokens
+its hash is committed atomically with the consumed state. Token names are
+case-insensitively unique across the permanent token history, including revoked
+records, so audit identities cannot be confused or reused. Legacy `full` tokens
 remain compatible. Device-authorized tokens separate:
 
 - read and catalog access;

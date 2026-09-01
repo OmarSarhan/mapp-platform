@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -38,6 +39,27 @@ class CensusLoadError(RuntimeError):
     pass
 
 
+def _repair_extent(value: str | None) -> tuple[float, float, float, float] | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        parts = [float(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise CensusConfigError(
+            "repair extent must be west,south,east,north"
+        ) from exc
+    if len(parts) != 4 or not all(math.isfinite(part) for part in parts):
+        raise CensusConfigError(
+            "repair extent must be finite west,south,east,north"
+        )
+    west, south, east, north = parts
+    if not (-180 <= west <= east <= 180 and -90 <= south <= north <= 90):
+        raise CensusConfigError(
+            "repair extent must be ordered WGS84 west,south,east,north"
+        )
+    return (west, south, east, north)
+
+
 def _default_config_path() -> str:
     configured = os.getenv("ETL_CENSUS_CONFIG")
     if configured:
@@ -64,6 +86,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="topics",
         help="check only this topic ID; repeat for more than one",
     )
+    parser.add_argument(
+        "--repair-extent",
+        default=os.getenv("MAPP_CENSUS_REPAIR_EXTENT"),
+        help=(
+            "limit Census geometry repair to WGS84 west,south,east,north; "
+            "used by mapp demo from the workspace extent"
+        ),
+    )
     args = parser.parse_args(argv)
 
     normalized: list[str] = []
@@ -80,6 +110,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     if args.topics and not args.check_source:
         parser.error("--topic may only be used with --check-source")
+    try:
+        args.repair_extent = _repair_extent(args.repair_extent)
+    except CensusConfigError as exc:
+        parser.error(str(exc))
+    if args.repair_extent is not None and args.check_source:
+        parser.error("--repair-extent cannot be used with --check-source")
     return args
 
 
@@ -241,6 +277,7 @@ def _run_load(
     arcgis_client: ArcGISClient,
     nomis_client: NomisClient,
     database_url: str,
+    repair_extent: tuple[float, float, float, float] | None = None,
 ) -> Any:
     # Keep PostgreSQL imports out of the source-only check path.
     from .census_database import CensusDatabaseError, CensusPostgresStore
@@ -252,7 +289,13 @@ def _run_load(
     try:
         connection = connect_with_retry(database_url)
         store = CensusPostgresStore(connection, config)
-        return run_census(config, arcgis_client, nomis_client, store)
+        return run_census(
+            config,
+            arcgis_client,
+            nomis_client,
+            store,
+            repair_extent=repair_extent,
+        )
     except (
         DatabaseError,
         CensusDatabaseError,
@@ -308,6 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arcgis_client,
             nomis_client,
             database_url,
+            args.repair_extent,
         )
     except (NomisError, ArcGISError, ValidationError, TransformError) as exc:
         LOGGER.error("Census ETL failed: %s", exc)

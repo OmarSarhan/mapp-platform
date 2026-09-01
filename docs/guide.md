@@ -10,7 +10,7 @@ when you need them, not before.
 ## Contents
 
 1. [What MAPP is](#1-what-mapp-is)
-2. [Your first twenty minutes](#2-your-first-twenty-minutes)
+2. [Your first hour](#2-your-first-hour)
 3. [The mental model](#3-the-mental-model)
 4. [Federation: attaching a source](#4-federation-attaching-a-source)
 5. [Semantics: what the platform knows about a relation](#5-semantics-what-the-platform-knows-about-a-relation)
@@ -51,9 +51,9 @@ databases and is read across the boundary.
 loading your data into it. There is no packaged ETL. If you want data in MAPP,
 you attach the database that holds it.
 
-## 2. Your first twenty minutes
+## 2. Your first hour
 
-You need Docker with Compose, and roughly 4 GB of free disk. Everything runs in
+You need Docker with Compose, and roughly 10 GB of free disk. Everything runs in
 containers; nothing is installed on the host.
 
 ```sh
@@ -72,8 +72,12 @@ something real to look at.
 On a new instance, `init` prints the configuration administrator password to
 the console once. Save it in your password manager before continuing; it is
 stored only as a hash and cannot be printed again. If credentials already
-exist, `init` leaves them unchanged and tells you to use
-`./bin/mapp reset-config-password` if the password has been lost.
+exist, ordinary `init` leaves them unchanged and tells you to use
+`./bin/mapp reset-config-password` if the password has been lost. Re-running
+`init --demo` is intentionally different: after validating that demo mode can
+be enabled, it replaces the administrator password, clears dashboard sessions,
+revokes every existing CLI API token, and invalidates outstanding device
+authorizations so disposable demo credentials do not survive into the new run.
 
 ### One key `init` cannot generate
 
@@ -97,24 +101,48 @@ without them is a list of column names.
 You can add the key later and run `./bin/mapp demo` again to fill them in;
 nothing needs rebuilding first.
 
-`demo` takes about fifteen minutes without a Gemini key, most of it
-downloading the England Census 2021 Output Area dataset. With one it takes
-considerably longer, because every field of every relation is described in its
-own model call and `census_2021_england_oa` alone has 470 columns.
+`demo` takes about 30 minutes without a Gemini key, most of it
+downloading the England Census 2021 Output Area dataset and cleaning geometries.
+With one it takes considerably longer, because every included field is described
+in its own model call and `census_2021_england_oa` alone has 470 columns.
 `MAPP_DEMO_FIELD_LIMIT` in `.env` is the source of truth for the per-relation
 cap; a fresh environment sets it to `50`. Raise it for a fuller catalogue, set
 it to a lower positive whole number for a shorter run, or leave it empty to
 describe every field. A relation over the limit still gets its table
-described, while its fields stay at the structural profile. Before generation,
-the semantic stage prints the effective limit and exact number of Gemini calls;
-it then shows a progress bar as those calls settle. The demo is doing four
+described along with its first configured number of fields, while its remaining
+fields stay at the structural profile. Before generation,
+the semantic stage prints the effective limit and exact number of description
+targets; normally each target is one Gemini call. It then shows a progress bar
+as those generation targets successfully settle. Repeat runs skip tables and
+fields that already have curated annotations instead of spending Gemini quota
+to regenerate them.
+
+There is a real HTTP 429 risk here: at the default limit the bundled fresh demo
+currently plans 123 Gemini description targets, and repeated runs can exhaust a
+project/model request-per-minute, token, daily, or spend allowance. The error
+`semantic.generation_rate_limited` specifically means Gemini returned the 429
+to MAPP; it is an upstream Gemini quota issue, not MAPP's local concurrency
+guard. Local MAPP generation saturation uses the distinct code
+`semantic.generation_busy`. Gemini applies quotas per project rather than per
+API key, so replacing a key from the same project does not reset the allowance.
+See [Gemini API rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+and the active limits for the project in Google AI Studio.
+
+If Gemini returns a rate limit, the demo waits 5, 15 and 45 seconds and retries
+the same target. A limit found during parallel work uses one recovery probe and
+makes the remaining description work serial, avoiding a synchronized retry
+burst. If all three retries fail, results drafted for the unfinished relation
+are not applied, and the optional phase retains existing descriptions and
+structural profiles while the rest of the demo finishes. Check the active limit
+in Google AI Studio and rerun `./bin/mapp demo` after it resets; the rerun
+resumes only targets that still need descriptions. The demo is doing four
 separate things, and the output names each one:
 
 | Step | What happens |
 | --- | --- |
 | Loading sources | Two source databases are populated straight from their publishers: Leeds City Council's ArcGIS feeds into `ops-db`, ONS Census 2021 into `census-db` |
 | Registering and provisioning | Both are attached to MAPP as federated sources |
-| Profiling and describing | Each exposed relation is profiled; with a Gemini key set, every relation and field is also described by a model |
+| Profiling and describing | Each exposed relation is profiled; with a Gemini key set, every included relation and field is also described by a model |
 | Building and publishing | Two derived layers are computed across both sources and put on the map |
 
 Then open:

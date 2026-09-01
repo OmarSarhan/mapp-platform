@@ -357,6 +357,37 @@ class CensusMainStatusTests(unittest.TestCase):
         ):
             self.assertEqual(main(["--config", str(CONFIG_PATH)]), 1)
 
+    def test_load_passes_repair_extent_from_environment(self) -> None:
+        result = SimpleNamespace(
+            run_id="12345678-1234-5678-1234-567812345678",
+            target_table="census_2021_england_oa",
+            oa_count=178_605,
+            topic_count=47,
+            variable_count=467,
+            geometry_repairs=0,
+        )
+        with (
+            patch(
+                "leeds_arcgis_etl.census_main._run_load",
+                return_value=result,
+            ) as run_load,
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgresql://example.invalid/mapp",
+                    "MAPP_CENSUS_REPAIR_EXTENT": "-1.85,53.65,-1.2,54",
+                },
+                clear=False,
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(["--config", str(CONFIG_PATH)]), 0)
+
+        self.assertEqual(
+            run_load.call_args.args[4],
+            (-1.85, 53.65, -1.2, 54.0),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

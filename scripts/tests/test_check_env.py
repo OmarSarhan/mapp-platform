@@ -42,6 +42,33 @@ class CheckEnvironmentTests(unittest.TestCase):
             check=False,
         )
 
+    @staticmethod
+    def create_isolated_token(root: Path, name: str) -> str:
+        process_environment = os.environ.copy()
+        process_environment["PYTHONPATH"] = str(root / "config-ui")
+        result = subprocess.run(
+            [
+                "python3",
+                "-c",
+                (
+                    "import sys; from pathlib import Path; "
+                    "from control_plane import ControlStore; "
+                    "_, record = ControlStore(Path(sys.argv[1])).create_token(sys.argv[2]); "
+                    "print(record['id'])"
+                ),
+                str(root / "var/control"),
+                name,
+            ],
+            cwd=root,
+            env=process_environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+        return result.stdout.strip()
+
     def test_new_demo_init_prints_its_admin_password_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self.isolated_mapp_root(directory)
@@ -108,6 +135,35 @@ class CheckEnvironmentTests(unittest.TestCase):
             )
             self.assertEqual("leeds", assignments["MAPP_DEMO_SOURCES"])
             self.assertEqual("7", assignments["MAPP_DEMO_FIELD_LIMIT"])
+
+    def test_init_demo_revokes_every_existing_api_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.isolated_mapp_root(directory)
+            initial = self.run_isolated_init(root)
+            self.assertEqual(0, initial.returncode, initial.stderr)
+            token_id = self.create_isolated_token(root, "existing operator")
+
+            result = self.run_isolated_init(root, "--demo")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(
+                "Revoked all existing CLI API tokens and outstanding device "
+                "authorizations for demo mode.",
+                result.stdout,
+            )
+            state = json.loads(
+                (root / "var/control/auth.json").read_text(encoding="utf-8")
+            )
+            token = next(item for item in state["tokens"] if item["id"] == token_id)
+            self.assertIsNotNone(token["revoked"])
+            audit = [
+                json.loads(line)
+                for line in (root / "var/control/audit.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual("token.revoked_all", audit[-1]["event"])
+            self.assertEqual({"reason": "demo-init"}, audit[-1]["details"])
 
     def test_demo_reads_the_field_limit_from_the_env_file(self):
         wrapper = (ROOT / "bin/mapp").read_text(encoding="utf-8")
@@ -178,31 +234,112 @@ class CheckEnvironmentTests(unittest.TestCase):
         validate_production_env refuses a non-empty MAPP_DEMO_SOURCES, and
         that gate runs for every wrapper command -- so writing one into a
         production .env left a deployment where down, ps and logs all failed
-        until the file was hand-edited back. The initializer's own stated goal
-        is that a demo opt-in cannot brick teardown.
+        until the file was hand-edited back. Refusal must also happen before
+        the demo-only password rotation and token revocation.
         """
         with tempfile.TemporaryDirectory() as directory:
-            environment = Path(directory) / ".env"
+            root = self.isolated_mapp_root(directory)
+            initial = self.run_isolated_init(root)
+            self.assertEqual(0, initial.returncode, initial.stderr)
+            token_id = self.create_isolated_token(root, "production operator")
+            environment = root / ".env"
             environment.write_text(
-                (ROOT / ".env.example").read_text(encoding="utf-8")
-                .replace("MAPP_ENVIRONMENT=development", "MAPP_ENVIRONMENT=production"),
+                environment.read_text(encoding="utf-8").replace(
+                    "MAPP_ENVIRONMENT=development",
+                    "MAPP_ENVIRONMENT=production",
+                ),
                 encoding="utf-8",
             )
             before = environment.read_text(encoding="utf-8")
-            process_environment = os.environ.copy()
-            process_environment["MAPP_ENV_FILE"] = str(environment)
+            auth_path = root / "var/control/auth.json"
+            auth_before = auth_path.read_text(encoding="utf-8")
 
-            result = subprocess.run(
-                [ROOT / "bin/mapp", "init", "--demo"],
-                capture_output=True,
-                text=True,
-                env=process_environment,
-            )
+            result = self.run_isolated_init(root, "--demo")
 
             self.assertEqual(2, result.returncode, result.stderr)
             self.assertIn("production", result.stderr)
             # Refused before anything is written, not rolled back after.
             self.assertEqual(before, environment.read_text(encoding="utf-8"))
+            self.assertEqual(auth_before, auth_path.read_text(encoding="utf-8"))
+            token = next(
+                item
+                for item in json.loads(auth_before)["tokens"]
+                if item["id"] == token_id
+            )
+            self.assertIsNone(token["revoked"])
+
+    def test_init_demo_missing_template_preserves_retained_authentication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.isolated_mapp_root(directory)
+            initial = self.run_isolated_init(root)
+            self.assertEqual(0, initial.returncode, initial.stderr)
+            self.create_isolated_token(root, "retained operator")
+            auth_path = root / "var/control/auth.json"
+            auth_before = auth_path.read_bytes()
+            (root / ".env").unlink()
+            (root / ".env.example").unlink()
+
+            result = self.run_isolated_init(root, "--demo")
+
+            self.assertEqual(2, result.returncode, result.stderr)
+            self.assertIn("Missing initialization template", result.stderr)
+            self.assertEqual(auth_before, auth_path.read_bytes())
+
+    def test_init_demo_invalid_template_preserves_retained_authentication(self):
+        mutations = (
+            (
+                "production",
+                lambda template: template.replace(
+                    "MAPP_ENVIRONMENT=development",
+                    "MAPP_ENVIRONMENT=production",
+                ),
+                "production",
+            ),
+            (
+                "missing-setting",
+                lambda template: template.replace("CENSUS_POSTGRES_DB=census\n", ""),
+                "CENSUS_POSTGRES_DB",
+            ),
+            (
+                "unknown-environment",
+                lambda template: template.replace(
+                    "MAPP_ENVIRONMENT=development",
+                    "MAPP_ENVIRONMENT=staging",
+                ),
+                "must be development",
+            ),
+            (
+                "empty-environment",
+                lambda template: template.replace(
+                    "MAPP_ENVIRONMENT=development",
+                    "MAPP_ENVIRONMENT=",
+                ),
+                "must be development",
+            ),
+        )
+        for label, mutate, expected_error in mutations:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = self.isolated_mapp_root(directory)
+                initial = self.run_isolated_init(root)
+                self.assertEqual(0, initial.returncode, initial.stderr)
+                self.create_isolated_token(root, f"{label} retained operator")
+                auth_path = root / "var/control/auth.json"
+                auth_before = auth_path.read_bytes()
+                (root / ".env").unlink()
+                template_path = root / ".env.example"
+                template_path.write_text(
+                    mutate(template_path.read_text(encoding="utf-8")),
+                    encoding="utf-8",
+                )
+
+                result = self.run_isolated_init(root, "--demo")
+
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertEqual(auth_before, auth_path.read_bytes())
 
     def test_every_documented_wrapper_command_exists(self):
         """Copy-pasteable commands must be commands.

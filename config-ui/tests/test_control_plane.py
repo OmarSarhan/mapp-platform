@@ -63,6 +63,26 @@ class ControlPlaneTests(unittest.TestCase):
                 stat.S_IMODE((Path(directory) / "auth.json").stat().st_mode),
             )
 
+    def test_token_names_are_permanently_unique_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            _raw, record = store.create_token("CLI operator")
+
+            for duplicate in ("CLI operator", " cli OPERATOR "):
+                with self.subTest(name=duplicate):
+                    with self.assertRaisesRegex(
+                        ValueError, "Token names must be unique"
+                    ):
+                        store.create_token(duplicate)
+
+            self.assertTrue(store.revoke_token(record["id"]))
+            with self.assertRaisesRegex(
+                ValueError, "Token names must be unique"
+            ):
+                store.create_token("CLI OPERATOR")
+            self.assertEqual(1, len(store.list_tokens()))
+
     def test_invalid_sessions_do_not_write_but_expiry_pruning_persists(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))
@@ -101,6 +121,96 @@ class ControlPlaneTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 store.reset_password("short")
+
+    def test_demo_password_reset_revokes_api_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize("correct horse battery staple", "instance")
+            session, _csrf = store.login(
+                "correct horse battery staple",
+                "127.0.0.1",
+            )
+            active_raw, active = store.create_token("active token")
+            revoked_raw, revoked = store.create_token("already revoked")
+            self.assertTrue(store.revoke_token(revoked["id"]))
+            pending_device = store.start_device_authorization(
+                "pending device",
+                ["inspect"],
+                "127.0.0.2",
+            )
+            approved_device = store.start_device_authorization(
+                "approved device",
+                ["inspect"],
+                "127.0.0.3",
+            )
+            self.assertTrue(
+                store.approve_device_authorization(approved_device["userCode"])
+            )
+
+            store.reset_password("ordinary replacement password")
+            self.assertFalse(store.session(session))
+            self.assertEqual(
+                active["id"],
+                store.authenticate_token(active_raw, "127.0.0.1")["id"],
+            )
+            self.assertIsNone(store.authenticate_token(revoked_raw, "127.0.0.1"))
+            self.assertEqual(
+                {"pending", "approved"},
+                {
+                    authorization["status"]
+                    for authorization in store.list_device_authorizations()
+                },
+            )
+
+            store.reset_password(
+                "disposable demo password",
+                revoke_tokens=True,
+            )
+
+            self.assertIsNone(store.authenticate_token(active_raw, "127.0.0.1"))
+            self.assertTrue(all(token["revoked"] for token in store.list_tokens()))
+            for duplicate_name in (" ACTIVE TOKEN ", " ALREADY REVOKED "):
+                with self.subTest(duplicate_name=duplicate_name):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Token names must be unique",
+                    ):
+                        store.create_token(duplicate_name)
+            self.assertEqual(
+                {"active token", "already revoked"},
+                {token["name"] for token in store.list_tokens()},
+            )
+            self.assertEqual([], store.list_device_authorizations())
+            self.assertEqual(
+                {"status": "expired"},
+                store.poll_device_authorization(pending_device["deviceId"]),
+            )
+            self.assertEqual(
+                {"status": "expired"},
+                store.poll_device_authorization(approved_device["deviceId"]),
+            )
+            revoked_devices = store._state()["deviceAuthorizations"]
+            self.assertEqual(
+                {"revoked"},
+                {item["status"] for item in revoked_devices},
+            )
+            self.assertTrue(
+                all(item["expires"] == item["revoked"] for item in revoked_devices)
+            )
+            device_audit = next(
+                event
+                for event in reversed(store.audit_tail())
+                if event["event"] == "device.authorizations_revoked"
+            )
+            self.assertEqual(
+                {"reason": "demo-init", "count": 2},
+                device_audit["details"],
+            )
+            self.assertEqual(
+                {"reason": "demo-init"},
+                store.audit_tail()[-1]["details"],
+            )
+            self.assertEqual("token.revoked_all", store.audit_tail()[-1]["event"])
 
     def test_token_expiry_is_validated_and_malformed_legacy_records_are_revoked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -246,6 +356,10 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual(
                 ["inspect", "propose", "visual", "semantic:inspect"],
                 authorized["record"]["scopes"],
+            )
+            self.assertEqual(
+                f"Device: codex [{authorized['record']['id']}]",
+                authorized["record"]["name"],
             )
             self.assertIsNotNone(authorized["record"]["expires"])
             self.assertNotIn(

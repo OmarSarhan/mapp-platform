@@ -9,6 +9,7 @@ from .arcgis import ArcGISClient
 from .census_database import (
     CensusDatasetMetadata,
     CensusPostgresStore,
+    CensusRepairExtent,
     CensusVariableMetadata,
 )
 from .census_geometry import CensusGeometryAudit, CensusGeometryError, OA_CODE_RE
@@ -74,6 +75,7 @@ def run_census(
     arcgis_client: ArcGISClient,
     nomis_client: NomisClient,
     store: CensusPostgresStore,
+    repair_extent: CensusRepairExtent | None = None,
 ) -> CensusRunResult:
     """Load and validate Census 2021 OA geometry and statistics, then publish."""
 
@@ -147,6 +149,7 @@ def run_census(
                 geometry_stage,
                 expected_count,
                 config.max_geometry_repairs,
+                repair_extent=repair_extent,
             )
             geometry_repairs = len(geometry_repair_candidates)
             if geometry_repairs:
@@ -303,6 +306,11 @@ def run_census(
                         "source_url": layer.source_url,
                         "sha256": geometry_sha256,
                         "repairs": geometry_repairs,
+                        "repair_extent": (
+                            list(repair_extent)
+                            if repair_extent is not None
+                            else None
+                        ),
                         "repair_candidates": list(
                             geometry_repair_candidates
                         ),

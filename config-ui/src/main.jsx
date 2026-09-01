@@ -549,26 +549,36 @@ export const TOKEN_ACCESS_PRESETS=[
 ];
 const FULL_TOKEN_PRESET_ID='full';
 const ALL_NARROW_TOKEN_SCOPES=TOKEN_SCOPE_OPTIONS.map(scope=>scope.id);
+function DeviceAuthorization({device,busy,approve}){
+ const requested=device.scopes.map(id=>({id,scope:TOKEN_SCOPE_OPTIONS.find(option=>option.id===id)})),unsupported=requested.some(item=>!item.scope);
+ return <div className="token-row permission-row"><div className="permission-info"><strong>{device.userCode} · {device.deviceName}</strong><small>expires {device.expires}</small><details className="permission-details"><summary>Requested permission{requested.length===1?'':'s'} ({requested.length})</summary><p className="muted">Approval grants this exact permission set.</p><div className="token-scope-grid">{requested.map(({id,scope})=>{const label=scope?.label||(id==='full'?'Unsupported device permission':'Unknown device permission'),help=scope?.help||(id==='full'?'Full platform access cannot be granted through device authorization.':'This dashboard does not recognize this requested permission.');return <label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{label}</strong><small>{id} · {help}</small></span></label>})}</div>{unsupported&&<p className="permission-warning">Approval is blocked because this request includes a permission the dashboard cannot authorize.</p>}</details></div><button aria-label={`Approve ${device.deviceName} (${device.userCode})`} disabled={busy||unsupported} onClick={()=>approve(device.userCode)}>Approve</button></div>;
+}
+function ApiToken({token,busy,revoke}){
+ const full=TOKEN_ACCESS_PRESETS.find(option=>option.id===FULL_TOKEN_PRESET_ID),granted=token.scopes.map(id=>({id,scope:TOKEN_SCOPE_OPTIONS.find(option=>option.id===id)||(id==='full'?full:null)}));
+ return <div className="token-row permission-row"><div className="permission-info"><strong>{token.name}</strong><small>{token.id} · expires {token.expires||'never'} · last used {token.lastUsed||'never'}{token.revoked?' · revoked':''}</small><details className="permission-details"><summary>Granted permission{granted.length===1?'':'s'} ({granted.length})</summary><p className="muted">This token carries the exact stored permission set below.</p><div className="token-scope-grid">{granted.map(({id,scope})=><label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unknown token permission'}</strong><small>{id} · {scope?.help||'This dashboard does not recognize this stored permission.'}</small></span></label>)}</div></details></div>{!token.revoked&&<button disabled={busy} className="danger" onClick={()=>revoke(token.id)}>Revoke</button>}</div>;
+}
 export function Security({close}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
  const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const copiedTimer=useRef(null);
  const load=async()=>{const [t,d,a]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events)};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
+ useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
  const toggleScope=(id,enabled)=>{setPreset('custom');setScopes(current=>{const narrow=current.includes('full')?ALL_NARROW_TOKEN_SCOPES:current;return enabled?[...new Set([...narrow,id])]:narrow.filter(scope=>scope!==id)})};
  const extendedExpiry=expiryDays==='never'||Number(expiryDays)>30;
  const create=async()=>{setBusy(true);setError('');try{const tokenRequest={name,scopes};tokenRequest.expires=expiryDays==='never'?null:new Date(Date.now()+Number(expiryDays)*86400000).toISOString();if(extendedExpiry)tokenRequest.extendedExpiryConfirmed=extendedExpiryConfirmed;const result=await api('/api/admin/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tokenRequest)});setRevealed(result.token);setCopied(false);await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const copyRevealed=async()=>{await navigator.clipboard.writeText(revealed);setCopied(true);setTimeout(()=>setCopied(false),250)};
+ const copyRevealed=async()=>{setError('');try{await navigator.clipboard.writeText(revealed);clearTimeout(copiedTimer.current);setCopied(true);copiedTimer.current=setTimeout(()=>setCopied(false),900)}catch{setCopied(false);setError('Could not copy the API token to the clipboard.')}};
  const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const presetHelp=TOKEN_ACCESS_PRESETS.find(item=>item.id===preset)?.help||'Custom least-privilege scope selection.';
  const visibleScopes=scopes.includes('full')?ALL_NARROW_TOKEN_SCOPES:scopes;
  const selectedScopesLabel=scopes.includes('full')?'full (all bearer-token workspace and semantic scopes)':(scopes.join(', ')||'none');
+ const pendingDevices=devices.filter(device=>device.status==='pending');
  return <div className="modal-backdrop"><section className="panel security-panel">
   <div className="form-head"><div><h2>Access and audit</h2><p>Create revocable least-privilege tokens and approve scoped CLI devices.</p></div><button onClick={close}>Close</button></div>
   {error&&<div className="expression-result error">{error}</div>}
-  <h3>Pending device authorizations</h3>
-  {devices.filter(device=>device.status==='pending').map(device=><div className="token-row" key={device.userCode}><span><strong>{device.userCode} · {device.deviceName}</strong><small>{device.scopes.join(', ')} · expires {device.expires}</small></span><button disabled={busy} onClick={()=>approve(device.userCode)}>Approve</button></div>)}
+  {pendingDevices.length>0&&<><h3>Pending device authorizations</h3>{pendingDevices.map(device=><DeviceAuthorization key={device.userCode} device={device} busy={busy} approve={approve}/>)}</>}
   <h3>Provision CLI token</h3>
   <div className="token-provision">
    <label><span>Token name</span><input aria-label="Token name" value={name} onChange={event=>setName(event.target.value)}/></label>
@@ -583,9 +593,9 @@ export function Security({close}){
    <p className="muted">Selected scopes: {selectedScopesLabel}</p>
    <button disabled={busy||!name.trim()||scopes.length===0||(extendedExpiry&&!extendedExpiryConfirmed)} onClick={create}>{busy?'Creating…':'Create scoped CLI token'}</button>
   </div>
-  {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>Copy</button></div>}
+  {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button type="button" aria-label={copied?'API token copied to clipboard':'Copy API token'} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>{copied?'Copied':'Copy'}</button></div>}
   <h3>CLI tokens</h3>
-  {tokens.map(token=><div className="token-row" key={token.id}><span><strong>{token.name}</strong><small>{token.id} · {token.scopes.join(', ')} · expires {token.expires||'never'} · last used {token.lastUsed||'never'}{token.revoked?' · revoked':''}</small></span>{!token.revoked&&<button disabled={busy} className="danger" onClick={()=>revoke(token.id)}>Revoke</button>}</div>)}
+  {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
  </section></div>;
 }

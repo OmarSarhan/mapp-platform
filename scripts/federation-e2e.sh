@@ -193,6 +193,23 @@ remove_alias_state() {
 # self-cleaning test leaves a source-db container and its volume running
 # indefinitely on a deployment that had neither before.
 cleanup() {
+  # Revoke every credential in the namespace reserved by this harness. Each
+  # inline probe also revokes its own token in finally, but this outer sweep
+  # covers an interpreter/container interruption between mint and finally and
+  # cleans residue from an earlier aborted run. It runs before container
+  # teardown while config-ui is still reachable.
+  "${compose[@]}" exec -T config-ui python3 - <<'PY' >/dev/null 2>&1 || true
+import os
+from pathlib import Path
+from control_plane import ControlStore
+
+store = ControlStore(Path(os.environ["CONTROL_DIR"]))
+for record in store.list_tokens():
+    name = record.get("name")
+    if isinstance(name, str) and name.startswith("federation-e2e") \
+            and not record.get("revoked"):
+        store.revoke_token(record["id"])
+PY
   if [[ "${OWNS_ALIAS}" == "1" ]]; then
     remove_alias_state
   fi
@@ -483,6 +500,7 @@ step "Driving register, observe and provision over HTTP"
 import datetime as dt
 import json
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -502,7 +520,7 @@ expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)
 ).isoformat()
 token, record = store.create_token(
-    "federation-e2e",
+    "federation-e2e-" + secrets.token_hex(8),
     expires,
     [
         "federation:register",
@@ -670,6 +688,7 @@ step "Group labels round-trip through the real registry"
 import datetime as dt
 import json
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -684,7 +703,7 @@ expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15)
 ).isoformat()
 token, record = store.create_token(
-    "federation-e2e-groups",
+    "federation-e2e-groups-" + secrets.token_hex(8),
     expires,
     ["federation:register", "federation:observe"],
 )
@@ -948,6 +967,7 @@ source_sql "
 import datetime as dt
 import json
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -962,7 +982,7 @@ expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)
 ).isoformat()
 token, record = store.create_token(
-    "federation-e2e-rebind",
+    "federation-e2e-rebind-" + secrets.token_hex(8),
     expires,
     ["federation:provision", "federation:observe"],
 )
@@ -1023,6 +1043,7 @@ step "Retirement archives rather than drops"
 import datetime as dt
 import json
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -1037,7 +1058,9 @@ expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)
 ).isoformat()
 token, record = store.create_token(
-    "federation-e2e-retire", expires, ["federation:provision"]
+    "federation-e2e-retire-" + secrets.token_hex(8),
+    expires,
+    ["federation:provision"],
 )
 
 request = urllib.request.Request(
@@ -1107,6 +1130,7 @@ step "Observing a retired alias must not resurrect it"
 import datetime as dt
 import json
 import os
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -1123,7 +1147,7 @@ expires = (
 # Observe needs federation:provision because it opens a live outbound
 # connection; reading the alias back needs federation:observe. Both.
 token, record = store.create_token(
-    "federation-e2e-terminal",
+    "federation-e2e-terminal-" + secrets.token_hex(8),
     expires,
     ["federation:provision", "federation:observe"],
 )

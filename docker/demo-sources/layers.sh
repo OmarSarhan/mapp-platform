@@ -38,7 +38,7 @@ BASE="http://localhost:${HTTP_PORT:-3000}"
 # auth.json on every call, so the running service sees this without a restart.
 mint_token() {
   "${compose[@]}" exec -T config-ui python - <<'PY'
-import datetime as dt, os
+import datetime as dt, os, secrets
 from pathlib import Path
 from control_plane import ControlStore
 
@@ -47,7 +47,7 @@ expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=45)
 ).isoformat()
 token, record = store.create_token(
-    "demo-layers",
+    "demo-layers-" + secrets.token_hex(8),
     expires,
     [
         "inspect",
@@ -79,6 +79,26 @@ ControlStore(Path(os.environ["CONTROL_DIR"])).revoke_token(sys.argv[1])
 PY
 }
 
+# Sweep credentials from an earlier interrupted demo as well as the token from
+# this run. The name namespace is reserved by this harness, and revocation is
+# idempotent.
+# This closes the gap where the container minted a token but the shell died
+# before it captured TOKEN_ID and armed its per-token cleanup.
+revoke_demo_tokens() {
+  "${compose[@]}" exec -T config-ui python - <<'PY' >/dev/null 2>&1 || true
+import os
+from pathlib import Path
+from control_plane import ControlStore
+
+store = ControlStore(Path(os.environ["CONTROL_DIR"]))
+for record in store.list_tokens():
+    name = record.get("name")
+    if isinstance(name, str) and name.startswith("demo-layers-") \
+            and not record.get("revoked"):
+        store.revoke_token(record["id"])
+PY
+}
+
 api() { # method path [json-body]
   local method="$1" path="$2" body="${3:-}"
   if [ -n "${body}" ]; then
@@ -93,9 +113,10 @@ api() { # method path [json-body]
 
 jqp() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 
+TOKEN_ID=""
+trap 'if [[ -n "${TOKEN_ID}" ]]; then revoke_token "${TOKEN_ID}"; fi; revoke_demo_tokens' EXIT
 read -r TOKEN TOKEN_ID < <(mint_token)
 [ -n "${TOKEN:-}" ] || fail "could not mint a token; is config-ui running?"
-trap 'revoke_token "${TOKEN_ID}"' EXIT
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -216,7 +237,7 @@ describe_relations() { # schema relation [schema relation ...]
   MAPP_BASE="${BASE}" MAPP_HOST="${CONFIG_HOST}" MAPP_TOKEN="${TOKEN}" \
     MAPP_FIELD_LIMIT="${DESCRIBE_FIELD_LIMIT}" python3 - "$@" <<'PY'
 import concurrent.futures
-import json, os, shutil, sys, urllib.error, urllib.request
+import json, os, shutil, sys, time, urllib.error, urllib.request
 
 BASE = os.environ["MAPP_BASE"]
 # Empty means no cap, so it has to survive int() rather than reach it.
@@ -225,6 +246,13 @@ LIMIT = int(os.environ["MAPP_FIELD_LIMIT"] or 0)
 # eleventh is refused outright with semantic.generation_busy rather than
 # queued -- the acquire is non-blocking. Stay under it.
 WORKERS = 8
+MAX_PROPOSAL_OPERATIONS = 100
+RATE_LIMIT_RETRY_DELAYS = (5, 15, 45)
+RETRYABLE_GENERATION_CODES = {
+    "semantic.generation_rate_limited",
+    "semantic.generation_busy",
+    "http_429",
+}
 HEADERS = {
     "Host": os.environ["MAPP_HOST"],
     "Authorization": "Bearer " + os.environ["MAPP_TOKEN"],
@@ -234,6 +262,21 @@ HEADERS = {
 
 class DemoSemanticError(RuntimeError):
     pass
+
+
+class DemoGenerationRateLimited(DemoSemanticError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+ANNOTATION_KEYS = ("displayName", "description", "tags", "caveats")
+
+
+def has_curated_annotation(value):
+    return isinstance(value, dict) and any(
+        key in value for key in ANNOTATION_KEYS
+    )
 
 
 class ProgressBar:
@@ -252,15 +295,15 @@ class ProgressBar:
     def _limit_summary(self):
         if LIMIT > 0:
             return (
-                "MAPP_DEMO_FIELD_LIMIT=%s; relations above %s fields are "
-                "table-only" % (self.limit_text, self.limit_text)
+                "MAPP_DEMO_FIELD_LIMIT=%s; the first %s fields per relation "
+                "are included" % (self.limit_text, self.limit_text)
             )
         return "MAPP_DEMO_FIELD_LIMIT is empty; all fields are included"
 
     def _line(self):
         percent = 100 if self.total == 0 else self.completed * 100 // self.total
         columns = shutil.get_terminal_size(fallback=(100, 24)).columns
-        suffix = "%d/%d calls (%3d%%)" % (
+        suffix = "%d/%d targets settled (%3d%%)" % (
             self.completed, self.total, percent,
         )
         available = columns - len("    Gemini descriptions [] ") - len(suffix)
@@ -295,7 +338,8 @@ class ProgressBar:
 
     def start(self):
         self.stream.write(
-            "    Gemini descriptions: %d calls (%s).\n"
+            "    Gemini descriptions: %d targets (%s; normally one model "
+            "call each).\n"
             % (self.total, self._limit_summary())
         )
         self.stream.flush()
@@ -315,11 +359,20 @@ class ProgressBar:
             self.stream.write("\n")
         else:
             self.stream.write(
-                "    Gemini descriptions stopped at %d/%d calls.\n"
+                "    Gemini descriptions stopped at %d/%d targets settled.\n"
                 % (self.completed, self.total)
             )
         self.stream.flush()
         self.active = False
+
+    def note(self, message):
+        if self.tty and self.active:
+            self.stream.write("\n")
+            self.last_length = 0
+        self.stream.write("    " + message + "\n")
+        self.stream.flush()
+        if self.tty and self.active:
+            self._render(force=True)
 
 
 def call(method, path, body=None):
@@ -368,6 +421,8 @@ def drafted_operations(asset_id, target):
     )
     if result.get("code") == "semantic.generation_no_change":
         return None, None
+    if result.get("code") in RETRYABLE_GENERATION_CODES:
+        raise DemoGenerationRateLimited(result["code"])
     draft = result.get("draft")
     if not isinstance(draft, dict):
         raise DemoSemanticError(
@@ -376,34 +431,120 @@ def drafted_operations(asset_id, target):
     return draft["operations"], draft["baseVersion"]
 
 
+def retry_rate_limited(asset_id, target, progress, error):
+    latest = error
+    for retry_number, delay in enumerate(RATE_LIMIT_RETRY_DELAYS, start=1):
+        progress.note(
+            "Description request returned %s; waiting %d seconds before "
+            "retry %d/%d."
+            % (
+                latest.code,
+                delay,
+                retry_number,
+                len(RATE_LIMIT_RETRY_DELAYS),
+            )
+        )
+        time.sleep(delay)
+        try:
+            return drafted_operations(asset_id, target)
+        except DemoGenerationRateLimited as next_error:
+            latest = next_error
+    raise latest
+
+
+def draft_serially(plan, index, target, drafts, progress, retry_state):
+    try:
+        drafted = drafted_operations(plan["asset_id"], target)
+    except DemoGenerationRateLimited as error:
+        retry_state["serial"] = True
+        drafted = retry_rate_limited(
+            plan["asset_id"], target, progress, error,
+        )
+    drafts[index] = drafted
+    progress.advance()
+
+
+def settle_worker_batch(plan, batch, pool, drafts, progress, retry_state):
+    futures = {
+        pool.submit(
+            drafted_operations,
+            plan["asset_id"],
+            target,
+        ): (index, target)
+        for index, target in batch
+    }
+    rate_limited = []
+    errors = []
+    for future in concurrent.futures.as_completed(futures):
+        index, target = futures[future]
+        try:
+            drafts[index] = future.result()
+        except DemoGenerationRateLimited as error:
+            rate_limited.append((index, target, error))
+        except Exception as error:
+            errors.append(error)
+        else:
+            progress.advance()
+    if errors:
+        raise errors[0]
+    if not rate_limited:
+        return
+
+    # A simultaneous provider limit must not create eight independent retry
+    # loops. Use one failed target as the recovery probe, then keep all later
+    # generation serial for the rest of this demo run.
+    retry_state["serial"] = True
+    rate_limited.sort(key=lambda item: item[0])
+    index, target, error = rate_limited[0]
+    drafts[index] = retry_rate_limited(
+        plan["asset_id"], target, progress, error,
+    )
+    progress.advance()
+    for index, target, _error in rate_limited[1:]:
+        draft_serially(
+            plan, index, target, drafts, progress, retry_state,
+        )
+
+
+def chunks(items, size):
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
+
+
 def apply_operations(asset_id, base_version, operations, explanation):
     """Generation only drafts -- "proposalCreated": false. Nothing reaches the
     catalogue until the draft is checked, proposed and applied, so the demo
     applies its own drafts unreviewed. That is right for a showcase and wrong
     for curated content; the explanation recorded on each proposal says so."""
-    request = {
-        "assetId": asset_id,
-        "baseVersion": base_version,
-        "operations": operations,
-        "explanation": explanation,
-    }
-    checked = call("POST", "/api/semantic/proposals/check", request)
-    check = checked.get("check")
-    if not isinstance(check, dict):
-        raise DemoSemanticError("check: %s" % checked.get("code"))
-    created = call(
-        "POST", "/api/semantic/proposals",
-        dict(request, fingerprint=check["fingerprint"]),
-    )
-    proposal = created.get("proposal") or {}
-    if not proposal.get("id"):
-        raise DemoSemanticError("propose: %s" % created.get("code"))
-    applied = call(
-        "POST", "/api/semantic/proposals/%s/apply" % proposal["id"],
-        {"confirmed": True},
-    )
-    if (applied.get("proposal") or {}).get("state") != "applied":
-        raise DemoSemanticError("apply: %s" % applied.get("code"))
+    for batch in chunks(operations, MAX_PROPOSAL_OPERATIONS):
+        request = {
+            "assetId": asset_id,
+            "baseVersion": base_version,
+            "operations": batch,
+            "explanation": explanation,
+        }
+        checked = call("POST", "/api/semantic/proposals/check", request)
+        check = checked.get("check")
+        if not isinstance(check, dict):
+            raise DemoSemanticError("check: %s" % checked.get("code"))
+        created = call(
+            "POST", "/api/semantic/proposals",
+            dict(request, fingerprint=check["fingerprint"]),
+        )
+        proposal = created.get("proposal") or {}
+        if not proposal.get("id"):
+            raise DemoSemanticError("propose: %s" % created.get("code"))
+        applied = call(
+            "POST", "/api/semantic/proposals/%s/apply" % proposal["id"],
+            {"confirmed": True},
+        )
+        if (applied.get("proposal") or {}).get("state") != "applied":
+            raise DemoSemanticError("apply: %s" % applied.get("code"))
+        asset = applied.get("asset") or {}
+        next_version = asset.get("version")
+        if isinstance(next_version, bool) or not isinstance(next_version, int):
+            raise DemoSemanticError("apply: semantic.invalid_response")
+        base_version = next_version
 
 
 def prepare_relation(schema, relation):
@@ -421,44 +562,75 @@ def prepare_relation(schema, relation):
         field for field in (asset.get("generated") or {}).get("fields") or []
         if field.get("id")
     ]
-    # There is one model call per included field. census_2021_england_oa has
-    # 470 columns, so a relation above the configured threshold gets its table
-    # described while its fields remain at the structural profile.
-    over_limit = LIMIT > 0 and len(fields) > LIMIT
-    if not over_limit and len(fields) > 60:
+    curated = asset.get("curated")
+    if not isinstance(curated, dict):
+        raise DemoSemanticError(
+            "%s.%s: semantic asset curated metadata is invalid"
+            % (schema, relation)
+        )
+    curated_fields = curated.get("fields", {})
+    if not isinstance(curated_fields, dict):
+        raise DemoSemanticError(
+            "%s.%s: semantic field annotations are invalid"
+            % (schema, relation)
+        )
+    # There is normally one model call per included field; a 429 adds bounded
+    # retries. Preserve generated field order and take the leading configured
+    # number from wide relations.
+    selected_fields = fields[:LIMIT] if LIMIT > 0 else fields
+    omitted_fields = len(fields) - len(selected_fields)
+    if len(selected_fields) > 60:
         print(
             "    %s.%s: describing %d fields, %d model calls at a time; lower"
             " MAPP_DEMO_FIELD_LIMIT in .env to cap this"
-            % (schema, relation, len(fields), WORKERS),
+            % (schema, relation, len(selected_fields), WORKERS),
             flush=True,
         )
-    targets = [{"kind": "table"}] + ([] if over_limit else [
-        {"kind": "field", "fieldId": field["id"]} for field in fields
-    ])
+    targets = ([] if has_curated_annotation(curated) else [
+        {"kind": "table"}
+    ]) + [
+        {"kind": "field", "fieldId": field["id"]}
+        for field in selected_fields
+        if not has_curated_annotation(curated_fields.get(field["id"]))
+    ]
     return {
         "schema": schema,
         "relation": relation,
         "asset_id": asset_id,
         "fields": fields,
-        "over_limit": over_limit,
+        "selected_fields": selected_fields,
+        "omitted_fields": omitted_fields,
         "targets": targets,
     }
 
 
-def describe_relation(plan, pool, progress):
+def describe_relation(plan, pool, progress, retry_state):
     targets = plan["targets"]
     drafts = [None] * len(targets)
-    futures = {
-        pool.submit(drafted_operations, plan["asset_id"], target): index
-        for index, target in enumerate(targets)
-    }
-    # Count real completions rather than consuming pool.map in input order: a
-    # slow first field must not make the bar look stuck while later calls have
-    # already settled. Results still go back into their input slots so the
-    # combined proposal remains deterministic.
-    for future in concurrent.futures.as_completed(futures):
-        drafts[futures[future]] = future.result()
-        progress.advance()
+    # Probe the first missing target before fanning out. A project-wide Gemini
+    # quota can reject every request; discovering that once must not launch all
+    # remaining fields into the same exhausted quota.
+    if targets:
+        draft_serially(
+            plan, 0, targets[0], drafts, progress, retry_state,
+        )
+    # Submit at most one worker window at a time while the provider is healthy.
+    # After any 429, the recovery probe and all remaining targets are serial so
+    # a retry cannot become another synchronized request burst. Results still
+    # return to their input slots for deterministic proposals.
+    indexed_targets = list(enumerate(targets[1:], start=1))
+    while indexed_targets:
+        if retry_state["serial"]:
+            index, target = indexed_targets.pop(0)
+            draft_serially(
+                plan, index, target, drafts, progress, retry_state,
+            )
+            continue
+        batch = indexed_targets[:WORKERS]
+        del indexed_targets[:WORKERS]
+        settle_worker_batch(
+            plan, batch, pool, drafts, progress, retry_state,
+        )
 
     operations = []
     base_version = None
@@ -479,16 +651,27 @@ def describe_relation(plan, pool, progress):
             "./bin/mapp demo. Treat them as a starting point, not as curated "
             "content."
         ))
-    scope = (
-        "table" if plan["over_limit"]
-        else "table and %d fields" % len(plan["fields"])
-    )
+    selected_count = len(plan["selected_fields"])
+    scope = "table and %d fields" % selected_count
+    if plan["omitted_fields"]:
+        scope = "table and first %d of %d fields" % (
+            selected_count, len(plan["fields"]),
+        )
+    omitted_note = ""
+    if plan["omitted_fields"]:
+        omitted_note = (
+            ", %d remaining field%s not described because "
+            "MAPP_DEMO_FIELD_LIMIT=%d"
+            % (
+                plan["omitted_fields"],
+                "" if plan["omitted_fields"] == 1 else "s",
+                LIMIT,
+            )
+        )
     return "    %s.%s: %s%s" % (
         plan["schema"], plan["relation"],
         ("%s described" % scope) if operations else "already described",
-        (", %d fields over the MAPP_DEMO_FIELD_LIMIT of %d not described"
-         % (len(plan["fields"]), LIMIT))
-        if plan["over_limit"] else "",
+        omitted_note,
     )
 
 
@@ -505,20 +688,69 @@ try:
         os.environ["MAPP_FIELD_LIMIT"],
     )
     summaries = []
+    rate_limited = None
+    retry_state = {"serial": False}
     progress.start()
     try:
         # Generation only drafts, so targets within one relation are
-        # independent. One shared pool retains the eight-request bound while
-        # each relation is still checked/proposed/applied atomically.
+        # independent. One shared pool retains the eight-request bound. The
+        # resulting operations are applied before moving to the next relation;
+        # large sets span sequential proposals because the API caps each one.
         with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
             for plan in plans:
-                summaries.append(describe_relation(plan, pool, progress))
+                try:
+                    summaries.append(describe_relation(
+                        plan, pool, progress, retry_state,
+                    ))
+                except DemoGenerationRateLimited as error:
+                    rate_limited = error
+                    break
     finally:
         # Keyboard interrupts, request failures and invalid provider responses
         # must never leave the next console message on the progress-bar line.
         progress.close()
     for summary in summaries:
         print(summary)
+    if rate_limited is not None:
+        if rate_limited.code == "semantic.generation_busy":
+            reason = (
+                "the configuration service remained at Gemini generation "
+                "capacity"
+            )
+            guidance = (
+                "Let other generation requests finish and rerun "
+                "./bin/mapp demo"
+            )
+        elif rate_limited.code == "semantic.generation_rate_limited":
+            reason = (
+                "the configured Gemini project or model remained rate limited"
+            )
+            guidance = (
+                "Check the active limit in Google AI Studio and rerun "
+                "./bin/mapp demo after it resets"
+            )
+        else:
+            reason = "the generation endpoint continued returning HTTP 429"
+            guidance = (
+                "Check other MAPP generation traffic and the active limit in "
+                "Google AI Studio, then rerun ./bin/mapp demo"
+            )
+        print(
+            "    Gemini descriptions paused because %s after %d retries."
+            % (reason, len(RATE_LIMIT_RETRY_DELAYS)),
+            file=sys.stderr,
+        )
+        print(
+            "    Any completed target results from the unfinished relation "
+            "were not applied and will be generated again on a rerun.",
+            file=sys.stderr,
+        )
+        print(
+            "    The demo will continue with existing descriptions and "
+            "structural profiles. %s; already curated targets will be skipped."
+            % guidance,
+            file=sys.stderr,
+        )
 except DemoSemanticError as error:
     print("    " + str(error), file=sys.stderr)
     raise SystemExit(1)
@@ -536,9 +768,9 @@ if [ "${DESCRIBE}" = "1" ]; then
   # This is the long step, and the knob that governs it is a line in .env
   # rather than something to discover afterwards.
   if [ -n "${DESCRIBE_FIELD_LIMIT}" ]; then
-    printf '  MAPP_DEMO_FIELD_LIMIT=%s in .env: relations above %s fields are\n' \
+    printf '  MAPP_DEMO_FIELD_LIMIT=%s in .env: describing the first %s fields\n' \
       "${DESCRIBE_FIELD_LIMIT}" "${DESCRIBE_FIELD_LIMIT}"
-    printf '  table-only; smaller relations describe every field, one model call each.\n'
+    printf '  of each relation (or every field when there are fewer), normally one model call each.\n'
     printf '  Raise the limit for a fuller catalogue, or empty it for no limit.\n'
   else
     printf '  MAPP_DEMO_FIELD_LIMIT is empty in .env: describing every field.\n'

@@ -11,7 +11,10 @@ from control_plane import ControlStore
 
 def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("init", "reset-password", "revoke-tokens"))
+    parser.add_argument(
+        "command",
+        choices=("init", "reset-password", "reset-demo", "revoke-tokens"),
+    )
     parser.add_argument("--root", default=os.environ.get("CONTROL_DIR", "/control"))
     parser.add_argument(
         "--password-stdin",
@@ -38,7 +41,7 @@ def main() -> None:
             print("Authentication already initialized; existing credentials were unchanged.")
             return
     else:
-        store.reset_password(password)
+        store.reset_password(password, revoke_tokens=args.command == "reset-demo")
     print(f"Admin password (shown once): {password}")
 
 

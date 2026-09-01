@@ -856,7 +856,9 @@ administrator password. `POST /api/admin/tokens` defaults a missing `expires`
 field to 30 days. A timestamp more than 30 days in the future, or an explicit
 `null` for a non-expiring token, also requires
 `"extendedExpiryConfirmed": true`; the server rejects ambiguous or
-unconfirmed extensions.
+unconfirmed extensions. Token names are trimmed and permanently unique without
+regard to case, including names belonging to revoked tokens. A duplicate name
+returns HTTP 400 and does not mint a credential.
 
 The managed write routes return HTTP 200 only after the XYZ supervisor reports
 child-process TCP readiness with the exact committed workspace fingerprint.
