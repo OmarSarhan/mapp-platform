@@ -70,23 +70,65 @@ first release.
   names. It is on whenever `GEMINI_APIKEY` is set; `./bin/mapp demo
   --no-semantics` turns it off, and an absent key skips the step rather than
   failing the build. Descriptions are drafted and applied without review, which
-  each proposal's recorded explanation says. Relations wider than
-  `MAPP_DEMO_FIELD_LIMIT` (50 by default in `.env`) get their table described
-  and their fields left to the structural profile --
-  `census_2021_england_oa` has 470 columns, and one model call per field is not
-  what a demo is for. The cap is announced in the output rather than applied
-  silently. The semantic stage now also reports the exact planned Gemini call
-  count and advances a terminal-safe progress bar as concurrent calls settle.
+  each proposal's recorded explanation says. Each relation gets its table and
+  first `MAPP_DEMO_FIELD_LIMIT` fields described (50 by default in `.env`),
+  while remaining fields stay at the structural profile --
+  `census_2021_england_oa` has 470 columns, and normally one model call per
+  field is not what a demo is for. The cap is announced in the output rather
+  than applied silently. The semantic stage reports the exact planned target
+  count and advances a terminal-safe progress bar as generation targets settle.
 
 ### Fixed
 
-- Multi-field semantic generation with sample rows or statistics no longer
-  fans out enough simultaneous PostgreSQL reads to exhaust a federated
-  source reader. The configuration service now queues optional-context reads
-  behind a process-wide three-slot admission bound, leaving headroom below
-  the packaged reader's four-connection ceiling; the dashboard also schedules
-  context-enabled field requests three at a time and metadata-only requests
-  ten at a time while preserving field order and all-or-nothing review.
+- Derived background work now has a bounded two-job FIFO by default: one job
+  executes while a second waits without holding a database connection. Jobs
+  publish durable worker/database/result stages, queued cancellation never
+  touches PostgreSQL, and a database-independent endpoint exposes sanitized
+  active operation IDs and queue positions for CLI inspection. Raising the
+  admission limit no longer launches competing mutations that immediately
+  fail on the database advisory lock. A failed worker-stage write now records
+  a terminal preflight failure instead of leaving an orphaned running record,
+  and capacity rejections keep rejection-time counts separate from their fresh
+  queue snapshot.
+- Repeated demo runs now preserve and skip already curated table and field
+  annotations instead of spending Gemini quota to regenerate them. A Gemini
+  429 now waits and retries after 5, 15 and 45 seconds; a limit during parallel
+  work uses one recovery probe and makes the remaining requests serial. If the
+  bounded retries are exhausted, the optional phase falls back to structural
+  profiles, explicitly discards results from the unfinished relation, and gives
+  source-specific capacity or quota guidance rather than failing the demo or
+  draining every queued request.
+- Census demo loading now limits expensive invalid-geometry accounting and
+  repair to the active workspace extent when that extent is valid, and records
+  the selected bounds in dataset provenance. Geometries outside those bounds
+  are loaded unchanged and do not count against the repair ceiling; an absent
+  or invalid workspace extent retains the full-dataset behaviour.
+- Re-enabling demo mode now revokes every existing CLI API token and
+  outstanding device authorization together with the demo-only administrator
+  credential rotation. The access dashboard also exposes each token's stored
+  permissions in a read-only expandable checklist and hides **Pending device
+  authorizations** when no request is pending. After a one-time API token is
+  confirmed on the clipboard, its copy button now flashes mint and reads
+  **Copied** instead of leaving the action visually unacknowledged.
+- Concurrent XYZ, configuration discovery, validation, planning, statistics,
+  and semantic-context work can no longer overrun a shared PostgreSQL reader.
+  Every configured `DBS_*` read in the configuration service now passes through
+  one process-wide eight-session admission gate, while optional semantic
+  context retains its tighter three-read bound. The runtime role now reserves
+  50 sessions for two upstream 20-client XYZ pools, eight admitted configuration
+  reads, and two probes; source readers reserve 64 for all bounded consumers.
+  Fresh and retained bundled/demo databases apply those limits, packaged
+  clusters explicitly provide 97 ordinary slots from `100 - 3 - 0`, and
+  verification rejects stale active capacity settings. The dashboard still
+  schedules context-enabled field requests three at a time and metadata-only
+  requests ten at a time while preserving field order and all-or-nothing
+  review.
+- New workspaces enable a source-controlled locale-wide tile recovery plugin.
+  MVT render and feature sources plus raster sources retry transient transport,
+  `408`, `429`, and selected `5xx` failures at most twice with capped backoff,
+  jitter, and `Retry-After`; deterministic visible `4xx` responses remain
+  terminal. Existing workspaces can enable the same policy through the normal
+  locale proposal and preview flow without changing individual layers.
 
 - Requesting sample rows or column statistics for a **federated** relation
   always failed with `semantic.generation_context_unavailable`, so the
