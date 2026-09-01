@@ -36,6 +36,16 @@ SOURCE_READER_USER="$(dotenv_value SOURCE_READER_USER)"
 : "${SOURCE_POSTGRES_DB:?SOURCE_POSTGRES_DB is required}"
 : "${SOURCE_READER_USER:?SOURCE_READER_USER is required}"
 
+# docker-entrypoint-initdb.d runs only for a new volume. Reapply the reviewed
+# reader budget before seeding so retained federation-test volumes are upgraded.
+"${compose[@]}" exec -T source-db psql \
+  --set ON_ERROR_STOP=1 \
+  --username "${SOURCE_POSTGRES_USER}" \
+  --dbname "${SOURCE_POSTGRES_DB}" \
+  --set reader_user="${SOURCE_READER_USER}" <<'SQL'
+ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
+SQL
+
 "${compose[@]}" exec -T source-db psql \
   --set ON_ERROR_STOP=1 \
   --username "${SOURCE_POSTGRES_USER}" \

@@ -310,6 +310,15 @@ fi
 # it, and without that Observe fails with federation.connection_ref_not_found.
 "${compose[@]}" up -d --wait source-db config-ui >/dev/null
 "${compose[@]}" exec -T source-db sh -c 'until pg_isready -q; do sleep 1; done'
+# The init directory is ignored for a retained source volume. Upgrade its
+# reader budget on every run before any Observe, FDW, or derived-layer work.
+"${compose[@]}" exec -T source-db psql \
+  --set ON_ERROR_STOP=1 \
+  --username "${SOURCE_POSTGRES_USER}" \
+  --dbname "${SOURCE_POSTGRES_DB}" \
+  --set reader_user="${SOURCE_READER_USER}" <<'SQL' >/dev/null
+ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
+SQL
 
 step "Claiming the probe alias and relation"
 # Both names are ones an operator could legitimately be using, and the cleanup

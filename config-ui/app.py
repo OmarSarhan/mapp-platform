@@ -78,6 +78,7 @@ from gemini_client import (
 )
 from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
+from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, parse_time
 from control_api import (
@@ -175,7 +176,7 @@ def requested_token_expiry(
     return requested
 try:
     DERIVED_MAX_BACKGROUND_JOBS = int(
-        os.environ.get("DERIVED_MAX_BACKGROUND_JOBS", "1")
+        os.environ.get("DERIVED_MAX_BACKGROUND_JOBS", "2")
     )
 except ValueError:
     raise RuntimeError(
@@ -204,8 +205,13 @@ SAVE_LOCK = threading.Lock()
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
 DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
+DERIVED_BACKGROUND_JOB_CONDITION = threading.Condition(
+    DERIVED_BACKGROUND_JOB_LOCK
+)
 DERIVED_BACKGROUND_ACTIVE_JOBS = 0
 DERIVED_BACKGROUND_CANCELLATIONS: dict[str, DerivedLayerCancellation] = {}
+DERIVED_BACKGROUND_WAITING_JOBS: list[str] = []
+DERIVED_BACKGROUND_EXECUTING_JOB: str | None = None
 PREVIEW_SYNC_LOCK = threading.Lock()
 PREVIEW_SYNC_STATE: dict[str, object] = {
     "pending": None,
@@ -256,8 +262,8 @@ class DerivedLayerBackgroundCapacityError(DerivedLayerError):
         self.active_jobs = active_jobs
         self.max_active_jobs = max_active_jobs
         super().__init__(
-            "The derived-layer background worker is busy. Wait for the active "
-            "operation to finish before retrying."
+            "The derived-layer background queue is full. Wait for an active "
+            "operation to finish or cancel one before retrying."
         )
 SEMANTIC = (
     SemanticClient(
@@ -1827,7 +1833,9 @@ def sync_layer_dependency_guard(workspace: dict) -> None:
         if not database_url:
             continue
         try:
-            with psycopg.connect(database_url, connect_timeout=5) as conn:
+            with dbs_connection(
+                psycopg.connect, database_url, connect_timeout=5
+            ) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT public.mapp_sync_platform_layer_dependencies(%s, %s)",
@@ -1970,6 +1978,11 @@ def run_derived_background(
             failure_phase = "result-reporting"
         else:
             raise DerivedLayerError("Unsupported background operation.")
+        CONTROL.update_operation_progress(
+            operation_id,
+            stage="result-reporting",
+            diagnostics={},
+        )
         schedule_semantic_outbox()
         CONTROL.audit(
             f"derived_layer.{action}d" if action != "refresh" else "derived_layer.refreshed",
@@ -2139,11 +2152,84 @@ def run_derived_background(
 
 
 def derived_background_capacity() -> dict:
-    with DERIVED_BACKGROUND_JOB_LOCK:
-        return {
-            "activeJobs": DERIVED_BACKGROUND_ACTIVE_JOBS,
-            "maxActiveJobs": DERIVED_MAX_BACKGROUND_JOBS,
+    with DERIVED_BACKGROUND_JOB_CONDITION:
+        active_jobs = DERIVED_BACKGROUND_ACTIVE_JOBS
+        executing_job = DERIVED_BACKGROUND_EXECUTING_JOB
+        waiting_jobs = list(DERIVED_BACKGROUND_WAITING_JOBS)
+        operation_ids = [
+            operation_id
+            for operation_id in [executing_job, *waiting_jobs]
+            if operation_id is not None
+        ]
+
+    observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    queue_positions = {
+        operation_id: position
+        for position, operation_id in enumerate(waiting_jobs, start=1)
+    }
+    active_operations = []
+    for operation_id in operation_ids:
+        try:
+            operation = CONTROL.read_operation(operation_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            continue
+        if operation.get("status") not in {"running", "cancelling"}:
+            continue
+        target = operation.get("target")
+        target = target if isinstance(target, dict) else {}
+        kind = operation.get("kind")
+        status = operation.get("status")
+        name = target.get("name")
+        action = target.get("action")
+        created = operation.get("created")
+        updated = operation.get("updated")
+        if (
+            kind not in {
+                "derived-layer.create",
+                "derived-layer.replace",
+                "derived-layer.refresh",
+            }
+            or status not in {"running", "cancelling"}
+            or not isinstance(name, str)
+            or not isinstance(action, str)
+            or not isinstance(created, str)
+            or not isinstance(updated, str)
+        ):
+            continue
+        stored_stage = operation.get("stage")
+        if operation_id in queue_positions:
+            stage = "waiting-for-worker"
+        elif stored_stage == "result-reporting":
+            stage = "result-reporting"
+        else:
+            stage = "database-transaction"
+        summary = {
+            "id": operation_id,
+            "kind": kind,
+            "status": status,
+            "target": {
+                "name": name,
+                "action": action,
+            },
+            "stage": stage,
+            "created": created,
+            "updated": updated,
+            "statusUrl": f"/api/operations/{operation_id}",
         }
+        if operation_id in queue_positions:
+            summary["queuePosition"] = queue_positions[operation_id]
+        active_operations.append(summary)
+    return {
+        "observedAt": observed_at,
+        "activeJobs": active_jobs,
+        "maxActiveJobs": DERIVED_MAX_BACKGROUND_JOBS,
+        "executingJobs": int(executing_job is not None),
+        "waitingJobs": max(
+            len(waiting_jobs),
+            active_jobs - int(executing_job is not None),
+        ),
+        "activeOperations": active_operations,
+    }
 
 
 def reserve_derived_background_job() -> None:
@@ -2165,13 +2251,119 @@ def release_derived_background_job() -> None:
         DERIVED_BACKGROUND_ACTIVE_JOBS -= 1
 
 
-def run_reserved_derived_background(*args) -> None:
+def refresh_derived_waiting_positions() -> None:
+    """Persist current FIFO positions while the job condition is held."""
+    for position, operation_id in enumerate(
+        DERIVED_BACKGROUND_WAITING_JOBS,
+        start=1,
+    ):
+        try:
+            CONTROL.update_operation_progress(
+                operation_id,
+                stage="waiting-for-worker",
+                diagnostics={"queuePosition": position},
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            # Queue ownership remains authoritative in memory. A missing or
+            # raced terminal record must not prevent the next job from running.
+            continue
+
+
+def run_reserved_derived_background(
+    operation_id: str,
+    action: str,
+    payload: dict,
+    actor: str,
+    remote: str,
+    name: str | None,
+    cancellation: DerivedLayerCancellation,
+) -> None:
+    global DERIVED_BACKGROUND_ACTIVE_JOBS
+    global DERIVED_BACKGROUND_EXECUTING_JOB
+    executing = False
     try:
-        run_derived_background(*args)
+        with DERIVED_BACKGROUND_JOB_CONDITION:
+            while True:
+                if cancellation.requested:
+                    if operation_id in DERIVED_BACKGROUND_WAITING_JOBS:
+                        DERIVED_BACKGROUND_WAITING_JOBS.remove(operation_id)
+                        refresh_derived_waiting_positions()
+                    DERIVED_BACKGROUND_JOB_CONDITION.notify_all()
+                    break
+                if (
+                    DERIVED_BACKGROUND_EXECUTING_JOB is None
+                    and DERIVED_BACKGROUND_WAITING_JOBS
+                    and DERIVED_BACKGROUND_WAITING_JOBS[0] == operation_id
+                ):
+                    DERIVED_BACKGROUND_WAITING_JOBS.pop(0)
+                    DERIVED_BACKGROUND_EXECUTING_JOB = operation_id
+                    executing = True
+                    refresh_derived_waiting_positions()
+                    break
+                DERIVED_BACKGROUND_JOB_CONDITION.wait(timeout=0.25)
+
+        if not executing:
+            finish_derived_background_cancellation(
+                operation_id,
+                action,
+                DerivedLayerCancellationRequested(
+                    "The queued derived-layer operation was cancelled."
+                ),
+                database_started=False,
+            )
+            return
+
+        try:
+            CONTROL.update_operation_progress(
+                operation_id,
+                stage="database-transaction",
+                diagnostics={},
+            )
+        except Exception as exc:
+            message = (
+                "The derived-layer worker could not record that its database "
+                "transaction was starting."
+            )
+            finish_derived_background_failure(
+                operation_id,
+                action,
+                exc,
+                derived_blocked_error(
+                    code="derived_layer.background_start_failed",
+                    message=message,
+                    suggested_action=(
+                        "Inspect the terminal operation record, then retry; "
+                        "no database transaction was started."
+                    ),
+                    operation=action,
+                ),
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "preflight",
+            )
+            return
+        run_derived_background(
+            operation_id,
+            action,
+            payload,
+            actor,
+            remote,
+            name,
+            cancellation,
+        )
     finally:
-        with DERIVED_BACKGROUND_JOB_LOCK:
-            DERIVED_BACKGROUND_CANCELLATIONS.pop(args[0], None)
-        release_derived_background_job()
+        with DERIVED_BACKGROUND_JOB_CONDITION:
+            if operation_id in DERIVED_BACKGROUND_WAITING_JOBS:
+                DERIVED_BACKGROUND_WAITING_JOBS.remove(operation_id)
+                refresh_derived_waiting_positions()
+            if DERIVED_BACKGROUND_EXECUTING_JOB == operation_id:
+                DERIVED_BACKGROUND_EXECUTING_JOB = None
+            DERIVED_BACKGROUND_CANCELLATIONS.pop(operation_id, None)
+            if DERIVED_BACKGROUND_ACTIVE_JOBS <= 0:
+                raise RuntimeError(
+                    "No derived-layer background job is reserved."
+                )
+            DERIVED_BACKGROUND_ACTIVE_JOBS -= 1
+            DERIVED_BACKGROUND_JOB_CONDITION.notify_all()
 
 
 INVALID_QUERY_REASON_CODES = frozenset({
@@ -2352,8 +2544,17 @@ def finish_derived_background_cancellation(
     operation_id: str,
     action: str,
     exc: Exception,
+    *,
+    database_started: bool = True,
 ) -> None:
-    message = f"Derived-layer {action} was cancelled and rolled back."
+    message = (
+        f"Derived-layer {action} was cancelled and rolled back."
+        if database_started
+        else (
+            f"Derived-layer {action} was cancelled before its database "
+            "transaction started."
+        )
+    )
     error = derived_failure_state(
         {
             "error": message,
@@ -2368,8 +2569,10 @@ def finish_derived_background_cancellation(
             "cancelled": True,
         },
         action,
-        failure_phase="database-transaction",
-        rolled_back=True,
+        failure_phase=(
+            "database-transaction" if database_started else "preflight"
+        ),
+        rolled_back=database_started,
     )
     CONTROL.finish_operation(
         operation_id,
@@ -2381,7 +2584,11 @@ def finish_derived_background_cancellation(
 def request_derived_background_cancellation(operation_id: str) -> bool:
     with DERIVED_BACKGROUND_JOB_LOCK:
         cancellation = DERIVED_BACKGROUND_CANCELLATIONS.get(operation_id)
-    return cancellation.request() if cancellation is not None else False
+    requested = cancellation.request() if cancellation is not None else False
+    if requested:
+        with DERIVED_BACKGROUND_JOB_CONDITION:
+            DERIVED_BACKGROUND_JOB_CONDITION.notify_all()
+    return requested
 
 
 def derived_blocked_error(
@@ -3156,6 +3363,7 @@ def start_derived_background(
     remote: str,
     name: str | None = None,
 ) -> dict:
+    global DERIVED_BACKGROUND_ACTIVE_JOBS
     reserve_derived_background_job()
     operation = None
     try:
@@ -3168,9 +3376,27 @@ def start_derived_background(
                 "spatialScope": payload.get("spatialScope"),
             },
         )
+        updated_operation = CONTROL.update_operation_progress(
+            operation["id"],
+            stage="waiting-for-worker",
+            diagnostics={"queuePosition": 1},
+        )
+        if isinstance(updated_operation, dict):
+            operation = updated_operation
         cancellation = DerivedLayerCancellation()
-        with DERIVED_BACKGROUND_JOB_LOCK:
+        with DERIVED_BACKGROUND_JOB_CONDITION:
             DERIVED_BACKGROUND_CANCELLATIONS[operation["id"]] = cancellation
+            DERIVED_BACKGROUND_WAITING_JOBS.append(operation["id"])
+            queue_position = len(DERIVED_BACKGROUND_WAITING_JOBS)
+            DERIVED_BACKGROUND_JOB_CONDITION.notify_all()
+        if queue_position != 1:
+            updated_operation = CONTROL.update_operation_progress(
+                operation["id"],
+                stage="waiting-for-worker",
+                diagnostics={"queuePosition": queue_position},
+            )
+            if isinstance(updated_operation, dict):
+                operation = updated_operation
         threading.Thread(
             target=run_reserved_derived_background,
             args=(
@@ -3183,9 +3409,19 @@ def start_derived_background(
         return operation
     except Exception:
         if operation is not None:
-            with DERIVED_BACKGROUND_JOB_LOCK:
+            with DERIVED_BACKGROUND_JOB_CONDITION:
                 DERIVED_BACKGROUND_CANCELLATIONS.pop(operation["id"], None)
-        release_derived_background_job()
+                if operation["id"] in DERIVED_BACKGROUND_WAITING_JOBS:
+                    DERIVED_BACKGROUND_WAITING_JOBS.remove(operation["id"])
+                    refresh_derived_waiting_positions()
+                if DERIVED_BACKGROUND_ACTIVE_JOBS <= 0:
+                    raise RuntimeError(
+                        "No derived-layer background job is reserved."
+                    )
+                DERIVED_BACKGROUND_ACTIVE_JOBS -= 1
+                DERIVED_BACKGROUND_JOB_CONDITION.notify_all()
+        else:
+            release_derived_background_job()
         if operation is not None:
             CONTROL.finish_operation(
                 operation["id"],
@@ -4141,7 +4377,12 @@ def discover_connection(db_name: str, database_url: str) -> list[dict]:
         AND has_table_privilege(c.oid, 'SELECT')
       ORDER BY n.nspname, c.relname, a.attnum
     """
-    with psycopg.connect(database_url, connect_timeout=5, row_factory=dict_row) as conn:
+    with dbs_connection(
+        psycopg.connect,
+        database_url,
+        connect_timeout=5,
+        row_factory=dict_row,
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = '5000ms'")
             cur.execute(query)
@@ -4231,7 +4472,9 @@ def aggregate_layer_values(
         effective_layer_filter(layer)
     )
 
-    with psycopg.connect(database_url, connect_timeout=5) as conn:
+    with dbs_connection(
+        psycopg.connect, database_url, connect_timeout=5
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SET statement_timeout = '5000ms'")
@@ -4362,7 +4605,9 @@ def aggregate_layer_statistics(
     )
     quantile_probabilities = (0.0, 0.25, 0.5, 0.75, 1.0)
 
-    with psycopg.connect(database_url, connect_timeout=5) as conn:
+    with dbs_connection(
+        psycopg.connect, database_url, connect_timeout=5
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SET statement_timeout = '5000ms'")
@@ -4882,7 +5127,9 @@ def validate_renderable(data: dict, tables: list[dict]) -> list[dict[str, str]]:
     errors = []
     table_index = {(table["dbs"], f'{table["schema"]}.{table["table"]}'): table for table in tables}
     for db_name, database_url in DB_CONNECTIONS.items():
-        with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with dbs_connection(
+            psycopg.connect, database_url, connect_timeout=5
+        ) as conn:
           with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SET statement_timeout = '5000ms'")
@@ -5042,7 +5289,9 @@ def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index
         psycopg.sql.Identifier(table_name),
     )
     sql_expression = psycopg.sql.SQL(expression)
-    with psycopg.connect(database_url, connect_timeout=5) as conn:
+    with dbs_connection(
+        psycopg.connect, database_url, connect_timeout=5
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute("SET TRANSACTION READ ONLY")
             cur.execute("SET statement_timeout = '5000ms'")
@@ -6276,6 +6525,10 @@ class Handler(SimpleHTTPRequestHandler):
                 })
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
+        elif path == "/api/derived-layers/background-jobs":
+            self._json(HTTPStatus.OK, {
+                "backgroundJobs": derived_background_capacity(),
+            })
         elif path == "/api/derived-layers/capabilities":
             try:
                 result = (
@@ -9940,17 +10193,20 @@ class Handler(SimpleHTTPRequestHandler):
                 request_path, derived_action_path,
             )
             message = str(exc)
+            capacity = derived_background_capacity()
             self._json(
                 HTTPStatus.TOO_MANY_REQUESTS,
                 derived_blocked_error(
                     code="derived_layer.background_capacity",
                     message=message,
                     suggested_action=(
-                        "Wait for the active derived-layer operation to finish, "
-                        "then retry the same request."
+                        "Inspect the active derived-layer operations, then wait "
+                        "for one to finish or deliberately cancel one before "
+                        "retrying the same request."
                     ),
                     operation=derived_operation,
                     retryable=True,
+                    backgroundJobs=capacity,
                     activeJobs=exc.active_jobs,
                     maxActiveJobs=exc.max_active_jobs,
                 ),

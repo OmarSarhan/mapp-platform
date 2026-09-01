@@ -27,6 +27,7 @@ from federation_schema import (
     MAX_GROUP_DESCRIPTION,
 )
 from relation_identity import parse_relation
+from runtime_database import dbs_connection
 from workspace_schema import expression_error
 
 try:
@@ -1014,6 +1015,12 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "risk": "inspect",
         "scope": "inspect",
     },
+    "derived-layers.background-jobs": {
+        "method": "GET",
+        "path": "/api/derived-layers/background-jobs",
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "derived-layers.create": {
         "method": "POST",
         "path": "/api/derived-layers",
@@ -1779,7 +1786,8 @@ def contract(instance_id: str) -> dict[str, Any]:
             "layers statistics",
             "layers style-elements", "layers filters", "layers effective",
             "catalog list", "icons list",
-            "derived-layers capabilities", "derived-layers list",
+            "derived-layers capabilities", "derived-layers jobs",
+            "derived-layers list",
             "derived-layers show", "derived-layers create",
             "derived-layers plan-area-weighted-h3",
             "derived-layers map-extent",
@@ -3358,7 +3366,9 @@ def visual_plan(
         default_filter=default_filter,
     )
     try:
-        with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with dbs_connection(
+            psycopg.connect, database_url, connect_timeout=5
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")
                 cur.execute(
@@ -3416,7 +3426,9 @@ def visual_plan(
         default_filter=default_filter,
     )
     try:
-        with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with dbs_connection(
+            psycopg.connect, database_url, connect_timeout=5
+        ) as conn:
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")
                 cur.execute(

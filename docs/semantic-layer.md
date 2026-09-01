@@ -337,11 +337,11 @@ the locked live column names and types must exactly match the stored generated
 profile. Synced source assets are rechecked against the configured allowlist
 and exclusions. Managed derived assets must also have the same current, ready
 semantic generation and are queried under the derived reader role. The
-configuration service queues every optional-context database read behind a
-process-wide three-slot admission bound, protecting CLI and demo generation as
-well as concurrent dashboard sessions. Sample rows are sent only to Gemini:
-they are never returned to the browser or CLI and never written to the audit
-log.
+configuration service queues every configured `DBS_*` read behind a shared
+process-wide eight-session admission gate, with a tighter three-read bound for
+optional context. This protects CLI and demo generation as well as concurrent
+dashboard sessions. Sample rows are sent only to Gemini: they are never
+returned to the browser or CLI and never written to the audit log.
 
 Gemini returns a closed structured object containing `displayName`,
 `description`, `tags`, and `caveats`. The server validates and bounds that

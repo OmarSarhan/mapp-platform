@@ -2283,6 +2283,24 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual(app.DERIVED_MAX_BACKGROUND_JOBS, capacity["maxActiveJobs"])
         self.assertGreaterEqual(capacity["activeJobs"], 0)
 
+    def test_background_jobs_route_does_not_require_database_access(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/background-jobs"
+        )
+        derived = Mock()
+        derived.capabilities.side_effect = AssertionError(
+            "background job inspection must not touch PostgreSQL"
+        )
+
+        with patch.object(app, "DERIVED", derived):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        jobs = responses[0][1]["backgroundJobs"]
+        self.assertEqual(app.DERIVED_MAX_BACKGROUND_JOBS, jobs["maxActiveJobs"])
+        self.assertIn("observedAt", jobs)
+        derived.capabilities.assert_not_called()
+
     def test_unconfigured_capabilities_include_safe_h3_diagnostics(self):
         handler, responses = self.handler("/api/derived-layers/capabilities")
 
@@ -3151,6 +3169,8 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual("No derived layer was created.", body["safeState"])
         self.assertEqual(1, body["activeJobs"])
         self.assertEqual(1, body["maxActiveJobs"])
+        self.assertEqual(0, body["backgroundJobs"]["activeJobs"])
+        self.assertEqual([], body["backgroundJobs"]["activeOperations"])
         derived.create.assert_not_called()
 
     def test_create_rejects_client_supplied_extent_bounds(self):
@@ -3355,6 +3375,136 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
 
+    def test_background_jobs_are_fifo_and_only_one_executes(self):
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        call_order = []
+
+        def run(operation_id, *_args):
+            call_order.append(operation_id)
+            if len(call_order) == 1:
+                first_entered.set()
+                self.assertTrue(release_first.wait(2))
+            else:
+                second_entered.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED_MAX_BACKGROUND_JOBS", 2,
+            ), patch.object(app, "run_derived_background", side_effect=run):
+                first = app.start_derived_background(
+                    "create", {"name": "first_layer"}, "admin", "local",
+                )
+                self.assertTrue(first_entered.wait(1))
+                second = app.start_derived_background(
+                    "refresh", {}, "admin", "local", "second_layer",
+                )
+
+                capacity = app.derived_background_capacity()
+                self.assertEqual(2, capacity["activeJobs"])
+                self.assertEqual(1, capacity["executingJobs"])
+                self.assertEqual(1, capacity["waitingJobs"])
+                self.assertFalse(second_entered.is_set())
+                self.assertEqual(
+                    [first["id"], second["id"]],
+                    [item["id"] for item in capacity["activeOperations"]],
+                )
+                self.assertEqual(
+                    {
+                        "id", "kind", "status", "target", "stage",
+                        "created", "updated", "statusUrl",
+                    },
+                    set(capacity["activeOperations"][0]),
+                )
+                waiting = capacity["activeOperations"][1]
+                self.assertEqual("waiting-for-worker", waiting["stage"])
+                self.assertEqual(1, waiting["queuePosition"])
+                self.assertEqual(
+                    {"name", "action"}, set(waiting["target"]),
+                )
+                self.assertNotIn("actor", waiting)
+                self.assertNotIn("spatialScope", waiting["target"])
+                with self.assertRaises(
+                    app.DerivedLayerBackgroundCapacityError
+                ):
+                    app.start_derived_background(
+                        "create", {"name": "third_layer"}, "admin", "local",
+                    )
+
+                release_first.set()
+                self.assertTrue(second_entered.wait(1))
+                deadline = time.monotonic() + 1
+                while (
+                    app.derived_background_capacity()["activeJobs"]
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+                self.assertEqual([first["id"], second["id"]], call_order)
+                self.assertEqual(
+                    0, app.derived_background_capacity()["activeJobs"],
+                )
+
+    def test_waiting_background_job_can_be_cancelled_without_database_work(self):
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def run(operation_id, *_args):
+            calls.append(operation_id)
+            first_entered.set()
+            self.assertTrue(release_first.wait(2))
+
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED_MAX_BACKGROUND_JOBS", 2,
+            ), patch.object(app, "run_derived_background", side_effect=run):
+                first = app.start_derived_background(
+                    "create", {"name": "first_layer"}, "admin", "local",
+                )
+                self.assertTrue(first_entered.wait(1))
+                second = app.start_derived_background(
+                    "refresh", {}, "admin", "local", "second_layer",
+                )
+
+                self.assertTrue(
+                    app.request_derived_background_cancellation(second["id"])
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    control.read_operation(second["id"])["status"]
+                    != "cancelled"
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                cancelled = control.read_operation(second["id"])
+                self.assertEqual("cancelled", cancelled["status"])
+                self.assertEqual(
+                    "preflight", cancelled["error"]["failurePhase"],
+                )
+                self.assertTrue(cancelled["error"]["stateUnchanged"])
+                self.assertNotIn("rolledBack", cancelled["error"])
+                self.assertEqual([first["id"]], calls)
+                self.assertEqual(
+                    1, app.derived_background_capacity()["activeJobs"],
+                )
+
+                release_first.set()
+                deadline = time.monotonic() + 1
+                while (
+                    app.derived_background_capacity()["activeJobs"]
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertEqual(
+                    0, app.derived_background_capacity()["activeJobs"],
+                )
+
     def test_worker_start_failure_persists_preflight_state(self):
         with tempfile.TemporaryDirectory() as directory:
             control = ControlStore(Path(directory))
@@ -3388,6 +3538,55 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             self.assertEqual("No derived layer was created.", error["safeState"])
             self.assertNotIn("indeterminate", error)
             self.assertFalse(error["suggestedAction"].startswith("Inspect"))
+            self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
+
+    def test_database_stage_write_failure_terminalizes_and_releases_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            original_update = control.update_operation_progress
+
+            def fail_database_stage(operation_id, *, stage, diagnostics=None):
+                if stage == "database-transaction":
+                    raise OSError("synthetic progress write failure")
+                return original_update(
+                    operation_id,
+                    stage=stage,
+                    diagnostics=diagnostics,
+                )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                control,
+                "update_operation_progress",
+                side_effect=fail_database_stage,
+            ), patch.object(app, "run_derived_background") as run:
+                operation = app.start_derived_background(
+                    "create",
+                    {"name": "safe_places"},
+                    "admin",
+                    "127.0.0.1",
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    (
+                        control.read_operation(operation["id"])["status"]
+                        == "running"
+                        or app.derived_background_capacity()["activeJobs"]
+                    )
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+            stored = control.read_operation(operation["id"])
+            self.assertEqual("failed", stored["status"])
+            self.assertEqual(
+                "derived_layer.background_start_failed",
+                stored["error"]["code"],
+            )
+            self.assertEqual("preflight", stored["error"]["failurePhase"])
+            self.assertTrue(stored["error"]["stateUnchanged"])
+            self.assertNotIn("rolledBack", stored["error"])
+            run.assert_not_called()
             self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
 
     def test_create_records_success_only_after_store_returns(self):

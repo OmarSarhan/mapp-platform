@@ -99,6 +99,14 @@ seed_one() {
   # for the server itself rather than for the container.
   "${compose[@]}" exec -T "${service}" sh -c 'until pg_isready -q; do sleep 1; done'
 
+  # docker-entrypoint-initdb.d only runs for a new volume. Reapply the packaged
+  # reader budget here so `mapp demo` upgrades retained census/ops volumes too.
+  "${compose[@]}" exec -T "${service}" psql \
+    --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
+    --set reader_user="${READER_USER}" <<'SQL' >/dev/null
+ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
+SQL
+
   "${compose[@]}" exec -T "${service}" psql \
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
     --command "CREATE SCHEMA IF NOT EXISTS leeds;" >/dev/null

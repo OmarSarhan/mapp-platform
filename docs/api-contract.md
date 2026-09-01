@@ -139,7 +139,7 @@ clients still use the route and response contract owned by the server.
 | `validate` | `POST /api/validate` | — | Legacy `full` or administrator session; it never saves |
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
-| `derived-layers capabilities\|list\|show\|map-extent` | `GET /api/derived-layers/*` | `derived-layers.map-extent` for the extent preview | `inspect` |
+| `derived-layers capabilities\|jobs\|list\|show\|map-extent` | `GET /api/derived-layers/*` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview | `inspect` |
 | `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
@@ -366,6 +366,7 @@ readiness does not disable derived queries that do not use H3.
 | `GET /api/capabilities` | Stable action IDs, risks, routes, schemas, and operation kinds |
 | `GET /api/operations/<id>` | Durable authorized status/result for a long action |
 | `POST /api/operations/<id>/cancel` | Request cancellation of a background derived-layer transaction |
+| `GET /api/derived-layers/background-jobs` | Database-independent, sanitized derived worker and waiting-queue status |
 
 Derived-layer create, replace, and refresh requests accept an optional
 `"background": true`. They return `202 Accepted` with `operation` and
@@ -373,10 +374,20 @@ Derived-layer create, replace, and refresh requests accept an optional
 or `indeterminate`. `cancelling` is nonterminal: the server reports `cancelled`
 only after PostgreSQL confirms the transaction was rolled back. Omitting the
 flag preserves the synchronous API behaviour.
-The server advertises `backgroundJobs.activeJobs` and `maxActiveJobs` in
-derived-layer capabilities. If the bounded worker is full, admission returns
-HTTP `429` with `derived_layer.background_capacity`, `blocked: true`, and
-`retryable: true`; it does not queue an unbounded thread or operation record.
+The server advertises `backgroundJobs.activeJobs`, `executingJobs`,
+`waitingJobs`, and `maxActiveJobs` in derived-layer capabilities and through
+the database-independent background-jobs route. The latter also returns
+sanitized active operation summaries containing only IDs, kinds, target
+names/actions, stages, timestamps, status URLs, and queue positions. It never
+returns actors, SQL, full payloads or spatial scopes, database sessions, or
+operation results/errors. A summary can disappear just before its in-memory
+slot is released during terminal cleanup, so clients accept fewer summaries
+than `activeJobs` and use the counts as the capacity authority. If the bounded
+queue is full, admission returns HTTP
+`429` with `derived_layer.background_capacity`, `blocked: true`,
+`retryable: true`, rejection-time `activeJobs`/`maxActiveJobs`, and a fresh safe
+queue summary. The fresh summary may already show an available slot; clients
+may then resubmit without an extra wait.
 
 ## Semantic catalog and proposals
 
@@ -425,11 +436,14 @@ field sample. Statistics do not disclose their contributing raw values.
 The response reports the exact booleans in `generation.contextOptions` and
 sets `generation.metadataOnly` accordingly. Neither optional context nor the
 sample values are returned in the draft or stored in semantic history.
-The configuration service admits at most three optional-context database
-reads at once and queues additional authenticated requests before opening a
-connection. This server-side bound applies equally to dashboard, CLI, demo,
-and concurrent-session callers and remains below the packaged source reader's
-four-connection ceiling. It does not change the request or response schema.
+Every configured `DBS_*` read made by the configuration service passes through
+one process-wide eight-session admission gate; additional requests wait before
+opening a PostgreSQL connection. Optional semantic context has a tighter
+three-read bound inside that shared gate. These server-side bounds apply
+equally to dashboard, CLI, demo, and concurrent-session callers and remain
+within the packaged source reader's 64-session budget alongside runtime tile,
+derived, federation, and administrative consumers. They do not change the
+request or response schema.
 
 Applying succeeds only while the asset still has the checked `baseVersion`.
 Source registration, replacement, refresh, or another curated apply increments

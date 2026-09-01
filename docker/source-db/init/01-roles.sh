@@ -18,6 +18,9 @@ psql \
   --set reader_user="${SOURCE_READER_USER}" \
   --set reader_password="${SOURCE_READER_PASSWORD}" <<'SQL'
 CREATE ROLE :"reader_user" LOGIN PASSWORD :'reader_password';
-ALTER ROLE :"reader_user" CONNECTION LIMIT 4;
+-- One packaged source can be read concurrently by the 50-session runtime
+-- role, four derived jobs, four federation jobs, three semantic context reads,
+-- and three additional source-reader sessions of headroom.
+ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
 GRANT CONNECT ON DATABASE :"DBNAME" TO :"reader_user";
 SQL

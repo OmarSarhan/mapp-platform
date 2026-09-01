@@ -612,3 +612,30 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual("indeterminate", recovered["status"])
             self.assertEqual(recovered["updated"], recovered["finished"])
             self.assertEqual("operation.interrupted", recovered["error"]["code"])
+
+    def test_waiting_derived_job_is_not_replayed_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ControlStore(root)
+            store.initialize("correct horse battery staple", "instance")
+            operation = store.create_operation(
+                "derived-layer.create",
+                "token:test",
+                {"name": "waiting_layer", "action": "create"},
+            )
+            store.update_operation_progress(
+                operation["id"],
+                stage="waiting-for-worker",
+                diagnostics={"queuePosition": 1},
+            )
+
+            restarted = ControlStore(root)
+            restarted.recover_interrupted_operations()
+            recovered = restarted.read_operation(operation["id"])
+
+            self.assertEqual("indeterminate", recovered["status"])
+            self.assertEqual("waiting-for-worker", recovered["stage"])
+            self.assertEqual(
+                "service-recovery", recovered["error"]["failurePhase"],
+            )
+            self.assertIsNone(recovered["result"])

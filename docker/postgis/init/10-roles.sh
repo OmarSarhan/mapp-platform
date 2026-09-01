@@ -73,7 +73,10 @@ CREATE ROLE :"semantic_reader_db_user"
   PASSWORD :'semantic_reader_db_password';
 
 ALTER ROLE :"etl_db_user" CONNECTION LIMIT 4;
-ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 32;
+-- Live and preview XYZ each have an upstream 20-client pool. The configuration
+-- service admits eight DBS_* reads, and two further runtime-reader sessions are
+-- reserved for health probes and operator diagnostics.
+ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 50;
 ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"semantic_db_user" CONNECTION LIMIT 4;

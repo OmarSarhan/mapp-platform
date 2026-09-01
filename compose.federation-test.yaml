@@ -54,6 +54,9 @@ services:
         chmod 600 /tmp/server.key
         chown postgres:postgres /tmp/server.crt /tmp/server.key
         exec docker-entrypoint.sh postgres \
+          -c max_connections=100 \
+          -c superuser_reserved_connections=3 \
+          -c reserved_connections=0 \
           -c ssl=on \
           -c ssl_cert_file=/tmp/server.crt \
           -c ssl_key_file=/tmp/server.key

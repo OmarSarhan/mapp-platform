@@ -20,7 +20,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
     def assert_resource_role_defaults(self, relative_path: str) -> None:
         source = self.normalized(relative_path)
         for contract in (
-            'ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 32;',
+            'ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 50;',
             'ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;',
             'ALTER ROLE :"derived_db_user" SET search_path = pg_catalog, public;',
             'ALTER ROLE :"xyz_db_user" SET work_mem = \'8MB\';',
@@ -339,6 +339,256 @@ class DatabaseAccessContractTests(unittest.TestCase):
             min(limits),
             "the store may open more connections than its role allows",
         )
+
+    def test_packaged_connection_budgets_cover_all_runtime_consumers(self) -> None:
+        """Role gates must admit both XYZ pools and every source consumer."""
+        def service_body(source: str, service: str) -> str:
+            service_block = re.search(
+                rf"^  {re.escape(service)}:\n(?P<body>.*?)"
+                r"(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                source,
+                re.M | re.S,
+            )
+            self.assertIsNotNone(service_block, f"missing {service} service")
+            return service_block.group("body")
+
+        def postgres_setting(body: str, setting: str) -> int:
+            values = re.findall(
+                rf"(?<![A-Za-z0-9_]){re.escape(setting)}=(\d+)",
+                body,
+            )
+            self.assertEqual(
+                1,
+                len(values),
+                f"expected one explicit {setting} setting",
+            )
+            return int(values[0])
+
+        dockerfile = (ROOT / "docker/xyz/Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        pool_match = re.search(
+            r"^ARG XYZ_DB_POOL_CONNECTIONS=(\d+)$", dockerfile, re.M
+        )
+        self.assertIsNotNone(pool_match, "the pinned XYZ pool size is not declared")
+        self.assertIn(
+            'grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," mod/utils/dbs.js',
+            dockerfile,
+            "the image build does not verify its upstream pool-size assumption",
+        )
+        pool_size = int(pool_match.group(1))
+
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        pool_services = ("xyz", "xyz-preview")
+        for service in pool_services:
+            self.assertIn("DBS_MAPP:", service_body(compose, service))
+        supervisor = (ROOT / "docker/xyz/supervisor.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            1,
+            supervisor.count('spawn("node", ["express.js"]'),
+            "one XYZ service can start more than one upstream pool process",
+        )
+
+        roles = (ROOT / "docker/postgis/init/10-roles.sh").read_text(
+            encoding="utf-8"
+        )
+        upgrade = (ROOT / "docker/postgis/upgrade-derived.sh").read_text(
+            encoding="utf-8"
+        )
+
+        def role_limit(source: str, variable: str) -> int:
+            match = re.search(
+                rf'ALTER ROLE :"{variable}" CONNECTION LIMIT (\d+);',
+                source,
+            )
+            self.assertIsNotNone(match, f"missing limit for {variable}")
+            return int(match.group(1))
+
+        runtime_limit = role_limit(roles, "xyz_db_user")
+        runtime_database = (ROOT / "config-ui/runtime_database.py").read_text(
+            encoding="utf-8"
+        )
+        admission_match = re.search(
+            r"^MAX_CONCURRENT_DBS_CONNECTIONS = (\d+)$",
+            runtime_database,
+            re.M,
+        )
+        self.assertIsNotNone(
+            admission_match,
+            "the configuration service declares no shared DBS_* admission bound",
+        )
+        admitted_configuration_connections = int(admission_match.group(1))
+        self.assertEqual(8, admitted_configuration_connections)
+        for relative_path, expected_uses in (
+            ("config-ui/app.py", 6),
+            ("config-ui/control_api.py", 2),
+            ("config-ui/semantic_sources.py", 3),
+        ):
+            caller = (ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("from runtime_database import dbs_connection", caller)
+            self.assertEqual(
+                expected_uses,
+                caller.count("with dbs_connection("),
+                f"{relative_path} has an unreviewed DBS_* connection site",
+            )
+        semantic_sources = (ROOT / "config-ui/semantic_sources.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("connection_context=dbs_connection", semantic_sources)
+        config_image = (ROOT / "config-ui/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("runtime_database.py", config_image)
+        runtime_probe_headroom = 2
+        self.assertEqual(
+            len(pool_services) * pool_size
+            + admitted_configuration_connections
+            + runtime_probe_headroom,
+            runtime_limit,
+            "the runtime role cannot admit both XYZ pools, the bounded "
+            "configuration service, and probe headroom",
+        )
+        self.assertEqual(
+            runtime_limit,
+            role_limit(upgrade, "xyz_db_user"),
+            "the existing-volume upgrade has a different runtime budget",
+        )
+
+        bundled_compose = (ROOT / "compose.bundled-db.yaml").read_text(
+            encoding="utf-8"
+        )
+        demo_compose = (ROOT / "compose.federated-demo.yaml").read_text(
+            encoding="utf-8"
+        )
+        federation_compose = (ROOT / "compose.federation-test.yaml").read_text(
+            encoding="utf-8"
+        )
+        cluster_services = (
+            (bundled_compose, "db"),
+            (demo_compose, "census-db"),
+            (demo_compose, "ops-db"),
+            (federation_compose, "source-db"),
+        )
+        expected_cluster_settings = {
+            "max_connections": 100,
+            "superuser_reserved_connections": 3,
+            "reserved_connections": 0,
+        }
+        for cluster_compose, service in cluster_services:
+            body = service_body(cluster_compose, service)
+            with self.subTest(service=service):
+                for setting, expected in expected_cluster_settings.items():
+                    self.assertEqual(
+                        expected,
+                        postgres_setting(body, setting),
+                    )
+        ordinary_cluster_capacity = (
+            expected_cluster_settings["max_connections"]
+            - expected_cluster_settings["superuser_reserved_connections"]
+            - expected_cluster_settings["reserved_connections"]
+        )
+        self.assertEqual(97, ordinary_cluster_capacity)
+        bundled_role_limit_total = sum(
+            role_limit(roles, variable)
+            for variable in (
+                "etl_db_user",
+                "xyz_db_user",
+                "derived_db_user",
+                "federation_db_user",
+                "semantic_db_user",
+                "semantic_reader_db_user",
+            )
+        )
+        self.assertLessEqual(
+            bundled_role_limit_total,
+            ordinary_cluster_capacity,
+            "the packaged role maxima exceed ordinary PostgreSQL capacity",
+        )
+
+        source_roles = (ROOT / "docker/source-db/init/01-roles.sh").read_text(
+            encoding="utf-8"
+        )
+        demo_seed = (ROOT / "docker/demo-sources/seed.sh").read_text(
+            encoding="utf-8"
+        )
+        federation_seed = (ROOT / "docker/source-db/seed.sh").read_text(
+            encoding="utf-8"
+        )
+        federation_e2e = (ROOT / "scripts/federation-e2e.sh").read_text(
+            encoding="utf-8"
+        )
+        source_limit = role_limit(source_roles, "reader_user")
+        semantic_limit_match = re.search(
+            r"^MAX_CONCURRENT_GENERATION_CONTEXT_READS = (\d+)$",
+            semantic_sources,
+            re.M,
+        )
+        self.assertIsNotNone(
+            semantic_limit_match,
+            "optional semantic context declares no server-side admission bound",
+        )
+        source_spare = 3
+        expected_source_limit = (
+            runtime_limit
+            + role_limit(roles, "derived_db_user")
+            + role_limit(roles, "federation_db_user")
+            + int(semantic_limit_match.group(1))
+            + source_spare
+        )
+        self.assertEqual(
+            expected_source_limit,
+            source_limit,
+            "the source reader cannot admit every bounded platform consumer",
+        )
+        self.assertLessEqual(
+            source_limit,
+            ordinary_cluster_capacity,
+            "the packaged source-reader maximum exceeds ordinary PostgreSQL capacity",
+        )
+        self.assertEqual(
+            source_limit,
+            role_limit(demo_seed, "reader_user"),
+            "mapp demo does not upgrade retained source volumes",
+        )
+        self.assertEqual(
+            source_limit,
+            role_limit(federation_seed, "reader_user"),
+            "the standalone federation seed does not upgrade its retained source",
+        )
+        self.assertEqual(
+            source_limit,
+            role_limit(federation_e2e, "reader_user"),
+            "the federation harness does not upgrade its retained source",
+        )
+        verifier = (ROOT / "scripts/verify.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            f'"connectionLimit": ({runtime_limit}, {runtime_limit})',
+            verifier,
+            "verification accepts a stale or over-broad runtime role limit",
+        )
+        for capacity_contract in (
+            'expected_cluster_settings = (100, 3, 0)',
+            'settings.max_connections AS "maxConnections"',
+            'AS "superuserReservedConnections"',
+            'settings.reserved_connections AS "reservedConnections"',
+            "active_cluster_settings != expected_cluster_settings",
+        ):
+            self.assertIn(
+                capacity_contract,
+                verifier,
+                "verification does not audit the active PostgreSQL capacity",
+            )
+        external_docs = (ROOT / "docs/external-postgresql.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f"ALTER ROLE mapp_runtime_reader CONNECTION LIMIT {runtime_limit};",
+            external_docs,
+        )
+        api_contract = (ROOT / "docs/api-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"{source_limit}-session budget", api_contract)
 
     def test_semantic_context_reads_stay_under_the_source_role_limit(self) -> None:
         """Optional data context must leave source-reader headroom.

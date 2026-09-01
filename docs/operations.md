@@ -236,6 +236,15 @@ decision, not a replacement for it. Neither role can reach `derived_layers`,
 `federation`, `public`, or any `source_<alias>` schema, and neither holds
 `postgres_fdw` `USAGE` or any role membership.
 
+Packaged PostgreSQL services explicitly configure 100 total connections, three
+superuser-reserved connections, and no additional reserved connections, leaving
+97 ordinary slots. The bundled login-role maxima total 70 and must remain at or
+below that usable capacity. The runtime reader's 50-session maximum covers the
+two 20-client XYZ pools, the configuration service's process-wide eight-session
+`DBS_*` admission gate, and two probe/diagnostic sessions. Packaged source
+readers use a 64-session maximum for that runtime budget plus bounded derived,
+federation, and semantic-context work and three spare source sessions.
+
 Both roles and the schema are created by the packaged database's initialization
 scripts, which run only on an empty data directory. An installation predating
 this change needs `./bin/mapp doctor --add-missing` for the six new keys and a

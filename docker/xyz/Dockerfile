@@ -5,6 +5,7 @@ FROM node:22.23.1-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2
 ARG XYZ_REPOSITORY=https://github.com/GEOLYTIX/xyz.git
 ARG XYZ_REF=v4.23.4
 ARG XYZ_COMMIT=a6f03c07dd7aaae2e9ab04087143ee0400e15cb9
+ARG XYZ_DB_POOL_CONNECTIONS=20
 
 RUN apk add --no-cache \
       ca-certificates \
@@ -18,7 +19,8 @@ WORKDIR /app
 RUN set -eux; \
     git clone --branch "${XYZ_REF}" --depth 1 "${XYZ_REPOSITORY}" xyz; \
     cd xyz; \
-    test "$(git rev-parse HEAD)" = "${XYZ_COMMIT}"
+    test "$(git rev-parse HEAD)" = "${XYZ_COMMIT}"; \
+    grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," mod/utils/dbs.js
 
 WORKDIR /app/xyz
 

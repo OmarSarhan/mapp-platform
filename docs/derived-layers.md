@@ -594,13 +594,32 @@ accepted operation uses `operation-polling`, and startup recovery uses
 `service-recovery`. Only `preflight` and proven rollback responses may include
 `stateUnchanged` and `safeState`.
 
-The configuration service admits one active derived background job by default.
-`DERIVED_MAX_BACKGROUND_JOBS` may be set from 1 through 4, but one is recommended
-because derived mutations are serialized at the database boundary. When all
-slots are occupied, a new background request is not queued: it returns HTTP
-`429` with `code: "derived_layer.background_capacity"`, `blocked: true`,
-`retryable: true`, and the active and maximum job counts. Wait for the recorded
-operation to finish and submit the same reviewed request again.
+The configuration service admits two derived background jobs by default.
+Exactly one executes against PostgreSQL while later admitted jobs wait in a
+bounded in-process FIFO without opening a database connection.
+`DERIVED_MAX_BACKGROUND_JOBS` controls the admitted total and may be set from
+1 through 4; the database executor remains one. A waiting operation keeps
+`status: running` and moves through `waiting-for-worker`,
+`database-transaction`, and `result-reporting` stages. These stages and their
+timestamps show ownership and phase, not percentage completion or a database
+heartbeat.
+
+Inspect the queue with `GET /api/derived-layers/background-jobs`. When every
+slot is occupied, another background request returns HTTP `429` with
+`code: "derived_layer.background_capacity"`, `blocked: true`,
+`retryable: true`, and sanitized active-operation summaries. Wait for an
+operation to finish or deliberately cancel one before resubmitting. Waiting
+jobs are cancellable without touching PostgreSQL. The queue is memory-only and
+is never replayed after a service restart; ordinary operation recovery remains
+the authority for interrupted records. During the short terminal-cleanup race,
+an operation summary may disappear before its admitted count is released; the
+counts remain the capacity authority and clients must accept a shorter summary
+list. A `429` keeps its top-level rejection-time counts but embeds a fresh queue
+snapshot, which may already show that retrying is possible.
+
+An existing `.env` that explicitly sets `DERIVED_MAX_BACKGROUND_JOBS=1` keeps
+that limit. Change it to `2` and recreate `config-ui` to adopt the packaged
+default; do not rewrite a deployment's private environment implicitly.
 
 Database-wide serialization also covers synchronous callers and multiple
 configuration-service processes. Mutation admission uses

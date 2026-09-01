@@ -28,6 +28,16 @@ services:
       SEMANTIC_DB_PASSWORD: ${SEMANTIC_DB_PASSWORD:?Set SEMANTIC_DB_PASSWORD in .env}
       SEMANTIC_READER_DB_USER: ${SEMANTIC_READER_DB_USER:?Set SEMANTIC_READER_DB_USER in .env}
       SEMANTIC_READER_DB_PASSWORD: ${SEMANTIC_READER_DB_PASSWORD:?Set SEMANTIC_READER_DB_PASSWORD in .env}
+    # Keep the role budgets below 97 ordinary slots. PostgreSQL reserves three
+    # of the 100 connections for superusers and no additional reserved roles.
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - superuser_reserved_connections=3
+      - -c
+      - reserved_connections=0
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgis/init/05-h3.sql:/docker-entrypoint-initdb.d/80-mapp-h3.sql:ro

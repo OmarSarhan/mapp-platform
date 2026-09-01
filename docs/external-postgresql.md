@@ -96,7 +96,9 @@ CREATE ROLE mapp_runtime_reader
 CREATE ROLE mapp_derived_owner
   LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
-ALTER ROLE mapp_runtime_reader CONNECTION LIMIT 32;
+-- Two 20-client XYZ pools, eight admitted configuration sessions, and two
+-- runtime-reader sessions reserved for probes and operator diagnostics.
+ALTER ROLE mapp_runtime_reader CONNECTION LIMIT 50;
 ALTER ROLE mapp_runtime_reader SET work_mem = '8MB';
 ALTER ROLE mapp_runtime_reader SET hash_mem_multiplier = '1';
 ALTER ROLE mapp_runtime_reader SET maintenance_work_mem = '32MB';

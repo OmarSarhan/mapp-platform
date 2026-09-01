@@ -209,7 +209,9 @@ REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw
   FROM :"xyz_db_user", :"derived_db_user";
 GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO :"federation_db_user";
 ALTER ROLE :"etl_db_user" CONNECTION LIMIT 4;
-ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 32;
+-- Keep existing volumes aligned with the two upstream 20-client XYZ pools,
+-- eight admitted configuration reads, and two runtime-reader probe sessions.
+ALTER ROLE :"xyz_db_user" CONNECTION LIMIT 50;
 ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;
 

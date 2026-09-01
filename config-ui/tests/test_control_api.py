@@ -53,6 +53,25 @@ from control_plane import ControlStore
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_contract_advertises_background_job_inspection(self):
+        advertised = contract("instance")
+        advertised_capabilities = capabilities("instance")
+
+        self.assertIn("derived-layers jobs", advertised["commands"])
+        self.assertEqual(
+            {
+                "id": "derived-layers.background-jobs",
+                "method": "GET",
+                "path": "/api/derived-layers/background-jobs",
+                "risk": "inspect",
+                "scope": "inspect",
+            },
+            next(
+                action for action in advertised_capabilities["actions"]
+                if action["id"] == "derived-layers.background-jobs"
+            ),
+        )
+
     def test_contract_advertises_exactly_the_federation_cli_commands(self):
         # This assertion used to be the inverse: advertising a command the CLI
         # cannot run is a lie, and the CLI refuses anything unadvertised with

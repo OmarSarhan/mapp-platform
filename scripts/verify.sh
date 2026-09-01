@@ -1518,7 +1518,7 @@ def resource_policy_valid(session, limits):
 
 
 reader_resource_limits = {
-    "connectionLimit": (1, 32),
+    "connectionLimit": (50, 50),
     "workMemKb": (1, 8 * 1024),
     "hashMemMultiplier": (1, 1),
     "maintenanceWorkMemKb": (1, 32 * 1024),
@@ -1529,6 +1529,10 @@ reader_resource_limits = {
     "lockTimeoutMs": (1, 5 * 1000),
     "idleTransactionTimeoutMs": (1, 30 * 1000),
 }
+expected_cluster_settings = (100, 3, 0)
+# Fresh and upgraded bundled roles can collectively admit seventy sessions.
+# PostgreSQL must leave at least that many ordinary (non-reserved) slots.
+required_ordinary_capacity = 70
 derived_resource_limits = {
     "connectionLimit": (1, 4),
     "workMemKb": (1, 16 * 1024),
@@ -1617,6 +1621,10 @@ with psycopg.connect(
               reader_role.rolconnlimit AS "connectionLimit",
               current_setting($$server_version_num$$)::integer
                 AS "serverVersionNum",
+              settings.max_connections AS "maxConnections",
+              settings.superuser_reserved_connections
+                AS "superuserReservedConnections",
+              settings.reserved_connections AS "reservedConnections",
               settings.work_mem_kb AS "workMemKb",
               settings.hash_mem_multiplier AS "hashMemMultiplier",
               settings.maintenance_work_mem_kb AS "maintenanceWorkMemKb",
@@ -1630,6 +1638,15 @@ with psycopg.connect(
             FROM pg_catalog.pg_roles AS reader_role
             CROSS JOIN LATERAL (
               SELECT
+                max(setting::integer) FILTER (
+                  WHERE name = $$max_connections$$
+                ) AS max_connections,
+                max(setting::integer) FILTER (
+                  WHERE name = $$superuser_reserved_connections$$
+                ) AS superuser_reserved_connections,
+                max(setting::integer) FILTER (
+                  WHERE name = $$reserved_connections$$
+                ) AS reserved_connections,
                 max(setting::numeric) FILTER (WHERE name = $$work_mem$$)
                   AS work_mem_kb,
                 max(setting::numeric) FILTER (
@@ -1657,6 +1674,8 @@ with psycopg.connect(
                 ) AS idle_transaction_timeout_ms
               FROM pg_catalog.pg_settings
               WHERE name IN (
+                $$max_connections$$, $$superuser_reserved_connections$$,
+                $$reserved_connections$$,
                 $$work_mem$$, $$hash_mem_multiplier$$,
                 $$maintenance_work_mem$$,
                 $$max_parallel_workers_per_gather$$, $$temp_file_limit$$,
@@ -1680,6 +1699,27 @@ if not resource_policy_valid(reader_session, reader_resource_limits):
     fail(
         "The active DBS_MAPP runtime reader does not enforce the required "
         "connection, memory, temporary-file, parallelism, and timeout limits."
+    )
+active_cluster_settings = (
+    reader_session["maxConnections"],
+    reader_session["superuserReservedConnections"],
+    reader_session["reservedConnections"],
+)
+if active_cluster_settings != expected_cluster_settings:
+    fail(
+        "The active bundled PostgreSQL capacity settings are not "
+        "max_connections=100, superuser_reserved_connections=3, and "
+        "reserved_connections=0; recreate the database service."
+    )
+ordinary_capacity = (
+    active_cluster_settings[0]
+    - active_cluster_settings[1]
+    - active_cluster_settings[2]
+)
+if ordinary_capacity < required_ordinary_capacity:
+    fail(
+        "The active bundled PostgreSQL cluster cannot admit all packaged "
+        "role connection maxima."
     )
 
 with psycopg.connect(

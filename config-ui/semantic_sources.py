@@ -15,6 +15,8 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from runtime_database import dbs_connection
+
 
 # No default: the packaged database holds no source data, and a federated
 # source schema cannot be wildcarded because parse_allowlist requires a
@@ -43,10 +45,10 @@ GENERATION_SAMPLE_MAX_BYTES = 96 * 1024
 GENERATION_SAMPLE_MAX_COLUMNS = 20
 GENERATION_SAMPLE_VALUE_MAX_CHARS = 512
 GENERATION_STATISTICS_MAX_ROWS = 1000
-# The packaged source-reader role permits four concurrent connections. Keep
-# optional semantic-generation context from exhausting that role by itself:
-# three reads proceed while additional requests wait before opening a
-# connection, leaving one slot of headroom for other source consumers.
+# Keep optional semantic-generation context from consuming the shared
+# eight-session DBS_* gate by itself. Three reads proceed while additional
+# requests wait before opening a connection; the remaining sessions cover
+# discovery, validation, planning, and statistics requests.
 MAX_CONCURRENT_GENERATION_CONTEXT_READS = 3
 _GENERATION_CONTEXT_READ_SLOTS = threading.BoundedSemaphore(
     MAX_CONCURRENT_GENERATION_CONTEXT_READS
@@ -461,12 +463,14 @@ class PostgresSemanticSources:
             sample_rows=sample_rows,
             statistics=statistics,
             sample_seed=sample_seed,
+            connection_context=dbs_connection,
         )
 
     def discover(self) -> list[dict[str, Any]]:
         relations: list[dict[str, Any]] = []
         for alias in self._aliases():
-            with psycopg.connect(
+            with dbs_connection(
+                psycopg.connect,
                 self.connections[alias],
                 connect_timeout=5,
                 row_factory=dict_row,
@@ -605,7 +609,8 @@ class PostgresSemanticSources:
                 alias_after,
                 remaining,
             )
-            with psycopg.connect(
+            with dbs_connection(
+                psycopg.connect,
                 self.connections[alias],
                 connect_timeout=5,
                 row_factory=dict_row,
@@ -643,7 +648,8 @@ class PostgresSemanticSources:
             )
         url = self._connection_url(alias)
         try:
-            with psycopg.connect(
+            with dbs_connection(
+                psycopg.connect,
                 url,
                 connect_timeout=5,
                 row_factory=dict_row,
@@ -959,6 +965,7 @@ def postgres_generation_context(
     sample_rows: bool = False,
     statistics: bool = False,
     sample_seed: float = 0.314159,
+    connection_context=None,
 ) -> dict[str, Any]:
     """Read explicitly requested, bounded context for Gemini generation.
 
@@ -999,6 +1006,7 @@ def postgres_generation_context(
             sample_rows=sample_rows,
             statistics=statistics,
             sample_seed=sample_seed,
+            connection_context=connection_context,
         )
 
 
@@ -1013,15 +1021,26 @@ def _read_postgres_generation_context(
     sample_rows: bool,
     statistics: bool,
     sample_seed: float,
+    connection_context,
 ) -> dict[str, Any]:
     relation_identifier = sql.Identifier(schema, relation)
     context: dict[str, Any] = {}
     try:
-        with psycopg.connect(
-            connection_url,
-            connect_timeout=5,
-            row_factory=dict_row,
-        ) as connection:
+        connection_scope = (
+            connection_context(
+                psycopg.connect,
+                connection_url,
+                connect_timeout=5,
+                row_factory=dict_row,
+            )
+            if connection_context is not None
+            else psycopg.connect(
+                connection_url,
+                connect_timeout=5,
+                row_factory=dict_row,
+            )
+        )
+        with connection_scope as connection:
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
                 # Same foreign-table exclusion the profiling path already
