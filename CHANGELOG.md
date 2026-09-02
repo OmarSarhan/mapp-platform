@@ -22,6 +22,10 @@ first release.
 
 ### Added
 
+- Added non-mutating `POST /api/derived-layers/plan` for any create
+  definition. It returns bounded access-path and index evidence plus a
+  replayable fingerprint; synchronous and queued creates reject stale reviewed
+  plans before mutation.
 - Demo ETL publishes fresh PostgreSQL planner statistics with `ANALYZE` after
   loading source tables, including targeted census identity and geometry
   columns, so federated estimates reflect the newly published data.
@@ -86,14 +90,15 @@ first release.
 
 - Derived background work now has a bounded two-job FIFO by default: one job
   executes while a second waits without holding a database connection. Jobs
-  publish durable worker/database/result stages, queued cancellation never
+  publish durable source/plan/database/result stages, queued cancellation never
   touches PostgreSQL, and a database-independent endpoint exposes sanitized
   active operation IDs and queue positions for CLI inspection. Raising the
   admission limit no longer launches competing mutations that immediately
   fail on the database advisory lock. A failed worker-stage write now records
   a terminal preflight failure instead of leaving an orphaned running record,
-  and capacity rejections keep rejection-time counts separate from their fresh
-  queue snapshot.
+  cancellation during source or reviewed-plan revalidation remains a
+  non-mutating preflight cancellation, and capacity rejections keep
+  rejection-time counts separate from their fresh queue snapshot.
 - Repeated demo runs now preserve and skip already curated table and field
   annotations instead of spending Gemini quota to regenerate them. A Gemini
   429 now waits and retries after 5, 15 and 45 seconds; a limit during parallel

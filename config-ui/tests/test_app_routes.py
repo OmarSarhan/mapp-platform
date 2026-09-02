@@ -2317,6 +2317,15 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "reasonCodes": ["nested_loop_pair_work"],
         }, capabilities["queryPlanning"])
         self.assertEqual(
+            "/api/derived-layers/plan",
+            capabilities["definitionPlanning"]["path"],
+        )
+        self.assertEqual(
+            8,
+            capabilities["definitionPlanning"]["accessPathProbe"]
+            ["indexMetadata"]["maxRemoteCatalogLookups"],
+        )
+        self.assertEqual(
             {
                 "method": "postgresql-catalog-and-execution",
                 "ready": False,
@@ -2478,14 +2487,35 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         derived.preflight_definition.return_value = {
             "queryPlanProbe": {"method": "postgresql-explain"},
             "queryPlanningProbe": {"method": "bounded-pairs"},
+            "accessPathProbe": {
+                "sources": [{
+                    "relation": "source_census.areas",
+                    "indexMetadata": {
+                        "status": "unavailable",
+                        "reason": "remote-catalog-required",
+                    },
+                }],
+            },
             "materializationProbe": {"estimatedBytes": 1024},
         }
+
+        def enrich(probes):
+            probes["accessPathProbe"]["sources"][0]["indexMetadata"] = {
+                "status": "available",
+                "source": "remote-catalog",
+                "indexes": [],
+            }
+            return probes
 
         with patch.object(
             app,
             "read_workspace",
             return_value=(b"{}", self.workspace(), "revision"),
-        ), patch.object(app, "DERIVED", derived):
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app,
+            "enrich_derived_plan_probes",
+            side_effect=enrich,
+        ) as enrich_probes:
             handler.do_POST()
 
         status, body = responses[0]
@@ -2505,6 +2535,13 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             {"method": "postgresql-explain"},
             plan["queryPlanProbe"],
         )
+        self.assertEqual(
+            "remote-catalog",
+            plan["accessPathProbe"]["sources"][0]["indexMetadata"][
+                "source"
+            ],
+        )
+        enrich_probes.assert_called_once()
         preflight_request = derived.preflight_definition.call_args.args[0]
         self.assertEqual(
             plan["resolvedSpatialScope"],
@@ -2517,6 +2554,307 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         derived.create.assert_not_called()
         handler._semantic_request.assert_called_once_with(
             "token:test", "/v1/assets/asset-census"
+        )
+
+    def test_generic_definition_plan_reuses_create_scope_and_preflight(self):
+        request = self.definition(spatialScope={
+            "type": "workspace-map-extent",
+            "locale": "city-centre",
+        })
+        handler, responses = self.handler(
+            "/api/derived-layers/plan",
+            request,
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value=self.catalog())
+        probes = {
+            "queryPlanProbe": {"method": "postgresql-explain"},
+            "queryPlanningProbe": {"method": "bounded-pairs"},
+            "accessPathProbe": {
+                "version": "1",
+                "method": "postgresql-explain-access-paths",
+                "maxRelationScans": 64,
+                "maxWarnings": 64,
+                "sources": [],
+                "sourcesTruncated": False,
+                "relationScans": [],
+                "relationScansTruncated": False,
+                "summary": {},
+                "warnings": [],
+                "warningsTruncated": False,
+            },
+        }
+        derived = Mock()
+        derived.preflight_definition.return_value = probes
+
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertFalse(body["mutationApplied"])
+        plan = body["derivedLayerPlan"]
+        self.assertEqual("1", plan["version"])
+        self.assertEqual(
+            {**request, "planFingerprint": plan["planFingerprint"]},
+            plan["createRequest"],
+        )
+        self.assertIn("envelopes", plan["resolvedSpatialScope"])
+        self.assertEqual(probes["accessPathProbe"], plan["accessPathProbe"])
+        self.assertRegex(
+            plan["planFingerprint"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        resolved = derived.preflight_definition.call_args.args[0]
+        self.assertEqual(
+            plan["resolvedSpatialScope"],
+            resolved["spatialScope"],
+        )
+        self.assertEqual(request["query"], resolved["query"])
+        handler._semantic_request.assert_called_once_with(
+            "token:test", "/v1/catalog"
+        )
+        derived.create.assert_not_called()
+
+    def test_generic_definition_plan_rejects_background(self):
+        handler, responses = self.handler(
+            "/api/derived-layers/plan",
+            self.definition(background=True),
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("derived_layer.invalid_request", body["code"])
+        self.assertEqual("plan", body["operation"])
+        self.assertTrue(body["stateUnchanged"])
+        derived.preflight_definition.assert_not_called()
+        derived.create.assert_not_called()
+
+    def test_create_rejects_a_stale_reviewed_plan_before_mutation(self):
+        request = self.definition(
+            planFingerprint="sha256:" + "a" * 64,
+        )
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            request,
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.return_value = {
+            "queryPlanProbe": {"estimatedFinalRows": 12},
+            "queryPlanningProbe": {"maxEstimatedNestedLoopPairRows": 12},
+            "accessPathProbe": {
+                "version": "1",
+                "method": "postgresql-explain-access-paths",
+                "sources": [],
+            },
+        }
+
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", self.workspace(), "revision"),
+        ), patch.object(app, "DERIVED", derived):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("derived_layer.plan_stale", body["code"])
+        self.assertEqual(request["planFingerprint"], body[
+            "expectedPlanFingerprint"
+        ])
+        self.assertRegex(
+            body["actualPlanFingerprint"],
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertFalse(body["mutationApplied"])
+        self.assertTrue(body["stateUnchanged"])
+        derived.create.assert_not_called()
+
+    def test_create_accepts_the_current_reviewed_plan_fingerprint(self):
+        definition = self.definition()
+        probes = {
+            "queryPlanProbe": {"estimatedFinalRows": 12},
+            "queryPlanningProbe": {"maxEstimatedNestedLoopPairRows": 12},
+            "accessPathProbe": {
+                "version": "1",
+                "method": "postgresql-explain-access-paths",
+                "sources": [],
+            },
+        }
+        workspace = self.workspace()
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", workspace, "revision"),
+        ):
+            resolved = app.resolve_derived_spatial_scope(definition)
+        fingerprint = app.derived_layer_plan_fingerprint(resolved, probes)
+        handler, responses = self.handler(
+            "/api/derived-layers",
+            {**definition, "planFingerprint": fingerprint},
+        )
+        handler._authentication["scopes"].append("semantic:inspect")
+        handler._semantic_request = Mock(return_value=self.catalog())
+        derived = Mock()
+        derived.preflight_definition.return_value = probes
+        derived.create.side_effect = lambda payload, _actor: {
+            **payload,
+            "semanticProfile": {
+                "assetId": "asset",
+                "generation": 1,
+                "status": "registering",
+                "revision": None,
+            },
+        }
+
+        with patch.object(
+            app,
+            "read_workspace",
+            return_value=(b"{}", workspace, "revision"),
+        ), patch.object(app, "DERIVED", derived), patch.object(
+            app, "schedule_semantic_outbox"
+        ), patch.object(app, "CONTROL", Mock()):
+            handler.do_POST()
+
+        self.assertEqual(HTTPStatus.CREATED, responses[0][0])
+        submitted = derived.create.call_args.args[0]
+        self.assertNotIn("planFingerprint", submitted)
+        self.assertEqual(resolved["spatialScope"], submitted["spatialScope"])
+
+    def test_federated_index_enrichment_caps_remote_connections(self):
+        probe = {
+            "sources": [
+                {
+                    "relation": f"source_alias{index}.table{index}",
+                    "indexMetadata": {"status": "unavailable"},
+                }
+                for index in range(
+                    app.ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS + 2
+                )
+            ],
+        }
+        federation = Mock()
+
+        def alias_record(alias):
+            index = int(alias.removeprefix("alias"))
+            return {
+                "status": "active",
+                "connectionRef": f"REF{index}",
+                "tlsPolicy": "require",
+                "allowedRelations": [f"remote.table{index}"],
+            }
+
+        federation.get.side_effect = alias_record
+        remote_metadata = Mock(return_value={
+            "status": "available",
+            "source": "remote-catalog",
+            "indexes": [],
+        })
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app,
+            "resolve_federation_connection_url",
+            side_effect=lambda reference: f"postgresql://{reference}",
+        ), patch.object(app, "enforce_tls_policy"), patch.object(
+            app.DerivedLayerStore,
+            "remote_relation_index_metadata",
+            remote_metadata,
+        ):
+            result = app.enrich_federated_access_path_probe(probe)
+
+        self.assertEqual(
+            app.ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS,
+            remote_metadata.call_count,
+        )
+        self.assertTrue(all(
+            source["indexMetadata"]["status"] == "available"
+            for source in result["sources"][
+                :app.ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS
+            ]
+        ))
+        self.assertTrue(all(
+            source["indexMetadata"]["reason"] == "metadata-limit"
+            for source in result["sources"][
+                app.ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS:
+            ]
+        ))
+
+    def test_federated_index_enrichment_stops_at_aggregate_time_budget(self):
+        probe = {
+            "sources": [
+                {
+                    "relation": f"source_alias{index}.table{index}",
+                    "indexMetadata": {"status": "unavailable"},
+                }
+                for index in range(3)
+            ],
+        }
+        federation = Mock()
+
+        def alias_record(alias):
+            index = int(alias.removeprefix("alias"))
+            return {
+                "status": "active",
+                "connectionRef": f"REF{index}",
+                "tlsPolicy": "require",
+                "allowedRelations": [f"remote.table{index}"],
+            }
+
+        federation.get.side_effect = alias_record
+        remote_metadata = Mock(return_value={
+            "status": "available",
+            "source": "remote-catalog",
+            "indexes": [],
+        })
+        resolve_connection = Mock(
+            side_effect=lambda reference: f"postgresql://{reference}"
+        )
+        with patch.object(app, "FEDERATION", federation), patch.object(
+            app,
+            "resolve_federation_connection_url",
+            resolve_connection,
+        ), patch.object(app, "enforce_tls_policy"), patch.object(
+            app.DerivedLayerStore,
+            "remote_relation_index_metadata",
+            remote_metadata,
+        ), patch.object(
+            app.time,
+            "monotonic",
+            side_effect=[100.0, 101.0, 116.0, 117.0],
+        ):
+            result = app.enrich_federated_access_path_probe(probe)
+
+        remote_metadata.assert_called_once_with(
+            "postgresql://REF0",
+            "remote",
+            "table0",
+            timeout_seconds=5,
+        )
+        resolve_connection.assert_called_once_with("REF0")
+        self.assertEqual("available", result["sources"][0]["indexMetadata"][
+            "status"
+        ])
+        self.assertEqual(
+            ["metadata-time-budget", "metadata-time-budget"],
+            [
+                source["indexMetadata"]["reason"]
+                for source in result["sources"][1:]
+            ],
         )
 
     def test_area_weighted_h3_recipe_requires_semantic_inspection_scope(self):
@@ -3316,6 +3654,19 @@ class CatalogDiscoveryTests(unittest.TestCase):
 
 
 class DerivedBackgroundOperationTests(unittest.TestCase):
+    def setUp(self):
+        self.semantic = Mock()
+        self.semantic.request.return_value = {"assets": []}
+        semantic_patcher = patch.object(app, "SEMANTIC", self.semantic)
+        semantic_patcher.start()
+        self.addCleanup(semantic_patcher.stop)
+        profiles_patcher = patch.object(
+            app,
+            "require_semantic_derived_sources",
+        )
+        self.require_profiles = profiles_patcher.start()
+        self.addCleanup(profiles_patcher.stop)
+
     @staticmethod
     def failure_state(
         exc,
@@ -3374,6 +3725,383 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         self.assertEqual("a" * 32, operation["id"])
         run.assert_called_once()
         self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
+
+    def test_worker_handoff_does_not_claim_database_stage_early(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            operation = control.create_operation(
+                "derived-layer.create",
+                "admin",
+                {"name": "safe_places", "action": "create"},
+            )
+            control.update_operation_progress(
+                operation["id"],
+                stage="waiting-for-worker",
+                diagnostics={"queuePosition": 1},
+            )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED_BACKGROUND_ACTIVE_JOBS", 1,
+            ), patch.object(
+                app, "DERIVED_BACKGROUND_EXECUTING_JOB", operation["id"],
+            ), patch.object(
+                app, "DERIVED_BACKGROUND_WAITING_JOBS", [],
+            ):
+                capacity = app.derived_background_capacity()
+
+        self.assertEqual(
+            "source-revalidation",
+            capacity["activeOperations"][0]["stage"],
+        )
+
+    def test_queued_fingerprinted_create_rechecks_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            derived = Mock()
+            derived.preflight_definition.return_value = {
+                "queryPlanProbe": {"estimatedFinalRows": 99},
+                "queryPlanningProbe": {
+                    "maxEstimatedNestedLoopPairRows": 99,
+                },
+                "accessPathProbe": {"sources": []},
+            }
+            spatial_scope = app.workspace_map_extent(
+                DerivedMapExtentRouteTests.workspace(),
+                None,
+            )
+            progress_stages = []
+            update_progress = control.update_operation_progress
+
+            def record_progress(operation_id, *, stage, diagnostics=None):
+                progress_stages.append(stage)
+                return update_progress(
+                    operation_id,
+                    stage=stage,
+                    diagnostics=diagnostics,
+                )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED", derived,
+            ), patch.object(
+                control,
+                "update_operation_progress",
+                side_effect=record_progress,
+            ):
+                operation = app.start_derived_background(
+                    "create",
+                    {
+                        "name": "safe_places",
+                        "kind": "view",
+                        "query": (
+                            "SELECT id, geom_3857 FROM leeds.safe_places"
+                        ),
+                        "sources": ["leeds.safe_places"],
+                        "idColumn": "id",
+                        "geometryColumn": "geom_3857",
+                        "spatialScope": spatial_scope,
+                    },
+                    "admin",
+                    "127.0.0.1",
+                    expected_plan_fingerprint="sha256:" + "a" * 64,
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    control.read_operation(operation["id"])["status"]
+                    == "running"
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+            stored = control.read_operation(operation["id"])
+            self.assertEqual("failed", stored["status"])
+            self.assertEqual(
+                "derived_layer.plan_stale",
+                stored["error"]["code"],
+            )
+            self.assertEqual("preflight", stored["error"]["failurePhase"])
+            self.assertTrue(stored["error"]["stateUnchanged"])
+            self.assertFalse(stored["error"]["mutationApplied"])
+            source_index = progress_stages.index("source-revalidation")
+            plan_index = progress_stages.index("plan-revalidation")
+            self.assertLess(source_index, plan_index)
+            self.assertIn("plan-revalidation", progress_stages)
+            self.assertNotIn("database-transaction", progress_stages)
+            derived.preflight_definition.assert_called_once()
+            derived.create.assert_not_called()
+
+    def test_fingerprinted_worker_publishes_database_stage_after_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control = ControlStore(Path(directory))
+            control.initialize("correct horse battery staple", "instance")
+            probes = {
+                "queryPlanProbe": {"estimatedFinalRows": 99},
+                "queryPlanningProbe": {
+                    "maxEstimatedNestedLoopPairRows": 99,
+                },
+                "accessPathProbe": {"sources": []},
+            }
+            derived = Mock()
+            derived.preflight_definition.return_value = probes
+            derived.create.return_value = {
+                "name": "safe_places",
+                "kind": "view",
+                "sources": ["leeds.safe_places"],
+            }
+            payload = {
+                "name": "safe_places",
+                "kind": "view",
+                "query": "SELECT id, geom_3857 FROM leeds.safe_places",
+                "sources": ["leeds.safe_places"],
+                "idColumn": "id",
+                "geometryColumn": "geom_3857",
+                "spatialScope": app.workspace_map_extent(
+                    DerivedMapExtentRouteTests.workspace(),
+                    None,
+                ),
+            }
+            expected = app.derived_layer_plan_fingerprint(payload, probes)
+            progress_stages = []
+            update_progress = control.update_operation_progress
+
+            def record_progress(operation_id, *, stage, diagnostics=None):
+                progress_stages.append(stage)
+                return update_progress(
+                    operation_id,
+                    stage=stage,
+                    diagnostics=diagnostics,
+                )
+
+            with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED", derived,
+            ), patch.object(
+                control,
+                "update_operation_progress",
+                side_effect=record_progress,
+            ), patch.object(app, "schedule_semantic_outbox"):
+                operation = app.start_derived_background(
+                    "create",
+                    payload,
+                    "admin",
+                    "127.0.0.1",
+                    expected_plan_fingerprint=expected,
+                )
+                deadline = time.monotonic() + 1
+                while (
+                    control.read_operation(operation["id"])["status"]
+                    == "running"
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+            stored = control.read_operation(operation["id"])
+            self.assertEqual("succeeded", stored["status"])
+            source_index = progress_stages.index("source-revalidation")
+            revalidation_index = progress_stages.index("plan-revalidation")
+            database_index = progress_stages.index("database-transaction")
+            self.assertLess(source_index, revalidation_index)
+            self.assertLess(revalidation_index, database_index)
+            derived.preflight_definition.assert_called_once_with(payload)
+            derived.create.assert_called_once()
+
+    def test_queued_create_and_replace_stop_after_semantic_readiness_drift(self):
+        for action in ("create", "replace"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                control = ControlStore(Path(directory))
+                control.initialize("correct horse battery staple", "instance")
+                derived = Mock()
+                self.require_profiles.reset_mock()
+                self.require_profiles.side_effect = app.DerivedLayerError(
+                    "Derived-layer sources need ready semantic profiles: "
+                    "leeds.safe_places. Synchronize each source with "
+                    "`semantic source sync` before creating or replacing a "
+                    "derived layer."
+                )
+                payload = {
+                    "name": "safe_places",
+                    "kind": "view",
+                    "query": (
+                        "SELECT id, geom_3857 FROM leeds.safe_places"
+                    ),
+                    "sources": ["leeds.safe_places"],
+                    "idColumn": "id",
+                    "geometryColumn": "geom_3857",
+                    "spatialScope": app.workspace_map_extent(
+                        DerivedMapExtentRouteTests.workspace(),
+                        None,
+                    ),
+                }
+
+                with patch.object(app, "CONTROL", control), patch.object(
+                    app, "DERIVED", derived,
+                ):
+                    operation = app.start_derived_background(
+                        action,
+                        payload,
+                        "admin",
+                        "127.0.0.1",
+                        **(
+                            {"name": "safe_places"}
+                            if action == "replace" else {}
+                        ),
+                    )
+                    deadline = time.monotonic() + 1
+                    while (
+                        (
+                            control.read_operation(operation["id"])["status"]
+                            == "running"
+                            or app.derived_background_capacity()["activeJobs"]
+                        )
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+
+                stored = control.read_operation(operation["id"])
+                self.assertEqual("failed", stored["status"])
+                self.assertEqual(
+                    "derived_layer.source_profile_required",
+                    stored["error"]["code"],
+                )
+                self.assertEqual("preflight", stored["error"]["failurePhase"])
+                self.assertTrue(stored["error"]["stateUnchanged"])
+                self.assertEqual("source-revalidation", stored["stage"])
+                derived.create.assert_not_called()
+                derived.replace.assert_not_called()
+                self.semantic.request.assert_called_with(
+                    "/v1/catalog",
+                    actor="admin",
+                    scopes=["semantic:inspect"],
+                )
+                self.semantic.reset_mock()
+
+    def test_semantic_revalidation_outage_fails_safely_before_mutation(self):
+        control = Mock()
+        derived = Mock()
+        self.semantic.request.side_effect = app.SemanticClientError(
+            "private semantic outage",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+        with patch.object(app, "CONTROL", control), patch.object(
+            app, "DERIVED", derived,
+        ):
+            app.run_derived_background(
+                "a" * 32,
+                "create",
+                {"name": "safe_places"},
+                "admin",
+                "127.0.0.1",
+            )
+
+        error = control.finish_operation.call_args.kwargs["error"]
+        self.assertEqual(
+            "derived_layer.source_profile_unavailable",
+            error["code"],
+        )
+        self.assertEqual("preflight", error["failurePhase"])
+        self.assertTrue(error["stateUnchanged"])
+        self.assertFalse(error["mutationApplied"])
+        self.assertNotIn("private semantic outage", repr(error))
+        derived.create.assert_not_called()
+
+    def test_source_revalidation_cancellation_stops_before_mutation(self):
+        for action in ("create", "replace"):
+            with self.subTest(action=action):
+                cancellation = app.DerivedLayerCancellation()
+                control = Mock()
+                derived = Mock()
+
+                def cancel_during_catalog(*_args, **_kwargs):
+                    self.assertTrue(cancellation.request())
+                    return {"assets": []}
+
+                self.semantic.request.side_effect = cancel_during_catalog
+                self.require_profiles.reset_mock()
+                with patch.object(app, "CONTROL", control), patch.object(
+                    app, "DERIVED", derived,
+                ):
+                    app.run_derived_background(
+                        "a" * 32,
+                        action,
+                        {"name": "safe_places"},
+                        "admin",
+                        "127.0.0.1",
+                        **(
+                            {"name": "safe_places"}
+                            if action == "replace" else {}
+                        ),
+                        cancellation=cancellation,
+                    )
+
+                error = control.finish_operation.call_args.kwargs["error"]
+                self.assertEqual("cancelled", control.finish_operation.call_args.kwargs["status"])
+                self.assertEqual("preflight", error["failurePhase"])
+                self.assertTrue(error["stateUnchanged"])
+                self.assertNotIn("rolledBack", error)
+                self.require_profiles.assert_not_called()
+                derived.create.assert_not_called()
+                derived.replace.assert_not_called()
+                self.semantic.request.reset_mock(side_effect=True)
+                self.semantic.request.return_value = {"assets": []}
+
+    def test_plan_revalidation_cancellation_stops_before_mutation(self):
+        payload = {"name": "safe_places"}
+        probes = {
+            "queryPlanProbe": {"estimatedFinalRows": 99},
+            "queryPlanningProbe": {
+                "maxEstimatedNestedLoopPairRows": 99,
+            },
+            "accessPathProbe": {"sources": []},
+        }
+        for timing in ("before-probe", "during-probe"):
+            with self.subTest(timing=timing):
+                cancellation = app.DerivedLayerCancellation()
+                control = Mock()
+                derived = Mock()
+                derived.preflight_definition.return_value = probes
+
+                def record_progress(_operation_id, *, stage, diagnostics=None):
+                    if stage == "plan-revalidation" and timing == "before-probe":
+                        self.assertTrue(cancellation.request())
+
+                control.update_operation_progress.side_effect = record_progress
+                if timing == "during-probe":
+                    def cancel_during_probe(_payload):
+                        self.assertTrue(cancellation.request())
+                        return probes
+
+                    derived.preflight_definition.side_effect = cancel_during_probe
+
+                with patch.object(app, "CONTROL", control), patch.object(
+                    app, "DERIVED", derived,
+                ):
+                    app.run_derived_background(
+                        "b" * 32,
+                        "create",
+                        payload,
+                        "admin",
+                        "127.0.0.1",
+                        cancellation=cancellation,
+                        expected_plan_fingerprint="sha256:" + "a" * 64,
+                    )
+
+                stages = [
+                    call.kwargs["stage"]
+                    for call in control.update_operation_progress.call_args_list
+                ]
+                error = control.finish_operation.call_args.kwargs["error"]
+                self.assertEqual("cancelled", control.finish_operation.call_args.kwargs["status"])
+                self.assertEqual("preflight", error["failurePhase"])
+                self.assertTrue(error["stateUnchanged"])
+                self.assertNotIn("rolledBack", error)
+                self.assertIn("plan-revalidation", stages)
+                self.assertNotIn("database-transaction", stages)
+                if timing == "before-probe":
+                    derived.preflight_definition.assert_not_called()
+                else:
+                    derived.preflight_definition.assert_called_once_with(payload)
+                derived.create.assert_not_called()
 
     def test_background_jobs_are_fifo_and_only_one_executes(self):
         first_entered = threading.Event()
@@ -3555,11 +4283,14 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
                     diagnostics=diagnostics,
                 )
 
+            derived = Mock()
             with patch.object(app, "CONTROL", control), patch.object(
+                app, "DERIVED", derived,
+            ), patch.object(
                 control,
                 "update_operation_progress",
                 side_effect=fail_database_stage,
-            ), patch.object(app, "run_derived_background") as run:
+            ):
                 operation = app.start_derived_background(
                     "create",
                     {"name": "safe_places"},
@@ -3580,13 +4311,13 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
             stored = control.read_operation(operation["id"])
             self.assertEqual("failed", stored["status"])
             self.assertEqual(
-                "derived_layer.background_start_failed",
+                "derived_layer.operation_failed",
                 stored["error"]["code"],
             )
             self.assertEqual("preflight", stored["error"]["failurePhase"])
             self.assertTrue(stored["error"]["stateUnchanged"])
             self.assertNotIn("rolledBack", stored["error"])
-            run.assert_not_called()
+            derived.create.assert_not_called()
             self.assertEqual(0, app.derived_background_capacity()["activeJobs"])
 
     def test_create_records_success_only_after_store_returns(self):
@@ -3654,14 +4385,19 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
                 return "57014"
 
         cancellation = app.DerivedLayerCancellation()
-        self.assertTrue(cancellation.request())
         derived = Mock()
-        derived.create.side_effect = app.DerivedLayerDatabaseOperationError(
+        failure = app.DerivedLayerDatabaseOperationError(
             CancelledQuery("query cancelled"),
             failure_phase="database-transaction",
             state_unchanged=True,
             rolled_back=True,
         )
+
+        def create(_payload, _actor, *, cancellation):
+            self.assertTrue(cancellation.request())
+            raise failure
+
+        derived.create.side_effect = create
         control = Mock()
 
         with patch.object(app, "DERIVED", derived), patch.object(
@@ -3682,14 +4418,19 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
 
     def test_cancellation_during_commit_remains_indeterminate(self):
         cancellation = app.DerivedLayerCancellation()
-        self.assertTrue(cancellation.request())
         derived = Mock()
-        derived.create.side_effect = app.DerivedLayerDatabaseOperationError(
+        failure = app.DerivedLayerDatabaseOperationError(
             app.psycopg.OperationalError("commit interrupted"),
             failure_phase="transaction-commit",
             state_unchanged=False,
             indeterminate=True,
         )
+
+        def create(_payload, _actor, *, cancellation):
+            self.assertTrue(cancellation.request())
+            raise failure
+
+        derived.create.side_effect = create
         control = Mock()
 
         with patch.object(app, "DERIVED", derived), patch.object(
@@ -7537,6 +8278,24 @@ class AuthorizationScopeTests(unittest.TestCase):
         )
         self.assertIsNone(
             semantic._authorized(required_scope="semantic:propose")
+        )
+
+    def test_derived_capabilities_are_authenticated_scope_neutral(self):
+        required = app.Handler._required_scope(
+            "/api/derived-layers/capabilities",
+            "GET",
+        )
+
+        self.assertIsNone(required)
+        derive = self.handler(["derive"])
+        self.assertEqual(
+            "token:test",
+            derive._authorized(required_scope=required),
+        )
+        inspect = self.handler(["inspect"])
+        self.assertEqual(
+            "token:test",
+            inspect._authorized(required_scope=required),
         )
 
     def test_capabilities_route_returns_runtime_pagination_contract(self):

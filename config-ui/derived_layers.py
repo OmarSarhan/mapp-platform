@@ -6,6 +6,7 @@ import math
 import re
 import secrets
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -50,6 +51,28 @@ QUERY_PLAN_MAX_PLANNED_WORKERS = 8
 QUERY_PLANNING_VERSION = "1"
 QUERY_PLANNING_METHOD = "postgresql-explain-bounded-generator-pairs"
 QUERY_PLANNING_MAX_NESTED_LOOP_PAIR_ROWS = 100_000_000
+ACCESS_PATH_VERSION = "1"
+ACCESS_PATH_METHOD = "postgresql-explain-access-paths"
+ACCESS_PATH_MAX_RELATION_SCANS = 64
+ACCESS_PATH_MAX_WARNINGS = 64
+ACCESS_PATH_MAX_INDEXES = 32
+ACCESS_PATH_MAX_INDEX_KEYS = 32
+ACCESS_PATH_MAX_EXPRESSION_CHARS = 256
+ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS = 8
+ACCESS_PATH_REMOTE_CATALOG_TIME_BUDGET_SECONDS = 15
+ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS = 5
+ACCESS_PATH_COORDINATOR_CATALOG_TIME_BUDGET_SECONDS = 5
+ACCESS_PATH_INDEX_UNAVAILABLE_REASONS = frozenset({
+    "alias-not-active",
+    "catalog-unavailable",
+    "expanded-relation",
+    "federation-not-configured",
+    "metadata-limit",
+    "metadata-time-budget",
+    "relation-not-found",
+    "relation-not-registered",
+    "remote-catalog-required",
+})
 QUERY_PLANNING_BOUND_PROPAGATING_NODES = frozenset({
     "Aggregate",
     "Gather",
@@ -1415,6 +1438,27 @@ def validate_definition(payload: dict[str, Any]) -> dict[str, Any]:
     return definition
 
 
+def derived_layer_plan_fingerprint(
+    resolved_definition: dict[str, Any],
+    probes: dict[str, Any],
+) -> str:
+    """Fingerprint the normalized definition and exact reviewed probes."""
+    definition = validate_definition(resolved_definition)
+    reviewed = {
+        "version": "1",
+        "resolvedDefinition": definition,
+        "probes": probes,
+    }
+    digest = hashlib.sha256(json.dumps(
+        reviewed,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()).hexdigest()
+    return f"sha256:{digest}"
+
+
 class DerivedLayerStore:
     def __init__(self, connection_string: str, reader_role: str):
         if not connection_string:
@@ -2347,6 +2391,1003 @@ class DerivedLayerStore:
             "reasonCodes": ["nested_loop_pair_work"],
         }
 
+    @staticmethod
+    def definition_planning_capability() -> dict[str, Any]:
+        return {
+            "version": "1",
+            "path": "/api/derived-layers/plan",
+            "mutationApplied": False,
+            "accessPathProbe": {
+                "version": ACCESS_PATH_VERSION,
+                "method": ACCESS_PATH_METHOD,
+                "maxRelationScans": ACCESS_PATH_MAX_RELATION_SCANS,
+                "maxWarnings": ACCESS_PATH_MAX_WARNINGS,
+                "indexMetadata": {
+                    "maxIndexes": ACCESS_PATH_MAX_INDEXES,
+                    "maxKeysPerIndex": ACCESS_PATH_MAX_INDEX_KEYS,
+                    "maxExpressionCharacters": (
+                        ACCESS_PATH_MAX_EXPRESSION_CHARS
+                    ),
+                    "maxRemoteCatalogLookups": (
+                        ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS
+                    ),
+                    "remoteCatalogTimeBudgetSeconds": (
+                        ACCESS_PATH_REMOTE_CATALOG_TIME_BUDGET_SECONDS
+                    ),
+                    "maxRemoteCatalogLookupSeconds": (
+                        ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS
+                    ),
+                    "coordinatorCatalogTimeBudgetSeconds": (
+                        ACCESS_PATH_COORDINATOR_CATALOG_TIME_BUDGET_SECONDS
+                    ),
+                    "unavailableReasons": sorted(
+                        ACCESS_PATH_INDEX_UNAVAILABLE_REASONS
+                    ),
+                },
+                "warningCodes": [
+                    "correlated_subplan_risk",
+                    "cross_federation_join",
+                    "foreign_predicate_not_pushed_down",
+                    "scan_evidence_unavailable",
+                    "transformed_predicate_not_index_backed",
+                    "unbounded_relation_scan",
+                    "unknown_statistics",
+                ],
+            },
+        }
+
+    @staticmethod
+    def unavailable_index_metadata(reason: str) -> dict[str, Any]:
+        if reason not in ACCESS_PATH_INDEX_UNAVAILABLE_REASONS:
+            raise ValueError("Invalid index-metadata unavailable reason.")
+        return {
+            "status": "unavailable",
+            "reason": reason,
+            "maxIndexes": ACCESS_PATH_MAX_INDEXES,
+        }
+
+    @classmethod
+    def _relation_index_metadata(
+        cls,
+        cur,
+        schema_name: str,
+        relation_name: str,
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        """Return a capped index inventory without names or raw predicates."""
+        cur.execute(
+            """
+            SELECT relation.relkind,
+                   relation.reltuples,
+                   GREATEST(statistics.last_analyze,
+                            statistics.last_autoanalyze) AS last_analyze,
+                   index.indexrelid,
+                   access_method.amname AS access_method,
+                   index.indisvalid,
+                   index.indisready,
+                   index.indisunique,
+                   index.indisprimary,
+                   index.indpred IS NOT NULL AS partial,
+                   COALESCE((
+                     SELECT pg_catalog.jsonb_agg(
+                       CASE
+                         WHEN key.attnum > 0 THEN
+                           pg_catalog.jsonb_build_object(
+                             'kind', 'column',
+                             'name', attribute.attname
+                           )
+                         ELSE
+                           pg_catalog.jsonb_build_object(
+                             'kind', 'expression',
+                             'expression', pg_catalog.left(
+                               pg_catalog.pg_get_indexdef(
+                                 index.indexrelid,
+                                 key.ordinality::pg_catalog.int4,
+                                 true
+                               ),
+                               %s
+                             ),
+                             'expressionTruncated', pg_catalog.length(
+                               pg_catalog.pg_get_indexdef(
+                                 index.indexrelid,
+                                 key.ordinality::pg_catalog.int4,
+                                 true
+                               )
+                             ) > %s
+                           )
+                       END
+                       ORDER BY key.ordinality
+                     )
+                     FROM pg_catalog.unnest(index.indkey)
+                       WITH ORDINALITY AS key(attnum, ordinality)
+                     LEFT JOIN pg_catalog.pg_attribute AS attribute
+                       ON attribute.attrelid = index.indrelid
+                      AND attribute.attnum = key.attnum
+                     WHERE key.ordinality <= index.indnkeyatts
+                       AND key.ordinality <= %s
+                   ), '[]'::pg_catalog.jsonb) AS keys,
+                   COALESCE((
+                     SELECT pg_catalog.jsonb_agg(
+                       pg_catalog.jsonb_build_object(
+                         'name', operator_class.opcname,
+                         'supportsKnn', EXISTS (
+                           SELECT 1
+                           FROM pg_catalog.pg_amop AS operator
+                           WHERE operator.amopfamily = operator_class.opcfamily
+                             AND operator.amoppurpose = 'o'
+                         )
+                       )
+                       ORDER BY operator_key.ordinality
+                     )
+                     FROM pg_catalog.unnest(index.indclass)
+                       WITH ORDINALITY AS operator_key(
+                         operator_class_oid, ordinality
+                       )
+                     JOIN pg_catalog.pg_opclass AS operator_class
+                       ON operator_class.oid = operator_key.operator_class_oid
+                     WHERE operator_key.ordinality <= index.indnkeyatts
+                       AND operator_key.ordinality <= %s
+                   ), '[]'::pg_catalog.jsonb) AS operator_classes
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            LEFT JOIN pg_catalog.pg_stat_all_tables AS statistics
+              ON statistics.relid = relation.oid
+            LEFT JOIN pg_catalog.pg_index AS index
+              ON index.indrelid = relation.oid
+            LEFT JOIN pg_catalog.pg_class AS index_relation
+              ON index_relation.oid = index.indexrelid
+            LEFT JOIN pg_catalog.pg_am AS access_method
+              ON access_method.oid = index_relation.relam
+            WHERE namespace.nspname = %s
+              AND relation.relname = %s
+            ORDER BY index.indexrelid NULLS LAST
+            LIMIT %s
+            """,
+            (
+                ACCESS_PATH_MAX_EXPRESSION_CHARS,
+                ACCESS_PATH_MAX_EXPRESSION_CHARS,
+                ACCESS_PATH_MAX_INDEX_KEYS,
+                ACCESS_PATH_MAX_INDEX_KEYS,
+                schema_name,
+                relation_name,
+                ACCESS_PATH_MAX_INDEXES + 1,
+            ),
+        )
+        rows = cur.fetchall()
+        if not isinstance(rows, list) or not rows:
+            return cls.unavailable_index_metadata("relation-not-found")
+
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        if first.get("relkind") in {"v", "f"}:
+            return cls.unavailable_index_metadata("expanded-relation")
+        indexes = []
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or row.get("indexrelid") is None
+                or len(indexes) >= ACCESS_PATH_MAX_INDEXES
+            ):
+                continue
+            method = row.get("access_method")
+            if not isinstance(method, str) or not method:
+                method = "unknown"
+            keys = row.get("keys")
+            keys = keys if isinstance(keys, list) else []
+            sanitized_keys = []
+            for key in keys[:ACCESS_PATH_MAX_INDEX_KEYS]:
+                if not isinstance(key, dict):
+                    continue
+                if key.get("kind") == "column" and isinstance(
+                    key.get("name"), str
+                ):
+                    sanitized_keys.append({
+                        "kind": "column",
+                        "name": key["name"][:63],
+                    })
+                elif key.get("kind") == "expression" and isinstance(
+                    key.get("expression"), str
+                ):
+                    expression = key["expression"]
+                    # Literals in expression indexes can contain operational
+                    # values. Numeric/function expressions are useful for
+                    # planning; quoted or statement-like text is not exposed.
+                    safe_expression = not any(
+                        marker in expression
+                        for marker in (
+                            "'", '"', ";", "--", "/*", "*/",
+                        )
+                    )
+                    expression_key = {
+                        "kind": "expression",
+                        "expressionAvailable": safe_expression,
+                    }
+                    if safe_expression:
+                        expression_key["expression"] = expression[
+                            :ACCESS_PATH_MAX_EXPRESSION_CHARS
+                        ]
+                        expression_key["expressionTruncated"] = (
+                            key.get("expressionTruncated") is True
+                        )
+                    sanitized_keys.append(expression_key)
+            operator_classes = row.get("operator_classes")
+            operator_classes = (
+                operator_classes if isinstance(operator_classes, list) else []
+            )
+            sanitized_operator_classes = []
+            for operator_class in operator_classes[
+                :ACCESS_PATH_MAX_INDEX_KEYS
+            ]:
+                if not isinstance(operator_class, dict):
+                    continue
+                name = operator_class.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                sanitized_operator_classes.append({
+                    "name": name[:63],
+                    "supportsKnn": operator_class.get("supportsKnn") is True,
+                })
+            indexes.append({
+                "method": method[:63],
+                "valid": row.get("indisvalid") is True,
+                "ready": row.get("indisready") is True,
+                "unique": row.get("indisunique") is True,
+                "primary": row.get("indisprimary") is True,
+                "partial": row.get("partial") is True,
+                "keys": sanitized_keys,
+                "operatorClasses": sanitized_operator_classes,
+                "supportsKnn": any(
+                    item["supportsKnn"]
+                    for item in sanitized_operator_classes
+                ),
+            })
+
+        metadata = {
+            "status": "available",
+            "source": source,
+            "maxIndexes": ACCESS_PATH_MAX_INDEXES,
+            "indexes": indexes,
+            "truncated": sum(
+                isinstance(row, dict) and row.get("indexrelid") is not None
+                for row in rows
+            ) > ACCESS_PATH_MAX_INDEXES,
+        }
+        reltuples = first.get("reltuples")
+        if (
+            not isinstance(reltuples, bool)
+            and isinstance(reltuples, (int, float))
+            and math.isfinite(reltuples)
+            and reltuples >= 0
+        ):
+            metadata["relationEstimatedRows"] = math.ceil(reltuples)
+        last_analyze = first.get("last_analyze")
+        if isinstance(last_analyze, (date, datetime)):
+            metadata["lastAnalyze"] = last_analyze.isoformat()
+        return metadata
+
+    @classmethod
+    def remote_relation_index_metadata(
+        cls,
+        connection_string: str,
+        schema_name: str,
+        relation_name: str,
+        *,
+        timeout_seconds: float = (
+            ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS
+        ),
+    ) -> dict[str, Any]:
+        timeout_seconds = max(0.0, min(
+            float(timeout_seconds),
+            ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS,
+        ))
+        if timeout_seconds <= 0:
+            return cls.unavailable_index_metadata("metadata-time-budget")
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            with psycopg.connect(
+                connection_string,
+                connect_timeout=max(1, min(5, math.ceil(timeout_seconds))),
+                row_factory=dict_row,
+            ) as connection, connection.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    return cls.unavailable_index_metadata(
+                        "metadata-time-budget"
+                    )
+                statement_timeout_ms = max(1, min(
+                    5_000,
+                    math.floor(remaining_seconds * 1_000),
+                ))
+                lock_timeout_ms = max(1, min(
+                    2_000,
+                    statement_timeout_ms,
+                ))
+                cur.execute(
+                    "SELECT pg_catalog.set_config("
+                    "'statement_timeout', %s, true)",
+                    (f"{statement_timeout_ms}ms",),
+                )
+                cur.execute(
+                    "SELECT pg_catalog.set_config("
+                    "'lock_timeout', %s, true)",
+                    (f"{lock_timeout_ms}ms",),
+                )
+                return cls._relation_index_metadata(
+                    cur,
+                    schema_name,
+                    relation_name,
+                    source="remote-catalog",
+                )
+        except psycopg.Error:
+            if time.monotonic() >= deadline:
+                return cls.unavailable_index_metadata(
+                    "metadata-time-budget"
+                )
+            return cls.unavailable_index_metadata("catalog-unavailable")
+
+    @classmethod
+    def _source_access_metadata(
+        cls,
+        cur,
+        definition: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        coordinator_catalog_deadline = (
+            time.monotonic()
+            + ACCESS_PATH_COORDINATOR_CATALOG_TIME_BUDGET_SECONDS
+        )
+        sources = definition["sources"][:ACCESS_PATH_MAX_RELATION_SCANS]
+        relation_parts = [_relation(source) for source in sources]
+        cur.execute(
+            """
+            WITH requested(schema_name, relation_name) AS (
+              SELECT requested_schema.schema_name,
+                     requested_relation.relation_name
+              FROM pg_catalog.unnest(%s::pg_catalog.text[])
+                WITH ORDINALITY AS requested_schema(schema_name, ordinal)
+              JOIN pg_catalog.unnest(%s::pg_catalog.text[])
+                WITH ORDINALITY AS requested_relation(relation_name, ordinal)
+                USING (ordinal)
+            )
+            SELECT requested.schema_name,
+                   requested.relation_name,
+                   relation.relkind,
+                   relation.reltuples,
+                   foreign_table.ftserver,
+                   COALESCE(
+                     (
+                       SELECT option_value
+                       FROM pg_catalog.pg_options_to_table(
+                         foreign_table.ftoptions
+                       )
+                       WHERE option_name = 'use_remote_estimate'
+                     ),
+                     (
+                       SELECT option_value
+                       FROM pg_catalog.pg_options_to_table(
+                         foreign_server.srvoptions
+                       )
+                       WHERE option_name = 'use_remote_estimate'
+                     ),
+                     'false'
+                   ) = 'true' AS use_remote_estimate
+            FROM requested
+            LEFT JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = requested.schema_name
+            LEFT JOIN pg_catalog.pg_class AS relation
+              ON relation.relnamespace = namespace.oid
+             AND relation.relname = requested.relation_name
+            LEFT JOIN pg_catalog.pg_foreign_table AS foreign_table
+              ON foreign_table.ftrelid = relation.oid
+            LEFT JOIN pg_catalog.pg_foreign_server AS foreign_server
+              ON foreign_server.oid = foreign_table.ftserver
+            ORDER BY requested.schema_name, requested.relation_name
+            """,
+            (
+                [part[0] for part in relation_parts],
+                [part[1] for part in relation_parts],
+            ),
+        )
+        rows = cur.fetchall()
+        by_relation = {}
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                schema_name = row.get("schema_name")
+                relation_name = row.get("relation_name")
+                if not (
+                    isinstance(schema_name, str)
+                    and isinstance(relation_name, str)
+                ):
+                    continue
+                by_relation[f"{schema_name}.{relation_name}"] = row
+
+        foreign_groups: dict[int, str] = {}
+        result = []
+        relation_kinds = {
+            "r": "table",
+            "p": "partitioned-table",
+            "v": "view",
+            "m": "materialized-view",
+            "f": "foreign-table",
+        }
+        for source in sources:
+            row = by_relation.get(source, {})
+            relkind = row.get("relkind")
+            relation_kind = relation_kinds.get(relkind, "unknown")
+            reltuples = row.get("reltuples")
+            local_statistics_known = (
+                not isinstance(reltuples, bool)
+                and isinstance(reltuples, (int, float))
+                and math.isfinite(reltuples)
+                and reltuples >= 0
+            )
+            statistics_known = local_statistics_known
+            planner_estimate_source = (
+                "local-statistics" if local_statistics_known else "unknown"
+            )
+            if relation_kind == "foreign-table":
+                server = row.get("ftserver")
+                if not isinstance(server, bool) and isinstance(server, int):
+                    if server not in foreign_groups:
+                        foreign_groups[server] = (
+                            f"foreign-{len(foreign_groups) + 1}"
+                        )
+                    execution_group = foreign_groups[server]
+                else:
+                    execution_group = "unknown"
+                if row.get("use_remote_estimate") is True:
+                    # postgres_fdw asks the source to plan the remote scan;
+                    # coordinator reltuples may legitimately remain -1.
+                    statistics_known = True
+                    planner_estimate_source = "remote-explain"
+            elif relation_kind in {"view", "partitioned-table"}:
+                # These are planner-expansion boundaries, not physical local
+                # scan guarantees. A view or partitioned parent can expand to
+                # local, foreign, or mixed children, whose explicit EXPLAIN
+                # identities are handled independently.
+                execution_group = "unknown"
+            elif relation_kind != "unknown":
+                execution_group = "local"
+            else:
+                execution_group = "unknown"
+            item = {
+                "relation": source,
+                "relationKind": relation_kind,
+                "statisticsKnown": statistics_known,
+                "plannerEstimateSource": planner_estimate_source,
+                "executionGroup": execution_group,
+            }
+            if local_statistics_known:
+                item["catalogEstimatedRows"] = math.ceil(reltuples)
+            if relation_kind == "foreign-table":
+                item["indexMetadata"] = {
+                    "status": "unavailable",
+                    "reason": "remote-catalog-required",
+                    "maxIndexes": ACCESS_PATH_MAX_INDEXES,
+                }
+            elif relation_kind != "unknown":
+                schema_name, relation_name = _relation(source)
+                remaining_seconds = (
+                    coordinator_catalog_deadline - time.monotonic()
+                )
+                if remaining_seconds <= 0:
+                    item["indexMetadata"] = cls.unavailable_index_metadata(
+                        "metadata-time-budget"
+                    )
+                    result.append(item)
+                    continue
+                cur.execute("SAVEPOINT derived_index_metadata")
+                try:
+                    statement_timeout_ms = max(
+                        1,
+                        math.floor(remaining_seconds * 1_000),
+                    )
+                    cur.execute(
+                        "SELECT pg_catalog.set_config("
+                        "'statement_timeout', %s, true)",
+                        (f"{statement_timeout_ms}ms",),
+                    )
+                    item["indexMetadata"] = cls._relation_index_metadata(
+                        cur,
+                        schema_name,
+                        relation_name,
+                        source="coordinator-catalog",
+                    )
+                except psycopg.Error as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT derived_index_metadata")
+                    reason = (
+                        "metadata-time-budget"
+                        if (
+                            time.monotonic()
+                            >= coordinator_catalog_deadline
+                            or getattr(exc, "sqlstate", None) == "57014"
+                        )
+                        else "catalog-unavailable"
+                    )
+                    item["indexMetadata"] = cls.unavailable_index_metadata(
+                        reason
+                    )
+                cur.execute("RELEASE SAVEPOINT derived_index_metadata")
+            else:
+                item["indexMetadata"] = cls.unavailable_index_metadata(
+                    "relation-not-found"
+                )
+            result.append(item)
+        return result
+
+    @classmethod
+    def _access_path_probe_result(
+        cls,
+        row: Any,
+        definition: dict[str, Any],
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        plan = row.get("QUERY PLAN") if isinstance(row, dict) else None
+        root = (
+            plan[0].get("Plan")
+            if (
+                isinstance(plan, list)
+                and len(plan) == 1
+                and isinstance(plan[0], dict)
+            )
+            else None
+        )
+        if not isinstance(root, dict):
+            raise DerivedLayerError(
+                "PostgreSQL returned an invalid access-path probe."
+            )
+
+        source_by_relation = {
+            source["relation"]: source for source in sources
+        }
+        source_names: dict[str, list[str]] = {}
+        for relation in source_by_relation:
+            _, relation_name = _relation(relation)
+            source_names.setdefault(relation_name, []).append(relation)
+
+        def declared_relation_for_node(
+            node: dict[str, Any],
+        ) -> str | None:
+            relation_name = node.get("Relation Name")
+            if not isinstance(relation_name, str):
+                return None
+            schema_name = node.get("Schema")
+            if isinstance(schema_name, str):
+                relation = f"{schema_name}.{relation_name}"
+                return relation if relation in source_by_relation else None
+            # Older/partial plan shapes can omit Schema. Only then is a bare
+            # name safe when it identifies exactly one declared relation.
+            # Falling back after an explicit schema mismatch would attribute
+            # an expanded view's base-table scan to the view itself.
+            matching = source_names.get(relation_name, [])
+            return matching[0] if len(matching) == 1 else None
+
+        predicate_fields = (
+            "Filter",
+            "Index Cond",
+            "Recheck Cond",
+            "Join Filter",
+            "Hash Cond",
+            "Merge Cond",
+            "TID Cond",
+        )
+
+        def predicate_texts(node: dict[str, Any]) -> list[str]:
+            return [
+                node[field]
+                for field in predicate_fields
+                if isinstance(node.get(field), str)
+            ]
+
+        def contains_unquoted_keyword(value: str, keyword: str) -> bool:
+            visible = []
+            quote = None
+            index = 0
+            while index < len(value):
+                character = value[index]
+                if quote is not None:
+                    if character == quote:
+                        if (
+                            index + 1 < len(value)
+                            and value[index + 1] == quote
+                        ):
+                            index += 2
+                            continue
+                        quote = None
+                    index += 1
+                    continue
+                if character in {"'", '"'}:
+                    quote = character
+                    visible.append(" ")
+                else:
+                    visible.append(character)
+                index += 1
+            return re.search(
+                rf"\b{re.escape(keyword)}\b",
+                "".join(visible),
+                re.IGNORECASE,
+            ) is not None
+
+        def contains_index_condition(node: dict[str, Any]) -> bool:
+            if isinstance(node.get("Index Cond"), str):
+                return True
+            return any(
+                contains_index_condition(child)
+                for child in node.get("Plans", [])
+                if isinstance(child, dict)
+            )
+
+        nodes = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            children = node.get("Plans", [])
+            if isinstance(children, list):
+                stack.extend(
+                    reversed([
+                        child for child in children
+                        if isinstance(child, dict)
+                    ])
+                )
+
+        transformed_predicate = any(
+            re.search(r"\bst_transform\s*\(", text, re.IGNORECASE)
+            for node in nodes
+            for text in predicate_texts(node)
+        )
+        subplan_count = sum(
+            1
+            for node in nodes
+            if (
+                node.get("Parent Relationship") == "SubPlan"
+                or (
+                    isinstance(node.get("Subplan Name"), str)
+                    and node["Subplan Name"].startswith("SubPlan")
+                )
+            )
+        )
+        cross_execution_group_join = False
+
+        def subtree_execution_groups(node: dict[str, Any]) -> set[str]:
+            nonlocal cross_execution_group_join
+            groups: set[str] = set()
+            relation = declared_relation_for_node(node)
+            if relation is not None:
+                group = source_by_relation[relation]["executionGroup"]
+                if group != "unknown":
+                    groups.add(group)
+            for child in node.get("Plans", []):
+                if isinstance(child, dict):
+                    child_groups = subtree_execution_groups(child)
+                    if child.get("Parent Relationship") not in {
+                        "InitPlan", "SubPlan",
+                    }:
+                        groups.update(child_groups)
+            node_type = node.get("Node Type")
+            join_node = (
+                node_type == "Nested Loop"
+                or (
+                    isinstance(node_type, str)
+                    and "Join" in node_type
+                )
+            )
+            if join_node and len(groups) > 1:
+                cross_execution_group_join = True
+            return groups
+
+        subtree_execution_groups(root)
+
+        relation_scans = []
+        warning_candidates = []
+        warned_unbounded = set()
+        warned_foreign_filter = set()
+        transformed_scan_predicate_seen = False
+        transformed_scan_without_candidate_access = False
+        any_candidate_access = False
+        for node in nodes:
+            relation = declared_relation_for_node(node)
+            if relation not in source_by_relation:
+                continue
+
+            source = source_by_relation[relation]
+            node_type = node.get("Node Type")
+            rows = node.get("Plan Rows")
+            if (
+                not isinstance(node_type, str)
+                or not node_type
+                or isinstance(rows, bool)
+                or not isinstance(rows, int)
+                or rows < 0
+            ):
+                continue
+
+            foreign_scan = node_type == "Foreign Scan"
+            index_condition = isinstance(node.get("Index Cond"), str)
+            recheck_condition = isinstance(node.get("Recheck Cond"), str)
+            tid_condition = isinstance(node.get("TID Cond"), str)
+            local_filter = isinstance(node.get("Filter"), str)
+            index_backed: bool | None
+            if foreign_scan:
+                index_backed = None
+            elif node_type in {
+                "Index Scan", "Index Only Scan", "Bitmap Index Scan",
+            }:
+                # Report the physical access path truthfully. An index scan
+                # without an Index Cond can still traverse the whole index;
+                # candidate_access below separately records whether the plan
+                # exposes a selective bound.
+                index_backed = True
+            elif (
+                node_type == "Bitmap Heap Scan"
+                and (
+                    recheck_condition
+                    or contains_index_condition(node)
+                )
+            ):
+                index_backed = True
+            elif node_type == "Bitmap Heap Scan":
+                index_backed = False
+            elif node_type in {"Seq Scan", "Sample Scan"}:
+                index_backed = False
+            else:
+                index_backed = None
+
+            remote_sql = node.get("Remote SQL")
+            remote_predicate = (
+                isinstance(remote_sql, str)
+                and contains_unquoted_keyword(remote_sql, "WHERE")
+            )
+            if index_condition or recheck_condition:
+                predicate_pushdown = "index-condition"
+            elif tid_condition:
+                predicate_pushdown = "tuple-condition"
+            elif foreign_scan and remote_predicate and local_filter:
+                predicate_pushdown = "remote-with-local-filter"
+            elif foreign_scan and remote_predicate:
+                predicate_pushdown = "remote"
+            elif local_filter:
+                predicate_pushdown = "local-filter"
+            elif foreign_scan:
+                predicate_pushdown = "unknown"
+            else:
+                predicate_pushdown = "none-visible"
+
+            transformed_scan_predicate = any(
+                re.search(r"\bst_transform\s*\(", text, re.IGNORECASE)
+                for text in predicate_texts(node)
+            )
+            transformed_scan_predicate_seen = (
+                transformed_scan_predicate_seen
+                or transformed_scan_predicate
+            )
+            candidate_access = (
+                index_condition
+                or recheck_condition
+                or tid_condition
+                or (
+                    node_type == "Bitmap Heap Scan"
+                    and contains_index_condition(node)
+                )
+                or predicate_pushdown in {
+                    "remote", "remote-with-local-filter",
+                }
+            )
+            any_candidate_access = any_candidate_access or candidate_access
+            if transformed_scan_predicate and not candidate_access:
+                transformed_scan_without_candidate_access = True
+
+            relation_scans.append({
+                "relation": relation,
+                "scanType": node_type[:80],
+                "estimatedRows": rows,
+                "indexBacked": index_backed,
+                "predicatePushdown": predicate_pushdown,
+                "statisticsKnown": source["statisticsKnown"],
+                "executionGroup": source["executionGroup"],
+            })
+            if (
+                (
+                    not candidate_access
+                )
+                and relation not in warned_unbounded
+            ):
+                warned_unbounded.add(relation)
+                if local_filter and not foreign_scan:
+                    unbounded_message = (
+                        f"PostgreSQL selected a full {node_type} for "
+                        f"{relation}; a local filter does not reduce rows "
+                        "read by that scan."
+                    )
+                elif foreign_scan and not remote_predicate:
+                    unbounded_message = (
+                        f"No remote predicate is visible for {relation}; "
+                        "the remote server may read the complete relation, "
+                        "and bounded remote access is not visible."
+                    )
+                else:
+                    unbounded_message = (
+                        f"No scan-level predicate is visible for {relation}; "
+                        "PostgreSQL may read the complete relation."
+                    )
+                warning_candidates.append({
+                    "code": "unbounded_relation_scan",
+                    "message": unbounded_message,
+                    "suggestedAction": (
+                        "Add an independently selective source predicate that "
+                        "can use a native indexed column before joins, "
+                        "transforms, aggregation, or output-scope filtering."
+                    ),
+                    "relation": relation,
+                })
+            if (
+                foreign_scan
+                and local_filter
+                and relation not in warned_foreign_filter
+            ):
+                warned_foreign_filter.add(relation)
+                warning_candidates.append({
+                    "code": "foreign_predicate_not_pushed_down",
+                    "message": (
+                        f"A visible predicate for {relation} is applied "
+                        "locally rather than by the foreign server."
+                    ),
+                    "suggestedAction": (
+                        "Use source-native columns, operators, and constants "
+                        "so the foreign server can restrict rows before "
+                        "transfer."
+                    ),
+                    "relation": relation,
+                })
+
+        warnings = []
+        for source in sources:
+            if not source["statisticsKnown"]:
+                relation_kind = source["relationKind"]
+                if relation_kind == "view":
+                    statistics_action = (
+                        "Inspect the view's base relations and ANALYZE the "
+                        "physical base tables before planning again."
+                    )
+                elif relation_kind == "foreign-table":
+                    statistics_action = (
+                        "Refresh statistics on the source database and use "
+                        "remote planner estimates when the federation "
+                        "supports them, then plan again."
+                    )
+                elif relation_kind in {
+                    "table", "partitioned-table", "materialized-view",
+                }:
+                    statistics_action = (
+                        "Run ANALYZE after loading or replacing the source, "
+                        "then plan the same definition again."
+                    )
+                else:
+                    statistics_action = (
+                        "Verify the registered relation and its statistics, "
+                        "then plan the same definition again."
+                    )
+                warnings.append({
+                    "code": "unknown_statistics",
+                    "message": (
+                        "PostgreSQL has no usable row statistics for "
+                        f"{source['relation']}."
+                    ),
+                    "suggestedAction": statistics_action,
+                    "relation": source["relation"],
+                })
+        matched_relations = {
+            scan["relation"] for scan in relation_scans
+        }
+        for source in sources:
+            if source["relation"] not in matched_relations:
+                warnings.append({
+                    "code": "scan_evidence_unavailable",
+                    "message": (
+                        "No EXPLAIN scan node could be reliably attributed "
+                        f"to {source['relation']}."
+                    ),
+                    "suggestedAction": (
+                        "Treat its access path as unknown; views and "
+                        "partitioned parents may appear under base or child "
+                        "relation names in EXPLAIN."
+                    ),
+                    "relation": source["relation"],
+                })
+        warnings.extend(warning_candidates)
+        transformed_without_candidate_access = (
+            transformed_scan_without_candidate_access
+            or (
+                transformed_predicate
+                and not transformed_scan_predicate_seen
+                and not any_candidate_access
+            )
+        )
+        if transformed_without_candidate_access:
+            warnings.append({
+                "code": "transformed_predicate_not_index_backed",
+                "message": (
+                    "No index-backed or remote candidate restriction is "
+                    "visible before the plan's transformed work."
+                ),
+                "suggestedAction": (
+                    "Filter candidates with an indexed native geometry first, "
+                    "then transform the reduced set once for exact metric work."
+                ),
+            })
+        known_groups = {
+            source["executionGroup"]
+            for source in sources
+            if source["executionGroup"] != "unknown"
+        }
+        if cross_execution_group_join:
+            warnings.append({
+                "code": "cross_federation_join",
+                "message": (
+                    "Joined sources span multiple database execution groups, "
+                    "so PostgreSQL cannot push the complete join to one source."
+                ),
+                "suggestedAction": (
+                    "Bound each source independently on its own server before "
+                    "joining the reduced candidate sets."
+                ),
+            })
+        if subplan_count:
+            warnings.append({
+                "code": "correlated_subplan_risk",
+                "message": (
+                    "EXPLAIN contains a SubPlan; without executing the query, "
+                    "the server cannot prove that it will not repeat for each "
+                    "outer row."
+                ),
+                "suggestedAction": (
+                    "Prefer one bounded join or precomputed lookup over a "
+                    "row-correlated source lookup."
+                ),
+            })
+
+        all_relation_scans = relation_scans
+        all_warnings = warnings
+        relation_scans = all_relation_scans[:ACCESS_PATH_MAX_RELATION_SCANS]
+        warnings = all_warnings[:ACCESS_PATH_MAX_WARNINGS]
+        return {
+            "version": ACCESS_PATH_VERSION,
+            "method": ACCESS_PATH_METHOD,
+            "maxRelationScans": ACCESS_PATH_MAX_RELATION_SCANS,
+            "maxWarnings": ACCESS_PATH_MAX_WARNINGS,
+            "sources": sources,
+            "sourcesTruncated": (
+                len(definition["sources"]) > ACCESS_PATH_MAX_RELATION_SCANS
+            ),
+            "relationScans": relation_scans,
+            "relationScansTruncated": (
+                len(all_relation_scans) > ACCESS_PATH_MAX_RELATION_SCANS
+            ),
+            "summary": {
+                "relationScanCount": len(all_relation_scans),
+                "indexBackedScanCount": sum(
+                    scan["indexBacked"] is True
+                    for scan in all_relation_scans
+                ),
+                "sequentialScanCount": sum(
+                    scan["scanType"] == "Seq Scan"
+                    for scan in all_relation_scans
+                ),
+                "foreignScanCount": sum(
+                    scan["scanType"] == "Foreign Scan"
+                    for scan in all_relation_scans
+                ),
+                "subPlanCount": subplan_count,
+                "executionGroupCount": len(known_groups),
+                "transformedPredicate": transformed_predicate,
+            },
+            "warnings": warnings,
+            "warningsTruncated": len(all_warnings) > ACCESS_PATH_MAX_WARNINGS,
+        }
+
     @classmethod
     def _query_plan_probe_result(
         cls,
@@ -2785,13 +3826,20 @@ class DerivedLayerStore:
         self,
         cur,
         definition: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any] | None,
+    ]:
         h3_expansion = _query_shape_guard(definition)
         inspection = validate_query_ast(definition["query"])
         cur.execute("SET LOCAL statement_timeout = '5s'")
         self._catalog_query_probe(cur, definition, inspection)
+        source_access = self._source_access_metadata(cur, definition)
+        cur.execute("SET LOCAL statement_timeout = '5s'")
         cur.execute(
-            sql.SQL("EXPLAIN (FORMAT JSON) {}").format(
+            sql.SQL("EXPLAIN (VERBOSE, FORMAT JSON) {}").format(
                 self._executable_query(definition)
             )
         )
@@ -2810,7 +3858,17 @@ class DerivedLayerStore:
             self._materialization_probe_result(definition["name"], row)
             if definition["kind"] == "materialized" else None
         )
-        return query_plan_probe, query_planning_probe, materialization_probe
+        access_path_probe = self._access_path_probe_result(
+            row,
+            definition,
+            source_access,
+        )
+        return (
+            query_plan_probe,
+            query_planning_probe,
+            access_path_probe,
+            materialization_probe,
+        )
 
     @staticmethod
     def _validate_catalog_dependencies(
@@ -2885,6 +3943,7 @@ class DerivedLayerStore:
             (
                 query_plan_probe,
                 query_planning_probe,
+                access_path_probe,
                 materialization_probe,
             ) = self._query_probe(
                 cur, definition,
@@ -2892,6 +3951,7 @@ class DerivedLayerStore:
             result = {
                 "queryPlanProbe": query_plan_probe,
                 "queryPlanningProbe": query_planning_probe,
+                "accessPathProbe": access_path_probe,
             }
             if materialization_probe is not None:
                 result["materializationProbe"] = materialization_probe
@@ -2910,6 +3970,7 @@ class DerivedLayerStore:
             (
                 query_plan_probe,
                 query_planning_probe,
+                access_path_probe,
                 materialization_probe,
             ) = self._query_probe(
                 cur, definition,
@@ -2917,6 +3978,7 @@ class DerivedLayerStore:
             return {
                 "queryPlanProbe": query_plan_probe,
                 "queryPlanningProbe": query_planning_probe,
+                "accessPathProbe": access_path_probe,
                 "materializationProbe": materialization_probe,
             }
 
@@ -3080,6 +4142,7 @@ class DerivedLayerStore:
             (
                 query_plan_probe,
                 query_planning_probe,
+                access_path_probe,
                 materialization_probe,
             ) = self._query_probe(
                 cur, definition,
@@ -3163,6 +4226,7 @@ class DerivedLayerStore:
             item.update(output)
             item["queryPlanProbe"] = query_plan_probe
             item["queryPlanningProbe"] = query_planning_probe
+            item["accessPathProbe"] = access_path_probe
             if materialization_probe is not None:
                 item["materializationProbe"] = materialization_probe
             self._enqueue_semantic_event(
@@ -3213,6 +4277,7 @@ class DerivedLayerStore:
             (
                 query_plan_probe,
                 query_planning_probe,
+                access_path_probe,
                 materialization_probe,
             ) = self._query_probe(
                 cur, definition,
@@ -3257,6 +4322,7 @@ class DerivedLayerStore:
             item = self.get_in_transaction(cur, name)
             item["queryPlanProbe"] = query_plan_probe
             item["queryPlanningProbe"] = query_planning_probe
+            item["accessPathProbe"] = access_path_probe
             item["materializationProbe"] = materialization_probe
             self._enqueue_semantic_event(
                 cur,
@@ -3290,6 +4356,7 @@ class DerivedLayerStore:
             (
                 query_plan_probe,
                 query_planning_probe,
+                access_path_probe,
                 materialization_probe,
             ) = self._query_probe(
                 cur, definition,
@@ -3446,6 +4513,7 @@ class DerivedLayerStore:
             item.update(output)
             item["queryPlanProbe"] = query_plan_probe
             item["queryPlanningProbe"] = query_planning_probe
+            item["accessPathProbe"] = access_path_probe
             if materialization_probe is not None:
                 item["materializationProbe"] = materialization_probe
             item["replacedKind"] = current["kind"]
@@ -4502,6 +5570,7 @@ class DerivedLayerStore:
                     },
                 },
                 "queryPlanning": self.query_planning_capability(),
+                "definitionPlanning": self.definition_planning_capability(),
                 "recipes": {
                     "areaWeightedH3": area_weighted_h3_recipe_capability(
                         available=h3_readiness["ready"],

@@ -328,6 +328,32 @@ class ControlApiTests(unittest.TestCase):
             "/api/derived-layers/map-extent",
             actions["derived-layers.map-extent"]["path"],
         )
+        generic_plan = actions["derived-layers.plan"]
+        self.assertEqual(
+            "/api/derived-layers/plan",
+            generic_plan["path"],
+        )
+        self.assertEqual(
+            ["derive", "semantic:inspect"],
+            generic_plan["requiredScopes"],
+        )
+        self.assertNotIn(
+            "background",
+            generic_plan["inputSchema"]["properties"],
+        )
+        self.assertNotIn(
+            "planFingerprint",
+            generic_plan["inputSchema"]["properties"],
+        )
+        self.assertEqual(
+            "^sha256:[0-9a-f]{64}$",
+            actions["derived-layers.create"]["inputSchema"]["properties"]
+            ["planFingerprint"]["pattern"],
+        )
+        self.assertIn(
+            "derivedLayerPlan.accessPathProbe",
+            generic_plan["presentation"]["technicalFields"],
+        )
         spatial_scope = actions["derived-layers.create"]["inputSchema"][
             "properties"
         ]["spatialScope"]
@@ -479,6 +505,10 @@ class ControlApiTests(unittest.TestCase):
         self.assertIn("layers statistics", contract("instance")["commands"])
         self.assertIn(
             "derived-layers plan-area-weighted-h3",
+            contract("instance")["commands"],
+        )
+        self.assertIn(
+            "derived-layers plan",
             contract("instance")["commands"],
         )
         self.assertIn(

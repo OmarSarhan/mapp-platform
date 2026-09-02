@@ -1058,6 +1058,10 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "geometryColumn": {"type": "string"},
                 "description": {"type": "string"},
                 "background": {"type": "boolean"},
+                "planFingerprint": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                },
                 "spatialScope": {
                     "type": "object",
                     "default": {"type": "workspace-map-extent"},
@@ -1753,6 +1757,39 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Generic planning accepts the same closed definition contract as creation.
+# Keep a copied schema so contract clients can replay createRequest unchanged
+# without a second, subtly different SQL-definition grammar.
+ACTION_SCHEMAS["derived-layers.plan"] = {
+    "method": "POST",
+    "path": "/api/derived-layers/plan",
+    "risk": "database-plan",
+    "scope": "derive",
+    "requiredScopes": ["derive", "semantic:inspect"],
+    "presentation": {
+        **DERIVED_ERROR_PRESENTATION,
+        "messageField": "userMessage",
+        "nextActionField": "suggestedAction",
+        "technicalFields": [
+            "derivedLayerPlan.queryPlanProbe",
+            "derivedLayerPlan.queryPlanningProbe",
+            "derivedLayerPlan.materializationProbe",
+            "derivedLayerPlan.accessPathProbe",
+            "derivedLayerPlan.planFingerprint",
+            "technicalDetail",
+        ],
+    },
+    "inputSchema": copy.deepcopy(
+        ACTION_SCHEMAS["derived-layers.create"]["inputSchema"]
+    ),
+}
+ACTION_SCHEMAS["derived-layers.plan"]["inputSchema"]["properties"].pop(
+    "background"
+)
+ACTION_SCHEMAS["derived-layers.plan"]["inputSchema"]["properties"].pop(
+    "planFingerprint"
+)
+
 
 def contract(instance_id: str) -> dict[str, Any]:
     return {
@@ -1788,7 +1825,8 @@ def contract(instance_id: str) -> dict[str, Any]:
             "catalog list", "icons list",
             "derived-layers capabilities", "derived-layers jobs",
             "derived-layers list",
-            "derived-layers show", "derived-layers create",
+            "derived-layers show", "derived-layers plan",
+            "derived-layers create",
             "derived-layers plan-area-weighted-h3",
             "derived-layers map-extent",
             "derived-layers refresh", "derived-layers replace",

@@ -32,6 +32,7 @@ from derived_layers import (
     DerivedLayerQueryTooExpensive,
     DerivedLayerResetOwnershipError,
     DerivedLayerStore,
+    derived_layer_plan_fingerprint,
     plan_area_weighted_h3_recipe,
     validate_definition,
 )
@@ -1015,6 +1016,969 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             probe["limits"]["maxTotalCost"],
         )
 
+    def test_access_path_probe_reports_only_bounded_safe_evidence(self):
+        definition = validate_definition(self.valid(
+            query=(
+                "SELECT stops.stop_id, stops.stop_geom AS geom_3857 "
+                "FROM ops.stops AS stops JOIN census.areas AS areas "
+                "ON ST_Intersects(stops.stop_geom, areas.area_geom)"
+            ),
+            sources=["ops.stops", "census.areas"],
+        ))
+        sources = [
+            {
+                "relation": "census.areas",
+                "relationKind": "foreign-table",
+                "statisticsKnown": True,
+                "plannerEstimateSource": "remote-explain",
+                "executionGroup": "foreign-1",
+            },
+            {
+                "relation": "ops.stops",
+                "relationKind": "foreign-table",
+                "statisticsKnown": True,
+                "plannerEstimateSource": "remote-explain",
+                "executionGroup": "foreign-2",
+            },
+        ]
+        subplan = self.plan_node(
+            "Result",
+            1,
+            **{
+                "Parent Relationship": "SubPlan",
+                "Subplan Name": "SubPlan 1",
+            },
+        )
+        areas = self.plan_node(
+            "Foreign Scan",
+            178_605,
+            plans=[subplan],
+            **{
+                "Schema": "census",
+                "Relation Name": "areas",
+                "Filter": "st_transform(area_geom, 3857) IS NOT NULL",
+            },
+        )
+        stops = self.plan_node(
+            "Foreign Scan",
+            4_233,
+            **{
+                "Schema": "ops",
+                "Relation Name": "stops",
+                "Remote SQL": "SELECT stop_id FROM stops WHERE active",
+            },
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Hash Join",
+                10_000,
+                plans=[areas, stops],
+                **{
+                    "Join Filter": (
+                        "st_intersects(st_transform(area_geom, 3857), "
+                        "stop_geom)"
+                    ),
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual("1", probe["version"])
+        self.assertEqual(2, probe["summary"]["relationScanCount"])
+        self.assertEqual(2, probe["summary"]["foreignScanCount"])
+        self.assertEqual(1, probe["summary"]["subPlanCount"])
+        self.assertEqual(2, probe["summary"]["executionGroupCount"])
+        self.assertTrue(probe["summary"]["transformedPredicate"])
+        self.assertIsNone(probe["relationScans"][0]["indexBacked"])
+        self.assertEqual(
+            "local-filter",
+            probe["relationScans"][0]["predicatePushdown"],
+        )
+        self.assertEqual(
+            "remote",
+            probe["relationScans"][1]["predicatePushdown"],
+        )
+        warning_codes = {item["code"] for item in probe["warnings"]}
+        self.assertEqual({
+            "correlated_subplan_risk",
+            "cross_federation_join",
+            "foreign_predicate_not_pushed_down",
+            "transformed_predicate_not_index_backed",
+            "unbounded_relation_scan",
+        }, warning_codes)
+        self.assertNotIn("Remote SQL", repr(probe))
+        self.assertNotIn("SELECT stop_id", repr(probe))
+
+    def test_foreign_remote_estimate_does_not_claim_missing_statistics(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{
+            "schema_name": "census",
+            "relation_name": "areas",
+            "relkind": "f",
+            "reltuples": -1.0,
+            "ftserver": 42,
+            "use_remote_estimate": True,
+        }]
+        definition = validate_definition(self.valid(
+            sources=["census.areas"],
+        ))
+
+        sources = DerivedLayerStore._source_access_metadata(
+            cursor,
+            definition,
+        )
+
+        self.assertEqual("remote-explain", sources[0]["plannerEstimateSource"])
+        self.assertTrue(sources[0]["statisticsKnown"])
+        self.assertNotIn("catalogEstimatedRows", sources[0])
+        probe = DerivedLayerStore._access_path_probe_result(
+            {
+                "QUERY PLAN": [{"Plan": self.plan_node(
+                    "Foreign Scan",
+                    178_605,
+                    **{
+                        "Schema": "census",
+                        "Relation Name": "areas",
+                    },
+                )}],
+            },
+            definition,
+            sources,
+        )
+        self.assertNotIn(
+            "unknown_statistics",
+            {warning["code"] for warning in probe["warnings"]},
+        )
+
+    def test_expandable_relations_do_not_claim_local_execution(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            {
+                "schema_name": "ops",
+                "relation_name": relation,
+                "relkind": relkind,
+                "reltuples": -1.0,
+                "ftserver": None,
+                "use_remote_estimate": False,
+            }
+            for relation, relkind in (
+                ("stop_view", "v"),
+                ("area_parent", "p"),
+            )
+        ]
+        definition = validate_definition(self.valid(
+            sources=["ops.stop_view", "ops.area_parent"],
+        ))
+
+        sources = DerivedLayerStore._source_access_metadata(
+            cursor,
+            definition,
+        )
+
+        self.assertEqual(
+            ["unknown", "unknown"],
+            [source["executionGroup"] for source in sources],
+        )
+
+    def test_coordinator_index_inventory_stops_at_aggregate_time_budget(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            {
+                "schema_name": "ops",
+                "relation_name": relation,
+                "relkind": "r",
+                "reltuples": 100.0,
+                "ftserver": None,
+                "use_remote_estimate": False,
+            }
+            for relation in ("areas", "stops")
+        ]
+        definition = validate_definition(self.valid(
+            sources=["ops.areas", "ops.stops"],
+        ))
+
+        with patch(
+            "derived_layers.time.monotonic",
+            side_effect=[100.0, 101.0, 106.0],
+        ), patch.object(
+            DerivedLayerStore,
+            "_relation_index_metadata",
+            return_value={"status": "available", "indexes": []},
+        ) as relation_metadata:
+            sources = DerivedLayerStore._source_access_metadata(
+                cursor,
+                definition,
+            )
+
+        relation_metadata.assert_called_once_with(
+            cursor,
+            "ops",
+            "areas",
+            source="coordinator-catalog",
+        )
+        set_timeout = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "set_config" in str(call.args[0])
+        )
+        self.assertEqual(("4000ms",), set_timeout.args[1])
+        self.assertEqual("available", sources[0]["indexMetadata"]["status"])
+        self.assertEqual(
+            "metadata-time-budget",
+            sources[1]["indexMetadata"]["reason"],
+        )
+
+    def test_query_probe_restores_five_second_explain_timeout(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"QUERY PLAN": [{"Plan": {}}]}
+        store = self.store_with_cursor(cursor)
+        store._catalog_query_probe = MagicMock()
+        store._source_access_metadata = MagicMock(return_value=[])
+        store._query_plan_probe_result = MagicMock(return_value={})
+        store._query_planning_probe_result = MagicMock(return_value={})
+        store._access_path_probe_result = MagicMock(return_value={})
+        definition = validate_definition(self.valid(
+            spatialScope=self.spatial_scope(),
+        ))
+
+        store._query_probe(cursor, definition)
+
+        statements = [
+            str(call.args[0]) for call in cursor.execute.call_args_list
+        ]
+        explain_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if "EXPLAIN (VERBOSE, FORMAT JSON)" in statement
+        )
+        self.assertEqual(
+            "SET LOCAL statement_timeout = '5s'",
+            statements[explain_index - 1],
+        )
+
+    def test_foreign_scan_reports_remote_and_local_predicates_separately(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "foreign-table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "remote-explain",
+            "executionGroup": "foreign-1",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Foreign Scan",
+                42,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "Remote SQL": (
+                        "SELECT stop_id FROM stops WHERE active"
+                    ),
+                    "Filter": "st_transform(stop_geom, 3857) IS NOT NULL",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual(
+            "remote-with-local-filter",
+            probe["relationScans"][0]["predicatePushdown"],
+        )
+        warning_codes = {item["code"] for item in probe["warnings"]}
+        self.assertIn("foreign_predicate_not_pushed_down", warning_codes)
+        self.assertNotIn("unbounded_relation_scan", warning_codes)
+        self.assertNotIn("Remote SQL", repr(probe))
+
+    def test_unqualified_foreign_scan_warns_that_it_may_be_unbounded(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "foreign-table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "remote-explain",
+            "executionGroup": "foreign-1",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Foreign Scan",
+                4_233,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "Remote SQL": 'SELECT "where" FROM stops',
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual(
+            "unknown",
+            probe["relationScans"][0]["predicatePushdown"],
+        )
+        self.assertIn("unbounded_relation_scan", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_local_filter_on_sequential_scan_still_warns_full_scan(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "local-statistics",
+            "executionGroup": "local",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Seq Scan",
+                100,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "Filter": "active",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual(
+            "local-filter",
+            probe["relationScans"][0]["predicatePushdown"],
+        )
+        warning = next(
+            item
+            for item in probe["warnings"]
+            if item["code"] == "unbounded_relation_scan"
+        )
+        self.assertIn("full Seq Scan", warning["message"])
+
+    def test_unconstrained_index_scan_filter_is_not_candidate_bounding(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "local-statistics",
+            "executionGroup": "local",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Index Scan",
+                100,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "Filter": "active",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        scan = probe["relationScans"][0]
+        self.assertTrue(scan["indexBacked"])
+        self.assertEqual("local-filter", scan["predicatePushdown"])
+        self.assertIn("unbounded_relation_scan", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_tid_scan_is_reported_as_tuple_bounded(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "local-statistics",
+            "executionGroup": "local",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Tid Scan",
+                1,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "TID Cond": "ctid = '(0,1)'::tid",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        scan = probe["relationScans"][0]
+        self.assertIsNone(scan["indexBacked"])
+        self.assertEqual("tuple-condition", scan["predicatePushdown"])
+        self.assertNotIn("unbounded_relation_scan", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_foreign_local_filter_warns_transfer_and_residual_filter(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops"],
+        ))
+        sources = [{
+            "relation": "ops.stops",
+            "relationKind": "foreign-table",
+            "statisticsKnown": True,
+            "plannerEstimateSource": "remote-explain",
+            "executionGroup": "foreign-1",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Foreign Scan",
+                100,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": "stops",
+                    "Filter": "active",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        warning_codes = {item["code"] for item in probe["warnings"]}
+        self.assertIn("unbounded_relation_scan", warning_codes)
+        self.assertIn("foreign_predicate_not_pushed_down", warning_codes)
+
+    def test_union_branch_from_another_group_is_not_a_cross_group_join(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops", "ops.routes", "census.areas"],
+        ))
+        sources = [
+            {
+                "relation": relation,
+                "relationKind": "foreign-table",
+                "statisticsKnown": True,
+                "plannerEstimateSource": "remote-explain",
+                "executionGroup": group,
+            }
+            for relation, group in (
+                ("ops.stops", "foreign-1"),
+                ("ops.routes", "foreign-1"),
+                ("census.areas", "foreign-2"),
+            )
+        ]
+
+        def scan(schema, relation):
+            return self.plan_node(
+                "Foreign Scan",
+                10,
+                **{
+                    "Schema": schema,
+                    "Relation Name": relation,
+                    "Remote SQL": (
+                        f"SELECT id FROM {relation} WHERE active"
+                    ),
+                },
+            )
+
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Append",
+                30,
+                plans=[
+                    self.plan_node(
+                        "Hash Join",
+                        20,
+                        plans=[scan("ops", "stops"), scan("ops", "routes")],
+                    ),
+                    scan("census", "areas"),
+                ],
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual(2, probe["summary"]["executionGroupCount"])
+        self.assertNotIn("cross_federation_join", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_initplan_group_does_not_taint_enclosing_local_join(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops", "ops.routes", "census.lookup"],
+        ))
+        sources = [
+            {
+                "relation": relation,
+                "relationKind": (
+                    "foreign-table" if group.startswith("foreign-")
+                    else "table"
+                ),
+                "statisticsKnown": True,
+                "plannerEstimateSource": (
+                    "remote-explain" if group.startswith("foreign-")
+                    else "local-statistics"
+                ),
+                "executionGroup": group,
+            }
+            for relation, group in (
+                ("ops.stops", "local"),
+                ("ops.routes", "local"),
+                ("census.lookup", "foreign-1"),
+            )
+        ]
+        local_scans = [
+            self.plan_node(
+                "Index Scan",
+                10,
+                **{
+                    "Schema": "ops",
+                    "Relation Name": relation,
+                    "Index Cond": "id > 0",
+                },
+            )
+            for relation in ("stops", "routes")
+        ]
+        initplan = self.plan_node(
+            "Foreign Scan",
+            1,
+            **{
+                "Schema": "census",
+                "Relation Name": "lookup",
+                "Parent Relationship": "InitPlan",
+                "Remote SQL": "SELECT id FROM lookup WHERE id = 1",
+            },
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Hash Join",
+                10,
+                plans=[*local_scans, initplan],
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertNotIn("cross_federation_join", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_exact_transform_after_indexed_candidate_scan_does_not_warn(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stops", "ops.areas", "ops.labels"],
+        ))
+        sources = [
+            {
+                "relation": relation,
+                "relationKind": "table",
+                "statisticsKnown": True,
+                "plannerEstimateSource": "coordinator-catalog",
+                "executionGroup": "coordinator",
+            }
+            for relation in ("ops.stops", "ops.areas", "ops.labels")
+        ]
+        stops = self.plan_node(
+            "Index Scan",
+            100,
+            **{
+                "Schema": "ops",
+                "Relation Name": "stops",
+                "Index Cond": "stop_geom && st_makeenvelope(0, 0, 1, 1)",
+            },
+        )
+        areas = self.plan_node(
+            "Bitmap Heap Scan",
+            50,
+            plans=[self.plan_node(
+                "Bitmap Index Scan",
+                50,
+                **{
+                    "Index Cond": (
+                        "area_geom && st_makeenvelope(0, 0, 1, 1)"
+                    ),
+                },
+            )],
+            **{
+                "Schema": "ops",
+                "Relation Name": "areas",
+                "Recheck Cond": (
+                    "area_geom && st_makeenvelope(0, 0, 1, 1)"
+                ),
+            },
+        )
+        labels = self.plan_node(
+            "Seq Scan",
+            500,
+            **{
+                "Schema": "ops",
+                "Relation Name": "labels",
+                "Filter": "active",
+            },
+        )
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Nested Loop",
+                20,
+                plans=[stops, areas, labels],
+                **{
+                    "Join Filter": (
+                        "st_intersects(st_transform(stop_geom, 3857), "
+                        "st_transform(area_geom, 3857))"
+                    ),
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertTrue(probe["summary"]["transformedPredicate"])
+        self.assertNotIn("transformed_predicate_not_index_backed", {
+            item["code"] for item in probe["warnings"]
+        })
+
+    def test_unmatched_view_and_partition_scans_report_unknown_evidence(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stop_view", "ops.area_parent"],
+        ))
+        sources = [
+            {
+                "relation": "ops.stop_view",
+                "relationKind": "view",
+                "statisticsKnown": False,
+                "plannerEstimateSource": "unknown",
+                "executionGroup": "unknown",
+            },
+            {
+                "relation": "ops.area_parent",
+                "relationKind": "partitioned-table",
+                "statisticsKnown": True,
+                "plannerEstimateSource": "local-statistics",
+                "executionGroup": "unknown",
+            },
+        ]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Append",
+                20,
+                plans=[
+                    self.plan_node(
+                        "Seq Scan",
+                        10,
+                        **{
+                            "Schema": "ops",
+                            "Relation Name": "stop_base",
+                        },
+                    ),
+                    self.plan_node(
+                        "Seq Scan",
+                        10,
+                        **{
+                            "Schema": "ops",
+                            "Relation Name": "area_parent_2026",
+                        },
+                    ),
+                ],
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual(0, probe["summary"]["relationScanCount"])
+        unavailable = [
+            warning
+            for warning in probe["warnings"]
+            if warning["code"] == "scan_evidence_unavailable"
+        ]
+        self.assertEqual(
+            {"ops.stop_view", "ops.area_parent"},
+            {warning["relation"] for warning in unavailable},
+        )
+        statistics_warning = next(
+            warning
+            for warning in probe["warnings"]
+            if warning["code"] == "unknown_statistics"
+        )
+        self.assertIn("view's base relations", statistics_warning[
+            "suggestedAction"
+        ])
+        self.assertNotIn(
+            "Run ANALYZE after loading",
+            statistics_warning["suggestedAction"],
+        )
+
+    def test_expanded_same_named_base_scan_is_not_attributed_to_view(self):
+        definition = validate_definition(self.valid(
+            sources=["ops.stop_view"],
+        ))
+        sources = [{
+            "relation": "ops.stop_view",
+            "relationKind": "view",
+            "statisticsKnown": False,
+            "plannerEstimateSource": "unknown",
+            "executionGroup": "unknown",
+        }]
+        row = {
+            "QUERY PLAN": [{"Plan": self.plan_node(
+                "Seq Scan",
+                100,
+                **{
+                    "Schema": "base",
+                    "Relation Name": "stop_view",
+                    "Filter": "active",
+                },
+            )}],
+        }
+
+        probe = DerivedLayerStore._access_path_probe_result(
+            row,
+            definition,
+            sources,
+        )
+
+        self.assertEqual([], probe["relationScans"])
+        self.assertIn(
+            {
+                "code": "scan_evidence_unavailable",
+                "message": (
+                    "No EXPLAIN scan node could be reliably attributed "
+                    "to ops.stop_view."
+                ),
+                "suggestedAction": (
+                    "Treat its access path as unknown; views and "
+                    "partitioned parents may appear under base or child "
+                    "relation names in EXPLAIN."
+                ),
+                "relation": "ops.stop_view",
+            },
+            probe["warnings"],
+        )
+
+    def test_index_inventory_is_bounded_and_redacts_literal_expressions(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [{
+            "reltuples": 178_604.4,
+            "last_analyze": datetime(2026, 8, 31, tzinfo=timezone.utc),
+            "indexrelid": 101,
+            "access_method": "gist",
+            "indisvalid": True,
+            "indisready": True,
+            "indisunique": False,
+            "indisprimary": False,
+            "partial": False,
+            "keys": [
+                {"kind": "column", "name": "geom_3857"},
+                {
+                    "kind": "expression",
+                    "expression": "st_transform(geom, 3857)",
+                    "expressionTruncated": False,
+                },
+                {
+                    "kind": "expression",
+                    "expression": "secret = 'do-not-return'",
+                    "expressionTruncated": False,
+                },
+                {
+                    "kind": "expression",
+                    "expression": 'lower("SensitiveColumn")',
+                    "expressionTruncated": False,
+                },
+            ],
+            "operator_classes": [{
+                "name": "gist_geometry_ops_2d",
+                "supportsKnn": True,
+            }],
+        }]
+
+        metadata = DerivedLayerStore._relation_index_metadata(
+            cursor,
+            "public",
+            "areas",
+            source="remote-catalog",
+        )
+
+        catalog_sql = cursor.execute.call_args.args[0]
+        self.assertIn("::pg_catalog.int4", catalog_sql)
+        self.assertNotIn("::pg_catalog.integer", catalog_sql)
+        self.assertEqual("available", metadata["status"])
+        self.assertEqual("remote-catalog", metadata["source"])
+        self.assertEqual(178_605, metadata["relationEstimatedRows"])
+        self.assertEqual(1, len(metadata["indexes"]))
+        index = metadata["indexes"][0]
+        self.assertEqual("gist", index["method"])
+        self.assertTrue(index["supportsKnn"])
+        self.assertEqual(
+            "st_transform(geom, 3857)",
+            index["keys"][1]["expression"],
+        )
+        self.assertFalse(index["keys"][2]["expressionAvailable"])
+        self.assertFalse(index["keys"][3]["expressionAvailable"])
+        self.assertNotIn("do-not-return", repr(metadata))
+        self.assertNotIn("SensitiveColumn", repr(metadata))
+        self.assertNotIn("Index Name", repr(metadata))
+
+    def test_expanded_relation_index_inventory_is_not_claimed_empty(self):
+        for relkind in ("v", "f"):
+            with self.subTest(relkind=relkind):
+                cursor = MagicMock()
+                cursor.fetchall.return_value = [{
+                    "relkind": relkind,
+                    "reltuples": -1.0,
+                    "last_analyze": None,
+                    "indexrelid": None,
+                }]
+
+                metadata = DerivedLayerStore._relation_index_metadata(
+                    cursor,
+                    "public",
+                    "expanded_source",
+                    source="remote-catalog",
+                )
+
+                self.assertEqual({
+                    "status": "unavailable",
+                    "reason": "expanded-relation",
+                    "maxIndexes": 32,
+                }, metadata)
+
+    def test_remote_index_inventory_enforces_read_only_transaction(self):
+        connection = MagicMock()
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection.cursor.return_value = cursor_context
+
+        with patch(
+            "derived_layers.psycopg.connect",
+            return_value=connection_context,
+        ), patch.object(
+            DerivedLayerStore,
+            "_relation_index_metadata",
+            return_value={"status": "available", "indexes": []},
+        ):
+            result = DerivedLayerStore.remote_relation_index_metadata(
+                "postgresql://source",
+                "public",
+                "areas",
+            )
+
+        self.assertEqual("available", result["status"])
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertEqual("SET TRANSACTION READ ONLY", statements[0])
+        self.assertIn("set_config", statements[1])
+        statement_timeout = int(
+            cursor.execute.call_args_list[1].args[1][0].removesuffix("ms")
+        )
+        lock_timeout = int(
+            cursor.execute.call_args_list[2].args[1][0].removesuffix("ms")
+        )
+        self.assertGreater(statement_timeout, 0)
+        self.assertLessEqual(statement_timeout, 5_000)
+        self.assertEqual(min(statement_timeout, 2_000), lock_timeout)
+
+    def test_remote_index_inventory_respects_remaining_time_budget(self):
+        connection = MagicMock()
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection.cursor.return_value = cursor_context
+
+        with patch(
+            "derived_layers.psycopg.connect",
+            return_value=connection_context,
+        ), patch(
+            "derived_layers.time.monotonic",
+            side_effect=[100.0, 106.0],
+        ), patch.object(
+            DerivedLayerStore,
+            "_relation_index_metadata",
+        ) as relation_metadata:
+            result = DerivedLayerStore.remote_relation_index_metadata(
+                "postgresql://source",
+                "public",
+                "areas",
+                timeout_seconds=5,
+            )
+
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual("metadata-time-budget", result["reason"])
+        self.assertEqual(
+            "SET TRANSACTION READ ONLY",
+            cursor.execute.call_args_list[0].args[0],
+        )
+        relation_metadata.assert_not_called()
+
+    def test_plan_fingerprint_is_deterministic_and_probe_bound(self):
+        definition = validate_definition(self.valid(
+            spatialScope=self.spatial_scope(),
+        ))
+        probes = {"queryPlanProbe": {"estimatedFinalRows": 10}}
+
+        first = derived_layer_plan_fingerprint(definition, probes)
+        second = derived_layer_plan_fingerprint(definition, probes)
+        changed = derived_layer_plan_fingerprint(
+            definition,
+            {"queryPlanProbe": {"estimatedFinalRows": 11}},
+        )
+
+        self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+
     def test_query_planning_guard_corrects_generated_nested_loop_rows(self):
         generated = self.plan_node(
             "ProjectSet",
@@ -1722,6 +2686,38 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             ),
             "reasonCodes": ["nested_loop_pair_work"],
         }, capabilities["queryPlanning"])
+        definition_planning = capabilities["definitionPlanning"]
+        self.assertEqual("/api/derived-layers/plan", definition_planning["path"])
+        self.assertFalse(definition_planning["mutationApplied"])
+        index_metadata = definition_planning["accessPathProbe"][
+            "indexMetadata"
+        ]
+        self.assertEqual(32, index_metadata["maxIndexes"])
+        self.assertEqual(8, index_metadata["maxRemoteCatalogLookups"])
+        self.assertEqual(15, index_metadata[
+            "remoteCatalogTimeBudgetSeconds"
+        ])
+        self.assertEqual(5, index_metadata[
+            "maxRemoteCatalogLookupSeconds"
+        ])
+        self.assertEqual(5, index_metadata[
+            "coordinatorCatalogTimeBudgetSeconds"
+        ])
+        self.assertEqual([
+            "alias-not-active",
+            "catalog-unavailable",
+            "expanded-relation",
+            "federation-not-configured",
+            "metadata-limit",
+            "metadata-time-budget",
+            "relation-not-found",
+            "relation-not-registered",
+            "remote-catalog-required",
+        ], index_metadata["unavailableReasons"])
+        self.assertIn(
+            "scan_evidence_unavailable",
+            definition_planning["accessPathProbe"]["warningCodes"],
+        )
 
         self.assertEqual({
             "method",
@@ -2144,7 +3140,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         explain = next(
             call for call in cursor.execute.call_args_list
-            if "EXPLAIN (FORMAT JSON)" in str(call.args[0])
+            if "EXPLAIN (VERBOSE, FORMAT JSON)" in str(call.args[0])
         )
         explain_sql = explain.args[0].as_string(None)
         self.assertIn(payload["query"], explain_sql)
@@ -2153,7 +3149,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
         self.assertLess(
-            statements.index("EXPLAIN (FORMAT JSON)"),
+            statements.index("EXPLAIN (VERBOSE, FORMAT JSON)"),
             statements.index("CREATE MATERIALIZED VIEW"),
         )
         self.assertLess(
@@ -2168,7 +3164,9 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             statements.index("REFRESH MATERIALIZED VIEW"),
         )
         self.assertIn("WITH NO DATA", statements)
-        self.assertEqual(1, statements.count("EXPLAIN (FORMAT JSON)"))
+        self.assertEqual(
+            1, statements.count("EXPLAIN (VERBOSE, FORMAT JSON)")
+        )
         store._validate_catalog_dependencies.assert_called_once()
 
     def test_catalog_probe_resolves_dependencies_before_explain(self):
@@ -2196,11 +3194,11 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         )
         self.assertLess(
             statements.index("CREATE VIEW"),
-            statements.index("EXPLAIN (FORMAT JSON)"),
+            statements.index("EXPLAIN (VERBOSE, FORMAT JSON)"),
         )
         self.assertLess(
             statements.index("ROLLBACK TO SAVEPOINT derived_catalog_probe"),
-            statements.index("EXPLAIN (FORMAT JSON)"),
+            statements.index("EXPLAIN (VERBOSE, FORMAT JSON)"),
         )
         store._validate_catalog_dependencies.assert_called_once()
 
@@ -2294,7 +3292,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
         self.assertNotIn("CREATE VIEW", statements)
-        self.assertNotIn("EXPLAIN (FORMAT JSON)", statements)
+        self.assertNotIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
         store._dependencies.assert_not_called()
 
     def test_catalog_rejection_cannot_reach_explain_or_population(self):
@@ -2331,7 +3329,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
         self.assertIn("CREATE VIEW", statements)
-        self.assertNotIn("EXPLAIN (FORMAT JSON)", statements)
+        self.assertNotIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
         self.assertNotIn("REFRESH MATERIALIZED VIEW", statements)
 
     def test_catalog_probe_rejects_undeclared_relations_before_explain(self):
@@ -2355,7 +3353,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         statements = "\n".join(
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
-        self.assertNotIn("EXPLAIN (FORMAT JSON)", statements)
+        self.assertNotIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
 
     def test_materialized_finalization_indexes_then_checks_total_size(self):
         cursor = MagicMock()
@@ -2666,7 +3664,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         statements = "\n".join(
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
-        self.assertIn("EXPLAIN (FORMAT JSON)", statements)
+        self.assertIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
         self.assertNotIn("CREATE MATERIALIZED VIEW", statements)
         self.assertNotIn("INSERT INTO", statements)
 
@@ -2720,7 +3718,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertEqual(9, result["queryPlanProbe"]["estimatedFinalRows"])
         self.assertIn("queryPlanningProbe", result)
         self.assertNotIn("materializationProbe", result)
-        self.assertIn("EXPLAIN (FORMAT JSON)", str(
+        self.assertIn("EXPLAIN (VERBOSE, FORMAT JSON)", str(
             cursor.execute.call_args_list[-1].args[0]
         ))
 
@@ -2919,7 +3917,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         statements = "\n".join(
             str(call.args[0]) for call in cursor.execute.call_args_list
         )
-        self.assertIn("EXPLAIN (FORMAT JSON)", statements)
+        self.assertIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
         self.assertNotIn("REFRESH MATERIALIZED VIEW", statements)
         self.assertNotIn("semantic_generation =", statements)
 
@@ -3019,7 +4017,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         self.assertIn("queryPlanningProbe", probe)
         explain = next(
             call for call in cursor.execute.call_args_list
-            if "EXPLAIN (FORMAT JSON)" in str(call.args[0])
+            if "EXPLAIN (VERBOSE, FORMAT JSON)" in str(call.args[0])
         )
         self.assertIn("ST_Intersects", explain.args[0].as_string(None))
 

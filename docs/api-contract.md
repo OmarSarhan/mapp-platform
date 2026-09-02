@@ -139,7 +139,9 @@ clients still use the route and response contract owned by the server.
 | `validate` | `POST /api/validate` | — | Legacy `full` or administrator session; it never saves |
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
-| `derived-layers capabilities\|jobs\|list\|show\|map-extent` | `GET /api/derived-layers/*` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview | `inspect` |
+| `derived-layers capabilities` | `GET /api/derived-layers/capabilities` | — | Any authenticated credential; contains planning methods and limits but no workspace rows |
+| `derived-layers jobs\|list\|show\|map-extent` | Other `GET /api/derived-layers/*` routes | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview | `inspect` |
+| `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
 | `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
@@ -371,9 +373,11 @@ readiness does not disable derived queries that do not use H3.
 Derived-layer create, replace, and refresh requests accept an optional
 `"background": true`. They return `202 Accepted` with `operation` and
 `statusUrl`; poll that URL until `status` is `succeeded`, `failed`, `cancelled`,
-or `indeterminate`. `cancelling` is nonterminal: the server reports `cancelled`
-only after PostgreSQL confirms the transaction was rolled back. Omitting the
-flag preserves the synchronous API behaviour.
+or `indeterminate`. `cancelling` is nonterminal. A terminal `cancelled` record
+with `failurePhase: "preflight"` proves the database transaction never started;
+one with `failurePhase: "database-transaction"` and `rolledBack: true` proves
+PostgreSQL confirmed rollback. Omitting the flag preserves the synchronous API
+behaviour.
 The server advertises `backgroundJobs.activeJobs`, `executingJobs`,
 `waitingJobs`, and `maxActiveJobs` in derived-layer capabilities and through
 the database-independent background-jobs route. The latter also returns
@@ -629,6 +633,37 @@ here because they are retryable rather than terminal and are reported as `409`:
 
 Managed derived-layer database actions are separate from workspace proposals:
 
+- `POST /api/derived-layers/plan` accepts the same closed definition fields as
+  create except the execution-only `background` field and a previous
+  `planFingerprint`. It resolves the selected workspace scope, requires ready
+  semantic relation profiles, and runs the exact non-mutating create preflight.
+  The response has `mutationApplied: false` and a `derivedLayerPlan` containing
+  the replayable selector-based `createRequest`, `resolvedSpatialScope`,
+  `queryPlanProbe`, `queryPlanningProbe`, `accessPathProbe`, the applicable
+  `materializationProbe`, and a `planFingerprint`. The `createRequest` already
+  includes that fingerprint. Planning creates no managed relation, durable
+  operation, or workspace change.
+- A client binds creation to the reviewed evidence by submitting the returned
+  `planFingerprint` with the returned `createRequest`. The server resolves and
+  preflights again, compares a newly computed fingerprint, and refuses stale or
+  changed evidence; it also repeats preflight at the database mutation boundary.
+  The fingerprint is not approval, authentication, or a substitute for either
+  server-side preflight. It is optional only for compatibility with unplanned
+  create clients. A mismatch returns HTTP `409`, code
+  `derived_layer.plan_stale`, `mutationApplied: false`, and the expected and
+  actual fingerprints; the client must plan and review again rather than strip
+  the binding automatically.
+- The fingerprint binds the resolved database definition and returned
+  preflight evidence. It does not bind semantic asset identity, generation,
+  version, or curated meaning; queued work rechecks usable ready relation
+  profiles only.
+- A fingerprinted background create recomputes the authoritative plan after it
+  leaves the waiting queue and owns a worker slot. Plan drift while queued
+  fails the durable operation with `derived_layer.plan_stale` before mutation.
+  Background create and replace first publish `source-revalidation` and
+  re-fetch semantic readiness. A fingerprinted create then publishes
+  `plan-revalidation`; `database-transaction` begins only after those checks
+  pass.
 - `POST /api/derived-layers/recipes/area-weighted-h3/plan` is the read-only
   exception in this POST family. It resolves a ready semantic polygon source,
   constructs the supported scope-bounded EPSG:27700 area-allocation query, and
@@ -638,8 +673,10 @@ Managed derived-layer database actions are separate from workspace proposals:
   `resolvedSpatialScope`, and all applicable plan/size probes. Review that
   evidence, then submit the returned request separately to create; planning
   itself never creates a database object or workspace change. Create resolves
-  the scope and preflights again so intervening workspace drift remains
-  authoritative.
+  the scope and preflights again, but the recipe response has no fingerprint
+  and does not reject scope drift by itself. Re-run the recipe after a
+  workspace change, or pass its `createRequest` through the generic planner
+  when the create must be bound to reviewed scope and database-plan evidence.
 - `POST /api/derived-layers` creates a dependency-checked view or materialized
   view with `derive` and `semantic:inspect`; every declared relation source
   must have a ready semantic profile. Database functions, including H3 and
@@ -705,12 +742,13 @@ polygon wrappers whose exact routine setting is the catalog-derived
 `pg_catalog` plus authoritative allowlisted-extension namespace path. Both the
 routine and implementation must resolve as members of an approved extension;
 same-named custom routines and every other configuration remain prohibited.
-Successful mutations include the unchanged `queryPlanProbe` and an additive
-`queryPlanningProbe`. The top-level `queryPlanning` capability is version `1`,
-uses method `postgresql-explain-bounded-generator-pairs`, advertises
-`maxNestedLoopPairRows`, and publishes the closed
-`nested_loop_pair_work` reason code. The corresponding probe contains only the
-same version and method, `maxProvenGeneratedRows`, `nestedLoopCount`,
+Successful mutations include the unchanged `queryPlanProbe` and additive
+`queryPlanningProbe` and `accessPathProbe` objects. The top-level
+`queryPlanning` capability is version `1`, uses method
+`postgresql-explain-bounded-generator-pairs`, advertises
+`maxNestedLoopPairRows`, and publishes the closed `nested_loop_pair_work`
+reason code. The corresponding probe contains only the same version and
+method, `maxProvenGeneratedRows`, `nestedLoopCount`,
 `maxEstimatedNestedLoopPairRows`, and `maxAllowedNestedLoopPairRows`.
 
 The server derives the proven maximum from literal `generate_series` and the
@@ -724,6 +762,76 @@ blocked when the product of its two corrected inputs exceeds 100,000,000 rows.
 This rule is query- and predicate-independent: a low-row parameterized index
 inner plan can pass, while an equally risky non-spatial nested loop is rejected;
 hash joins do not accrue nested-loop pair work.
+
+The top-level `definitionPlanning` capability advertises the non-mutating plan
+path, access-path version/method, evidence caps, and closed advisory warning
+codes. `accessPathProbe.sources` reports each declared relation's kind, opaque
+database execution group, planner-estimate source, statistics availability,
+and capped `indexMetadata`. An available inventory may include estimated rows,
+`lastAnalyze`, index method and validity/readiness, uniqueness, safe bounded
+column/expression keys, operator classes, and KNN support. It omits index names,
+connection details, raw partial predicates, and unsafe expression text.
+An available index or index scan does not alone prove selectivity. Clients
+must review its condition, estimated rows, and warnings; an unconstrained
+index scan with only a local filter is reported as unbounded.
+
+For an active federated source, the service attempts a bounded read-only
+inspection of the registered remote catalog. Failure is represented as
+`indexMetadata.status: "unavailable"` with a closed reason, never as an empty
+available inventory. The coordinator's `Foreign Scan` also leaves
+`relationScans[].indexBacked` unknown when it cannot prove the remote path.
+Clients must not turn either unknown into a “missing index” claim.
+
+Remote catalog inspection explicitly starts a read-only transaction and is
+limited to eight sequential eligible sources, a 15-second aggregate budget,
+and five seconds per lookup; later sources report `metadata-limit` or
+`metadata-time-budget`. Each inventory contains at most 32 indexes, 32 keys
+per index, and 256 characters of safe expression text. The closed unavailable
+reasons advertised in `definitionPlanning.accessPathProbe.indexMetadata` are
+`alias-not-active`, `catalog-unavailable`, `expanded-relation`,
+`federation-not-configured`, `metadata-limit`, `metadata-time-budget`,
+`relation-not-found`, `relation-not-registered`, and
+`remote-catalog-required`. Ordinary views and nested foreign tables report
+`expanded-relation`; an empty index inventory on the wrapper is not evidence
+about its expanded base access paths. Views and partitioned parents report an
+`unknown` execution group because their expanded children can be local,
+foreign, or mixed.
+Coordinator-local inventories have a separate five-second aggregate catalog
+budget. Later sources report `metadata-time-budget`, and the server restores
+the five-second submitted-query `EXPLAIN` timeout after catalog inspection.
+Remote inventory is returned by generic and area-weighted recipe planning.
+Create, replace, and refresh responses return their coordinator preflight
+evidence and may retain `remote-catalog-required`; clients needing remote index
+evidence should call a plan route before mutation. Fingerprinted create still
+repeats the bounded remote enrichment to compare the reviewed fingerprint. A
+background fingerprinted create can repeat it both at admission and after
+worker ownership.
+For a costly or federated fingerprinted create, clients should use
+`background: true` and poll the operation rather than hold the mutation HTTP
+request through source and plan revalidation.
+
+`accessPathProbe.warnings` is advisory: it does not block an otherwise admitted
+definition and does not replace the query or storage guards. Closed warnings
+cover unknown statistics, unbounded scans, predicates not pushed to a foreign
+source, transformed work without a visible index-backed or remote candidate
+restriction,
+cross-execution-group joins, correlated subplans, and declared sources whose
+expanded view or partition scan nodes cannot be reliably attributed
+(`scan_evidence_unavailable`). A `remote-with-local-filter` scan has partial
+remote restriction but still emits the local-predicate warning.
+`tuple-condition` identifies a direct PostgreSQL `TID Cond`; it is bounded
+tuple access, not an index claim. Agents should
+bound each federated source
+independently before joining, avoid per-row remote subplans, and use discovered
+native access paths before transformations. For globally applicable spatial
+work, use indexed native or EPSG:3857 geometry for coarse candidate
+restriction, transform only the reduced set to EPSG:4326, and cast to PostGIS
+`geography` for geodetic distance and spheroidal area. Return EPSG:3857
+geometry for XYZ. EPSG:3857 scale is distorted and EPSG:4326 `geometry` is
+angular, so neither should be treated as an exact metric plane; evidence for
+the exact source remains authoritative. Geography calculations support
+worldwide and antimeridian locations, but EPSG:3857 XYZ output is limited to
+the Web Mercator domain and cannot represent polar caps.
 
 Query guard failures use this stable taxonomy:
 
@@ -813,6 +921,7 @@ query cost:
 | --- | --- |
 | HTTP `422`, `derived_layer.source_mismatch` | `declaredSources`, `resolvedSources`, `missingSources`, and `extraSources` identify exactly how to make the declaration match PostgreSQL dependencies. |
 | HTTP `400`, `derived_layer.source_profile_required` | Synchronize each listed source semantic profile, then inspect it before retrying. |
+| HTTP `503`, `derived_layer.source_profile_unavailable` | Background source revalidation could not reach the semantic service; no mutation began. Restore semantic service access and ready profiles, then resubmit. |
 | HTTP `400`, `derived_layer.spatial_scope_invalid` | Select a valid workspace locale and let the server resolve its extent. |
 | HTTP `400`, `derived_layer.invalid_request` | Correct the named definition/request field. |
 | HTTP `404`/`409`, `derived_layer.not_found`/`derived_layer.already_exists` | List or rename/replace the layer as directed; the response states the preserved operation state. |

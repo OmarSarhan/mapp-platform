@@ -27,6 +27,9 @@ from psycopg.rows import dict_row
 
 from infoj_types import info_value_error
 from derived_layers import (
+    ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS,
+    ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS,
+    ACCESS_PATH_REMOTE_CATALOG_TIME_BUDGET_SECONDS,
     SCHEMA as DERIVED_SCHEMA,
     DerivedLayerCancellation,
     DerivedLayerCancellationRequested,
@@ -41,6 +44,7 @@ from derived_layers import (
     DerivedLayerSourceMismatchError,
     DerivedLayerStore,
     area_weighted_h3_recipe_capability,
+    derived_layer_plan_fingerprint,
     plan_area_weighted_h3_recipe,
     validate_definition,
     validate_spatial_scope,
@@ -1941,15 +1945,107 @@ def run_derived_background(
     remote: str,
     name: str | None = None,
     cancellation: DerivedLayerCancellation | None = None,
+    expected_plan_fingerprint: str | None = None,
 ) -> None:
     """Complete a derived-layer database operation after HTTP has returned."""
-    failure_phase = "database-transaction"
+    failure_phase = (
+        "preflight"
+        if action in {"create", "replace"}
+        else "database-transaction"
+    )
     try:
         if not DERIVED:
             raise DerivedLayerError(
                 "Derived-layer database management is not configured."
             )
+        if action in {"create", "replace"}:
+            if cancellation is not None:
+                cancellation.checkpoint()
+            if not SEMANTIC:
+                raise SemanticClientError(
+                    "Semantic service is not configured.",
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    payload={"code": "semantic.not_configured"},
+                )
+            semantic_catalog = SEMANTIC.request(
+                "/v1/catalog",
+                actor=actor,
+                scopes=["semantic:inspect"],
+            )
+            if cancellation is not None:
+                cancellation.checkpoint()
+            require_semantic_derived_sources(payload, semantic_catalog)
+            if cancellation is not None:
+                cancellation.checkpoint()
         if action == "create":
+            if expected_plan_fingerprint is not None:
+                CONTROL.update_operation_progress(
+                    operation_id,
+                    stage="plan-revalidation",
+                    diagnostics={},
+                )
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                probes = enrich_derived_plan_probes(
+                    DERIVED.preflight_definition(payload)
+                )
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                actual_plan_fingerprint = derived_layer_plan_fingerprint(
+                    payload,
+                    probes,
+                )
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                if actual_plan_fingerprint != expected_plan_fingerprint:
+                    stale = DerivedLayerError(
+                        "The reviewed derived-layer plan changed while the "
+                        "operation was waiting for a worker."
+                    )
+                    finish_derived_background_failure(
+                        operation_id,
+                        action,
+                        stale,
+                        derived_blocked_error(
+                            code="derived_layer.plan_stale",
+                            message=str(stale),
+                            suggested_action=(
+                                "Plan the definition again, review the new "
+                                "scope and diagnostics, then submit the new "
+                                "createRequest."
+                            ),
+                            operation=action,
+                            mutationApplied=False,
+                            expectedPlanFingerprint=(
+                                expected_plan_fingerprint
+                            ),
+                            actualPlanFingerprint=actual_plan_fingerprint,
+                        ),
+                        HTTPStatus.CONFLICT,
+                        "preflight",
+                    )
+                    return
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                CONTROL.update_operation_progress(
+                    operation_id,
+                    stage="database-transaction",
+                    diagnostics={},
+                )
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                failure_phase = "database-transaction"
+            else:
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                CONTROL.update_operation_progress(
+                    operation_id,
+                    stage="database-transaction",
+                    diagnostics={},
+                )
+                if cancellation is not None:
+                    cancellation.checkpoint()
+                failure_phase = "database-transaction"
             result = DERIVED.create(
                 payload,
                 actor,
@@ -1957,6 +2053,16 @@ def run_derived_background(
             )
             failure_phase = "result-reporting"
         elif action == "replace" and name:
+            if cancellation is not None:
+                cancellation.checkpoint()
+            CONTROL.update_operation_progress(
+                operation_id,
+                stage="database-transaction",
+                diagnostics={},
+            )
+            if cancellation is not None:
+                cancellation.checkpoint()
+            failure_phase = "database-transaction"
             result = DERIVED.replace(
                 name,
                 payload,
@@ -2002,7 +2108,37 @@ def run_derived_background(
             result={"derivedLayer": result},
         )
     except DerivedLayerCancellationRequested as exc:
-        finish_derived_background_cancellation(operation_id, action, exc)
+        phase, rolled_back = derived_exception_failure_state(
+            exc, failure_phase,
+        )
+        finish_derived_background_cancellation(
+            operation_id,
+            action,
+            exc,
+            database_started=(phase != "preflight" or rolled_back),
+        )
+    except SemanticClientError as exc:
+        finish_derived_background_failure(
+            operation_id,
+            action,
+            exc,
+            derived_blocked_error(
+                code="derived_layer.source_profile_unavailable",
+                message=(
+                    "Semantic source readiness could not be revalidated "
+                    "before the background mutation."
+                ),
+                suggested_action=(
+                    "Restore semantic catalog access and ready source "
+                    "profiles, then submit the derived-layer request again."
+                ),
+                operation=action,
+                mutationApplied=False,
+                retryable=True,
+            ),
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "preflight",
+        )
     except DerivedLayerQueryTooExpensive as exc:
         finish_derived_background_failure(
             operation_id,
@@ -2134,7 +2270,10 @@ def run_derived_background(
         phase, rolled_back = derived_exception_failure_state(
             exc, failure_phase,
         )
-        state_unchanged = rolled_back and phase == "database-transaction"
+        state_unchanged = (
+            phase == "preflight"
+            or (rolled_back and phase == "database-transaction")
+        )
         response = derived_operation_failed_error(
             action,
             failure_phase=phase,
@@ -2199,8 +2338,20 @@ def derived_background_capacity() -> dict:
         stored_stage = operation.get("stage")
         if operation_id in queue_positions:
             stage = "waiting-for-worker"
-        elif stored_stage == "result-reporting":
-            stage = "result-reporting"
+        elif stored_stage in {
+            "source-revalidation",
+            "plan-revalidation",
+            "result-reporting",
+        }:
+            stage = stored_stage
+        elif (
+            stored_stage == "waiting-for-worker"
+            and action in {"create", "replace"}
+        ):
+            # Queue ownership moves in memory just before the worker persists
+            # its first preflight stage. Do not briefly claim that a database
+            # transaction started during that hand-off window.
+            stage = "source-revalidation"
         else:
             stage = "database-transaction"
         summary = {
@@ -2277,6 +2428,7 @@ def run_reserved_derived_background(
     remote: str,
     name: str | None,
     cancellation: DerivedLayerCancellation,
+    expected_plan_fingerprint: str | None = None,
 ) -> None:
     global DERIVED_BACKGROUND_ACTIVE_JOBS
     global DERIVED_BACKGROUND_EXECUTING_JOB
@@ -2314,15 +2466,20 @@ def run_reserved_derived_background(
             return
 
         try:
+            initial_stage = (
+                "source-revalidation"
+                if action in {"create", "replace"}
+                else "database-transaction"
+            )
             CONTROL.update_operation_progress(
                 operation_id,
-                stage="database-transaction",
+                stage=initial_stage,
                 diagnostics={},
             )
         except Exception as exc:
             message = (
-                "The derived-layer worker could not record that its database "
-                "transaction was starting."
+                "The derived-layer worker could not record that its "
+                f"{initial_stage.replace('-', ' ')} was starting."
             )
             finish_derived_background_failure(
                 operation_id,
@@ -2349,6 +2506,7 @@ def run_reserved_derived_background(
             remote,
             name,
             cancellation,
+            expected_plan_fingerprint,
         )
     finally:
         with DERIVED_BACKGROUND_JOB_CONDITION:
@@ -2416,6 +2574,8 @@ def derived_operation_safe_state(operation: str | None) -> str:
 def derived_request_operation(request_path: str, derived_action_path) -> str | None:
     if request_path == "/api/derived-layers/recipes/area-weighted-h3/plan":
         return "plan-area-weighted-h3"
+    if request_path == "/api/derived-layers/plan":
+        return "plan"
     if request_path == "/api/derived-layers":
         return "create"
     if derived_action_path:
@@ -3279,7 +3439,8 @@ def resolve_federation_connection_url(connection_ref: str) -> str:
     connectionRef is the suffix of a `FEDERATION_DBS_<NAME>` environment
     variable. Keeping these credentials outside `DB_CONNECTIONS` prevents
     normal catalog, layer, and semantic discovery from reaching a federation
-    source; only explicitly scoped Observe/Provision actions resolve them.
+    source; only explicitly scoped Observe/Provision actions and bounded
+    derived-layer planning resolve them.
     """
     connection_url = FEDERATION_CONNECTIONS.get(connection_ref)
     if not connection_url:
@@ -3289,6 +3450,112 @@ def resolve_federation_connection_url(connection_ref: str) -> str:
             code="federation.connection_ref_not_found",
         )
     return connection_url
+
+
+def enrich_federated_access_path_probe(
+    access_path_probe: dict,
+) -> dict:
+    """Attach bounded remote index facts for declared source_<alias> inputs."""
+    sources = access_path_probe.get("sources")
+    if not isinstance(sources, list):
+        return access_path_probe
+    remote_catalog_lookups = 0
+    remote_catalog_deadline = (
+        time.monotonic() + ACCESS_PATH_REMOTE_CATALOG_TIME_BUDGET_SECONDS
+    )
+    remote_catalog_budget_exhausted = False
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        relation = _normalize_relation(source.get("relation"))
+        if relation is None or not relation[0].startswith("source_"):
+            continue
+        alias = relation[0].removeprefix("source_")
+        local_relation = relation[1]
+        if not FEDERATION:
+            source["indexMetadata"] = (
+                DerivedLayerStore.unavailable_index_metadata(
+                    "federation-not-configured"
+                )
+            )
+            continue
+        try:
+            record = FEDERATION.get(alias)
+            if record.get("status") != "active":
+                source["indexMetadata"] = (
+                    DerivedLayerStore.unavailable_index_metadata(
+                        "alias-not-active"
+                    )
+                )
+                continue
+            remote_relations = [
+                parsed
+                for parsed in (
+                    _normalize_relation(item)
+                    for item in record.get("allowedRelations", [])
+                )
+                if parsed is not None and parsed[1] == local_relation
+            ]
+            if len(remote_relations) != 1:
+                source["indexMetadata"] = (
+                    DerivedLayerStore.unavailable_index_metadata(
+                        "relation-not-registered"
+                    )
+                )
+                continue
+            if (
+                remote_catalog_lookups
+                >= ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS
+            ):
+                source["indexMetadata"] = (
+                    DerivedLayerStore.unavailable_index_metadata(
+                        "metadata-limit"
+                    )
+                )
+                continue
+            remaining_seconds = remote_catalog_deadline - time.monotonic()
+            if remote_catalog_budget_exhausted or remaining_seconds <= 0:
+                source["indexMetadata"] = (
+                    DerivedLayerStore.unavailable_index_metadata(
+                        "metadata-time-budget"
+                    )
+                )
+                remote_catalog_budget_exhausted = True
+                continue
+            remote_catalog_lookups += 1
+            connection_url = resolve_federation_connection_url(
+                record["connectionRef"]
+            )
+            enforce_tls_policy(record["tlsPolicy"], connection_url)
+            source["indexMetadata"] = (
+                DerivedLayerStore.remote_relation_index_metadata(
+                    connection_url,
+                    remote_relations[0][0],
+                    remote_relations[0][1],
+                    timeout_seconds=min(
+                        remaining_seconds,
+                        ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS,
+                    ),
+                )
+            )
+            if source["indexMetadata"].get("reason") == (
+                "metadata-time-budget"
+            ):
+                remote_catalog_budget_exhausted = True
+        except (FileNotFoundError, FederationSchemaError, psycopg.Error):
+            source["indexMetadata"] = (
+                DerivedLayerStore.unavailable_index_metadata(
+                    "catalog-unavailable"
+                )
+            )
+    return access_path_probe
+
+
+def enrich_derived_plan_probes(probes: dict) -> dict:
+    access_path_probe = probes.get("accessPathProbe")
+    if isinstance(access_path_probe, dict):
+        enrich_federated_access_path_probe(access_path_probe)
+    return probes
 
 
 def archive_excluded_semantic_sources(actor: str) -> list[dict]:
@@ -3362,6 +3629,7 @@ def start_derived_background(
     actor: str,
     remote: str,
     name: str | None = None,
+    expected_plan_fingerprint: str | None = None,
 ) -> dict:
     global DERIVED_BACKGROUND_ACTIVE_JOBS
     reserve_derived_background_job()
@@ -3401,7 +3669,7 @@ def start_derived_background(
             target=run_reserved_derived_background,
             args=(
                 operation["id"], action, payload, actor, remote, name,
-                cancellation,
+                cancellation, expected_plan_fingerprint,
             ),
             name=f"derived-{action}-{operation['id'][:8]}",
             daemon=True,
@@ -5788,6 +6056,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/contract",
             "/api/connect",
             "/api/auth/me",
+            "/api/derived-layers/capabilities",
         }:
             # Contract discovery and a credential's own identity do not expose
             # workspace state. Any authenticated narrow-scope token may read
@@ -6541,6 +6810,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "spatialScopeTypes": ["workspace-map-extent"],
                         "queryPlanning": (
                             DerivedLayerStore.query_planning_capability()
+                        ),
+                        "definitionPlanning": (
+                            DerivedLayerStore.definition_planning_capability()
                         ),
                         "recipes": {
                             "areaWeightedH3": (
@@ -7801,6 +8073,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/admin/device-authorizations/approve",
             "/api/sql/test",
             "/api/derived-layers",
+            "/api/derived-layers/plan",
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             "/api/federation/aliases",
             "/api/federation/groups",
@@ -7940,7 +8213,9 @@ class Handler(SimpleHTTPRequestHandler):
                 resolved_create_request = resolve_derived_spatial_scope(
                     recipe_plan["createRequest"]
                 )
-                probes = DERIVED.preflight_definition(resolved_create_request)
+                probes = enrich_derived_plan_probes(
+                    DERIVED.preflight_definition(resolved_create_request)
+                )
                 recipe_plan = {
                     **recipe_plan,
                     "createRequest": create_request,
@@ -7954,6 +8229,46 @@ class Handler(SimpleHTTPRequestHandler):
                     "mutationApplied": False,
                 })
                 return
+            if request_path == "/api/derived-layers/plan":
+                if not self._scope_granted(actor, "semantic:inspect"):
+                    return
+                derived_failure_phase = "preflight"
+                if not DERIVED:
+                    raise DerivedLayerError(
+                        "Derived-layer database management is not configured."
+                    )
+                create_request = dict(payload)
+                resolved_create_request = resolve_derived_spatial_scope(
+                    create_request
+                )
+                require_semantic_derived_sources(
+                    resolved_create_request,
+                    self._semantic_request(actor, "/v1/catalog"),
+                )
+                probes = enrich_derived_plan_probes(
+                    DERIVED.preflight_definition(resolved_create_request)
+                )
+                plan_fingerprint = derived_layer_plan_fingerprint(
+                    resolved_create_request,
+                    probes,
+                )
+                derived_layer_plan = {
+                    "version": "1",
+                    "createRequest": {
+                        **create_request,
+                        "planFingerprint": plan_fingerprint,
+                    },
+                    "resolvedSpatialScope": resolved_create_request[
+                        "spatialScope"
+                    ],
+                    **probes,
+                    "planFingerprint": plan_fingerprint,
+                }
+                self._json(HTTPStatus.OK, {
+                    "derivedLayerPlan": derived_layer_plan,
+                    "mutationApplied": False,
+                })
+                return
             if request_path == "/api/derived-layers":
                 derived_failure_phase = "preflight"
                 if not DERIVED:
@@ -7961,15 +8276,67 @@ class Handler(SimpleHTTPRequestHandler):
                         "Derived-layer database management is not configured."
                     )
                 background = payload.pop("background", False)
+                expected_plan_fingerprint = payload.pop(
+                    "planFingerprint", None
+                )
+                if expected_plan_fingerprint is not None and (
+                    not isinstance(expected_plan_fingerprint, str)
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}",
+                        expected_plan_fingerprint,
+                    )
+                ):
+                    raise DerivedLayerError(
+                        "planFingerprint must be a server-issued SHA-256 "
+                        "derived-layer plan fingerprint."
+                    )
                 payload = resolve_derived_spatial_scope(payload)
                 require_semantic_derived_sources(
                     payload,
                     self._semantic_request(actor, "/v1/catalog"),
                 )
-                DERIVED.preflight_definition(payload)
+                probes = DERIVED.preflight_definition(payload)
+                if expected_plan_fingerprint is not None:
+                    enrich_derived_plan_probes(probes)
+                    actual_plan_fingerprint = derived_layer_plan_fingerprint(
+                        payload,
+                        probes,
+                    )
+                    if actual_plan_fingerprint != expected_plan_fingerprint:
+                        self._json(
+                            HTTPStatus.CONFLICT,
+                            derived_blocked_error(
+                                code="derived_layer.plan_stale",
+                                message=(
+                                    "The reviewed derived-layer plan no longer "
+                                    "matches the authoritative scope or "
+                                    "database plan."
+                                ),
+                                suggested_action=(
+                                    "Plan the definition again, review the new "
+                                    "scope and diagnostics, then submit the new "
+                                    "createRequest."
+                                ),
+                                operation="create",
+                                mutationApplied=False,
+                                expectedPlanFingerprint=(
+                                    expected_plan_fingerprint
+                                ),
+                                actualPlanFingerprint=(
+                                    actual_plan_fingerprint
+                                ),
+                            ),
+                        )
+                        return
                 if background is True:
                     operation = start_derived_background(
-                        "create", payload, actor, self._remote()
+                        "create",
+                        payload,
+                        actor,
+                        self._remote(),
+                        expected_plan_fingerprint=(
+                            expected_plan_fingerprint
+                        ),
                     )
                     derived_failure_phase = "request-response"
                     self._json(HTTPStatus.ACCEPTED, {
@@ -10459,15 +10826,24 @@ class Handler(SimpleHTTPRequestHandler):
                 )
         except SemanticClientError as exc:
             if (
-                request_path
-                == "/api/derived-layers/recipes/area-weighted-h3/plan"
+                request_path in {
+                    "/api/derived-layers/plan",
+                    "/api/derived-layers/recipes/area-weighted-h3/plan",
+                }
             ):
                 status = exc.status or HTTPStatus.SERVICE_UNAVAILABLE
                 if status < 400 or status > 599:
                     status = HTTPStatus.BAD_GATEWAY
                 if status == HTTPStatus.UNAUTHORIZED:
                     status = HTTPStatus.BAD_GATEWAY
-                missing = status == HTTPStatus.NOT_FOUND
+                recipe_plan = (
+                    request_path
+                    == "/api/derived-layers/recipes/area-weighted-h3/plan"
+                )
+                missing = recipe_plan and status == HTTPStatus.NOT_FOUND
+                operation = (
+                    "plan-area-weighted-h3" if recipe_plan else "plan"
+                )
                 response = derived_blocked_error(
                     code=(
                         "derived_layer.source_profile_required"
@@ -10483,9 +10859,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "Synchronize the source with `semantic source sync`, "
                         "then retry the recipe plan."
                         if missing
-                        else "Restore semantic profile access, then retry the recipe plan."
+                        else (
+                            "Restore semantic profile access, then retry the "
+                            "derived-layer plan."
+                        )
                     ),
-                    operation="plan-area-weighted-h3",
+                    operation=operation,
                     mutationApplied=False,
                 )
                 self._json(status, response)
