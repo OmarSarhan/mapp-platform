@@ -63,7 +63,7 @@ staging, the old and new snapshots, indexes, geometry, and WAL can coexist. Use
 headroom, and monitor the database volume during the run. Container `/tmp`
 capacity does not replace database-volume capacity.
 
-MAPP idempotently prepares native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
+MAPP idempotently prepares native, EPSG:4326, EPSG:3857, and safe
 geometry/geography cross-cast GiST indexes on the relations it owns, and runs
 `ANALYZE`. Include this index set in capacity estimates. An existing packaged
 volume receives the complete idempotent role, H3, and spatial-index upgrade

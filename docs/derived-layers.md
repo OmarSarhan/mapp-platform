@@ -11,7 +11,7 @@ XYZ-compatible relation. The service always creates the result in
 
 A materialized view receives a unique index on its declared feature ID and a
 GiST index set for its declared geometry: the native SRID, canonical EPSG:4326,
-EPSG:3857, and EPSG:27700 expressions when they differ, and a safe EPSG:4326
+EPSG:3857 expressions when they differ, and a safe EPSG:4326
 geography expression. Projected geometry is transformed to EPSG:4326 before the
 geography cast. Refresh, replacement, and drop are confirmed, scoped, and audited actions.
 Before any view or materialized view is created or replaced—and before a
@@ -174,10 +174,10 @@ create, refresh, or drop them. Ordinary views use `security_invoker=true` and
 A new packaged volume receives the roles, schema, H3 extensions, grants, and
 the restricted-path setting required by the H3 PostGIS polygon SQL wrappers
 automatically. MAPP also prepares every managed geometry and geography column
-it owns with native, EPSG:4326, EPSG:3857, EPSG:27700, and safe cross-cast
-GiST indexes, then refreshes planner statistics. On an existing
+in `derived_layers` with native, EPSG:4326, EPSG:3857, and safe
+cross-cast GiST indexes, then refreshes planner statistics. On an existing
 bundled volume, normal startup runs the same idempotent derived-role/H3 upgrade
-and ensures missing source and materialized spatial indexes before application
+and ensures missing managed materialized spatial indexes before application
 services start. The explicit maintenance equivalent is:
 
 ```sh
@@ -494,27 +494,43 @@ uniqueness instead of an enforced database constraint.
 The planner resolves the saved workspace scope and returns a replayable
 selector-based `createRequest`, the full `resolvedSpatialScope`, resolved
 source/field metadata, assumptions,
-`queryPlanProbe`, `queryPlanningProbe`, and, for a materialized result,
-`materializationProbe`. It also returns `mutationApplied: false`: inspect the
-meaning, allocation assumptions, scope, and probes, then pass only the reviewed
-`createRequest` to the normal derived-layer create command. Planning never
-creates a relation or changes the workspace. Create deliberately resolves the
-selector and runs preflight again, so a workspace-scope change between review
-and creation cannot silently reuse stale evidence.
+`queryPlanProbe`, `queryPlanningProbe`, `accessPathProbe`, and, for a
+materialized result, `materializationProbe`. It also returns
+`mutationApplied: false`: inspect the meaning, allocation assumptions, scope,
+and probes, then pass only the reviewed `createRequest` to the normal
+derived-layer create command. Planning never creates a relation or changes the
+workspace. Create deliberately resolves the selector and runs preflight again,
+but the recipe response itself has no `planFingerprint`: a changed workspace
+scope can therefore produce different authoritative evidence at create time.
+Re-run the recipe after a workspace change. When a reject-on-drift binding is
+required, submit the recipe's `createRequest` to the generic definition planner
+and create only from that planner's fingerprinted `createRequest`.
 
-The generated query obtains overlap-mode candidate cells only from
+Recipe version 2 reports `areaModel: "wgs84-spheroid"`,
+`geodeticSrid: 4326`, and explicit spheroid use. Its resolved
+`metricGeometry` identifies PostGIS `geography` and records whether source
+geometry is cast directly or transformed once and cast. The output geometry is
+`MultiPolygon` because H3 cells crossing the antimeridian can have split
+boundaries. The generated query obtains overlap-mode candidate cells only from
 `_mapp_h3_scope`, so coarse cells and cells crossing the scope boundary are not
-silently omitted. It uses the prepared EPSG:27700 metric-area path, bounds
-source polygons in their native SRID by the workspace scope, transforms each
-accepted non-EPSG:27700 geometry once, and computes `ST_Intersection` once per
-accepted polygon/cell pair. The scope chooses source polygons and candidate
+silently omitted. It bounds source polygons in their native SRID by the
+workspace scope, transforms each accepted non-EPSG:4326 geometry once, and
+computes one PostGIS geography `ST_Intersection` per accepted polygon/cell
+pair. `ST_Area(..., true)` measures the source and intersection on the WGS84
+spheroid in square metres; geography intersection internally selects an
+appropriate projection and is not advertised as an exact planar overlay. The
+scope chooses source polygons and candidate
 cells; allocation uses each accepted polygon's complete geometry, including
 the part of a boundary cell outside the scope. Each measure is
 allocated as `source value × intersection area ÷ source polygon area`, then
 summed by H3 cell. `nullHandling: "zero"` treats a null measure as zero;
 `"ignore"` excludes that null contribution. Overlapping source polygons
 contribute independently and can double-count overlap, so the returned
-assumptions must remain part of the review evidence. Measure outputs remain
+assumptions must remain part of the review evidence. Source polygons must be
+valid and represented so native scope intersection is correct, including
+antimeridian normalization where applicable; geography edges use their
+shortest geodesic arc. The returned assumptions also make the EPSG:3857 polar
+limit explicit. Measure outputs remain
 `double precision` for filtering and symbology; add separately formatted
 feature-information text only at the workspace presentation layer.
 

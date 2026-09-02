@@ -2348,6 +2348,10 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         recipe = capabilities["recipes"]["areaWeightedH3"]
         self.assertFalse(recipe["available"])
         self.assertFalse(recipe["mutationAppliedByPlan"])
+        self.assertEqual(2, recipe["version"])
+        self.assertEqual("wgs84-spheroid", recipe["areaModel"])
+        self.assertEqual(4326, recipe["geodeticSrid"])
+        self.assertTrue(recipe["useSpheroid"])
         self.assertEqual(
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             recipe["planPath"],
@@ -2523,6 +2527,10 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertFalse(body["mutationApplied"])
         plan = body["recipePlan"]
         self.assertEqual("area-weighted-h3", plan["recipe"]["name"])
+        self.assertEqual(2, plan["recipe"]["version"])
+        self.assertEqual("wgs84-spheroid", plan["recipe"]["areaModel"])
+        self.assertEqual(4326, plan["recipe"]["geodeticSrid"])
+        self.assertTrue(plan["recipe"]["useSpheroid"])
         self.assertEqual(
             {
                 "type": "workspace-map-extent",

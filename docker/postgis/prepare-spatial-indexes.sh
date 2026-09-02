@@ -158,23 +158,6 @@ BEGIN
             END
           ),
           (
-            'geom_27700',
-            CASE
-              WHEN spatial_column.srid <= 0 THEN NULL
-              WHEN spatial_column.spatial_type = 'geometry'
-                   AND spatial_column.srid <> 27700
-                THEN pg_catalog.format(
-                  'public.ST_Transform(%I, 27700)',
-                  spatial_column.column_name
-                )
-              WHEN spatial_column.spatial_type = 'geography'
-                THEN pg_catalog.format(
-                  'public.ST_Transform(%I::public.geometry, 27700)',
-                  spatial_column.column_name
-                )
-            END
-          ),
-          (
             'geog_4326',
             CASE
               WHEN spatial_column.spatial_type <> 'geometry'

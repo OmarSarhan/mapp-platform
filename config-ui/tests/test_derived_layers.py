@@ -167,12 +167,22 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
 
         self.assertEqual({
             "name": "area-weighted-h3",
-            "version": 1,
-            "areaCrs": "EPSG:27700",
+            "version": 2,
+            "areaModel": "wgs84-spheroid",
+            "geodeticSrid": 4326,
+            "useSpheroid": True,
             "candidateContainment": "overlapping",
         }, result["recipe"])
         self.assertEqual(9, result["resolution"])
-        self.assertEqual("transform", result["source"]["metricGeometry"]["mode"])
+        self.assertEqual(
+            {
+                "type": "geography",
+                "srid": 4326,
+                "mode": "cast",
+                "useSpheroid": True,
+            },
+            result["source"]["metricGeometry"],
+        )
         self.assertEqual(
             "field-population",
             result["measures"][0]["sourceField"]["id"],
@@ -220,14 +230,21 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
         # caller's own search_path). Build cell boundaries from the safe,
         # schema-qualified C function plus ST_GeomFromEWKB instead.
         self.assertNotIn("h3_cell_to_boundary_geometry", query)
+        self.assertIn("public.ST_Multi(", query)
+        self.assertIn("h3_cell_to_boundary_wkb(candidate.h3)", query)
         self.assertIn(
-            "public.ST_GeomFromEWKB(h3_cell_to_boundary_wkb(candidate.h3))",
+            "::public.geometry(MultiPolygon, 4326) AS geom_4326",
+            query,
+        )
+        self.assertIn(
+            "::public.geometry(MultiPolygon, 3857) AS geom_3857",
             query,
         )
         self.assertIn("pair_areas AS MATERIALIZED", query)
         self.assertIn("source_scope AS MATERIALIZED", query)
         self.assertIn("bounded_sources AS MATERIALIZED", query)
-        self.assertIn("metric_sources AS MATERIALIZED", query)
+        self.assertIn("geodesic_sources AS MATERIALIZED", query)
+        self.assertIn("measured_sources AS MATERIALIZED", query)
         self.assertIn(
             "SELECT _mapp_h3_scope.geom_4326 AS geom_source",
             query,
@@ -241,9 +258,24 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
             "\n                      source_scope.geom_source",
             query,
         )
+        self.assertNotIn("public.ST_Transform(source_geom, 4326)", query)
+        self.assertIn(
+            "(source_geom)::public.geography AS source_geog_4326",
+            query,
+        )
+        self.assertIn(
+            "public.ST_Area(source_geog_4326, true) AS source_area_m2",
+            query,
+        )
         self.assertEqual(
             1,
-            query.count("public.ST_Transform(source_geom, 27700)"),
+            query.count(
+                "public.ST_Area(source_geog_4326, true) AS source_area_m2"
+            ),
+        )
+        self.assertIn(
+            "public.ST_Intersection(source_geog_4326, geog_4326),",
+            query,
         )
         self.assertIn(
             'COALESCE(source."population"::double precision, 0.0)',
@@ -257,6 +289,11 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
             'COALESCE(source."house"" holds"::double precision',
             query,
         )
+        self.assertEqual("MultiPolygon", result["output"]["geometryType"])
+        self.assertTrue(any(
+            "antimeridian" in assumption
+            for assumption in result["assumptions"]
+        ))
         resolved_request = {
             **create_request,
             "spatialScope": DerivedLayerDefinitionTests.spatial_scope(),
@@ -277,7 +314,7 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
             asset,
         )["createRequest"]["query"]
 
-        transformed = "public.ST_Transform(source_geom, 27700)"
+        transformed = "public.ST_Transform(source_geom, 4326)"
         self.assertEqual(1, query.count(transformed))
         self.assertIn(
             "public.ST_Transform(_mapp_h3_scope.geom_4326, 3857) "
@@ -293,45 +330,54 @@ class AreaWeightedH3RecipeTests(unittest.TestCase):
             "\n                      source_scope.geom_source",
             query,
         )
-        self.assertIn("JOIN metric_sources AS source", query)
+        self.assertIn("JOIN measured_sources AS source", query)
         self.assertIn(
-            "ON source.source_geom_27700 && cell.geom_27700",
+            "ON source.source_geog_4326 && cell.geog_4326",
             query,
         )
+        result = plan_area_weighted_h3_recipe(request, asset)
+        self.assertEqual(
+            {
+                "type": "geography",
+                "srid": 4326,
+                "mode": "transform-and-cast",
+                "useSpheroid": True,
+            },
+            result["source"]["metricGeometry"],
+        )
 
-    def test_uses_native_27700_geometry_for_indexable_join(self):
+    def test_uses_native_4326_geometry_for_geodesic_area(self):
         query = plan_area_weighted_h3_recipe(
             self.request(),
-            self.source_asset(srid=27700),
+            self.source_asset(srid=4326),
         )["createRequest"]["query"]
 
         self.assertNotIn(
-            'ST_Transform(source."source_geom", 27700)',
+            "public.ST_Transform(source_geom, 4326)",
             query,
         )
         self.assertIn("bounded_sources AS MATERIALIZED", query)
         self.assertIn(
-            "public.ST_Transform(_mapp_h3_scope.geom_4326, 27700) "
-            "AS geom_source",
+            "SELECT _mapp_h3_scope.geom_4326 AS geom_source",
             query,
         )
         self.assertIn(
             'WHERE source."source_geom" && source_scope.geom_source',
             query,
         )
+        self.assertIn("JOIN measured_sources AS source", query)
         self.assertIn(
-            "JOIN bounded_sources AS source",
-            query,
-        )
-        self.assertIn(
-            "source.source_geom AS source_geom_27700",
+            "source.source_geog_4326 && cell.geog_4326",
             query,
         )
         result = plan_area_weighted_h3_recipe(
             self.request(),
-            self.source_asset(srid=27700),
+            self.source_asset(srid=4326),
         )
-        self.assertEqual("native", result["source"]["metricGeometry"]["mode"])
+        self.assertEqual(
+            "cast",
+            result["source"]["metricGeometry"]["mode"],
+        )
 
     def test_rejects_open_recipe_objects_and_invalid_bounds(self):
         invalid_requests = []
@@ -3395,11 +3441,9 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             statement for statement in statements
             if "USING gist" in statement
         ]
-        self.assertEqual(4, len(spatial_indexes))
+        self.assertEqual(3, len(spatial_indexes))
         self.assertTrue(any('"geom_3857"' in item for item in spatial_indexes))
         self.assertTrue(any("ST_Transform" in item and "4326" in item
-                            for item in spatial_indexes))
-        self.assertTrue(any("ST_Transform" in item and "27700" in item
                             for item in spatial_indexes))
         self.assertTrue(any("geography" in item for item in spatial_indexes))
         self.assertTrue(all(
@@ -3459,14 +3503,10 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             call.args[0].as_string(None)
             for call in cursor.execute.call_args_list
         ]
-        self.assertEqual(4, len(index_names))
+        self.assertEqual(3, len(index_names))
         self.assertTrue(any('gist ("geom_3857")' in item for item in statements))
         self.assertTrue(any(
             'ST_Transform("geom_3857", 3857)' in item
-            for item in statements
-        ))
-        self.assertTrue(any(
-            'ST_Transform("geom_3857", 27700)' in item
             for item in statements
         ))
         self.assertTrue(any(
@@ -3519,7 +3559,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             call.args[0].as_string(None)
             for call in cursor.execute.call_args_list
         ]
-        self.assertEqual(4, len(statements))
+        self.assertEqual(3, len(statements))
         self.assertTrue(all(
             item.startswith('ALTER INDEX "derived_layers".')
             for item in statements

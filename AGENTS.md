@@ -95,10 +95,11 @@ filters and symbology; formatted text fields are display-only.
 
 Supported area-weighted H3 planning is read-only and semantic-profile driven.
 Generate candidates only from the resolved workspace scope, use the prepared
-metric-area path, prefilter source geometries in their native SRID, transform
-accepted non-native source geometries once, and intersect each accepted
-polygon/cell pair once. Return the exact create request,
-assumptions, and normal guard probes; creating it remains a separate action.
+global spheroidal geography-area path, prefilter source geometries in their
+native SRID, transform accepted non-EPSG:4326 source geometries once, and
+intersect each accepted polygon/cell pair once as geography. Return the exact
+create request, assumptions, and normal guard probes; creating it remains a
+separate action.
 
 ## Semantic invariants
 

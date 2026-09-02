@@ -310,8 +310,13 @@ Two things are worth knowing before you build one:
 - **It needs a ready semantic profile.** Planning refuses a source it has no
   profile for, and refuses one whose source is currently unavailable. That is
   the check doing its job, not an obstacle.
-- **Intersect in the source's own SRID.** Transforming the indexed side inside
-  the join makes the spatial index unusable and turns seconds into minutes.
+- **Reduce candidates in the indexed source representation.** Transforming the
+  indexed side in the first predicate can make its spatial index unusable and
+  turn seconds into minutes. For worldwide metric area or distance, transform
+  only the reduced rows to EPSG:4326 and cast to PostGIS `geography`; use a
+  local projected CRS only when the source profile establishes that it fits
+  the complete area of interest. EPSG:3857 is rendering output, limited to the
+  Web Mercator domain, rather than an accurate metric work plane.
 
 Read: [`derived-layers.md`](derived-layers.md)
 

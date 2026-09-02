@@ -270,7 +270,7 @@ functions required by the configured layers and reviewed derived queries.
 Before advertising an external source as ready for derived queries, give every
 persistent query-facing `geometry` or `geography` column a valid native GiST
 index and current planner statistics. Also add expression indexes for the exact
-forms used by derived SQL: canonical EPSG:4326, EPSG:3857, and EPSG:27700
+forms used by derived SQL: canonical EPSG:4326 and EPSG:3857
 transforms and the corresponding geometry/geography cast. A projected geometry must be transformed
 to EPSG:4326 before casting to geography; a direct `geometry(…,3857)::geography`
 index is invalid. For example, for `transport.geom geometry(...,4326)`:
@@ -280,8 +280,6 @@ CREATE INDEX transport_geom_gix
   ON transport.features USING gist (geom);
 CREATE INDEX transport_geom_3857_gix
   ON transport.features USING gist (public.ST_Transform(geom, 3857));
-CREATE INDEX transport_geom_27700_gix
-  ON transport.features USING gist (public.ST_Transform(geom, 27700));
 CREATE INDEX transport_geog_4326_gix
   ON transport.features USING gist ((geom::public.geography));
 ANALYZE transport.features;

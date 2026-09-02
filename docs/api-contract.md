@@ -665,9 +665,14 @@ Managed derived-layer database actions are separate from workspace proposals:
   `plan-revalidation`; `database-transaction` begins only after those checks
   pass.
 - `POST /api/derived-layers/recipes/area-weighted-h3/plan` is the read-only
-  exception in this POST family. It resolves a ready semantic polygon source,
-  constructs the supported scope-bounded EPSG:27700 area-allocation query, and
+  recipe planner in this POST family. It resolves a ready semantic polygon source,
+  constructs the supported scope-bounded WGS84 geography/spheroid
+  area-allocation query, and
   runs the exact create preflight. Its response includes
+  recipe version `2`, `areaModel: "wgs84-spheroid"`,
+  `geodeticSrid: 4326`, `useSpheroid: true`, and `MultiPolygon` EPSG:3857
+  output metadata so antimeridian-split H3 boundaries remain representable.
+  It also includes
   `mutationApplied: false`, resolved source/field metadata, explicit allocation
   assumptions, a replayable selector-based `createRequest`, the full
   `resolvedSpatialScope`, and all applicable plan/size probes. Review that
@@ -864,7 +869,7 @@ the transaction before `pg_total_relation_size` exceeded the limit; the
 probe includes `actualBytes`, the response includes `rolledBack: true`, and
 PostgreSQL rolls the transaction back. That check cannot prevent transient
 table, index, TOAST, or WAL growth. Materialized indexing includes the unique
-feature-ID index and native, EPSG:4326, EPSG:3857, EPSG:27700, and safe
+feature-ID index and native, EPSG:4326, EPSG:3857, and safe
 EPSG:4326 geography GiST expressions for the declared geometry. Clients should use the
 operation-specific
 `safeState`, prompt the user to review a create/convert-to-view fallback or

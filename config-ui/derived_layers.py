@@ -164,8 +164,9 @@ NUMERIC_FIELD_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 AREA_WEIGHTED_H3_RECIPE_NAME = "area-weighted-h3"
-AREA_WEIGHTED_H3_RECIPE_VERSION = 1
-AREA_WEIGHTED_H3_AREA_SRID = 27700
+AREA_WEIGHTED_H3_RECIPE_VERSION = 2
+AREA_WEIGHTED_H3_GEODETIC_SRID = 4326
+AREA_WEIGHTED_H3_AREA_MODEL = "wgs84-spheroid"
 AREA_WEIGHTED_H3_MAX_MEASURES = 32
 AREA_WEIGHTED_H3_OUTPUT_COLUMNS = frozenset({
     "h3_id", "h3_resolution", "geom_3857",
@@ -542,27 +543,34 @@ def _area_weighted_h3_query(
         sql.SQL("source.{}").format(column)
         for column in pair_measure_columns
     ]
-    if geometry_srid == AREA_WEIGHTED_H3_AREA_SRID:
-        source_preparation = bounded_source_preparation
-        matched_source = sql.SQL("bounded_sources")
-        metric_geometry = sql.SQL("source.source_geom")
-    else:
-        source_preparation = bounded_source_preparation + sql.SQL("""
-        metric_sources AS MATERIALIZED (
+    area_geometry = (
+        sql.SQL("source_geom")
+        if geometry_srid == AREA_WEIGHTED_H3_GEODETIC_SRID
+        else sql.SQL("public.ST_Transform(source_geom, {})").format(
+            sql.Literal(AREA_WEIGHTED_H3_GEODETIC_SRID)
+        )
+    )
+    source_preparation = bounded_source_preparation + sql.SQL("""
+        geodesic_sources AS MATERIALIZED (
           SELECT
             {pair_measure_columns},
-            public.ST_Transform(source_geom, {area_srid})
-              AS source_geom_27700
+            ({area_geometry})::public.geography AS source_geog_4326
           FROM bounded_sources
         ),
-        """).format(
-            pair_measure_columns=sql.SQL(",\n            ").join(
-                pair_measure_columns
-            ),
-            area_srid=sql.Literal(AREA_WEIGHTED_H3_AREA_SRID),
-        )
-        matched_source = sql.SQL("metric_sources")
-        metric_geometry = sql.SQL("source.source_geom_27700")
+        measured_sources AS MATERIALIZED (
+          SELECT
+            {pair_measure_columns},
+            source_geog_4326,
+            public.ST_Area(source_geog_4326, true) AS source_area_m2
+          FROM geodesic_sources
+          WHERE source_geog_4326 IS NOT NULL
+        ),
+    """).format(
+        pair_measure_columns=sql.SQL(",\n            ").join(
+            pair_measure_columns
+        ),
+        area_geometry=area_geometry,
+    )
 
     query = sql.SQL("""
         WITH candidate_ids AS (
@@ -577,46 +585,50 @@ def _area_weighted_h3_query(
         cells_4326 AS MATERIALIZED (
           SELECT
             candidate.h3,
-            public.ST_SetSRID(
-              public.ST_GeomFromEWKB(h3_cell_to_boundary_wkb(candidate.h3)),
-              4326
-            )::public.geometry(Polygon, 4326) AS geom_4326
+            public.ST_Multi(
+              public.ST_SetSRID(
+                public.ST_GeomFromEWKB(
+                  h3_cell_to_boundary_wkb(candidate.h3)
+                ),
+                4326
+              )
+            )::public.geometry(MultiPolygon, 4326) AS geom_4326
           FROM candidate_ids AS candidate
         ),
         cells AS MATERIALIZED (
           SELECT
             h3,
-            public.ST_Transform(geom_4326, {area_srid})
-              ::public.geometry(Polygon, 27700) AS geom_27700,
+            geom_4326::public.geography AS geog_4326,
             public.ST_Transform(geom_4326, 3857)
-              ::public.geometry(Polygon, 3857) AS geom_3857
+              ::public.geometry(MultiPolygon, 3857) AS geom_3857
           FROM cells_4326
         ),
         {source_preparation}
         matched_pairs AS MATERIALIZED (
           SELECT
             cell.h3,
-            cell.geom_27700,
+            cell.geog_4326,
             cell.geom_3857,
             {matched_measure_projections},
-            {metric_geometry} AS source_geom_27700
+            source.source_geog_4326,
+            source.source_area_m2
           FROM cells AS cell
-          JOIN {matched_source} AS source
-            ON {metric_geometry} && cell.geom_27700
+          JOIN measured_sources AS source
+            ON source.source_geog_4326 && cell.geog_4326
            AND public.ST_Intersects(
-                 {metric_geometry},
-                 cell.geom_27700
+                 source.source_geog_4326,
+                 cell.geog_4326
                )
-          WHERE {metric_geometry} IS NOT NULL
         ),
         pair_areas AS MATERIALIZED (
           SELECT
             h3,
             geom_3857,
             {pair_measure_columns},
-            public.ST_Area(source_geom_27700) AS source_area_m2,
+            source_area_m2,
             public.ST_Area(
-              public.ST_Intersection(source_geom_27700, geom_27700)
+              public.ST_Intersection(source_geog_4326, geog_4326),
+              true
             ) AS intersection_area_m2
           FROM matched_pairs
         ),
@@ -634,17 +646,14 @@ def _area_weighted_h3_query(
           h3::text AS h3_id,
           {resolution}::smallint AS h3_resolution,
           {final_measure_columns},
-          geom_3857::public.geometry(Polygon, 3857) AS geom_3857
+          geom_3857::public.geometry(MultiPolygon, 3857) AS geom_3857
         FROM weighted_cells
     """).format(
         resolution=sql.Literal(resolution),
-        area_srid=sql.Literal(AREA_WEIGHTED_H3_AREA_SRID),
         source_preparation=source_preparation,
         matched_measure_projections=sql.SQL(",\n            ").join(
             matched_measure_projections
         ),
-        metric_geometry=metric_geometry,
-        matched_source=matched_source,
         pair_measure_columns=sql.SQL(",\n            ").join(
             pair_measure_columns
         ),
@@ -667,7 +676,9 @@ def area_weighted_h3_recipe_capability(*, available: bool) -> dict[str, Any]:
         "maxMeasures": AREA_WEIGHTED_H3_MAX_MEASURES,
         "resolution": {"minimum": 0, "maximum": 15},
         "spatialScopeType": "workspace-map-extent",
-        "areaCrs": f"EPSG:{AREA_WEIGHTED_H3_AREA_SRID}",
+        "areaModel": AREA_WEIGHTED_H3_AREA_MODEL,
+        "geodeticSrid": AREA_WEIGHTED_H3_GEODETIC_SRID,
+        "useSpheroid": True,
         "candidateContainment": "overlapping",
         "mutationAppliedByPlan": False,
     }
@@ -1007,7 +1018,9 @@ def plan_area_weighted_h3_recipe(
         "recipe": {
             "name": AREA_WEIGHTED_H3_RECIPE_NAME,
             "version": AREA_WEIGHTED_H3_RECIPE_VERSION,
-            "areaCrs": f"EPSG:{AREA_WEIGHTED_H3_AREA_SRID}",
+            "areaModel": AREA_WEIGHTED_H3_AREA_MODEL,
+            "geodeticSrid": AREA_WEIGHTED_H3_GEODETIC_SRID,
+            "useSpheroid": True,
             "candidateContainment": "overlapping",
         },
         "createRequest": create_request,
@@ -1023,12 +1036,14 @@ def plan_area_weighted_h3_recipe(
             "idColumn": _resolved_recipe_field(id_field),
             "geometryColumn": _resolved_recipe_field(geometry_field),
             "metricGeometry": {
-                "srid": AREA_WEIGHTED_H3_AREA_SRID,
+                "type": "geography",
+                "srid": AREA_WEIGHTED_H3_GEODETIC_SRID,
                 "mode": (
-                    "native"
-                    if geometry_srid == AREA_WEIGHTED_H3_AREA_SRID
-                    else "transform"
+                    "cast"
+                    if geometry_srid == AREA_WEIGHTED_H3_GEODETIC_SRID
+                    else "transform-and-cast"
                 ),
+                "useSpheroid": True,
             },
         },
         "resolution": resolution,
@@ -1037,7 +1052,7 @@ def plan_area_weighted_h3_recipe(
             "idColumn": "h3_id",
             "resolutionColumn": "h3_resolution",
             "geometryColumn": "geom_3857",
-            "geometryType": "Polygon",
+            "geometryType": "MultiPolygon",
             "srid": 3857,
         },
         "assumptions": [
@@ -1051,6 +1066,14 @@ def plan_area_weighted_h3_recipe(
             "therefore double-count their overlap.",
             "Null source values follow each measure's explicit nullHandling "
             "rule.",
+            "Source polygons are valid and their native representation "
+            "supports correct scope intersection, including antimeridian "
+            "normalization where applicable.",
+            "Geography edges use the shortest geodesic arc and source "
+            "polygons express their intended region under that model.",
+            "Geodetic allocation supports worldwide and antimeridian "
+            "locations, but EPSG:3857 XYZ output cannot represent the polar "
+            "caps outside the Web Mercator domain.",
         ],
     }
 
@@ -2143,11 +2166,6 @@ class DerivedLayerStore:
             specs.append((
                 "geom_3857",
                 sql.SQL("public.ST_Transform({}, 3857)").format(geometry),
-            ))
-        if srid != 27700:
-            specs.append((
-                "geom_27700",
-                sql.SQL("public.ST_Transform({}, 27700)").format(geometry),
             ))
         geography_source = (
             geometry

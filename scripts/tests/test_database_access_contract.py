@@ -1084,7 +1084,6 @@ class DatabaseAccessContractTests(unittest.TestCase):
             "access_method.amname = 'gist'",
             "public.ST_Transform(%I, 4326)",
             "public.ST_Transform(%I, 3857)",
-            "public.ST_Transform(%I, 27700)",
             "::public.geometry",
             "::public.geography",
             "ANALYZE %I.%I",

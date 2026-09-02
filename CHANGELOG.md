@@ -266,9 +266,11 @@ first release.
   now applies the idempotent derived-role/H3 upgrade before application
   services and ensures missing managed spatial indexes without repeatedly
   analyzing unchanged relations.
-- Prepared EPSG:27700 GiST expression indexes for managed source and
-  materialized geometry so metric area/intersection joins can remain indexed
-  instead of comparing every projected source and generated row.
+- Prepared global EPSG:4326 geography and EPSG:3857 GiST expression indexes
+  for managed geometry. Area-weighted H3 recipe version 2 now retains indexed
+  source-native candidate filtering, represents antimeridian cells as
+  multipolygons, and uses WGS84 geography intersection with spheroidal area
+  instead of a region-specific projected CRS.
 - Combined proven literal-generator and scoped H3 row bounds with PostgreSQL
   plan structure so underestimated `ProjectSet`, `Function Scan`, and CTE
   inputs cannot hide over-budget nested-loop pair work. Rejections now carry a
