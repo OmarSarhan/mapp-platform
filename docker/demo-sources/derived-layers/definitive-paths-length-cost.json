@@ -1,0 +1,18 @@
+{
+  "name": "definitive_paths_length_cost",
+  "kind": "view",
+  "sources": [
+    "source_ops.definitive_paths"
+  ],
+  "idColumn": "object_id",
+  "geometryColumn": "geom_3857",
+  "description": "MAPP demo fixture v2: definitive paths within the saved workspace extent, with length bands and illustrative area-based costs.",
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "locale"
+  },
+  "queryFile": "definitive-paths-length-cost.sql",
+  "legacyQuerySha256": [
+    "c2183af1e02f915084a8fb2915c0f65fdabf8a517b9ef474da9d040a25ae7df8"
+  ]
+}

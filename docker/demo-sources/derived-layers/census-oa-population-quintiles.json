@@ -1,0 +1,18 @@
+{
+  "name": "census_oa_population_quintiles",
+  "kind": "view",
+  "sources": [
+    "source_census.census_2021_england_oa"
+  ],
+  "idColumn": "oa_id",
+  "geometryColumn": "geom_3857",
+  "description": "MAPP demo fixture v2: 2021 Census Output Areas within the saved workspace extent, classified into population quintiles.",
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "locale"
+  },
+  "queryFile": "census-oa-population-quintiles.sql",
+  "legacyQuerySha256": [
+    "02ed501a097bc8dee92e6481256117410fee187d8c473a4a869677a7871944bb"
+  ]
+}

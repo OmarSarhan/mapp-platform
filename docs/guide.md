@@ -61,13 +61,20 @@ cd mapp-platform
 ./bin/mapp init --demo     # write .env, generate secrets, turn the demo on
 # optional: put a Gemini key in .env before the next step — see below
 ./bin/mapp all             # build and start the platform, then verify it
-./bin/mapp demo            # load two real open-data sources and publish a map
+./bin/mapp demo            # load two real open-data sources and the saved ten-layer map
 ```
 
 `init` writes a private `.env` and generates every secret in it. `--demo` adds
 two throwaway source databases to the deployment — this is the one flag that
 makes the platform stand up databases of its own, and it exists so you have
 something real to look at.
+
+The demo publishes a versioned, saved ten-layer workspace. It keeps the small
+`instance/workspace.seed.json` baseline separate because that seed must remain
+valid before any demo-derived relation exists. Running `demo` does not change
+the source datasets or reinterpret their fields: it still loads the same Leeds
+ArcGIS and ONS Census data, then reconciles the saved derived definitions and
+map configuration around them.
 
 On a new instance, `init` prints the configuration administrator password to
 the console once. Save it in your password manager before continuing; it is
@@ -143,7 +150,7 @@ separate things, and the output names each one:
 | Loading sources | Two source databases are populated straight from their publishers: Leeds City Council's ArcGIS feeds into `ops-db`, ONS Census 2021 into `census-db` |
 | Registering and provisioning | Both are attached to MAPP as federated sources |
 | Profiling and describing | Each exposed relation is profiled; with a Gemini key set, every included relation and field is also described by a model |
-| Building and publishing | Two derived layers are computed across both sources and put on the map |
+| Building and publishing | Four versioned derived relations are generically planned and reconciled, then the saved ten-layer workspace is published |
 
 Then open:
 
@@ -154,13 +161,17 @@ The dashboard password was printed by `init`. If you have lost it,
 `./bin/mapp reset-config-password` issues a new one.
 
 **What you just built.** Two independent PostgreSQL servers holding real open
-data, attached read-only to MAPP, with a population layer and a smoke-control
-layer computed by intersecting one source's polygons with the other's census
-geography — a join across two separate databases, aggregated into H3 cells.
+data, attached read-only to MAPP, plus four managed relations: Output Area
+population quintiles, definitive-path length and cost bands, Output Area
+country-of-birth categories, and a materialized H3 view of those birth
+categories. The saved workspace presents those relations as eight data layers,
+alongside bus stops and OpenStreetMap.
 
 If anything goes wrong at this stage, the answer is almost always to run
 `./bin/mapp demo` again. It is idempotent, and a broken demo is rebuilt rather
-than repaired.
+than repaired. It will not silently plan for a different live map extent or
+overwrite an unrelated derived definition that happens to use one of the four
+demo names; restore the packaged scope or resolve that name collision first.
 
 ## 3. The mental model
 
@@ -300,10 +311,14 @@ A derived layer is a relation MAPP computes and owns, in the `derived_layers`
 schema. The platform tracks its definition, refreshes it on request, and
 refuses to drop anything the workspace still points at.
 
-The recipe the demo uses is **area-weighted H3 allocation**: take polygons from
-one source, intersect them with a census geography from another, weight each
-measure by the proportion of area that overlaps, and aggregate into H3 cells at
-a chosen resolution.
+The demo carries four versioned SQL fixtures and sends every one through the
+generic derived-layer planner before changing the database. Three are
+workspace-scoped views; the fourth is a materialized H3 relation that allocates
+Census Output Area measures by spheroidal WGS84 area and emits Web Mercator
+geometry for rendering. A repeat demo run keeps matching views and refreshes
+the matching materialized relation after its source has been reloaded. A known
+older demo definition is replaced atomically, while a same-name definition
+that cannot be proved to belong to the demo is refused.
 
 Two things are worth knowing before you build one:
 
@@ -327,8 +342,14 @@ filters. MAPP does not let you edit it in place. You build a **proposal**,
 preflight it, and apply it — so every change to what the map shows is a
 reviewable record.
 
-`./bin/mapp demo` does exactly this at its final step, which is why it prints
-`apply: ok` rather than writing a file.
+`./bin/mapp demo` does exactly this at its final step. It checks the complete
+saved workspace against the current revision, creates a fingerprint-bound
+proposal, applies it, and waits for XYZ to load the committed fingerprint. The
+proposal retains both original and candidate workspaces, so an interrupted
+apply can be reconciled instead of blindly repeated. This is a full demo
+workspace replacement, not a merge of its layers with local customisations.
+The saved workspace also retains the bundled tile-retry plugin configuration,
+so transient or partial tile failures keep their normal recovery behaviour.
 
 Read: [`workspace-schema.md`](workspace-schema.md)
 
@@ -370,10 +391,13 @@ Read: [`backup-restore.md`](backup-restore.md)
 ./bin/mapp reset-data --confirm
 ```
 
-Removes the packaged database entirely and restores the seed workspace. Read
-the warning it prints: it destroys derived layers, the federation registry and
-the semantic catalogue, and those do not come back. Your source databases are
-untouched, so `./bin/mapp demo` rebuilds the showcase from them afterwards.
+Removes the packaged database entirely and restores the separate base seed
+workspace. Read the warning it prints: it destroys derived layers, the
+federation registry and the semantic catalogue, and those do not come back.
+The full ten-layer demo is deliberately not the seed because its four managed
+relations do not exist in a fresh packaged database. Your source databases are
+untouched, so `./bin/mapp demo` rebuilds those relations and publishes the
+saved showcase afterwards.
 
 ### Production
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Rebuild the two-source federated demo from a seeded pair of source databases.
+# Rebuild the saved demo workspace from a seeded pair of source databases.
 #
 # Run ./docker/demo-sources/seed.sh first. This takes it from "two databases
 # holding data" to "a map served from them", so the arrangement survives this
 # machine: register both aliases, observe, profile the exposed relations,
-# provision, build the derived layers, and put them on the map.
+# provision, reconcile the workspace's derived layers, and publish the exact
+# versioned map configuration.
 #
 # Idempotent. Every step tolerates its own prior success, so a partial run can
 # simply be repeated.
@@ -12,7 +13,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${MAPP_ENV_FILE:-${ROOT_DIR}/.env}"
-RECIPES="$(dirname "${BASH_SOURCE[0]}")/recipes"
+DEMO_DIR="$(dirname "${BASH_SOURCE[0]}")"
+DERIVED_FIXTURES="${DEMO_DIR}/derived-layers"
+DEMO_WORKSPACE="${DEMO_DIR}/workspace-demo.json"
 
 dotenv_value() { sed -n "s/^$1=//p" "${ENV_FILE}" | tail -n 1; }
 
@@ -44,7 +47,11 @@ from control_plane import ControlStore
 
 store = ControlStore(Path(os.environ["CONTROL_DIR"]))
 expires = (
-    dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=45)
+    # Four sequential derived mutations can each spend 30 minutes waiting for
+    # admission and 60 minutes running. Leave the preceding bounded semantic
+    # generation phase ample room too; the EXIT trap still revokes this token
+    # as soon as the demo finishes.
+    dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=24)
 ).isoformat()
 token, record = store.create_token(
     "demo-layers-" + secrets.token_hex(8),
@@ -119,6 +126,54 @@ read -r TOKEN TOKEN_ID < <(mint_token)
 [ -n "${TOKEN:-}" ] || fail "could not mint a token; is config-ui running?"
 
 step() { printf '\n== %s\n' "$*"; }
+
+# Generic derived-layer planning deliberately resolves its spatial scope from
+# the live workspace. The packaged seed and saved demo have the same scope, so
+# clean and repeated demo runs are deterministic. Refuse a different live
+# scope before mutating federation or derived state: silently planning against
+# it would publish the saved map with truncated or misplaced derived output.
+current_workspace="$(api GET /api/workspace)"
+python3 - "${DEMO_WORKSPACE}" "${current_workspace}" <<'PY' || fail \
+  "the live workspace scope differs from the saved demo; restore the packaged workspace scope before rebuilding the demo"
+import json
+import sys
+
+saved = json.load(open(sys.argv[1], encoding="utf-8"))
+response = json.loads(sys.argv[2])
+current = response.get("workspace")
+if not isinstance(current, dict):
+    raise SystemExit("could not read the live workspace")
+
+saved_locale = saved.get("locale") or {}
+current_locale = current.get("locale") or {}
+for label, expected, actual in (
+    ("database", saved.get("dbs"), current.get("dbs")),
+    ("extent", saved_locale.get("extent"), current_locale.get("extent")),
+    ("view", saved_locale.get("view"), current_locale.get("view")),
+):
+    if actual != expected:
+        print(
+            "  Saved demo %s does not match the live workspace %s."
+            % (label, label),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+
+scope_revision="$(printf '%s' "${current_workspace}" | jqp \
+  "print(d.get('revision') or '')")"
+[ -n "${scope_revision}" ] || fail "could not read the live workspace revision"
+scope_response="$(api GET '/api/derived-layers/map-extent?locale=locale')"
+DEMO_RESOLVED_SCOPE="$(printf '%s' "${scope_response}" | python3 -c "
+import json,sys
+scope=json.load(sys.stdin).get('spatialScope')
+if not isinstance(scope, dict):
+    raise SystemExit('the API could not resolve the saved demo extent')
+print(json.dumps(scope, separators=(',', ':'))) ")"
+latest_scope_revision="$(api GET /api/workspace | jqp \
+  "print(d.get('revision') or '')")"
+[ "${latest_scope_revision}" = "${scope_revision}" ] || fail \
+  "the live workspace changed while the demo planning scope was being resolved"
 
 # ---------------------------------------------------------------- register --
 step "Registering the two demo sources"
@@ -785,70 +840,660 @@ if [ "${DESCRIBE}" = "1" ]; then
 fi
 
 # ----------------------------------------------------------------- derived --
-step "Building derived layers from the federated relations"
-for recipe in "${RECIPES}"/*.json; do
-  name="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['name'])" "${recipe}")"
-  if api GET "/api/derived-layers/${name}" 2>/dev/null | grep -q '"derivedLayer"'; then
-    printf '  %-32s already exists\n' "${name}"
-    continue
+fixture_definition() { # manifest
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+manifest = json.load(open(path, encoding="utf-8"))
+definition_keys = {
+    "name", "kind", "sources", "idColumn", "geometryColumn",
+    "description", "spatialScope",
+}
+local_keys = {"queryFile", "legacyQuerySha256"}
+unknown = sorted(set(manifest) - definition_keys - local_keys)
+missing = sorted((definition_keys | {"queryFile"}) - set(manifest))
+if unknown or missing:
+    raise SystemExit(
+        "%s has invalid keys (missing=%s, unknown=%s)"
+        % (path, missing, unknown)
+    )
+query_file = manifest["queryFile"]
+if (
+    not isinstance(query_file, str)
+    or not query_file
+    or Path(query_file).name != query_file
+):
+    raise SystemExit("%s queryFile must be an adjacent file name" % path)
+query_path = path.parent / query_file
+query = query_path.read_text(encoding="utf-8").strip()
+if not query:
+    raise SystemExit("%s is empty" % query_path)
+legacy = manifest.get("legacyQuerySha256", [])
+if (
+    not isinstance(legacy, list)
+    or any(
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in legacy
+    )
+):
+    raise SystemExit("%s legacyQuerySha256 must contain SHA-256 hex values" % path)
+description = manifest.get("description")
+if (
+    not isinstance(description, str)
+    or not description.startswith("MAPP demo fixture v")
+):
+    raise SystemExit("%s must carry the reserved MAPP demo ownership marker" % path)
+definition = {key: manifest[key] for key in definition_keys}
+definition["query"] = query
+print(json.dumps(definition, separators=(",", ":")))
+PY
+}
+
+fixture_decision() { # manifest current-response resolved-definition
+  python3 - "$1" "$2" "$3" <<'PY'
+import hashlib
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+response = json.loads(sys.argv[2])
+desired = json.loads(sys.argv[3])
+current = response.get("derivedLayer")
+if not isinstance(current, dict):
+    if response.get("code") == "derived_layer.not_found":
+        print("create")
+        raise SystemExit
+    raise SystemExit(
+        "derived-layer lookup failed: %s %s"
+        % (response.get("code"), str(response.get("error") or "")[:160])
+    )
+
+keys = (
+    "name", "kind", "query", "sources", "idColumn", "geometryColumn",
+    "description", "spatialScope",
+)
+
+def project(value):
+    output = {key: value.get(key) for key in keys}
+    output["query"] = str(output.get("query") or "").strip()
+    output["sources"] = sorted(output.get("sources") or [])
+    output["description"] = str(output.get("description") or "").strip()
+    return output
+
+current_definition = project(current)
+desired_definition = project(desired)
+if current_definition == desired_definition:
+    print("same")
+    raise SystemExit
+
+# An exact definition with only the ownership description missing is safe to
+# adopt.
+if all(
+    current_definition[key] == desired_definition[key]
+    for key in keys
+    if key != "description"
+):
+    print("replace")
+    raise SystemExit
+
+# The first saved workspace predates fixture ownership markers. Adopt only the
+# exact target or recovered query, interface and resolved scope; never a merely
+# similar same-name user definition. A future fixture SQL change must carry
+# the previous fixture hash in legacyQuerySha256 before it can replace it.
+signature_keys = (
+    "name", "kind", "sources", "idColumn", "geometryColumn", "spatialScope",
+)
+query_hash = hashlib.sha256(
+    current_definition["query"].encode("utf-8")
+).hexdigest()
+target_hash = hashlib.sha256(
+    desired_definition["query"].encode("utf-8")
+).hexdigest()
+if (
+    all(
+        current_definition[key] == desired_definition[key]
+        for key in signature_keys
+    )
+    and query_hash in {
+        target_hash,
+        *manifest.get("legacyQuerySha256", []),
+    }
+):
+    print("replace")
+    raise SystemExit
+
+raise SystemExit(
+    "derived layer %r already exists but is not owned by this demo; "
+    "rename or remove that definition before rerunning"
+    % desired_definition["name"]
+)
+PY
+}
+
+wait_for_derived_profile() { # name
+  local name="$1" response status attempt
+  for attempt in $(seq 1 180); do
+    response="$(api GET "/api/derived-layers/${name}")"
+    status="$(printf '%s' "${response}" | jqp \
+      "print(((d.get('derivedLayer') or {}).get('semanticProfile') or {}).get('status') or '')")"
+    case "${status}" in
+      ready) return 0 ;;
+      repair_required|archived)
+        fail "derived layer '${name}' has semantic status '${status}' and cannot be published"
+        ;;
+    esac
+    sleep 1
+  done
+  fail "timed out waiting for derived layer '${name}' to become semantically ready"
+}
+
+derived_capacity_state() { # background-jobs response
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+response = json.loads(sys.argv[1])
+jobs = response.get("backgroundJobs")
+if not isinstance(jobs, dict):
+    raise SystemExit("derived background capacity response is invalid")
+active = jobs.get("activeJobs")
+maximum = jobs.get("maxActiveJobs")
+if (
+    isinstance(active, bool)
+    or not isinstance(active, int)
+    or active < 0
+    or isinstance(maximum, bool)
+    or not isinstance(maximum, int)
+    or maximum < 1
+):
+    raise SystemExit("derived background capacity counts are invalid")
+state = "available" if active < maximum else "full"
+print("%s\t%d\t%d" % (state, active, maximum))
+PY
+}
+
+background_derived_mutation() { # path json-body name
+  local path="$1" body="$2" name="$3"
+  local response http_status payload response_code status_url
+  local operation_response operation_status operation_stage last_stage=""
+  local capacity_response capacity_values capacity_state active_jobs max_active_jobs
+  local attempt wait_announced=0
+
+  # Inspect the database-independent queue before submitting. Derived mutation
+  # admission follows its database preflight, so repeatedly probing with POST
+  # while all slots are known to be occupied would repeat expensive planning.
+  # The 429 branch remains necessary for the race between this GET and POST.
+  for attempt in $(seq 1 360); do
+    capacity_response="$(api GET /api/derived-layers/background-jobs)"
+    capacity_values="$(derived_capacity_state "${capacity_response}")"
+    IFS=$'\t' read -r \
+      capacity_state active_jobs max_active_jobs <<<"${capacity_values}"
+    if [ "${capacity_state}" = "full" ]; then
+      if [ "${wait_announced}" -eq 0 ]; then
+        printf '  %-42s waiting for a derived worker slot (%s/%s active)\n' \
+          "${name}" "${active_jobs}" "${max_active_jobs}"
+        wait_announced=1
+      fi
+      sleep 5
+      continue
+    fi
+    if ! response="$(curl -sS -X POST \
+      -H "Host: ${CONFIG_HOST}" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H 'Content-Type: application/json' \
+      --data-binary "${body}" \
+      --write-out $'\n%{http_code}' \
+      "${BASE}${path}")"
+    then
+      fail "could not submit background derived operation for '${name}'"
+    fi
+    http_status="${response##*$'\n'}"
+    payload="${response%$'\n'*}"
+    if [ "${http_status}" = "202" ]; then
+      status_url="$(printf '%s' "${payload}" | jqp \
+        "print(d.get('statusUrl') or '')")"
+      [ -n "${status_url}" ] || fail \
+        "background derived operation for '${name}' omitted its status URL"
+      break
+    fi
+    response_code="$(printf '%s' "${payload}" | jqp \
+      "print(d.get('code') or '')")"
+    if [ "${http_status}" = "429" ] \
+      && [ "${response_code}" = "derived_layer.background_capacity" ]
+    then
+      if [ "${wait_announced}" -eq 0 ]; then
+        printf '  %-42s waiting for a derived worker slot\n' "${name}"
+        wait_announced=1
+      fi
+      sleep 5
+      continue
+    fi
+    printf '%s' "${payload}" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+raise SystemExit(
+    '  background request refused: %s %s'
+    % (d.get('code') or '${http_status}', str(d.get('error') or '')[:240])
+)"
+  done
+  [ -n "${status_url:-}" ] || fail \
+    "timed out waiting to submit background derived operation for '${name}'"
+
+  for attempt in $(seq 1 1800); do
+    operation_response="$(api GET "${status_url}")"
+    IFS=$'\t' read -r operation_status operation_stage < <(
+      printf '%s' "${operation_response}" | python3 -c "
+import json,sys
+operation=(json.load(sys.stdin).get('operation') or {})
+print('%s\t%s' % (operation.get('status') or '', operation.get('stage') or ''))"
+    )
+    if [ -n "${operation_stage}" ] \
+      && [ "${operation_stage}" != "${last_stage}" ]
+    then
+      printf '  %-42s %s\n' "${name}" "${operation_stage}"
+      last_stage="${operation_stage}"
+    fi
+    case "${operation_status}" in
+      succeeded) return 0 ;;
+      running|cancelling) sleep 2 ;;
+      failed|cancelled|indeterminate)
+        printf '%s' "${operation_response}" | python3 -c "
+import json,sys
+operation=(json.load(sys.stdin).get('operation') or {})
+error=operation.get('error') or {}
+raise SystemExit(
+    '  background operation ended %s: %s %s'
+    % (
+        operation.get('status'), error.get('code') or '',
+        str(error.get('message') or '')[:240],
+    )
+)"
+        ;;
+      *) fail "background operation for '${name}' returned invalid status '${operation_status}'" ;;
+    esac
+  done
+  fail "timed out waiting for background derived operation for '${name}'"
+}
+
+validate_xyz_reload() { # reload-response
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+
+response = json.loads(sys.argv[1])
+expected = response.get("expectedWorkspaceFingerprint")
+status = response.get("status")
+requested = response.get("requestedGeneration")
+if (
+    not isinstance(expected, str)
+    or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+    or not isinstance(status, dict)
+    or status.get("completed") is not True
+    or status.get("healthy") is not True
+    or status.get("workspaceFingerprint") != expected
+    or isinstance(requested, bool)
+    or not isinstance(requested, int)
+    or requested < 1
+    or isinstance(status.get("appliedGeneration"), bool)
+    or not isinstance(status.get("appliedGeneration"), int)
+    or status["appliedGeneration"] < requested
+):
+    raise SystemExit("XYZ did not load the saved workspace fingerprint")
+PY
+}
+
+ensure_saved_workspace_xyz() {
+  local response
+  # JSON equality above proves the live workspace has the saved content, but
+  # not that both files have identical serialization. Omit a caller-computed
+  # digest: the reload endpoint derives the current raw fingerprint while
+  # holding the save/reload lock and returns the value it bound.
+  printf '  requesting a reload bound to the installed workspace\n'
+  response="$(api POST /api/xyz/reload '{"confirmed":true,"timeout":120}')"
+  validate_xyz_reload "${response}"
+  printf '  XYZ reloaded the saved workspace fingerprint\n'
+}
+
+workspace_apply_state() { # saved-workspace http-status response
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import re
+import sys
+
+saved = json.load(open(sys.argv[1], encoding="utf-8"))
+try:
+    http_status = int(sys.argv[2])
+except ValueError as exc:
+    raise SystemExit("workspace apply returned an invalid HTTP status") from exc
+response = json.loads(sys.argv[3])
+proposal = response.get("proposal")
+reload = response.get("reload")
+if http_status not in {200, 504}:
+    raise SystemExit(
+        "workspace apply refused: %s %s"
+        % (response.get("code") or http_status, str(response.get("error") or "")[:240])
+    )
+if (
+    not isinstance(proposal, dict)
+    or proposal.get("status") != "applied"
+    or proposal.get("candidate") != saved
+    or not isinstance(reload, dict)
+):
+    raise SystemExit("workspace apply did not commit the saved demo")
+fingerprint = proposal.get("appliedFingerprint")
+reload_status = reload.get("status")
+if (
+    not isinstance(fingerprint, str)
+    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+    or reload.get("expectedWorkspaceFingerprint") != fingerprint
+    or not isinstance(reload_status, dict)
+):
+    raise SystemExit("workspace apply returned invalid reload evidence")
+if http_status == 200:
+    if (
+        reload_status.get("completed") is not True
+        or reload_status.get("healthy") is not True
+        or reload_status.get("workspaceFingerprint") != fingerprint
+    ):
+        raise SystemExit("workspace apply did not reload the saved demo")
+    print("ready")
+else:
+    if reload_status.get("completed") is not False:
+        raise SystemExit("workspace apply timeout returned invalid reload evidence")
+    print("recover")
+PY
+}
+
+apply_saved_workspace_proposal() { # proposal-id saved-workspace
+  local identifier="$1" saved_workspace="$2"
+  local response http_status payload state current_workspace
+  if ! response="$(curl -sS -X POST \
+    -H "Host: ${CONFIG_HOST}" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H 'Content-Type: application/json' \
+    --data-binary '{"approved":true}' \
+    --write-out $'\n%{http_code}' \
+    "${BASE}/api/proposals/${identifier}/apply")"
+  then
+    fail "could not apply the saved demo workspace proposal"
   fi
-  # The recipe planner resolves a ready semantic source, constructs the
-  # scope-bounded allocation query and runs the create preflight. It applies
-  # no mutation: the returned createRequest is submitted separately.
-  plan="$(api POST /api/derived-layers/recipes/area-weighted-h3/plan "$(cat "${recipe}")")"
+  http_status="${response##*$'\n'}"
+  payload="${response%$'\n'*}"
+  state="$(workspace_apply_state \
+    "${saved_workspace}" "${http_status}" "${payload}")"
+  if [ "${state}" = "ready" ]; then
+    printf '  workspace applied and XYZ reloaded\n'
+    return 0
+  fi
+
+  printf '  workspace committed; recovering its timed-out XYZ reload\n'
+  current_workspace="$(api GET /api/workspace)"
+  python3 - "${saved_workspace}" "${current_workspace}" <<'PY' || fail \
+    "workspace changed after the timed-out apply; inspect it before reloading XYZ"
+import json
+import sys
+
+saved = json.load(open(sys.argv[1], encoding="utf-8"))
+current = json.loads(sys.argv[2]).get("workspace")
+raise SystemExit(0 if current == saved else 1)
+PY
+  ensure_saved_workspace_xyz
+}
+
+step "Reconciling the saved workspace's derived layers"
+shopt -s nullglob
+fixtures=("${DERIVED_FIXTURES}"/*.json)
+shopt -u nullglob
+[ "${#fixtures[@]}" -eq 4 ] || fail \
+  "the saved demo must contain exactly four derived-layer manifests"
+
+capabilities="$(api GET /api/derived-layers/capabilities)"
+printf '%s' "${capabilities}" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+planning = d.get('definitionPlanning') or {}
+h3 = d.get('h3Readiness') or {}
+if d.get('configured') is not True:
+    raise SystemExit('  derived-layer management is not configured')
+if planning.get('path') != '/api/derived-layers/plan':
+    raise SystemExit(
+        '  the running API does not advertise derived-layers plan; rebuild '
+        'or restart config-ui before running the demo'
+    )
+if h3.get('ready') is not True:
+    raise SystemExit(
+        '  H3 is not ready: %s' % (h3.get('reasons') or h3.get('code') or h3)
+    )"
+
+definitions=()
+derived_names=()
+kinds=()
+create_requests=()
+desired_definitions=()
+fixture_actions=()
+
+# Plan and collision-check the complete set before applying the first change.
+# A malformed final fixture or a foreign same-name definition therefore leaves
+# every managed relation unchanged.
+for fixture in "${fixtures[@]}"; do
+  definition="$(fixture_definition "${fixture}")"
+  name="$(python3 -c \
+    "import json,sys; print(json.loads(sys.argv[1])['name'])" \
+    "${definition}")"
+  kind="$(python3 -c \
+    "import json,sys; print(json.loads(sys.argv[1])['kind'])" \
+    "${definition}")"
+  definitions+=("${definition}")
+  derived_names+=("${name}")
+  kinds+=("${kind}")
+
+  # The generic planner resolves the versioned workspace scope, verifies the
+  # semantic source profiles, and executes every query/access-path/storage
+  # preflight. It mutates nothing; creation remains a separate request bound
+  # to the returned plan fingerprint.
+  plan="$(api POST /api/derived-layers/plan "${definition}")"
   create="$(printf '%s' "${plan}" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
-if d.get('code'):
-    sys.stderr.write('  plan refused: %s %s\n' % (d['code'], (d.get('error') or '')[:160]))
-    raise SystemExit(1)
-print(json.dumps(d['recipePlan']['createRequest']))")"
-  api POST /api/derived-layers "${create}" \
-    | jqp "
-name = (d.get('derivedLayer') or {}).get('name')
-if not name:
-    raise SystemExit('  create refused: %s %s' % (d.get('code'), (d.get('error') or '')[:160]))
-print('  %-32s created' % name)"
-  # Read it back. The create response is the server describing what it did,
-  # and printing a name out of it is not evidence the relation is there --
-  # which is how this step came to report two layers it had not left behind.
-  api GET "/api/derived-layers/${name}" \
-    | jqp "
-layer = d.get('derivedLayer') or {}
-if not layer.get('name'):
-    raise SystemExit('  %s is absent after a create that reported success: %s'
-                     % ('${name}', d.get('code')))" \
-    || fail "derived layer '${name}' was not created"
+p = d.get('derivedLayerPlan')
+if not isinstance(p, dict):
+    raise SystemExit('  plan refused: %s %s' % (d.get('code'), str(d.get('error') or '')[:160]))
+if d.get('mutationApplied') is not False:
+    raise SystemExit('  plan response did not prove mutationApplied=false')
+request = p.get('createRequest') or {}
+fingerprint = request.get('planFingerprint')
+if not isinstance(fingerprint, str) or not fingerprint.startswith('sha256:'):
+    raise SystemExit('  plan response omitted its create fingerprint')
+expected = json.loads(sys.argv[1])
+unbound = dict(request); unbound.pop('planFingerprint', None)
+if unbound != expected:
+    raise SystemExit('  planned create request differs from the saved fixture')
+print(json.dumps(request, separators=(',', ':'))) " "${definition}")"
+  desired="$(printf '%s' "${plan}" | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+p = d['derivedLayerPlan']
+expected_scope = json.loads(sys.argv[1])
+if p.get('resolvedSpatialScope') != expected_scope:
+    raise SystemExit('  planned scope differs from the saved demo workspace')
+definition = dict(p['createRequest'])
+definition.pop('planFingerprint', None)
+definition['spatialScope'] = p['resolvedSpatialScope']
+print(json.dumps(definition, separators=(',', ':'))) " \
+    "${DEMO_RESOLVED_SCOPE}")"
+
+  probe="$(api GET "/api/derived-layers/${name}" 2>/dev/null || true)"
+  action="$(fixture_decision "${fixture}" "${probe}" "${desired}")"
+  create_requests+=("${create}")
+  desired_definitions+=("${desired}")
+  fixture_actions+=("${action}")
+  printf '  %-42s planned (%s)\n' "${name}" "${action}"
+done
+
+for index in "${!fixtures[@]}"; do
+  fixture="${fixtures[index]}"
+  definition="${definitions[index]}"
+  name="${derived_names[index]}"
+  kind="${kinds[index]}"
+  create="${create_requests[index]}"
+  desired="${desired_definitions[index]}"
+  action="${fixture_actions[index]}"
+  # Close the gap between the all-fixture collision check and this mutation.
+  # A concurrently-created exact target is harmless; any other action change
+  # requires a fresh full planning pass rather than overwriting new state.
+  probe="$(api GET "/api/derived-layers/${name}" 2>/dev/null || true)"
+  current_action="$(fixture_decision "${fixture}" "${probe}" "${desired}")"
+  if [ "${current_action}" = "same" ]; then
+    action="same"
+  elif [ "${current_action}" != "${action}" ]; then
+    fail "derived layer '${name}' changed after planning; rerun the demo from a fresh plan"
+  fi
+  case "${action}" in
+    create)
+      request="$(python3 -c "
+import json,sys
+d=json.loads(sys.argv[1]); d['background']=True
+print(json.dumps(d, separators=(',', ':')))" "${create}")"
+      background_derived_mutation /api/derived-layers "${request}" "${name}"
+      printf '  %-42s created\n' "${name}"
+      ;;
+    replace)
+      replacement="$(python3 -c "
+import json,sys
+d = json.loads(sys.argv[1]); d['confirmed'] = True; d['background'] = True
+print(json.dumps(d, separators=(',', ':')))" "${definition}")"
+      background_derived_mutation \
+        "/api/derived-layers/${name}/replace" "${replacement}" "${name}"
+      printf '  %-42s updated from the saved fixture\n' "${name}"
+      ;;
+    same)
+      if [ "${kind}" = "materialized" ]; then
+        background_derived_mutation \
+          "/api/derived-layers/${name}/refresh" \
+          '{"confirmed":true,"background":true}' "${name}"
+        printf '  %-42s refreshed from the reloaded source\n' "${name}"
+      else
+        printf '  %-42s already matches\n' "${name}"
+      fi
+      ;;
+    *) fail "invalid fixture action '${action}' for '${name}'" ;;
+  esac
+
+  # Read back and compare the complete managed definition. A successful HTTP
+  # mutation response alone is not evidence that the intended relation is the
+  # one now stored.
+  probe="$(api GET "/api/derived-layers/${name}")"
+  [ "$(fixture_decision "${fixture}" "${probe}" "${desired}")" = "same" ] \
+    || fail "derived layer '${name}' does not match its saved fixture"
+done
+
+step "Waiting for the derived semantic profiles"
+for name in "${derived_names[@]}"; do
+  wait_for_derived_profile "${name}"
+  printf '  %-42s ready\n' "${name}"
 done
 
 # --------------------------------------------------------------- workspace --
-step "Publishing the map layers"
-revision="$(api GET /api/workspace | jqp "print(d.get('revision'))")"
-proposal="$(python3 -c "
-import json,sys
-ops = json.load(open(sys.argv[1]))
+step "Publishing the saved demo workspace"
+workspace_response="$(api GET /api/workspace)"
+if python3 - "${DEMO_WORKSPACE}" "${workspace_response}" <<'PY'
+import json
+import sys
+saved = json.load(open(sys.argv[1], encoding="utf-8"))
+current = json.loads(sys.argv[2]).get("workspace")
+raise SystemExit(0 if current == saved else 1)
+PY
+then
+  printf '  workspace already matches the saved demo\n'
+  ensure_saved_workspace_xyz
+else
+  revision="$(printf '%s' "${workspace_response}" | jqp \
+    "print(d.get('revision') or '')")"
+  [ -n "${revision}" ] || fail "could not read the live workspace revision"
+  proposal="$(python3 - "${DEMO_WORKSPACE}" "${revision}" \
+    "${workspace_response}" <<'PY'
+import json
+import sys
+
+workspace = json.load(open(sys.argv[1], encoding="utf-8"))
+current = json.loads(sys.argv[3]).get("workspace")
+if not isinstance(current, dict):
+    raise SystemExit("could not read the current workspace")
+
+def pointer(key):
+    return "/" + key.replace("~", "~0").replace("/", "~1")
+
+operations = [
+    {"op": "unset", "path": pointer(key)}
+    for key in current
+    if key not in workspace
+]
+operations.extend(
+    {"op": "set", "path": pointer(key), "value": value}
+    for key, value in workspace.items()
+)
 print(json.dumps({
-  'revision': sys.argv[2],
-  'operations': [{'op': 'set', 'path': '/locale/layers/' + k, 'value': v}
-                 for k, v in ops.items()],
-  'explanation': 'Publish the two-source federated demo layers.',
-}))" "$(dirname "${BASH_SOURCE[0]}")/workspace-demo.json" "${revision}")"
+    "revision": sys.argv[2],
+    "operations": operations,
+    "explanation": (
+        "Load the versioned demo workspace and its four reconciled derived "
+        "layers. ./bin/mapp demo applies this saved showcase configuration."
+    ),
+}, separators=(",", ":")))
+PY
+)"
 
-check="$(api POST /api/proposals/check "${proposal}")"
-fingerprint="$(printf '%s' "${check}" | python3 -c "
-import json,sys
-c = (json.load(sys.stdin).get('check') or {})
+  check="$(api POST /api/proposals/check "${proposal}")"
+  fingerprint="$(printf '%s' "${check}" | python3 -c "
+import hashlib,json,sys
+d = json.load(sys.stdin)
+c = d.get('check') or {}
 if not c.get('valid'):
-    sys.stderr.write('  workspace preflight failed: %s\n' % (c.get('errors') or c))
-    raise SystemExit(1)
-print(c['checkFingerprint'])")"
-
-bound="$(python3 -c "
+    raise SystemExit('  workspace preflight failed: %s' % (c.get('errors') or c))
+target = json.load(open(sys.argv[1], encoding='utf-8'))
+target_hash = hashlib.sha256(json.dumps(
+    target, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    allow_nan=False,
+).encode()).hexdigest()
+if c.get('candidateHash') != target_hash:
+    raise SystemExit('  workspace preflight candidate is not the saved demo')
+fingerprint = c.get('checkFingerprint')
+if not fingerprint:
+    raise SystemExit('  workspace preflight omitted its fingerprint')
+print(fingerprint) " "${DEMO_WORKSPACE}")"
+  bound="$(python3 -c "
 import json,sys
-b = json.loads(sys.argv[1]); b['checkFingerprint'] = sys.argv[2]
-print(json.dumps(b))" "${proposal}" "${fingerprint}")"
-identifier="$(api POST /api/proposals "${bound}" | jqp "print((d.get('proposal') or {}).get('id') or d.get('code'))")"
-api POST "/api/proposals/${identifier}/apply" '{"approved": true}' \
-  | jqp "print('  apply:', d.get('code') or 'ok')"
+d = json.loads(sys.argv[1]); d['checkFingerprint'] = sys.argv[2]
+print(json.dumps(d, separators=(',', ':')))" "${proposal}" "${fingerprint}")"
+  identifier="$(api POST /api/proposals "${bound}" | jqp "
+proposal = d.get('proposal') or {}
+identifier = proposal.get('id')
+if not identifier or proposal.get('status') != 'pending':
+    raise SystemExit('  workspace proposal refused: %s %s' % (d.get('code'), str(d.get('error') or '')[:160]))
+print(identifier)")"
+  apply_saved_workspace_proposal "${identifier}" "${DEMO_WORKSPACE}"
 
-printf '\nDemo rebuilt. Verify with ./bin/mapp verify and open the map.\n'
+fi
+
+# Close the read/reload race in the already-matching path as well as proving
+# the proposal path's final state. The reload endpoint binds whichever exact
+# bytes are current under its lock; this readback proves those bytes still
+# represent the saved workspace before the command reports success.
+workspace_response="$(api GET /api/workspace)"
+python3 - "${DEMO_WORKSPACE}" "${workspace_response}" <<'PY' || fail \
+  "the published workspace does not match the saved demo"
+import json
+import sys
+saved = json.load(open(sys.argv[1], encoding="utf-8"))
+current = json.loads(sys.argv[2]).get("workspace")
+raise SystemExit(0 if current == saved else 1)
+PY
+
+printf '\nDemo rebuilt: four derived relations and the saved ten-layer workspace are ready.\n'
+printf 'Verify with ./bin/mapp verify and open the map.\n'

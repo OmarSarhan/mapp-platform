@@ -51,10 +51,47 @@ database; omit the topic to check all 47 reviewed England topic tables.
 `./bin/mapp demo` loads the Leeds showcase into its two source databases
 directly from their publishers -- the sample ArcGIS feeds into `ops-db` and
 the reviewed England Census 2021 topics into `census-db` -- then registers,
-observes and provisions both as federated sources and publishes the map
-layers built across them. It is idempotent: rerunning it reloads the sources
-and republishes. A demo that goes wrong is reset and rebuilt with it rather
-than repaired.
+observes and provisions both as federated sources. The source dataset choices
+and field meanings are unchanged; the versioned derived catalogue and
+published workspace are the parts reconciled by the new demo contract.
+Retained source volumes also have the demo-owned read-only login password
+reconciled from `.env`; rotating that credential therefore does not require
+discarding or reloading either source database.
+
+Before changing federation or derived state, the command requires the live
+workspace database, default view, and extent to match the saved demo. Generic
+derived planning resolves its authoritative scope from that live workspace, so
+continuing across a mismatch could build truncated relations and then publish
+the saved extent around them. Restore the packaged scope before rerunning; the
+command does not silently choose one side.
+
+The command generically plans all four versioned derived fixtures and checks
+all four names before applying the first definition change. It creates missing
+definitions, atomically replaces only an exact or recognised older demo
+definition, and refuses a same-name definition whose query and interface do
+not prove demo ownership. Matching views are retained. The matching
+materialized H3 fixture is refreshed after the source reload; a newly created
+or replaced materialized fixture is already built from that current source.
+Mutations use the bounded background queue one at a time. If every admission
+slot is occupied, the command waits and resubmits only the API's proven
+non-mutating capacity rejection; after admission it follows the operation to a
+terminal result. Every resulting semantic profile must reach `ready` before
+workspace publication begins.
+
+The final publication replaces the live workspace with the complete saved
+ten-layer workspace, including its tile-retry plugin configuration. It is not
+a merge with local layers or styles. The command submits the replacement
+through the normal revision-bound proposal check, create, approved apply, and
+exact-fingerprint XYZ reload path, then reads the workspace back. Proposal
+application records its recoverable `applying` state before commit; if the
+client loses the response, reconcile the proposal, workspace fingerprint, and
+XYZ status rather than assuming the replacement failed. A rerun is idempotent
+when the saved workspace and definitions already match.
+
+The full demo workspace is versioned at
+`docker/demo-sources/workspace-demo.json`. It remains separate from
+`instance/workspace.seed.json`, which must be valid against a fresh packaged
+database before any of those four derived relations exists.
 
 Before running `./bin/mapp demo`, confirm headroom on the census-db volume. The raw
 statistic values alone are approximately 636 MiB (667 MB), while PostgreSQL
@@ -98,6 +135,12 @@ fresh database, and runs the unrestricted ETL. This clears workspace layers
 which depended on deleted derived or custom relations. Dashboard
 authentication, audit records, proposals, artifacts, and public assets live
 under `var` and are not reset.
+
+The restored file is intentionally the small base workspace, not the saved
+ten-layer demo. After reset has verified that fresh state, `./bin/mapp demo`
+reconciles the four managed definitions and proposal-applies the full saved
+workspace. Do not copy the demo workspace over the seed: verification runs
+before the derived relations are rebuilt.
 
 The semantic catalog no longer survives a reset. It is a schema in the bundled
 database, so removing that volume destroys generated profiles, curated

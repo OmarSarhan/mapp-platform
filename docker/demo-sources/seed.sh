@@ -31,11 +31,16 @@ compose=(
 
 SOURCE_USER="$(dotenv_value SOURCE_POSTGRES_USER)"
 READER_USER="$(dotenv_value SOURCE_READER_USER)"
+READER_PASSWORD="$(dotenv_value SOURCE_READER_PASSWORD)"
 CENSUS_DB="$(dotenv_value CENSUS_POSTGRES_DB)"
 OPS_DB="$(dotenv_value OPS_POSTGRES_DB)"
 
 workspace_repair_extent() {
-  local workspace="${ROOT_DIR}/var/workspace/workspace.json"
+  # Demo source repair must follow the versioned demo workspace, not whichever
+  # mutable workspace happens to be live when the command starts. Otherwise a
+  # custom live extent can produce source geometry that does not cover the map
+  # this same demo run publishes.
+  local workspace="${ROOT_DIR}/docker/demo-sources/workspace-demo.json"
   if [[ ! -f "${workspace}" ]]; then
     workspace="${ROOT_DIR}/instance/workspace.seed.json"
   fi
@@ -103,7 +108,12 @@ seed_one() {
   # reader budget here so `mapp demo` upgrades retained census/ops volumes too.
   "${compose[@]}" exec -T "${service}" psql \
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
-    --set reader_user="${READER_USER}" <<'SQL' >/dev/null
+    --set reader_user="${READER_USER}" \
+    --set reader_password="${READER_PASSWORD}" <<'SQL' >/dev/null
+-- Retained source volumes keep their roles when .env credentials are rotated.
+-- Reconcile the demo-owned read-only login on every load, just as the bundled
+-- database upgrade reconciles its service roles.
+ALTER ROLE :"reader_user" LOGIN PASSWORD :'reader_password';
 ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
 SQL
 

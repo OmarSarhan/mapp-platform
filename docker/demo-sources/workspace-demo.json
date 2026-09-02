@@ -1,166 +1,947 @@
 {
-  "Fed_census_population_h3_r9": {
-    "name": "Population \u2014 from census-db",
-    "display": true,
-    "format": "mvt",
-    "table": "derived_layers.fed_census_population_h3_r9",
-    "geom": "geom_3857",
-    "srid": "3857",
-    "qID": "h3_id",
-    "zIndex": 40,
-    "group": "Federated: census-db",
-    "infoj": [
-      {
-        "type": "numeric",
-        "field": "population_total",
-        "label": "Usual residents"
-      },
-      {
-        "type": "numeric",
-        "field": "households_no_car",
-        "label": "Households, no car"
-      },
-      {
-        "type": "numeric",
-        "field": "deprived_four_dimensions",
-        "label": "Deprived in 4 dimensions"
-      },
-      {
-        "type": "text",
-        "field": "h3_id",
-        "label": "H3 cell"
-      }
+  "key": "leeds-mapp-explore",
+  "dbs": "MAPP",
+  "locale": {
+    "name": "Leeds GIS sampler",
+    "extent": {
+      "north": 54,
+      "east": -1.2,
+      "south": 53.65,
+      "west": -1.85,
+      "mask": true
+    },
+    "view": {
+      "lat": 53.8008,
+      "lng": -1.5491,
+      "z": 11
+    },
+    "mapviewControls": [
+      "Zoom"
     ],
-    "style": {
-      "default": {
-        "fillColor": "#eff3ff",
-        "fillOpacity": 0.75,
-        "strokeColor": "#08306b",
-        "strokeOpacity": 0.25,
-        "strokeWidth": 0.4
-      },
-      "theme": {
-        "type": "graduated",
-        "title": "Usual residents per H3 r9 cell",
-        "field": "population_total",
-        "graduated_breaks": "less_than",
-        "categories": [
-          {
-            "value": 5,
-            "label": "Under 5",
-            "style": {
-              "fillColor": "#eff3ff"
-            }
-          },
-          {
-            "value": 25,
-            "label": "5 to 25",
-            "style": {
-              "fillColor": "#c6dbef"
-            }
-          },
-          {
-            "value": 100,
-            "label": "25 to 100",
-            "style": {
-              "fillColor": "#9ecae1"
-            }
-          },
-          {
-            "value": 250,
-            "label": "100 to 250",
-            "style": {
-              "fillColor": "#6baed6"
-            }
-          },
-          {
-            "value": 500,
-            "label": "250 to 500",
-            "style": {
-              "fillColor": "#3182bd"
-            }
-          },
-          {
-            "value": 2300,
-            "label": "500 or more",
-            "style": {
-              "fillColor": "#08519c"
-            }
-          }
-        ]
-      },
-      "elements": [
-        "theme",
-        "hover",
-        "opacitySlider"
-      ],
-      "opacitySlider": true,
-      "hover": {
+    "ScaleLine": "metric",
+    "plugins": [
+      "/instance/plugins/tile-retry/index.mjs"
+    ],
+    "syncPlugins": [
+      "tile_retry"
+    ],
+    "tile_retry": {},
+    "layers": {
+      "Open_Street_Map": {
+        "name": "Open Street Map",
         "display": true,
-        "field": "population_total",
-        "title": "Usual residents (census-db)"
-      }
-    }
-  },
-  "Fed_smoke_control_h3_r9": {
-    "name": "Smoke control \u2014 from ops-db",
-    "display": true,
-    "format": "mvt",
-    "table": "derived_layers.fed_smoke_control_h3_r9",
-    "geom": "geom_3857",
-    "srid": "3857",
-    "qID": "h3_id",
-    "zIndex": 41,
-    "group": "Federated: ops-db",
-    "infoj": [
-      {
-        "type": "numeric",
-        "field": "smoke_control_area_m2",
-        "label": "Smoke control area (m2)"
+        "format": "tiles",
+        "URI": "https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attribution": {
+          "© OpenStreetMap contributors": "https://www.openstreetmap.org/copyright"
+        }
       },
-      {
-        "type": "text",
-        "field": "h3_id",
-        "label": "H3 cell"
-      }
-    ],
-    "style": {
-      "default": {
-        "fillColor": "#1b7837",
-        "fillOpacity": 0.4,
-        "strokeColor": "#00441b",
-        "strokeOpacity": 1,
-        "strokeWidth": 1.2,
-        "lineDash": [
-          4,
-          3
-        ]
-      },
-      "theme": {
-        "type": "basic",
-        "label": "Smoke control (ops-db, via postgres_fdw)",
+      "Bus_Stops": {
+        "name": "Bus Stops",
+        "display": false,
+        "format": "mvt",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "object_id",
+        "zIndex": 40,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "stop_name",
+            "title": "Bus stop",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "stop_id",
+            "title": "Stop ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "on_street",
+            "title": "On street",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "town",
+            "title": "Town",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "stand",
+            "title": "Stand",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "towards",
+            "title": "Towards",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "direction",
+            "title": "Direction (source code)",
+            "skipNullValue": true
+          }
+        ],
         "style": {
-          "fillColor": "#1b7837",
-          "fillOpacity": 0.4,
-          "strokeColor": "#00441b",
-          "strokeWidth": 1.2,
-          "lineDash": [
-            4,
-            3
+          "default": {
+            "icon": {
+              "url": "/instance/svg/bus.svg",
+              "scale": 0.8
+            }
+          },
+          "hover": {
+            "display": true,
+            "field": "stop_name",
+            "title": "Bus stop"
+          },
+          "elements": [
+            "hover"
+          ]
+        },
+        "tables": {
+          "0": null,
+          "15": "source_ops.bus_stops"
+        }
+      },
+      "Census_OA_Population": {
+        "name": "2021 Census population by Output Area",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_population_quintiles",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "population_display",
+            "fieldfx": "to_char(population, 'FM999,999,999,990')",
+            "title": "Population (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#f7fbff",
+            "fillOpacity": 0.55,
+            "strokeColor": "#08306b",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Population (2021 Census)",
+            "field": "population_quintile",
+            "categories": [
+              {
+                "value": 1,
+                "label": "Lowest-population fifth",
+                "style": {
+                  "fillColor": "#f7fbff",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#08306b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "Lower-middle population fifth",
+                "style": {
+                  "fillColor": "#c6dbef",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#08306b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "Middle population fifth",
+                "style": {
+                  "fillColor": "#9ecae1",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#08306b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 4,
+                "label": "Upper-middle population fifth",
+                "style": {
+                  "fillColor": "#4292c6",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#08306b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 5,
+                "label": "Highest-population fifth",
+                "style": {
+                  "fillColor": "#08519c",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#08306b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "hover_label",
+            "title": "Output area and population"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        }
+      },
+      "Definitive_Paths": {
+        "name": "Definitive Paths — length bands",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.definitive_paths_length_cost",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "object_id",
+        "zIndex": 30,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "path_name_display",
+            "title": "Path name",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "estimated_cost_display",
+            "title": "Estimated cost (£30/m²; length × width)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "strokeColor": "#31a354",
+            "strokeOpacity": 0.9,
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Path length",
+            "field": "length_quintile",
+            "categories": [
+              {
+                "value": 1,
+                "label": "Shortest fifth",
+                "style": {
+                  "strokeColor": "#c7e9c0",
+                  "strokeOpacity": 0.9,
+                  "strokeWidth": 6
+                }
+              },
+              {
+                "value": 2,
+                "label": "Shorter-middle fifth",
+                "style": {
+                  "strokeColor": "#a1d99b",
+                  "strokeOpacity": 0.9,
+                  "strokeWidth": 6
+                }
+              },
+              {
+                "value": 3,
+                "label": "Middle-length fifth",
+                "style": {
+                  "strokeColor": "#74c476",
+                  "strokeOpacity": 0.9,
+                  "strokeWidth": 6
+                }
+              },
+              {
+                "value": 4,
+                "label": "Longer-middle fifth",
+                "style": {
+                  "strokeColor": "#31a354",
+                  "strokeOpacity": 0.9,
+                  "strokeWidth": 6
+                }
+              },
+              {
+                "value": 5,
+                "label": "Longest fifth",
+                "style": {
+                  "strokeColor": "#006d2c",
+                  "strokeOpacity": 0.9,
+                  "strokeWidth": 6
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "path_name_display",
+            "title": "Path"
+          },
+          "elements": [
+            "theme",
+            "hover"
           ]
         }
       },
-      "elements": [
-        "theme",
-        "hover",
-        "opacitySlider"
-      ],
-      "opacitySlider": true,
-      "hover": {
-        "display": true,
-        "field": "smoke_control_area_m2",
-        "title": "Smoke control area (ops-db)"
+      "Foreign_Birth_Categories_H3_R9": {
+        "name": "2021 Census country of birth — dominant category (H3 r9)",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.foreign_birth_categories_h3_r9",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "h3_id",
+        "zIndex": 21,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "h3_id",
+            "title": "H3 resolution-9 cell",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "africa_estimate",
+            "fieldfx": "to_char(africa_estimate, 'FM999,999,999,990.0')",
+            "title": "Africa",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "middle_east_asia_estimate",
+            "fieldfx": "to_char(middle_east_asia_estimate, 'FM999,999,999,990.0')",
+            "title": "Middle East & Asia",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "americas_caribbean_estimate",
+            "fieldfx": "to_char(americas_caribbean_estimate, 'FM999,999,999,990.0')",
+            "title": "Americas & Caribbean",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "antarctica_oceania_other_estimate",
+            "fieldfx": "to_char(antarctica_oceania_other_estimate, 'FM999,999,999,990.0')",
+            "title": "Antarctica, Oceania & Other",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "british_overseas_estimate",
+            "fieldfx": "to_char(british_overseas_estimate, 'FM999,999,999,990.0')",
+            "title": "British Overseas",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#0072B2",
+            "fillOpacity": 0.55,
+            "strokeOpacity": 0,
+            "strokeWidth": 0
+          },
+          "highlight": {
+            "strokeOpacity": 0,
+            "strokeWidth": 0
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Most common category",
+            "field": "most_common_category",
+            "categories": [
+              {
+                "value": "Africa",
+                "label": "Africa",
+                "style": {
+                  "fillColor": "#E69F00",
+                  "fillOpacity": 0.55,
+                  "strokeOpacity": 0,
+                  "strokeWidth": 0
+                }
+              },
+              {
+                "value": "Middle East & Asia",
+                "label": "Middle East & Asia",
+                "style": {
+                  "fillColor": "#0072B2",
+                  "fillOpacity": 0.55,
+                  "strokeOpacity": 0,
+                  "strokeWidth": 0
+                }
+              },
+              {
+                "value": "Americas & Caribbean",
+                "label": "Americas & Caribbean",
+                "style": {
+                  "fillColor": "#009E73",
+                  "fillOpacity": 0.55,
+                  "strokeOpacity": 0,
+                  "strokeWidth": 0
+                }
+              },
+              {
+                "value": "Antarctica, Oceania & Other",
+                "label": "Antarctica, Oceania & Other",
+                "style": {
+                  "fillColor": "#CC79A7",
+                  "fillOpacity": 0.55,
+                  "strokeOpacity": 0,
+                  "strokeWidth": 0
+                }
+              },
+              {
+                "value": "British Overseas",
+                "label": "British Overseas",
+                "style": {
+                  "fillColor": "#D55E00",
+                  "fillOpacity": 0.55,
+                  "strokeOpacity": 0,
+                  "strokeWidth": 0
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "most_common_category",
+            "title": "Most common category"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        }
+      },
+      "Census_OA_Birth_Africa": {
+        "name": "2021 Census country of birth — Africa",
+        "group": "2021 Census country of birth",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_country_birth_categories",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "africa",
+            "fieldfx": "to_char(africa, 'FM999,999,999,990')",
+            "title": "Africa (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#fff7e6",
+            "fillOpacity": 0.55,
+            "strokeColor": "#fff7e6",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Africa (2021 Census)",
+            "field": "africa_band",
+            "categories": [
+              {
+                "value": 1,
+                "label": "1–3 people",
+                "style": {
+                  "fillColor": "#fff7e6",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#fff7e6",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "4–8 people",
+                "style": {
+                  "fillColor": "#f8c56a",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#f8c56a",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "9+ people",
+                "style": {
+                  "fillColor": "#E69F00",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#E69F00",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "africa_hover_label",
+            "title": "Output area and value"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        },
+        "filter": {
+          "default": {
+            "africa": {
+              "gt": 0
+            }
+          }
+        }
+      },
+      "Census_OA_Birth_Middle_East_Asia": {
+        "name": "2021 Census country of birth — Middle East & Asia",
+        "group": "2021 Census country of birth",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_country_birth_categories",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "middle_east_asia",
+            "fieldfx": "to_char(middle_east_asia, 'FM999,999,999,990')",
+            "title": "Middle East & Asia (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#f7fbff",
+            "fillOpacity": 0.55,
+            "strokeColor": "#f7fbff",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Middle East & Asia (2021 Census)",
+            "field": "middle_east_asia_band",
+            "categories": [
+              {
+                "value": 1,
+                "label": "1–4 people",
+                "style": {
+                  "fillColor": "#f7fbff",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#f7fbff",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "5–12 people",
+                "style": {
+                  "fillColor": "#6baed6",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#6baed6",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "13+ people",
+                "style": {
+                  "fillColor": "#0072B2",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#0072B2",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "middle_east_asia_hover_label",
+            "title": "Output area and value"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        },
+        "filter": {
+          "default": {
+            "middle_east_asia": {
+              "gt": 0
+            }
+          }
+        }
+      },
+      "Census_OA_Birth_Americas_Caribbean": {
+        "name": "2021 Census country of birth — Americas & Caribbean",
+        "group": "2021 Census country of birth",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_country_birth_categories",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "americas_caribbean",
+            "fieldfx": "to_char(americas_caribbean, 'FM999,999,999,990')",
+            "title": "Americas & Caribbean (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#f7fcf5",
+            "fillOpacity": 0.55,
+            "strokeColor": "#f7fcf5",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Americas & Caribbean (2021 Census)",
+            "field": "americas_caribbean_band",
+            "categories": [
+              {
+                "value": 1,
+                "label": "1–2 people",
+                "style": {
+                  "fillColor": "#f7fcf5",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#f7fcf5",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "3–6 people",
+                "style": {
+                  "fillColor": "#74c476",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#74c476",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "7+ people",
+                "style": {
+                  "fillColor": "#009E73",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#009E73",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "americas_caribbean_hover_label",
+            "title": "Output area and value"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        },
+        "filter": {
+          "default": {
+            "americas_caribbean": {
+              "gt": 0
+            }
+          }
+        }
+      },
+      "Census_OA_Birth_Antarctica_Oceania_Other": {
+        "name": "2021 Census country of birth — Antarctica, Oceania & Other",
+        "group": "2021 Census country of birth",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_country_birth_categories",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "antarctica_oceania_other",
+            "fieldfx": "to_char(antarctica_oceania_other, 'FM999,999,999,990')",
+            "title": "Antarctica, Oceania & Other (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#fcf5fa",
+            "fillOpacity": 0.55,
+            "strokeColor": "#fcf5fa",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "Antarctica, Oceania & Other (2021 Census)",
+            "field": "antarctica_oceania_other_band",
+            "categories": [
+              {
+                "value": 1,
+                "label": "1 person",
+                "style": {
+                  "fillColor": "#fcf5fa",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#fcf5fa",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "2 people",
+                "style": {
+                  "fillColor": "#e7a9d0",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#e7a9d0",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "3+ people",
+                "style": {
+                  "fillColor": "#CC79A7",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#CC79A7",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "antarctica_oceania_other_hover_label",
+            "title": "Output area and value"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        },
+        "filter": {
+          "default": {
+            "antarctica_oceania_other": {
+              "gt": 0
+            }
+          }
+        }
+      },
+      "Census_OA_Birth_British_Overseas": {
+        "name": "2021 Census country of birth — British Overseas",
+        "group": "2021 Census country of birth",
+        "display": false,
+        "format": "mvt",
+        "table": "derived_layers.census_oa_country_birth_categories",
+        "geom": "geom_3857",
+        "srid": "3857",
+        "qID": "oa_id",
+        "zIndex": 20,
+        "infoj": [
+          {
+            "type": "text",
+            "field": "oa_id",
+            "title": "Output area ID",
+            "skipNullValue": true
+          },
+          {
+            "type": "text",
+            "field": "british_overseas",
+            "fieldfx": "to_char(british_overseas, 'FM999,999,999,990')",
+            "title": "British Overseas (2021 Census)",
+            "skipNullValue": true
+          }
+        ],
+        "style": {
+          "default": {
+            "fillColor": "#fff5eb",
+            "fillOpacity": 0.55,
+            "strokeColor": "#fff5eb",
+            "strokeOpacity": 0.25,
+            "strokeWidth": 0.35
+          },
+          "highlight": {
+            "strokeColor": "#d4af37",
+            "strokeWidth": 6
+          },
+          "theme": {
+            "type": "categorized",
+            "title": "British Overseas (2021 Census)",
+            "field": "british_overseas_band",
+            "categories": [
+              {
+                "value": 1,
+                "label": "1 person",
+                "style": {
+                  "fillColor": "#fff5eb",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#fff5eb",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 2,
+                "label": "2 people",
+                "style": {
+                  "fillColor": "#fdae6b",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#fdae6b",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              },
+              {
+                "value": 3,
+                "label": "3+ people",
+                "style": {
+                  "fillColor": "#D55E00",
+                  "fillOpacity": 0.55,
+                  "strokeColor": "#D55E00",
+                  "strokeOpacity": 0.25,
+                  "strokeWidth": 0.35
+                }
+              }
+            ]
+          },
+          "hover": {
+            "display": true,
+            "field": "british_overseas_hover_label",
+            "title": "Output area and value"
+          },
+          "elements": [
+            "theme",
+            "hover",
+            "opacitySlider"
+          ],
+          "opacitySlider": true
+        },
+        "filter": {
+          "default": {
+            "british_overseas": {
+              "gt": 0
+            }
+          }
+        }
       }
-    }
+    },
+    "layer_order": [
+      "Open_Street_Map",
+      "Census_OA_Population",
+      "Foreign_Birth_Categories_H3_R9",
+      "Census_OA_Birth_Africa",
+      "Census_OA_Birth_Middle_East_Asia",
+      "Census_OA_Birth_Americas_Caribbean",
+      "Census_OA_Birth_Antarctica_Oceania_Other",
+      "Census_OA_Birth_British_Overseas",
+      "Bus_Stops",
+      "Definitive_Paths"
+    ]
   }
 }

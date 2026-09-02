@@ -1,0 +1,18 @@
+{
+  "name": "census_oa_country_birth_categories",
+  "kind": "view",
+  "sources": [
+    "source_census.census_2021_england_oa"
+  ],
+  "idColumn": "oa_id",
+  "geometryColumn": "geom_3857",
+  "description": "MAPP demo fixture v2: 2021 Census country-of-birth category bands for Output Areas within the saved workspace extent.",
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "locale"
+  },
+  "queryFile": "census-oa-country-birth-categories.sql",
+  "legacyQuerySha256": [
+    "9fee04c4aa02e4b5316c3c86c91d35d2b84e771b6a2c509c51a61b7e8391c53b"
+  ]
+}

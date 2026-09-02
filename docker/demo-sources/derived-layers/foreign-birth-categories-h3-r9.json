@@ -1,0 +1,18 @@
+{
+  "name": "foreign_birth_categories_h3_r9",
+  "kind": "materialized",
+  "sources": [
+    "source_census.census_2021_england_oa"
+  ],
+  "idColumn": "h3_id",
+  "geometryColumn": "geom_3857",
+  "description": "MAPP demo fixture v2: globally geodetic, spheroid-area allocation of 2021 Census country-of-birth categories to H3 resolution 9.",
+  "spatialScope": {
+    "type": "workspace-map-extent",
+    "locale": "locale"
+  },
+  "queryFile": "foreign-birth-categories-h3-r9.sql",
+  "legacyQuerySha256": [
+    "0b05a2cb89c8954427a2cc3397a4c9c773ca66dfb7b0596b948055491afb8c5b"
+  ]
+}
