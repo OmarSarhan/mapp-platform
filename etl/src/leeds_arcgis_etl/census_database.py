@@ -1411,6 +1411,19 @@ class CensusPostgresStore:
                         for variable in variables
                     ],
                 )
+                # Refresh relation cardinality plus the identity and spatial
+                # distributions that drive the federated query plans. Avoid
+                # scanning every measure column during the atomic publish.
+                cursor.execute(
+                    sql.SQL("ANALYZE {}.{} ({})").format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(self.target_table),
+                        sql.SQL(", ").join(
+                            sql.Identifier(column)
+                            for column in ("oa21cd", "geom", "geom_3857")
+                        ),
+                    )
+                )
                 cursor.execute(
                     sql.SQL(
                         """

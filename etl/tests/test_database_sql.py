@@ -103,6 +103,34 @@ class DatabaseSQLTests(unittest.TestCase):
         self.assertIn("pg_advisory_unlock", statement)
         self.assertEqual(params, ("mapp-explore-etl:leeds.bus_stops",))
 
+    def test_finish_run_analyzes_target_before_marking_success(self) -> None:
+        layer = self.config.layers[0]
+
+        self.store.finish_run(
+            layer,
+            uuid.uuid4(),
+            rows_seen=10,
+            rows_deleted=1,
+            ending_count=10,
+        )
+
+        statements = [statement for statement, _ in self.connection.statements]
+        analyze_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if statement.startswith("ANALYZE")
+        )
+        success_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if "SET status = 'succeeded'" in statement
+        )
+        self.assertEqual(
+            statements[analyze_index],
+            'ANALYZE "leeds"."bus_stops"',
+        )
+        self.assertLess(analyze_index, success_index)
+
 
 class ScriptedFakeCursor:
     def __init__(self, statements: list[tuple[str, Any]], fetchone_results: list) -> None:

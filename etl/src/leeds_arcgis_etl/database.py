@@ -461,6 +461,12 @@ class PostgresStore:
         def operation() -> None:
             with self.connection.cursor() as cursor:
                 cursor.execute(
+                    sql.SQL("ANALYZE {}.{}").format(
+                        sql.Identifier(self.schema),
+                        sql.Identifier(layer.target_table),
+                    )
+                )
+                cursor.execute(
                     sql.SQL(
                         """
                         UPDATE {}._etl_runs

@@ -22,6 +22,10 @@ first release.
 
 ### Added
 
+- Demo ETL publishes fresh PostgreSQL planner statistics with `ANALYZE` after
+  loading source tables, including targeted census identity and geometry
+  columns, so federated estimates reflect the newly published data.
+
 - Federation groups, as labels. A group is a name, an optional description and
   who created it; a source belongs to zero or more. Membership grants nothing,
   revokes nothing, and changes no PostgreSQL privilege -- it records which

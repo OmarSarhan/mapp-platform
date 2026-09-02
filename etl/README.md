@@ -123,7 +123,11 @@ without changing the stable relation's PostgreSQL OID. Publication uses
 `TRUNCATE` followed by the complete stable-table insert, so it holds an
 `AccessExclusive` lock for the full replacement and can block map, semantic,
 or derived-layer readers until commit. Schedule refreshes with that
-availability impact in mind. Any source, conversion, validation, or
+availability impact in mind. Before the transaction records success, it runs
+`ANALYZE` for the OA identifier and the EPSG:4326 and EPSG:3857 geometry
+columns. This refreshes relation row estimates and the spatial statistics used
+by federated plans without extending the publication lock to analyze all 467
+measure columns. Any source, conversion, validation, planner-statistics, or
 publication failure rolls back the transaction, leaves the last successful
 relation and metadata available, removes staging, and exits non-zero.
 
@@ -229,8 +233,11 @@ Each data table has selected, typed business columns plus:
 - `source_hash` — SHA-256 of canonical properties and geometry
 - first-seen, last-changed, last-seen, and run identifiers
 
-Both geometry columns have GiST indexes. Control tables `leeds._etl_runs` and
-`leeds._etl_layers` hold counts, errors, source metadata, and last-success state.
+Both geometry columns have GiST indexes. After each complete reconciliation,
+the loader explicitly runs `ANALYZE` on the target table before marking that
+layer run successful. Control tables `leeds._etl_runs` and
+`leeds._etl_layers` hold counts, errors, source metadata, and last-success
+state.
 
 The sources do not consistently expose a trustworthy last-edit watermark. A run
 therefore does an ordered `resultOffset`/`resultRecordCount` scan and hash-based

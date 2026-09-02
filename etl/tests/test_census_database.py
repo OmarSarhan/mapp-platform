@@ -574,6 +574,55 @@ class CensusDatabaseTests(unittest.TestCase):
             variable_comment[0],
         )
 
+    def test_publish_analyzes_bounded_planning_columns_before_success(self) -> None:
+        run_id = uuid.uuid4()
+        dataset = CensusDatasetMetadata(
+            dataset_key="census_2021_england_oa",
+            oa_count=2,
+            variable_count=3,
+            geometry_repairs=0,
+            geometry_source_url="https://example.test/FeatureServer/0",
+            geometry_source_sha256="a" * 64,
+            source_metadata={"release": "Census 2021"},
+        )
+        variable = CensusVariableMetadata(
+            column_name="ts001_0001",
+            topic_id="TS001",
+            topic_title="Topic",
+            ordinal=1,
+            label="People",
+            source_url="https://example.test/topic.zip",
+            source_member="topic-oa.csv",
+            source_sha256="b" * 64,
+            source_metadata={"version": 1},
+        )
+
+        self.store.publish(
+            "census_wide_safe",
+            run_id,
+            dataset,
+            (variable,),
+        )
+
+        statements = [statement for statement, _ in self.connection.statements]
+        analyze_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if statement.startswith("ANALYZE")
+        )
+        success_index = next(
+            index
+            for index, statement in enumerate(statements)
+            if "SET status = 'succeeded'" in statement
+        )
+        self.assertEqual(
+            statements[analyze_index],
+            'ANALYZE "leeds"."census_2021_england_oa" '
+            '("oa21cd", "geom", "geom_3857")',
+        )
+        self.assertNotIn("ts001_0001", statements[analyze_index])
+        self.assertLess(analyze_index, success_index)
+
     def test_variable_comments_are_bounded_before_stable_replacement(self) -> None:
         dataset = CensusDatasetMetadata(
             dataset_key="census_2021_england_oa",
