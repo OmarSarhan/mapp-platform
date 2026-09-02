@@ -3686,6 +3686,133 @@ class DerivedBackgroundOperationTests(unittest.TestCase):
         exc.rolled_back = rolled_back
         return exc
 
+    def test_operation_progress_samples_safely_and_uses_short_cache(self):
+        operation_id = "a" * 32
+        cancellation = app.DerivedLayerCancellation()
+        connection = MagicMock()
+        connection.info.backend_pid = 4312
+        cancellation.bind(connection)
+        cancellation.report_progress("output-validation")
+        derived = Mock()
+        derived.database_operation_activity.return_value = {
+            "observedAt": "2026-09-02T12:00:00Z",
+            "condition": "active",
+            "statementStartedAt": "2026-09-02T11:59:00Z",
+            "statementElapsedSeconds": 60.0,
+            "blockerCount": 0,
+        }
+        operation = {
+            "id": operation_id,
+            "kind": "derived-layer.create",
+            "status": "running",
+            "stage": "database-transaction",
+            "diagnostics": {"databasePhase": "query-preflight"},
+        }
+
+        with patch.object(app, "DERIVED", derived), patch.dict(
+            app.DERIVED_BACKGROUND_CANCELLATIONS,
+            {operation_id: cancellation},
+            clear=True,
+        ), patch.dict(app.DERIVED_PROGRESS_CACHE, {}, clear=True):
+            first = app.derived_operation_progress(operation)
+            second = app.derived_operation_progress(operation)
+
+        self.assertEqual(1, first["version"])
+        self.assertEqual("output-validation", first["phase"])
+        self.assertEqual("active", first["condition"])
+        self.assertEqual(first, second)
+        derived.database_operation_activity.assert_called_once_with(4312)
+        self.assertFalse(
+            {"pid", "query", "database", "role", "relation"}
+            & set(first)
+        )
+
+    def test_operation_progress_sampling_failure_is_advisory(self):
+        operation_id = "b" * 32
+        cancellation = app.DerivedLayerCancellation()
+        connection = MagicMock()
+        connection.info.backend_pid = 4313
+        cancellation.bind(connection)
+        derived = Mock()
+        derived.database_operation_activity.side_effect = (
+            app.psycopg.OperationalError("private database failure")
+        )
+        operation = {
+            "id": operation_id,
+            "kind": "derived-layer.refresh",
+            "status": "running",
+            "stage": "database-transaction",
+        }
+
+        with patch.object(app, "DERIVED", derived), patch.dict(
+            app.DERIVED_BACKGROUND_CANCELLATIONS,
+            {operation_id: cancellation},
+            clear=True,
+        ), patch.dict(app.DERIVED_PROGRESS_CACHE, {}, clear=True):
+            progress = app.derived_operation_progress(operation)
+
+        self.assertEqual("unavailable", progress["condition"])
+        self.assertNotIn("error", progress)
+        self.assertNotIn("private", repr(progress))
+
+    def test_operation_progress_distinguishes_queue_and_omits_terminal(self):
+        queued = {
+            "id": "c" * 32,
+            "kind": "derived-layer.replace",
+            "status": "running",
+            "stage": "waiting-for-worker",
+        }
+        progress = app.derived_operation_progress(queued)
+        self.assertEqual("queued", progress["condition"])
+        self.assertEqual("waiting-for-worker", progress["phase"])
+        self.assertIsNone(app.derived_operation_progress({
+            **queued,
+            "status": "succeeded",
+        }))
+
+    def test_operation_get_adds_only_request_time_nonterminal_progress(self):
+        operation_id = "d" * 32
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = f"/api/operations/{operation_id}"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "admin"
+        handler._authentication = {"scopes": ["derive"]}
+        handler._json = lambda status, body: responses.append((status, body))
+        running = {
+            "id": operation_id,
+            "kind": "derived-layer.create",
+            "status": "running",
+            "target": {"name": "safe_places", "action": "create"},
+        }
+        progress = {
+            "version": 1,
+            "observedAt": "2026-09-02T12:00:00Z",
+            "phase": "query-preflight",
+            "condition": "active",
+        }
+        control = Mock()
+        control.read_operation.return_value = running
+
+        with patch.object(app, "CONTROL", control), patch.object(
+            app, "derived_operation_progress", return_value=progress,
+        ):
+            handler.do_GET()
+
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual(progress, responses[0][1]["operation"]["progress"])
+        self.assertNotIn("progress", running)
+
+        responses.clear()
+        control.read_operation.return_value = {
+            **running,
+            "status": "succeeded",
+            "progress": progress,
+        }
+        with patch.object(app, "CONTROL", control):
+            handler.do_GET()
+        self.assertNotIn("progress", responses[0][1]["operation"])
+
     def test_background_job_admission_is_bounded(self):
         reserved = 0
         try:

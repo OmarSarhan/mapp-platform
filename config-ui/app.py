@@ -30,6 +30,7 @@ from derived_layers import (
     ACCESS_PATH_MAX_REMOTE_CATALOG_LOOKUPS,
     ACCESS_PATH_REMOTE_CATALOG_PER_LOOKUP_SECONDS,
     ACCESS_PATH_REMOTE_CATALOG_TIME_BUDGET_SECONDS,
+    DERIVED_DATABASE_PROGRESS_PHASES,
     SCHEMA as DERIVED_SCHEMA,
     DerivedLayerCancellation,
     DerivedLayerCancellationRequested,
@@ -216,6 +217,12 @@ DERIVED_BACKGROUND_ACTIVE_JOBS = 0
 DERIVED_BACKGROUND_CANCELLATIONS: dict[str, DerivedLayerCancellation] = {}
 DERIVED_BACKGROUND_WAITING_JOBS: list[str] = []
 DERIVED_BACKGROUND_EXECUTING_JOB: str | None = None
+DERIVED_PROGRESS_CACHE_TTL_SECONDS = 1.0
+DERIVED_PROGRESS_CACHE_LOCK = threading.Lock()
+DERIVED_PROGRESS_SAMPLE_LOCK = threading.Lock()
+DERIVED_PROGRESS_CACHE: dict[
+    tuple[str, int], tuple[float, dict[str, object]]
+] = {}
 PREVIEW_SYNC_LOCK = threading.Lock()
 PREVIEW_SYNC_STATE: dict[str, object] = {
     "pending": None,
@@ -2290,6 +2297,164 @@ def run_derived_background(
         )
 
 
+DERIVED_OPERATION_PROGRESS_PHASES = frozenset({
+    "waiting-for-worker",
+    "source-revalidation",
+    "plan-revalidation",
+    "database-transaction",
+    "result-reporting",
+}) | DERIVED_DATABASE_PROGRESS_PHASES
+
+
+def _progress_observed_at() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def update_derived_database_phase(operation_id: str, phase: str) -> None:
+    """Persist advisory phase progress without affecting the mutation."""
+    try:
+        CONTROL.update_operation_progress(
+            operation_id,
+            stage="database-transaction",
+            diagnostics={"databasePhase": phase},
+        )
+    except Exception:
+        # The cancellation context retains the phase in memory. Progress
+        # persistence is advisory and must never change transaction outcome.
+        return
+
+
+def clear_derived_progress_cache(operation_id: str) -> None:
+    with DERIVED_PROGRESS_CACHE_LOCK:
+        stale = [
+            key for key in DERIVED_PROGRESS_CACHE if key[0] == operation_id
+        ]
+        for key in stale:
+            DERIVED_PROGRESS_CACHE.pop(key, None)
+
+
+def sample_derived_database_progress(
+    operation_id: str,
+    backend_pid: int,
+) -> dict[str, object]:
+    """Sample at most once per TTL and at most one backend at a time."""
+    key = (operation_id, backend_pid)
+    now = time.monotonic()
+    with DERIVED_PROGRESS_CACHE_LOCK:
+        cached = DERIVED_PROGRESS_CACHE.get(key)
+        if cached is not None and now - cached[0] < (
+            DERIVED_PROGRESS_CACHE_TTL_SECONDS
+        ):
+            return cached[1]
+
+    if not DERIVED_PROGRESS_SAMPLE_LOCK.acquire(blocking=False):
+        if cached is not None:
+            return cached[1]
+        return {
+            "observedAt": _progress_observed_at(),
+            "condition": "unavailable",
+        }
+    try:
+        now = time.monotonic()
+        with DERIVED_PROGRESS_CACHE_LOCK:
+            cached = DERIVED_PROGRESS_CACHE.get(key)
+            if cached is not None and now - cached[0] < (
+                DERIVED_PROGRESS_CACHE_TTL_SECONDS
+            ):
+                return cached[1]
+        try:
+            if DERIVED is None:
+                raise RuntimeError("Derived-layer database is unavailable.")
+            snapshot = DERIVED.database_operation_activity(backend_pid)
+            if not isinstance(snapshot, dict):
+                raise TypeError("Invalid database progress snapshot.")
+        except Exception:
+            snapshot = {
+                "observedAt": _progress_observed_at(),
+                "condition": "unavailable",
+            }
+        with DERIVED_PROGRESS_CACHE_LOCK:
+            DERIVED_PROGRESS_CACHE[key] = (time.monotonic(), snapshot)
+        return snapshot
+    finally:
+        DERIVED_PROGRESS_SAMPLE_LOCK.release()
+
+
+def derived_operation_progress(operation: dict) -> dict | None:
+    """Build optional request-time progress without mutating durable state."""
+    if (
+        operation.get("kind") not in {
+            "derived-layer.create",
+            "derived-layer.replace",
+            "derived-layer.refresh",
+        }
+        or operation.get("status") not in {"running", "cancelling"}
+    ):
+        return None
+
+    operation_id = operation.get("id")
+    if not isinstance(operation_id, str):
+        return None
+    stage = operation.get("stage")
+    diagnostics = operation.get("diagnostics")
+    durable_phase = (
+        diagnostics.get("databasePhase")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    phase = (
+        durable_phase
+        if durable_phase in DERIVED_DATABASE_PROGRESS_PHASES
+        else stage
+        if stage in DERIVED_OPERATION_PROGRESS_PHASES
+        else "database-transaction"
+    )
+
+    with DERIVED_BACKGROUND_JOB_LOCK:
+        cancellation = DERIVED_BACKGROUND_CANCELLATIONS.get(operation_id)
+    live_phase = cancellation.phase if cancellation is not None else None
+    if live_phase in DERIVED_DATABASE_PROGRESS_PHASES:
+        phase = live_phase
+
+    if phase == "waiting-for-worker":
+        snapshot: dict[str, object] = {
+            "observedAt": _progress_observed_at(),
+            "condition": "queued",
+        }
+    elif phase in {"source-revalidation", "plan-revalidation"}:
+        snapshot = {
+            "observedAt": _progress_observed_at(),
+            "condition": "starting",
+        }
+    elif phase == "result-reporting":
+        snapshot = {
+            "observedAt": _progress_observed_at(),
+            "condition": "not-observed",
+        }
+    elif cancellation is None:
+        snapshot = {
+            "observedAt": _progress_observed_at(),
+            "condition": "not-observed",
+        }
+    else:
+        backend_pid = cancellation.backend_pid
+        if backend_pid is None:
+            snapshot = {
+                "observedAt": _progress_observed_at(),
+                "condition": "starting",
+            }
+        else:
+            snapshot = sample_derived_database_progress(
+                operation_id,
+                backend_pid,
+            )
+    return {
+        "version": 1,
+        "phase": phase,
+        **snapshot,
+    }
+
+
 def derived_background_capacity() -> dict:
     with DERIVED_BACKGROUND_JOB_CONDITION:
         active_jobs = DERIVED_BACKGROUND_ACTIVE_JOBS
@@ -2516,6 +2681,7 @@ def run_reserved_derived_background(
             if DERIVED_BACKGROUND_EXECUTING_JOB == operation_id:
                 DERIVED_BACKGROUND_EXECUTING_JOB = None
             DERIVED_BACKGROUND_CANCELLATIONS.pop(operation_id, None)
+            clear_derived_progress_cache(operation_id)
             if DERIVED_BACKGROUND_ACTIVE_JOBS <= 0:
                 raise RuntimeError(
                     "No derived-layer background job is reserved."
@@ -3651,7 +3817,11 @@ def start_derived_background(
         )
         if isinstance(updated_operation, dict):
             operation = updated_operation
-        cancellation = DerivedLayerCancellation()
+        cancellation = DerivedLayerCancellation(
+            on_progress=lambda phase: update_derived_database_phase(
+                operation["id"], phase,
+            ),
+        )
         with DERIVED_BACKGROUND_JOB_CONDITION:
             DERIVED_BACKGROUND_CANCELLATIONS[operation["id"]] = cancellation
             DERIVED_BACKGROUND_WAITING_JOBS.append(operation["id"])
@@ -7313,6 +7483,11 @@ class Handler(SimpleHTTPRequestHandler):
                         "requiredScope": required_scope,
                     })
                     return
+                operation = dict(operation)
+                operation.pop("progress", None)
+                progress = derived_operation_progress(operation)
+                if progress is not None:
+                    operation["progress"] = progress
                 self._json(HTTPStatus.OK, {"operation": operation})
             except FileNotFoundError as exc:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc), "code": "operation.not_found"})

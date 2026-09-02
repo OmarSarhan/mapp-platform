@@ -22,6 +22,20 @@ first release.
 
 ### Added
 
+- Added an optional request-time `progress` snapshot to nonterminal
+  derived operations. `GET /api/operations/<id>` reports a version-1
+  object naming the safe database subphase, a closed activity condition,
+  statement elapsed time, blocker count, a sanitized wait event, and
+  PostgreSQL's block, tuple, partition and locker counters while an index
+  builds. Sampling is serialized, briefly cached and bounded; a failed
+  sample reports `unavailable` and never changes the durable record,
+  which stays the authority for status and terminal outcome. There is
+  deliberately no generic percentage, because PostgreSQL exposes none for
+  an arbitrary `SELECT`, materialized-view population or output
+  validation, so unchanged elapsed time is not evidence of a stall. SQL,
+  query IDs, database, role and relation names, connection data and
+  backend or blocker PIDs are never exposed. Derived-layer capabilities
+  advertise the version, field, phases, conditions and measurement types.
 - Added non-mutating `POST /api/derived-layers/plan` for any create
   definition. It returns bounded access-path and index evidence plus a
   replayable fingerprint; synchronous and queued creates reject stale reviewed

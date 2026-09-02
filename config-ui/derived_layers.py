@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 from psycopg import sql
@@ -39,6 +39,29 @@ MATERIALIZED_ROW_OVERHEAD_BYTES = 32
 MATERIALIZED_ESTIMATE_SAFETY_MULTIPLIER = 1.2
 MATERIALIZED_PROBE_METHOD = "postgresql-explain"
 OUTPUT_VALIDATION_STATEMENT_TIMEOUT = "2min"
+DERIVED_DATABASE_PROGRESS_PHASES = frozenset({
+    "acquiring-mutation-lock",
+    "query-preflight",
+    "definition-create",
+    "materializing-output",
+    "indexing-output",
+    "output-validation",
+    "registry-update",
+    "transaction-commit",
+})
+DATABASE_WAIT_EVENT_TYPES = frozenset({
+    "Activity",
+    "BufferPin",
+    "Client",
+    "Extension",
+    "IO",
+    "IPC",
+    "InjectionPoint",
+    "Lock",
+    "LWLock",
+    "Timeout",
+})
+DATABASE_PROGRESS_MONITOR_TIMEOUT_SECONDS = 1
 QUERY_PLAN_PROBE_METHOD = "postgresql-explain"
 QUERY_PLAN_MAX_TOTAL_COST = 50_000_000
 QUERY_PLAN_MAX_FINAL_ROWS = 10_000_000
@@ -207,24 +230,59 @@ class DerivedLayerCancellationRequested(DerivedLayerError):
 class DerivedLayerCancellation:
     """Coordinate cancellation with one background database transaction."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        on_progress: Callable[[str], None] | None = None,
+    ):
         self._lock = threading.Lock()
         self._requested = threading.Event()
         self._connection = None
+        self._backend_pid: int | None = None
         self._database_finished = False
+        self._on_progress = on_progress
+        self._phase: str | None = None
 
     @property
     def requested(self) -> bool:
         return self._requested.is_set()
 
     def bind(self, connection) -> None:
+        backend_pid = getattr(
+            getattr(connection, "info", None), "backend_pid", None,
+        )
+        if isinstance(backend_pid, bool) or not isinstance(backend_pid, int):
+            backend_pid = None
         with self._lock:
             self._connection = connection
+            self._backend_pid = backend_pid
             requested = self._requested.is_set()
         if requested:
             raise DerivedLayerCancellationRequested(
                 "The derived-layer operation was cancelled."
             )
+
+    @property
+    def backend_pid(self) -> int | None:
+        """Return the live database identity without exposing its connection."""
+        with self._lock:
+            return self._backend_pid
+
+    def report_progress(self, phase: str) -> None:
+        if phase not in DERIVED_DATABASE_PROGRESS_PHASES:
+            raise ValueError("Invalid derived-layer database progress phase.")
+        with self._lock:
+            self._phase = phase
+        if self._on_progress is not None:
+            try:
+                self._on_progress(phase)
+            except Exception:
+                # Telemetry must never alter the database transaction outcome.
+                pass
+
+    @property
+    def phase(self) -> str | None:
+        with self._lock:
+            return self._phase
 
     def checkpoint(self) -> None:
         if self._requested.is_set():
@@ -251,6 +309,7 @@ class DerivedLayerCancellation:
     def finish_database(self) -> None:
         with self._lock:
             self._connection = None
+            self._backend_pid = None
             self._database_finished = True
 
 
@@ -1523,6 +1582,144 @@ class DerivedLayerStore:
             connection.close()
             raise
 
+    def database_operation_activity(self, backend_pid: int) -> dict[str, Any]:
+        """Return a bounded, sanitized snapshot for one owned mutation backend."""
+        if (
+            isinstance(backend_pid, bool)
+            or not isinstance(backend_pid, int)
+            or backend_pid <= 0
+        ):
+            raise ValueError("Invalid derived-layer database backend identity.")
+        with psycopg.connect(
+            self.connection_string,
+            autocommit=True,
+            connect_timeout=DATABASE_PROGRESS_MONITOR_TIMEOUT_SECONDS,
+            row_factory=dict_row,
+        ) as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_catalog.set_config('statement_timeout', %s, false)",
+                (f"{DATABASE_PROGRESS_MONITOR_TIMEOUT_SECONDS}s",),
+            )
+            cur.execute(
+                """
+                SELECT
+                  activity.state,
+                  activity.query_start AS statement_started_at,
+                  activity.wait_event_type,
+                  activity.wait_event,
+                  COALESCE(pg_catalog.cardinality(
+                    pg_catalog.pg_blocking_pids(activity.pid)
+                  ), 0) AS blocker_count,
+                  progress.phase AS index_phase,
+                  progress.blocks_done,
+                  progress.blocks_total,
+                  progress.tuples_done,
+                  progress.tuples_total,
+                  progress.partitions_done,
+                  progress.partitions_total,
+                  progress.lockers_done,
+                  progress.lockers_total
+                FROM pg_catalog.pg_stat_activity AS activity
+                LEFT JOIN pg_catalog.pg_stat_progress_create_index AS progress
+                  ON progress.pid = activity.pid
+                WHERE activity.pid = %s
+                  AND activity.datname = pg_catalog.current_database()
+                  AND activity.usename = CURRENT_USER
+                  AND activity.backend_type = 'client backend'
+                """,
+                (backend_pid,),
+            )
+            row = cur.fetchone()
+
+        observed = datetime.now(timezone.utc)
+        snapshot: dict[str, Any] = {
+            "observedAt": observed.isoformat().replace("+00:00", "Z"),
+        }
+        if not isinstance(row, dict):
+            snapshot["condition"] = "not-observed"
+            return snapshot
+
+        state = row.get("state")
+        wait_type = row.get("wait_event_type")
+        wait_event = row.get("wait_event")
+        blocker_count = row.get("blocker_count")
+        if (
+            isinstance(blocker_count, bool)
+            or not isinstance(blocker_count, int)
+            or blocker_count < 0
+        ):
+            blocker_count = 0
+
+        if state == "active":
+            if blocker_count > 0 or wait_type == "Lock":
+                condition = "blocked"
+            elif isinstance(wait_type, str) and wait_type:
+                condition = "waiting"
+            else:
+                condition = "active"
+        elif isinstance(state, str) and state.startswith("idle"):
+            condition = "idle"
+        else:
+            condition = "not-observed"
+        snapshot.update({
+            "condition": condition,
+            "blockerCount": blocker_count,
+        })
+
+        statement_started = row.get("statement_started_at")
+        if state == "active" and isinstance(statement_started, datetime):
+            if statement_started.tzinfo is None:
+                statement_started = statement_started.replace(
+                    tzinfo=timezone.utc,
+                )
+            statement_started = statement_started.astimezone(timezone.utc)
+            snapshot["statementStartedAt"] = (
+                statement_started.isoformat().replace("+00:00", "Z")
+            )
+            snapshot["statementElapsedSeconds"] = round(
+                max(0.0, (observed - statement_started).total_seconds()),
+                3,
+            )
+
+        if isinstance(wait_type, str) and wait_type and isinstance(
+            wait_event, str,
+        ) and wait_event:
+            snapshot["wait"] = {
+                "type": (
+                    wait_type
+                    if wait_type in DATABASE_WAIT_EVENT_TYPES
+                    else "Other"
+                ),
+                "event": wait_event[:128],
+            }
+
+        index_phase = row.get("index_phase")
+        if isinstance(index_phase, str) and index_phase:
+            measurement = {
+                "type": "create-index",
+                "phase": index_phase[:128],
+            }
+            for field in ("blocks", "tuples", "partitions", "lockers"):
+                done = row.get(f"{field}_done")
+                total = row.get(f"{field}_total")
+                measurement[field] = {
+                    "done": (
+                        done
+                        if isinstance(done, int) and not isinstance(done, bool)
+                        and done >= 0
+                        else 0
+                    ),
+                    "total": (
+                        total
+                        if isinstance(total, int)
+                        and not isinstance(total, bool)
+                        and total >= 0
+                        else 0
+                    ),
+                }
+            snapshot["measurement"] = measurement
+        return snapshot
+
     @contextmanager
     def _mutation_connection(
         self,
@@ -1567,6 +1764,8 @@ class DerivedLayerStore:
                     ) from body_error
                 raise
             try:
+                if cancellation is not None:
+                    cancellation.report_progress("transaction-commit")
                 connection.commit()
             except psycopg.Error as commit_error:
                 raise DerivedLayerDatabaseOperationError(
@@ -2242,7 +2441,10 @@ class DerivedLayerStore:
         create_index: bool,
         output: dict[str, Any],
         error_name: str | None = None,
+        cancellation: DerivedLayerCancellation | None = None,
     ) -> dict[str, Any]:
+        if cancellation is not None:
+            cancellation.report_progress("indexing-output")
         if create_index:
             self._create_materialized_id_index(cur, definition)
         self._create_materialized_spatial_indexes(
@@ -2250,6 +2452,8 @@ class DerivedLayerStore:
             definition,
             int(output["srid"]),
         )
+        if cancellation is not None:
+            cancellation.report_progress("output-validation")
         self._validate_output_rows(
             cur,
             definition,
@@ -4148,6 +4352,8 @@ class DerivedLayerStore:
             # HTTP request. The dashboard submits these as durable background
             # operations; retain a finite database-side safety bound.
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            if cancellation is not None:
+                cancellation.report_progress("acquiring-mutation-lock")
             self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
             self._ensure_changes_allowed(cur)
@@ -4157,6 +4363,8 @@ class DerivedLayerStore:
             ), (definition["name"],))
             if cur.fetchone():
                 raise FileExistsError(definition["name"])
+            if cancellation is not None:
+                cancellation.report_progress("query-preflight")
             (
                 query_plan_probe,
                 query_planning_probe,
@@ -4168,6 +4376,8 @@ class DerivedLayerStore:
             cur.execute("SET LOCAL statement_timeout = '30min'")
             query = self._executable_query(definition)
             target = sql.Identifier(SCHEMA, definition["name"])
+            if cancellation is not None:
+                cancellation.report_progress("definition-create")
             if definition["kind"] == "view":
                 cur.execute(
                     sql.SQL(
@@ -4196,6 +4406,8 @@ class DerivedLayerStore:
             )
             if definition["kind"] == "materialized":
                 output = self._validate_output_metadata(cur, definition)
+                if cancellation is not None:
+                    cancellation.report_progress("materializing-output")
                 cur.execute(
                     sql.SQL("REFRESH MATERIALIZED VIEW {}").format(target)
                 )
@@ -4209,9 +4421,14 @@ class DerivedLayerStore:
                     materialization_probe,
                     create_index=True,
                     output=output,
+                    cancellation=cancellation,
                 )
             else:
+                if cancellation is not None:
+                    cancellation.report_progress("output-validation")
                 output = self._validate_output(cur, definition)
+            if cancellation is not None:
+                cancellation.report_progress("registry-update")
             cur.execute(
                 sql.SQL("GRANT SELECT ON {} TO {}").format(
                     target, sql.Identifier(self.reader_role)
@@ -4283,6 +4500,8 @@ class DerivedLayerStore:
             raise DerivedLayerError("Invalid derived-layer name.")
         with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            if cancellation is not None:
+                cancellation.report_progress("acquiring-mutation-lock")
             self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
             self._ensure_changes_allowed(cur)
@@ -4292,6 +4511,8 @@ class DerivedLayerStore:
             if definition["kind"] != "materialized":
                 raise DerivedLayerError("Only materialized views can be refreshed.")
             self._require_resolved_spatial_scope(definition)
+            if cancellation is not None:
+                cancellation.report_progress("query-preflight")
             (
                 query_plan_probe,
                 query_planning_probe,
@@ -4313,6 +4534,8 @@ class DerivedLayerStore:
                 validate_query_ast(definition["query"]),
             )
             output = self._validate_output_metadata(cur, definition)
+            if cancellation is not None:
+                cancellation.report_progress("materializing-output")
             cur.execute(
                 sql.SQL("REFRESH MATERIALIZED VIEW {}").format(
                     sql.Identifier(SCHEMA, name)
@@ -4328,7 +4551,10 @@ class DerivedLayerStore:
                 materialization_probe,
                 create_index=False,
                 output=output,
+                cancellation=cancellation,
             )
+            if cancellation is not None:
+                cancellation.report_progress("registry-update")
             cur.execute(sql.SQL("""
                 UPDATE {}._definitions
                 SET refreshed_at = clock_timestamp(),
@@ -4364,6 +4590,8 @@ class DerivedLayerStore:
             raise DerivedLayerError("Replacement name must match the existing relation.")
         with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = '30min'")
+            if cancellation is not None:
+                cancellation.report_progress("acquiring-mutation-lock")
             self._acquire_mutation_lock(connection)
             cur.execute("SET LOCAL lock_timeout = '5s'")
             self._ensure_changes_allowed(cur)
@@ -4371,6 +4599,8 @@ class DerivedLayerStore:
             if not current:
                 raise FileNotFoundError(name)
             self._require_resolved_spatial_scope(definition)
+            if cancellation is not None:
+                cancellation.report_progress("query-preflight")
             (
                 query_plan_probe,
                 query_planning_probe,
@@ -4389,6 +4619,8 @@ class DerivedLayerStore:
             temporary = {**definition, "name": temporary_name}
             temporary_target = sql.Identifier(SCHEMA, temporary_name)
             query = self._executable_query(definition)
+            if cancellation is not None:
+                cancellation.report_progress("definition-create")
             if definition["kind"] == "view":
                 cur.execute(
                     sql.SQL(
@@ -4431,6 +4663,8 @@ class DerivedLayerStore:
                 )
             temporary_index = f"{temporary_name}_qid_uidx"
             if definition["kind"] == "materialized":
+                if cancellation is not None:
+                    cancellation.report_progress("materializing-output")
                 cur.execute(
                     sql.SQL("REFRESH MATERIALIZED VIEW {}").format(
                         temporary_target
@@ -4447,13 +4681,18 @@ class DerivedLayerStore:
                     create_index=True,
                     output=output,
                     error_name=name,
+                    cancellation=cancellation,
                 )
             else:
+                if cancellation is not None:
+                    cancellation.report_progress("output-validation")
                 self._validate_output_rows(
                     cur,
                     temporary,
                     duplicates_enforced=False,
                 )
+            if cancellation is not None:
+                cancellation.report_progress("registry-update")
             cur.execute(
                 sql.SQL("GRANT SELECT ON {} TO {}").format(
                     temporary_target, sql.Identifier(self.reader_role)

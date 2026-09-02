@@ -378,6 +378,38 @@ with `failurePhase: "preflight"` proves the database transaction never started;
 one with `failurePhase: "database-transaction"` and `rolledBack: true` proves
 PostgreSQL confirmed rollback. Omitting the flag preserves the synchronous API
 behaviour.
+For a nonterminal derived operation, the status GET may add this optional,
+request-time-only object to the returned operation:
+
+```json
+{
+  "progress": {
+    "version": 1,
+    "observedAt": "2026-09-02T12:00:00Z",
+    "phase": "output-validation",
+    "condition": "active",
+    "statementStartedAt": "2026-09-02T11:57:00Z",
+    "statementElapsedSeconds": 180.0,
+    "blockerCount": 0
+  }
+}
+```
+
+The closed conditions are `queued`, `starting`, `active`, `waiting`,
+`blocked`, `idle`, `not-observed`, and `unavailable`. Optional `wait` contains
+only `type` and `event`. Optional `measurement` is currently limited to
+`type: "create-index"`, its PostgreSQL phase, and done/total pairs for blocks,
+tuples, partitions, and lockers. PostgreSQL does not expose a generic
+percentage for arbitrary derived queries: `active` is current execution
+evidence, not proof that rows advanced, and unchanged elapsed time does not
+prove a stall. Sampling is serialized, briefly cached, and bounded; a sampling
+failure returns `condition: "unavailable"` without failing or changing the
+durable operation. Terminal and non-derived operations omit `progress`.
+SQL, query IDs, database/role/relation names, connection data, and backend or
+blocker PIDs are never included. The capabilities operation contract advertises
+the progress version, field, phases, conditions, measurement types, and the
+absence of a generic percentage.
+
 The server advertises `backgroundJobs.activeJobs`, `executingJobs`,
 `waitingJobs`, and `maxActiveJobs` in derived-layer capabilities and through
 the database-independent background-jobs route. The latter also returns
@@ -1305,6 +1337,10 @@ States are `running`, `succeeded`, `failed`, and `indeterminate`. Visual tests,
 proposal applies, explicit reloads, and background derived-layer create,
 replace, or refresh work retain bounded mode-`0600` records. Reading one
 requires its corresponding `visual`, `apply`, `reload`, or `derive` scope.
+`GET /api/operations/<id>` enriches only a currently running or cancelling
+derived operation with the optional request-time `progress` described above;
+the stored mode-`0600` operation record remains the authority for status and
+terminal outcome.
 
 Indeterminate is not a retry instruction. Proposal apply retains the existing
 committed-state recovery rules, while reload recovery inspects XYZ generation

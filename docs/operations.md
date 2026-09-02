@@ -78,6 +78,18 @@ non-mutating capacity rejection; after admission it follows the operation to a
 terminal result. Every resulting semantic profile must reach `ready` before
 workspace publication begins.
 
+For any long-running derived create, replace, or refresh, inspect its retained
+ID with `config-cli operations show ID` or continue following it with
+`config-cli operations wait ID --progress`. A nonterminal status response can
+show the safe database subphase, current activity or wait condition, elapsed
+statement time, blocker count, and real PostgreSQL index counters when that
+command supports them. `active` means the backend is executing, not that a
+generic query exposes measurable row progress; do not cancel or resubmit work
+merely because its elapsed time increased. `blocked` identifies lock waiting,
+while `unavailable` means only that the separate one-second monitoring sample
+could not be obtained. The mutation and its 30-minute PostgreSQL statement
+timeout continue independently of that advisory sample.
+
 The final publication replaces the live workspace with the complete saved
 ten-layer workspace, including its tile-retry plugin configuration. It is not
 a merge with local layers or styles. The command submits the replacement

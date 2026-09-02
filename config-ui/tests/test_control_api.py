@@ -157,6 +157,21 @@ class ControlApiTests(unittest.TestCase):
             "proposal.screenshot",
             actions["proposals.screenshot"]["operationKind"],
         )
+        progress = contract("instance")["capabilities"]["operations"][
+            "progress"
+        ]
+        self.assertEqual(1, progress["version"])
+        self.assertEqual("progress", progress["field"])
+        self.assertFalse(progress["genericPercentAvailable"])
+        self.assertEqual(["create-index"], progress["measurementTypes"])
+        self.assertIn("output-validation", progress["phases"])
+        self.assertEqual(
+            {
+                "queued", "starting", "active", "waiting", "blocked",
+                "idle", "not-observed", "unavailable",
+            },
+            set(progress["conditions"]),
+        )
         self.assertNotIn("querySchema", actions["federation.aliases.list"])
         allowed_relations = actions["federation.aliases.register"][
             "inputSchema"

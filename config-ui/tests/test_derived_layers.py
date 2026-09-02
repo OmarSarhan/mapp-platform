@@ -55,6 +55,132 @@ class DerivedLayerCancellationTests(unittest.TestCase):
         connection.close.assert_called_once_with()
         self.assertFalse(cancellation.request())
 
+    def test_progress_is_best_effort_and_backend_identity_is_lifecycle_bound(self):
+        phases = []
+
+        def progress(phase):
+            phases.append(phase)
+            raise OSError("operation store unavailable")
+
+        connection = MagicMock()
+        connection.info.backend_pid = 4312
+        cancellation = DerivedLayerCancellation(on_progress=progress)
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+        store._connect = MagicMock(return_value=connection)
+
+        with store._mutation_connection(cancellation):
+            self.assertEqual(4312, cancellation.backend_pid)
+            cancellation.report_progress("output-validation")
+            self.assertEqual("output-validation", cancellation.phase)
+
+        self.assertEqual(
+            ["output-validation", "transaction-commit"], phases,
+        )
+        self.assertEqual("transaction-commit", cancellation.phase)
+        self.assertIsNone(cancellation.backend_pid)
+        connection.commit.assert_called_once_with()
+
+    def test_database_activity_snapshot_is_safe_and_reports_real_index_counters(self):
+        connection_context = MagicMock()
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection_context.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.return_value = {
+            "state": "active",
+            "statement_started_at": datetime(
+                2026, 9, 2, 11, 57, tzinfo=timezone.utc,
+            ),
+            "wait_event_type": "Lock",
+            "wait_event": "relation",
+            "blocker_count": 2,
+            "index_phase": "building index: loading tuples in tree",
+            "blocks_done": 4,
+            "blocks_total": 10,
+            "tuples_done": 25,
+            "tuples_total": 100,
+            "partitions_done": 0,
+            "partitions_total": 0,
+            "lockers_done": 1,
+            "lockers_total": 2,
+        }
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+
+        with patch(
+            "derived_layers.psycopg.connect",
+            return_value=connection_context,
+        ) as connect:
+            snapshot = store.database_operation_activity(4312)
+
+        self.assertEqual("blocked", snapshot["condition"])
+        self.assertEqual(2, snapshot["blockerCount"])
+        self.assertEqual(
+            {"type": "Lock", "event": "relation"}, snapshot["wait"],
+        )
+        self.assertEqual(
+            {"done": 4, "total": 10},
+            snapshot["measurement"]["blocks"],
+        )
+        self.assertEqual("create-index", snapshot["measurement"]["type"])
+        self.assertGreaterEqual(snapshot["statementElapsedSeconds"], 0)
+        self.assertEqual(
+            1, connect.call_args.kwargs["connect_timeout"],
+        )
+        statement = str(cursor.execute.call_args_list[1].args[0])
+        self.assertNotIn("activity.query,", statement)
+        self.assertFalse(
+            {"pid", "query", "database", "role", "relation"}
+            & set(snapshot)
+        )
+
+    def test_database_activity_snapshot_reports_missing_backend_without_details(self):
+        connection_context = MagicMock()
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection_context.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.return_value = None
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+
+        with patch(
+            "derived_layers.psycopg.connect",
+            return_value=connection_context,
+        ):
+            snapshot = store.database_operation_activity(4312)
+
+        self.assertEqual(
+            {"observedAt", "condition"}, set(snapshot),
+        )
+        self.assertEqual("not-observed", snapshot["condition"])
+
+    def test_database_activity_snapshot_does_not_time_an_idle_statement(self):
+        connection_context = MagicMock()
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection_context.__enter__.return_value = connection
+        connection.cursor.return_value.__enter__.return_value = cursor
+        cursor.fetchone.return_value = {
+            "state": "idle in transaction",
+            "statement_started_at": datetime(
+                2026, 9, 2, 11, 57, tzinfo=timezone.utc,
+            ),
+            "wait_event_type": "Client",
+            "wait_event": "ClientRead",
+            "blocker_count": 0,
+            "index_phase": None,
+        }
+        store = DerivedLayerStore("postgresql://database", "mapp_xyz")
+
+        with patch(
+            "derived_layers.psycopg.connect",
+            return_value=connection_context,
+        ):
+            snapshot = store.database_operation_activity(4312)
+
+        self.assertEqual("idle", snapshot["condition"])
+        self.assertNotIn("statementStartedAt", snapshot)
+        self.assertNotIn("statementElapsedSeconds", snapshot)
+
 
 class AreaWeightedH3RecipeTests(unittest.TestCase):
     @staticmethod
@@ -3094,10 +3220,13 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         store.get_in_transaction = MagicMock(return_value=stored)
         store._semantic_fields = MagicMock(return_value=[])
         store._enqueue_semantic_event = MagicMock()
+        phases = []
+        cancellation = DerivedLayerCancellation(phases.append)
 
         result = store.create(
             self.valid(spatialScope=scope),
             "token:test",
+            cancellation=cancellation,
         )
 
         create = next(
@@ -3123,6 +3252,14 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
                 str(call.args[0]) for call in cursor.execute.call_args_list
             ),
         )
+        self.assertEqual([
+            "acquiring-mutation-lock",
+            "query-preflight",
+            "definition-create",
+            "output-validation",
+            "registry-update",
+            "transaction-commit",
+        ], phases)
 
     def test_materialized_create_probes_scoped_query_and_returns_probe(self):
         events = []
@@ -3410,6 +3547,8 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             kind="materialized",
             spatialScope=self.spatial_scope(),
         ))
+        phases = []
+        cancellation = DerivedLayerCancellation(phases.append)
 
         result = store._finalize_materialized_output(
             cursor,
@@ -3417,6 +3556,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             self.materialization_probe(),
             create_index=True,
             output={"geometryType": "Polygon", "srid": 3857},
+            cancellation=cancellation,
         )
 
         statements = [
@@ -3455,6 +3595,9 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             cursor,
             definition,
             duplicates_enforced=True,
+        )
+        self.assertEqual(
+            ["indexing-output", "output-validation"], phases,
         )
 
     def test_actual_materialized_size_uses_existing_typed_failure(self):

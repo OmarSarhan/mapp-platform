@@ -751,7 +751,25 @@ bounded in-process FIFO without opening a database connection.
 `source-revalidation`; only a fingerprinted create then uses
 `plan-revalidation`. Refresh begins at `database-transaction`, and every
 action can finish with `result-reporting`. These stages and their timestamps
-show ownership and phase, not percentage completion or a database heartbeat.
+show ownership and coarse phase. While a derived operation is nonterminal,
+`GET /api/operations/<id>` also adds a request-time `progress` version 1
+snapshot. Database work reports one safe subphase: acquiring the mutation
+lock, query preflight, definition creation, materialization, indexing, output
+validation, registry update, or transaction commit. The snapshot classifies
+the observed backend as active, waiting, blocked, idle, not observed, or
+temporarily unavailable and may include a sanitized wait event, blocker count,
+and statement elapsed time. `active` proves only that PostgreSQL is executing;
+it does not prove that output rows advanced.
+
+PostgreSQL has no generic completion counter for an arbitrary `SELECT`,
+materialized-view population, or output validation. During an index build the
+snapshot can include PostgreSQL's block, tuple, partition, and locker counters;
+otherwise it deliberately provides no percentage. An unchanged observation is
+not enough to call work stuck. A lock blocker is actionable waiting evidence,
+while `unavailable` means the bounded monitoring query failed and does not
+change the durable operation. The snapshot never exposes SQL, query IDs,
+database or relation names, roles, connection details, or backend/blocker PIDs.
+Terminal records omit `progress`.
 
 Inspect the queue with `GET /api/derived-layers/background-jobs`. When every
 slot is occupied, another background request returns HTTP `429` with
