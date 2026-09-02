@@ -304,44 +304,54 @@ class DemoLayersLifecycleTests(unittest.TestCase):
                 },
             },
         }
-        ready = run_embedded_program(
-            "workspace_apply_state",
-            str(saved_path),
-            "200",
-            json.dumps(response),
-        )
-        self.assertEqual(0, ready.returncode, ready.stderr)
-        self.assertEqual("ready", ready.stdout.strip())
+        with tempfile.TemporaryDirectory() as directory:
+            written = 0
 
-        timed_out = run_embedded_program(
-            "workspace_apply_state",
-            str(saved_path),
-            "504",
-            json.dumps({
-                **response,
-                "reload": {
-                    **response["reload"],
-                    "status": {
-                        **response["reload"]["status"],
-                        "completed": False,
+            def response_file(payload: dict) -> str:
+                nonlocal written
+                written += 1
+                path = Path(directory) / f"apply-{written}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                return str(path)
+
+            ready = run_embedded_program(
+                "workspace_apply_state",
+                str(saved_path),
+                "200",
+                response_file(response),
+            )
+            self.assertEqual(0, ready.returncode, ready.stderr)
+            self.assertEqual("ready", ready.stdout.strip())
+
+            timed_out = run_embedded_program(
+                "workspace_apply_state",
+                str(saved_path),
+                "504",
+                response_file({
+                    **response,
+                    "reload": {
+                        **response["reload"],
+                        "status": {
+                            **response["reload"]["status"],
+                            "completed": False,
+                        },
                     },
-                },
-            }),
-        )
-        self.assertEqual(0, timed_out.returncode, timed_out.stderr)
-        self.assertEqual("recover", timed_out.stdout.strip())
+                }),
+            )
+            self.assertEqual(0, timed_out.returncode, timed_out.stderr)
+            self.assertEqual("recover", timed_out.stdout.strip())
 
-        uncommitted = run_embedded_program(
-            "workspace_apply_state",
-            str(saved_path),
-            "504",
-            json.dumps({
-                **response,
-                "proposal": {**response["proposal"], "status": "applying"},
-            }),
-        )
-        self.assertNotEqual(0, uncommitted.returncode)
-        self.assertIn("did not commit", uncommitted.stderr)
+            uncommitted = run_embedded_program(
+                "workspace_apply_state",
+                str(saved_path),
+                "504",
+                response_file({
+                    **response,
+                    "proposal": {**response["proposal"], "status": "applying"},
+                }),
+            )
+            self.assertNotEqual(0, uncommitted.returncode)
+            self.assertIn("did not commit", uncommitted.stderr)
 
         apply_start = self.source.index("apply_saved_workspace_proposal()")
         apply_end = self.source.index(
@@ -352,6 +362,79 @@ class DemoLayersLifecycleTests(unittest.TestCase):
         self.assertIn("--write-out", apply_function)
         self.assertIn("workspace_apply_state", apply_function)
         self.assertIn("ensure_saved_workspace_xyz", apply_function)
+
+    def test_apply_response_never_passes_through_argv(self) -> None:
+        """A response holding several workspace copies exceeds MAX_ARG_STRLEN.
+
+        Passing it as an argument made ./bin/mapp demo fail the publishing
+        step with "Argument list too long", so the body must reach python
+        through a file that curl writes.
+        """
+        saved_path = ROOT / "docker" / "demo-sources" / "workspace-demo.json"
+        saved = json.loads(saved_path.read_text(encoding="utf-8"))
+        fingerprint = "e" * 64
+        proposal = {
+            "status": "applied",
+            "candidate": saved,
+            "appliedFingerprint": fingerprint,
+            "original": saved,
+            "operations": [
+                {"op": "set", "path": f"/{key}", "value": value}
+                for key, value in saved.items()
+            ],
+            "diff": [
+                {"op": "replace", "path": f"/{key}", "old": value,
+                 "value": value}
+                for key, value in saved.items()
+            ],
+        }
+        reload_evidence = {
+            "expectedWorkspaceFingerprint": fingerprint,
+            "status": {
+                "completed": True,
+                "healthy": True,
+                "workspaceFingerprint": fingerprint,
+            },
+        }
+        body = json.dumps({
+            "proposal": proposal,
+            "reload": reload_evidence,
+            "operation": {
+                "id": "operation",
+                "status": "succeeded",
+                "result": {"proposal": proposal, "reload": reload_evidence},
+            },
+        }, separators=(",", ":"))
+        self.assertGreater(len(body.encode()), 131072, "MAX_ARG_STRLEN")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "apply.json"
+            path.write_text(body, encoding="utf-8")
+            ready = run_embedded_program(
+                "workspace_apply_state",
+                str(saved_path),
+                "200",
+                str(path),
+            )
+        self.assertEqual(0, ready.returncode, ready.stderr)
+        self.assertEqual("ready", ready.stdout.strip())
+
+        state_function = self.function_source(
+            "workspace_apply_state",
+            "apply_saved_workspace_proposal",
+        )
+        self.assertIn(
+            'response = json.load(open(sys.argv[3], encoding="utf-8"))',
+            state_function,
+        )
+        apply_start = self.source.index("apply_saved_workspace_proposal()")
+        apply_end = self.source.index(
+            '\nstep "Reconciling the saved workspace\'s derived layers"',
+            apply_start,
+        )
+        apply_function = self.source[apply_start:apply_end]
+        self.assertIn("--output", apply_function)
+        self.assertIn('"${http_status}" "${payload_file}"', apply_function)
 
 
 if __name__ == "__main__":

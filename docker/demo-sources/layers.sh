@@ -121,7 +121,8 @@ api() { # method path [json-body]
 jqp() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 
 TOKEN_ID=""
-trap 'if [[ -n "${TOKEN_ID}" ]]; then revoke_token "${TOKEN_ID}"; fi; revoke_demo_tokens' EXIT
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"; if [[ -n "${TOKEN_ID}" ]]; then revoke_token "${TOKEN_ID}"; fi; revoke_demo_tokens' EXIT
 read -r TOKEN TOKEN_ID < <(mint_token)
 [ -n "${TOKEN:-}" ] || fail "could not mint a token; is config-ui running?"
 
@@ -1160,7 +1161,11 @@ ensure_saved_workspace_xyz() {
   printf '  XYZ reloaded the saved workspace fingerprint\n'
 }
 
-workspace_apply_state() { # saved-workspace http-status response
+workspace_apply_state() { # saved-workspace http-status response-file
+  # The apply response carries the proposal twice (once directly and once as
+  # the operation result), and each copy holds the workspace four times over.
+  # That is far past the kernel's single-argument limit, so read it from a
+  # file rather than argv.
   python3 - "$1" "$2" "$3" <<'PY'
 import json
 import re
@@ -1171,7 +1176,7 @@ try:
     http_status = int(sys.argv[2])
 except ValueError as exc:
     raise SystemExit("workspace apply returned an invalid HTTP status") from exc
-response = json.loads(sys.argv[3])
+response = json.load(open(sys.argv[3], encoding="utf-8"))
 proposal = response.get("proposal")
 reload = response.get("reload")
 if http_status not in {200, 504}:
@@ -1212,21 +1217,21 @@ PY
 
 apply_saved_workspace_proposal() { # proposal-id saved-workspace
   local identifier="$1" saved_workspace="$2"
-  local response http_status payload state current_workspace
-  if ! response="$(curl -sS -X POST \
+  local http_status payload_file state current_workspace
+  payload_file="${WORK_DIR}/workspace-apply.json"
+  if ! http_status="$(curl -sS -X POST \
     -H "Host: ${CONFIG_HOST}" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H 'Content-Type: application/json' \
     --data-binary '{"approved":true}' \
-    --write-out $'\n%{http_code}' \
+    --output "${payload_file}" \
+    --write-out '%{http_code}' \
     "${BASE}/api/proposals/${identifier}/apply")"
   then
     fail "could not apply the saved demo workspace proposal"
   fi
-  http_status="${response##*$'\n'}"
-  payload="${response%$'\n'*}"
   state="$(workspace_apply_state \
-    "${saved_workspace}" "${http_status}" "${payload}")"
+    "${saved_workspace}" "${http_status}" "${payload_file}")"
   if [ "${state}" = "ready" ]; then
     printf '  workspace applied and XYZ reloaded\n'
     return 0

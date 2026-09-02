@@ -102,6 +102,13 @@ first release.
 
 ### Fixed
 
+- `./bin/mapp demo` publishes the saved workspace again. The proposal
+  apply response repeats the proposal as the operation result, and each
+  copy carries the workspace as the original, the candidate, the
+  operations and the diff, so the body outgrew the kernel's
+  single-argument limit and the publishing step failed with "Argument
+  list too long". The body is now written to a file and read from there
+  rather than passed as an argument.
 - Derived background work now has a bounded two-job FIFO by default: one job
   executes while a second waits without holding a database connection. Jobs
   publish durable source/plan/database/result stages, queued cancellation never
