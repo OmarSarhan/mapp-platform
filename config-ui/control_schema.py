@@ -214,16 +214,19 @@ def _migration_1(connection: psycopg.Connection) -> None:
             recovery_epoch bigint      NOT NULL DEFAULT 0
         );
 
-        -- Deliberately NOT unique. Name reservation is a policy the store
-        -- enforces on creation, and real deployments already hold records that
-        -- violate it -- one installation has 51 tokens sharing a name, minted
-        -- by scripts that construct ControlStore directly. A unique index
-        -- would make importing real data impossible, so the index exists for
-        -- the lookup and the check stays in Python where it always was.
+        -- Unique among LIVE tokens only, which is what the data supports and
+        -- what matters operationally. The store's rule is stronger -- a name
+        -- stays reserved after revocation -- and that stays in Python, because
+        -- real deployments predate it: one holds 278 tokens of which 7 folded
+        -- names repeat, 51 sharing `federation-e2e`, all minted before the
+        -- harness began appending a random suffix. Every one of those is
+        -- revoked, and no two live tokens anywhere share a name, so this index
+        -- admits the history while making the invariant that still matters
+        -- structural rather than merely intended.
+        CREATE UNIQUE INDEX tokens_live_name_idx
+ ON {schema}.tokens (name_key) WHERE revoked_at IS NULL;
         CREATE INDEX tokens_name_key_idx
  ON {schema}.tokens (name_key);
-        CREATE INDEX tokens_live_idx
- ON {schema}.tokens (revoked_at) WHERE revoked_at IS NULL;
 
         CREATE TABLE {schema}.device_authorizations (
             id_hash        text        PRIMARY KEY,

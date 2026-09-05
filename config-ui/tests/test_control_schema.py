@@ -241,6 +241,60 @@ class SchemaShapeTests(unittest.TestCase):
                 (utc(), utc(600)),
             )
 
+    def test_two_live_tokens_cannot_share_a_name(self) -> None:
+        self._token("shared", revoked=False)
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._token("shared", revoked=False)
+        self.connection.execute("DELETE FROM control.tokens")
+
+    def test_a_case_variant_live_name_is_refused(self) -> None:
+        """name_key is folded in Python and stored, never recomputed in SQL.
+
+        PostgreSQL lower() is not str.casefold -- 'SS' and 'ß' fold together in
+        Python and not in SQL -- so deriving the key here would reserve a
+        different set of names than the store checks.
+        """
+        self._token("Shared", revoked=False)
+        with self.assertRaises(psycopg.errors.UniqueViolation):
+            self._token("SHARED", revoked=False)
+        self.connection.execute("DELETE FROM control.tokens")
+
+    def test_revoked_tokens_may_share_a_name(self) -> None:
+        """Which is what lets real history import.
+
+        One deployment holds 278 tokens with 7 repeated folded names, 51 of
+        them `federation-e2e`, all created before the harness appended a random
+        suffix and all since revoked. A full unique index would make that data
+        unimportable; the store still refuses to reuse the name for a new
+        token, which is the rule that matters.
+        """
+        self._token("recycled", revoked=True)
+        self._token("recycled", revoked=True)
+        self._token("recycled", revoked=False)
+        rows = self.connection.execute(
+            "SELECT count(*) AS n FROM control.tokens WHERE name_key = 'recycled'"
+        ).fetchone()
+        self.assertEqual(3, rows["n"])
+        self.connection.execute("DELETE FROM control.tokens")
+
+    _token_seq = 0
+
+    def _token(self, name: str, *, revoked: bool) -> None:
+        type(self)._token_seq += 1
+        suffix = str(self._token_seq)
+        self.connection.execute(
+            "INSERT INTO control.tokens"
+            "(token_hash, token_id, name, name_key, created_at, scopes, revoked_at)"
+            " VALUES(%s,%s,%s,%s,now(),'{}',%s)",
+            (
+                "hash-" + suffix,
+                "id-" + suffix,
+                name,
+                name.casefold(),
+                utc(-3600) if revoked else None,
+            ),
+        )
+
     def _seed_client(self, client_id: str) -> None:
         self.connection.execute(
             "INSERT INTO control.oauth_clients"
