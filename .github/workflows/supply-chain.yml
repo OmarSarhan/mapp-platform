@@ -32,6 +32,7 @@ jobs:
               {"image":"xyz","context":"docker/xyz","dockerfile":"docker/xyz/Dockerfile"},
               {"image":"config-ui","context":"config-ui","dockerfile":"config-ui/Dockerfile"},
               {"image":"semantic-service","context":"semantic-service","dockerfile":"semantic-service/Dockerfile"},
+              {"image":"mcp-auth","context":"mcp-auth","dockerfile":"mcp-auth/Dockerfile"},
               {"image":"browser-runner","context":"browser-runner","dockerfile":"browser-runner/Dockerfile"},
               {"image":"postgis-h3","context":"docker/postgis","dockerfile":"docker/postgis/Dockerfile"},
               {"image":"etl","context":"etl","dockerfile":"etl/Dockerfile"},
