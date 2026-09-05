@@ -191,8 +191,20 @@ resolved_semantic_reader_dbs="$(
   "${compose[@]}" config --format json \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["semantic-service"]["environment"]["SEMANTIC_READER_DATABASE_URL"], end="")'
 )"
+resolved_control_dbs="$(
+  "${compose[@]}" config --format json \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["config-ui"]["environment"].get("CONTROL_DATABASE_URL", ""), end="")'
+)"
 if [[ -z "${resolved_semantic_dbs}" || -z "${resolved_semantic_reader_dbs}" ]]; then
   printf 'SEMANTIC_DATABASE_URL and SEMANTIC_READER_DATABASE_URL are required with a local database.\n' >&2
+  exit 2
+fi
+# The control schema holds dashboard authentication, API tokens and device
+# authorizations. Without it the platform starts and then refuses every login,
+# so this is checked here alongside the other runtime DSNs rather than being
+# discovered at a login prompt.
+if [[ -z "${resolved_control_dbs}" ]]; then
+  printf 'CONTROL_DATABASE_URL is required: it holds dashboard authentication, API tokens and device authorizations. See docs/external-postgresql.md for deployments without the packaged database.\n' >&2
   exit 2
 fi
 if [[ "${resolved_semantic_dbs}" == "${resolved_semantic_reader_dbs}" ]]; then

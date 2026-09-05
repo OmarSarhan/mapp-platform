@@ -146,6 +146,45 @@ GRANT SELECT ON TABLE
 
 CREATE SCHEMA derived_layers AUTHORIZATION mapp_derived_owner;
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
+
+### Control plane
+
+The configuration dashboard keeps its administrator credential, browser
+sessions, API tokens and device authorizations in a `control` schema, together
+with the MCP authorization component's OAuth records. The packaged deployment
+creates this automatically; an external database needs it created once, by a
+superuser, because the owning role deliberately has no `CREATE` on the database
+and so cannot create — or recreate — its own schema.
+
+```sql
+CREATE ROLE mapp_control
+  LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD 'PERCENT_ENCODE_THIS_IN_THE_URI';
+ALTER ROLE mapp_control CONNECTION LIMIT 8;
+ALTER ROLE mapp_control SET search_path = pg_catalog, control;
+
+GRANT CONNECT ON DATABASE maps TO mapp_control;
+REVOKE CREATE ON DATABASE maps FROM mapp_control;
+
+CREATE SCHEMA control AUTHORIZATION mapp_control;
+REVOKE ALL ON SCHEMA control FROM PUBLIC;
+```
+
+The role needs nothing else: it owns `control` and reaches no other schema, and
+no other role is granted anything on `control`. The tables inside are created
+and migrated by the configuration service on first start.
+
+Set the connection URI alongside the others:
+
+```dotenv
+CONTROL_DATABASE_URL=postgresql://mapp_control:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
+```
+
+Without it the platform starts and then refuses every login, so `./bin/mapp
+verify` fails closed on a missing value rather than leaving it to be discovered
+at the login prompt. `./bin/mapp init` mints the first administrator password;
+where there is no packaged database to start, point it at the control database
+directly with `MAPP_BOOTSTRAP_DATABASE_URL`.
 GRANT USAGE ON SCHEMA derived_layers TO mapp_runtime_reader;
 ```
 

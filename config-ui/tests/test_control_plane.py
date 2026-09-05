@@ -8,6 +8,12 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+import control_schema
+from control_fixture import (
+    DATABASE_URL,
+    ControlStoreTestCase,
+    control_rows,
+)
 from control_plane import (
     DEVICE_SCOPES,
     TOKEN_SCOPES,
@@ -18,27 +24,25 @@ from control_plane import (
 )
 
 
-class ControlPlaneTests(unittest.TestCase):
+class ControlPlaneTests(ControlStoreTestCase):
     def test_existing_sensitive_state_is_made_private(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             proposals = root / "proposals"
             proposal_dir = proposals / "legacy-proposal"
             proposal_dir.mkdir(parents=True)
-            state = root / "auth.json"
             audit = root / "audit.jsonl"
             proposal = proposal_dir / "proposal.json"
-            state.write_text("{}")
             audit.write_text("{}\n")
             proposal.write_text("{}")
-            state.chmod(0o644)
             audit.chmod(0o644)
             proposal_dir.chmod(0o755)
             proposal.chmod(0o644)
 
             ControlStore(root)
 
-            self.assertEqual(0o600, stat.S_IMODE(state.stat().st_mode))
+            # The credential itself is no longer a file; what remains on disk
+            # is the audit log, the proposals and the lock.
             self.assertEqual(0o600, stat.S_IMODE(audit.stat().st_mode))
             self.assertEqual(0o700, stat.S_IMODE(proposal_dir.stat().st_mode))
             self.assertEqual(0o600, stat.S_IMODE(proposal.stat().st_mode))
@@ -57,10 +61,6 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertEqual(
                 0o600,
                 stat.S_IMODE((Path(directory) / "audit.jsonl").stat().st_mode),
-            )
-            self.assertEqual(
-                0o600,
-                stat.S_IMODE((Path(directory) / "auth.json").stat().st_mode),
             )
 
     def test_token_names_are_permanently_unique_case_insensitively(self):
@@ -83,7 +83,16 @@ class ControlPlaneTests(unittest.TestCase):
                 store.create_token("CLI OPERATOR")
             self.assertEqual(1, len(store.list_tokens()))
 
-    def test_invalid_sessions_do_not_write_but_expiry_pruning_persists(self):
+    def test_a_refused_session_is_not_refreshed_and_expiry_is_pruned(self):
+        """Two properties the JSON store expressed as "did not write".
+
+        A rejected session must not have its last-use stamped -- otherwise a
+        wrong CSRF token would keep a session alive indefinitely -- and an
+        expired row must be removed even when the call that finds it fails.
+        Against SQL those are observable directly rather than through a write
+        counter, which is the better assertion anyway: it says what must be
+        true of the state, not how many times the store touched it.
+        """
         with tempfile.TemporaryDirectory() as directory:
             store = ControlStore(Path(directory))
             store.initialize("correct horse battery staple", "instance")
@@ -91,24 +100,30 @@ class ControlPlaneTests(unittest.TestCase):
                 "correct horse battery staple",
                 "127.0.0.1",
             )
+            before = control_rows("sessions")[0]["last_used_at"]
 
-            with patch.object(store, "_write", wraps=store._write) as write:
-                self.assertFalse(store.session("not-a-session"))
-                self.assertFalse(
-                    store.session(session, "wrong-csrf", require_csrf=True)
+            self.assertFalse(store.session("not-a-session"))
+            self.assertFalse(store.session(session, "wrong-csrf", require_csrf=True))
+            self.assertEqual(before, control_rows("sessions")[0]["last_used_at"])
+
+            # A valid call does refresh it, so the assertion above is about the
+            # refusal and not about the store never writing at all.
+            self.assertTrue(store.session(session))
+            self.assertGreater(control_rows("sessions")[0]["last_used_at"], before)
+
+            # Age the row past the idle bound; the next call prunes it even
+            # though that call is itself refused.
+            stale = now() - timedelta(seconds=31 * 60)
+            connection = control_schema.connect(DATABASE_URL)
+            try:
+                connection.execute(
+                    "UPDATE control.sessions SET last_used_at = %s", (stale,)
                 )
-                write.assert_not_called()
-
-            state = store._state()
-            state["sessions"][0]["lastUsed"] = iso(
-                now() - timedelta(seconds=31 * 60)
-            )
-            store._write(state)
-
-            with patch.object(store, "_write", wraps=store._write) as write:
-                self.assertFalse(store.session("not-a-session"))
-                write.assert_called_once()
-            self.assertEqual([], store._state()["sessions"])
+            finally:
+                connection.close()
+            self.assertFalse(store.session("not-a-session"))
+            self.assertEqual([], control_rows("sessions"))
+            self.assertFalse(store.session(session))
 
     def test_password_changes_require_a_nonempty_minimum_length(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -189,14 +204,11 @@ class ControlPlaneTests(unittest.TestCase):
                 {"status": "expired"},
                 store.poll_device_authorization(approved_device["deviceId"]),
             )
-            revoked_devices = store._state()["deviceAuthorizations"]
-            self.assertEqual(
-                {"revoked"},
-                {item["status"] for item in revoked_devices},
-            )
-            self.assertTrue(
-                all(item["expires"] == item["revoked"] for item in revoked_devices)
-            )
+            revoked_devices = control_rows("device_authorizations")
+            self.assertEqual({"revoked"}, {row["status"] for row in revoked_devices})
+            # Revocation also brings the expiry forward, so a revoked record
+            # stops occupying a queue slot as well as losing its authority.
+            self.assertTrue(all(row["expires_at"] <= now() for row in revoked_devices))
             device_audit = next(
                 event
                 for event in reversed(store.audit_tail())
@@ -226,24 +238,37 @@ class ControlPlaneTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         store.create_token("invalid", invalid_expiry)
 
-            first_raw, first = store.create_token(
-                "legacy",
+            # The former half of this test seeded "not-a-date" into a token's
+            # expiry and asserted the store revoked it on sight. A timestamptz
+            # column cannot hold that value, so the malformed-record path is
+            # now unrepresentable rather than merely unhandled, and the
+            # behaviour it protected no longer has an input that reaches it.
+            # What remains is the property that still has meaning: an expired
+            # token does not authenticate, and a live one does.
+            expired_raw, expired = store.create_token(
+                "expiring",
                 iso(now() + timedelta(days=1)),
             )
-            second_raw, second = store.create_token("valid")
-            state = store._state()
-            state["tokens"][0]["expires"] = "not-a-date"
-            store._write(state)
+            live_raw, live = store.create_token("valid")
+            connection = control_schema.connect(DATABASE_URL)
+            try:
+                connection.execute(
+                    "UPDATE control.tokens SET expires_at = %s WHERE token_id = %s",
+                    (now() - timedelta(seconds=1), expired["id"]),
+                )
+            finally:
+                connection.close()
 
-            self.assertIsNone(
-                store.authenticate_token(first_raw, "127.0.0.1")
-            )
+            self.assertIsNone(store.authenticate_token(expired_raw, "127.0.0.1"))
             self.assertEqual(
-                second["id"],
-                store.authenticate_token(second_raw, "127.0.0.1")["id"],
+                live["id"],
+                store.authenticate_token(live_raw, "127.0.0.1")["id"],
             )
+            # An expired token is refused without being marked revoked: expiry
+            # and revocation are different states, and conflating them would
+            # release the name reservation.
             records = {item["id"]: item for item in store.list_tokens()}
-            self.assertIsNotNone(records[first["id"]]["revoked"])
+            self.assertIsNone(records[expired["id"]]["revoked"])
 
     def test_semantic_token_scopes_are_closed_canonical_and_audited(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -272,7 +297,7 @@ class ControlPlaneTests(unittest.TestCase):
                 record["scopes"],
             )
             self.assertEqual(expiry, record["expires"])
-            self.assertNotIn(raw, (root / "auth.json").read_text())
+            self.assertNotIn(raw, str(control_rows("tokens")))
             audit = [
                 json.loads(line)
                 for line in (root / "audit.jsonl").read_text().splitlines()
@@ -341,15 +366,13 @@ class ControlPlaneTests(unittest.TestCase):
             )
             self.assertEqual("pending", store.poll_device_authorization(started["deviceId"])["status"])
             self.assertTrue(store.approve_device_authorization(started["userCode"]))
-            approved_state = store._state()
-            self.assertEqual([], approved_state["tokens"])
+            self.assertEqual([], control_rows("tokens"))
             self.assertEqual(
-                "approved",
-                approved_state["deviceAuthorizations"][0]["status"],
+                "approved", control_rows("device_authorizations")[0]["status"]
             )
             self.assertNotIn(
                 "mapp_",
-                (Path(directory) / "auth.json").read_text(),
+                str(control_rows("device_authorizations")),
             )
             authorized = store.poll_device_authorization(started["deviceId"])
             self.assertEqual("authorized", authorized["status"])
@@ -366,64 +389,20 @@ class ControlPlaneTests(unittest.TestCase):
                 authorized["token"],
                 (Path(directory) / "audit.jsonl").read_text(),
             )
-            persisted = (Path(directory) / "auth.json").read_text()
+            # The issued bearer token must exist nowhere at rest: not in the
+            # device record that authorised it, and not in the token row, which
+            # holds only its hash.
+            persisted = str(control_rows("device_authorizations")) + str(
+                control_rows("tokens")
+            )
             self.assertNotIn(authorized["token"], persisted)
-            self.assertNotIn('"token":', persisted)
             self.assertEqual(
                 token_hash(authorized["token"]),
-                store._state()["tokens"][0]["hash"],
+                control_rows("tokens")[0]["token_hash"],
             )
             self.assertEqual(
                 "consumed",
                 store.poll_device_authorization(started["deviceId"])["status"],
-            )
-
-    def test_legacy_raw_device_credentials_are_purged_and_revoked(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            store = ControlStore(root)
-            store.initialize("correct horse battery staple", "instance")
-            started = store.start_device_authorization(
-                "legacy-agent",
-                ["inspect"],
-                "127.0.0.1",
-            )
-            raw, record = store.create_token(
-                "Device: legacy-agent",
-                iso(now() + timedelta(days=30)),
-                ["inspect"],
-            )
-            state = store._state()
-            authorization = state["deviceAuthorizations"][0]
-            authorization.update({
-                "status": "approved",
-                "token": raw,
-                "tokenRecord": record,
-            })
-            store._write(state)
-
-            migrated = ControlStore(root)
-            migrated_state = migrated._state()
-            migrated_authorization = migrated_state["deviceAuthorizations"][0]
-            migrated_token = next(
-                item
-                for item in migrated_state["tokens"]
-                if item["id"] == record["id"]
-            )
-
-            self.assertNotIn("token", migrated_authorization)
-            self.assertNotIn("tokenRecord", migrated_authorization)
-            self.assertIsNotNone(
-                migrated_authorization["legacyCredentialPurged"],
-            )
-            self.assertIsNotNone(migrated_token["revoked"])
-            self.assertIsNone(
-                migrated.authenticate_token(raw, "127.0.0.1"),
-            )
-            self.assertNotIn(raw, (root / "auth.json").read_text())
-            self.assertEqual(
-                "authorized",
-                migrated.poll_device_authorization(started["deviceId"])["status"],
             )
 
     def test_operation_records_are_private_and_terminal(self):

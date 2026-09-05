@@ -16,6 +16,8 @@ import app
 from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
+from control_fixture import ControlStoreTestCase
+
 
 class FederationHostDiagnosticRouteTests(unittest.TestCase):
     """An unusable registry must still be able to say why."""
@@ -1205,7 +1207,7 @@ class JsonResponseTests(unittest.TestCase):
         handler.send_response.assert_called_once_with(HTTPStatus.OK)
 
 
-class TokenAdministrationRouteTests(unittest.TestCase):
+class TokenAdministrationRouteTests(ControlStoreTestCase):
     @staticmethod
     def handler(
         payload: dict,
@@ -3661,8 +3663,9 @@ class CatalogDiscoveryTests(unittest.TestCase):
         self.assertNotIn("JOIN geometry_columns", discovery_query)
 
 
-class DerivedBackgroundOperationTests(unittest.TestCase):
+class DerivedBackgroundOperationTests(ControlStoreTestCase):
     def setUp(self):
+        super().setUp()
         self.semantic = Mock()
         self.semantic.request.return_value = {"assets": []}
         semantic_patcher = patch.object(app, "SEMANTIC", self.semantic)
@@ -6765,7 +6768,7 @@ class ApplyRouteTests(unittest.TestCase):
         self.assertEqual("indeterminate", responses[0][1]["operation"]["status"])
 
 
-class CandidatePreviewRouteTests(unittest.TestCase):
+class CandidatePreviewRouteTests(ControlStoreTestCase):
     @staticmethod
     def handler(path: str, payload: dict) -> tuple[app.Handler, list]:
         responses = []

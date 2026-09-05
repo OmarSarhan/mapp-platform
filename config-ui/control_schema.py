@@ -1,8 +1,8 @@
 """The `control` schema: migration ladder, connect helper, and its DDL.
 
-The configuration service keeps its authorization state in `var/control/auth.json`
-today. This module is the PostgreSQL side of moving it, and the storage the
-mcp-auth component needs for OAuth records.
+The configuration service used to keep its authorization state in a JSON
+document under `var/control`. This module is the PostgreSQL side that replaced
+it, and the storage the mcp-auth component needs for its OAuth records.
 
 Two rules run through the whole schema.
 
@@ -162,7 +162,7 @@ def migrate(connection: psycopg.Connection) -> list[int]:
 
 
 def _migration_1(connection: psycopg.Connection) -> None:
-    """Platform authorization state, replacing var/control/auth.json.
+    """Platform authorization state, replacing the former JSON document.
 
     Column names are snake_case here while the JSON document used camelCase;
     the importer maps between them in one place rather than spreading the

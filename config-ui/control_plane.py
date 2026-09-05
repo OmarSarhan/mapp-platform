@@ -17,6 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import control_schema
+
 
 UTC = dt.timezone.utc
 PBKDF2_ROUNDS = 310_000
@@ -160,7 +162,6 @@ class ControlStore:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
-        self.state_path = root / "auth.json"
         self.audit_path = root / "audit.jsonl"
         self.process_lock_path = root / ".control.lock"
         self.proposals = root / "proposals"
@@ -178,8 +179,13 @@ class ControlStore:
         )
         os.chmod(self.process_lock_path, 0o600)
         self._last_failed_token_audit = 0.0
+        #: Nothing connects in the constructor. config-ui builds this store at
+        #: module import (app.py) and has no depends_on for the database, so
+        #: connecting eagerly would make the service unstartable whenever
+        #: PostgreSQL is merely slower to come up.
+        self._migrated = False
+        self._db_lock = threading.RLock()
         self._secure_existing_state()
-        self._remove_persisted_device_tokens()
 
     @contextlib.contextmanager
     def _locked(self):
@@ -196,7 +202,6 @@ class ControlStore:
 
     def _secure_existing_state(self) -> None:
         for path in (
-            self.state_path,
             self.audit_path,
             self.process_lock_path,
         ):
@@ -212,61 +217,6 @@ class ControlStore:
         for operation_path in self.operations.glob("*.json"):
             if operation_path.is_file() and not operation_path.is_symlink():
                 os.chmod(operation_path, 0o600)
-
-    def _remove_persisted_device_tokens(self) -> None:
-        """Strip raw device tokens from state, and revoke what they matched.
-
-        Not dead code, despite the older name: it runs on every store
-        construction, and what it removes is a usable credential sitting in
-        auth.json in the clear. Deleting it would leave any state still in the
-        earlier staged format holding readable tokens that also still work.
-
-        The `legacyCredentialPurged` marker and the
-        `device.legacy_credential_purged` audit event keep the older word
-        deliberately. The first is written into persisted records, so renaming
-        it orphans every record already carrying it; the second names events
-        already in the audit history, and splitting that history across two
-        names to improve a word is a poor trade.
-        """
-        if not self.state_path.exists():
-            return
-        changed = False
-        with self._locked():
-            state = self._state()
-            current = iso()
-            tokens = state.get("tokens")
-            if not isinstance(tokens, list):
-                tokens = []
-            for item in state["deviceAuthorizations"]:
-                if not isinstance(item, dict):
-                    continue
-                raw = item.pop("token", None)
-                public_record = item.pop("tokenRecord", None)
-                if raw is None and public_record is None:
-                    continue
-                changed = True
-                token_id = (
-                    public_record.get("id")
-                    if isinstance(public_record, dict)
-                    else None
-                )
-                raw_hash = token_hash(raw) if isinstance(raw, str) else None
-                for token in tokens:
-                    if not isinstance(token, dict) or token.get("revoked"):
-                        continue
-                    if (
-                        (token_id and token.get("id") == token_id)
-                        or (raw_hash and token.get("hash") == raw_hash)
-                    ):
-                        token["revoked"] = current
-                item["legacyCredentialPurged"] = current
-            if changed:
-                self._write(state)
-        if changed:
-            self.audit(
-                "device.legacy_credential_purged",
-                actor="system",
-            )
 
     def recover_interrupted_operations(self) -> None:
         """Fail closed for work abandoned by a previous service process."""
@@ -305,43 +255,92 @@ class ControlStore:
                 })
                 _atomic_json(operation_path, operation)
 
-    def _state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            raise RuntimeError("Control-plane authentication is not initialized. Run ./bin/mapp init.")
-        state = _strict_json(self.state_path.read_text())
-        state.setdefault("deviceAuthorizations", [])
-        return state
+    @contextlib.contextmanager
+    def _db(self):
+        """A connection to the control schema, closed when the call ends.
 
-    def _write(self, state: dict[str, Any]) -> None:
-        _atomic_json(self.state_path, state)
+        One connection per operation rather than one held per store. Holding
+        one open is tempting -- these are short statements -- but a store is
+        constructed per process and per test, and a held connection is only
+        released when the object is collected, which exhausted the role's
+        CONNECTION LIMIT of 8 as soon as more than a handful existed at once.
+        Connecting per call keeps that limit meaningful; the cost is a few
+        milliseconds on a dashboard request.
+        """
+        connection = control_schema.connect()
+        try:
+            with self._db_lock:
+                if not self._migrated:
+                    control_schema.migrate(connection)
+                    self._migrated = True
+            yield connection
+        finally:
+            connection.close()
+
+    def _require_initialized(self, connection) -> str:
+        row = connection.execute(
+            "SELECT encoded FROM control.admin_credential WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                "Control-plane authentication is not initialized. Run ./bin/mapp init."
+            )
+        return row["encoded"]
 
     def initialize(self, password: str, instance_id: str | None = None) -> bool:
-        with self._locked():
-            if self.state_path.exists():
+        """Create the administrator credential, or report it already exists.
+
+        The insert is conditional rather than a read followed by a write, so two
+        simultaneous first starts cannot both believe they initialised the
+        store -- which would print two different passwords, only one of which
+        works.
+        """
+        require_password(password)
+        with self._db() as connection:
+            row = connection.execute(
+                "INSERT INTO control.admin_credential(id, encoded)"
+                " VALUES(1, %s) ON CONFLICT (id) DO NOTHING"
+                " RETURNING encoded",
+                (password_hash(password),),
+            ).fetchone()
+            if row is None:
                 return False
-            require_password(password)
-            self._write({
-                "version": 1,
-                "instanceId": instance_id or secrets.token_hex(16),
-                "adminPassword": password_hash(password),
-                "sessions": [],
-                "tokens": [],
-                "deviceAuthorizations": [],
-            })
-            self.audit("auth.initialized", actor="local-admin")
-            return True
+            connection.execute(
+                "INSERT INTO control.metadata(key, value) VALUES('instance_id', %s)"
+                " ON CONFLICT (key) DO NOTHING",
+                (instance_id or secrets.token_hex(16),),
+            )
+        self.audit("auth.initialized", actor="local-admin")
+        return True
 
     def instance_id(self) -> str:
-        with self._locked():
-            return self._state()["instanceId"]
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "SELECT value FROM control.metadata WHERE key = 'instance_id'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Control-plane authentication is not initialized. Run ./bin/mapp init."
+                )
+            return row["value"]
 
     def pagination_key(self) -> bytes:
-        """Return a stable private key for integrity-bound opaque cursors."""
-        with self._locked():
-            state = self._state()
+        """Return a stable private key for integrity-bound opaque cursors.
+
+        The material is the instance id and the *encoded* credential exactly as
+        stored -- not a re-hash of it. Changing the administrator password
+        therefore invalidates outstanding cursors, which is existing behaviour
+        and must not change silently: the credential has to move between stores
+        byte-for-byte or every issued cursor stops verifying.
+        """
+        with self._db() as connection:
+            encoded = self._require_initialized(connection)
+            row = connection.execute(
+                "SELECT value FROM control.metadata WHERE key = 'instance_id'"
+            ).fetchone()
             material = (
-                f"mapp-pagination-v1\0{state['instanceId']}\0"
-                f"{state['adminPassword']}"
+                f"mapp-pagination-v1\0{row['value']}\0{encoded}"
             ).encode("utf-8")
         return hashlib.sha256(material).digest()
 
@@ -404,79 +403,82 @@ class ControlStore:
                 os.fsync(stream.fileno())
 
     def login(self, password: str, remote: str) -> tuple[str, str] | None:
-        with self._locked():
-            state = self._state()
-            if not verify_password(password, state["adminPassword"]):
+        with self._db() as connection:
+            encoded = self._require_initialized(connection)
+            if not verify_password(password, encoded):
                 self.audit("auth.login_failed", actor="admin", remote=remote)
                 return None
             session = secrets.token_urlsafe(32)
             csrf = secrets.token_urlsafe(24)
-            state["sessions"].append({
-                "hash": token_hash(session),
-                "csrfHash": token_hash(csrf),
-                "created": iso(),
-                "lastUsed": iso(),
-                "remote": remote,
-            })
-            self._write(state)
-            self.audit("auth.login", actor="admin", remote=remote)
-            return session, csrf
+            current = now()
+            connection.execute(
+                "INSERT INTO control.sessions"
+                "(session_hash, csrf_hash, created_at, last_used_at, remote)"
+                " VALUES(%s,%s,%s,%s,%s)",
+                (token_hash(session), token_hash(csrf), current, current, remote),
+            )
+        self.audit("auth.login", actor="admin", remote=remote)
+        return session, csrf
 
     def session(self, session: str | None, csrf: str | None = None, *, require_csrf: bool = False) -> bool:
+        """Validate and refresh a browser session.
+
+        Both bounds stay in Python rather than becoming SQL intervals so the
+        two constants keep one definition, and the refusal is one statement:
+        the UPDATE matches only a live row whose CSRF hash agrees, so a wrong
+        token cannot refresh the session it failed to authorise.
+        """
         if not session:
             return False
-        with self._locked():
-            state = self._state()
+        with self._db() as connection:
             current = now()
-            valid = False
-            retained = []
-            changed = False
-            for item in state["sessions"]:
-                created = parse_time(item["created"])
-                used = parse_time(item["lastUsed"])
-                expired = (
-                    not created or not used
-                    or (current - created).total_seconds() > SESSION_MAX_SECONDS
-                    or (current - used).total_seconds() > SESSION_IDLE_SECONDS
-                )
-                if expired:
-                    changed = True
-                    continue
-                if hmac.compare_digest(item["hash"], token_hash(session)):
-                    if require_csrf and (not csrf or not hmac.compare_digest(item["csrfHash"], token_hash(csrf))):
-                        retained.append(item)
-                        continue
-                    item["lastUsed"] = iso(current)
-                    valid = True
-                    changed = True
-                retained.append(item)
-            if changed:
-                state["sessions"] = retained
-                self._write(state)
-            return valid
+            idle_floor = current - dt.timedelta(seconds=SESSION_IDLE_SECONDS)
+            absolute_floor = current - dt.timedelta(seconds=SESSION_MAX_SECONDS)
+            # Expired rows are removed whether or not this call authenticates,
+            # matching the pruning the JSON store did as a side effect.
+            connection.execute(
+                "DELETE FROM control.sessions"
+                " WHERE created_at <= %s OR last_used_at <= %s",
+                (absolute_floor, idle_floor),
+            )
+            clauses = ["session_hash = %s", "created_at > %s", "last_used_at > %s"]
+            values: list = [token_hash(session), absolute_floor, idle_floor]
+            if require_csrf:
+                if not csrf:
+                    return False
+                clauses.append("csrf_hash = %s")
+                values.append(token_hash(csrf))
+            row = connection.execute(
+                "UPDATE control.sessions SET last_used_at = %s"
+                " WHERE " + " AND ".join(clauses) + " RETURNING session_hash",
+                [current, *values],
+            ).fetchone()
+            return row is not None
 
     def logout(self, session: str | None) -> None:
         if not session:
             return
-        with self._locked():
-            state = self._state()
-            state["sessions"] = [
-                item for item in state["sessions"]
-                if not hmac.compare_digest(item["hash"], token_hash(session))
-            ]
-            self._write(state)
+        with self._db() as connection:
+            connection.execute(
+                "DELETE FROM control.sessions WHERE session_hash = %s",
+                (token_hash(session),),
+            )
 
     def change_password(self, current: str, replacement: str) -> bool:
-        with self._locked():
-            state = self._state()
-            if not verify_password(current, state["adminPassword"]):
+        with self._db() as connection:
+            encoded = self._require_initialized(connection)
+            if not verify_password(current, encoded):
                 return False
             require_password(replacement)
-            state["adminPassword"] = password_hash(replacement)
-            state["sessions"] = []
-            self._write(state)
-            self.audit("auth.password_changed", actor="admin")
-            return True
+            connection.execute(
+                "UPDATE control.admin_credential"
+                "   SET encoded = %s, updated_at = now() WHERE id = 1",
+                (password_hash(replacement),),
+            )
+            # Every session is invalidated: the old password may be known.
+            connection.execute("DELETE FROM control.sessions")
+        self.audit("auth.password_changed", actor="admin")
+        return True
 
     def create_token(
         self,
@@ -518,18 +520,35 @@ class ControlStore:
             "revoked": None,
             "scopes": normalized_scopes,
         }
-        with self._locked():
-            state = self._state()
+        with self._db() as connection:
+            self._require_initialized(connection)
+            # Reservation is permanent and case-insensitive, and it is checked
+            # here rather than by a constraint because it covers revoked rows
+            # too: the schema's unique index only spans live tokens, since real
+            # deployments already hold revoked duplicates from before the rule
+            # existed. casefold, not SQL lower(): they disagree on 'SS'/'ß'.
             normalized_name = record["name"].casefold()
-            if any(
-                isinstance(existing, dict)
-                and isinstance(existing.get("name"), str)
-                and existing["name"].strip().casefold() == normalized_name
-                for existing in state["tokens"]
-            ):
+            taken = connection.execute(
+                "SELECT 1 FROM control.tokens WHERE name_key = %s LIMIT 1",
+                (normalized_name,),
+            ).fetchone()
+            if taken is not None:
                 raise ValueError("Token names must be unique.")
-            state["tokens"].append(record)
-            self._write(state)
+            connection.execute(
+                "INSERT INTO control.tokens"
+                "(token_hash, token_id, name, name_key, created_at, expires_at,"
+                " scopes)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    record["hash"],
+                    record["id"],
+                    record["name"],
+                    normalized_name,
+                    parse_time(record["created"]),
+                    parse_time(record["expires"]),
+                    record["scopes"],
+                ),
+            )
         self.audit(
             "token.created",
             actor="admin",
@@ -562,164 +581,196 @@ class ControlStore:
         current = now()
         device_id = secrets.token_urlsafe(24)
         user_code = f"{secrets.token_hex(2).upper()}-{secrets.token_hex(2).upper()}"
-        record = {
-            "idHash": token_hash(device_id),
-            "userCode": user_code,
-            "deviceName": device_name.strip(),
-            "scopes": list(dict.fromkeys(scopes)),
-            "created": iso(current),
-            "expires": iso(current + dt.timedelta(seconds=DEVICE_AUTH_SECONDS)),
-            "remote": remote,
-            "status": "pending",
-        }
-        with self._locked():
-            state = self._state()
-            active = [
-                item for item in state["deviceAuthorizations"]
-                if parse_time(item.get("expires")) and parse_time(item["expires"]) > current
-            ]
-            if sum(
-                item.get("remote") == remote and item.get("status") == "pending"
-                for item in active
-            ) >= 3:
-                raise ValueError("Too many pending device authorizations from this client.")
-            if len(active) >= 20:
-                raise ValueError("The device authorization queue is full.")
-            state["deviceAuthorizations"] = [*active, record]
-            self._write(state)
+        normalized_scopes = list(dict.fromkeys(scopes))
+        expires_at = current + dt.timedelta(seconds=DEVICE_AUTH_SECONDS)
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute("BEGIN")
+            try:
+                # Expired rows are dropped first, exactly as the JSON store
+                # rebuilt its list from the live records, so an abandoned
+                # request never permanently occupies a queue slot.
+                connection.execute(
+                    "DELETE FROM control.device_authorizations WHERE expires_at <= %s",
+                    (current,),
+                )
+                per_client = connection.execute(
+                    "SELECT count(*) AS n FROM control.device_authorizations"
+                    " WHERE remote = %s AND status = 'pending' AND expires_at > %s",
+                    (remote, current),
+                ).fetchone()
+                if int(per_client["n"]) >= 3:
+                    raise ValueError("Too many pending device authorizations from this client.")
+                total = connection.execute(
+                    "SELECT count(*) AS n FROM control.device_authorizations"
+                    " WHERE expires_at > %s",
+                    (current,),
+                ).fetchone()
+                if int(total["n"]) >= 20:
+                    raise ValueError("The device authorization queue is full.")
+                connection.execute(
+                    "INSERT INTO control.device_authorizations"
+                    "(id_hash, user_code, device_name, scopes, created_at,"
+                    " expires_at, remote, status)"
+                    " VALUES(%s,%s,%s,%s,%s,%s,%s,'pending')",
+                    (
+                        token_hash(device_id),
+                        user_code,
+                        device_name.strip(),
+                        normalized_scopes,
+                        current,
+                        expires_at,
+                        remote,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
         self.audit("device.started", actor="anonymous", remote=remote, details={"userCode": user_code})
         return {
             "deviceId": device_id,
             "userCode": user_code,
             "expiresIn": DEVICE_AUTH_SECONDS,
             "interval": 3,
-            "scopes": record["scopes"],
+            "scopes": normalized_scopes,
         }
 
     def list_device_authorizations(self) -> list[dict]:
-        with self._locked():
-            current = now()
-            return [
-                {
-                    key: item.get(key)
-                    for key in ("userCode", "deviceName", "scopes", "created", "expires", "remote", "status")
-                }
-                for item in self._state()["deviceAuthorizations"]
-                if parse_time(item.get("expires")) and parse_time(item["expires"]) > current
-            ]
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT * FROM control.device_authorizations"
+                " WHERE expires_at > %s ORDER BY created_at",
+                (now(),),
+            ).fetchall()
+        return [
+            {
+                "userCode": row["user_code"],
+                "deviceName": row["device_name"],
+                "scopes": list(row["scopes"]),
+                "created": iso(row["created_at"]),
+                "expires": iso(row["expires_at"]),
+                "remote": row["remote"],
+                "status": row["status"],
+            }
+            for row in rows
+        ]
 
     def approve_device_authorization(self, user_code: str) -> bool:
-        approved = False
-        approved_details = None
-        with self._locked():
-            state = self._state()
-            current = now()
-            for item in state["deviceAuthorizations"]:
-                if (
-                    item.get("userCode") == user_code
-                    and item.get("status") == "pending"
-                    and parse_time(item.get("expires"))
-                    and parse_time(item["expires"]) > current
-                ):
-                    item.update({
-                        "status": "approved",
-                        "approved": iso(current),
-                    })
-                    self._write(state)
-                    approved = True
-                    approved_details = {
-                        "userCode": user_code,
-                        "deviceName": item["deviceName"],
-                        "scopes": item["scopes"],
-                    }
-                    break
-        if approved:
-            self.audit(
-                "device.approved",
-                actor="admin",
-                details=approved_details,
-            )
-        return approved
+        """Approve a pending request, in one conditional statement.
+
+        The predicate and the transition are the same statement, so two
+        operators approving at once cannot both believe they did it.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.device_authorizations"
+                "   SET status = 'approved', approved_at = %s"
+                " WHERE user_code = %s AND status = 'pending' AND expires_at > %s"
+                " RETURNING device_name, scopes",
+                (now(), user_code, now()),
+            ).fetchone()
+        if row is None:
+            return False
+        self.audit(
+            "device.approved",
+            actor="admin",
+            details={
+                "userCode": user_code,
+                "deviceName": row["device_name"],
+                "scopes": list(row["scopes"]),
+            },
+        )
+        return True
 
     def poll_device_authorization(self, device_id: str) -> dict:
+        """Report status, and mint the token exactly once when approved.
+
+        The consume and the token insert share one transaction, and the consume
+        is conditional on the row still being approved, so two simultaneous
+        polls cannot both mint a token from one authorization. The file lock
+        used to provide that; here the row does.
+        """
         digest = token_hash(device_id)
         issued: tuple[str, dict, str] | None = None
-        with self._locked():
-            state = self._state()
+        with self._db() as connection:
+            self._require_initialized(connection)
             current = now()
-            for item in state["deviceAuthorizations"]:
-                if not hmac.compare_digest(str(item.get("idHash", "")), digest):
-                    continue
-                expiry = parse_time(item.get("expires"))
-                if not expiry or expiry <= current:
-                    return {"status": "expired"}
-                status = item.get("status")
-                if status == "pending":
-                    return {"status": "pending"}
-                if status == "consumed":
-                    return {"status": "consumed"}
-                if status != "approved":
-                    return {"status": "invalid"}
+            row = connection.execute(
+                "SELECT * FROM control.device_authorizations WHERE id_hash = %s",
+                (digest,),
+            ).fetchone()
+            if row is None:
+                return {"status": "invalid"}
+            if row["expires_at"] <= current:
+                return {"status": "expired"}
+            if row["status"] == "pending":
+                return {"status": "pending"}
+            if row["status"] == "consumed":
+                return {"status": "consumed"}
+            if row["status"] != "approved":
+                return {"status": "invalid"}
+            scopes = list(row["scopes"])
+            if not scopes or any(scope not in DEVICE_SCOPES for scope in scopes):
+                return {"status": "invalid"}
 
-                scopes = item.get("scopes")
-                if (
-                    not isinstance(scopes, list)
-                    or not scopes
-                    or any(
-                        not isinstance(scope, str) or scope not in DEVICE_SCOPES
-                        for scope in scopes
-                    )
-                ):
-                    return {"status": "invalid"}
+            connection.execute("BEGIN")
+            try:
                 raw = "mapp_" + secrets.token_urlsafe(32)
-                while True:
-                    token_id = secrets.token_hex(8)
-                    token_name = f"Device: {item['deviceName']} [{token_id}]"
-                    folded_name = token_name.casefold()
-                    if not any(
-                        isinstance(existing, dict)
-                        and (
-                            existing.get("id") == token_id
-                            or (
-                                isinstance(existing.get("name"), str)
-                                and existing["name"].strip().casefold()
-                                == folded_name
-                            )
-                        )
-                        for existing in state["tokens"]
-                    ):
-                        break
-                record = {
-                    "id": token_id,
-                    "name": token_name,
-                    "hash": token_hash(raw),
-                    "created": iso(current),
-                    "expires": iso(
-                        current + dt.timedelta(seconds=DEVICE_TOKEN_SECONDS)
+                token_id = secrets.token_hex(8)
+                token_name = f"Device: {row['device_name']} [{token_id}]"
+                expires_at = current + dt.timedelta(seconds=DEVICE_TOKEN_SECONDS)
+                # Consume first, conditionally: if this returns nothing another
+                # poll already took it, and no token is minted.
+                consumed = connection.execute(
+                    "UPDATE control.device_authorizations"
+                    "   SET status = 'consumed', consumed_at = %s, token_id = %s"
+                    " WHERE id_hash = %s AND status = 'approved' AND expires_at > %s"
+                    " RETURNING remote",
+                    (current, token_id, digest, current),
+                ).fetchone()
+                if consumed is None:
+                    connection.execute("ROLLBACK")
+                    return {"status": "consumed"}
+                connection.execute(
+                    "INSERT INTO control.tokens"
+                    "(token_hash, token_id, name, name_key, created_at,"
+                    " expires_at, scopes)"
+                    " VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        token_hash(raw),
+                        token_id,
+                        token_name,
+                        token_name.casefold(),
+                        current,
+                        expires_at,
+                        scopes,
                     ),
-                    "lastUsed": None,
-                    "revoked": None,
-                    "scopes": list(dict.fromkeys(scopes)),
-                }
-                state["tokens"].append(record)
-                item.update({
-                    "status": "consumed",
-                    "consumed": iso(current),
-                    "tokenId": record["id"],
-                })
-                self._write(state)
-                issued = (raw, self.public_token(record), str(item.get("remote", "")))
-                break
-        if issued:
-            raw, record, remote = issued
-            self.audit(
-                "device.token_issued",
-                actor=f"token:{record['id']}",
-                remote=remote,
-                details={"id": record["id"], "scopes": record["scopes"]},
-            )
-            return {"status": "authorized", "token": raw, "record": record}
-        return {"status": "invalid"}
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            record = {
+                "id": token_id,
+                "name": token_name,
+                "created": iso(current),
+                "expires": iso(expires_at),
+                "lastUsed": None,
+                "revoked": None,
+                "scopes": scopes,
+            }
+            issued = (raw, record, str(consumed["remote"] or ""))
+        raw, record, remote = issued
+        self.audit(
+            "device.token_issued",
+            actor=f"token:{record['id']}",
+            remote=remote,
+            details={"id": record["id"], "scopes": record["scopes"]},
+        )
+        return {"status": "authorized", "token": raw, "record": record}
 
     def create_operation(self, kind: str, actor: str, target: dict | None = None) -> dict:
         operation = {
@@ -835,43 +886,56 @@ class ControlStore:
     def public_token(record: dict) -> dict:
         return {key: record.get(key) for key in ("id", "name", "created", "expires", "lastUsed", "revoked", "scopes")}
 
+    @staticmethod
+    def _token_row(row) -> dict:
+        """Project a row into the exact shape the JSON store returned.
+
+        The key names and the falsy-when-live `revoked` are load-bearing well
+        beyond this module: two output-suppressed revocation sweeps in the demo
+        and federation harnesses filter on `record["name"]` and
+        `not record.get("revoked")`, and would silently sweep nothing if either
+        changed.
+        """
+        return {
+            "id": row["token_id"],
+            "name": row["name"],
+            "created": iso(row["created_at"]),
+            "expires": iso(row["expires_at"]) if row["expires_at"] else None,
+            "lastUsed": iso(row["last_used_at"]) if row["last_used_at"] else None,
+            "revoked": iso(row["revoked_at"]) if row["revoked_at"] else None,
+            "scopes": list(row["scopes"]),
+        }
+
     def list_tokens(self) -> list[dict]:
-        with self._locked():
-            return [
-                self.public_token(item)
-                for item in self._state()["tokens"]
-            ]
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT * FROM control.tokens ORDER BY created_at, token_id"
+            ).fetchall()
+        return [self._token_row(row) for row in rows]
 
     def authenticate_token(self, raw: str | None, remote: str) -> dict | None:
+        """Authenticate a bearer token and stamp its last use.
+
+        One conditional UPDATE does both: a row that is revoked or expired
+        cannot be matched, so it cannot have its last-use stamped either, and
+        no separate read can go stale between the check and the write.
+        """
         if not raw:
             return None
-        digest = token_hash(raw)
         audit_failure = False
-        with self._locked():
-            state = self._state()
+        with self._db() as connection:
             current = now()
-            found = None
-            changed = False
-            for item in state["tokens"]:
-                try:
-                    expiry = parse_time(item.get("expires"))
-                except (TypeError, ValueError):
-                    if not item.get("revoked"):
-                        item["revoked"] = iso(current)
-                        changed = True
-                    continue
-                if (
-                    not item.get("revoked")
-                    and (not expiry or expiry > current)
-                    and hmac.compare_digest(item["hash"], digest)
-                ):
-                    item["lastUsed"] = iso(current)
-                    found = self.public_token(item)
-                    break
-            if found or changed:
-                self._write(state)
-            if found:
-                return found
+            row = connection.execute(
+                "UPDATE control.tokens SET last_used_at = %s"
+                " WHERE token_hash = %s"
+                "   AND revoked_at IS NULL"
+                "   AND (expires_at IS NULL OR expires_at > %s)"
+                " RETURNING *",
+                (current, token_hash(raw), current),
+            ).fetchone()
+            if row is not None:
+                return self._token_row(row)
             monotonic = time.monotonic()
             if (
                 monotonic - self._last_failed_token_audit
@@ -884,27 +948,33 @@ class ControlStore:
         return None
 
     def revoke_token(self, token_id: str) -> bool:
-        with self._locked():
-            state = self._state()
-            found = False
-            for item in state["tokens"]:
-                if item["id"] == token_id and not item.get("revoked"):
-                    item["revoked"] = iso()
-                    found = True
-            if found:
-                self._write(state)
-                self.audit("token.revoked", actor="admin", details={"id": token_id})
-            return found
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.tokens SET revoked_at = %s"
+                " WHERE token_id = %s AND revoked_at IS NULL"
+                " RETURNING token_id",
+                (now(), token_id),
+            ).fetchone()
+            found = row is not None
+        if found:
+            self.audit("token.revoked", actor="admin", details={"id": token_id})
+        return found
 
     def sessions(self) -> list[dict]:
-        with self._locked():
-            return [
-                {
-                    key: item.get(key)
-                    for key in ("created", "lastUsed", "remote")
-                }
-                for item in self._state()["sessions"]
-            ]
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT * FROM control.sessions ORDER BY created_at"
+            ).fetchall()
+        return [
+            {
+                "created": iso(row["created_at"]),
+                "lastUsed": iso(row["last_used_at"]),
+                "remote": row["remote"],
+            }
+            for row in rows
+        ]
 
     def audit_tail(self, limit: int = 200) -> list[dict]:
         with self._locked():
@@ -925,54 +995,63 @@ class ControlStore:
             return [_strict_json(line) for line in lines]
 
     def reset_password(self, password: str, *, revoke_tokens: bool = False) -> None:
-        with self._locked():
-            require_password(password)
-            state = self._state()
-            state["adminPassword"] = password_hash(password)
-            state["sessions"] = []
-            if revoke_tokens:
-                revoked_at = iso()
-                # Keep every token record: revocation must not release its
-                # permanently reserved, case-insensitive name.
-                for item in state["tokens"]:
-                    if not item.get("revoked"):
-                        item["revoked"] = revoked_at
-                revoked_devices = 0
-                for item in state["deviceAuthorizations"]:
-                    if item.get("status") in {"pending", "approved"}:
-                        # Approved device grants can still mint a token, and
-                        # every unexpired record occupies a queue slot. Expire
-                        # both forms of outstanding authority in the same
-                        # transaction as the token revocation.
-                        item.update({
-                            "status": "revoked",
-                            "revoked": revoked_at,
-                            "expires": revoked_at,
-                        })
-                        revoked_devices += 1
-            self._write(state)
-            self.audit("auth.password_reset", actor="local-admin")
-            if revoke_tokens:
-                if revoked_devices:
-                    self.audit(
-                        "device.authorizations_revoked",
-                        actor="local-admin",
-                        details={
-                            "reason": "demo-init",
-                            "count": revoked_devices,
-                        },
-                    )
-                self.audit(
-                    "token.revoked_all",
-                    actor="local-admin",
-                    details={"reason": "demo-init"},
+        require_password(password)
+        with self._db() as connection:
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    "INSERT INTO control.admin_credential(id, encoded) VALUES(1, %s)"
+                    " ON CONFLICT (id) DO UPDATE SET"
+                    "   encoded = EXCLUDED.encoded, updated_at = now()",
+                    (password_hash(password),),
                 )
+                connection.execute("DELETE FROM control.sessions")
+                revoked_devices = 0
+                if revoke_tokens:
+                    revoked_at = now()
+                    # Every token record is kept: revocation must not release
+                    # its permanently reserved, case-insensitive name.
+                    connection.execute(
+                        "UPDATE control.tokens SET revoked_at = %s"
+                        " WHERE revoked_at IS NULL",
+                        (revoked_at,),
+                    )
+                    # An approved device grant can still mint a token, and every
+                    # unexpired record occupies a queue slot, so both forms of
+                    # outstanding authority end in the same transaction as the
+                    # token revocation.
+                    cursor = connection.execute(
+                        "UPDATE control.device_authorizations"
+                        "   SET status = 'revoked', expires_at = %s"
+                        " WHERE status IN ('pending','approved')",
+                        (revoked_at,),
+                    )
+                    revoked_devices = cursor.rowcount or 0
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        # Audited after the commit: an audit line for a rolled-back reset would
+        # claim authority that was never revoked.
+        self.audit("auth.password_reset", actor="local-admin")
+        if revoke_tokens:
+            if revoked_devices:
+                self.audit(
+                    "device.authorizations_revoked",
+                    actor="local-admin",
+                    details={"reason": "demo-init", "count": revoked_devices},
+                )
+            self.audit(
+                "token.revoked_all",
+                actor="local-admin",
+                details={"reason": "demo-init"},
+            )
 
     def revoke_all(self) -> None:
-        with self._locked():
-            state = self._state()
-            for item in state["tokens"]:
-                if not item.get("revoked"):
-                    item["revoked"] = iso()
-            self._write(state)
-            self.audit("token.revoked_all", actor="local-admin")
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute(
+                "UPDATE control.tokens SET revoked_at = %s WHERE revoked_at IS NULL",
+                (now(),),
+            )
+        self.audit("token.revoked_all", actor="local-admin")

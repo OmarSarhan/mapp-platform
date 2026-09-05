@@ -101,7 +101,19 @@ jobs:
         run: docker build --tag mapp-semantic-service:ci semantic-service
 
       - name: Test deployment helpers
-        run: PYTHONPATH=. python -m unittest discover -s scripts/tests -v
+        env:
+          CONTROL_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
+        # init writes the administrator credential to the control schema, so
+        # these skip without a database -- and a silent skip is the failure the
+        # guard exists to catch.
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python -m unittest discover -s scripts/tests -v 2>&1 \
+            | tee /tmp/scripts-tests.log
+          if grep -q "skipped=" /tmp/scripts-tests.log; then
+            echo "::error::deployment-helper tests skipped; they must run against PostgreSQL"
+            exit 1
+          fi
 
       - name: Test browser egress allowlist
         run: |

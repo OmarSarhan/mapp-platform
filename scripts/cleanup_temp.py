@@ -162,7 +162,10 @@ def cleanup(state_dir: Path, *, confirm: bool) -> dict[str, object]:
         "removedCount": len(relative) if confirm else 0,
         "preserved": [
             "workspace",
-            "authentication",
+            # Authentication is no longer among these: the administrator
+            # credential, API tokens and device authorizations live in the
+            # control schema, not under var/. Naming it here would promise
+            # something this sweep does not touch and cannot protect.
             "audit",
             "proposals",
             "semantic database and history",

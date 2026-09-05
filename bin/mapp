@@ -348,6 +348,93 @@ enable_demo_sources() {
   printf 'Next: ./bin/mapp all to start the platform, then ./bin/mapp demo to load demo data.\n'
 }
 
+report_admin_bootstrap() {
+  # config_admin prints either the new password or a line saying credentials
+  # already existed. Deciding which by *containment* rather than an exact
+  # string compare: the previous version compared the whole line, so a single
+  # stray byte on stdout silently turned a real new password into "left
+  # alone", and the operator was locked out of a system they had just created.
+  local output="$1" password="$2"
+  if [[ "${output}" == *"${password}"* ]]; then
+    printf 'Configuration administrator password (shown once): %s\n' "${password}"
+  else
+    printf '%s\n' "${output}"
+    printf 'Run ./bin/mapp reset-config-password if you no longer have the password.\n'
+  fi
+}
+
+bootstrap_admin_credential() {
+  # The administrator credential lives in the control schema, so it cannot be
+  # created on the host: the packaged database publishes no port, and its DSN
+  # names `db`, which resolves only inside the compose network. init therefore
+  # starts the database and mints the credential in a container. .env must
+  # already exist, because compose needs it to resolve the database at all --
+  # which is why this runs after the template is written, not before.
+  local demo_flag="${1:-}"
+  local admin_password admin_output admin_command="init"
+  command -v openssl >/dev/null 2>&1 || {
+    printf 'openssl is required to generate the configuration administrator password.\n' >&2
+    exit 127
+  }
+  if [[ -n "${MAPP_BOOTSTRAP_DATABASE_URL:-}" ]]; then
+    # An explicit control database was supplied, so there is nothing to start
+    # and no container to reach it through. This is the path an
+    # external-PostgreSQL deployment takes -- it has no packaged database to
+    # bring up -- and it is also what lets the wrapper's own tests exercise
+    # init without a compose model.
+    admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+    if [[ "${demo_flag}" == "--demo" ]]; then
+      admin_command="reset-demo"
+    fi
+    if ! admin_output="$(printf '%s\n' "${admin_password}" \
+      | CONTROL_DATABASE_URL="${MAPP_BOOTSTRAP_DATABASE_URL}" \
+        python3 "${ROOT_DIR}/config-ui/config_admin.py" "${admin_command}" \
+          --root "${CONTROL_DIR}" \
+          --password-stdin)"; then
+      printf '%s\n' "${admin_output}" >&2
+      exit 1
+    fi
+    report_admin_bootstrap "${admin_output}" "${admin_password}"
+    if [[ "${admin_command}" == "reset-demo" ]]; then
+      printf 'Revoked all existing CLI API tokens and outstanding device authorizations for demo mode.\n'
+    fi
+    return
+  fi
+  require_docker
+  local -a init_compose=(
+    docker compose
+    --project-directory "${ROOT_DIR}"
+    --env-file "${ENV_FILE}"
+    --file "${ROOT_DIR}/compose.yaml"
+    --file "${ROOT_DIR}/compose.bundled-db.yaml"
+  )
+  if ! "${init_compose[@]}" up --detach --wait db >/dev/null 2>&1; then
+    printf 'Could not start the packaged database to initialize authentication.\n' >&2
+    exit 1
+  fi
+  if [[ "${demo_flag}" == "--demo" ]]; then
+    # Demo credentials are disposable: reset clears sessions, revokes API
+    # tokens and leaves the newly printed password as the only credential.
+    # config_admin init refuses to overwrite an existing one.
+    admin_command="reset-demo"
+  fi
+  admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  # --no-deps because the database is already up and nothing else is needed;
+  # without the explicit `up` above this would run with no database at all.
+  if ! admin_output="$(printf '%s\n' "${admin_password}" \
+    | "${init_compose[@]}" run --rm --no-deps -T config-ui \
+        python config_admin.py "${admin_command}" \
+          --root /control \
+          --password-stdin)"; then
+    printf '%s\n' "${admin_output}" >&2
+    exit 1
+  fi
+  report_admin_bootstrap "${admin_output}" "${admin_password}"
+  if [[ "${admin_command}" == "reset-demo" ]]; then
+    printf 'Revoked all existing CLI API tokens and outstanding device authorizations for demo mode.\n'
+  fi
+}
+
 init_env() {
   local demo_flag="${1:-}"
   local admin_password=""
@@ -368,48 +455,12 @@ init_env() {
     validate_demo_sources "${demo_source_file}"
   fi
   init_state
-  if [[ ! -f "${CONTROL_DIR}/auth.json" || "${demo_flag}" == "--demo" ]]; then
-    command -v openssl >/dev/null 2>&1 || {
-      printf 'openssl is required to generate the configuration administrator password.\n' >&2
-      exit 127
-    }
-    if [[ -f "${CONTROL_DIR}/auth.json" ]]; then
-      admin_command="reset-demo"
-    fi
-    admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
-    if ! admin_output="$(printf '%s\n' "${admin_password}" \
-      | python3 "${ROOT_DIR}/config-ui/config_admin.py" "${admin_command}" \
-          --root "${CONTROL_DIR}" \
-          --password-stdin)"; then
-      printf '%s\n' "${admin_output}" >&2
-      exit 1
-    fi
-    # config_admin init refuses to overwrite an existing store. Demo init uses
-    # its explicit reset operation instead because demo credentials are meant
-    # to be disposable: it clears sessions, revokes API tokens, and ensures the
-    # newly printed password is the only retained administrator credential.
-    if [[ "${admin_output}" != "Admin password (shown once): ${admin_password}" ]]; then
-      admin_password=""
-      printf '%s\n' "${admin_output}"
-    fi
-    if [[ "${admin_command}" == "reset-demo" ]]; then
-      printf 'Revoked all existing CLI API tokens and outstanding device authorizations for demo mode.\n'
-    fi
-  fi
-  # var/ is a bind mount, so control/auth.json outlives the database volume and
-  # an ordinary repeat init skips the block above. Saying nothing there leaves
-  # you at a login prompt with a password that only exists as a hash.
-  # Print a newly created password before any later environment work can fail.
-  # Existing stores hold only a password hash, so never pretend that a newly
-  # generated candidate replaced them.
-  if [[ -n "${admin_password}" ]]; then
-    printf 'Configuration administrator password (shown once): %s\n' \
-      "${admin_password}"
-  else
-    printf 'Configuration administrator credentials already existed and were left alone.\n'
-    printf 'Run ./bin/mapp reset-config-password if you no longer have the password.\n'
-  fi
   if [[ -e "${ENV_FILE}" ]]; then
+    # The environment is already written, so the database can be started from
+    # it directly. The credential still has to be checked: it lives in the
+    # database now, not in var/, so an existing .env says nothing about
+    # whether authentication was ever initialized.
+    bootstrap_admin_credential "${demo_flag}"
     if [[ "${demo_flag}" == "--demo" ]]; then
       enable_demo_sources
       return
@@ -449,6 +500,7 @@ init_env() {
   sed "${template_edits[@]}" "${ROOT_DIR}/.env.example" >"${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
   printf 'Created %s with URL-safe local passwords.\n' "${ENV_FILE}"
+  bootstrap_admin_credential "${demo_flag}"
   # Both paths end by naming the next command. demo needs the platform up --
   # it mints a token inside config-ui and drives registration over HTTP -- so
   # all comes first either way.
@@ -510,10 +562,13 @@ esac
 check_state_owner
 init_state
 check_state_owner
-if [[ ! -f "${CONTROL_DIR}/auth.json" ]]; then
-  printf 'Configuration authentication is not initialized. Run ./bin/mapp init.\n' >&2
-  exit 2
-fi
+# There is no file to test any more: the administrator credential lives in the
+# control schema. Gating every compose subcommand on a database query would be
+# worse than useless -- `down`, `ps`, `logs` and `stop` all have to work when
+# the database is stopped, which is exactly when such a check would fail. The
+# .env check above already catches a system that never ran init, and an
+# uninitialized control plane surfaces at the login prompt with the message
+# from ControlStore rather than here.
 
 compose=(
   docker compose
@@ -702,7 +757,8 @@ case "${1:-}" in
       printf '%s\n' \
         'This permanently removes the packaged PostgreSQL database and everything in it: derived layers, the federation registry and its group labels, and the whole semantic catalogue -- generated profiles, curated meaning, semantic proposals and their history.' \
         'Back the database up first if any of that matters. Active derived semantic profiles are archived beforehand, but archival records the state, it does not survive the volume.' \
-        'Not touched: the source databases holding the spatial data, and everything under var -- dashboard authentication, the audit log, workspace proposals, artifacts and public assets. The live workspace is replaced by instance/workspace.seed.json.' \
+        'Destroys: the packaged database volume, and with it dashboard authentication, every CLI API token and every device authorization. Authentication is reinitialized afterwards and a new administrator password is printed, leaving the platform as ./bin/mapp init leaves it.' \
+        'Not touched: the source databases holding the spatial data, and the audit log, workspace proposals, artifacts and public assets under var. The live workspace is replaced by instance/workspace.seed.json.' \
         'Run ./bin/mapp reset-data --confirm to continue.' >&2
       exit 2
     fi
@@ -783,9 +839,15 @@ case "${1:-}" in
     printf 'Reset live and preview workspaces from instance/workspace.seed.json.\n'
     # --no-build: everything was built before the destructive boundary above.
     "${compose[@]}" up --detach --no-build "${runtime_services[@]}"
+    # The administrator credential, API tokens and device authorizations lived
+    # in the volume that was just destroyed, so the platform comes back with no
+    # way to sign in. Re-bootstrapping here is what makes reset-data mean
+    # "return to a freshly initialized system" rather than "lock yourself out":
+    # the new password is printed exactly as ./bin/mapp init prints it.
+    bootstrap_admin_credential ""
     "${ROOT_DIR}/scripts/verify.sh"
     printf '%s\n' \
-      'Database reset completed and the seed workspace was restored. Spatial data lives in the source databases; reload it with ./bin/mapp demo.'
+      'Database reset completed and the seed workspace was restored. The platform is back at its initial state: authentication was reinitialized and the new administrator password is shown above. Spatial data lives in the source databases; reload it with ./bin/mapp demo.'
     ;;
   upgrade-derived)
     run_with_buildkit_lease_retry "${compose[@]}" build db
@@ -828,11 +890,41 @@ case "${1:-}" in
   test)
     run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service
     run_with_buildkit_lease_retry docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
-    docker run --rm \
+    # The configuration suite now needs a database for the same reason the
+    # semantic one does: the administrator credential, API tokens and device
+    # authorizations live in the control schema, and a mocked cursor cannot
+    # fail the way PostgreSQL fails. Run under `compose run` rather than a bare
+    # `docker run`, which has no network and so could not reach a database at
+    # all -- every one of those tests would skip and the run would still say OK.
+    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --wait db
+    "${compose[@]}" exec -T db sh -c \
+      'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+        --set ON_ERROR_STOP=1 \
+        --command "DROP DATABASE IF EXISTS mapp_control_test" \
+        --command "CREATE DATABASE mapp_control_test"' >/dev/null
+    "${compose[@]}" exec -T db sh -c \
+      'exec psql --username "$POSTGRES_USER" --dbname mapp_control_test \
+        --set ON_ERROR_STOP=1 --command "CREATE SCHEMA control"' >/dev/null
+    control_test_url="postgresql://$(dotenv_value POSTGRES_USER):$(dotenv_value POSTGRES_PASSWORD)@db:5432/mapp_control_test?sslmode=disable"
+    config_ui_log="$(mktemp)"
+    if ! "${compose[@]}" run --rm --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
-      mapp-config-ui:local \
-      python -m unittest discover -s /workspace/config-ui/tests -v
+      --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
+      --env "MAPP_BOOTSTRAP_DATABASE_URL=${control_test_url}" \
+      config-ui \
+      python -m unittest discover -s /workspace/config-ui/tests -v 2>&1 \
+      | tee "${config_ui_log}"; then
+      rm -f "${config_ui_log}"
+      exit 1
+    fi
+    # A skip here is the failure this guard exists to catch.
+    if grep -q "skipped=" "${config_ui_log}"; then
+      rm -f "${config_ui_log}"
+      printf 'Configuration service tests skipped; the control-plane suite must run against PostgreSQL.\n' >&2
+      exit 1
+    fi
+    rm -f "${config_ui_log}"
     # The semantic-service suite exercises real SQL against a real server: a
     # mocked cursor cannot fail the way PostgreSQL fails when it parses a
     # statement, which is the whole reason those tests exist. Without
@@ -840,8 +932,7 @@ case "${1:-}" in
     # reports OK, so the database is stood up here rather than left to
     # whoever remembers. It is a scratch database and never the packaged
     # catalogue -- the fixture drops and recreates the schema it is pointed
-    # at.
-    run_with_buildkit_lease_retry "${compose[@]}" up --detach --build --wait db
+    # at. The database is already up from the configuration suite above.
     "${compose[@]}" exec -T db sh -c \
       'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
         --set ON_ERROR_STOP=1 \
@@ -923,10 +1014,16 @@ case "${1:-}" in
     "${compose[@]}" exec db psql --username "${postgres_user}" --dbname "${postgres_db}"
     ;;
   reset-config-password)
+    # These are the commands you reach for when locked out, and the credential
+    # now lives in the database, so the database has to be running. --no-deps
+    # alone used to be enough when it was a file; on its own it would now fail
+    # with no database at all.
+    "${compose[@]}" up --detach --wait db >/dev/null
     "${compose[@]}" run --rm --no-deps config-ui \
       python config_admin.py reset-password --root /control
     ;;
   revoke-config-tokens)
+    "${compose[@]}" up --detach --wait db >/dev/null
     "${compose[@]}" run --rm --no-deps config-ui \
       python config_admin.py revoke-tokens --root /control
     ;;
