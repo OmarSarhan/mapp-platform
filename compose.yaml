@@ -109,6 +109,10 @@ services:
       # every /oauth call would fail closed without this. The production
       # overlay clears it, and a test pins that it is cleared.
       AUTHLIB_INSECURE_TRANSPORT: ${AUTHLIB_INSECURE_TRANSPORT-1}
+      # Its OAuth records live in the control schema. Empty in the base
+      # (external-PostgreSQL) model, where there is no packaged database;
+      # compose.bundled-db.yaml supplies it.
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-}
     expose:
       - "8080"
     volumes:
@@ -129,9 +133,11 @@ services:
       retries: 6
       start_period: 5s
     networks:
-      # Only the internal control link. The public surface is reached solely
-      # through the Unix socket, so this service is on no edge network.
+      # The internal control link, plus backend to reach the packaged database
+      # where the control schema lives. Deliberately no edge network: the
+      # public surface is reached solely through the Unix socket.
       - mcp-control
+      - backend
 
   config-ui:
     image: mapp-config-ui:local

@@ -318,3 +318,71 @@ class ThrottleTableTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DependencySurfaceTests(unittest.TestCase):
+    """The component must not acquire a native cryptography stack.
+
+    Every platform image is musl-based and `cryptography` publishes no musl
+    wheel, so pulling it in turns a pip install into a source build. The RFCs
+    this component uses -- rfc6749, 6750, 7009, 7636, 7662, 8414, 9207 -- need
+    none of it, which is why Authlib is installed with --no-deps.
+
+    The assertion is on the Dockerfile rather than on what happens to be
+    importable here: this repository's devcontainer has `cryptography`
+    installed for other reasons, so a runtime import check would pin the
+    developer's machine instead of the image.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_authlib_is_installed_without_its_dependencies(self) -> None:
+        dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        nodeps = (self.ROOT / "requirements-nodeps.txt").read_text(encoding="utf-8")
+        plain = (self.ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("--no-deps --requirement /app/requirements-nodeps.txt", dockerfile)
+        self.assertIn("Authlib==", nodeps)
+        # If Authlib ever moves to the ordinary file it would arrive with
+        # cryptography, so the split is the control and both halves matter.
+        self.assertNotIn("Authlib", plain)
+
+    def test_the_authlib_modules_in_use_import_cleanly(self) -> None:
+        """Every RFC module this component relies on, imported for real.
+
+        A stray import into rfc7523/7591/7592/9068/9101 is what would drag the
+        native stack in, so the surface is enumerated here rather than assumed.
+        """
+        for module in (
+            "authlib.oauth2.rfc6749",
+            "authlib.oauth2.rfc6750",
+            "authlib.oauth2.rfc7009",
+            "authlib.oauth2.rfc7636",
+            "authlib.oauth2.rfc7662",
+            "authlib.oauth2.rfc8414",
+            "authlib.oauth2.rfc9207",
+        ):
+            with self.subTest(module=module):
+                __import__(module)
+
+    def test_the_component_imports_no_forbidden_authlib_module(self) -> None:
+        """Checked against parsed imports, not the file text.
+
+        The forbidden module names appear legitimately in comments explaining
+        why they are avoided, so a substring search over the source would flag
+        the documentation rather than the dependency.
+        """
+        import ast
+
+        forbidden = ("rfc7523", "rfc7591", "rfc7592", "rfc9068", "rfc9101")
+        for path in sorted(self.ROOT.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            imported: list[str] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.append(node.module)
+            for name in imported:
+                for banned in forbidden:
+                    with self.subTest(module=path.name, imported=name):
+                        self.assertNotIn(banned, name)

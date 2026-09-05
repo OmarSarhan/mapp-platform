@@ -12,13 +12,14 @@ RUN addgroup -S -g 10002 mappauth \
     && chmod 0755 /app \
     && chmod 0770 /run/mapp-auth
 
-COPY requirements.txt /app/
-# --no-deps is the whole point: Authlib's declared dependency set pulls
-# cryptography, which has no musl wheel and is not needed by the RFC subset
-# this component imports.
-RUN pip install --no-cache-dir --no-deps --requirement /app/requirements.txt
+COPY requirements.txt requirements-nodeps.txt /app/
+# Two steps on purpose. psycopg needs its dependencies; Authlib must not have
+# them, because its declared set pulls cryptography, which has no musl wheel
+# and none of the RFCs this component uses need it.
+RUN pip install --no-cache-dir --requirement /app/requirements.txt \
+    && pip install --no-cache-dir --no-deps --requirement /app/requirements-nodeps.txt
 
-COPY --chown=mappauth:mappauth VERSION authlib_adapter.py issuer.py models.py pages.py passwords.py server.py stub_store.py unix_server.py /app/
+COPY --chown=mappauth:mappauth VERSION authlib_adapter.py issuer.py models.py pages.py passwords.py server.py sql_store.py stub_store.py unix_server.py /app/
 
 USER mappauth:mappauth
 WORKDIR /app

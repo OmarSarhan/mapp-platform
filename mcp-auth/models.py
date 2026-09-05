@@ -29,6 +29,11 @@ class Client(ClientMixin):
     #: Phase 1 item.
     token_endpoint_auth_method: str = "none"
     client_secret: str | None = None
+    #: True when client_secret already holds the sha256 digest rather than the
+    #: secret itself. The SQL store keeps only the digest -- a client secret at
+    #: rest is a credential -- and check_client_secret hashes the supplied
+    #: value before comparing, so both stores compare like with like.
+    secret_is_hashed: bool = False
     #: refresh_token is absent on purpose: P6 approves refresh for the code flow
     #: but not here, and authlib decides whether to mint one by asking
     #: Refresh is gated twice. authlib asks check_grant_type("refresh_token")
@@ -77,11 +82,16 @@ class Client(ClientMixin):
 
         if not self.client_secret:
             return False
+        supplied = client_secret or ""
+        if self.secret_is_hashed:
+            import hashlib
+
+            supplied = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
         # Encoded, for the same reason as the form tokens in server.py:
         # compare_digest raises TypeError on str operands holding non-ASCII,
         # and the supplied half is attacker-controlled.
         return hmac.compare_digest(
-            self.client_secret.encode("utf-8"), (client_secret or "").encode("utf-8")
+            self.client_secret.encode("utf-8"), supplied.encode("utf-8")
         )
 
     def check_endpoint_auth_method(self, method: str, endpoint: str) -> bool:
