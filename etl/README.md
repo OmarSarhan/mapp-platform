@@ -60,7 +60,7 @@ source database rather than into the platform's own:
 
 `census-check` reads the publisher and writes to no database, so it works
 whatever state the sources are in. The platform database holds no spatial data
-at all, so `./bin/mapp reset-data --confirm` does not remove the Census
+at all, so `./bin/mapp reset-system --confirm` does not remove the Census
 snapshot: it lives in the `census-db` volume and survives. Rerun
 `./bin/mapp demo` when you want the sources reloaded from their publishers.
 The 47 topic archives alone are approximately 152 MiB compressed, before the

@@ -272,7 +272,7 @@ To remove the complete bundled PostgreSQL volume and rebuild it with only the
 configured ETL sources, run:
 
 ```sh
-./bin/mapp reset-data --confirm
+./bin/mapp reset-system --confirm
 ```
 
 This deletes the packaged database and everything in it: derived layers, the
@@ -293,8 +293,8 @@ checks the outbox again; a `repair_required` event or timeout aborts before
 volume deletion.
 
 A handled interruption compensates only the reset operation's own gate. If the
-host or process stops before compensation, confirm that no `reset-data`
-process remains and run `./bin/mapp recover-reset-data --confirm`; ordinary
+host or process stops before compensation, confirm that no `reset-system`
+process remains and run `./bin/mapp recover-reset-system --confirm`; ordinary
 service startup does not force reset recovery. Both commands are unavailable
 in external-database mode and require their explicit `--confirm` guards.
 Source availability can change independently; treat a non-zero ETL exit as a

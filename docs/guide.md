@@ -388,7 +388,7 @@ Read: [`backup-restore.md`](backup-restore.md)
 ### Reset
 
 ```sh
-./bin/mapp reset-data --confirm
+./bin/mapp reset-system --confirm
 ```
 
 Removes the packaged database entirely and restores the separate base seed

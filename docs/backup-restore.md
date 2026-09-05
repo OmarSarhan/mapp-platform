@@ -88,8 +88,8 @@ not place it in the same unencrypted archive as public release files.
    retrying outbox delivery, but deliberately does not force recovery of a
    retained reset maintenance gate.
 7. If the restored PostgreSQL state contains a gate from an interrupted reset,
-   confirm that no `reset-data` process exists in the restored environment,
-   then run `./bin/mapp recover-reset-data --confirm`. The command assigns new
+   confirm that no `reset-system` process exists in the restored environment,
+   then run `./bin/mapp recover-reset-system --confirm`. The command assigns new
    semantic asset IDs at generation 1 to definitions left in reset archival
    state. Each registration names its validated archived predecessor so
    curated metadata, orphans, visibility, and matching field IDs carry into

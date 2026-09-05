@@ -147,7 +147,7 @@ generation 1 with the archived asset as a validated predecessor. Curated
 metadata, orphans, and matching field IDs carry into the audited successor; the
 accepted predecessor remains an immutable tombstone. Startup never
 force-recovers a retained gate. After confirming that no reset process remains,
-an operator must use `./bin/mapp recover-reset-data --confirm`. See [Semantic
+an operator must use `./bin/mapp recover-reset-system --confirm`. See [Semantic
 metadata control plane](semantic-layer.md).
 
 ## Configuration flow

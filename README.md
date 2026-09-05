@@ -65,7 +65,7 @@ covers preparing the source database itself.
 | `./bin/mapp doctor` | Report `.env` key drift; `--add-missing` fills safe defaults |
 | `./bin/mapp ps`, `logs` | Service state and logs |
 | `./bin/mapp stop`, `down` | Stop, or remove containers and keep the data |
-| `./bin/mapp reset-data --confirm` | Remove the packaged database; read the warning first |
+| `./bin/mapp reset-system --confirm` | Remove the packaged database; read the warning first |
 
 `./bin/mapp` with no arguments lists all of them.
 

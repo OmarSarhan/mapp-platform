@@ -76,7 +76,7 @@ class ResetCommandSafetyTests(unittest.TestCase):
 
     def test_host_loss_recovery_is_explicit_and_confirmed(self) -> None:
         self.assertIn(
-            "recover-reset-data --confirm",
+            "recover-reset-system --confirm",
             self.script,
         )
         self.assertIn(
@@ -114,7 +114,7 @@ class ResetCommandSafetyTests(unittest.TestCase):
             "EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE MCP_SITE CADDY_EMAIL",
             self.script,
         )
-        self.assertIn("up|serve|config-ui|reset-data|all)", self.script)
+        self.assertIn("up|serve|config-ui|reset-system|all)", self.script)
         self.assertIn("ensure_caddy_bindings()", self.script)
         self.assertIn(
             'config --format json | edge_bindings compose',

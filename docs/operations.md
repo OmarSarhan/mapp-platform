@@ -138,7 +138,7 @@ To rebuild the packaged database from its initialization scripts and leave only
 the configured ETL datasets, use the explicitly destructive command:
 
 ```sh
-./bin/mapp reset-data --confirm
+./bin/mapp reset-system --confirm
 ```
 
 It stops the stack, removes only the named bundled PostgreSQL volume, replaces
@@ -204,10 +204,10 @@ never unarchived or reused.
 
 Configuration-service startup does not force reset recovery. If a process or
 host interruption prevents owned compensation, keep the database volume and
-first confirm that no `reset-data` process remains. Then run:
+first confirm that no `reset-system` process remains. Then run:
 
 ```sh
-./bin/mapp recover-reset-data --confirm
+./bin/mapp recover-reset-system --confirm
 ```
 
 This explicitly force-recovers the retained gate; never run it against an

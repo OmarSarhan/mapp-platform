@@ -6359,7 +6359,7 @@ class SemanticGatewayRouteTests(unittest.TestCase):
         derived = SemanticDerivedIntegrationTests.derived("repair_required")
         derived.repair_semantic_profile.side_effect = (
             app.DerivedLayerMaintenanceError(
-                "Derived-layer changes are paused while reset-data archives "
+                "Derived-layer changes are paused while reset-system archives "
                 "semantic profiles."
             )
         )

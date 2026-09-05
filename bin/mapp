@@ -41,11 +41,11 @@ usage() {
     "  reload-xyz   reload XYZ and wait for the current workspace fingerprint" \
     "  config-ui    build/start the workspace configuration dashboard" \
     "  config-ui-down stop and remove only the configuration dashboard" \
-    "  recover-reset-data --confirm recover a retained database after an interrupted reset" \
+    "  recover-reset-system --confirm recover a retained database after an interrupted reset" \
     "  reset-config-password generate a new config UI administrator password" \
     "  revoke-config-tokens revoke every remote CLI token" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
-    "  reset-data --confirm remove the packaged database and restore the seed workspace" \
+    "  reset-system --confirm return the platform to its initial state: new database, seed workspace, new administrator password" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
     "  all          start the platform, then verify it" \
     "  test         run local unit and configuration tests" \
@@ -555,7 +555,7 @@ require_federation_settings
 require_docker
 reject_database_environment_overrides
 case "${1:-}" in
-  up|serve|config-ui|reset-data|all)
+  up|serve|config-ui|reset-system|all)
     clear_edge_environment_overrides
     ;;
 esac
@@ -740,11 +740,11 @@ case "${1:-}" in
     run_with_buildkit_lease_retry "${compose[@]}" run --rm --build --no-deps \
       etl "${census_check_args[@]}"
     ;;
-  recover-reset-data)
+  recover-reset-system)
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
       printf '%s\n' \
-        'This force-recovers a retained bundled database from an interrupted reset-data operation.' \
-        'Confirm that no reset-data process is still running, then run ./bin/mapp recover-reset-data --confirm.' >&2
+        'This force-recovers a retained bundled database from an interrupted reset-system operation.' \
+        'Confirm that no reset-system process is still running, then run ./bin/mapp recover-reset-system --confirm.' >&2
       exit 2
     fi
     printf 'Starting the private control plane for explicit interrupted-reset recovery.\n'
@@ -752,14 +752,14 @@ case "${1:-}" in
     "${compose[@]}" exec -T config-ui python -c \
       'import json; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(force=True, wait_for_ready=True), separators=(",", ":")))'
     ;;
-  reset-data)
+  reset-system)
     if [[ "${2:-}" != "--confirm" || -n "${3:-}" ]]; then
       printf '%s\n' \
         'This permanently removes the packaged PostgreSQL database and everything in it: derived layers, the federation registry and its group labels, and the whole semantic catalogue -- generated profiles, curated meaning, semantic proposals and their history.' \
         'Back the database up first if any of that matters. Active derived semantic profiles are archived beforehand, but archival records the state, it does not survive the volume.' \
         'Destroys: the packaged database volume, and with it dashboard authentication, every CLI API token and every device authorization. Authentication is reinitialized afterwards and a new administrator password is printed, leaving the platform as ./bin/mapp init leaves it.' \
         'Not touched: the source databases holding the spatial data, and the audit log, workspace proposals, artifacts and public assets under var. The live workspace is replaced by instance/workspace.seed.json.' \
-        'Run ./bin/mapp reset-data --confirm to continue.' >&2
+        'Run ./bin/mapp reset-system --confirm to continue.' >&2
       exit 2
     fi
     database_volume="$(
@@ -787,13 +787,13 @@ case "${1:-}" in
               'import json, os; from app import recover_interrupted_reset_semantics; print(json.dumps(recover_interrupted_reset_semantics(reset_owner=os.environ["MAPP_RESET_GATE_OWNER"], wait_for_ready=True), separators=(",", ":")))'
             local recovery_status=$?
             if [[ "${recovery_status}" != "0" ]]; then
-              printf 'Owned semantic reset recovery failed; keep the database volume, confirm no reset-data process is active, then run ./bin/mapp recover-reset-data --confirm.\n' >&2
+              printf 'Owned semantic reset recovery failed; keep the database volume, confirm no reset-system process is active, then run ./bin/mapp recover-reset-system --confirm.\n' >&2
             fi
           else
-            printf 'The control plane could not restart for semantic reset recovery; keep the database volume, confirm no reset-data process is active, then run ./bin/mapp recover-reset-data --confirm.\n' >&2
+            printf 'The control plane could not restart for semantic reset recovery; keep the database volume, confirm no reset-system process is active, then run ./bin/mapp recover-reset-system --confirm.\n' >&2
           fi
         elif [[ "${recovery_volume_inspection}" == *"No such volume"* ]]; then
-          printf 'The bundled database volume was already removed; semantic compensation is no longer safe. Run reset-data --confirm again to finish initialization.\n' >&2
+          printf 'The bundled database volume was already removed; semantic compensation is no longer safe. Run reset-system --confirm again to finish initialization.\n' >&2
         else
           printf 'The bundled database volume state could not be verified; no semantic compensation was attempted. Inspect Docker state before explicit recovery.\n' >&2
         fi
@@ -841,7 +841,7 @@ case "${1:-}" in
     "${compose[@]}" up --detach --no-build "${runtime_services[@]}"
     # The administrator credential, API tokens and device authorizations lived
     # in the volume that was just destroyed, so the platform comes back with no
-    # way to sign in. Re-bootstrapping here is what makes reset-data mean
+    # way to sign in. Re-bootstrapping here is what makes reset-system mean
     # "return to a freshly initialized system" rather than "lock yourself out":
     # the new password is printed exactly as ./bin/mapp init prints it.
     bootstrap_admin_credential ""

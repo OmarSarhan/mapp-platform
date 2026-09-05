@@ -3054,7 +3054,7 @@ if [[ -n "${mvt_query}" ]]; then
   # error: 500" here. The most likely reason for that 500 is a workspace
   # naming a relation the database does not have -- the state you are left in
   # when the database is recreated without restoring the seed workspace, which
-  # reset-data does and a devcontainer rebuild does not -- and the operator
+  # reset-system does and a devcontainer rebuild does not -- and the operator
   # needs to know which layer to be able to act on it.
   mvt_status="$(curl --silent --show-error "${map_headers[@]}" \
     --output "${mvt_file}" --write-out '%{http_code}' \

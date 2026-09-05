@@ -3303,7 +3303,7 @@ def derived_maintenance_error(
         code="derived_layer.maintenance",
         message=message,
         suggested_action=(
-            "Wait for reset-data maintenance to finish, then retry the same "
+            "Wait for reset-system maintenance to finish, then retry the same "
             "request."
         ),
         operation=operation,

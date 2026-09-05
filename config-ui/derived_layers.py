@@ -1845,6 +1845,13 @@ class DerivedLayerStore:
             ).format(sql.Identifier(SCHEMA)))
         cur.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {}._maintenance (
+              -- 'reset-data' is a persisted identifier, not the CLI command
+              -- name. The wrapper's command was renamed to reset-system; this
+              -- value was deliberately not, because the table is created with
+              -- IF NOT EXISTS, so an existing volume keeps the old CHECK and
+              -- would reject a renamed value at reset time -- exactly when a
+              -- failure is least welcome. The same string appears as the
+              -- 'system:reset-data' actor on durable semantic history events.
               operation text PRIMARY KEY
                 CHECK (operation IN ('reset-data')),
               actor text NOT NULL,
@@ -1933,7 +1940,7 @@ class DerivedLayerStore:
         """).format(sql.Identifier(SCHEMA)))
         if cur.fetchone() is not None:
             raise DerivedLayerMaintenanceError(
-                "Derived-layer changes are paused while reset-data archives "
+                "Derived-layer changes are paused while reset-system archives "
                 "semantic profiles."
             )
 

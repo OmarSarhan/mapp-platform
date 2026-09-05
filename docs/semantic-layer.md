@@ -513,7 +513,7 @@ cause, then use the confirmed administrator retry. The retained event remains
 unchanged, so retrying without correcting a deterministic failure will
 reproduce it. Recovery is not permission to invent curated annotations.
 
-The destructive `reset-data --confirm` operation no longer
+The destructive `reset-system --confirm` operation no longer
 preserves this history: the catalog is a schema in the volume that reset
 removes, so the archived tombstones and the curated metadata they carry are
 deleted with it. The choreography below therefore protects the aborted path,
@@ -554,10 +554,10 @@ ordinary derived mutations cannot enter during that wait.
 Service startup deliberately does not force recovery of a retained reset gate,
 because it cannot prove that the owning reset process has stopped. If a
 process or host interruption prevents owned compensation, keep the database
-volume, confirm that no `reset-data` process remains, and run:
+volume, confirm that no `reset-system` process remains, and run:
 
 ```sh
-./bin/mapp recover-reset-data --confirm
+./bin/mapp recover-reset-system --confirm
 ```
 
 That explicit command force-recovers the retained gate. It is not a substitute

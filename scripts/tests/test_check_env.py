@@ -285,7 +285,7 @@ class CheckEnvironmentTests(unittest.TestCase):
         deleted and half-rebuilt.
         """
         script = (ROOT / "bin/mapp").read_text(encoding="utf-8")
-        start = script.index("  reset-data)")
+        start = script.index("  reset-system)")
         reset = script[start : script.index("\n  upgrade-derived)", start)]
 
         build_all = reset.index('build "${runtime_services[@]}"')
@@ -447,7 +447,7 @@ class CheckEnvironmentTests(unittest.TestCase):
             {name: sorted(files) for name, files in unknown.items()},
         )
 
-    def test_reset_data_names_what_it_destroys_before_asking(self):
+    def test_reset_system_names_what_it_destroys_before_asking(self):
         """The warning is where consent is obtained, so it must be true.
 
         It said semantic history was preserved. That was correct while the
@@ -457,7 +457,7 @@ class CheckEnvironmentTests(unittest.TestCase):
         to something other than what happens.
         """
         result = subprocess.run(
-            [ROOT / "bin/mapp", "reset-data"],
+            [ROOT / "bin/mapp", "reset-system"],
             capture_output=True,
             text=True,
         )
