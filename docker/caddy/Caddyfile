@@ -39,6 +39,46 @@
 	}
 }
 
+# The MCP origin. Phase 0 publishes only the authorization component's four
+# public paths (P1); the /mcp resource itself arrives with mapp-mcp.
+#
+# CSP is deliberately NOT in the site-level header block. Caddy's header
+# directive REPLACES the upstream's value, so a site-level Content-Security-
+# Policy would discard the nonce-based policy the consent and login pages
+# emit, leaving them with default-src 'none' and no styling. Verified against
+# caddy 2.11.4. The rule this encodes: the application owns CSP on every
+# response it serves, and Caddy sets CSP only where Caddy itself responds.
+{$MCP_SITE:http://mcp.localhost} {
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	request_body {
+		max_size {$MCP_MAX_REQUEST_BODY:512KiB}
+	}
+	@auth_public path /.well-known/oauth-authorization-server /oauth/authorize /oauth/token /oauth/login
+	handle @auth_public {
+		reverse_proxy unix//run/mapp-auth/mapp-auth.sock {
+			# Overwrite rather than append: over an exclusive Unix socket the
+			# only peer is Caddy, so a client-supplied forwarding header would
+			# otherwise be indistinguishable from the real address. The
+			# authorization component keys its login throttle on this.
+			header_up -Forwarded
+			header_up -X-Real-IP
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+	handle {
+		header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		respond 404
+	}
+}
+
 # The automation hostname is intentionally unusable on the published HTTP
 # listener. Browser validation uses the separate, un-published :8081 site.
 http://caddy {

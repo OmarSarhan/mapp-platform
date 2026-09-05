@@ -11,3 +11,14 @@ services:
       MAP_SITE: ${PRODUCTION_MAP_SITE:?Set PRODUCTION_MAP_SITE to the public HTTPS map origin}
       CONFIG_SITE: ${PRODUCTION_CONFIG_SITE:?Set PRODUCTION_CONFIG_SITE to the public HTTPS configuration origin}
       CADDY_EMAIL: ${PRODUCTION_CADDY_EMAIL:?Set PRODUCTION_CADDY_EMAIL for certificate notifications}
+      MCP_SITE: ${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}
+
+  mcp-auth:
+    environment:
+      MCP_ISSUER: ${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}
+      MCP_RESOURCE: ${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}/mcp
+      MCP_AUTH_SECURE_COOKIES: "true"
+      # Cleared, not absent: authlib reads truthiness, and an https origin
+      # needs no escape hatch. Leaving it set in production would accept a
+      # plain-http issuer.
+      AUTHLIB_INSECURE_TRANSPORT: ""

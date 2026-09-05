@@ -33,6 +33,7 @@ def resolved_compose(*overlays: str) -> dict[str, Any]:
         "PRODUCTION_MAP_SITE": "https://maps.company.co.uk",
         "PRODUCTION_CONFIG_SITE": "https://config.company.co.uk",
         "PRODUCTION_CONFIG_ALLOWED_HOSTS": "config.company.co.uk,config-ui",
+        "PRODUCTION_MCP_SITE": "https://mcp.company.co.uk",
         "PRODUCTION_CADDY_EMAIL": "operations@company.co.uk",
     })
     completed = subprocess.run(

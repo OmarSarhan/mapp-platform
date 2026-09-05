@@ -27,6 +27,9 @@ CONTROL_DIR="${STATE_DIR}/control"
 RELOAD_DIR="${STATE_DIR}/reload"
 PREVIEW_DIR="${STATE_DIR}/preview"
 PREVIEW_RELOAD_DIR="${STATE_DIR}/preview-reload"
+# Holds only the authorization component's edge socket. Caddy mounts it to
+# connect; nothing else is shared between the two containers.
+MCP_SOCKET_DIR="${STATE_DIR}/mcp-auth"
 
 usage() {
   printf '%s\n' \
@@ -189,7 +192,7 @@ reject_database_environment_overrides() {
 clear_edge_environment_overrides() {
   local key
   for key in \
-    EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE CADDY_EMAIL
+    EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE MCP_SITE CADDY_EMAIL
   do
     if [[ -v "${key}" ]]; then
       # Shell values outrank --env-file interpolation in Compose. Edge
@@ -258,7 +261,8 @@ init_state() {
     "${CONTROL_DIR}/proposals" \
     "${RELOAD_DIR}" \
     "${PREVIEW_DIR}" \
-    "${PREVIEW_RELOAD_DIR}"
+    "${PREVIEW_RELOAD_DIR}" \
+    "${MCP_SOCKET_DIR}"
   chmod 700 \
     "${STATE_DIR}" \
     "${WORKSPACE_DIR}" \
@@ -267,7 +271,8 @@ init_state() {
     "${CONTROL_DIR}/proposals" \
     "${RELOAD_DIR}" \
     "${PREVIEW_DIR}" \
-    "${PREVIEW_RELOAD_DIR}"
+    "${PREVIEW_RELOAD_DIR}" \
+    "${MCP_SOCKET_DIR}"
 
   if [[ ! -f "${WORKSPACE_DIR}/workspace.json" ]]; then
     if [[ ! -f "${ROOT_DIR}/instance/workspace.seed.json" ]]; then

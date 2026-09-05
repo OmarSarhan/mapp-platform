@@ -90,6 +90,49 @@ services:
       - backend
       - semantic-control
 
+  mcp-auth:
+    image: mapp-mcp-auth:local
+    build:
+      context: ./mcp-auth
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
+      MCP_RESOURCE: ${MCP_SITE:-http://mcp.localhost}/mcp
+      MCP_AUTH_CONTROL_PORT: 8080
+      MCP_AUTH_SOCKET: /run/mapp-auth/mapp-auth.sock
+      MCP_AUTH_ADMIN_PASSWORD_HASH: ${MCP_AUTH_ADMIN_PASSWORD_HASH:-}
+      MCP_AUTH_SECURE_COOKIES: ${MCP_AUTH_SECURE_COOKIES:-}
+      # authlib refuses http:// for anything but literal localhost or a
+      # loopback IP, and the development origin is http://mcp.localhost, so
+      # every /oauth call would fail closed without this. The production
+      # overlay clears it, and a test pins that it is cleared.
+      AUTHLIB_INSECURE_TRANSPORT: ${AUTHLIB_INSECURE_TRANSPORT-1}
+    expose:
+      - "8080"
+    volumes:
+      # The only shared mount: the runtime directory holding the edge socket.
+      # No database credentials, workspace, control state or Docker socket.
+      - ./var/mcp-auth:/run/mapp-auth
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      # Only the internal control link. The public surface is reached solely
+      # through the Unix socket, so this service is on no edge network.
+      - mcp-control
+
   config-ui:
     image: mapp-config-ui:local
     build:
@@ -149,6 +192,10 @@ services:
       - edge
       - automation
       - semantic-control
+      # Reaches the authorization component's internal endpoints. Deliberately
+      # no depends_on: ci.yml asserts config-ui depends only on
+      # semantic-service, and the token-B path fails closed if mcp-auth is down.
+      - mcp-control
     depends_on:
       semantic-service:
         condition: service_healthy
@@ -170,6 +217,7 @@ services:
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.invalid}
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./var/mcp-auth:/run/mapp-auth
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -279,4 +327,7 @@ networks:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_browser-egress
   semantic-control:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_semantic-control
+    internal: true
+  mcp-control:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_mcp-control
     internal: true
