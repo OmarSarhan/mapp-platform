@@ -1530,9 +1530,11 @@ reader_resource_limits = {
     "idleTransactionTimeoutMs": (1, 30 * 1000),
 }
 expected_cluster_settings = (100, 3, 0)
-# Fresh and upgraded bundled roles can collectively admit seventy sessions.
-# PostgreSQL must leave at least that many ordinary (non-reserved) slots.
-required_ordinary_capacity = 70
+# Fresh and upgraded bundled roles can collectively admit seventy-eight
+# sessions: etl 4, xyz 50, derived 4, federation 4, semantic 4, semantic reader
+# 4, control 8. PostgreSQL must leave at least that many ordinary
+# (non-reserved) slots.
+required_ordinary_capacity = 78
 derived_resource_limits = {
     "connectionLimit": (1, 4),
     "workMemKb": (1, 16 * 1024),

@@ -146,6 +146,11 @@ services:
       DERIVED_OWNER_ROLE: ${DERIVED_OWNER_ROLE:-}
       DERIVED_READER_ROLE: ${DERIVED_READER_ROLE:-}
       DERIVED_MAX_BACKGROUND_JOBS: ${DERIVED_MAX_BACKGROUND_JOBS:-2}
+      # Empty in the base (external-PostgreSQL) model, which has no packaged
+      # database and therefore no control schema. compose.bundled-db.yaml
+      # requires it. The store treats an empty value as "unavailable" rather
+      # than falling back to anything.
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
       PLUGIN_DIR: /instance-public/plugins
