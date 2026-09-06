@@ -32,7 +32,7 @@ from authlib_adapter import MappResponse
 from authlib_adapter import parse_form
 from models import PendingAuthorization
 from models import Session
-from stub_store import PendingLimitReached
+from models import PendingLimitReached
 from passwords import verify_password
 from unix_server import UNIX_PEER
 from unix_server import UnixSocketServerMixin
@@ -617,13 +617,39 @@ class ControlServer(ThreadingHTTPServer):
         }
 
 
-def build_authorization():
+def build_store():
+    """The store the deployed component uses: PostgreSQL, or nothing.
+
+    This used to construct StubStore unconditionally, so the running service
+    kept every credential in memory: a restart discarded all of them, the
+    control schema it had been given was never written, and SqlStore -- with
+    its atomic single-use consumption and its grant state -- was referenced by
+    no production code at all. The in-memory store is a test double and is
+    treated as one here.
+
+    Failing closed rather than falling back. A silent fallback is how the
+    component ran for a whole milestone against the wrong store while every
+    test passed.
+    """
+    from sql_store import SqlStore
+
+    dsn = os.environ.get("CONTROL_DATABASE_URL") or ""
+    if not dsn:
+        raise RuntimeError(
+            "CONTROL_DATABASE_URL is not set. The authorization component keeps"
+            " its records in the control schema and has no in-memory fallback;"
+            " see docs/external-postgresql.md for deployments without the"
+            " packaged database."
+        )
+    return SqlStore(dsn, audience=os.environ.get("MCP_RESOURCE", ""))
+
+
+def build_authorization(store=None):
     from issuer import MappAuthorizationServer
-    from stub_store import StubStore
 
     issuer = os.environ.get("MCP_ISSUER", "http://mcp.localhost")
     return MappAuthorizationServer(
-        StubStore(),
+        store if store is not None else build_store(),
         issuer=issuer,
         resource=os.environ.get("MCP_RESOURCE", issuer + "/mcp"),
         config_api_resource=os.environ.get(

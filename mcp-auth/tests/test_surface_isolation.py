@@ -422,3 +422,67 @@ class ImageContractTests(unittest.TestCase):
         copied = {token for token in copy_line.split() if token.endswith(".py")}
         on_disk = {path.name for path in self.ROOT.glob("*.py")}
         self.assertEqual(set(), copied - on_disk, "COPY names a module that is gone")
+
+
+class DeployedStoreTests(unittest.TestCase):
+    """The running component must use PostgreSQL, not the in-memory double.
+
+    build_authorization() constructed StubStore unconditionally for an entire
+    milestone. The service kept every credential in memory -- a restart
+    discarded all of them -- the control schema it had been given was never
+    written, and SqlStore was referenced by no production code at all. Every
+    test passed throughout, because tests construct their own store.
+    """
+
+    def test_the_deployed_store_is_the_sql_one(self) -> None:
+        import server as server_module
+        from sql_store import SqlStore
+
+        previous = os.environ.get("CONTROL_DATABASE_URL")
+        os.environ["CONTROL_DATABASE_URL"] = "postgresql://u:p@127.0.0.1:1/x"
+        try:
+            # Constructing the store must not connect; it is lazy by design so
+            # the service starts before the database is ready.
+            self.assertIsInstance(server_module.build_store(), SqlStore)
+        finally:
+            if previous is None:
+                os.environ.pop("CONTROL_DATABASE_URL", None)
+            else:
+                os.environ["CONTROL_DATABASE_URL"] = previous
+
+    def test_it_fails_closed_without_a_control_database(self) -> None:
+        """No silent fallback.
+
+        A fallback is exactly how the component ran against the wrong store
+        without anyone noticing, so an unset DSN is refused with a message
+        naming the variable and the document that explains it.
+        """
+        import server as server_module
+
+        previous = os.environ.get("CONTROL_DATABASE_URL")
+        os.environ.pop("CONTROL_DATABASE_URL", None)
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                server_module.build_store()
+            self.assertIn("CONTROL_DATABASE_URL", str(caught.exception))
+        finally:
+            if previous is not None:
+                os.environ["CONTROL_DATABASE_URL"] = previous
+
+    def test_the_in_memory_store_is_not_reachable_from_production_code(self) -> None:
+        """StubStore is a test double and must stay in the tests."""
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        offenders = []
+        for path in sorted(root.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "stub_store":
+                    offenders.append(path.name)
+                elif isinstance(node, ast.Import):
+                    offenders.extend(
+                        path.name for a in node.names if a.name == "stub_store"
+                    )
+        self.assertEqual([], offenders)

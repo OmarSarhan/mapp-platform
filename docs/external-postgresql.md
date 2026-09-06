@@ -147,6 +147,9 @@ GRANT SELECT ON TABLE
 CREATE SCHEMA derived_layers AUTHORIZATION mapp_derived_owner;
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
 
+GRANT USAGE ON SCHEMA derived_layers TO mapp_runtime_reader;
+```
+
 ### Control plane
 
 The configuration dashboard keeps its administrator credential, browser
@@ -185,8 +188,6 @@ verify` fails closed on a missing value rather than leaving it to be discovered
 at the login prompt. `./bin/mapp init` mints the first administrator password;
 where there is no packaged database to start, point it at the control database
 directly with `MAPP_BOOTSTRAP_DATABASE_URL`.
-GRANT USAGE ON SCHEMA derived_layers TO mapp_runtime_reader;
-```
 
 On PostgreSQL 16 and earlier, omit the two `transaction_timeout` statements;
 that setting was introduced in PostgreSQL 17. Retain the finite statement,

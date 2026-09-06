@@ -272,6 +272,28 @@ class SubjectTokenRefusalTests(ExchangeTestCase):
         self._seed_subject("mapp_a_dead", "apply", revoked=True)
         self.assert_refused("invalid_grant", form(subject_token="mapp_a_dead"))
 
+    def test_a_placeholder_audience_is_refused(self) -> None:
+        """The audience is compared positively, not denied by a list.
+
+        It used to read `audience not in (None, "mcp")`, so a token whose
+        audience had never been set -- or carried the model's old "mcp"
+        placeholder -- passed as a token A. Both are refused now because the
+        comparison is against the configured MCP resource and nothing else.
+        """
+        for placeholder in ("", "mcp"):
+            with self.subTest(audience=placeholder):
+                self._seed_subject(
+                    "mapp_a_" + (placeholder or "empty"), "apply", audience=placeholder
+                )
+                self.assert_refused(
+                    "invalid_grant",
+                    form(subject_token="mapp_a_" + (placeholder or "empty")),
+                )
+
+    def test_a_token_for_another_resource_is_refused(self) -> None:
+        self._seed_subject("mapp_a_elsewhere", "apply", audience="http://other/api")
+        self.assert_refused("invalid_grant", form(subject_token="mapp_a_elsewhere"))
+
     def test_a_token_b_cannot_be_exchanged_again(self) -> None:
         """Audience separation, in the direction that matters.
 
@@ -597,7 +619,7 @@ class AudienceSeparationTests(unittest.TestCase):
     def test_the_default_configuration_keeps_them_distinct(self) -> None:
         import server as server_module
 
-        authorization = server_module.build_authorization()
+        authorization = server_module.build_authorization(StubStore())
         self.assertNotEqual(
             authorization.resource, authorization.config_api_resource
         )

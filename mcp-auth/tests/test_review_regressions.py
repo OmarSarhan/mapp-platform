@@ -600,7 +600,10 @@ class AdvertisedScopeTests(Base):
     def test_the_default_configuration_omits_apply(self) -> None:
         import server as server_module
 
-        authorization = server_module.build_authorization()
+        # The store is injected: build_authorization() now refuses to run
+        # without a control database, because the deployed component must
+        # never silently fall back to the in-memory double.
+        authorization = server_module.build_authorization(StubStore())
         self.assertNotIn("apply", authorization.metadata_document()["scopes_supported"])
 
 

@@ -436,8 +436,17 @@ class PendingLifecycleTests(Base):
         self.assertIn("code=", headers["Location"])
 
     def test_simultaneous_consents_produce_one_winner(self) -> None:
-        # As with the code race: without a tiny switch interval a non-atomic
-        # read-then-delete passes this every time.
+        """One consent is honoured; this does NOT prove the store is atomic.
+
+        Splitting consume_pending into a read under one lock hold and a delete
+        under another -- a genuine TOCTOU -- passes this test in 6 runs of 6,
+        even with the switch interval lowered: each consent is a full HTTP
+        round trip, so the window between the two acquisitions never lines up.
+        What is pinned here is that a record is honoured once; the atomicity
+        claim is pinned against the SQL store, where the conditional UPDATE is
+        the mechanism and its mutation IS caught, and the SQL store is what the
+        deployed component uses.
+        """
         previous = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)
         self.addCleanup(sys.setswitchinterval, previous)

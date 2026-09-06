@@ -16,6 +16,17 @@ from authlib.oauth2.rfc6749.models import ClientMixin
 from authlib.oauth2.rfc6749.models import TokenMixin
 
 
+class PendingLimitReached(RuntimeError):
+    """Too many live parked authorization requests.
+
+    Defined here, not in a store, because both stores raise it and server.py
+    catches it. Two identically named classes in two modules are not the same
+    exception: the handler imported the stub's, so a capacity refusal from the
+    SQL store escaped it and became a 500 instead of the 503 with Retry-After
+    that P21 requires.
+    """
+
+
 @dataclass
 class Client(ClientMixin):
     client_id: str
@@ -143,8 +154,13 @@ class Token(TokenMixin):
     #: Which resource this token is for. Token A carries the MCP resource and
     #: token B the configuration API, and the exchange refuses a subject token
     #: that is not an A -- so a B cannot be exchanged again for another B.
-    #: Defaulted so every existing construction site keeps working.
-    audience: str = "mcp"
+    #: Deliberately empty rather than a plausible-looking placeholder. A
+    #: default of "mcp" silently satisfied nothing and matched nothing: the
+    #: exchange compares against the configured MCP resource, so a token that
+    #: took the default was refused as "not active" with no hint that its
+    #: audience had never been set. An empty value fails the same comparison
+    #: but is obviously unset when read.
+    audience: str = ""
 
     def check_client(self, client: ClientMixin) -> bool:
         return self.client_id == client.get_client_id()

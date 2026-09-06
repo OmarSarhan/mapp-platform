@@ -17,13 +17,10 @@ import threading
 
 from models import AuthorizationCode
 from models import Client
+from models import PendingLimitReached
 from models import PendingAuthorization
 from models import Session
 from models import Token
-
-
-class PendingLimitReached(RuntimeError):
-    """Too many live parked authorization requests."""
 
 
 def token_digest(raw: str) -> str:

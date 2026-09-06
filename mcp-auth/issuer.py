@@ -261,6 +261,13 @@ class MappAuthorizationServer(AuthorizationServer):
                 subject=request.user or "",
                 issued_at=int(time.time()),
                 expires_in=token["expires_in"],
+                # The resource this token is for. Omitted, it took the model's
+                # "mcp" placeholder, while the exchange compares against the
+                # configured MCP resource -- so a genuinely issued token A
+                # could never be exchanged. Every exchange test passed because
+                # each seeded its own subject token with the audience it
+                # wanted, and none drove the authorization-code flow.
+                audience=self.resource,
             ),
         )
 

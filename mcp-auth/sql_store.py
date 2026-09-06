@@ -26,6 +26,7 @@ from psycopg.rows import dict_row
 
 from models import AuthorizationCode
 from models import Client
+from models import PendingLimitReached
 from models import PendingAuthorization
 from models import Session
 from models import Token
@@ -37,10 +38,6 @@ CONNECT_TIMEOUT_SECONDS = 10
 #: alone lets one unauthenticated caller lock everyone out of /oauth/authorize.
 MAX_PENDING_PER_SOURCE = 64
 MAX_PENDING = 10_000
-
-
-class PendingLimitReached(RuntimeError):
-    """Too many live parked authorization requests."""
 
 
 def token_digest(raw: str) -> str:
