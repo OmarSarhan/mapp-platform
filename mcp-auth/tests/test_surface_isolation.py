@@ -386,3 +386,39 @@ class DependencySurfaceTests(unittest.TestCase):
                 for banned in forbidden:
                     with self.subTest(module=path.name, imported=name):
                         self.assertNotIn(banned, name)
+
+
+class ImageContractTests(unittest.TestCase):
+    """Every module on disk must reach the image.
+
+    config-ui has had this test for a while; this component did not, and three
+    modules were added to it before anyone noticed the COPY line enumerates
+    them by name. The image builds fine and then dies on the first import.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_every_module_is_copied_into_the_image(self) -> None:
+        dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        copy_lines = [
+            line for line in dockerfile.splitlines() if line.startswith("COPY --chown")
+        ]
+        self.assertEqual(1, len(copy_lines), "expected exactly one module COPY line")
+        copied = {token for token in copy_lines[0].split() if token.endswith(".py")}
+        on_disk = {path.name for path in self.ROOT.glob("*.py")}
+        self.assertEqual(
+            set(),
+            on_disk - copied,
+            "modules exist but are not copied into the image; the container will"
+            " raise ModuleNotFoundError on its first import. Add them to the COPY"
+            " line.",
+        )
+
+    def test_nothing_is_copied_that_does_not_exist(self) -> None:
+        dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        copy_line = [
+            line for line in dockerfile.splitlines() if line.startswith("COPY --chown")
+        ][0]
+        copied = {token for token in copy_line.split() if token.endswith(".py")}
+        on_disk = {path.name for path in self.ROOT.glob("*.py")}
+        self.assertEqual(set(), copied - on_disk, "COPY names a module that is gone")

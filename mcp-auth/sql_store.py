@@ -262,8 +262,72 @@ class SqlStore:
             subject=row["subject"],
             issued_at=int(issued.timestamp()),
             expires_in=int((row["expires_at"] - issued).total_seconds()),
-            revoked=row["revoked_at"] is not None,
+            revoked=row["revoked_at"] is not None or row["consumed_at"] is not None,
+            audience=row["audience"],
         )
+
+    def save_exchanged_token(
+        self,
+        raw_token: str,
+        *,
+        client_id: str,
+        actor_client_id: str,
+        subject: str,
+        scope: str,
+        audience: str,
+        issued_at,
+        expires_at,
+        operation_id: str,
+        request_digest: str,
+        single_use: bool,
+    ) -> None:
+        """Persist a token B, bound to the one operation it authorises.
+
+        The binding is not advisory: the configuration API re-checks the
+        operation and the request digest on every call, so a token minted for
+        one proposal cannot be spent on another even within its sixty seconds.
+        """
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO control.oauth_tokens"
+                "(token_hash, client_id, subject, scope, audience, issued_at,"
+                " expires_at, single_use, operation_id, request_digest,"
+                " actor_client_id, broker_client_id)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    token_digest(raw_token),
+                    client_id,
+                    subject,
+                    scope,
+                    audience,
+                    issued_at,
+                    expires_at,
+                    single_use,
+                    operation_id,
+                    request_digest,
+                    actor_client_id,
+                    client_id,
+                ),
+            )
+
+    def consume_exchanged_token(self, raw_token: str, operation_id: str):
+        """Spend a single-use token B, or report that it is already spent.
+
+        One conditional statement, so two calls presenting the same token
+        cannot both proceed -- which is the entire value of single use.
+        """
+        with self._connect() as connection:
+            return connection.execute(
+                "UPDATE control.oauth_tokens SET consumed_at = now()"
+                " WHERE token_hash = %s"
+                "   AND operation_id = %s"
+                "   AND single_use"
+                "   AND consumed_at IS NULL"
+                "   AND revoked_at IS NULL"
+                "   AND expires_at > now()"
+                " RETURNING scope, subject, request_digest",
+                (token_digest(raw_token), operation_id),
+            ).fetchone()
 
     def token_count(self) -> int:
         with self._connect() as connection:

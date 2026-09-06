@@ -19,7 +19,7 @@ COPY requirements.txt requirements-nodeps.txt /app/
 RUN pip install --no-cache-dir --requirement /app/requirements.txt \
     && pip install --no-cache-dir --no-deps --requirement /app/requirements-nodeps.txt
 
-COPY --chown=mappauth:mappauth VERSION authlib_adapter.py issuer.py models.py pages.py passwords.py server.py sql_store.py stub_store.py unix_server.py /app/
+COPY --chown=mappauth:mappauth VERSION authlib_adapter.py canonical.py exchange.py issuer.py models.py operations.py pages.py passwords.py server.py sql_store.py stub_store.py unix_server.py /app/
 
 USER mappauth:mappauth
 WORKDIR /app

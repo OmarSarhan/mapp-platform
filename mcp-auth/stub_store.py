@@ -42,6 +42,8 @@ class StubStore:
         self._clients: dict[str, Client] = {}
         self._codes: dict[str, AuthorizationCode] = {}
         self._tokens: dict[str, Token] = {}
+        #: Operation binding for exchanged tokens, keyed the same way.
+        self._exchanged: dict[str, dict] = {}
         self._pending: dict[str, PendingAuthorization] = {}
         self._sessions: dict[str, Session] = {}
 
@@ -115,6 +117,71 @@ class StubStore:
     def query_token(self, raw_token: str) -> Token | None:
         with self._lock:
             return self._tokens.get(token_digest(raw_token))
+
+    def save_exchanged_token(
+        self,
+        raw_token: str,
+        *,
+        client_id: str,
+        actor_client_id: str,
+        subject: str,
+        scope: str,
+        audience: str,
+        issued_at,
+        expires_at,
+        operation_id: str,
+        request_digest: str,
+        single_use: bool,
+    ) -> None:
+        """In-memory twin of the SQL form, holding the same binding."""
+        digest = token_digest(raw_token)
+        record = Token(
+            token_hash=digest,
+            client_id=client_id,
+            scope=scope,
+            subject=subject,
+            issued_at=int(issued_at.timestamp()),
+            expires_in=int((expires_at - issued_at).total_seconds()),
+            audience=audience,
+        )
+        with self._lock:
+            self._tokens[digest] = record
+            self._exchanged[digest] = {
+                "operation_id": operation_id,
+                "request_digest": request_digest,
+                "single_use": single_use,
+                "actor_client_id": actor_client_id,
+                "broker_client_id": client_id,
+                "consumed": False,
+            }
+
+    def consume_exchanged_token(self, raw_token: str, operation_id: str):
+        """Spend a single-use token B, atomically, or report it already spent."""
+        digest = token_digest(raw_token)
+        with self._lock:
+            binding = self._exchanged.get(digest)
+            record = self._tokens.get(digest)
+            if (
+                binding is None
+                or record is None
+                or binding["consumed"]
+                or not binding["single_use"]
+                or binding["operation_id"] != operation_id
+                or record.is_expired()
+                or record.is_revoked()
+            ):
+                return None
+            binding["consumed"] = True
+            return {
+                "scope": record.scope,
+                "subject": record.subject,
+                "request_digest": binding["request_digest"],
+            }
+
+    def exchanged_binding(self, raw_token: str):
+        """Read the binding without spending it, for assertions."""
+        with self._lock:
+            return self._exchanged.get(token_digest(raw_token))
 
     def token_count(self) -> int:
         with self._lock:

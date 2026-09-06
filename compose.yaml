@@ -100,6 +100,10 @@ services:
     environment:
       MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
       MCP_RESOURCE: ${MCP_SITE:-http://mcp.localhost}/mcp
+      # What an exchanged token B is for. Must differ from MCP_RESOURCE: equal
+      # values would let a token A be replayed at the configuration API, and
+      # the component refuses to start if they match.
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
       MCP_AUTH_CONTROL_PORT: 8080
       MCP_AUTH_SOCKET: /run/mapp-auth/mapp-auth.sock
       MCP_AUTH_ADMIN_PASSWORD_HASH: ${MCP_AUTH_ADMIN_PASSWORD_HASH:-}

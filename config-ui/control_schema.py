@@ -363,9 +363,49 @@ def _migration_2(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_3(connection: psycopg.Connection) -> None:
+    """Bind an exchanged token to the one operation it was issued for.
+
+    A token B is not a general-purpose credential: it authorises exactly one
+    allowlisted operation against one canonical request, and the configuration
+    API re-checks that binding on every call. Without these columns the token
+    would carry only a scope, and a scope is not an authorization -- an
+    `apply` token minted for one proposal would work against any other.
+
+    Added as a third migration rather than by editing the second: a database
+    that already applied migration 2 would keep reporting it as applied and
+    silently never acquire these columns.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+            ALTER TABLE {schema}.oauth_tokens
+                ADD COLUMN operation_id    text,
+                ADD COLUMN request_digest  text,
+                -- The MCP client the grant belongs to, derived from validated
+                -- token-A state and never from exchange input: a caller that
+                -- could name its own originating client could borrow another
+                -- client's authority.
+                ADD COLUMN actor_client_id text,
+                -- The broker that performed the exchange, kept distinct from
+                -- the actor so an audit can tell "who asked" from "who
+                -- brokered".
+                ADD COLUMN broker_client_id text,
+                -- Both halves of the binding travel together or not at all.
+                ADD CONSTRAINT token_operation_binding_is_complete
+                    CHECK ((operation_id IS NULL) = (request_digest IS NULL)),
+                -- A single-use token must name what it is single-use *for*.
+                ADD CONSTRAINT token_single_use_is_bound
+                    CHECK (NOT single_use OR operation_id IS NOT NULL)
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
+    3: _migration_3,
 }
 
 

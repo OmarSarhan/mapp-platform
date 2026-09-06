@@ -8,6 +8,8 @@ internal listener, and the disjoint route tables that make an internal path a
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -23,6 +25,7 @@ from pathlib import Path
 
 from authlib.oauth2.rfc6749.errors import OAuth2Error
 
+import exchange
 import pages
 from authlib_adapter import FormError
 from authlib_adapter import MappResponse
@@ -503,6 +506,73 @@ def healthz(handler) -> None:
     MappResponse(200, json.dumps({"status": "ok", "version": VERSION}), JSON_HEADERS).write_to(handler)
 
 
+def _authenticate_broker(handler):
+    """HTTP Basic, resolving to a confidential client, or None.
+
+    The exchange is the most security-critical surface in the design, so the
+    caller is authenticated before it is allowed to name a subject token at
+    all: an unauthenticated request must never reach the point of being told
+    whether some token exists.
+    """
+    header = handler.headers.get("Authorization") or ""
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    client_id, separator, secret = decoded.partition(":")
+    if not separator:
+        return None
+    client = handler.server.authorization.store.query_client(
+        urllib.parse.unquote(client_id)
+    )
+    if client is None:
+        return None
+    if client.token_endpoint_auth_method != "client_secret_basic":
+        return None
+    if not client.check_client_secret(urllib.parse.unquote(secret)):
+        return None
+    return client
+
+
+def exchange_endpoint(handler) -> None:
+    """RFC 8693 token exchange, on the control listener only.
+
+    Registered here and nowhere else. Putting it on /oauth/token would place
+    the exchange on an edge-routed path, leaving the Caddy allowlist as the
+    only thing between the internet and the ability to mint configuration-API
+    credentials.
+    """
+    server = handler.server.authorization
+    _, datalist = parse_form(handler, max_bytes=16 * 1024)
+    client = _authenticate_broker(handler)
+    if client is None:
+        MappResponse(
+            401,
+            json.dumps({"error": "invalid_client"}),
+            JSON_HEADERS + [("WWW-Authenticate", 'Basic realm="exchange"')],
+        ).write_to(handler)
+        return
+    try:
+        token = exchange.exchange(
+            datalist=datalist,
+            broker_client=client,
+            store=server.store,
+            resource=server.config_api_resource,
+        )
+    except exchange.ExchangeError as exc:
+        status = 401 if exc.error == "invalid_client" else 400
+        MappResponse(
+            status,
+            json.dumps({"error": exc.error, "error_description": exc.description}),
+            JSON_HEADERS,
+        ).write_to(handler)
+        return
+    MappResponse(200, json.dumps(token), JSON_HEADERS).write_to(handler)
+
+
 class EdgeServer(ThreadingHTTPServer):
     """The publicly reachable surface, over TCP. Tests use this directly."""
 
@@ -542,6 +612,7 @@ class ControlServer(ThreadingHTTPServer):
         self.authorization = authorization
         self.routes = {
             ("GET", "/healthz"): healthz,
+            ("POST", "/internal/oauth/exchange"): exchange_endpoint,
         }
 
 
@@ -554,6 +625,9 @@ def build_authorization():
         StubStore(),
         issuer=issuer,
         resource=os.environ.get("MCP_RESOURCE", issuer + "/mcp"),
+        config_api_resource=os.environ.get(
+            "MCP_CONFIG_API_RESOURCE", os.environ.get("CONFIG_SITE", "http://config.localhost") + "/api"
+        ),
         # What the server will *accept* on an explicit request.
         scopes_supported=("mcp:connect", "inspect", "propose", "visual", "apply"),
         # What discovery *advertises*. P2: metadata carries only the safe

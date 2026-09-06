@@ -305,5 +305,144 @@ class SqlStoreContractTests(unittest.TestCase):
         self.assertNotIn("cookie-secret", str(rows))
 
 
+@requires_database
+class ExchangedTokenTests(unittest.TestCase):
+    """Token B against the real schema: bound, single-use, unchainable."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        connection = cs.connect(DATABASE_URL)
+        try:
+            cs.migrate(connection)
+        finally:
+            connection.close()
+
+    def setUp(self) -> None:
+        import datetime as dt
+
+        from collections import defaultdict
+
+        import canonical
+        import exchange
+
+        self.dt = dt
+        self.canonical = canonical
+        self.exchange = exchange
+        self.defaultdict = defaultdict
+        self.resource = "http://config.localhost/api"
+        self.store = SqlStore(DATABASE_URL)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            connection.execute(
+                "TRUNCATE control.oauth_authorization_codes,"
+                " control.oauth_pending_authorizations, control.oauth_tokens,"
+                " control.oauth_sessions, control.oauth_clients CASCADE"
+            )
+        self.broker = Client(
+            client_id="broker", name="B", redirect_uris=(), scopes=(),
+            token_endpoint_auth_method="client_secret_basic", client_secret="s",
+        )
+        self.store.add_client(self.broker)
+        self.store.add_client(_client("mcp-client"))
+        self.now = dt.datetime.now(dt.timezone.utc)
+        self.store.save_token(
+            "mapp_a_sub",
+            Token(
+                token_hash="", client_id="mcp-client", scope="apply",
+                subject="oauth:grant-1", issued_at=int(self.now.timestamp()),
+                expires_in=900, audience="mcp",
+            ),
+        )
+
+    def _request(self, **overrides):
+        import json
+
+        context = {
+            "version": self.canonical.SCHEME,
+            "operationId": "proposals.apply",
+            "method": "POST",
+            "pathTemplate": "/api/proposals/{proposalId}/apply",
+            "requestDigest": self.canonical.digest({"proposalId": "p1"}),
+        }
+        fields = {
+            "grant_type": self.exchange.GRANT_TYPE,
+            "subject_token": "mapp_a_sub",
+            "subject_token_type": self.exchange.ACCESS_TOKEN_TYPE,
+            "resource": self.resource,
+            "scope": "apply",
+            self.exchange.CONTEXT_PARAMETER: json.dumps(context),
+        }
+        fields.update(overrides)
+        datalist = self.defaultdict(list)
+        for name, value in fields.items():
+            datalist[name].append(value)
+        return datalist
+
+    def _exchange(self, **overrides):
+        return self.exchange.exchange(
+            datalist=self._request(**overrides),
+            broker_client=self.broker,
+            store=self.store,
+            resource=self.resource,
+            now=self.now,
+        )
+
+    def test_the_issued_token_is_bound_and_single_use(self) -> None:
+        token = self._exchange()
+        self.assertEqual(60, token["expires_in"])
+        self.assertNotIn("refresh_token", token)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            row = connection.execute(
+                "SELECT operation_id, single_use, audience, actor_client_id,"
+                " broker_client_id FROM control.oauth_tokens"
+                " WHERE audience <> 'mcp'"
+            ).fetchone()
+        self.assertEqual("proposals.apply", row[0])
+        self.assertTrue(row[1])
+        self.assertEqual(self.resource, row[2])
+        # The originating client comes from the subject token, the broker from
+        # client authentication; an audit can tell "who asked" from "who
+        # brokered" only because they are stored separately.
+        self.assertEqual("mcp-client", row[3])
+        self.assertEqual("broker", row[4])
+
+    def test_a_single_use_token_is_spent_exactly_once(self) -> None:
+        token = self._exchange()["access_token"]
+        self.assertIsNotNone(
+            self.store.consume_exchanged_token(token, "proposals.apply")
+        )
+        self.assertIsNone(
+            self.store.consume_exchanged_token(token, "proposals.apply")
+        )
+
+    def test_it_cannot_be_spent_against_another_operation(self) -> None:
+        # The binding is the point: a token minted for one operation must not
+        # work for another even inside its sixty seconds.
+        token = self._exchange()["access_token"]
+        self.assertIsNone(
+            self.store.consume_exchanged_token(token, "layers.values")
+        )
+
+    def test_a_token_b_cannot_be_exchanged_again(self) -> None:
+        """Otherwise one sixty-second credential chains into an endless series."""
+        token = self._exchange()["access_token"]
+        with self.assertRaises(self.exchange.ExchangeError) as caught:
+            self._exchange(subject_token=token)
+        self.assertEqual("invalid_grant", caught.exception.error)
+
+    def test_a_refused_scope_persists_no_token(self) -> None:
+        self.store.save_token(
+            "mapp_a_narrow",
+            Token(
+                token_hash="", client_id="mcp-client", scope="derive",
+                subject="oauth:grant-2", issued_at=int(self.now.timestamp()),
+                expires_in=900, audience="mcp",
+            ),
+        )
+        before = self.store.token_count()
+        with self.assertRaises(self.exchange.ExchangeError):
+            self._exchange(subject_token="mapp_a_narrow")
+        self.assertEqual(before, self.store.token_count())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -196,6 +196,7 @@ class MappAuthorizationServer(AuthorizationServer):
         *,
         issuer: str,
         resource: str,
+        config_api_resource: str | None = None,
         scopes_supported=None,
         advertised_scopes=None,
         admin_password_hash: str = "",
@@ -215,7 +216,22 @@ class MappAuthorizationServer(AuthorizationServer):
         )
         self.store = store
         self.issuer = issuer
+        #: What token A is for.
         self.resource = resource
+        #: What token B is for. Deliberately a separate value: if the two were
+        #: ever equal, an A and a B would target the same resource and the
+        #: audience separation the design rests on would be gone -- a token A
+        #: could be replayed at the configuration API. assert_audiences_differ
+        #: refuses that configuration outright rather than trusting deployment.
+        self.config_api_resource = config_api_resource or (
+            resource.rsplit("/", 1)[0] + "/api"
+        )
+        if self.config_api_resource == self.resource:
+            raise ValueError(
+                "The MCP resource and the configuration-API resource must differ;"
+                " equal values collapse the audience separation between token A"
+                " and token B."
+            )
         #: M1/M2 read this from the environment. P4 moves it to control.admin_credential;
         #: passwords.py is byte-compatible with config-ui so that move is a copy.
         self.admin_password_hash = admin_password_hash

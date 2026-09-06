@@ -140,6 +140,11 @@ class Token(TokenMixin):
     issued_at: int
     expires_in: int
     revoked: bool = False
+    #: Which resource this token is for. Token A carries the MCP resource and
+    #: token B the configuration API, and the exchange refuses a subject token
+    #: that is not an A -- so a B cannot be exchanged again for another B.
+    #: Defaulted so every existing construction site keeps working.
+    audience: str = "mcp"
 
     def check_client(self, client: ClientMixin) -> bool:
         return self.client_id == client.get_client_id()
