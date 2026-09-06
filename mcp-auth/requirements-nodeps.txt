@@ -1,6 +1,6 @@
 # Installed with --no-deps deliberately. Authlib's declared dependency set
 # pulls cryptography, which has no musl wheel and is not needed by the RFC
-# subset this component imports (rfc6749/6750/7009/7636/7662/8414/9207).
+# subset this component imports (rfc6749/6750/7636/8414/9207).
 # test_no_native_dependency_is_installed pins that the import surface stays
 # inside that subset.
 Authlib==1.8.0

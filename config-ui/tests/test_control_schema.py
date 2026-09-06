@@ -170,11 +170,21 @@ class SchemaShapeTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([], naive)
 
-    def test_every_table_that_carries_authority_has_a_recovery_epoch(self) -> None:
+    def test_every_table_that_carries_authority_reserves_a_recovery_epoch(self) -> None:
+        """Reserved storage, not an enforced control.
+
+        Nothing writes or reads this column yet, so this pins that the storage
+        exists and nothing more. Renamed because the previous name read as
+        though snapshot recovery were implemented.
+        """
         expected = {
             "sessions",
             "tokens",
             "device_authorizations",
+            # The grant most of all: every token resolves through it, so a
+            # restore that invalidated tokens but left grants live would
+            # re-authorise everything on the next exchange.
+            "oauth_grants",
             "oauth_authorization_codes",
             "oauth_tokens",
             "oauth_pending_authorizations",

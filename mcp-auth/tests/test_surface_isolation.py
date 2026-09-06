@@ -325,7 +325,7 @@ class DependencySurfaceTests(unittest.TestCase):
 
     Every platform image is musl-based and `cryptography` publishes no musl
     wheel, so pulling it in turns a pip install into a source build. The RFCs
-    this component uses -- rfc6749, 6750, 7009, 7636, 7662, 8414, 9207 -- need
+    this component uses -- rfc6749, 6750, 7636, 8414, 9207 -- need
     none of it, which is why Authlib is installed with --no-deps.
 
     The assertion is on the Dockerfile rather than on what happens to be
@@ -355,9 +355,7 @@ class DependencySurfaceTests(unittest.TestCase):
         for module in (
             "authlib.oauth2.rfc6749",
             "authlib.oauth2.rfc6750",
-            "authlib.oauth2.rfc7009",
             "authlib.oauth2.rfc7636",
-            "authlib.oauth2.rfc7662",
             "authlib.oauth2.rfc8414",
             "authlib.oauth2.rfc9207",
         ):
@@ -469,8 +467,17 @@ class DeployedStoreTests(unittest.TestCase):
             if previous is not None:
                 os.environ["CONTROL_DATABASE_URL"] = previous
 
-    def test_the_in_memory_store_is_not_reachable_from_production_code(self) -> None:
-        """StubStore is a test double and must stay in the tests."""
+    def test_the_in_memory_store_is_not_shipped_or_imported(self) -> None:
+        """The double lives under tests/ and stays out of the image.
+
+        It is a credential store that keeps secrets in process memory; there
+        is no reason for it to exist in the runtime image at all.
+        """
+        from pathlib import Path as _P
+
+        root = _P(__file__).resolve().parents[1]
+        self.assertFalse((root / "stub_store.py").exists())
+        self.assertTrue((root / "tests" / "stub_store.py").exists())
         import ast
         from pathlib import Path
 

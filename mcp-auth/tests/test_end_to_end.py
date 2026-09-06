@@ -231,6 +231,34 @@ class FullFlowTests(unittest.TestCase):
         record = self.store.query_token(self.obtain_token_a())
         self.assertEqual(MCP_RESOURCE, record.audience)
 
+    def test_each_consent_produces_its_own_grant(self) -> None:
+        """P3: the actor is the grant, not the operator.
+
+        Before this, `subject` was the operator session's "admin" for every
+        consent by every client, so two grants were indistinguishable and
+        revocation had nothing to act on. Two consents must now yield two
+        grant records, each carrying what was actually consented to.
+        """
+        first = self.store.query_token(self.obtain_token_a()).subject
+        second = self.store.query_token(self.obtain_token_a()).subject
+        self.assertNotEqual(first, second)
+        for grant_id in (first, second):
+            with self.subTest(grant=grant_id):
+                self.assertTrue(grant_id.startswith("oauth:"))
+                grant = self.store.query_grant(grant_id)
+                self.assertIsNotNone(grant)
+                self.assertEqual("mcp-client", grant.client_id)
+                self.assertEqual(("apply",), grant.scopes)
+
+    def test_revoking_one_grant_leaves_the_other_alone(self) -> None:
+        """Revocation is per consent, not per operator or per client."""
+        first = self.store.query_token(token_a := self.obtain_token_a()).subject
+        other_raw = self.obtain_token_a()
+        self.assertTrue(self.store.revoke_grant(first))
+        self.assertTrue(self.store.query_grant(first).is_revoked())
+        second = self.store.query_token(other_raw).subject
+        self.assertFalse(self.store.query_grant(second).is_revoked())
+
     def test_a_real_token_a_can_be_exchanged_for_token_b(self) -> None:
         status, _, body = self.exchange_for_token_b(self.obtain_token_a())
         self.assertEqual(200, status, body)

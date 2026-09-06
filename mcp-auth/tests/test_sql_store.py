@@ -26,7 +26,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised by the skip below
     psycopg = None
 
-from models import AuthorizationCode, Client, PendingAuthorization, Session, Token
+from models import AuthorizationCode, Client, Grant, PendingAuthorization, Session, Token
 
 DATABASE_URL = os.getenv("CONTROL_TEST_DATABASE_URL", "")
 
@@ -66,14 +66,30 @@ class SqlStoreContractTests(unittest.TestCase):
         self.store = SqlStore(DATABASE_URL)
         with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
             for table in (
+                # Child before parent: grants reference clients, and tokens
+                # and codes reference grants, so this order is load-bearing --
+                # these are plain DELETEs, not CASCADE.
                 "oauth_authorization_codes",
                 "oauth_pending_authorizations",
                 "oauth_tokens",
                 "oauth_sessions",
+                "oauth_grants",
                 "oauth_clients",
             ):
                 connection.execute(f"DELETE FROM control.{table}")
         self.store.add_client(_client())
+        # The grant every seeded code and token belongs to. Codes and tokens
+        # reference it now, so seeding one without it is a foreign-key
+        # violation -- which is the schema saying the same thing the exchange
+        # says: a credential with no grant behind it is not a credential.
+        self.store.save_grant(
+            Grant(
+                grant_id="oauth:grant-1",
+                client_id="mcp-client",
+                subject="admin",
+                scopes=("mcp:connect", "inspect"),
+            )
+        )
 
     # -- clients ---------------------------------------------------------
 
@@ -81,6 +97,36 @@ class SqlStoreContractTests(unittest.TestCase):
         found = self.store.query_client("mcp-client")
         self.assertEqual(("mcp:connect", "inspect"), found.scopes)
         self.assertEqual(("http://127.0.0.1:9/cb",), found.redirect_uris)
+
+    def test_a_disabled_client_is_not_returned(self) -> None:
+        """The same rule the in-memory double enforces.
+
+        SqlStore could not persist disablement at all, so this rule was only
+        ever exercised against the double -- each store's tests build their own
+        fixture, so the two could disagree about who may act and both suites
+        would stay green.
+        """
+        self.store.add_client(
+            Client(
+                client_id="disabled-client", name="Gone", redirect_uris=(),
+                scopes=("mcp:connect",), token_endpoint_auth_method="none",
+                disabled=True,
+            )
+        )
+        self.assertIsNone(self.store.query_client("disabled-client"))
+
+    def test_re_enabling_a_client_makes_it_visible_again(self) -> None:
+        self.store.add_client(
+            Client(client_id="toggle", name="T", redirect_uris=(),
+                   scopes=("mcp:connect",), token_endpoint_auth_method="none",
+                   disabled=True)
+        )
+        self.assertIsNone(self.store.query_client("toggle"))
+        self.store.add_client(
+            Client(client_id="toggle", name="T", redirect_uris=(),
+                   scopes=("mcp:connect",), token_endpoint_auth_method="none")
+        )
+        self.assertIsNotNone(self.store.query_client("toggle"))
 
     def test_an_unknown_client_is_none(self) -> None:
         self.assertIsNone(self.store.query_client("nosuch"))
@@ -336,7 +382,8 @@ class ExchangedTokenTests(unittest.TestCase):
             connection.execute(
                 "TRUNCATE control.oauth_authorization_codes,"
                 " control.oauth_pending_authorizations, control.oauth_tokens,"
-                " control.oauth_sessions, control.oauth_clients CASCADE"
+                " control.oauth_sessions, control.oauth_grants,"
+                " control.oauth_clients CASCADE"
             )
         self.broker = Client(
             client_id="broker", name="B", redirect_uris=(), scopes=(),
@@ -345,6 +392,10 @@ class ExchangedTokenTests(unittest.TestCase):
         self.store.add_client(self.broker)
         self.store.add_client(_client("mcp-client"))
         self.now = dt.datetime.now(dt.timezone.utc)
+        self.store.save_grant(
+            Grant(grant_id="oauth:grant-1", client_id="mcp-client",
+                  subject="admin", scopes=("apply", "derive", "semantic:inspect"))
+        )
         self.store.save_token(
             "mapp_a_sub",
             Token(
@@ -496,7 +547,7 @@ class ExchangedTokenTests(unittest.TestCase):
             "mapp_a_reader",
             Token(
                 token_hash="", client_id="mcp-client", scope="derive semantic:inspect",
-                subject="oauth:grant-3", issued_at=int(self.now.timestamp()),
+                subject="oauth:grant-1", issued_at=int(self.now.timestamp()),
                 expires_in=900, audience=self.mcp_resource,
             ),
         )
@@ -525,7 +576,7 @@ class ExchangedTokenTests(unittest.TestCase):
             "mapp_a_narrow",
             Token(
                 token_hash="", client_id="mcp-client", scope="derive",
-                subject="oauth:grant-2", issued_at=int(self.now.timestamp()),
+                subject="oauth:grant-1", issued_at=int(self.now.timestamp()),
                 expires_in=900, audience=self.mcp_resource,
             ),
         )

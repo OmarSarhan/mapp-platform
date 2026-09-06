@@ -32,7 +32,6 @@ import decimal
 import hashlib
 import json
 import math
-import re
 from typing import Any
 
 #: The canonicalization version. A new algorithm requires a new version: an
@@ -178,15 +177,18 @@ def _utf16_key(name: str) -> tuple[int, ...]:
     return tuple(name.encode("utf-16-be"))
 
 
-_DUPLICATE_SCAN = re.compile(rb'"(?:[^"\\]|\\.)*"\s*:')
 
 
 def loads(raw: bytes) -> Any:
     """Parse JSON, refusing what this scheme cannot canonicalize.
 
-    The checks run on the raw bytes because a normal parser destroys the
-    evidence: duplicate names collapse to the last value, and a huge integer
-    silently becomes a float. Neither is recoverable after the fact.
+    Both checks run *during* parsing rather than after it, because a completed
+    parse destroys the evidence: duplicate names collapse to the last value and
+    a huge integer silently becomes a float, and neither is recoverable
+    afterwards. Duplicates are caught by json's object_pairs_hook as members
+    are assembled -- which sees names after escape processing, so
+    ``{"a":1,"\u0061":2}`` is caught -- and the numeric domain is walked over
+    the parsed tree by _check_domain.
     """
     if not isinstance(raw, (bytes, bytearray)):
         raise CanonicalizationError("Canonical input must be raw bytes.")

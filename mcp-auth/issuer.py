@@ -140,8 +140,9 @@ class MappAuthorizationCodeGrant(AuthorizationCodeGrant):
         return None
 
     def authenticate_user(self, authorization_code):
-        # P3: the actor is the grant, not a directory user. M1 carries the
-        # subject straight off the code; M4 resolves it through the grant row.
+        # P3: the actor is the grant, not a directory user. The code's subject
+        # is already the grant id -- consent writes it in server.authorize_post
+        # -- so this returns it unchanged and the token inherits it.
         return authorization_code.subject
 
 

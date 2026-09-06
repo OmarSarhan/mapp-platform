@@ -26,11 +26,13 @@ from pathlib import Path
 from authlib.oauth2.rfc6749.errors import OAuth2Error
 
 import exchange
+import introspection
 import pages
 from authlib_adapter import FormError
 from authlib_adapter import MappResponse
 from authlib_adapter import parse_form
 from models import PendingAuthorization
+from models import Grant
 from models import Session
 from models import PendingLimitReached
 from passwords import verify_password
@@ -420,13 +422,35 @@ def authorize_post(handler) -> None:
     # Rebuilt from the stored query, so nothing in this POST body can change
     # scope, redirect_uri, client_id or resource. The decision is the only input.
     request = server.request_from(handler, read_body=False, query_override=pending.query)
-    grant = server.get_consent_grant(request=request, end_user=session.subject)
+    server.get_consent_grant(request=request, end_user=session.subject)
 
     allowed = form.get("decision") == "allow"
+    grant_id = None
+    if allowed:
+        # The consent becomes a record here, and its id becomes the token
+        # subject. Before this, `subject` was the operator session's "admin"
+        # for every consent by every client, so two grants were
+        # indistinguishable and there was nothing for revocation to act on.
+        # P3 says the actor is the grant rather than a directory user; this is
+        # the line that makes that true.
+        grant_id = "oauth:" + secrets.token_urlsafe(18)
+        server.store.save_grant(
+            Grant(
+                grant_id=grant_id,
+                client_id=pending.client_id,
+                # Which operator session authorised it, not who they are: a
+                # single shared administrator identity (P3) makes this a record
+                # of provenance, not an identity claim.
+                subject=session.subject,
+                scopes=tuple((request.scope or "").split()),
+            )
+        )
     response = server.create_authorization_response(
         request=request,
-        grant_user=session.subject if allowed else None,
-        grant=grant,
+        grant_user=grant_id,
+        grant=server.get_consent_grant(
+            request=request, end_user=session.subject
+        ),
     )
     if not any(name.lower() == "content-type" for name, _ in response.headers):
         response.headers.append(("Content-Type", "text/plain; charset=utf-8"))
@@ -574,6 +598,43 @@ def exchange_endpoint(handler) -> None:
     MappResponse(200, json.dumps(token), JSON_HEADERS).write_to(handler)
 
 
+def _control_endpoint(handler, action):
+    """Shared shape for the authenticated control endpoints.
+
+    Client authentication happens before the body is interpreted, so an
+    unauthenticated caller never learns whether a token exists -- which is the
+    oracle RFC 7662 warns an open introspection endpoint becomes.
+    """
+    server = handler.server.authorization
+    _, datalist = parse_form(handler, max_bytes=16 * 1024)
+    client = _authenticate_broker(handler)
+    if client is None:
+        MappResponse(
+            401,
+            json.dumps({"error": "invalid_client"}),
+            JSON_HEADERS + [("WWW-Authenticate", 'Basic realm="control"')],
+        ).write_to(handler)
+        return
+    try:
+        payload = action(datalist=datalist, store=server.store)
+    except introspection.IntrospectionError as exc:
+        MappResponse(
+            400,
+            json.dumps({"error": exc.error, "error_description": exc.description}),
+            JSON_HEADERS,
+        ).write_to(handler)
+        return
+    MappResponse(200, json.dumps(payload), JSON_HEADERS).write_to(handler)
+
+
+def introspect_endpoint(handler) -> None:
+    _control_endpoint(handler, introspection.introspect)
+
+
+def revoke_endpoint(handler) -> None:
+    _control_endpoint(handler, introspection.revoke)
+
+
 class EdgeServer(ThreadingHTTPServer):
     """The publicly reachable surface, over TCP. Tests use this directly."""
 
@@ -614,6 +675,8 @@ class ControlServer(ThreadingHTTPServer):
         self.routes = {
             ("GET", "/healthz"): healthz,
             ("POST", "/internal/oauth/exchange"): exchange_endpoint,
+            ("POST", "/internal/oauth/introspect"): introspect_endpoint,
+            ("POST", "/internal/oauth/revoke"): revoke_endpoint,
         }
 
 
@@ -641,7 +704,7 @@ def build_store():
             " see docs/external-postgresql.md for deployments without the"
             " packaged database."
         )
-    return SqlStore(dsn, audience=os.environ.get("MCP_RESOURCE", ""))
+    return SqlStore(dsn)
 
 
 def build_authorization(store=None):

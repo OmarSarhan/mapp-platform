@@ -142,6 +142,7 @@ services:
       # public surface is reached solely through the Unix socket.
       - mcp-control
       - backend
+      - edge
 
   config-ui:
     image: mapp-config-ui:local

@@ -142,6 +142,16 @@ def exchange(
     # absent audience passed it.
     if record.audience != mcp_resource:
         raise ExchangeError("invalid_grant", "The subject token is not active.")
+    # The grant, not just the token. The scope document requires revocation to
+    # prevent new exchanges immediately, and a token A stays live for its full
+    # fifteen minutes after consent is withdrawn -- so checking only the token
+    # would keep minting token Bs from a grant that no longer exists.
+    grant = store.query_grant(record.subject) if record.subject else None
+    if grant is None or grant.is_revoked():
+        raise ExchangeError("invalid_grant", "The subject token is not active.")
+    # And the client that holds the grant must still be permitted to act.
+    if store.query_client(record.client_id) is None:
+        raise ExchangeError("invalid_grant", "The subject token is not active.")
 
     # -- the operation binding --------------------------------------------
     raw_context = _single(datalist, CONTEXT_PARAMETER)
@@ -184,8 +194,8 @@ def exchange(
     path_template = context.get("pathTemplate")
     if method != operation.method or path_template != operation.path_template:
         # The caller does not get to describe the operation differently from
-        # the allowlist. NOTE the digest itself is only checked for its scheme
-        # prefix here: recomputing it against the real downstream request is
+        # the allowlist. NOTE the digest's *shape* is checked above but its
+        # value is never recomputed against the real downstream request: that is
         # the configuration API's job and that half does not exist yet (M7).
         # Until it lands, the binding is recorded but not enforced downstream.
         raise ExchangeError(
@@ -200,14 +210,20 @@ def exchange(
     if len(set(requested)) != len(requested):
         raise ExchangeError("invalid_scope", "Duplicate scope values.")
 
-    permitted = set((record.get_scope() or "").split())
+    # Both the token and the grant bound it. The grant is the stronger of the
+    # two: it is what the operator actually saw and approved on the consent
+    # screen, and a token is only ever derived from it. Checking the token
+    # alone let a grant that consented to nothing mint an `apply` token B,
+    # because nothing downstream reconciled the two.
+    permitted = set((record.get_scope() or "").split()) & set(grant.scopes)
     missing = [scope for scope in requested if scope not in permitted]
     if missing:
         # Refused, not narrowed. Narrowing here would hand back a working
         # token for a request the caller never made.
         raise ExchangeError(
             "invalid_scope",
-            "Requested scopes exceed the subject token: " + " ".join(sorted(missing)),
+            "Requested scopes exceed the subject token or its grant: "
+            + " ".join(sorted(missing)),
         )
 
     # No separate "does the grant hold the operation's scopes" branch: the

@@ -26,6 +26,7 @@ from psycopg.rows import dict_row
 
 from models import AuthorizationCode
 from models import Client
+from models import Grant
 from models import PendingLimitReached
 from models import PendingAuthorization
 from models import Session
@@ -67,11 +68,8 @@ class SqlStore:
     CONNECTION LIMIT is the backstop.
     """
 
-    def __init__(self, dsn: str, *, audience: str = "mcp") -> None:
+    def __init__(self, dsn: str) -> None:
         self._dsn = dsn
-        #: Recorded on every issued token so introspection can refuse a token
-        #: minted for a different resource (P5's audience separation).
-        self._audience = audience
 
     def _connect(self) -> psycopg.Connection:
         connection = psycopg.connect(
@@ -98,15 +96,17 @@ class SqlStore:
             connection.execute(
                 "INSERT INTO control.oauth_clients"
                 "(client_id, name, redirect_uris, scopes, grant_types,"
-                " token_endpoint_auth_method, client_secret_hash)"
-                " VALUES(%s,%s,%s,%s,%s,%s,%s)"
+                " token_endpoint_auth_method, client_secret_hash, disabled_at)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,"
+                "        CASE WHEN %s THEN now() ELSE NULL END)"
                 " ON CONFLICT (client_id) DO UPDATE SET"
                 "   name = EXCLUDED.name,"
                 "   redirect_uris = EXCLUDED.redirect_uris,"
                 "   scopes = EXCLUDED.scopes,"
                 "   grant_types = EXCLUDED.grant_types,"
                 "   token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method,"
-                "   client_secret_hash = EXCLUDED.client_secret_hash",
+                "   client_secret_hash = EXCLUDED.client_secret_hash,"
+                "   disabled_at = EXCLUDED.disabled_at",
                 (
                     client.client_id,
                     client.name,
@@ -117,6 +117,11 @@ class SqlStore:
                     # Stored hashed: a client secret at rest is a credential,
                     # and the comparison happens on the digest either way.
                     token_digest(client.client_secret) if client.client_secret else None,
+                    # Without this the SQL store could not express a disabled
+                    # client at all, so the rule was only ever exercised
+                    # against the in-memory double and the two stores could
+                    # disagree about who may act.
+                    client.disabled,
                 ),
             )
         return client
@@ -142,6 +147,52 @@ class SqlStore:
             client_secret=row["client_secret_hash"] or "",
             secret_is_hashed=True,
         )
+
+    # -- grants ----------------------------------------------------------
+
+    def save_grant(self, grant: Grant) -> Grant:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO control.oauth_grants"
+                "(grant_id, client_id, subject, scopes) VALUES(%s,%s,%s,%s)",
+                (grant.grant_id, grant.client_id, grant.subject, list(grant.scopes)),
+            )
+        return grant
+
+    def query_grant(self, grant_id: str) -> Grant | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM control.oauth_grants WHERE grant_id = %s",
+                (grant_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Grant(
+            grant_id=row["grant_id"],
+            client_id=row["client_id"],
+            subject=row["subject"],
+            scopes=tuple(row["scopes"]),
+            revoked_at=_epoch(row["revoked_at"]),
+        )
+
+    def revoke_grant(self, grant_id: str, reason: str = "") -> bool:
+        """Revoke a grant, reporting whether this call was the one that did it.
+
+        One conditional statement, so two operators revoking at once cannot
+        both believe they acted. Nothing else is touched: tokens are not
+        updated row by row, because introspection resolves each of them through
+        the grant, so one write invalidates every credential derived from it --
+        including a token B already issued and not yet spent.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "UPDATE control.oauth_grants"
+                "   SET revoked_at = now(), revoked_reason = %s"
+                " WHERE grant_id = %s AND revoked_at IS NULL"
+                " RETURNING grant_id",
+                (reason or None, grant_id),
+            ).fetchone()
+        return row is not None
 
     # -- authorization codes ---------------------------------------------
 
@@ -236,11 +287,13 @@ class SqlStore:
                     token.client_id,
                     token.subject,
                     token.scope,
-                    # The caller's audience, not the store's default: silently
-                    # substituting one made a token minted for another resource
-                    # look like a token A, and the exchange's subject check is
-                    # exactly that comparison.
-                    token.audience or self._audience,
+                    # Written as given. There used to be a store-level default
+                    # of "mcp" behind an `or`, which is the same placeholder
+                    # models.py and exchange.py both removed for being
+                    # dangerous -- the rule had been applied at two of three
+                    # sites. An unset audience now fails the exchange's
+                    # comparison, which is what it is for.
+                    token.audience,
                     token.issued_at,
                     token.issued_at + token.expires_in,
                 ),

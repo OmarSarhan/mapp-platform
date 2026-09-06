@@ -45,8 +45,6 @@ class Client(ClientMixin):
     #: rest is a credential -- and check_client_secret hashes the supplied
     #: value before comparing, so both stores compare like with like.
     secret_is_hashed: bool = False
-    #: refresh_token is absent on purpose: P6 approves refresh for the code flow
-    #: but not here, and authlib decides whether to mint one by asking
     #: Refresh is gated twice. authlib asks check_grant_type("refresh_token")
     #: and passes the answer to the token generator, so omitting the grant type
     #: here suppresses a refresh token -- but it is not currently the decisive
@@ -54,6 +52,10 @@ class Client(ClientMixin):
     #: grant type alone changes nothing until the grant and its storage exist.
     grant_types: tuple[str, ...] = ("authorization_code",)
     response_types: tuple[str, ...] = ("code",)
+    #: A disabled client authorises nothing. The SQL store already filtered on
+    #: disabled_at; the model had no way to say it, so the in-memory store
+    #: could not express a client state the real one enforces.
+    disabled: bool = False
 
     def get_client_id(self) -> str:
         return self.client_id
@@ -220,6 +222,26 @@ class PendingAuthorization:
 
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
+
+
+@dataclass
+class Grant:
+    """One consent, as a thing that can be revoked.
+
+    Revocation is grant-shaped, not token-shaped: an operator withdrawing
+    consent means every credential derived from it stops working at once,
+    including a token B already in flight. Revoking tokens one at a time could
+    never achieve that, because the broker can mint another the moment before.
+    """
+
+    grant_id: str
+    client_id: str
+    subject: str
+    scopes: tuple[str, ...]
+    revoked_at: float | None = None
+
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
 
 
 @dataclass

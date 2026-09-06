@@ -30,6 +30,7 @@ TABLES = (
     "oauth_pending_authorizations",
     "oauth_tokens",
     "oauth_sessions",
+    "oauth_grants",
     "oauth_clients",
     "device_authorizations",
     "tokens",

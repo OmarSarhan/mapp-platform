@@ -30,7 +30,10 @@ class Operation:
     operation_id: str
     method: str
     path_template: str
-    #: Every scope that must be present in BOTH token A and the active grant.
+    #: The scopes this operation needs. The exchange requires the request to
+    #: name exactly these, and requires every one of them to be held by BOTH
+    #: token A and the grant behind it -- the grant being what the operator
+    #: actually approved on the consent screen.
     #: A superset of the action's own `scope`, because some actions need a
     #: second scope to read what they act on.
     required_scopes: tuple[str, ...]

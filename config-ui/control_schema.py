@@ -12,9 +12,14 @@ exactly one caller can win a race, and the loser learns it lost from an empty
 result rather than from a second query. Consumed rows are kept rather than
 deleted, so a replay is detectably a replay instead of merely unknown.
 
-**Authority carries a recovery epoch.** Every table whose rows can authorise
-something has ``recovery_epoch``, so restoring a snapshot can invalidate
-everything issued before the restore without deleting the audit trail.
+**Authority carries a recovery epoch -- as storage, not yet as a control.**
+Every table whose rows can authorise something has ``recovery_epoch``. The
+design is that restoring a snapshot bumps the epoch and every lookup compares
+against it, so a restore invalidates what was issued before it without
+deleting the audit trail. *None of that is implemented*: nothing writes the
+column and nothing reads it, so every row sits at 0 forever. It is reserved
+storage so the eventual writer needs no migration, and it must not be mistaken
+for a live control -- a restore today invalidates nothing.
 
 No table uses a sequence or an identity column: primary keys are sha256 hashes
 of secrets the client already holds. That is partly least-privilege --
@@ -403,10 +408,68 @@ def _migration_3(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_4(connection: psycopg.Connection) -> None:
+    """The grant, as a record that can be revoked.
+
+    Until now nothing represented a consent. Tokens carried a `subject` string
+    which, after a real authorization-code flow, was the literal "admin" for
+    every consent by every client for every scope set -- so two grants were
+    indistinguishable and "revoke the grant" had nothing to act on. P3 says the
+    actor is the grant rather than a directory user; this is what makes that
+    true rather than aspirational.
+
+    It is also what lets revocation mean what the scope document requires:
+    revoking a grant invalidates an already-issued token B immediately, instead
+    of leaving it live for the rest of its sixty seconds, because introspection
+    resolves every token through its grant.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+            CREATE TABLE {schema}.oauth_grants (
+                grant_id       text        PRIMARY KEY,
+                client_id      text        NOT NULL
+                                 REFERENCES {schema}.oauth_clients(client_id),
+                -- Who consented. Today a single shared administrator (P3), so
+                -- this is not an identity claim -- it records which operator
+                -- session authorised the grant, not who they are.
+                subject        text        NOT NULL,
+                -- Exactly what was consented to. A token may never widen
+                -- beyond this, and it is the set the consent screen displayed.
+                scopes         text[]      NOT NULL,
+                created_at     timestamptz NOT NULL DEFAULT now(),
+                revoked_at     timestamptz,
+                revoked_reason text,
+                recovery_epoch bigint      NOT NULL DEFAULT 0,
+                CONSTRAINT grant_reason_requires_revocation
+                    CHECK (revoked_reason IS NULL OR revoked_at IS NOT NULL)
+            );
+
+            CREATE INDEX oauth_grants_live_idx
+                ON {schema}.oauth_grants (client_id) WHERE revoked_at IS NULL;
+
+            -- No separate grant_id column: `subject` already holds the grant
+            -- id. authenticate_user returns it off the authorization code and
+            -- the token inherits it, so a second column would be the same
+            -- value written twice and free to drift. This index is what
+            -- introspection's grant lookup uses.
+            --
+            -- No foreign key either, deliberately. Rows written before grants
+            -- existed carry an operator name rather than a grant id, and a
+            -- constraint would fail the migration on them. Introspection
+            -- treats a subject that resolves to no grant as inactive, so the
+            -- absence fails closed without needing the database to enforce it.
+            CREATE INDEX oauth_tokens_subject_idx ON {schema}.oauth_tokens (subject);
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
+    4: _migration_4,
 }
 
 

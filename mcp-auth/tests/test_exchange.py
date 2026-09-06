@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import canonical
 import exchange
 import operations
-from models import Client, Token
+from models import Client, Grant, Token
 from server import ControlServer
 from stub_store import StubStore
 
@@ -85,18 +85,39 @@ class ExchangeTestCase(unittest.TestCase):
             client_secret="broker-secret",
         )
         self.store.add_client(self.broker)
+        # The client the subject token belongs to. The exchange resolves it
+        # now, because a grant held by a client that may no longer act should
+        # not mint anything.
+        self.store.add_client(
+            Client(
+                client_id="mcp-client",
+                name="Claude Code",
+                redirect_uris=("http://127.0.0.1:9/cb",),
+                scopes=("apply", "derive", "semantic:inspect"),
+                token_endpoint_auth_method="none",
+            )
+        )
         self.now = dt.datetime.now(dt.timezone.utc)
         self._seed_subject("mapp_a_subject", "apply derive semantic:inspect")
 
     def _seed_subject(self, raw: str, scope: str, *, expires_in: int = 900,
-                      revoked: bool = False, audience: str = MCP_RESOURCE) -> None:
+                      revoked: bool = False, audience: str = MCP_RESOURCE,
+                      subject: str = "oauth:grant-1") -> None:
+        # A grant behind the token, because the exchange resolves one now:
+        # a subject with no grant is refused, which is what makes revocation
+        # stop new exchanges.
+        if self.store.query_grant(subject) is None:
+            self.store.save_grant(
+                Grant(grant_id=subject, client_id="mcp-client",
+                      subject="admin", scopes=tuple(scope.split()))
+            )
         self.store.save_token(
             raw,
             Token(
                 token_hash="",
                 client_id="mcp-client",
                 scope=scope,
-                subject="oauth:grant-1",
+                subject=subject,
                 issued_at=int(self.now.timestamp()),
                 expires_in=expires_in,
                 revoked=revoked,
@@ -419,6 +440,21 @@ class DigestFormatTests(ExchangeTestCase):
 class ScopeRefusalTests(ExchangeTestCase):
     """Refuse when requested is not a subset. Never intersect."""
 
+    def test_a_scope_the_grant_never_consented_to_is_refused(self) -> None:
+        """The consent screen is binding, not decorative.
+
+        Token A's scope is derived from the grant, but nothing reconciled the
+        two, so a grant that consented to nothing still minted an `apply`
+        token B. The grant is the stronger statement: it is what the operator
+        actually approved.
+        """
+        self.store.query_grant("oauth:grant-1").scopes = ()
+        self.assert_refused("invalid_scope", form())
+
+    def test_a_narrower_grant_narrows_the_token(self) -> None:
+        self.store.query_grant("oauth:grant-1").scopes = ("inspect",)
+        self.assert_refused("invalid_scope", form())
+
     def test_a_permitted_but_unrequired_scope_is_refused(self) -> None:
         """Exactly the operation's scopes: no more, no fewer.
 
@@ -647,6 +683,15 @@ class ExchangeOverHttpTests(unittest.TestCase):
             )
         )
         now = dt.datetime.now(dt.timezone.utc)
+        self.store.add_client(
+            Client(client_id="mcp-client", name="Claude Code",
+                   redirect_uris=("http://127.0.0.1:9/cb",), scopes=("apply",),
+                   token_endpoint_auth_method="none")
+        )
+        self.store.save_grant(
+            Grant(grant_id="oauth:grant-1", client_id="mcp-client",
+                  subject="admin", scopes=("apply",))
+        )
         self.store.save_token(
             "mapp_a_subject",
             Token(

@@ -17,6 +17,7 @@ import threading
 
 from models import AuthorizationCode
 from models import Client
+from models import Grant
 from models import PendingLimitReached
 from models import PendingAuthorization
 from models import Session
@@ -41,6 +42,7 @@ class StubStore:
         self._tokens: dict[str, Token] = {}
         #: Operation binding for exchanged tokens, keyed the same way.
         self._exchanged: dict[str, dict] = {}
+        self._grants: dict[str, Grant] = {}
         self._pending: dict[str, PendingAuthorization] = {}
         self._sessions: dict[str, Session] = {}
 
@@ -52,8 +54,40 @@ class StubStore:
         return client
 
     def query_client(self, client_id: str) -> Client | None:
+        """Disabled clients are not returned, matching the SQL store.
+
+        SqlStore filters `disabled_at IS NULL`, so a store that returned a
+        disabled client here would let the two disagree about who may act.
+        """
         with self._lock:
-            return self._clients.get(client_id)
+            client = self._clients.get(client_id)
+        return None if client is None or client.disabled else client
+
+    # -- grants ----------------------------------------------------------
+
+    def save_grant(self, grant: Grant) -> Grant:
+        with self._lock:
+            self._grants[grant.grant_id] = grant
+        return grant
+
+    def query_grant(self, grant_id: str) -> Grant | None:
+        with self._lock:
+            return self._grants.get(grant_id)
+
+    def revoke_grant(self, grant_id: str, reason: str = "") -> bool:
+        """Revoke a grant, reporting whether this call was the one that did it.
+
+        Conditional so two operators revoking at once cannot both believe they
+        acted, and so an audit records one revocation rather than two.
+        """
+        import time as _time
+
+        with self._lock:
+            grant = self._grants.get(grant_id)
+            if grant is None or grant.revoked_at is not None:
+                return False
+            grant.revoked_at = _time.time()
+            return True
 
     # -- authorization codes ---------------------------------------------
 
