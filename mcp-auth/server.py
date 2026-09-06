@@ -561,6 +561,7 @@ def exchange_endpoint(handler) -> None:
             broker_client=client,
             store=server.store,
             resource=server.config_api_resource,
+            mcp_resource=server.resource,
         )
     except exchange.ExchangeError as exc:
         status = 401 if exc.error == "invalid_client" else 400

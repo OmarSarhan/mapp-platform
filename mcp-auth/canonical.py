@@ -8,8 +8,14 @@ produces a *consistent* wrong answer everywhere, which is why the scheme is
 vendored and checked against the RFC's own published vectors instead of being
 taken from a library.
 
-Two rules are easy to state and easy to get wrong, so both are enforced on the
-**raw bytes** before any parser sees them:
+Two rules are easy to state and easy to get wrong. Both are enforced during
+parsing rather than after it, which matters because a completed parse destroys
+the evidence -- but note they are not raw-byte scans: duplicates are caught by
+json's object_pairs_hook as members are assembled, and the numeric domain is
+checked over the parsed tree. The hook is the stricter of the two possible
+duplicate checks, because it sees names after escape processing, so
+``{"a":1,"\u0061":2}`` is caught where a regex over the bytes would not see a
+collision at all.
 
 *   Duplicate object member names are rejected. Python's json silently keeps
     the last, so a caller could hide a second ``scope`` behind the first and
@@ -33,9 +39,29 @@ from typing import Any
 #: approval or a token issued under one is never interpreted under another.
 SCHEME = "mapp-jcs-v1"
 
-#: Beyond this an integer cannot round-trip through a double, so the two sides
-#: of the contract could canonicalize different values from the same bytes.
+#: Named for the ECMAScript constant, and still the value the docstrings cite,
+#: but the rule enforced is the round-trip property below rather than this
+#: magnitude -- see survives_round_trip.
 MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def survives_round_trip(value: int) -> bool:
+    """True when an integer survives a double and comes back unchanged.
+
+    The rule has to be about the *value*, not about the Python type. Written
+    as a magnitude on `int` it left the scheme not closed: 1e16 parsed to a
+    float, passed the check, and canonicalized to the literal
+    10000000000000000 -- which the very same loader then rejected. One trust
+    boundary accepted what the next refused, which is precisely the
+    disagreement this scheme exists to prevent.
+
+    Large round-numbered integers such as 1e20 do survive a double exactly, so
+    they are admitted; 2**53 + 1 does not, so it is refused.
+    """
+    try:
+        return int(float(value)) == value
+    except (OverflowError, ValueError):
+        return False
 
 
 class CanonicalizationError(ValueError):
@@ -54,9 +80,9 @@ def _format_number(value: float | int) -> str:
     if isinstance(value, bool):  # bool is an int subclass; JSON says otherwise
         raise CanonicalizationError("Booleans are not numbers.")
     if isinstance(value, int):
-        if abs(value) > MAX_SAFE_INTEGER:
+        if not survives_round_trip(value):
             raise CanonicalizationError(
-                f"Integer {value} is outside the safe range for this scheme."
+                f"Integer {value} does not survive a double round trip."
             )
         return str(value)
     if math.isnan(value) or math.isinf(value):
@@ -102,6 +128,7 @@ _ESCAPES = {
 
 
 def _format_string(value: str) -> str:
+    _reject_lone_surrogates(value)
     out = ['"']
     for character in value:
         if character in _ESCAPES:
@@ -168,6 +195,7 @@ def loads(raw: bytes) -> Any:
     except UnicodeDecodeError as exc:
         raise CanonicalizationError("Canonical input must be UTF-8.") from exc
 
+
     def _no_duplicates(pairs):
         seen: set[str] = set()
         for name, value in pairs:
@@ -195,12 +223,29 @@ def loads(raw: bytes) -> Any:
     return parsed
 
 
+def _reject_lone_surrogates(text: str) -> None:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CanonicalizationError(
+            "Unpaired surrogates cannot be canonicalized."
+        ) from exc
+
+
 def _check_domain(value: Any) -> None:
     if isinstance(value, bool) or value is None:
         return
-    if isinstance(value, int) and abs(value) > MAX_SAFE_INTEGER:
+    if isinstance(value, str):
+        # Checked here rather than on the input text: a \ud800 escape is
+        # perfectly good ASCII in the raw bytes and only becomes an unpaired
+        # surrogate once json decodes it. It has no UTF-8 encoding, so
+        # canonicalize would raise UnicodeEncodeError -- outside this module's
+        # error contract, and not something a peer could agree with either.
+        _reject_lone_surrogates(value)
+        return
+    if isinstance(value, int) and not survives_round_trip(value):
         raise CanonicalizationError(
-            f"Integer {value} is outside the safe range for this scheme."
+            f"Integer {value} does not survive a double round trip."
         )
     if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
         raise CanonicalizationError("NaN and Infinity have no JSON form.")

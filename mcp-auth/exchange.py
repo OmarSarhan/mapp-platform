@@ -26,6 +26,7 @@ the Caddy allowlist the only thing standing between the internet and it.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import secrets
 
 import canonical
@@ -48,6 +49,9 @@ CONTEXT_VERSION = canonical.SCHEME
 #: The private extension carrying the operation binding. Namespaced so it
 #: cannot collide with a future registered RFC 8693 parameter.
 CONTEXT_PARAMETER = "mapp_operation_context"
+
+#: scheme name, then exactly one sha256 in lower-case hex.
+DIGEST_PATTERN = re.compile(re.escape(canonical.SCHEME) + r":[0-9a-f]{64}")
 
 
 class ExchangeError(Exception):
@@ -80,6 +84,7 @@ def exchange(
     broker_client,
     store,
     resource: str,
+    mcp_resource: str,
     now: dt.datetime | None = None,
 ) -> dict:
     """Validate an exchange request and issue token B, or refuse.
@@ -131,8 +136,11 @@ def exchange(
     record = store.query_token(subject_token)
     if record is None or record.is_expired() or record.is_revoked():
         raise ExchangeError("invalid_grant", "The subject token is not active.")
-    if getattr(record, "audience", None) not in (None, "mcp"):
-        # A token minted for some other resource is not a token A.
+    # Compared positively against the configured MCP resource rather than
+    # denied by magic string. `not in (None, "mcp")` spread a literal across
+    # three files with three different ideas of what an audience is, and an
+    # absent audience passed it.
+    if record.audience != mcp_resource:
         raise ExchangeError("invalid_grant", "The subject token is not active.")
 
     # -- the operation binding --------------------------------------------
@@ -162,19 +170,24 @@ def exchange(
         ) from None
 
     request_digest = context.get("requestDigest")
-    if not isinstance(request_digest, str) or not request_digest.startswith(
-        canonical.SCHEME + ":"
+    # Fully matched, not merely prefixed: a prefix test admitted
+    # "mapp-jcs-v1:" with nothing after it, so a token could be bound to the
+    # empty digest -- a binding that matches whatever it is later compared to.
+    if not isinstance(request_digest, str) or not DIGEST_PATTERN.fullmatch(
+        request_digest
     ):
         raise ExchangeError(
-            "invalid_request", "The request digest is missing or not this scheme."
+            "invalid_request", "The request digest is missing or malformed."
         )
 
     method = context.get("method")
     path_template = context.get("pathTemplate")
     if method != operation.method or path_template != operation.path_template:
         # The caller does not get to describe the operation differently from
-        # the allowlist: the digest covers what it says, and the API will
-        # recompute against the real request.
+        # the allowlist. NOTE the digest itself is only checked for its scheme
+        # prefix here: recomputing it against the real downstream request is
+        # the configuration API's job and that half does not exist yet (M7).
+        # Until it lands, the binding is recorded but not enforced downstream.
         raise ExchangeError(
             "invalid_request", "The context does not match the allowlisted operation."
         )
@@ -197,19 +210,18 @@ def exchange(
             "Requested scopes exceed the subject token: " + " ".join(sorted(missing)),
         )
 
-    # The operation's own requirements must also be met; a grant broad enough
-    # to ask is not necessarily broad enough to act.
-    unmet = [scope for scope in operation.required_scopes if scope not in permitted]
-    if unmet:
+    # No separate "does the grant hold the operation's scopes" branch: the
+    # subset test above already ran over `requested`, and `requested` must
+    # equal the operation's scopes, so that check was unreachable. It used to
+    # exist, and the test named for it passed because a different check fired.
+    # Exactly the operation's scopes: no more, no fewer. Issuing whatever was
+    # asked for would hand a mutation token unrelated authority for its
+    # lifetime, which is the opposite of binding it to one operation.
+    if set(requested) != set(operation.required_scopes):
         raise ExchangeError(
             "invalid_scope",
-            "The subject token lacks scopes this operation requires: "
-            + " ".join(sorted(unmet)),
-        )
-    if not set(operation.required_scopes).issubset(set(requested)):
-        raise ExchangeError(
-            "invalid_scope",
-            "The request must ask for every scope the operation requires.",
+            "The request must ask for exactly the scopes this operation requires: "
+            + " ".join(sorted(operation.required_scopes)),
         )
 
     # -- issue -------------------------------------------------------------

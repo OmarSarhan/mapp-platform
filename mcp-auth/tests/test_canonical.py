@@ -68,13 +68,24 @@ class NumberSerializationTests(unittest.TestCase):
                 with self.assertRaises(canonical.CanonicalizationError):
                     canonical._format_number(value)
 
-    def test_an_integer_beyond_the_safe_range_is_refused(self) -> None:
-        # Beyond 2^53 an integer cannot round-trip through a double, so two
-        # components could canonicalize different values from the same bytes
-        # and each believe the other agreed.
+    def test_an_integer_that_cannot_round_trip_is_refused(self) -> None:
+        """The rule is the round trip, not a magnitude.
+
+        Stated as `abs(value) > 2**53 - 1` it refused 2**53 itself, which is a
+        power of two and survives a double exactly -- and, worse, it was a
+        rule about the Python *type*, so the same number written as 1e16 was
+        admitted while its own canonical form was not.
+        """
         canonical._format_number(canonical.MAX_SAFE_INTEGER)
+        # 2**53 is representable, so it is admitted.
+        canonical._format_number(2**53)
+        # 2**53 + 1 is not.
         with self.assertRaises(canonical.CanonicalizationError):
-            canonical._format_number(canonical.MAX_SAFE_INTEGER + 1)
+            canonical._format_number(2**53 + 1)
+        with self.assertRaises(canonical.CanonicalizationError):
+            canonical._format_number(-(2**53 + 1))
+        with self.assertRaises(canonical.CanonicalizationError):
+            canonical._format_number(123456789012345678901)
 
 
 class CanonicalFormTests(unittest.TestCase):
@@ -152,15 +163,84 @@ class RawByteRejectionTests(unittest.TestCase):
                 with self.assertRaises(canonical.CanonicalizationError):
                     canonical.loads(literal)
 
-    def test_an_unsafe_integer_is_refused_on_input(self) -> None:
-        with self.assertRaises(canonical.CanonicalizationError):
-            canonical.loads(b'{"n":9007199254740992}')
+    def test_the_domain_check_reaches_inside_arrays(self) -> None:
+        """Objects were covered and arrays were not.
 
-    def test_a_safe_integer_is_accepted(self) -> None:
+        _check_domain recurses into both, but only the object branch had a
+        test, so the list branch was guarded by nothing.
+        """
+        for raw in (
+            b'[9007199254740993]',
+            b'{"a":[{"b":9007199254740993}]}',
+            b'[[[9007199254740993]]]',
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(canonical.CanonicalizationError):
+                    canonical.loads(raw)
+
+    def test_a_lone_surrogate_raises_this_modules_error(self) -> None:
+        """Not UnicodeEncodeError, which a caller would not be catching.
+
+        RFC 8785 has no encoding for an unpaired surrogate, and a peer
+        computing the same digest would not agree about one either.
+        """
+        with self.assertRaises(canonical.CanonicalizationError):
+            canonical.loads(b'["\\ud800"]')
+
+    def test_a_duplicate_hidden_behind_an_escape_is_refused(self) -> None:
+        # "a" and "\u0061" are the same member name after escape processing.
+        # The parser hook sees that; a scan over the raw bytes would not.
+        with self.assertRaises(canonical.CanonicalizationError):
+            canonical.loads(b'{"a":1,"\\u0061":2}')
+
+    def test_an_integer_that_cannot_round_trip_is_refused_on_input(self) -> None:
+        with self.assertRaises(canonical.CanonicalizationError):
+            canonical.loads(b'{"n":9007199254740993}')
+
+    def test_a_representable_integer_is_accepted(self) -> None:
         self.assertEqual(
             {"n": canonical.MAX_SAFE_INTEGER},
             canonical.loads(b'{"n":9007199254740991}'),
         )
+
+
+class ClosureTests(unittest.TestCase):
+    """canonicalize must produce something loads accepts.
+
+    The scheme is evaluated independently at each trust boundary, so a value
+    one boundary admits and the next refuses is a disagreement by
+    construction. It happened: 1e16 was accepted, canonicalized to
+    10000000000000000, and that literal was then rejected by the same loader.
+    """
+
+    VECTORS = [
+        b'[1e16]',
+        b'[1e20]',
+        b'[1e21]',
+        b'[10000000000000000]',
+        b'[-1e16]',
+        b'[0.000001]',
+        b'[1e-7]',
+        b'{"a":[1,2.5,"x"],"b":{"n":null}}',
+        b'[9007199254740991]',
+        b'[1.7976931348623157e308]',
+    ]
+
+    def test_every_canonical_form_is_itself_acceptable(self) -> None:
+        for raw in self.VECTORS:
+            with self.subTest(raw=raw):
+                once = canonical.canonicalize(canonical.loads(raw))
+                twice = canonical.canonicalize(canonical.loads(once))
+                self.assertEqual(once, twice)
+
+    def test_the_digest_is_stable_across_a_round_trip(self) -> None:
+        for raw in self.VECTORS:
+            with self.subTest(raw=raw):
+                first = canonical.digest(canonical.loads(raw))
+                again = canonical.digest(
+                    canonical.loads(canonical.canonicalize(canonical.loads(raw)))
+                )
+                self.assertEqual(first, again)
 
     def test_non_utf8_input_is_refused(self) -> None:
         with self.assertRaises(canonical.CanonicalizationError):

@@ -35,6 +35,7 @@ from server import ControlServer
 from stub_store import StubStore
 
 RESOURCE = "http://config.localhost/api"
+MCP_RESOURCE = "http://mcp.localhost/mcp"
 OPERATION = "proposals.apply"
 READ_OPERATION = "layers.values"
 
@@ -88,7 +89,7 @@ class ExchangeTestCase(unittest.TestCase):
         self._seed_subject("mapp_a_subject", "apply derive semantic:inspect")
 
     def _seed_subject(self, raw: str, scope: str, *, expires_in: int = 900,
-                      revoked: bool = False, audience: str = "mcp") -> None:
+                      revoked: bool = False, audience: str = MCP_RESOURCE) -> None:
         self.store.save_token(
             raw,
             Token(
@@ -109,6 +110,7 @@ class ExchangeTestCase(unittest.TestCase):
             broker_client=self.broker,
             store=self.store,
             resource=RESOURCE,
+            mcp_resource=MCP_RESOURCE,
             now=self.now,
         )
 
@@ -149,11 +151,16 @@ class HappyPathTests(ExchangeTestCase):
         token = self.run_exchange()
         self.assertTrue(self.store.exchanged_binding(token["access_token"])["single_use"])
         # And it can be spent exactly once.
+        digest = canonical.digest({"proposalId": "p1"})
         self.assertIsNotNone(
-            self.store.consume_exchanged_token(token["access_token"], OPERATION)
+            self.store.consume_exchanged_token(
+                token["access_token"], OPERATION, digest
+            )
         )
         self.assertIsNone(
-            self.store.consume_exchanged_token(token["access_token"], OPERATION)
+            self.store.consume_exchanged_token(
+                token["access_token"], OPERATION, digest
+            )
         )
 
     def test_a_read_operation_is_not_single_use(self) -> None:
@@ -354,8 +361,50 @@ class ContextRefusalTests(ExchangeTestCase):
         )
 
 
+class DigestFormatTests(ExchangeTestCase):
+    """The digest must be a digest, not merely something with the prefix."""
+
+    def test_a_prefix_only_digest_is_refused(self) -> None:
+        # The case that survived every earlier check: bound to the empty
+        # digest, which matches whatever it is later compared against.
+        self.assert_refused(
+            "invalid_request",
+            form(**{exchange.CONTEXT_PARAMETER: context(requestDigest=canonical.SCHEME + ":")}),
+        )
+
+    def test_a_short_digest_is_refused(self) -> None:
+        self.assert_refused(
+            "invalid_request",
+            form(**{exchange.CONTEXT_PARAMETER: context(requestDigest=canonical.SCHEME + ":abcd")}),
+        )
+
+    def test_a_non_hex_digest_is_refused(self) -> None:
+        self.assert_refused(
+            "invalid_request",
+            form(**{exchange.CONTEXT_PARAMETER: context(requestDigest=canonical.SCHEME + ":" + "z" * 64)}),
+        )
+
+    def test_an_uppercase_digest_is_refused(self) -> None:
+        # One spelling only: two components must not disagree about case.
+        self.assert_refused(
+            "invalid_request",
+            form(**{exchange.CONTEXT_PARAMETER: context(
+                requestDigest=canonical.digest({"proposalId": "p1"}).upper()
+            )}),
+        )
+
+
 class ScopeRefusalTests(ExchangeTestCase):
     """Refuse when requested is not a subset. Never intersect."""
+
+    def test_a_permitted_but_unrequired_scope_is_refused(self) -> None:
+        """Exactly the operation's scopes: no more, no fewer.
+
+        The subject holds `derive`, so asking for `apply derive` passes the
+        subset test -- but issuing it would hand a mutation token unrelated
+        authority for its whole lifetime.
+        """
+        self.assert_refused("invalid_scope", form(scope="apply derive"))
 
     def test_a_scope_the_subject_lacks_is_refused_not_narrowed(self) -> None:
         """The single most important refusal in this file.
@@ -385,8 +434,15 @@ class ScopeRefusalTests(ExchangeTestCase):
     def test_duplicate_scope_values_are_refused(self) -> None:
         self.assert_refused("invalid_scope", form(scope="apply apply"))
 
-    def test_a_subject_missing_the_operations_own_scope_is_refused(self) -> None:
-        # A grant broad enough to ask is not necessarily broad enough to act.
+    def test_a_request_that_does_not_name_the_operations_scopes_is_refused(self) -> None:
+        """Renamed to say what actually fires.
+
+        This was called "a subject missing the operation's own scope", after a
+        branch that checked exactly that -- and which was unreachable, because
+        `requested` must equal the operation's scopes and had already been
+        tested against the subject. The branch is gone; the refusal here comes
+        from the equality check.
+        """
         self._seed_subject("mapp_a_reader", "derive")
         self.assert_refused(
             "invalid_scope", form(subject_token="mapp_a_reader", scope="derive")
@@ -438,6 +494,57 @@ class AllowlistDriftTests(unittest.TestCase):
             with self.subTest(operation=name):
                 self.assertEqual(action["method"], operation.method)
                 self.assertEqual(action["pathTemplate"], operation.path_template)
+
+    #: Risk classes that describe a pure read. Everything else writes, probes
+    #: or produces an artifact, and its token must not be replayable.
+    READ_RISKS = frozenset({"aggregate-data-read", "inspect", "read"})
+
+    def test_each_key_equals_its_entrys_operation_id(self) -> None:
+        """The key selects the operation; the field is what gets bound.
+
+        exchange.py stamps `operation.operation_id` into the token, while
+        lookup happens by dict key, so a one-token drift between them would
+        bind a token to a different operation than the one validated.
+        """
+        for key, operation in operations.OPERATIONS.items():
+            with self.subTest(key=key):
+                self.assertEqual(key, operation.operation_id)
+
+    def test_the_mutating_flag_is_derived_from_the_platforms_risk_class(self) -> None:
+        """The one field that decides whether a token B is single-use.
+
+        Nothing else constrains it: flipping `mutating` to False on three of
+        the five entries left the whole suite green, and a non-single-use
+        token is replayable for its full sixty seconds. Derived from `risk`
+        rather than from `method`, because semantic.proposals.check is a POST
+        whose risk is `inspect` -- method alone would mark reads as mutations
+        and, worse, invite the inverse mistake.
+        """
+        for name, operation in operations.OPERATIONS.items():
+            action = self.actions[name]
+            with self.subTest(operation=name, risk=action["risk"]):
+                self.assertEqual(
+                    action["risk"] not in self.READ_RISKS,
+                    operation.mutating,
+                )
+
+    def test_every_platform_risk_class_is_classified(self) -> None:
+        """A risk class nobody has classified must not default to "read".
+
+        A new action class arriving in the platform should fail here rather
+        than silently become non-mutating the first time someone allowlists it.
+        """
+        known = self.READ_RISKS | {
+            "apply", "database-definition", "database-plan", "database-refresh",
+            "external-semantic-egress", "federation-observe",
+            "federation-provision", "federation-register", "propose", "reload",
+            "semantic-apply", "semantic-archive", "semantic-repair",
+            "semantic-source", "visual",
+        }
+        seen = {spec.get("risk") for spec in self.actions.values()}
+        self.assertEqual(
+            set(), seen - known, "unclassified platform risk class"
+        )
 
     def test_required_scopes_cover_the_actions_declared_scope(self) -> None:
         """The action's `scope` authorises it, so it must be required.
@@ -527,7 +634,7 @@ class ExchangeOverHttpTests(unittest.TestCase):
                 subject="oauth:grant-1",
                 issued_at=int(now.timestamp()),
                 expires_in=900,
-                audience="mcp",
+                audience=MCP_RESOURCE,
             ),
         )
         self.authorization = MappAuthorizationServer(
@@ -536,7 +643,7 @@ class ExchangeOverHttpTests(unittest.TestCase):
             # The two resources are distinct on purpose: token A is for the
             # MCP endpoint and token B for the configuration API, and the
             # server refuses to start if they are equal.
-            resource="http://mcp.localhost/mcp",
+            resource=MCP_RESOURCE,
             config_api_resource=RESOURCE,
             scopes_supported=("apply",),
         )

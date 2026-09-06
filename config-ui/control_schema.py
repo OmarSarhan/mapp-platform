@@ -366,11 +366,12 @@ def _migration_2(connection: psycopg.Connection) -> None:
 def _migration_3(connection: psycopg.Connection) -> None:
     """Bind an exchanged token to the one operation it was issued for.
 
-    A token B is not a general-purpose credential: it authorises exactly one
-    allowlisted operation against one canonical request, and the configuration
-    API re-checks that binding on every call. Without these columns the token
-    would carry only a scope, and a scope is not an authorization -- an
-    `apply` token minted for one proposal would work against any other.
+    A token B is meant to authorise exactly one allowlisted operation against
+    one canonical request, with the configuration API re-checking that binding
+    on every call. These columns are the storage for it. The re-check itself is
+    M7 and does not exist yet, so today the binding is written and never read
+    outside the authorization component -- worth knowing before treating an
+    issued token B as narrower than its scope.
 
     Added as a third migration rather than by editing the second: a database
     that already applied migration 2 would keep reporting it as applied and

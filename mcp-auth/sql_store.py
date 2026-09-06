@@ -239,7 +239,11 @@ class SqlStore:
                     token.client_id,
                     token.subject,
                     token.scope,
-                    self._audience,
+                    # The caller's audience, not the store's default: silently
+                    # substituting one made a token minted for another resource
+                    # look like a token A, and the exchange's subject check is
+                    # exactly that comparison.
+                    token.audience or self._audience,
                     token.issued_at,
                     token.issued_at + token.expires_in,
                 ),
@@ -283,9 +287,14 @@ class SqlStore:
     ) -> None:
         """Persist a token B, bound to the one operation it authorises.
 
-        The binding is not advisory: the configuration API re-checks the
-        operation and the request digest on every call, so a token minted for
-        one proposal cannot be spent on another even within its sixty seconds.
+        NOT YET ENFORCED DOWNSTREAM. The design has the configuration API
+        re-check the operation and digest on every call, which is what would
+        stop a token minted for one proposal being spent on another inside its
+        sixty seconds. That half is M7 and no code outside this component
+        reads the binding today, so a token B is currently a plain scoped
+        bearer credential for the configuration API with a recorded, unchecked
+        binding. consume_exchanged_token exists for that caller and has none
+        yet.
         """
         with self._connect() as connection:
             connection.execute(
@@ -310,24 +319,50 @@ class SqlStore:
                 ),
             )
 
-    def consume_exchanged_token(self, raw_token: str, operation_id: str):
-        """Spend a single-use token B, or report that it is already spent.
+    def consume_exchanged_token(
+        self, raw_token: str, operation_id: str, request_digest: str
+    ):
+        """Spend a single-use token B, or report that it is not spendable.
+
+        The request digest is a predicate of the consuming statement, not
+        something returned for the caller to compare afterwards. Returning it
+        meant a presentation carrying the right operation but a different
+        request body burned the token before anyone noticed the mismatch --
+        the legitimate retry would then find it spent.
 
         One conditional statement, so two calls presenting the same token
-        cannot both proceed -- which is the entire value of single use.
+        cannot both proceed, which is the entire value of single use.
         """
         with self._connect() as connection:
             return connection.execute(
                 "UPDATE control.oauth_tokens SET consumed_at = now()"
                 " WHERE token_hash = %s"
                 "   AND operation_id = %s"
+                "   AND request_digest = %s"
                 "   AND single_use"
                 "   AND consumed_at IS NULL"
                 "   AND revoked_at IS NULL"
                 "   AND expires_at > now()"
                 " RETURNING scope, subject, request_digest",
-                (token_digest(raw_token), operation_id),
+                (token_digest(raw_token), operation_id, request_digest),
             ).fetchone()
+
+    def exchanged_binding(self, raw_token: str):
+        """Read a token B's binding without spending it.
+
+        A read operation's token is not single-use, so it can never go through
+        consume_exchanged_token -- without this there was no way to verify a
+        read token's binding at all through the SQL contract, and the stub had
+        a reader the real store lacked.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT operation_id, request_digest, single_use, audience,"
+                " actor_client_id, broker_client_id, consumed_at, expires_at"
+                " FROM control.oauth_tokens WHERE token_hash = %s",
+                (token_digest(raw_token),),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def token_count(self) -> int:
         with self._connect() as connection:

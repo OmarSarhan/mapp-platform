@@ -155,8 +155,16 @@ class StubStore:
                 "consumed": False,
             }
 
-    def consume_exchanged_token(self, raw_token: str, operation_id: str):
-        """Spend a single-use token B, atomically, or report it already spent."""
+    def consume_exchanged_token(
+        self, raw_token: str, operation_id: str, request_digest: str
+    ):
+        """Spend a single-use token B, atomically, or report it unspendable.
+
+        The digest is a predicate here too, so the two stores refuse the same
+        presentations. They also have to agree on what a *spent* token looks
+        like afterwards: this one used to mark only its side table, so the
+        same token reported is_revoked() False here and True from SQL.
+        """
         digest = token_digest(raw_token)
         with self._lock:
             binding = self._exchanged.get(digest)
@@ -167,11 +175,14 @@ class StubStore:
                 or binding["consumed"]
                 or not binding["single_use"]
                 or binding["operation_id"] != operation_id
+                or binding["request_digest"] != request_digest
                 or record.is_expired()
                 or record.is_revoked()
             ):
                 return None
             binding["consumed"] = True
+            # Mirrors the SQL store, which folds consumed_at into `revoked`.
+            record.revoked = True
             return {
                 "scope": record.scope,
                 "subject": record.subject,

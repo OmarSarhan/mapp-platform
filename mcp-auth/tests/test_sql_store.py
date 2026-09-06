@@ -330,6 +330,7 @@ class ExchangedTokenTests(unittest.TestCase):
         self.exchange = exchange
         self.defaultdict = defaultdict
         self.resource = "http://config.localhost/api"
+        self.mcp_resource = "http://mcp.localhost/mcp"
         self.store = SqlStore(DATABASE_URL)
         with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
             connection.execute(
@@ -349,7 +350,7 @@ class ExchangedTokenTests(unittest.TestCase):
             Token(
                 token_hash="", client_id="mcp-client", scope="apply",
                 subject="oauth:grant-1", issued_at=int(self.now.timestamp()),
-                expires_in=900, audience="mcp",
+                expires_in=900, audience=self.mcp_resource,
             ),
         )
 
@@ -383,6 +384,7 @@ class ExchangedTokenTests(unittest.TestCase):
             broker_client=self.broker,
             store=self.store,
             resource=self.resource,
+            mcp_resource=self.mcp_resource,
             now=self.now,
         )
 
@@ -394,7 +396,7 @@ class ExchangedTokenTests(unittest.TestCase):
             row = connection.execute(
                 "SELECT operation_id, single_use, audience, actor_client_id,"
                 " broker_client_id FROM control.oauth_tokens"
-                " WHERE audience <> 'mcp'"
+                " WHERE audience = %s", (self.resource,)
             ).fetchone()
         self.assertEqual("proposals.apply", row[0])
         self.assertTrue(row[1])
@@ -407,11 +409,12 @@ class ExchangedTokenTests(unittest.TestCase):
 
     def test_a_single_use_token_is_spent_exactly_once(self) -> None:
         token = self._exchange()["access_token"]
+        digest = self.canonical.digest({"proposalId": "p1"})
         self.assertIsNotNone(
-            self.store.consume_exchanged_token(token, "proposals.apply")
+            self.store.consume_exchanged_token(token, "proposals.apply", digest)
         )
         self.assertIsNone(
-            self.store.consume_exchanged_token(token, "proposals.apply")
+            self.store.consume_exchanged_token(token, "proposals.apply", digest)
         )
 
     def test_it_cannot_be_spent_against_another_operation(self) -> None:
@@ -419,7 +422,9 @@ class ExchangedTokenTests(unittest.TestCase):
         # work for another even inside its sixty seconds.
         token = self._exchange()["access_token"]
         self.assertIsNone(
-            self.store.consume_exchanged_token(token, "layers.values")
+            self.store.consume_exchanged_token(
+                token, "layers.values", self.canonical.digest({"proposalId": "p1"})
+            )
         )
 
     def test_a_token_b_cannot_be_exchanged_again(self) -> None:
@@ -429,13 +434,99 @@ class ExchangedTokenTests(unittest.TestCase):
             self._exchange(subject_token=token)
         self.assertEqual("invalid_grant", caught.exception.error)
 
+    def test_the_stored_expiry_agrees_with_the_advertised_lifetime(self) -> None:
+        """Asserted against the literal, not against the same constant.
+
+        Comparing expires_in to TOKEN_B_MAX_LIFETIME could not fail: it is the
+        value that produced it. This pins the number and checks the persisted
+        record agrees with what the client was told.
+        """
+        token = self._exchange()
+        self.assertEqual(60, token["expires_in"])
+        binding = self.store.exchanged_binding(token["access_token"])
+        issued_for = (binding["expires_at"] - self.now).total_seconds()
+        self.assertAlmostEqual(60, issued_for, delta=2)
+
+    def test_a_mismatched_digest_leaves_the_token_intact(self) -> None:
+        """A wrong request must not burn the credential.
+
+        With the digest merely returned rather than tested, a presentation
+        carrying the right operation and the wrong body spent the token, and
+        the legitimate retry then found it consumed.
+        """
+        token = self._exchange()["access_token"]
+        right = self.canonical.digest({"proposalId": "p1"})
+        wrong = self.canonical.digest({"proposalId": "p2"})
+        self.assertIsNone(
+            self.store.consume_exchanged_token(token, "proposals.apply", wrong)
+        )
+        self.assertIsNotNone(
+            self.store.consume_exchanged_token(token, "proposals.apply", right)
+        )
+
+    def test_an_expired_token_b_is_not_consumable(self) -> None:
+        token = self._exchange()["access_token"]
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            connection.execute(
+                "UPDATE control.oauth_tokens SET expires_at = now() - interval '1 second'"
+                " WHERE audience = %s", (self.resource,)
+            )
+        self.assertIsNone(
+            self.store.consume_exchanged_token(
+                token, "proposals.apply", self.canonical.digest({"proposalId": "p1"})
+            )
+        )
+
+    def test_a_revoked_token_b_is_not_consumable(self) -> None:
+        token = self._exchange()["access_token"]
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            connection.execute(
+                "UPDATE control.oauth_tokens SET revoked_at = now()"
+                " WHERE audience = %s", (self.resource,)
+            )
+        self.assertIsNone(
+            self.store.consume_exchanged_token(
+                token, "proposals.apply", self.canonical.digest({"proposalId": "p1"})
+            )
+        )
+
+    def test_a_non_single_use_token_is_not_consumable(self) -> None:
+        """A read token has no consume path, so its binding is read instead."""
+        self.store.save_token(
+            "mapp_a_reader",
+            Token(
+                token_hash="", client_id="mcp-client", scope="derive semantic:inspect",
+                subject="oauth:grant-3", issued_at=int(self.now.timestamp()),
+                expires_in=900, audience=self.mcp_resource,
+            ),
+        )
+        token = self._exchange(
+            subject_token="mapp_a_reader",
+            scope="derive semantic:inspect",
+            **{self.exchange.CONTEXT_PARAMETER: __import__("json").dumps({
+                "version": self.canonical.SCHEME,
+                "operationId": "layers.values",
+                "method": "GET",
+                "pathTemplate": "/api/layers/{layerKey}/values",
+                "requestDigest": self.canonical.digest({"layerKey": "l1"}),
+            })},
+        )["access_token"]
+        self.assertIsNone(
+            self.store.consume_exchanged_token(
+                token, "layers.values", self.canonical.digest({"layerKey": "l1"})
+            )
+        )
+        binding = self.store.exchanged_binding(token)
+        self.assertFalse(binding["single_use"])
+        self.assertEqual("layers.values", binding["operation_id"])
+
     def test_a_refused_scope_persists_no_token(self) -> None:
         self.store.save_token(
             "mapp_a_narrow",
             Token(
                 token_hash="", client_id="mcp-client", scope="derive",
                 subject="oauth:grant-2", issued_at=int(self.now.timestamp()),
-                expires_in=900, audience="mcp",
+                expires_in=900, audience=self.mcp_resource,
             ),
         )
         before = self.store.token_count()
