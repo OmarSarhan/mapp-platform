@@ -31,6 +31,8 @@ from authlib.oauth2.rfc7636 import create_s256_code_challenge  # noqa: E402
 
 import canonical  # noqa: E402
 import exchange  # noqa: E402
+import operations  # noqa: E402
+import server as server_module  # noqa: E402
 from issuer import MappAuthorizationServer  # noqa: E402
 from models import Client  # noqa: E402
 from passwords import password_hash  # noqa: E402
@@ -51,6 +53,10 @@ class FullFlowTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         os.environ["AUTHLIB_INSECURE_TRANSPORT"] = "1"
 
+    def static_admin_hash(self) -> str:
+        """Overridden below to prove the store-backed path also works."""
+        return password_hash(PASSWORD)
+
     def setUp(self) -> None:
         self.store = StubStore()
         self.store.add_client(
@@ -58,7 +64,7 @@ class FullFlowTests(unittest.TestCase):
                 client_id="mcp-client",
                 name="Claude Code",
                 redirect_uris=(REDIRECT_URI,),
-                scopes=("mcp:connect", "apply"),
+                scopes=server_module.SUPPORTED_SCOPES,
                 token_endpoint_auth_method="none",
             )
         )
@@ -77,8 +83,11 @@ class FullFlowTests(unittest.TestCase):
             issuer=ISSUER,
             resource=MCP_RESOURCE,
             config_api_resource=CONFIG_RESOURCE,
-            scopes_supported=("mcp:connect", "apply"),
-            admin_password_hash=password_hash(PASSWORD),
+            # The deployed vocabulary, not a convenient subset. Building its
+            # own was how this file missed that four of the five allowlisted
+            # operations named scopes the server would not issue.
+            scopes_supported=server_module.SUPPORTED_SCOPES,
+            admin_password_hash=self.static_admin_hash(),
             secure_cookies=False,
         )
         self.edge = EdgeServer(("127.0.0.1", 0), self.authorization)
@@ -190,13 +199,16 @@ class FullFlowTests(unittest.TestCase):
         self.assertEqual(200, status, body)
         return json.loads(body)["access_token"]
 
-    def exchange_for_token_b(self, token_a: str, *, scope: str = "apply"):
+    def exchange_for_token_b(
+        self, token_a: str, *, scope: str = "apply", operation_id: str = "proposals.apply"
+    ):
+        operation = operations.OPERATIONS[operation_id]
         context = json.dumps(
             {
                 "version": canonical.SCHEME,
-                "operationId": "proposals.apply",
-                "method": "POST",
-                "pathTemplate": "/api/proposals/{proposalId}/apply",
+                "operationId": operation.operation_id,
+                "method": operation.method,
+                "pathTemplate": operation.path_template,
                 "requestDigest": canonical.digest({"proposalId": "p1"}),
             }
         )
@@ -304,3 +316,67 @@ class FullFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EveryAllowlistedOperationTests(FullFlowTests):
+    """Each allowlisted operation, walked from consent to token B.
+
+    The defect that motivated this: `proposals.apply` was the only operation
+    this file ever exercised, and it was the only one that worked. The other
+    four required scopes the authorization server refused to issue, so the
+    browser flow died at `/oauth/authorize` with `invalid_scope` long before
+    the exchange -- in the deployed configuration, not in a fixture.
+    """
+
+    def test_every_operation_can_be_consented_to_and_exchanged(self) -> None:
+        for name, operation in operations.OPERATIONS.items():
+            with self.subTest(operation=name):
+                scope = " ".join(operation.required_scopes)
+                token_a = self.obtain_token_a(scope=scope)
+                status, _, body = self.exchange_for_token_b(
+                    token_a, scope=scope, operation_id=name
+                )
+                self.assertEqual(200, status, f"{name}: {body}")
+                self.assertTrue(
+                    json.loads(body)["access_token"].startswith(
+                        exchange.TOKEN_B_PREFIX
+                    )
+                )
+
+
+class StoreSuppliedCredentialTests(FullFlowTests):
+    """The whole flow again, with the credential coming from the store.
+
+    This is how the component is actually deployed. The consent screen used to
+    check MCP_AUTH_ADMIN_PASSWORD_HASH, which nothing in the repository set and
+    which .env.example did not carry, while ./bin/mapp init wrote the operator
+    credential into control.admin_credential -- a table this component never
+    read. Every test passed because every test injected a hash directly.
+
+    Inheriting the whole flow is the point: if the store-backed credential does
+    not work, sign-in fails and every inherited test fails with it.
+    """
+
+    def static_admin_hash(self) -> str:
+        self.store.set_admin_password_hash(password_hash(PASSWORD))
+        return ""
+
+    def test_the_hash_comes_from_the_store_and_not_the_constructor(self) -> None:
+        self.assertEqual("", self.authorization._admin_password_hash)
+        self.assertTrue(self.authorization.admin_password_hash)
+
+    def test_a_credential_changed_in_the_store_takes_effect_at_once(self) -> None:
+        """Read per attempt, not captured at start-up."""
+        self.store.set_admin_password_hash(password_hash("a different secret"))
+        url = self.authorize_url()
+        status, headers, _ = self._request(self.edge, "GET", url)
+        rid = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(headers["Location"]).query
+        )["rid"][0]
+        _, _, page = self._request(self.edge, "GET", headers["Location"])
+        status, _, _ = self._request(
+            self.edge, "POST", "/oauth/login",
+            body={"rid": rid, "csrf": self._hidden(page, "csrf"),
+                  "password": PASSWORD},
+        )
+        self.assertEqual(401, status)

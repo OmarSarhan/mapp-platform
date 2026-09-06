@@ -1,10 +1,12 @@
 """Password verification, byte-compatible with the configuration service.
 
 The format is deliberately identical to ``config-ui/control_plane.py``'s
-``password_hash``/``verify_password`` so that P4's migration of the administrator
-credential into the ``control`` schema is a copy rather than a re-hash. Do not
-change the algorithm, the round count or the encoding here without changing it
-there in the same commit.
+``password_hash``/``verify_password`` because both verify the *same stored
+credential*: ``config_admin.py`` writes ``control.admin_credential`` during
+``./bin/mapp init`` and ``SqlStore.admin_password_hash`` reads that row back
+here. There is one operator credential, not two, and no re-hash anywhere. Do
+not change the algorithm, the round count or the encoding here without
+changing it there in the same commit.
 """
 
 from __future__ import annotations

@@ -577,7 +577,7 @@ compose=(
   --file "${ROOT_DIR}/compose.yaml"
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-runtime_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+runtime_services=(db semantic-service mcp-auth xyz xyz-preview config-ui browser-runner egress-proxy caddy)
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
 # an alias using them could be registered, or recreating config-ui silently
 # strips the reference and the periodic verifier withdraws that source. One
@@ -888,7 +888,7 @@ case "${1:-}" in
     "${ROOT_DIR}/scripts/federation-e2e.sh"
     ;;
   test)
-    run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service
+    run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service mcp-auth
     run_with_buildkit_lease_retry docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
     # The configuration suite now needs a database for the same reason the
     # semantic one does: the administrator credential, API tokens and device
@@ -925,6 +925,30 @@ case "${1:-}" in
       exit 1
     fi
     rm -f "${config_ui_log}"
+    # The authorization component, on the same scratch database. Its store
+    # contract runs against the in-memory double and against PostgreSQL, and
+    # the SQL half is the half that matters: the grant is enforced in the
+    # statements, so a run without a database reports the double's behaviour
+    # as the system's. This suite ran in no target at all until now.
+    mcp_auth_log="$(mktemp)"
+    if ! "${compose[@]}" run --rm --no-deps \
+      --volume "${ROOT_DIR}:/workspace:ro" \
+      --env PYTHONPATH=/app \
+      --env PYTHONDONTWRITEBYTECODE=1 \
+      --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
+      --entrypoint python \
+      mcp-auth \
+      -m unittest discover -s /workspace/mcp-auth/tests -v 2>&1 \
+      | tee "${mcp_auth_log}"; then
+      rm -f "${mcp_auth_log}"
+      exit 1
+    fi
+    if grep -q "skipped=" "${mcp_auth_log}"; then
+      rm -f "${mcp_auth_log}"
+      printf 'Authorization tests skipped; the store contract must run against PostgreSQL.\n' >&2
+      exit 1
+    fi
+    rm -f "${mcp_auth_log}"
     # The semantic-service suite exercises real SQL against a real server: a
     # mocked cursor cannot fail the way PostgreSQL fails when it parses a
     # statement, which is the whole reason those tests exist. Without

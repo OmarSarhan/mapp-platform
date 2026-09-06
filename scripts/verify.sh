@@ -67,7 +67,7 @@ compose=(
   --file "${ROOT_DIR}/compose.yaml"
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+required_services=(db semantic-service mcp-auth xyz xyz-preview config-ui browser-runner egress-proxy caddy)
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
 # an alias using them could be registered, or recreating config-ui silently
 # strips the reference and the periodic verifier withdraws that source. One
@@ -2857,6 +2857,7 @@ published_http="${published_http/#\[::\]:/[::1]:}"
 if [[ "${production}" == true ]]; then
   map_url="$("${compose[@]}" exec -T caddy sh -c 'printf %s "$MAP_SITE"')"
   config_url="$("${compose[@]}" exec -T caddy sh -c 'printf %s "$CONFIG_SITE"')"
+  mcp_url="$("${compose[@]}" exec -T caddy sh -c 'printf %s "$MCP_SITE"')"
   published_https="$("${compose[@]}" port caddy 443 | tail -n 1)"
   published_https="${published_https/#0.0.0.0:/127.0.0.1:}"
   published_https="${published_https/#\[::\]:/[::1]:}"
@@ -2864,21 +2865,28 @@ if [[ "${production}" == true ]]; then
   https_address="${published_https%:*}"
   map_headers=()
   config_headers=()
+  mcp_headers=()
 else
   map_url="http://${published_http}"
   config_url="${map_url}"
+  mcp_url="${map_url}"
   map_headers=(--header 'Host: localhost')
   config_headers=(--header 'Host: config.localhost')
+  mcp_headers=(--header 'Host: mcp.localhost')
 fi
 map_url="${map_url%/}"
 config_url="${config_url%/}"
+mcp_url="${mcp_url%/}"
 if [[ "${production}" == true ]]; then
   map_host="${map_url#https://}"
   config_host="${config_url#https://}"
   map_host="${map_host%:443}"
   config_host="${config_host%:443}"
+  mcp_host="${mcp_url#https://}"
+  mcp_host="${mcp_host%:443}"
   map_headers=(--resolve "${map_host}:${https_port}:${https_address}")
   config_headers=(--resolve "${config_host}:${https_port}:${https_address}")
+  mcp_headers=(--resolve "${mcp_host}:${https_port}:${https_address}")
   check_https_redirect() {
     local hostname="$1"
     local expected_url="$2"
@@ -2946,6 +2954,27 @@ probe_endpoint "The configuration service health check" config_headers \
   "${config_url}/healthz"
 probe_endpoint "The configuration service public identity" config_headers \
   "${config_url}/api/public/identity"
+# The MCP origin. Caddy proxies it over a Unix socket to a service that
+# `verify` did not start and did not check, so this origin returned 502 while
+# the run reported success. The metadata document is the right probe: it is
+# unauthenticated, it is served by the component rather than by Caddy, and it
+# fails if the socket is missing, if the component cannot reach the control
+# schema, or if the issuer is misconfigured.
+probe_endpoint "The MCP authorization server metadata" mcp_headers \
+  "${mcp_url}/.well-known/oauth-authorization-server"
+# And the control endpoints must not be reachable from the edge. The component
+# owns that as a property of its route tables; the Caddy allowlist is the
+# second, independent control. Both are asserted here because this is the only
+# check that exercises them together, as deployed.
+for internal_path in /internal/oauth/exchange /internal/oauth/introspect /internal/oauth/revoke; do
+  internal_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "${mcp_headers[@]}" --request POST "${mcp_url}${internal_path}")"
+  if [[ "${internal_status}" != "404" ]]; then
+    printf 'The MCP edge exposed %s with HTTP %s; it must be 404.\n' \
+      "${internal_path}" "${internal_status}" >&2
+    exit 1
+  fi
+done
 traversal_status="$(
   curl --path-as-is --silent "${config_headers[@]}" \
     --output /dev/null --write-out '%{http_code}' \

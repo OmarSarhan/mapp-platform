@@ -106,7 +106,6 @@ services:
       MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
       MCP_AUTH_CONTROL_PORT: 8080
       MCP_AUTH_SOCKET: /run/mapp-auth/mapp-auth.sock
-      MCP_AUTH_ADMIN_PASSWORD_HASH: ${MCP_AUTH_ADMIN_PASSWORD_HASH:-}
       MCP_AUTH_SECURE_COOKIES: ${MCP_AUTH_SECURE_COOKIES:-}
       # authlib refuses http:// for anything but literal localhost or a
       # loopback IP, and the development origin is http://mcp.localhost, so
@@ -142,7 +141,10 @@ services:
       # public surface is reached solely through the Unix socket.
       - mcp-control
       - backend
-      - edge
+    # Every credential this component reads or writes lives in the control
+    # schema, so starting before the database is starting unhealthy. The
+    # bundled-db overlay is what supplies `db`; in the external-PostgreSQL
+    # model there is no such service and the health check is the only gate.
 
   config-ui:
     image: mapp-config-ui:local
@@ -230,6 +232,7 @@ services:
     environment:
       MAP_SITE: ${MAP_SITE:-http://localhost}
       CONFIG_SITE: ${CONFIG_SITE:-http://config.localhost}
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.invalid}
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro

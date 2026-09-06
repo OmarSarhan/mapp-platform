@@ -57,7 +57,10 @@
 		-Server
 	}
 	request_body {
-		max_size {$MCP_MAX_REQUEST_BODY:512KiB}
+		# Literal, not a placeholder: no compose file supplied
+		# MCP_MAX_REQUEST_BODY and no document mentioned it, so the
+		# indirection could only ever resolve to this default.
+		max_size 512KiB
 	}
 	@auth_public path /.well-known/oauth-authorization-server /oauth/authorize /oauth/token /oauth/login
 	handle @auth_public {

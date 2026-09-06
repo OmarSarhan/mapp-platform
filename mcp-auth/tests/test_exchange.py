@@ -440,6 +440,28 @@ class DigestFormatTests(ExchangeTestCase):
 class ScopeRefusalTests(ExchangeTestCase):
     """Refuse when requested is not a subset. Never intersect."""
 
+    def _subject_under_a_grant_of(self, *scopes: str) -> None:
+        """Seed a subject token whose grant consented to exactly these.
+
+        Both of these tests used to narrow the grant by assigning through
+        `store.query_grant(...).scopes`, which reached into the double's
+        internals. SqlStore returns a snapshot and cannot be written that way,
+        so the assertion held only against the stand-in -- precisely the class
+        of divergence tests/store_contract.py now forbids. Seeding a second
+        grant uses nothing but the store's real interface.
+        """
+        self.store.save_grant(
+            Grant(
+                grant_id="oauth:narrow",
+                client_id="mcp-client",
+                subject="operator",
+                scopes=scopes,
+            )
+        )
+        self._seed_subject(
+            "mapp_a_narrow", "apply derive semantic:inspect", subject="oauth:narrow"
+        )
+
     def test_a_scope_the_grant_never_consented_to_is_refused(self) -> None:
         """The consent screen is binding, not decorative.
 
@@ -448,12 +470,12 @@ class ScopeRefusalTests(ExchangeTestCase):
         token B. The grant is the stronger statement: it is what the operator
         actually approved.
         """
-        self.store.query_grant("oauth:grant-1").scopes = ()
-        self.assert_refused("invalid_scope", form())
+        self._subject_under_a_grant_of()
+        self.assert_refused("invalid_scope", form(subject_token="mapp_a_narrow"))
 
     def test_a_narrower_grant_narrows_the_token(self) -> None:
-        self.store.query_grant("oauth:grant-1").scopes = ("inspect",)
-        self.assert_refused("invalid_scope", form())
+        self._subject_under_a_grant_of("inspect")
+        self.assert_refused("invalid_scope", form(subject_token="mapp_a_narrow"))
 
     def test_a_permitted_but_unrequired_scope_is_refused(self) -> None:
         """Exactly the operation's scopes: no more, no fewer.
@@ -540,6 +562,24 @@ class AllowlistDriftTests(unittest.TestCase):
         import control_api
 
         cls.actions = control_api.ACTION_SCHEMAS
+
+    def test_every_allowlisted_scope_can_actually_be_issued(self) -> None:
+        """The allowlist and the issuer must share one vocabulary.
+
+        They did not. server.py restated a list that omitted `derive`,
+        `semantic:inspect`, `federation:provision` and `semantic:apply`, so
+        authlib refused the authorization request before the exchange was
+        ever reached and four of these five operations were unreachable in
+        the deployed configuration. This file compared operations.py against
+        the *platform* and never against what the server can issue, which is
+        the gap that let it stand.
+        """
+        import server
+
+        supported = set(server.SUPPORTED_SCOPES)
+        for name, operation in operations.OPERATIONS.items():
+            with self.subTest(operation=name):
+                self.assertLessEqual(set(operation.required_scopes), supported)
 
     def test_every_allowlisted_operation_exists_in_the_platform(self) -> None:
         for name in operations.OPERATIONS:

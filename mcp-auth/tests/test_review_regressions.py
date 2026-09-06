@@ -607,6 +607,46 @@ class AdvertisedScopeTests(Base):
         self.assertNotIn("apply", authorization.metadata_document()["scopes_supported"])
 
 
+class SecureCookieSettingTests(Base):
+    """MCP_AUTH_SECURE_COOKIES is a word, not a truthiness test.
+
+    The platform's identically-named sibling setting is compared against the
+    literal "true", and .env teaches operators to write `false`. Under
+    bool(os.environ.get(...)) that string is True, so the operators who
+    explicitly turned Secure cookies off were the ones who got them on -- over
+    plain HTTP, where the browser then never returns the cookie and sign-in
+    fails with nothing in the logs to explain it.
+    """
+
+    def build(self, value):
+        import os
+
+        import server as server_module
+
+        previous = os.environ.get("MCP_AUTH_SECURE_COOKIES")
+        if value is None:
+            os.environ.pop("MCP_AUTH_SECURE_COOKIES", None)
+        else:
+            os.environ["MCP_AUTH_SECURE_COOKIES"] = value
+        try:
+            return server_module.build_authorization(StubStore()).secure_cookies
+        finally:
+            if previous is None:
+                os.environ.pop("MCP_AUTH_SECURE_COOKIES", None)
+            else:
+                os.environ["MCP_AUTH_SECURE_COOKIES"] = previous
+
+    def test_only_the_word_true_enables_secure_cookies(self) -> None:
+        for value in ("true", "TRUE", " True "):
+            with self.subTest(value=value):
+                self.assertTrue(self.build(value))
+
+    def test_everything_else_leaves_them_off(self) -> None:
+        for value in (None, "", "false", "False", "0", "no", "off"):
+            with self.subTest(value=value):
+                self.assertFalse(self.build(value))
+
+
 class LoginTokenTests(Base):
     """The login form token is checked, not merely present."""
 

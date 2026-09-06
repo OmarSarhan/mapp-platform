@@ -89,8 +89,14 @@ ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"semantic_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"semantic_reader_db_user" CONNECTION LIMIT 4;
--- config-ui holds a small pool and the authorization component another; eight
--- leaves room for both plus an operator session.
+-- Two consumers share this role: config-ui and the authorization component.
+-- Neither pools -- both open a connection per operation and close it -- so
+-- eight is a ceiling on concurrent control-plane operations, not headroom
+-- above two pools. That is a known Phase 0 limitation: mcp-auth serves on an
+-- unbounded-thread HTTP server, so a burst of authorization requests can
+-- exhaust the budget and the ninth fails to connect. Raising this without
+-- pooling only moves the number; pooling is the actual fix and belongs with
+-- the component, not here.
 ALTER ROLE :"control_db_user" CONNECTION LIMIT 8;
 
 ALTER ROLE :"derived_db_user" SET search_path = pg_catalog, public;

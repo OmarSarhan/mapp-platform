@@ -4,6 +4,14 @@ M1 exposes the token endpoint alone, on a TCP listener, so the adapter can be
 driven over a real socket. M3 adds the Unix-domain edge listener, the separate
 internal listener, and the disjoint route tables that make an internal path a
 404 on the edge socket independently of the Caddy allowlist.
+
+**Phase 0 limitation: nothing registers a client.** ``SqlStore.add_client``
+has no production caller -- no operator command, no dynamic registration
+endpoint (RFC 7591 is Phase 1) -- so a correctly deployed component starts
+with an empty client table and refuses every authorization request as an
+unknown client. The tests register their own, which is why the suite proves
+the flow works and not that anyone can reach it. Registration is a Phase 1
+deliverable and this component is not usable end to end until it exists.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from authlib.oauth2.rfc6749.errors import OAuth2Error
 
 import exchange
 import introspection
+import operations
 import pages
 from authlib_adapter import FormError
 from authlib_adapter import MappResponse
@@ -527,6 +536,26 @@ def login_post(handler) -> None:
 
 
 def healthz(handler) -> None:
+    """Healthy means the store answers, not merely that the process is up.
+
+    This returned 200 unconditionally, so the container was healthy -- and
+    `compose up --wait` was satisfied -- while every OAuth request failed on a
+    database the component could not reach. The probe is a bare SELECT: enough
+    to distinguish "reachable" from "not", and it reports no detail, because
+    /healthz is answered before any caller is authenticated.
+    """
+    store = getattr(handler.server.authorization, "store", None)
+    ping = getattr(store, "ping", None)
+    if ping is not None:
+        try:
+            ping()
+        except Exception:  # noqa: BLE001 - any failure to reach the store is unhealthy
+            MappResponse(
+                503,
+                json.dumps({"status": "unavailable", "version": VERSION}),
+                JSON_HEADERS,
+            ).write_to(handler)
+            return
     MappResponse(200, json.dumps({"status": "ok", "version": VERSION}), JSON_HEADERS).write_to(handler)
 
 
@@ -601,9 +630,15 @@ def exchange_endpoint(handler) -> None:
 def _control_endpoint(handler, action):
     """Shared shape for the authenticated control endpoints.
 
-    Client authentication happens before the body is interpreted, so an
-    unauthenticated caller never learns whether a token exists -- which is the
-    oracle RFC 7662 warns an open introspection endpoint becomes.
+    The body is read before the caller is authenticated, so the connection
+    stays framed and a rejected request cannot leave an unread body to be
+    parsed as the next one. Nothing about the *token* is looked up until
+    authentication has succeeded, which is the property that matters: an
+    unauthenticated caller never learns whether a token exists, and that is
+    the oracle RFC 7662 warns an open introspection endpoint becomes.
+
+    A malformed body is therefore a 400 rather than a 401. That distinction
+    describes the request, not the token, so it reveals nothing.
     """
     server = handler.server.authorization
     _, datalist = parse_form(handler, max_bytes=16 * 1024)
@@ -707,6 +742,19 @@ def build_store():
     return SqlStore(dsn)
 
 
+#: The MCP-side vocabulary: what a token A can carry for the MCP resource
+#: itself, independent of anything the broker can exchange it for.
+MCP_SCOPES = frozenset({"mcp:connect", "inspect", "propose", "visual"})
+
+#: What the server accepts on an explicit request. Derived rather than
+#: restated, because the restated version drifted: it listed neither `derive`,
+#: `semantic:inspect`, `federation:provision` nor `semantic:apply`, so four of
+#: the five allowlisted operations named scopes authlib refused to issue and
+#: could never be exchanged for. Every test passed because each built its own
+#: vocabulary. Deriving it means the allowlist and the issuer cannot disagree.
+SUPPORTED_SCOPES = tuple(sorted(MCP_SCOPES | operations.all_required_scopes()))
+
+
 def build_authorization(store=None):
     from issuer import MappAuthorizationServer
 
@@ -719,14 +767,25 @@ def build_authorization(store=None):
             "MCP_CONFIG_API_RESOURCE", os.environ.get("CONFIG_SITE", "http://config.localhost") + "/api"
         ),
         # What the server will *accept* on an explicit request.
-        scopes_supported=("mcp:connect", "inspect", "propose", "visual", "apply"),
+        scopes_supported=SUPPORTED_SCOPES,
         # What discovery *advertises*. P2: metadata carries only the safe
         # discovery scopes, so a greedy client cannot auto-request every
         # permission up front; a privileged scope needs a deliberate step-up
         # request, which the acceptance list above still admits.
         advertised_scopes=("mcp:connect", "inspect"),
-        admin_password_hash=os.environ.get("MCP_AUTH_ADMIN_PASSWORD_HASH", ""),
-        secure_cookies=bool(os.environ.get("MCP_AUTH_SECURE_COOKIES")),
+        # No admin_password_hash: the issuer reads control.admin_credential
+        # through the store. It used to come from MCP_AUTH_ADMIN_PASSWORD_HASH,
+        # which nothing in the repository ever set and which .env.example did
+        # not carry -- so ./bin/mapp doctor could not report it missing either,
+        # and a correctly deployed component could authenticate nobody.
+        #
+        # Compared against the literal "true", not truthiness. The platform
+        # teaches operators to write `false`, and bool("false") is True, so the
+        # truthiness form turned Secure cookies ON for exactly the operators
+        # who had written them off -- over plain HTTP, where the cookie is then
+        # never sent and sign-in silently fails.
+        secure_cookies=os.environ.get("MCP_AUTH_SECURE_COOKIES", "").strip().lower()
+        == "true",
     )
 
 

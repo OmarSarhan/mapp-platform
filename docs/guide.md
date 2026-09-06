@@ -460,6 +460,7 @@ Read: [`security.md`](security.md)
 | [`security.md`](security.md) | Roles, isolation, secrets, the trust boundary |
 | [`backup-restore.md`](backup-restore.md) | What to back up and how to restore it |
 | [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation, XYZ framework policy |
+| [`mcp-authorization.md`](mcp-authorization.md) | The Phase 0 MCP authorization component: its origin, endpoints, state and limits |
 | [`api-contract.md`](api-contract.md) | Every route, its scope and its shape |
 
 ---

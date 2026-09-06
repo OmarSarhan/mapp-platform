@@ -1,15 +1,20 @@
-"""In-memory store for M1 only.
+"""In-memory store: a test double, and nothing else.
 
-M1 exists to prove the authlib adapter against real HTTP, so the store is the
-one thing deliberately faked. M4 replaces this with the Postgres ``control``
-schema behind the same four methods; nothing above this line should need to
-change when it does.
+SqlStore over the ``control`` schema is the real one. This exists so the suite
+can drive the whole component without a database, and it lives under tests/
+because it keeps credentials in process memory -- it was previously shipped
+inside the runtime image, which is not a thing a credential store should be.
 
-The interface is narrow on purpose — if it grows here, that is a signal the
-adapter is leaking storage concerns.
+It must not be more permissive than the store it stands in for. A double that
+allows what the real one forbids turns every test written against it into a
+report of safety the deployed system does not have; that happened, and
+tests/store_contract.py now asserts the shared rules against both.
 """
 
 from __future__ import annotations
+
+import dataclasses as _dataclasses
+import datetime as _dt
 
 import hashlib
 import secrets
@@ -43,6 +48,7 @@ class StubStore:
         #: Operation binding for exchanged tokens, keyed the same way.
         self._exchanged: dict[str, dict] = {}
         self._grants: dict[str, Grant] = {}
+        self._admin_password_hash = ""
         self._pending: dict[str, PendingAuthorization] = {}
         self._sessions: dict[str, Session] = {}
 
@@ -63,16 +69,37 @@ class StubStore:
             client = self._clients.get(client_id)
         return None if client is None or client.disabled else client
 
+    def ping(self) -> None:
+        """Always reachable: it is this process."""
+
+    # -- the operator credential -----------------------------------------
+
+    def admin_password_hash(self) -> str:
+        return self._admin_password_hash
+
+    def set_admin_password_hash(self, encoded: str) -> None:
+        self._admin_password_hash = encoded
+
     # -- grants ----------------------------------------------------------
 
     def save_grant(self, grant: Grant) -> Grant:
         with self._lock:
+            if grant.grant_id in self._grants:
+                # grant_id is the primary key in SQL, so a re-save raises
+                # there. Silently overwriting here let the double express a
+                # state the real store forbids -- and specifically let a
+                # revoked grant come back live.
+                raise ValueError(f"Grant {grant.grant_id!r} already exists.")
             self._grants[grant.grant_id] = grant
         return grant
 
     def query_grant(self, grant_id: str) -> Grant | None:
         with self._lock:
-            return self._grants.get(grant_id)
+            grant = self._grants.get(grant_id)
+            # A snapshot, as SqlStore returns. Handing back the live record let
+            # a caller's Grant change underneath it -- and let a caller mutate
+            # the store -- neither of which the real store can do.
+            return _dataclasses.replace(grant) if grant is not None else None
 
     def revoke_grant(self, grant_id: str, reason: str = "") -> bool:
         """Revoke a grant, reporting whether this call was the one that did it.
@@ -181,9 +208,15 @@ class StubStore:
                 "operation_id": operation_id,
                 "request_digest": request_digest,
                 "single_use": single_use,
+                "audience": audience,
                 "actor_client_id": actor_client_id,
                 "broker_client_id": client_id,
-                "consumed": False,
+                # consumed_at rather than a `consumed` flag, and expires_at:
+                # the SQL store returns both and this returned neither, so the
+                # two doubles could not be compared and each suite asserted
+                # only the keys its own store happened to produce.
+                "consumed_at": None,
+                "expires_at": expires_at,
             }
 
     def consume_exchanged_token(
@@ -200,10 +233,16 @@ class StubStore:
         with self._lock:
             binding = self._exchanged.get(digest)
             record = self._tokens.get(digest)
+            grant = self._grants.get(record.subject) if record else None
             if (
                 binding is None
                 or record is None
-                or binding["consumed"]
+                # Mirrors the EXISTS predicate on the SQL statement: a token
+                # whose grant is gone or revoked is not spendable, whatever
+                # its own row says.
+                or grant is None
+                or grant.is_revoked()
+                or binding["consumed_at"] is not None
                 or not binding["single_use"]
                 or binding["operation_id"] != operation_id
                 or binding["request_digest"] != request_digest
@@ -211,7 +250,7 @@ class StubStore:
                 or record.is_revoked()
             ):
                 return None
-            binding["consumed"] = True
+            binding["consumed_at"] = _dt.datetime.now(_dt.timezone.utc)
             # Mirrors the SQL store, which folds consumed_at into `revoked`.
             record.revoked = True
             return {
@@ -221,9 +260,22 @@ class StubStore:
             }
 
     def exchanged_binding(self, raw_token: str):
-        """Read the binding without spending it, for assertions."""
+        """Read the binding without spending it, or refuse.
+
+        Refuses on a dead grant for the same reason the SQL store's inner join
+        does: for a read operation there is no consume path, so this is the
+        only place the grant can be enforced.
+        """
+        digest = token_digest(raw_token)
         with self._lock:
-            return self._exchanged.get(token_digest(raw_token))
+            binding = self._exchanged.get(digest)
+            record = self._tokens.get(digest)
+            if binding is None or record is None:
+                return None
+            grant = self._grants.get(record.subject)
+            if grant is None or grant.is_revoked():
+                return None
+            return dict(binding)
 
     def token_count(self) -> int:
         with self._lock:

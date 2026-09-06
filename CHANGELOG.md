@@ -22,6 +22,23 @@ first release.
 
 ### Added
 
+- Added `mcp-auth`, an OAuth 2.1 authorization component for the forthcoming
+  MCP server, on a third public origin (`MCP_SITE`, and `PRODUCTION_MCP_SITE`
+  in production, which is now mandatory and validated alongside the other two
+  origins). Caddy publishes exactly four paths on that origin and proxies them
+  over a Unix socket; the exchange, introspection and revocation endpoints sit
+  on a separate internal listener and are not edge-routed. This is a Phase 0
+  feasibility spike: **nothing registers an OAuth client yet**, so a correctly
+  deployed component refuses every authorization request. See
+  [`docs/mcp-authorization.md`](docs/mcp-authorization.md).
+- Consent now creates a grant, and revoking a grant invalidates every
+  credential derived from it immediately -- including an exchanged token
+  already issued and not yet spent, which previously stayed spendable for its
+  full lifetime.
+- `./bin/mapp` now starts the authorization component, `./bin/mapp verify`
+  probes its origin and confirms the internal endpoints are not edge-reachable,
+  and `./bin/mapp test` runs its suite.
+
 - Added an optional request-time `progress` snapshot to nonterminal
   derived operations. `GET /api/operations/<id>` reports a version-1
   object naming the safe database subphase, a closed activity condition,
@@ -344,6 +361,15 @@ first release.
   recognize them.
 
 ### Changed
+
+- Moved authentication, token and session state out of files under `var/` and
+  into the packaged database's `control` schema. The audit log deliberately
+  remains at `var/control/audit.jsonl`. The administrator credential is now a
+  single row shared by the configuration service and the authorization
+  component's consent screen, read at each sign-in rather than captured at
+  start-up, so a password change needs no restart.
+- The authorization component's health check now reports unhealthy when the
+  control schema is unreachable, instead of answering from the process alone.
 
 - Split managed-derived query failures into malformed, policy-prohibited, and
   over-budget codes with reason-specific remediation, operation-specific

@@ -1,8 +1,9 @@
 """The control-schema store: the same contract as StubStore, over PostgreSQL.
 
-StubStore is the in-memory stand-in this replaces. The interfaces are identical
-on purpose -- the same suite runs against both -- but two behaviours differ,
-and both differences are the point of moving to SQL:
+StubStore (tests/stub_store.py) is the in-memory stand-in this replaces. The
+interfaces are identical on purpose, and tests/store_contract.py asserts the
+shared shape against both so a divergence fails rather than hides. Two
+behaviours still differ, and both differences are the point of moving to SQL:
 
 *   **A one-shot record is consumed by the statement that reads it.** The stub
     removes a record under a lock; here the conditional
@@ -148,6 +149,38 @@ class SqlStore:
             secret_is_hashed=True,
         )
 
+    def ping(self) -> None:
+        """Prove the control schema is reachable, or raise.
+
+        The health check used to answer from the process alone, so the
+        container reported healthy while every OAuth request failed on the
+        database it could not reach -- and `compose up --wait` treated that as
+        a successful start.
+        """
+        with self._connect() as connection:
+            connection.execute("SELECT 1")
+
+    # -- the operator credential -----------------------------------------
+
+    def admin_password_hash(self) -> str:
+        """The administrator credential, as ./bin/mapp init wrote it.
+
+        Read live rather than captured at start-up, so changing the password
+        takes effect without restarting this component -- and so a component
+        that starts before the credential exists does not cache the absence.
+
+        This is the whole reason passwords.py is byte-compatible with
+        config-ui's hasher: one credential, written by config_admin.py into
+        control.admin_credential and verified here. It was previously taken
+        from MCP_AUTH_ADMIN_PASSWORD_HASH, which nothing anywhere set, so a
+        correctly deployed component could not authenticate anybody.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT encoded FROM control.admin_credential WHERE id = 1"
+            ).fetchone()
+        return row["encoded"] if row is not None else ""
+
     # -- grants ----------------------------------------------------------
 
     def save_grant(self, grant: Grant) -> Grant:
@@ -180,9 +213,15 @@ class SqlStore:
 
         One conditional statement, so two operators revoking at once cannot
         both believe they acted. Nothing else is touched: tokens are not
-        updated row by row, because introspection resolves each of them through
-        the grant, so one write invalidates every credential derived from it --
-        including a token B already issued and not yet spent.
+        updated row by row, because every path that reads one resolves it
+        through the grant -- introspection, the exchange, and both halves of
+        the token-B verification surface (consume_exchanged_token and
+        exchanged_binding). So one write invalidates every credential derived
+        from the grant, including a token B already issued and not yet spent.
+
+        That was previously true of introspection alone. The two statements
+        that actually spend or verify a token B did not join the grant at all,
+        so a revoked grant reported inactive and its token still spent.
         """
         with self._connect() as connection:
             row = connection.execute(
@@ -216,6 +255,10 @@ class SqlStore:
             )
         return code
 
+    #: Test-only reader. The flow never calls it: authlib asks the grant for a
+    #: code and the grant consumes it through consume_authorization_code_for,
+    #: because a one-shot record is read by the statement that spends it. This
+    #: exists so a test can assert on what was stored without spending it.
     def query_authorization_code(
         self, code: str, client_id: str
     ) -> AuthorizationCode | None:
@@ -280,8 +323,11 @@ class SqlStore:
             connection.execute(
                 "INSERT INTO control.oauth_tokens"
                 "(token_hash, client_id, subject, scope, audience, issued_at,"
-                " expires_at)"
-                " VALUES(%s,%s,%s,%s,%s,to_timestamp(%s),to_timestamp(%s))",
+                " expires_at, revoked_at)"
+                " VALUES(%s,%s,%s,%s,%s,to_timestamp(%s),to_timestamp(%s),"
+                # Dropped silently before, so a record saved already revoked
+                # came back live -- the stub kept the flag and this did not.
+                " CASE WHEN %s THEN now() END)",
                 (
                     digest,
                     token.client_id,
@@ -296,6 +342,7 @@ class SqlStore:
                     token.audience,
                     token.issued_at,
                     token.issued_at + token.expires_in,
+                    bool(token.revoked),
                 ),
             )
         return token
@@ -393,27 +440,43 @@ class SqlStore:
                 "   AND consumed_at IS NULL"
                 "   AND revoked_at IS NULL"
                 "   AND expires_at > now()"
+                # The live grant is a predicate of the spend, not a check the
+                # caller is trusted to have made. Without it, revoking a grant
+                # made the token report inactive to introspection and still
+                # spend successfully here -- and this is the only statement
+                # that actually spends one.
+                "   AND EXISTS ("
+                "     SELECT 1 FROM control.oauth_grants g"
+                "      WHERE g.grant_id = oauth_tokens.subject"
+                "        AND g.revoked_at IS NULL)"
                 " RETURNING scope, subject, request_digest",
                 (token_digest(raw_token), operation_id, request_digest),
             ).fetchone()
 
     def exchanged_binding(self, raw_token: str):
-        """Read a token B's binding without spending it.
+        """Read a token B's binding without spending it, or refuse.
 
         A read operation's token is not single-use, so it can never go through
-        consume_exchanged_token -- without this there was no way to verify a
-        read token's binding at all through the SQL contract, and the stub had
-        a reader the real store lacked.
+        consume_exchanged_token -- which makes this the whole verification
+        surface for a read, and therefore the place the grant has to be
+        checked. The join is inner on purpose: a token whose subject resolves
+        to no grant, or to a revoked one, yields no row and the caller sees
+        None. Returning the binding and leaving the grant to the caller would
+        put the decision in the one place that cannot be audited from here.
         """
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT operation_id, request_digest, single_use, audience,"
-                " actor_client_id, broker_client_id, consumed_at, expires_at"
-                " FROM control.oauth_tokens WHERE token_hash = %s",
+                "SELECT t.operation_id, t.request_digest, t.single_use,"
+                " t.audience, t.actor_client_id, t.broker_client_id,"
+                " t.consumed_at, t.expires_at"
+                " FROM control.oauth_tokens t"
+                " JOIN control.oauth_grants g ON g.grant_id = t.subject"
+                " WHERE t.token_hash = %s AND g.revoked_at IS NULL",
                 (token_digest(raw_token),),
             ).fetchone()
         return dict(row) if row is not None else None
 
+    #: Test-only. Nothing in the flow counts tokens; assertions about growth do.
     def token_count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(

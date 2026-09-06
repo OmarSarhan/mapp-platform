@@ -66,9 +66,10 @@ class SqlStoreContractTests(unittest.TestCase):
         self.store = SqlStore(DATABASE_URL)
         with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
             for table in (
-                # Child before parent: grants reference clients, and tokens
-                # and codes reference grants, so this order is load-bearing --
-                # these are plain DELETEs, not CASCADE.
+                # Child before parent. The only foreign keys in the control
+                # schema are client_id -> oauth_clients, so it is the clients
+                # that must go last; nothing references oauth_grants. These are
+                # plain DELETEs, not CASCADE.
                 "oauth_authorization_codes",
                 "oauth_pending_authorizations",
                 "oauth_tokens",
@@ -78,10 +79,12 @@ class SqlStoreContractTests(unittest.TestCase):
             ):
                 connection.execute(f"DELETE FROM control.{table}")
         self.store.add_client(_client())
-        # The grant every seeded code and token belongs to. Codes and tokens
-        # reference it now, so seeding one without it is a foreign-key
-        # violation -- which is the schema saying the same thing the exchange
-        # says: a credential with no grant behind it is not a credential.
+        # The grant every seeded code and token belongs to. There is no
+        # foreign key to enforce that -- control_schema.py declines to add one
+        # deliberately, and a token whose subject resolves to no grant writes
+        # cleanly. The linkage is an application rule, checked in
+        # introspection.py and exchange.py and in both halves of the token-B
+        # verification surface, and pinned by tests/store_contract.py.
         self.store.save_grant(
             Grant(
                 grant_id="oauth:grant-1",
@@ -588,3 +591,81 @@ class ExchangedTokenTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_database
+class OperatorCredentialTests(unittest.TestCase):
+    """One credential, written by config-ui and verified by this component.
+
+    passwords.py claims byte-compatibility with config-ui's hasher. Nothing
+    checked it, and for a while nothing needed to: the consent screen read
+    MCP_AUTH_ADMIN_PASSWORD_HASH, a variable no compose file, .env.example or
+    script ever set, while ./bin/mapp init wrote control.admin_credential --
+    a table this component did not read. The two halves of the claim were
+    never joined, so the deployed component could authenticate nobody.
+
+    This is the join: config-ui hashes, the control schema stores, SqlStore
+    reads, and mcp-auth's own verifier accepts. A change to either hasher
+    breaks it here rather than in production.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        connection = cs.connect(DATABASE_URL)
+        try:
+            cs.migrate(connection)
+        finally:
+            connection.close()
+
+    def setUp(self) -> None:
+        self.store = SqlStore(DATABASE_URL)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            connection.execute("DELETE FROM control.admin_credential")
+
+    def _write_as_config_ui(self, password: str) -> str:
+        import control_plane
+
+        encoded = control_plane.password_hash(password)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            connection.execute(
+                "INSERT INTO control.admin_credential(id, encoded) VALUES(1, %s)"
+                " ON CONFLICT (id) DO UPDATE SET encoded = EXCLUDED.encoded",
+                (encoded,),
+            )
+        return encoded
+
+    def test_a_credential_written_by_config_ui_verifies_here(self) -> None:
+        import passwords
+
+        self._write_as_config_ui("correct horse battery staple")
+        stored = self.store.admin_password_hash()
+        self.assertTrue(stored)
+        self.assertTrue(
+            passwords.verify_password("correct horse battery staple", stored)
+        )
+        self.assertFalse(passwords.verify_password("wrong", stored))
+
+    def test_both_hashers_agree_on_the_encoding(self) -> None:
+        """Not merely mutually verifiable -- the same format, parameters and all."""
+        import control_plane
+
+        import passwords
+
+        self.assertEqual(passwords.PBKDF2_ROUNDS, control_plane.PBKDF2_ROUNDS)
+        theirs = control_plane.password_hash("shared secret")
+        mine = passwords.password_hash("shared secret")
+        self.assertEqual(theirs.split("$")[:2], mine.split("$")[:2])
+        # And each verifier accepts the other's output.
+        self.assertTrue(passwords.verify_password("shared secret", theirs))
+        self.assertTrue(control_plane.verify_password("shared secret", mine))
+
+    def test_an_absent_credential_reads_as_empty_not_as_an_error(self) -> None:
+        """A component that starts before ./bin/mapp init must not crash.
+
+        It must refuse every sign-in instead, which an empty hash does:
+        verify_password returns False for it.
+        """
+        import passwords
+
+        self.assertEqual("", self.store.admin_password_hash())
+        self.assertFalse(passwords.verify_password("anything", ""))

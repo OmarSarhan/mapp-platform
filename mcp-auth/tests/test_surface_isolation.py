@@ -316,8 +316,6 @@ class ThrottleTableTests(unittest.TestCase):
         self.assertTrue(server._throttled("203.0.113.2"))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class DependencySurfaceTests(unittest.TestCase):
@@ -493,3 +491,7 @@ class DeployedStoreTests(unittest.TestCase):
                         path.name for a in node.names if a.name == "stub_store"
                     )
         self.assertEqual([], offenders)
+
+
+if __name__ == "__main__":
+    unittest.main()

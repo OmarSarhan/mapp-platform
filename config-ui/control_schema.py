@@ -445,20 +445,29 @@ def _migration_4(connection: psycopg.Connection) -> None:
                     CHECK (revoked_reason IS NULL OR revoked_at IS NOT NULL)
             );
 
+            -- Both indexes are for queries that do not exist yet: "the live
+            -- grants of one client" and "the tokens of one grant". Every
+            -- lookup the code performs today is by primary key, so neither
+            -- has a reader -- they are reserved, like recovery_epoch, and
+            -- saying so is better than a comment that describes a mechanism.
             CREATE INDEX oauth_grants_live_idx
                 ON {schema}.oauth_grants (client_id) WHERE revoked_at IS NULL;
 
             -- No separate grant_id column: `subject` already holds the grant
             -- id. authenticate_user returns it off the authorization code and
             -- the token inherits it, so a second column would be the same
-            -- value written twice and free to drift. This index is what
-            -- introspection's grant lookup uses.
+            -- value written twice and free to drift. Introspection's grant
+            -- lookup is a primary-key read of oauth_grants and cannot use an
+            -- index on oauth_tokens at all.
             --
             -- No foreign key either, deliberately. Rows written before grants
             -- existed carry an operator name rather than a grant id, and a
-            -- constraint would fail the migration on them. Introspection
-            -- treats a subject that resolves to no grant as inactive, so the
-            -- absence fails closed without needing the database to enforce it.
+            -- constraint would fail the migration on them. Every path that
+            -- reads a credential treats a subject resolving to no grant as
+            -- dead -- introspection, the exchange, and both halves of the
+            -- token-B verification surface -- so the absence fails closed
+            -- without the database enforcing it. mcp-auth/tests/
+            -- store_contract.py is what holds that true of both stores.
             CREATE INDEX oauth_tokens_subject_idx ON {schema}.oauth_tokens (subject);
             """
         ).format(schema=sql.Identifier(SCHEMA))

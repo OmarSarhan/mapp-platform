@@ -222,6 +222,8 @@ WHERE NOT EXISTS (
 \gexec
 
 ALTER ROLE :"control_db_user" LOGIN PASSWORD :'control_db_password';
+-- Same limit and the same caveat as docker/postgis/init/10-roles.sh: neither
+-- consumer pools, so this is a ceiling on concurrent operations.
 ALTER ROLE :"control_db_user" CONNECTION LIMIT 8;
 ALTER ROLE :"control_db_user" SET search_path = pg_catalog, control;
 

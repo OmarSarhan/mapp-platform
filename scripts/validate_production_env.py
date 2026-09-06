@@ -11,6 +11,11 @@ from urllib.parse import urlsplit
 PRODUCTION_KEYS = (
     "PRODUCTION_MAP_SITE",
     "PRODUCTION_CONFIG_SITE",
+    # The third public origin. compose.production.yaml makes it a required
+    # variable, so a deploy missing it fails at `compose config` -- but it was
+    # absent from this list, which exists to catch exactly that before the
+    # deploy rather than during it.
+    "PRODUCTION_MCP_SITE",
     "PRODUCTION_CONFIG_ALLOWED_HOSTS",
     "PRODUCTION_CADDY_EMAIL",
     "EDGE_BIND_ADDRESS",
@@ -186,12 +191,37 @@ def validate(values: dict[str, str]) -> list[str]:
         "PRODUCTION_CONFIG_SITE",
         errors,
     )
-    map_hostname = urlsplit(map_origin).hostname if map_origin else None
-    config_hostname = urlsplit(config_origin).hostname if config_origin else None
-    if map_hostname and config_hostname and map_hostname == config_hostname:
-        errors.append(
-            "PRODUCTION_MAP_SITE and PRODUCTION_CONFIG_SITE must use distinct hostnames."
-        )
+    mcp_origin = validated_origin(
+        values["PRODUCTION_MCP_SITE"].strip(),
+        "PRODUCTION_MCP_SITE",
+        errors,
+    )
+    origins = {
+        "PRODUCTION_MAP_SITE": map_origin,
+        "PRODUCTION_CONFIG_SITE": config_origin,
+        "PRODUCTION_MCP_SITE": mcp_origin,
+    }
+    hostnames = {
+        key: urlsplit(origin).hostname
+        for key, origin in origins.items()
+        if origin
+    }
+    map_hostname = hostnames.get("PRODUCTION_MAP_SITE")
+    config_hostname = hostnames.get("PRODUCTION_CONFIG_SITE")
+    # Every pair must differ. Caddy routes these three origins to different
+    # backends by hostname, so a collision does not merely look untidy -- it
+    # silently serves one service's paths from another's site block.
+    for first, second in (
+        ("PRODUCTION_MAP_SITE", "PRODUCTION_CONFIG_SITE"),
+        ("PRODUCTION_MAP_SITE", "PRODUCTION_MCP_SITE"),
+        ("PRODUCTION_CONFIG_SITE", "PRODUCTION_MCP_SITE"),
+    ):
+        if (
+            hostnames.get(first)
+            and hostnames.get(second)
+            and hostnames[first] == hostnames[second]
+        ):
+            errors.append(f"{first} and {second} must use distinct hostnames.")
 
     raw_allowed_hosts = [
         item.strip()

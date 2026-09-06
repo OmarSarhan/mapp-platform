@@ -27,6 +27,19 @@ class PendingLimitReached(RuntimeError):
     """
 
 
+#: The only response type this server implements. Advertised in the metadata
+#: document as ``response_types_supported`` and enforced here, so the two
+#: cannot disagree.
+SUPPORTED_RESPONSE_TYPES = ("code",)
+
+# The mixin methods below look unused because nothing in this repository calls
+# them: authlib does, from the grant and endpoint code it runs on our behalf.
+# Four that were here are gone -- get_nonce, get_client and get_user are
+# reached only from authlib's OIDC package, which this server is not, and
+# get_expires_in is called from nowhere in authlib at all. What remains is
+# reachable from a module this component registers.
+
+
 @dataclass
 class Client(ClientMixin):
     client_id: str
@@ -51,7 +64,6 @@ class Client(ClientMixin):
     #: condition: issuer.REFRESH_TOKENS_IMPLEMENTED is False, so adding the
     #: grant type alone changes nothing until the grant and its storage exist.
     grant_types: tuple[str, ...] = ("authorization_code",)
-    response_types: tuple[str, ...] = ("code",)
     #: A disabled client authorises nothing. The SQL store already filtered on
     #: disabled_at; the model had no way to say it, so the in-memory store
     #: could not express a client state the real one enforces.
@@ -79,8 +91,14 @@ class Client(ClientMixin):
             # default scope, and inventing one here would be an escalation.
             return None
         allowed = set(self.scopes)
-        # Preserve the requested order so the issued scope reads back predictably.
-        kept = [s for s in scope.split() if s in allowed]
+        # Preserve the requested order so the issued scope reads back
+        # predictably, and drop repeats: "apply apply" otherwise listed apply
+        # twice on the consent screen and stored it twice on the grant, where
+        # the exchange compares scope sets and would not have noticed.
+        kept: list[str] = []
+        for candidate in scope.split():
+            if candidate in allowed and candidate not in kept:
+                kept.append(candidate)
         return " ".join(kept) if kept else None
 
     def check_redirect_uri(self, redirect_uri: str) -> bool:
@@ -113,7 +131,14 @@ class Client(ClientMixin):
         return method == self.token_endpoint_auth_method
 
     def check_response_type(self, response_type: str) -> bool:
-        return response_type in self.response_types
+        # Compared against what this server supports, not against a per-client
+        # list. There was one, declared on the model with no column behind it:
+        # the SQL store could neither write nor read it, so a client narrowed
+        # at registration came back from the database permissive. One response
+        # type exists here -- an OAuth 2.1 authorization-code server with PKCE
+        # -- so per-client narrowing was expressing a distinction that has no
+        # values to distinguish.
+        return response_type in SUPPORTED_RESPONSE_TYPES
 
     def check_grant_type(self, grant_type: str) -> bool:
         return grant_type in self.grant_types
@@ -137,9 +162,6 @@ class AuthorizationCode(AuthorizationCodeMixin):
         return self.scope
 
     # Read by authlib's CodeChallenge extension.
-    def get_nonce(self) -> None:
-        return None
-
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
 
@@ -170,20 +192,12 @@ class Token(TokenMixin):
     def get_scope(self) -> str:
         return self.scope
 
-    def get_expires_in(self) -> int:
-        return self.expires_in
-
     def is_expired(self) -> bool:
         return self.issued_at + self.expires_in < time.time()
 
     def is_revoked(self) -> bool:
         return self.revoked
 
-    def get_client(self) -> str:
-        return self.client_id
-
-    def get_user(self) -> str:
-        return self.subject
 
 
 @dataclass

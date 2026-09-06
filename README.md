@@ -76,11 +76,12 @@ covers preparing the source database itself.
 | `bin/mapp` | The wrapper every operation goes through |
 | `config-ui/` | Configuration dashboard and API |
 | `semantic-service/` | Private semantic catalogue service |
+| `mcp-auth/` | Phase 0 OAuth authorization component for the forthcoming MCP server |
 | `etl/` | Loader used by the demo to populate source databases |
 | `docker/` | Image definitions and database initialisation |
 | `scripts/` | `verify.sh`, acceptance and contract test helpers |
 | `instance/` | Reviewed, versioned inputs — seed workspace, public assets |
-| `var/` | Runtime state: authentication, audit, proposals, artifacts |
+| `var/` | Runtime state: audit, proposals, artifacts, and the authorization component's socket |
 | `docs/` | [Documentation](docs/guide.md) |
 
 `instance/` is checked in and reviewed. `var/` is generated, private, and
@@ -95,6 +96,11 @@ every reference document in the right place.
 If you already know what you are looking for, its
 [reference index](docs/guide.md#10-reference-index) lists all of them with a
 line each.
+
+The platform's own state — the administrator credential, dashboard sessions,
+CLI tokens, device authorizations and the OAuth records of the Phase 0
+[MCP authorization component](docs/mcp-authorization.md) — lives in the
+`control` schema of the packaged database, not in files under `var/`.
 
 ## The remote client
 

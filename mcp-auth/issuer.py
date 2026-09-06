@@ -233,14 +233,32 @@ class MappAuthorizationServer(AuthorizationServer):
                 " equal values collapse the audience separation between token A"
                 " and token B."
             )
-        #: M1/M2 read this from the environment. P4 moves it to control.admin_credential;
-        #: passwords.py is byte-compatible with config-ui so that move is a copy.
-        self.admin_password_hash = admin_password_hash
+        #: Empty in deployment: the property below reads control.admin_credential,
+        #: which is what ./bin/mapp init writes. A non-empty value here is a
+        #: test override. passwords.py is byte-compatible with config-ui's
+        #: hasher precisely so this is one credential and not two.
+        self._admin_password_hash = admin_password_hash
         self.secure_cookies = secure_cookies
         self.register_token_generator("default", self._generate_token)
         self.register_grant(MappAuthorizationCodeGrant, [S256OnlyCodeChallenge(required=True)])
         self._issuer_parameter = MappIssuerParameter(issuer)
         self.register_extension(self._register_issuer_parameter)
+
+    @property
+    def admin_password_hash(self) -> str:
+        """The operator credential, from the store unless one was supplied.
+
+        Tests pass an explicit hash; the deployed component passes none and
+        the store answers, so the credential ./bin/mapp init writes into
+        control.admin_credential is the one the consent screen checks. Read
+        per attempt rather than captured at start-up, so a password change
+        needs no restart and a component that started before the credential
+        existed does not cache its absence.
+        """
+        if self._admin_password_hash:
+            return self._admin_password_hash
+        reader = getattr(self.store, "admin_password_hash", None)
+        return reader() if reader is not None else ""
 
     def _register_issuer_parameter(self, server):
         self._issuer_parameter(server)

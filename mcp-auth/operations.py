@@ -9,9 +9,10 @@ by scope would work against every proposal the grant could reach.
 Every entry here mirrors an action the configuration API already publishes in
 ``ACTION_SCHEMAS``. That is the source of truth, and it lives in another
 service that this component cannot import at runtime, so the values are
-restated rather than derived -- with ``test_the_allowlist_matches_the_platform``
-comparing them against the real table, because a restated contract that nobody
-compares is a contract that has already drifted.
+restated rather than derived -- with ``AllowlistDriftTests`` in
+tests/test_exchange.py comparing them against the real table, because a
+restated contract that nobody compares is a contract that has already
+drifted.
 
 Phase 0 deliberately allowlists a handful rather than all fifty-two: enough to
 cover a read with a path parameter and a query, a mutation, and the flagship
@@ -102,3 +103,19 @@ def lookup(operation_id: str) -> Operation:
     if not isinstance(operation_id, str) or operation_id not in OPERATIONS:
         raise UnknownOperation(operation_id)
     return OPERATIONS[operation_id]
+
+
+def all_required_scopes() -> frozenset[str]:
+    """Every scope some allowlisted operation needs.
+
+    The authorization server derives its acceptance vocabulary from this. It
+    used to restate one, and the two disagreed: four of the five operations
+    here required scopes the server refused to issue, so they could never be
+    exchanged for at all. Nothing caught it because every test built its own
+    vocabulary -- the drift was only visible by walking the real flow.
+    """
+    return frozenset(
+        scope
+        for operation in OPERATIONS.values()
+        for scope in operation.required_scopes
+    )

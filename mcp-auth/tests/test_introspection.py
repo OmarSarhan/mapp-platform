@@ -176,6 +176,59 @@ class InactiveTests(IntrospectionTestCase):
         # as though it were for the MCP endpoint.
         self.assert_inactive(token="mapp_a_live", resource=CONFIG_RESOURCE)
 
+    def test_a_resource_that_is_a_prefix_of_the_audience_is_inactive(self) -> None:
+        """The check is equality, and only these cases can prove that.
+
+        The existing mismatch case compares two audiences sharing no prefix,
+        so it passes under a `startswith` implementation too -- mutation
+        confirmed it survived. A prefix test would introspect a token for
+        ".../mcp" as active for the resource ".../m".
+        """
+        for resource in (
+            MCP_RESOURCE[:-1],
+            MCP_RESOURCE.rsplit("/", 1)[0],
+            MCP_RESOURCE + "/x",
+            MCP_RESOURCE + " ",
+        ):
+            with self.subTest(resource=resource):
+                self.assert_inactive(token="mapp_a_live", resource=resource)
+
+    def test_a_disabled_grant_client_deactivates_its_token_b(self) -> None:
+        """A token B names the broker, so checking its own client proved nothing.
+
+        record.client_id on a token B is whichever broker performed the
+        exchange, so the "active client" rule reached token A and the exchange
+        but never the credential actually presented to the configuration API:
+        disabling a client left its token B live for the full sixty seconds.
+        The client that must be live is the one holding the grant.
+        """
+        issued = dt.datetime.now(dt.timezone.utc)
+        self.store.save_exchanged_token(
+            "mapp_b_live",
+            client_id="mapp-mcp-broker",
+            actor_client_id="mcp-client",
+            subject="oauth:grant-1",
+            scope="apply",
+            audience=CONFIG_RESOURCE,
+            issued_at=issued,
+            expires_at=issued + dt.timedelta(seconds=60),
+            operation_id="proposals.apply",
+            request_digest=canonical.digest({"proposalId": "p1"}),
+            single_use=True,
+        )
+        self.assertTrue(self.introspect(token="mapp_b_live")["active"])
+        self.store.add_client(
+            Client(
+                client_id="mcp-client",
+                name="Claude Code",
+                redirect_uris=("http://127.0.0.1:9/cb",),
+                scopes=("apply",),
+                token_endpoint_auth_method="none",
+                disabled=True,
+            )
+        )
+        self.assert_inactive(token="mapp_b_live")
+
     def test_an_inactive_response_carries_no_other_member(self) -> None:
         """RFC 7662 s2.2: do not describe an inactive token."""
         self.store.save_token("mapp_a_dead", self._token(revoked=True))
@@ -408,6 +461,35 @@ class ControlListenerTests(unittest.TestCase):
         )
         self.assertEqual(401, status)
 
+    def test_a_public_client_holding_a_secret_still_cannot_authenticate(self) -> None:
+        """The refusal must come from the auth method, not from an empty secret.
+
+        The test above passes because its client has no secret at all --
+        check_client_secret returns False for any falsy stored value -- so
+        deleting the auth-method check in server.py left the whole suite
+        green. Nothing in the schema stops a row having
+        token_endpoint_auth_method='none' and a client_secret_hash, so the
+        state is representable and only this pins the binding.
+        """
+        self.store.add_client(
+            Client(
+                client_id="public-with-secret",
+                name="Confused Client",
+                redirect_uris=("http://127.0.0.1:9/cb",),
+                scopes=("apply",),
+                token_endpoint_auth_method="none",
+                client_secret="a-real-secret",
+            )
+        )
+        for path in ("/internal/oauth/introspect", "/internal/oauth/revoke",
+                     "/internal/oauth/exchange"):
+            with self.subTest(path=path):
+                status, _ = self.post(
+                    path, {"token": "mapp_a_live"},
+                    auth=("public-with-secret", "a-real-secret"),
+                )
+                self.assertEqual(401, status)
+
     def test_a_missing_token_is_a_four_hundred(self) -> None:
         status, body = self.post("/internal/oauth/introspect", {})
         self.assertEqual(400, status)
@@ -421,3 +503,126 @@ class ControlListenerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OracleTests(IntrospectionTestCase):
+    """The inactive response is flat; the ways *around* it must be closed too.
+
+    Both of these were found by driving the real endpoint rather than by
+    reading it. A response that says nothing is not enough if the error
+    behaviour or the response time says it instead.
+    """
+
+    class _CountingStore:
+        """Wraps a store and counts the lookups introspection performs."""
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self.calls: list[str] = []
+
+        def __getattr__(self, name):
+            attribute = getattr(self._inner, name)
+            if name not in ("query_token", "query_grant", "query_client"):
+                return attribute
+
+            def record(*args, **kwargs):
+                self.calls.append(name)
+                return attribute(*args, **kwargs)
+
+            return record
+
+    def test_a_duplicate_resource_is_refused_whatever_the_token(self) -> None:
+        """Otherwise a malformed request is a liveness oracle.
+
+        `resource` used to be parsed after the inactive short-circuits, so a
+        duplicated value raised only for a token that got that far: 400 meant
+        live, 200 meant anything else. One request, no statistics.
+        """
+        self.store.save_token("mapp_a_dead", self._token(revoked=True))
+        self.store.save_token("mapp_a_orphan", self._token(subject="oauth:gone"))
+        for token in ("mapp_a_live", "mapp_a_dead", "mapp_a_orphan", "mapp_a_nosuch"):
+            with self.subTest(token=token):
+                with self.assertRaises(introspection.IntrospectionError):
+                    self.introspect(
+                        token=token, resource=[MCP_RESOURCE, CONFIG_RESOURCE]
+                    )
+
+    def test_every_outcome_costs_the_same_lookups(self) -> None:
+        """Response time distinguished the outcomes at roughly 1:2:3.
+
+        Short-circuiting after one, two or three store calls was measurable
+        from outside -- 7.5ms / 15.5ms / 22.8ms medians against a real
+        database, because SqlStore opens a connection per call. Counting the
+        lookups pins the shape of the fix without depending on a clock.
+        """
+        self.store.save_token("mapp_a_dead", self._token(revoked=True))
+        self.store.save_token("mapp_a_orphan", self._token(subject="oauth:gone"))
+        counts = {}
+        for token in ("mapp_a_nosuch", "mapp_a_dead", "mapp_a_orphan", "mapp_a_live"):
+            counting = self._CountingStore(self.store)
+            introspection.introspect(
+                datalist=self._form(token=token), store=counting
+            )
+            counts[token] = counting.calls
+        self.assertEqual(
+            {token: ["query_token", "query_grant", "query_client"]
+             for token in counts},
+            counts,
+        )
+
+
+class HealthTests(IntrospectionTestCase):
+    """/healthz answers for the store, not for the process.
+
+    It returned 200 unconditionally, so the container was healthy -- and
+    `compose up --wait` was satisfied -- while every OAuth request failed on a
+    control schema the component could not reach. `verify` then reported the
+    whole platform green.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.authorization = MappAuthorizationServer(
+            self.store, issuer="http://mcp.localhost", resource=MCP_RESOURCE,
+            config_api_resource=CONFIG_RESOURCE, scopes_supported=("apply",),
+        )
+        self.httpd = ControlServer(("127.0.0.1", 0), self.authorization)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def get_healthz(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.request("GET", "/healthz")
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode())
+        finally:
+            connection.close()
+
+    def test_a_reachable_store_is_healthy(self) -> None:
+        status, body = self.get_healthz()
+        self.assertEqual(200, status)
+        self.assertEqual("ok", body["status"])
+
+    def test_an_unreachable_store_is_unhealthy(self) -> None:
+        def refuse():
+            raise OSError("connection refused")
+
+        self.store.ping = refuse
+        status, body = self.get_healthz()
+        self.assertEqual(503, status)
+        self.assertEqual("unavailable", body["status"])
+
+    def test_the_unhealthy_response_describes_nothing(self) -> None:
+        """/healthz is answered before any caller is authenticated."""
+        def refuse():
+            raise OSError("password authentication failed for user mapp_control")
+
+        self.store.ping = refuse
+        _, body = self.get_healthz()
+        self.assertEqual({"status", "version"}, set(body))
+        self.assertNotIn("mapp_control", json.dumps(body))

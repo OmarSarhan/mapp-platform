@@ -89,6 +89,18 @@ services:
       # appearing to work -- see docs/external-postgresql.md.
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:?Set CONTROL_DATABASE_URL in .env}
 
+  mcp-auth:
+    # Same control schema, same role, same requirement: every credential the
+    # authorization component reads or writes lives there, so starting before
+    # the database is starting unhealthy. It had neither the dependency nor a
+    # health check that touched the store, so it reported healthy while every
+    # OAuth request failed.
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:?Set CONTROL_DATABASE_URL in .env}
+
   etl:
     image: mapp-leeds-etl:local
     build:
