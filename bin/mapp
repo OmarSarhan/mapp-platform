@@ -47,6 +47,7 @@ usage() {
     "  mcp-client-register --name N --redirect-uri U --scope S  register an MCP agent client" \
     "  mcp-client-list list registered MCP clients" \
     "  mcp-client-disable --client-id ID  disable an MCP client" \
+    "  migrate-rollback --to N [--confirm]  step the control schema ladder down; destructive, prints the plan first" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-system --confirm return the platform to its initial state: new database, seed workspace, new administrator password" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
@@ -1054,6 +1055,16 @@ case "${1:-}" in
     "${compose[@]}" up --detach --wait db >/dev/null
     "${compose[@]}" run --rm --no-deps config-ui \
       python config_admin.py revoke-tokens --root /control
+    ;;
+  migrate-rollback)
+    # Destructive, and the plan is printed by config_admin rather than here:
+    # it reads the migration ledger, so the warning names the versions this
+    # database actually has instead of a paragraph that goes stale the first
+    # time a migration is added. Arguments are forwarded verbatim -- --confirm
+    # is never injected, so the unconfirmed path is the default.
+    "${compose[@]}" up --detach --wait db >/dev/null
+    "${compose[@]}" run --rm --no-deps config-ui \
+      python config_admin.py migrate-rollback --root /control "${@:2}"
     ;;
   mcp-client-register|mcp-client-list|mcp-client-disable)
     # The agent-client registry. Nothing else registers a client, so without

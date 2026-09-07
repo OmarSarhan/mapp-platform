@@ -21,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
             "mcp-client-register",
             "mcp-client-list",
             "mcp-client-disable",
+            "migrate-rollback",
         ),
     )
     parser.add_argument("--root", default=os.environ.get("CONTROL_DIR", "/control"))
@@ -45,7 +46,76 @@ def parser() -> argparse.ArgumentParser:
         help="Scope an MCP client may request. Repeatable.",
     )
     parser.add_argument("--client-id", help="MCP client to disable.")
+    parser.add_argument(
+        "--to",
+        type=int,
+        help="Schema version to roll the migration ladder back to. 0 removes"
+        " every control table.",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Perform a rollback. Without it the plan is printed and nothing"
+        " changes.",
+    )
     return parser
+
+
+def migrate_rollback_command(args, store) -> bool:
+    """Step the schema ladder down, after saying what that costs.
+
+    Two calls on purpose. Without --confirm this prints the plan and exits
+    non-zero, which is the same shape reset-system uses: an operator reaching
+    for a destructive command under pressure should read the price before
+    paying it. The plan is computed from the ledger rather than written out, so
+    it cannot go stale when a migration is added.
+    """
+    if args.command != "migrate-rollback":
+        return False
+    if args.to is None:
+        raise SystemExit("--to is required: the schema version to roll back to.")
+    plan = store.rollback_plan(args.to)
+    if plan["missing"]:
+        raise SystemExit(
+            f"Migrations {plan['missing']} have no rollback, so the ladder"
+            f" cannot step below {max(plan['missing'])}."
+        )
+    if not plan["undo"]:
+        print(
+            f"Schema is already at or below version {args.to};"
+            f" applied: {plan['applied']}. Nothing to do."
+        )
+        return True
+    if not args.confirm:
+        print(
+            f"Would roll back migrations {plan['undo']}"
+            f" (applied: {plan['applied']})."
+        )
+        if plan["losses"]:
+            print()
+            print("This destroys, and no transaction brings it back:")
+            for version in plan["undo"]:
+                if version in plan["losses"]:
+                    print(f"  migration {version}: {plan['losses'][version]}")
+        print()
+        print(
+            "Not touched: the audit log, workspace proposals, artifacts and"
+            " public assets under var, and the source databases holding the"
+            " spatial data. Only the control schema is changed."
+        )
+        print()
+        print(
+            "Back up the database first if any of that matters, then"
+            " re-run with --confirm."
+        )
+        raise SystemExit(2)
+    undone = store.rollback_schema(args.to, accept_data_loss=True)
+    print(f"Rolled back migrations {undone}. Schema is now at version {args.to}.")
+    print(
+        "The next start applies the forward ladder again, so re-running a"
+        " migration is how you go back up."
+    )
+    return True
 
 
 def mcp_client_command(args, store) -> bool:
@@ -106,6 +176,8 @@ def mcp_client_command(args, store) -> bool:
 def main() -> None:
     args = parser().parse_args()
     store = ControlStore(Path(args.root))
+    if migrate_rollback_command(args, store):
+        return
     if mcp_client_command(args, store):
         return
     if args.command == "revoke-tokens":

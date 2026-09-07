@@ -85,6 +85,41 @@ class ResetCommandSafetyTests(unittest.TestCase):
             self.script,
         )
 
+    def test_schema_rollback_is_destructive_and_never_self_confirms(self) -> None:
+        """The wrapper must not decide the confirmation for the operator.
+
+        migrate-rollback drops tables. Its plan is printed by config_admin,
+        which reads the migration ledger -- so the warning names the versions
+        this database actually has rather than a paragraph that goes stale the
+        first time a migration is added. What the wrapper must get right is
+        narrower and easier to get wrong: forward the operator's arguments
+        verbatim and never inject --confirm.
+        """
+        dispatch = self.script[self.script.index("\n  migrate-rollback)") :]
+        dispatch = dispatch[: dispatch.index("\n    ;;")]
+        self.assertIn(
+            'python config_admin.py migrate-rollback --root /control "${@:2}"',
+            dispatch,
+        )
+        # Executable lines only. The comment above the dispatch explains that
+        # --confirm is never injected, and should not have to avoid naming it.
+        commands = "\n".join(
+            line
+            for line in dispatch.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertNotIn("--confirm", commands)
+
+    def test_schema_rollback_is_advertised_as_destructive(self) -> None:
+        """An operator reading usage should not have to run it to find out."""
+        usage = self.script[self.script.index("usage() {") :]
+        usage = usage[: usage.index("\n}\n")]
+        line = next(
+            item for item in usage.splitlines() if "migrate-rollback" in item
+        )
+        self.assertIn("destructive", line)
+        self.assertIn("--confirm", line)
+
     def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
         self.assertIn("is_buildkit_lease_failure()", self.script)
         self.assertIn("run_with_buildkit_lease_retry()", self.script)

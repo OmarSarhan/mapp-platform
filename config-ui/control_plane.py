@@ -370,6 +370,41 @@ class ControlStore:
                 (client_id, name, digest),
             )
 
+    # -- schema ladder ---------------------------------------------------
+
+    def rollback_plan(self, to_version: int) -> dict:
+        """What a rollback to ``to_version`` would undo, and what it would cost.
+
+        Read-only. Exists so an operator sees the price before paying it, and
+        so the warning is *computed from the ledger* rather than written out by
+        hand -- a hardcoded paragraph goes stale the first time a migration is
+        added, and this one is read under pressure.
+        """
+        with self._db() as connection:
+            applied = control_schema.applied_versions(connection)
+        undo = [version for version in sorted(applied, reverse=True) if version > to_version]
+        return {
+            "applied": applied,
+            "undo": undo,
+            "losses": {
+                version: control_schema.DESTRUCTIVE_ROLLBACKS[version]
+                for version in undo
+                if version in control_schema.DESTRUCTIVE_ROLLBACKS
+            },
+            "missing": [
+                version
+                for version in undo
+                if version not in control_schema.ROLLBACKS
+            ],
+        }
+
+    def rollback_schema(self, to_version: int, *, accept_data_loss: bool) -> list[int]:
+        """Step the schema ladder down. Returns the versions undone."""
+        with self._db() as connection:
+            return control_schema.rollback(
+                connection, to_version, accept_data_loss=accept_data_loss
+            )
+
     # -- agent OAuth clients ---------------------------------------------
 
     #: Hosts for which plain http is an acceptable redirect target. RFC 8252
