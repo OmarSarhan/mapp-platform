@@ -670,6 +670,10 @@ def revoke_endpoint(handler) -> None:
     _control_endpoint(handler, introspection.revoke)
 
 
+def redeem_endpoint(handler) -> None:
+    _control_endpoint(handler, introspection.redeem)
+
+
 class EdgeServer(ThreadingHTTPServer):
     """The publicly reachable surface, over TCP. Tests use this directly."""
 
@@ -712,6 +716,10 @@ class ControlServer(ThreadingHTTPServer):
             ("POST", "/internal/oauth/exchange"): exchange_endpoint,
             ("POST", "/internal/oauth/introspect"): introspect_endpoint,
             ("POST", "/internal/oauth/revoke"): revoke_endpoint,
+            # The configuration API spends a token B here. On the control
+            # listener only: an edge-reachable redemption endpoint would let
+            # anyone who captured a token burn it, or worse, execute with it.
+            ("POST", "/internal/oauth/redeem"): redeem_endpoint,
         }
 
 

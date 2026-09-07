@@ -1,7 +1,8 @@
-"""RFC 7662 introspection and grant revocation, for the control listener.
+"""Introspection, grant revocation and token-B redemption, for the control
+listener.
 
-Two endpoints that are really one idea: what makes a credential live, and how
-to make it stop being live.
+Three endpoints that are really one idea: what makes a credential live, how to
+make it stop being live, and how it is spent.
 
 **Active means more than "the token exists and has not expired."** The scope
 document requires a token be reported active only when the mapped local grant,
@@ -29,6 +30,16 @@ inactive response is there to hide.
 """
 
 from __future__ import annotations
+
+import hmac
+import re
+
+import canonical
+
+#: A fully formed ``mapp-jcs-v1`` digest. Matched entire rather than by prefix:
+#: a prefix test accepts the scheme name with nothing after it, which is a
+#: binding that matches whatever it is compared against.
+DIGEST_PATTERN = re.compile(re.escape(canonical.SCHEME) + r":[0-9a-f]{64}")
 
 #: Reported for every inactive token, with nothing else. RFC 7662 s2.2 is
 #: explicit that an inactive response must not describe the token: saying why
@@ -142,3 +153,68 @@ def revoke(*, datalist, store) -> dict:
         store.revoke_grant(record.subject, "token-revocation")
     # Nothing is reported either way, per RFC 7009 s2.2.
     return {}
+
+
+def redeem(*, datalist, store) -> dict:
+    """Spend or verify a token B against the request actually being executed.
+
+    This is the half of the operation binding that lives outside the broker.
+    The broker validates the *shape* of the digest it is handed at exchange
+    time and stores it; it never sees the downstream request and so cannot
+    recompute anything. The configuration API rebuilds the canonical envelope
+    from the request in front of it, digests that, and presents the result
+    here. A token minted for one proposal therefore cannot be spent on
+    another, which is the entire point of binding it.
+
+    For a mutating operation the token is single-use and
+    ``consume_exchanged_token`` is the authority: one conditional statement,
+    with the operation and digest as predicates, so two presentations of the
+    same token cannot both proceed. The binding is read first only to learn
+    whether the token is single-use; the consuming statement re-checks
+    everything atomically, so the read cannot become a stale decision.
+
+    A read operation's token is not single-use -- there is nothing to spend --
+    so the binding comparison is the whole check, and it happens here rather
+    than in a statement.
+
+    Both paths answer with the same three members. Neither returns the scope or
+    the subject: the caller already has both from introspection, and inventing
+    empty values for the branch that cannot produce them would make one
+    endpoint answer in two shapes.
+    """
+    raw = _single(datalist, "token")
+    operation_id = _single(datalist, "operation_id")
+    request_digest = _single(datalist, "request_digest")
+    if not raw:
+        raise IntrospectionError("invalid_request", "Missing 'token'.")
+    if not operation_id:
+        raise IntrospectionError("invalid_request", "Missing 'operation_id'.")
+    if not request_digest or not DIGEST_PATTERN.fullmatch(request_digest):
+        raise IntrospectionError(
+            "invalid_request", "The request digest is missing or malformed."
+        )
+
+    binding = store.exchanged_binding(raw)
+    if binding is None:
+        # Covers an unknown token, a token that is not a B, an expired one and
+        # one whose grant is gone or revoked -- the store resolves the grant.
+        raise IntrospectionError("invalid_grant", "The token is not redeemable.")
+
+    if binding["single_use"]:
+        if store.consume_exchanged_token(raw, operation_id, request_digest) is None:
+            raise IntrospectionError(
+                "invalid_grant", "The token is not redeemable for this request."
+            )
+        return {"redeemed": True, "single_use": True, "operation_id": operation_id}
+
+    # Compared as digests, so compare_digest rather than ==. Both halves are
+    # hex from a fixed alphabet, so this is hygiene rather than a live timing
+    # defence -- but the operation id is caller-supplied and the habit is
+    # cheaper to keep than to reason about each time.
+    if not hmac.compare_digest(
+        str(binding["operation_id"]), operation_id
+    ) or not hmac.compare_digest(str(binding["request_digest"]), request_digest):
+        raise IntrospectionError(
+            "invalid_grant", "The token is not redeemable for this request."
+        )
+    return {"redeemed": True, "single_use": False, "operation_id": operation_id}

@@ -35,6 +35,15 @@ first release.
   credential derived from it immediately -- including an exchanged token
   already issued and not yet spent, which previously stayed spendable for its
   full lifetime.
+- The configuration API now validates an exchanged token B, so such a
+  credential authorises one operation on one request rather than a class of
+  effect. It rebuilds the canonical `mapp-jcs-v1` envelope from the request in
+  front of it -- method, operation, path template, typed path parameters,
+  normalized path, ordered query pairs and the exact body -- and spends the
+  token against that digest at the authorization component's new
+  `/internal/oauth/redeem` endpoint; a mutating operation's token is
+  single-use. A token minted for one proposal cannot be applied to another.
+  Requires `MCP_AUTH_CLIENT_SECRET`; blank refuses every exchanged credential.
 - `./bin/mapp` now starts the authorization component, `./bin/mapp verify`
   probes its origin and confirms the internal endpoints are not edge-reachable,
   and `./bin/mapp test` runs its suite.

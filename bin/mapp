@@ -491,6 +491,7 @@ init_env() {
     -e "s/CHANGEME_SEMANTIC_CRUD$/$(openssl rand -hex 24)/"
     -e "s/CHANGEME_SEMANTIC_READER$/$(openssl rand -hex 24)/"
     -e "s/CHANGEME_CONTROL$/$(openssl rand -hex 24)/"
+    -e "s/CHANGEME_MCP_AUTH$/$(openssl rand -hex 32)/"
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/"
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/"
   )

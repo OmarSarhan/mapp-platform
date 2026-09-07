@@ -5,6 +5,12 @@ services:
     environment:
       CONFIG_ALLOWED_HOSTS: ${PRODUCTION_CONFIG_ALLOWED_HOSTS:?Set PRODUCTION_CONFIG_ALLOWED_HOSTS to the configuration hostname}
       CONFIG_SECURE_COOKIES: "true"
+      # The same override mcp-auth gets below, and it must be the same value:
+      # the configuration API compares a token B's audience against this on
+      # every introspection. Overriding one and not the other made every
+      # exchanged credential refused in production and nowhere else, with
+      # nothing in the response to say why.
+      MCP_CONFIG_API_RESOURCE: ${PRODUCTION_CONFIG_SITE:?Set PRODUCTION_CONFIG_SITE to the public HTTPS configuration origin}/api
 
   caddy:
     environment:

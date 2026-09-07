@@ -325,6 +325,51 @@ class ControlStore:
                 )
             return row["value"]
 
+    def ensure_oauth_client(
+        self, client_id: str, client_secret: str, *, name: str
+    ) -> None:
+        """Provision this service's own confidential client, idempotently.
+
+        The authorization component authenticates every caller of its control
+        listener as an OAuth confidential client, and Phase 0 has no client
+        registration endpoint -- RFC 7591 is Phase 1. That gap is deliberate
+        for *agent* clients, which must be registered by a person. It is not a
+        reason for this service to be unable to talk to the component: the
+        client here is the configuration API itself, provisioned by the service
+        that owns the schema the row lives in. control_schema.py declares
+        control.oauth_clients, and this module runs its migrations, so writing
+        one row for ourselves is the same class of act.
+
+        The secret is stored as a sha256 digest because that is what the
+        component's Client.check_client_secret compares against -- a client
+        secret at rest is a credential. No redirect URIs, no scopes and no
+        grant types: this client authenticates to the control listener and can
+        do nothing else. It never appears in an authorization request, so a
+        redirect URI would be a capability with no purpose.
+        """
+        if not client_id or not client_secret:
+            raise ValueError("An OAuth client id and secret are both required.")
+        digest = hashlib.sha256(client_secret.encode("utf-8")).hexdigest()
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute(
+                "INSERT INTO control.oauth_clients"
+                "(client_id, name, redirect_uris, scopes, grant_types,"
+                " token_endpoint_auth_method, client_secret_hash, disabled_at)"
+                " VALUES(%s,%s,'{}','{}','{}','client_secret_basic',%s,NULL)"
+                " ON CONFLICT (client_id) DO UPDATE SET"
+                "   name = EXCLUDED.name,"
+                "   client_secret_hash = EXCLUDED.client_secret_hash,"
+                "   token_endpoint_auth_method"
+                "     = EXCLUDED.token_endpoint_auth_method,"
+                # Re-enables a client an operator disabled. That is the
+                # intent: the secret is supplied by the deployment, so a
+                # restart with a valid secret is the deployment asserting this
+                # client should work.
+                "   disabled_at = NULL",
+                (client_id, name, digest),
+            )
+
     def pagination_key(self) -> bytes:
         """Return a stable private key for integrity-bound opaque cursors.
 

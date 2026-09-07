@@ -164,6 +164,14 @@ services:
       # requires it. The store treats an empty value as "unavailable" rather
       # than falling back to anything.
       CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-}
+      # Token-B validation. The audience must be the same expression the
+      # authorization component derives its MCP_CONFIG_API_RESOURCE from, or
+      # the two would disagree about which audience this service accepts and
+      # every exchanged token would be refused here.
+      MCP_AUTH_URL: ${MCP_AUTH_URL:-http://mcp-auth:8080}
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
+      MCP_AUTH_CLIENT_ID: ${MCP_AUTH_CLIENT_ID:-mapp-config-api}
+      MCP_AUTH_CLIENT_SECRET: ${MCP_AUTH_CLIENT_SECRET:-}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
       PLUGIN_DIR: /instance-public/plugins

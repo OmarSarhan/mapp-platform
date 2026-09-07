@@ -314,6 +314,44 @@ class ComposeIsolationTests(unittest.TestCase):
                 f"{mode} must clear AUTHLIB_INSECURE_TRANSPORT",
             )
 
+    def test_the_configuration_api_can_reach_the_authorization_component(
+        self,
+    ) -> None:
+        """Both halves of token-B validation, and the audience they share.
+
+        The configuration API authenticates to the control listener as a
+        confidential client and checks the token's audience on every
+        introspection. If the two services resolved MCP_CONFIG_API_RESOURCE
+        differently, every exchanged credential would be refused with nothing
+        to indicate why -- so the two values are asserted equal rather than
+        assumed to come from one expression.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                services = model["services"]
+                config = services["config-ui"]["environment"]
+                component = services["mcp-auth"]["environment"]
+                self.assertEqual(
+                    component["MCP_CONFIG_API_RESOURCE"],
+                    config["MCP_CONFIG_API_RESOURCE"],
+                )
+                # Reached by service name on the control network they share.
+                self.assertEqual(
+                    "http://mcp-auth:8080", config["MCP_AUTH_URL"]
+                )
+                self.assertTrue(config["MCP_AUTH_CLIENT_ID"])
+
+    def test_the_component_client_secret_is_not_shared_more_widely(self) -> None:
+        """Only the configuration API needs it, so only it should have it."""
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                holders = {
+                    name
+                    for name, service in model["services"].items()
+                    if "MCP_AUTH_CLIENT_SECRET" in service.get("environment", {})
+                }
+                self.assertEqual({"config-ui"}, holders)
+
     def test_the_mcp_origin_reaches_caddy_and_the_component_together(self) -> None:
         """One MCP_SITE, or the identifiers move without the site serving them.
 
