@@ -112,7 +112,8 @@ already corrected for parked requests. Refuses with `slow_down` on a sliding
 window, so a legitimate burst is delayed rather than denied. Provisional, as
 P11 requires: replaced by measured values in Phase 6.
 
-**`recovery_epoch` is reserved storage, not a mechanism.** The column is
+**`recovery_epoch` was reserved storage, not a mechanism** — through Phase 0.
+Phase 1 wired it; see the note below. Through Phase 0 the column was
 declared on eight tables and never written or read. A restore today invalidates
 nothing. The schema previously described it as working.
 
@@ -167,19 +168,33 @@ no pooling refuses the ninth caller cleanly and recovers on release, which is
 adequate for one operator and not for several. Raising the limit without
 pooling only moves the number.
 
-**`recovery_epoch` is not being wired, and is not Phase 1 scope.** The
-columns exist on eight tables, but wiring them means an epoch predicate on 46 statements
-across two components plus a new metadata row, a bump command and a mirrored
-implementation in the test double — re-engineering rather than filling in a
-field. Nothing in the gate requires it.
+**`recovery_epoch` is wired, in Phase 1, and the cost estimate that nearly
+prevented it was wrong.** The
+columns exist on eight tables. The estimate that deferred this said wiring them
+meant an epoch predicate on 46 statements across two components — and that was
+for the wrong design. Every credential read already filters on a revocation, so
+the epoch only has to be applied *once, at restore*, by revoking what predates
+it. Reads never change.
 
-Owner decision: **a nice-to-have, revisited at the end of the project rather
-than scheduled.** The consequence, stated so it is not forgotten: restoring a
-backup reinstates credentials that were valid at snapshot time, including ones
-revoked since. If it is picked up, the cheaper and arguably better shape is a
-single bulk invalidation run as a documented restore step: after a restore an
-operator generally *wants* everything re-consented, not selectively filtered.
-The columns stay reserved storage and say so.
+The remaining problem — rows inserted after an advance must carry the new epoch
+— is solved by a function-backed column default rather than by passing it at
+every INSERT, which is where the 46 statements came from. **Not one INSERT in
+either component changed.**
+
+Phase 1's tested list requires it outright: "a restore advances the recovery
+epoch and cannot make a pre-restore grant/A mapping, refresh family or B
+usable". That requirement was missed in the Phase 0 reading that recorded the
+deferral. `./bin/mapp advance-recovery-epoch --confirm` is the entry point, and
+it is step 5 of the restore procedure — before the stack starts, because a
+pre-restore credential is usable until it has run.
+
+The sweep invalidates every *live* credential rather than only those stamped
+below the counter. A surviving mutation showed why: at sweep time nothing can
+legitimately carry the new epoch, so an epoch predicate selects the same rows —
+except when a *newer* snapshot is restored over an older database, where it
+spares exactly the credentials from a state this database does not recognise.
+The stamp records which restore era a credential was minted in; it is not the
+filter.
 
 **The audit table (P19) is deferred past Phase 1**, by decision. The audit log
 stays append-only at `var/control/audit.jsonl` and does not share a transaction

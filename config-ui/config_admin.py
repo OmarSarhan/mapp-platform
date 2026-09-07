@@ -22,6 +22,7 @@ def parser() -> argparse.ArgumentParser:
             "mcp-client-list",
             "mcp-client-disable",
             "migrate-rollback",
+            "advance-recovery-epoch",
         ),
     )
     parser.add_argument("--root", default=os.environ.get("CONTROL_DIR", "/control"))
@@ -53,12 +54,67 @@ def parser() -> argparse.ArgumentParser:
         " every control table.",
     )
     parser.add_argument(
+        "--reason",
+        help="Recorded in the audit entry for an epoch advance.",
+    )
+    parser.add_argument(
         "--confirm",
         action="store_true",
         help="Perform a rollback. Without it the plan is printed and nothing"
         " changes.",
     )
     return parser
+
+
+def advance_recovery_epoch_command(args, store) -> bool:
+    """Invalidate every credential the restored database brought back.
+
+    A snapshot contains every credential that was valid when it was taken,
+    including ones revoked since, so restoring it hands them back. This is the
+    step that closes that -- and it is destructive in the ordinary way rather
+    than the alarming way: nothing is lost that cannot be obtained again by
+    signing in and consenting.
+
+    Confirmed, because it is equally usable as a panic button on a live
+    platform, where the effect is the same and the intent is different.
+    """
+    if args.command != "advance-recovery-epoch":
+        return False
+    if not args.confirm:
+        print(f"Current recovery epoch: {store.recovery_epoch()}.")
+        print()
+        print(
+            "Advancing it invalidates every credential this database now"
+            " holds:"
+        )
+        print("  - dashboard sessions, so operators sign in again")
+        print("  - CLI API tokens, so each has to be reissued")
+        print("  - device authorizations in flight")
+        print("  - MCP grants and their tokens, so agents consent again")
+        print()
+        print(
+            "Not touched: the administrator credential, registered OAuth"
+            " clients,\nthe audit log, and everything under var. Nothing here"
+            " is unrecoverable --\nit all comes back by signing in and"
+            " consenting again."
+        )
+        print()
+        print(
+            "Run this after restoring a database and before serving traffic,"
+            " or a\npre-restore credential stays usable. Re-run with --confirm."
+        )
+        raise SystemExit(2)
+    result = store.advance_recovery_epoch(reason=args.reason or "operator")
+    print(f"Recovery epoch is now {result['epoch']}.")
+    for table, count in sorted(result["revoked"].items()):
+        if count:
+            print(f"  revoked {count} in {table}")
+    for table, count in sorted(result["deleted"].items()):
+        if count:
+            print(f"  removed {count} in {table}")
+    if not any(result["revoked"].values()) and not any(result["deleted"].values()):
+        print("  nothing was live, so nothing was invalidated")
+    return True
 
 
 def migrate_rollback_command(args, store) -> bool:
@@ -176,6 +232,8 @@ def mcp_client_command(args, store) -> bool:
 def main() -> None:
     args = parser().parse_args()
     store = ControlStore(Path(args.root))
+    if advance_recovery_epoch_command(args, store):
+        return
     if migrate_rollback_command(args, store):
         return
     if mcp_client_command(args, store):

@@ -120,6 +120,57 @@ class ResetCommandSafetyTests(unittest.TestCase):
         self.assertIn("destructive", line)
         self.assertIn("--confirm", line)
 
+    def test_epoch_advance_never_self_confirms_and_never_starts_the_app(
+        self,
+    ) -> None:
+        """Two properties, and the second is the one easy to lose.
+
+        The point of the command is to invalidate restored credentials *before*
+        anything can accept one, so it must bring up the database and not the
+        application. --no-deps is what makes that true, and injecting --confirm
+        would take the decision away from the operator.
+        """
+        dispatch = self.script[self.script.index("\n  advance-recovery-epoch)") :]
+        dispatch = dispatch[: dispatch.index("\n    ;;")]
+        commands = "\n".join(
+            line
+            for line in dispatch.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertIn(
+            'python config_admin.py advance-recovery-epoch --root /control'
+            ' "${@:2}"',
+            commands,
+        )
+        self.assertIn("run --rm --no-deps config-ui", commands)
+        self.assertIn("up --detach --wait db", commands)
+        self.assertNotIn("--confirm", commands)
+
+    def test_epoch_advance_is_advertised_as_destructive(self) -> None:
+        usage = self.script[self.script.index("usage() {") :]
+        usage = usage[: usage.index("\n}\n")]
+        line = next(
+            item for item in usage.splitlines() if "advance-recovery-epoch" in item
+        )
+        self.assertIn("destructive", line)
+        self.assertIn("--confirm", line)
+
+    def test_the_restore_procedure_invalidates_restored_credentials(self) -> None:
+        """The mechanism is only reachable if the procedure says to run it.
+
+        A restore document that recovers credentials without invalidating them
+        is how the hole stays open in practice, whatever the code can do.
+        """
+        document = (ROOT / "docs/backup-restore.md").read_text(encoding="utf-8")
+        self.assertIn("./bin/mapp advance-recovery-epoch --confirm", document)
+        self.assertIn("including ones revoked since", document)
+        # Ordered before the stack starts, or a pre-restore credential is
+        # usable in the window between.
+        self.assertLess(
+            document.index("advance-recovery-epoch"),
+            document.index("Initialize or clear stale live and preview reload"),
+        )
+
     def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
         self.assertIn("is_buildkit_lease_failure()", self.script)
         self.assertIn("run_with_buildkit_lease_retry()", self.script)

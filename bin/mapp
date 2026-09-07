@@ -48,6 +48,7 @@ usage() {
     "  mcp-client-list list registered MCP clients" \
     "  mcp-client-disable --client-id ID  disable an MCP client" \
     "  migrate-rollback --to N [--confirm]  step the control schema ladder down; destructive, prints the plan first" \
+    "  advance-recovery-epoch [--confirm]  invalidate every credential a restored database brought back; destructive, prints the plan first" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-system --confirm return the platform to its initial state: new database, seed workspace, new administrator password" \
     "  upgrade-derived repair H3, derived roles, and spatial indexes in an existing bundled database" \
@@ -1055,6 +1056,20 @@ case "${1:-}" in
     "${compose[@]}" up --detach --wait db >/dev/null
     "${compose[@]}" run --rm --no-deps config-ui \
       python config_admin.py revoke-tokens --root /control
+    ;;
+  advance-recovery-epoch)
+    # Run after restoring a database and before serving traffic: a snapshot
+    # carries every credential that was valid when it was taken, including ones
+    # revoked since. config_admin prints the plan and refuses without
+    # --confirm; arguments are forwarded verbatim and --confirm is never
+    # injected.
+    #
+    # --no-deps deliberately: this needs the database and must not start the
+    # application, because the whole point is to invalidate the credentials
+    # before anything can accept one.
+    "${compose[@]}" up --detach --wait db >/dev/null
+    "${compose[@]}" run --rm --no-deps config-ui \
+      python config_admin.py advance-recovery-epoch --root /control "${@:2}"
     ;;
   migrate-rollback)
     # Destructive, and the plan is printed by config_admin rather than here:

@@ -383,11 +383,18 @@ which is recreated on start; do not restore it.
 Phase 0 stops deliberately short in several places. Beyond the missing client
 registration above:
 
-- the configuration API does not re-check a token B's operation and request
-  binding, so the binding is written and read only within the component;
-- `recovery_epoch` exists on every table that can authorise something, but
-  nothing writes or reads it, so restoring a snapshot invalidates nothing;
 - the operation allowlist covers a handful of configuration-API actions
   rather than the whole surface, and adding one is a deliberate act;
-- there is no dashboard view of grants and no operator revocation command;
-- the migration ladder is forward-only.
+- there is no dashboard view of grants, and revocation is reachable only
+  through the internal endpoint or by disabling a client;
+- rotating refresh tokens with family replay detection are not implemented;
+- the audit log records authorization decisions from the configuration
+  service, but the authorization component itself writes no audit events;
+- `mapp-mcp` does not exist, so nothing produces a request digest in anger and
+  the third independent canonicalization implementation is absent.
+
+Three entries left this list in Phase 1 and one in M7, which is worth naming
+because a stale limitations list is worse than none: the configuration API
+re-checks the token-B operation and request binding (M7), the migration ladder
+has a tested rollback, and `recovery_epoch` is a working restore-time
+invalidation rather than reserved storage.
