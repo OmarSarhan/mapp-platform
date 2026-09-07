@@ -160,6 +160,250 @@ class SqlStore:
         with self._connect() as connection:
             connection.execute("SELECT 1")
 
+    # -- rotating refresh families ---------------------------------------
+
+    #: Section 4's approved bounds. Idle moves on every rotation; absolute
+    #: never does, which is what stops an indefinitely-refreshed session
+    #: outliving the consent it came from.
+    REFRESH_IDLE_SECONDS = 12 * 60 * 60
+    REFRESH_ABSOLUTE_SECONDS = 30 * 24 * 60 * 60
+
+    def start_refresh_family(
+        self,
+        raw_token: str,
+        *,
+        family_id: str,
+        grant_id: str,
+        client_id: str,
+        scope: str,
+        idle_seconds: int | None = None,
+        absolute_seconds: int | None = None,
+    ) -> None:
+        """Open a family and issue its first token, in one transaction.
+
+        The two are never separately visible: a family with no token is a row
+        nothing can use, and a token with no family cannot be authorised.
+        """
+        idle = idle_seconds or self.REFRESH_IDLE_SECONDS
+        absolute = absolute_seconds or self.REFRESH_ABSOLUTE_SECONDS
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                connection.execute(
+                    "INSERT INTO control.oauth_refresh_families"
+                    "(family_id, grant_id, client_id, scope, absolute_expires_at)"
+                    " VALUES(%s,%s,%s,%s, now() + make_interval(secs => %s))",
+                    (family_id, grant_id, client_id, scope, absolute),
+                )
+                connection.execute(
+                    "INSERT INTO control.oauth_refresh_tokens"
+                    "(token_hash, family_id, idle_expires_at)"
+                    " VALUES(%s,%s, now() + make_interval(secs => %s))",
+                    (token_digest(raw_token), family_id, idle),
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def rotate_refresh_token(
+        self,
+        old_raw: str,
+        new_raw: str,
+        *,
+        idle_seconds: int | None = None,
+    ) -> dict:
+        """Spend one refresh token and issue its successor, or explain why not.
+
+        One transaction, so a client is never left holding a spent token and no
+        replacement. The conditional UPDATE is the authority: two simultaneous
+        presentations of the same token cannot both rotate, which is what makes
+        "rotated every use" mean anything.
+
+        **A replay revokes the family and its grant here, not in the caller.**
+        Section 4 requires that, and detection separated from the act leaves a
+        window in which a replay is known and nothing has happened -- which is
+        the window an attacker with a stolen token wants. The cost is real and
+        is the specification's own open item O7: a client that retries after a
+        network timeout is indistinguishable from an attacker replaying, and
+        loses the operator's consent.
+
+        Returns an outcome rather than raising, because the caller has to
+        distinguish "refuse" from "refuse and tell the operator something is
+        wrong", and an exception type per reason would be worse.
+        """
+        idle = idle_seconds or self.REFRESH_IDLE_SECONDS
+        old_digest = token_digest(old_raw)
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                rotated = connection.execute(
+                    "UPDATE control.oauth_refresh_tokens AS t"
+                    "   SET consumed_at = now()"
+                    " WHERE t.token_hash = %s"
+                    "   AND t.consumed_at IS NULL"
+                    "   AND t.idle_expires_at > now()"
+                    "   AND EXISTS ("
+                    "     SELECT 1 FROM control.oauth_refresh_families f"
+                    "       JOIN control.oauth_grants g"
+                    "         ON g.grant_id = f.grant_id"
+                    "      WHERE f.family_id = t.family_id"
+                    "        AND f.revoked_at IS NULL"
+                    "        AND f.absolute_expires_at > now()"
+                    "        AND g.revoked_at IS NULL)"
+                    " RETURNING family_id",
+                    (old_digest,),
+                ).fetchone()
+                if rotated is not None:
+                    family_id = rotated["family_id"]
+                    family = connection.execute(
+                        "SELECT grant_id, client_id, scope, absolute_expires_at"
+                        "  FROM control.oauth_refresh_families"
+                        " WHERE family_id = %s",
+                        (family_id,),
+                    ).fetchone()
+                    connection.execute(
+                        "INSERT INTO control.oauth_refresh_tokens"
+                        "(token_hash, family_id, idle_expires_at)"
+                        " VALUES(%s,%s, now() + make_interval(secs => %s))",
+                        (token_digest(new_raw), family_id, idle),
+                    )
+                    connection.execute(
+                        "UPDATE control.oauth_refresh_tokens SET replaced_by = %s"
+                        " WHERE token_hash = %s",
+                        (token_digest(new_raw), old_digest),
+                    )
+                    connection.execute("COMMIT")
+                    return {
+                        "outcome": "rotated",
+                        "family_id": family_id,
+                        "grant_id": family["grant_id"],
+                        "client_id": family["client_id"],
+                        "scope": family["scope"],
+                    }
+
+                # It did not rotate. Why decides whether this is merely a
+                # refusal or evidence of a stolen credential.
+                state = connection.execute(
+                    "SELECT t.family_id, t.consumed_at,"
+                    "       t.idle_expires_at <= now() AS idle_expired,"
+                    "       f.revoked_at IS NOT NULL AS family_revoked,"
+                    "       f.absolute_expires_at <= now() AS family_expired,"
+                    "       g.revoked_at IS NOT NULL AS grant_revoked"
+                    "  FROM control.oauth_refresh_tokens t"
+                    "  LEFT JOIN control.oauth_refresh_families f"
+                    "    ON f.family_id = t.family_id"
+                    "  LEFT JOIN control.oauth_grants g"
+                    "    ON g.grant_id = f.grant_id"
+                    " WHERE t.token_hash = %s",
+                    (old_digest,),
+                ).fetchone()
+                if state is None:
+                    connection.execute("COMMIT")
+                    return {"outcome": "unknown"}
+                # Revocation is checked before consumption, so a token spent
+                # before a restore reports the restore rather than a replay. It
+                # used to report "replayed" -- a stolen-credential signal -- for
+                # a family the operator's own restore had revoked.
+                if state["grant_revoked"]:
+                    connection.execute("COMMIT")
+                    return {"outcome": "grant-revoked", "family_id": state["family_id"]}
+                if state["family_revoked"]:
+                    connection.execute("COMMIT")
+                    return {"outcome": "family-revoked", "family_id": state["family_id"]}
+                if state["consumed_at"] is not None:
+                    # The replay. Revoke the family and the grant in this same
+                    # transaction, so the detection and the consequence cannot
+                    # be separated by a crash or a slow caller.
+                    connection.execute(
+                        "UPDATE control.oauth_refresh_families"
+                        "   SET revoked_at = now(), revoked_reason = %s"
+                        " WHERE family_id = %s AND revoked_at IS NULL",
+                        ("refresh-replay", state["family_id"]),
+                    )
+                    grant = connection.execute(
+                        "UPDATE control.oauth_grants"
+                        "   SET revoked_at = now(), revoked_reason = %s"
+                        " WHERE grant_id = ("
+                        "     SELECT grant_id FROM control.oauth_refresh_families"
+                        "      WHERE family_id = %s)"
+                        "   AND revoked_at IS NULL"
+                        " RETURNING grant_id",
+                        ("refresh-replay", state["family_id"]),
+                    ).fetchone()
+                    connection.execute("COMMIT")
+                    return {
+                        "outcome": "replayed",
+                        "family_id": state["family_id"],
+                        "grant_revoked": grant["grant_id"] if grant else None,
+                    }
+                connection.execute("COMMIT")
+                if state["family_expired"]:
+                    return {"outcome": "family-expired", "family_id": state["family_id"]}
+                if state["idle_expired"]:
+                    return {"outcome": "idle-expired", "family_id": state["family_id"]}
+                # No condition explains it: the row moved between the update and
+                # the read. Refuse rather than guess.
+                return {"outcome": "unknown", "family_id": state["family_id"]}
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def revoke_refresh_family(self, family_id: str, reason: str = "") -> bool:
+        """Revoke one family, reporting whether this call did it.
+
+        Does not touch the grant. An operator withdrawing a refresh family is
+        not withdrawing the consent; only a replay does both, and that is
+        decided where the replay is detected.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "UPDATE control.oauth_refresh_families"
+                "   SET revoked_at = now(), revoked_reason = %s"
+                " WHERE family_id = %s AND revoked_at IS NULL"
+                " RETURNING family_id",
+                (reason or None, family_id),
+            ).fetchone()
+        return row is not None
+
+    def revoke_refresh_families_for_grant(self, grant_id: str, reason: str = "") -> int:
+        """Revoke every live family of one grant.
+
+        Revoking a grant already stops a refresh -- the rotation statement
+        joins the grant -- so this is not what makes revocation correct. It is
+        what stops a revoked grant leaving live-looking families behind for an
+        operator to puzzle over.
+        """
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE control.oauth_refresh_families"
+                "   SET revoked_at = now(), revoked_reason = %s"
+                " WHERE grant_id = %s AND revoked_at IS NULL",
+                (reason or None, grant_id),
+            )
+        return result.rowcount
+
+    def query_refresh_family(self, family_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT family_id, grant_id, client_id, scope, created_at,"
+                " absolute_expires_at, revoked_at, revoked_reason"
+                "  FROM control.oauth_refresh_families WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def refresh_token_state(self, raw_token: str) -> dict | None:
+        """Read one refresh token without spending it, for assertions and audit."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT family_id, issued_at, idle_expires_at, consumed_at,"
+                " replaced_by"
+                "  FROM control.oauth_refresh_tokens WHERE token_hash = %s",
+                (token_digest(raw_token),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     # -- the operator credential -----------------------------------------
 
     def admin_password_hash(self) -> str:

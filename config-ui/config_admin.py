@@ -104,7 +104,13 @@ def advance_recovery_epoch_command(args, store) -> bool:
             " or a\npre-restore credential stays usable. Re-run with --confirm."
         )
         raise SystemExit(2)
-    result = store.advance_recovery_epoch(reason=args.reason or "operator")
+    try:
+        result = store.advance_recovery_epoch(reason=args.reason or "operator")
+    except RuntimeError as exc:
+        # Now reachable: the store no longer migrates before checking. This is
+        # the refusal docs/backup-restore.md documents for a dump that predates
+        # the mechanism, so it must read as guidance rather than a traceback.
+        raise SystemExit(str(exc)) from None
     print(f"Recovery epoch is now {result['epoch']}.")
     for table, count in sorted(result["revoked"].items()):
         if count:
@@ -130,6 +136,13 @@ def migrate_rollback_command(args, store) -> bool:
         return False
     if args.to is None:
         raise SystemExit("--to is required: the schema version to roll back to.")
+    if args.to < 0:
+        # Refused here, with the plan, rather than by control_schema.rollback
+        # after --confirm. A negative target used to print a full destructive
+        # plan and exit 2, and the confirmed run then died on an unhandled
+        # ValueError -- so the plan and the action disagreed for every negative
+        # value.
+        raise SystemExit("--to must be zero or a migration version.")
     plan = store.rollback_plan(args.to)
     if plan["missing"]:
         raise SystemExit(
@@ -251,8 +264,17 @@ def main() -> None:
         if not store.initialize(password):
             print("Authentication already initialized; existing credentials were unchanged.")
             return
-    else:
+    elif args.command in ("reset-password", "reset-demo"):
         store.reset_password(password, revoke_tokens=args.command == "reset-demo")
+    else:
+        # Named rather than a trailing else. Every command above returns, so an
+        # unhandled one used to fall through to reset_password -- meaning a new
+        # entry in the parser's choices with no dispatch branch would silently
+        # rotate the administrator credential and print a new one, exiting 0.
+        raise SystemExit(
+            f"{args.command!r} has no handler. This is a bug: add a branch"
+            " rather than letting it reach the credential reset."
+        )
     print(f"Admin password (shown once): {password}")
 
 

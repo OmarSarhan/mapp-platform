@@ -37,6 +37,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised by the skip below
     psycopg = None
 
+# Imported at module scope because the fixtures below read its shared
+# table order; a method-local import left it invisible to setUp.
+try:
+    import control_schema as cs  # noqa: E402
+except ModuleNotFoundError:  # pragma: no cover - covered by the skip
+    cs = None  # type: ignore[assignment]
+
 from authlib.oauth2.rfc7636 import create_s256_code_challenge  # noqa: E402
 
 import canonical  # noqa: E402
@@ -66,8 +73,6 @@ class RegisteredClientFlowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         os.environ["AUTHLIB_INSECURE_TRANSPORT"] = "1"
-        import control_schema as cs
-
         connection = cs.connect(DATABASE_URL)
         try:
             cs.migrate(connection)
@@ -80,14 +85,7 @@ class RegisteredClientFlowTests(unittest.TestCase):
 
         os.environ["CONTROL_DATABASE_URL"] = DATABASE_URL
         with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
-            for table in (
-                "oauth_authorization_codes",
-                "oauth_pending_authorizations",
-                "oauth_tokens",
-                "oauth_sessions",
-                "oauth_grants",
-                "oauth_clients",
-            ):
+            for table in cs.TABLES_IN_DELETE_ORDER:
                 connection.execute(f"DELETE FROM control.{table}")
 
         # The operator's half. ControlStore needs a root for the file-backed

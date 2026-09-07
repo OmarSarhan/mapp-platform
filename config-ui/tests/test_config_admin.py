@@ -20,21 +20,74 @@ class ConfigAdminTests(unittest.TestCase):
             args = config_admin.parser().parse_args(["revoke-tokens"])
         self.assertEqual("/control", args.root)
 
-    def test_every_command_is_reachable_from_the_parser(self):
-        """A command in the choices list with no branch would exit silently."""
-        for command in (
-            "init",
-            "reset-password",
-            "reset-demo",
-            "revoke-tokens",
-            "mcp-client-register",
-            "mcp-client-list",
-            "mcp-client-disable",
-            "migrate-rollback",
-        ):
-            with self.subTest(command=command):
-                args = config_admin.parser().parse_args([command])
-                self.assertEqual(command, args.command)
+    def test_an_unhandled_command_refuses_instead_of_resetting_the_password(self):
+        """The catch-all used to mean "rotate the administrator credential".
+
+        Every handled command returns before the tail of main(), so a command
+        in the parser's choices with no dispatch branch fell through to
+        reset_password -- silently destroying the credential, printing a new
+        one and exiting 0. Driven with a command the parser accepts and nothing
+        handles.
+
+        The previous test here only asserted that argparse echoed back a name
+        from its own choices list, which is true by construction and could not
+        detect this.
+        """
+        import unittest.mock as mock
+
+        args = config_admin.parser().parse_args(["revoke-tokens"])
+        args.command = "not-dispatched"
+        store = mock.MagicMock()
+        with self.assertRaises(SystemExit) as caught:
+            config_admin.main.__wrapped__(args, store) if hasattr(
+                config_admin.main, "__wrapped__"
+            ) else self._run_main_tail(args, store)
+        self.assertIn("no handler", str(caught.exception))
+        store.reset_password.assert_not_called()
+        store.initialize.assert_not_called()
+
+    def _run_main_tail(self, args, store):
+        """main() reads its arguments from sys.argv, so drive it that way."""
+        import unittest.mock as mock
+
+        with mock.patch.object(config_admin, "ControlStore", return_value=store), \
+             mock.patch.object(config_admin.sys, "argv",
+                               ["config_admin.py", "revoke-tokens"]), \
+             mock.patch.object(config_admin, "parser") as parser:
+            parser.return_value.parse_args.return_value = args
+            config_admin.main()
+
+    def test_every_choice_has_a_dispatch_branch(self):
+        """Drives each command far enough to prove it is handled somewhere.
+
+        The guard above turns a missing branch into a refusal; this is what
+        notices one exists at all.
+        """
+        import unittest.mock as mock
+
+        handled = []
+        for command in config_admin.parser()._actions[1].choices:
+            args = config_admin.parser().parse_args([command])
+            store = mock.MagicMock()
+            for handler in (
+                config_admin.advance_recovery_epoch_command,
+                config_admin.migrate_rollback_command,
+                config_admin.mcp_client_command,
+            ):
+                try:
+                    if handler(args, store):
+                        handled.append(command)
+                        break
+                except SystemExit:
+                    handled.append(command)
+                    break
+            else:
+                if command in ("init", "reset-password", "reset-demo",
+                               "revoke-tokens"):
+                    handled.append(command)
+        self.assertEqual(
+            sorted(config_admin.parser()._actions[1].choices), sorted(set(handled))
+        )
 
 
 class MigrateRollbackCommandTests(ControlStoreTestCase):
@@ -62,6 +115,39 @@ class MigrateRollbackCommandTests(ControlStoreTestCase):
         with redirect_stdout(captured):
             handled = config_admin.migrate_rollback_command(args, self.store)
         return handled, captured.getvalue()
+
+    def test_the_plan_only_run_does_not_migrate_the_schema(self) -> None:
+        """Its whole contract is "prints the plan and changes nothing".
+
+        It was applying the entire forward ladder before computing the plan,
+        because ControlStore._db migrates on first use: a schema at version 4
+        came back at 6, and the command then exited 2 saying nothing had
+        happened. Measured through a *separate* connection, because measuring
+        through the store's own would be blind to exactly this.
+        """
+        import control_schema as cs
+
+        with self.store._db(migrate=False) as connection:
+            cs.rollback(connection, 4, accept_data_loss=True)
+        with self.store._db(migrate=False) as connection:
+            self.assertEqual([1, 2, 3, 4], cs.applied_versions(connection))
+        with self.assertRaises(SystemExit):
+            self.run_command("--to", "2")
+        with self.store._db(migrate=False) as connection:
+            self.assertEqual([1, 2, 3, 4], cs.applied_versions(connection))
+
+    def test_a_negative_target_is_refused_with_the_plan(self) -> None:
+        """The plan and the action have to agree.
+
+        A negative target used to print a full destructive plan and exit 2 --
+        the "read the price, then re-run with --confirm" contract -- and the
+        confirmed run then died on an unhandled ValueError.
+        """
+        with self.assertRaises(SystemExit) as caught:
+            self.run_command("--to", "-1")
+        self.assertIn("zero or a migration version", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            self.run_command("--to", "-1", "--confirm")
 
     def test_it_requires_a_target(self) -> None:
         with self.assertRaises(SystemExit) as caught:
@@ -223,6 +309,23 @@ class AdvanceRecoveryEpochCommandTests(ControlStoreTestCase):
         self.assertFalse(
             config_admin.advance_recovery_epoch_command(args, self.store)
         )
+
+    def test_a_schema_without_the_mechanism_refuses_with_guidance(self) -> None:
+        """The refusal docs/backup-restore.md documents, now reachable.
+
+        It could not fire before: the store migrated to head on first use, so
+        the precondition checked for a migration it had just applied. And it
+        arrived as a traceback rather than as something an operator could act
+        on.
+        """
+        import control_schema as cs
+
+        with self.store._db(migrate=False) as connection:
+            cs.rollback(connection, 4, accept_data_loss=True)
+        with self.assertRaises(SystemExit) as caught:
+            self.run_command("--confirm")
+        self.assertIn("migration 5", str(caught.exception))
+        self.assertIn("pre-restore credentials", str(caught.exception))
 
 
 if __name__ == "__main__":

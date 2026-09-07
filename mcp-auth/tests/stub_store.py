@@ -49,6 +49,8 @@ class StubStore:
         self._exchanged: dict[str, dict] = {}
         self._grants: dict[str, Grant] = {}
         self._admin_password_hash = ""
+        self._refresh_families: dict[str, dict] = {}
+        self._refresh_tokens: dict[str, dict] = {}
         self._pending: dict[str, PendingAuthorization] = {}
         self._sessions: dict[str, Session] = {}
 
@@ -71,6 +73,146 @@ class StubStore:
 
     def ping(self) -> None:
         """Always reachable: it is this process."""
+
+    # -- rotating refresh families ---------------------------------------
+
+    REFRESH_IDLE_SECONDS = 12 * 60 * 60
+    REFRESH_ABSOLUTE_SECONDS = 30 * 24 * 60 * 60
+
+    def start_refresh_family(
+        self,
+        raw_token: str,
+        *,
+        family_id: str,
+        grant_id: str,
+        client_id: str,
+        scope: str,
+        idle_seconds: int | None = None,
+        absolute_seconds: int | None = None,
+    ) -> None:
+        import time as _time
+
+        now = _time.time()
+        with self._lock:
+            if family_id in self._refresh_families:
+                # family_id is the primary key in SQL, so a re-open raises
+                # there. Silently overwriting would let the double resurrect a
+                # revoked family.
+                raise ValueError(f"Refresh family {family_id!r} already exists.")
+            self._refresh_families[family_id] = {
+                "family_id": family_id,
+                "grant_id": grant_id,
+                "client_id": client_id,
+                "scope": scope,
+                "created_at": now,
+                "absolute_expires_at": now
+                + (absolute_seconds or self.REFRESH_ABSOLUTE_SECONDS),
+                "revoked_at": None,
+                "revoked_reason": None,
+            }
+            self._refresh_tokens[token_digest(raw_token)] = {
+                "family_id": family_id,
+                "issued_at": now,
+                "idle_expires_at": now + (idle_seconds or self.REFRESH_IDLE_SECONDS),
+                "consumed_at": None,
+                "replaced_by": None,
+            }
+
+    def rotate_refresh_token(
+        self, old_raw: str, new_raw: str, *, idle_seconds: int | None = None
+    ) -> dict:
+        """In-memory twin of the SQL rotation, with the same outcomes.
+
+        The replay branch revokes the family and its grant here too. A double
+        that detected a replay without acting would let every test written
+        against it report a containment the real store performs and it does not.
+        """
+        import time as _time
+
+        now = _time.time()
+        old_digest = token_digest(old_raw)
+        with self._lock:
+            token = self._refresh_tokens.get(old_digest)
+            if token is None:
+                return {"outcome": "unknown"}
+            family = self._refresh_families.get(token["family_id"])
+            grant = self._grants.get(family["grant_id"]) if family else None
+
+            # Revocation before consumption, as in SQL: a token spent before a
+            # restore reports the restore, not a replay.
+            if grant is None or grant.is_revoked():
+                return {"outcome": "grant-revoked", "family_id": token["family_id"]}
+            if family is not None and family["revoked_at"] is not None:
+                return {"outcome": "family-revoked", "family_id": token["family_id"]}
+            if token["consumed_at"] is not None:
+                if family is not None and family["revoked_at"] is None:
+                    family["revoked_at"] = now
+                    family["revoked_reason"] = "refresh-replay"
+                revoked_grant = None
+                if grant is not None and grant.revoked_at is None:
+                    grant.revoked_at = now
+                    revoked_grant = grant.grant_id
+                return {
+                    "outcome": "replayed",
+                    "family_id": token["family_id"],
+                    "grant_revoked": revoked_grant,
+                }
+            if family["absolute_expires_at"] <= now:
+                return {"outcome": "family-expired", "family_id": token["family_id"]}
+            if token["idle_expires_at"] <= now:
+                return {"outcome": "idle-expired", "family_id": token["family_id"]}
+
+            new_digest = token_digest(new_raw)
+            token["consumed_at"] = now
+            token["replaced_by"] = new_digest
+            self._refresh_tokens[new_digest] = {
+                "family_id": token["family_id"],
+                "issued_at": now,
+                "idle_expires_at": now + (idle_seconds or self.REFRESH_IDLE_SECONDS),
+                "consumed_at": None,
+                "replaced_by": None,
+            }
+            return {
+                "outcome": "rotated",
+                "family_id": family["family_id"],
+                "grant_id": family["grant_id"],
+                "client_id": family["client_id"],
+                "scope": family["scope"],
+            }
+
+    def revoke_refresh_family(self, family_id: str, reason: str = "") -> bool:
+        import time as _time
+
+        with self._lock:
+            family = self._refresh_families.get(family_id)
+            if family is None or family["revoked_at"] is not None:
+                return False
+            family["revoked_at"] = _time.time()
+            family["revoked_reason"] = reason or None
+            return True
+
+    def revoke_refresh_families_for_grant(self, grant_id: str, reason: str = "") -> int:
+        import time as _time
+
+        now = _time.time()
+        with self._lock:
+            count = 0
+            for family in self._refresh_families.values():
+                if family["grant_id"] == grant_id and family["revoked_at"] is None:
+                    family["revoked_at"] = now
+                    family["revoked_reason"] = reason or None
+                    count += 1
+            return count
+
+    def query_refresh_family(self, family_id: str) -> dict | None:
+        with self._lock:
+            family = self._refresh_families.get(family_id)
+            return dict(family) if family is not None else None
+
+    def refresh_token_state(self, raw_token: str) -> dict | None:
+        with self._lock:
+            token = self._refresh_tokens.get(token_digest(raw_token))
+            return dict(token) if token is not None else None
 
     # -- the operator credential -----------------------------------------
 

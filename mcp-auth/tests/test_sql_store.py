@@ -65,18 +65,7 @@ class SqlStoreContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.store = SqlStore(DATABASE_URL)
         with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
-            for table in (
-                # Child before parent. The only foreign keys in the control
-                # schema are client_id -> oauth_clients, so it is the clients
-                # that must go last; nothing references oauth_grants. These are
-                # plain DELETEs, not CASCADE.
-                "oauth_authorization_codes",
-                "oauth_pending_authorizations",
-                "oauth_tokens",
-                "oauth_sessions",
-                "oauth_grants",
-                "oauth_clients",
-            ):
+            for table in cs.TABLES_IN_DELETE_ORDER:
                 connection.execute(f"DELETE FROM control.{table}")
         self.store.add_client(_client())
         # The grant every seeded code and token belongs to. There is no
@@ -669,3 +658,116 @@ class OperatorCredentialTests(unittest.TestCase):
 
         self.assertEqual("", self.store.admin_password_hash())
         self.assertFalse(passwords.verify_password("anything", ""))
+
+
+@requires_database
+class RefreshRotationConcurrencyTests(unittest.TestCase):
+    """Rotation must have exactly one winner, across connections.
+
+    "Rotated every use" is only meaningful if two simultaneous presentations of
+    the same token cannot both produce a replacement. And the loser must be a
+    *replay* -- which revokes the family and the grant -- because a store that
+    quietly let the second one through would make a stolen token as good as a
+    legitimate one.
+
+    That is also the sharpest edge of open item O7: a client that retries a
+    timed-out refresh is indistinguishable from an attacker here, and this test
+    pins the containment rather than the comfort.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        connection = cs.connect(DATABASE_URL)
+        try:
+            cs.migrate(connection)
+        finally:
+            connection.close()
+
+    def setUp(self) -> None:
+        self.store = SqlStore(DATABASE_URL)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as connection:
+            for table in cs.TABLES_IN_DELETE_ORDER:
+                connection.execute(f"DELETE FROM control.{table}")
+        self.store.add_client(_client())
+        self.store.save_grant(
+            Grant(
+                grant_id="oauth:grant-1",
+                client_id="mcp-client",
+                subject="operator",
+                scopes=("mcp:connect", "inspect"),
+            )
+        )
+        self.store.start_refresh_family(
+            "mapp_r_start",
+            family_id="fam",
+            grant_id="oauth:grant-1",
+            client_id="mcp-client",
+            scope="mcp:connect",
+        )
+
+    def test_simultaneous_rotations_yield_one_replacement(self) -> None:
+        outcomes: list = []
+
+        def rotate(index):
+            store = SqlStore(DATABASE_URL)
+            try:
+                outcomes.append(
+                    store.rotate_refresh_token("mapp_r_start", f"mapp_r_new_{index}")
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded then asserted
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=rotate, args=(n,)) for n in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertTrue(all(isinstance(item, dict) for item in outcomes), outcomes)
+        rotated = [item for item in outcomes if item["outcome"] == "rotated"]
+        self.assertEqual(1, len(rotated), outcomes)
+        # Exactly one replacement exists, and it is the winner's.
+        winner = rotated[0]
+        live = [
+            index
+            for index in range(6)
+            if self.store.refresh_token_state(f"mapp_r_new_{index}") is not None
+        ]
+        self.assertEqual(1, len(live))
+        self.assertEqual("fam", winner["family_id"])
+
+    def test_the_losers_are_replays_and_the_family_is_contained(self) -> None:
+        """Whether a loser reports 'replayed' depends on the timing of its read.
+
+        A loser that reaches the diagnostic after the winner committed sees a
+        consumed token and reports a replay; one that reads inside the winner's
+        window sees it unconsumed and reports 'unknown'. Both refuse, which is
+        the property that matters. What must always hold is that a *later*
+        presentation of the spent token is a replay and the family is contained.
+        """
+        outcomes: list = []
+
+        def rotate(index):
+            store = SqlStore(DATABASE_URL)
+            outcomes.append(
+                store.rotate_refresh_token("mapp_r_start", f"mapp_r_new_{index}")
+            )
+
+        threads = [threading.Thread(target=rotate, args=(n,)) for n in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(
+            1, sum(1 for item in outcomes if item["outcome"] == "rotated")
+        )
+        for item in outcomes:
+            with self.subTest(outcome=item["outcome"]):
+                self.assertIn(
+                    item["outcome"], {"rotated", "replayed", "unknown", "grant-revoked"}
+                )
+        # Now, unambiguously after the fact:
+        after = self.store.rotate_refresh_token("mapp_r_start", "mapp_r_late")
+        self.assertIn(after["outcome"], {"replayed", "grant-revoked", "family-revoked"})
+        self.assertTrue(self.store.query_grant("oauth:grant-1").is_revoked())
+        self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])

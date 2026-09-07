@@ -230,6 +230,56 @@ class AdvanceTests(RecoveryEpochTestCase):
             ).fetchone()["revoked_at"]
         self.assertEqual(2020, when.year)
 
+    def test_a_restore_revocation_says_it_was_a_restore(self) -> None:
+        """Otherwise it is indistinguishable from an operator or a replay.
+
+        Only some tables carry a revoked_reason -- oauth_grants and
+        oauth_refresh_families do, `tokens` and `oauth_tokens` do not -- so the
+        sweep asks the catalogue which can record one rather than assuming.
+        """
+        self.seed_credentials()
+        self.store.advance_recovery_epoch(reason="restored from 2026-09-01")
+        with self.store._db(migrate=False) as connection:
+            reason = connection.execute(
+                "SELECT revoked_reason FROM control.oauth_grants"
+                " WHERE grant_id = 'g'"
+            ).fetchone()["revoked_reason"]
+        self.assertIn("recovery-epoch", reason)
+        self.assertIn("restored from 2026-09-01", reason)
+
+    def test_a_refresh_family_is_swept(self) -> None:
+        """Migration 6's coupling, which nothing exercised.
+
+        The family is in EPOCH_REVOKED_TABLES because it carries the
+        authority; its tokens are not, because revoking the family kills them.
+        """
+        client_id = self.store.register_oauth_client(
+            name="Agent",
+            redirect_uris=["https://agent.example/cb"],
+            scopes=["apply"],
+        )
+        with self.store._db(migrate=False) as connection:
+            connection.execute(
+                "INSERT INTO control.oauth_grants(grant_id, client_id, subject,"
+                " scopes) VALUES('gr', %s, 'operator', '{apply}')",
+                (client_id,),
+            )
+            connection.execute(
+                "INSERT INTO control.oauth_refresh_families(family_id, grant_id,"
+                " client_id, scope, absolute_expires_at)"
+                " VALUES('fam','gr',%s,'apply', now() + interval '30 days')",
+                (client_id,),
+            )
+        result = self.store.advance_recovery_epoch(reason="restore")
+        self.assertEqual(1, result["revoked"]["oauth_refresh_families"])
+        with self.store._db(migrate=False) as connection:
+            row = connection.execute(
+                "SELECT revoked_at, revoked_reason FROM"
+                " control.oauth_refresh_families WHERE family_id = 'fam'"
+            ).fetchone()
+        self.assertIsNotNone(row["revoked_at"])
+        self.assertIn("recovery-epoch", row["revoked_reason"])
+
     def test_the_advance_is_audited(self) -> None:
         self.seed_credentials()
         self.store.advance_recovery_epoch(reason="restored from 2026-09-01")
@@ -283,8 +333,12 @@ class MigrationTests(RecoveryEpochTestCase):
         for table, default in reverted.items():
             with self.subTest(table=table, stage="rolled back"):
                 self.assertNotIn("current_recovery_epoch", default or "")
+        # Derived: rolling back to 4 undoes every migration above it, so the
+        # re-apply returns all of them. Hardcoding [5] was the same drift that
+        # the ladder tests were already written to avoid, reintroduced here.
+        undone = sorted(version for version in cs.MIGRATIONS if version > 4)
         with self.store._db() as connection:
-            self.assertEqual([5], cs.migrate(connection))
+            self.assertEqual(undone, cs.migrate(connection))
         self.assertEqual(before, self.defaults())
 
     def test_the_function_is_stable_not_immutable(self) -> None:
@@ -364,14 +418,27 @@ class AtomicityTests(RecoveryEpochTestCase):
         self.assertFalse(self.revoked("oauth_grants", "grant_id", "g"))
 
     def test_an_advance_before_migration_five_is_refused(self) -> None:
-        """The mechanism cannot be half-present.
+        """The guard, pinned by its message rather than by any exception.
 
-        Reachable by rolling the ladder back to 4, which is exactly the state a
-        partial deployment would be in.
+        Asserting that "some exception escapes" did not pin this: deleting the
+        whole guard left the test passing, because the sweep then died on a
+        dropped table instead. A mutation showed that, so the assertion is now
+        on the guard's own words and on the counter not having moved.
         """
+        before = self.store.recovery_epoch()
         self.store.rollback_schema(4, accept_data_loss=True)
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError) as caught:
             self.store.advance_recovery_epoch()
+        message = str(caught.exception)
+        self.assertIn("migration 5", message)
+        self.assertIn("pre-restore credentials", message)
+        # And nothing moved: the refusal precedes the counter.
+        with self.store._db(migrate=False) as connection:
+            row = connection.execute(
+                "SELECT value FROM control.metadata WHERE key = 'recovery_epoch'"
+            ).fetchone()
+        self.assertIsNone(row, "migration 5's rollback removes the counter")
+        self.assertEqual(before, 0)
 
 
 if __name__ == "__main__":

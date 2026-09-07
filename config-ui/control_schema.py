@@ -474,17 +474,79 @@ def _migration_4(connection: psycopg.Connection) -> None:
     )
 
 
+#: Every table the ladder creates, ordered so a plain DELETE or TRUNCATE can
+#: walk it front to back: children before the parents they reference.
+#:
+#: Defined here because six fixtures and a benchmark each had their own copy of
+#: this order, and migration 6 broke every one of them at once -- its
+#: oauth_refresh_families references oauth_clients, so a list written before it
+#: existed deleted the clients first and hit a foreign key. One list, one place
+#: to update, and a test below that fails if a migration adds a table and
+#: forgets it.
+TABLES_IN_DELETE_ORDER = (
+    "oauth_refresh_tokens",
+    "oauth_refresh_families",
+    "oauth_authorization_codes",
+    "oauth_pending_authorizations",
+    "oauth_tokens",
+    "oauth_sessions",
+    "oauth_grants",
+    "oauth_clients",
+    "device_authorizations",
+    "tokens",
+    "sessions",
+    "admin_credential",
+    "metadata",
+)
+
+
+def all_tables(connection: psycopg.Connection) -> set[str]:
+    """Every table the control schema actually holds, for the drift check."""
+    return {
+        row["table_name"]
+        for row in connection.execute(
+            sql.SQL(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_schema = %s"
+            ),
+            (SCHEMA,),
+        ).fetchall()
+    }
+
+
 #: Every table whose rows carry authority and are stamped with the epoch they
 #: were minted under. Split by how each is invalidated, because they do not
 #: share a column: three record a revocation, the rest are ephemeral and are
 #: removed outright.
-EPOCH_REVOKED_TABLES = ("tokens", "oauth_tokens", "oauth_grants")
+EPOCH_REVOKED_TABLES = (
+    "tokens",
+    "oauth_tokens",
+    "oauth_grants",
+    # The family, not its tokens: the family is the unit of authority, so
+    # revoking it kills every token in it, and the tokens are worth keeping
+    # as replay evidence rather than sweeping.
+    "oauth_refresh_families",
+)
 
 #: Sessions, one-shot codes and in-flight authorizations. Nothing here is worth
 #: keeping as evidence after a restore, and none of them has a revoked_at to
 #: mark. `tokens` is deliberately *not* in this list: a revoked token's
 #: case-insensitive name must stay reserved, so it is revoked and kept.
 EPOCH_DELETED_TABLES = (
+    "sessions",
+    "oauth_sessions",
+    "device_authorizations",
+    "oauth_authorization_codes",
+    "oauth_pending_authorizations",
+)
+
+
+#: The epoch-bearing tables as they stood when migration 5 was written. Frozen
+#: on purpose -- see the comment in the loop below.
+_MIGRATION_5_TABLES = (
+    "tokens",
+    "oauth_tokens",
+    "oauth_grants",
     "sessions",
     "oauth_sessions",
     "device_authorizations",
@@ -542,7 +604,13 @@ def _migration_5(connection: psycopg.Connection) -> None:
             """
         ).format(schema=sql.Identifier(SCHEMA))
     )
-    for table in EPOCH_REVOKED_TABLES + EPOCH_DELETED_TABLES:
+    # Named here rather than taken from EPOCH_REVOKED_TABLES: a migration is a
+    # historical fact, and reading a module constant makes its behaviour change
+    # whenever that constant does. Migration 6 added a table to those lists and
+    # this loop immediately tried to alter a table that would not exist for
+    # another migration -- so a fresh database failed where an existing one had
+    # succeeded. Each migration owns the objects it created.
+    for table in _MIGRATION_5_TABLES:
         # A DEFAULT change is catalogue-only in PostgreSQL, so this rewrites no
         # table and takes no long lock however large they are.
         connection.execute(
@@ -554,12 +622,100 @@ def _migration_5(connection: psycopg.Connection) -> None:
         )
 
 
+def _migration_6(connection: psycopg.Connection) -> None:
+    """Rotating refresh families, with replay detection as a schema property.
+
+    P6 approves rotating refresh for the P2 client ecosystems, and section 4
+    fixes the bounds: at most 12 hours idle, 30 days absolute, rotated every
+    use, and a replay invalidates the entire family *and its grant*.
+
+    Two tables because there are two lifetimes. The family carries the
+    authority -- the grant it belongs to, the scope it may refresh for, the
+    absolute deadline and the revocation -- and each token is a leaf that lives
+    until its idle deadline or until it is spent. Folding both into one table
+    would mean recomputing family state from whichever row happened to be
+    newest, and revoking a family would be a loop rather than one write.
+
+    `replaced_by` records the rotation chain. It is not needed to authorise
+    anything; it is what lets an operator see which token superseded which
+    after a replay, which is the only forensic question worth asking here.
+
+    No recovery_epoch on the tokens, deliberately. The family is the unit of
+    authority, so revoking families at a restore kills every token in them --
+    and the tokens are worth keeping as replay evidence rather than sweeping.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+            CREATE TABLE {schema}.oauth_refresh_families (
+                family_id           text        PRIMARY KEY,
+                -- The grant this family refreshes against. No foreign key: a
+                -- refresh requires an *active* grant, which is an application
+                -- check against revoked_at, and a constraint here would only
+                -- restate the weaker half of it.
+                grant_id            text        NOT NULL,
+                client_id           text        NOT NULL
+                    REFERENCES {schema}.oauth_clients(client_id),
+                scope               text        NOT NULL,
+                created_at          timestamptz NOT NULL DEFAULT now(),
+                -- Absolute: 30 days from creation, and rotation never extends
+                -- it. Only the idle deadline moves.
+                absolute_expires_at timestamptz NOT NULL,
+                revoked_at          timestamptz,
+                revoked_reason      text,
+                recovery_epoch      bigint      NOT NULL
+                    DEFAULT {schema}.current_recovery_epoch(),
+                CONSTRAINT refresh_family_reason_requires_revocation
+                    CHECK (revoked_reason IS NULL OR revoked_at IS NOT NULL),
+                CONSTRAINT refresh_family_absolute_after_creation
+                    CHECK (absolute_expires_at > created_at)
+            );
+
+            CREATE TABLE {schema}.oauth_refresh_tokens (
+                token_hash      text        PRIMARY KEY,
+                family_id       text        NOT NULL
+                    REFERENCES {schema}.oauth_refresh_families(family_id)
+                    ON DELETE CASCADE,
+                issued_at       timestamptz NOT NULL DEFAULT now(),
+                -- Idle: 12 hours, and each rotation issues a fresh one.
+                idle_expires_at timestamptz NOT NULL,
+                -- Spent, not deleted. A replay has to arrive at a row that
+                -- says when it was used, or a replayed token is
+                -- indistinguishable from one that never existed -- and the two
+                -- have opposite consequences.
+                consumed_at     timestamptz,
+                -- Which token superseded this one. There is no separate
+                -- "consumed_by": for a refresh token the consumer *is* the
+                -- rotation, so the successor's hash was the only value it
+                -- could ever hold, and two columns holding one fact drift.
+                replaced_by     text
+                    REFERENCES {schema}.oauth_refresh_tokens(token_hash),
+                CONSTRAINT refresh_token_replacement_requires_consumption
+                    CHECK (replaced_by IS NULL OR consumed_at IS NOT NULL)
+            );
+
+            -- Every live token of one family, for revocation and for the
+            -- bounded cleanup that expiry requires.
+            CREATE INDEX oauth_refresh_tokens_family_idx
+                ON {schema}.oauth_refresh_tokens (family_id);
+            CREATE INDEX oauth_refresh_tokens_expiry_idx
+                ON {schema}.oauth_refresh_tokens (idle_expires_at);
+            -- A grant's live families, for revoking them with the grant.
+            CREATE INDEX oauth_refresh_families_grant_idx
+                ON {schema}.oauth_refresh_families (grant_id)
+                WHERE revoked_at IS NULL;
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
     5: _migration_5,
+    6: _migration_6,
 }
 
 
@@ -584,9 +740,12 @@ DESTRUCTIVE_ROLLBACKS = {
        " which is what confines one to a single request",
     4: "every grant -- the record of what an operator consented to, and the"
        " subject every issued credential resolves through",
-    5: "the recovery-epoch counter. No credential state goes with it, but a"
-       " later advance would restart from zero and would not invalidate"
-       " anything already stamped above it",
+    5: "the ability to invalidate restored credentials at all: the counter,"
+       " the function and the column defaults. The sweep itself lives in"
+       " application code, so after this rollback an advance refuses rather"
+       " than half-working",
+    6: "every rotating refresh family and its tokens, so each client has to"
+       " complete a fresh authorization instead of refreshing",
 }
 
 
@@ -669,27 +828,52 @@ def _rollback_4(connection: psycopg.Connection) -> None:
 def _rollback_5(connection: psycopg.Connection) -> None:
     """Put the epoch back to reserved storage.
 
-    Loses the counter, which is why this is declared destructive. No credential
-    state goes with it -- an advance records itself as a revocation, and those
-    survive -- but a future advance would restart from zero and would not
-    invalidate rows already stamped above it.
+    Loses the counter, the function and every column default, which is why this
+    is declared destructive. No credential state goes with it: an advance
+    records itself as a revocation and those survive. What goes is the ability
+    to perform another one -- advance_recovery_epoch checks for the function and
+    refuses without it, which is the refusal the restore procedure documents.
+
+    An earlier version of this note claimed a later advance "would restart from
+    zero and would not invalidate anything already stamped above it". That
+    described the read-time-predicate design this migration deliberately
+    rejected; the sweep never reads the stamp.
     """
-    for table in EPOCH_REVOKED_TABLES + EPOCH_DELETED_TABLES:
+    for table in _MIGRATION_5_TABLES:
         connection.execute(
             sql.SQL(
                 "ALTER TABLE {schema}.{table}"
                 " ALTER COLUMN recovery_epoch SET DEFAULT 0"
             ).format(schema=sql.Identifier(SCHEMA), table=sql.Identifier(table))
         )
-    # After the defaults, or the drop fails on the dependency.
+    # After the defaults, and CASCADE. Migration 6's oauth_refresh_families
+    # also defaults to this function, so a plain DROP succeeds only while the
+    # ladder happens to descend newest-first and _rollback_6 has already
+    # removed that table. Depending on the iteration order of a different
+    # function for correctness here is exactly the coupling that made
+    # migration 5 read a live constant in the first place.
     connection.execute(
-        sql.SQL("DROP FUNCTION IF EXISTS {schema}.current_recovery_epoch()").format(
-            schema=sql.Identifier(SCHEMA)
-        )
+        sql.SQL(
+            "DROP FUNCTION IF EXISTS {schema}.current_recovery_epoch() CASCADE"
+        ).format(schema=sql.Identifier(SCHEMA))
     )
     connection.execute(
         sql.SQL(
             "DELETE FROM {schema}.metadata WHERE key = 'recovery_epoch'"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_6(connection: psycopg.Connection) -> None:
+    """Tokens before families: the tokens reference them.
+
+    ON DELETE CASCADE would cope, but naming the order means the statement
+    says what it depends on rather than relying on a clause three tables away.
+    """
+    connection.execute(
+        sql.SQL(
+            "DROP TABLE IF EXISTS {schema}.oauth_refresh_tokens,"
+            " {schema}.oauth_refresh_families"
         ).format(schema=sql.Identifier(SCHEMA))
     )
 
@@ -700,6 +884,7 @@ ROLLBACKS = {
     3: _rollback_3,
     4: _rollback_4,
     5: _rollback_5,
+    6: _rollback_6,
 }
 
 

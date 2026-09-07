@@ -150,6 +150,46 @@ class RedirectUriTests(RegistryTestCase):
             self.store.check_redirect_uri("com.example.agent:/oauth"),
         )
 
+    def test_a_scheme_that_is_not_reverse_dns_is_refused(self) -> None:
+        """The "any other scheme" allowance admitted javascript:, data: and file:.
+
+        RFC 8252 s7.1 says a private-use scheme is a reverse-DNS name the
+        application controls. Without that rule these registered successfully,
+        and the authorization server redirects to a registered URI exactly as
+        stored.
+        """
+        for value in (
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "vbscript:msgbox(1)",
+            "about:blank",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.store.check_redirect_uri(value)
+
+    def test_the_scheme_is_normalised_to_lower_case(self) -> None:
+        """The server matches byte for byte, so casing has to be settled here.
+
+        A stored mixed-case scheme would only match a client that repeated the
+        same casing. RFC 3986 s3.1 makes the scheme case-insensitive, so the
+        client is not wrong to send either.
+        """
+        self.assertEqual(
+            "https://agent.example/CB",
+            self.store.check_redirect_uri("HtTpS://agent.example/CB"),
+        )
+        self.assertEqual(
+            "com.example.agent:/oauth",
+            self.store.check_redirect_uri("COM.Example.Agent:/oauth"),
+        )
+        # The path keeps its casing: only the scheme is case-insensitive.
+        self.assertEqual(
+            "https://agent.example/Callback",
+            self.store.check_redirect_uri("https://agent.example/Callback"),
+        )
+
 
 class ScopeTests(RegistryTestCase):
     def test_the_reserved_scopes_are_never_issued_to_an_agent(self) -> None:

@@ -54,13 +54,19 @@ from sql_store import (  # noqa: E402
 #: is worth measuring rather than assuming.
 DEPLOYED_CONNECTION_LIMIT = 8
 
-TABLES = (
-    "oauth_authorization_codes",
-    "oauth_pending_authorizations",
-    "oauth_tokens",
-    "oauth_sessions",
-    "oauth_grants",
-    "oauth_clients",
+#: The benchmark's working set: the schema's delete order minus the credential
+#: tables. The order is shared so foreign keys stay satisfied as the ladder
+#: grows, but admin_credential and metadata are excluded deliberately --
+#: clearing admin_credential would disarm this script's own destructive guard,
+#: and the deployment-helper suite shares this scratch database and asserts on
+#: what ./bin/mapp init writes there.
+#:
+#: Taking the shared order wholesale reintroduced exactly that, and the test
+#: written to forbid it caught the change.
+TABLES = tuple(
+    table
+    for table in cs.TABLES_IN_DELETE_ORDER
+    if table not in ("admin_credential", "metadata")
 )
 
 

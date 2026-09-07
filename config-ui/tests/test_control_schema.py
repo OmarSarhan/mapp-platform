@@ -177,19 +177,17 @@ class SchemaShapeTests(unittest.TestCase):
         exists and nothing more. Renamed because the previous name read as
         though snapshot recovery were implemented.
         """
-        expected = {
-            "sessions",
-            "tokens",
-            "device_authorizations",
-            # The grant most of all: every token resolves through it, so a
-            # restore that invalidated tokens but left grants live would
-            # re-authorise everything on the next exchange.
-            "oauth_grants",
-            "oauth_authorization_codes",
-            "oauth_tokens",
-            "oauth_pending_authorizations",
-            "oauth_sessions",
-        }
+        # Derived from the sweep's own lists rather than written out. A
+        # hardcoded set breaks on every migration that adds an authority-
+        # bearing table -- migration 6 did exactly that -- and the property
+        # worth asserting is that the column and the sweep agree, which a copy
+        # cannot express.
+        #
+        # The grant matters most: every token resolves through it, so a restore
+        # that invalidated tokens but left grants live would re-authorise
+        # everything on the next exchange.
+        expected = set(cs.EPOCH_REVOKED_TABLES) | set(cs.EPOCH_DELETED_TABLES)
+        self.assertIn("oauth_grants", expected)
         rows = self.connection.execute(
             "SELECT table_name FROM information_schema.columns"
             " WHERE table_schema = %s AND column_name = 'recovery_epoch'",
@@ -432,6 +430,57 @@ class RollbackLadderTests(unittest.TestCase):
         self.addCleanup(self.connection.close)
 
     # -- structure -------------------------------------------------------
+
+    def test_the_delete_order_covers_every_table_the_ladder_creates(self) -> None:
+        """The drift guard for six fixtures that used to hold their own copy.
+
+        Migration 6 broke every copy at once -- its oauth_refresh_families
+        references oauth_clients, so a list written before it existed deleted
+        the clients first and hit a foreign key. One list now, and this fails
+        if a migration adds a table without extending it.
+        """
+        cs.migrate(self.connection)
+        self.assertEqual(
+            cs.all_tables(self.connection),
+            set(cs.TABLES_IN_DELETE_ORDER) | {"schema_migrations"},
+        )
+
+    def test_the_delete_order_is_actually_safe(self) -> None:
+        """Asserting the membership is not enough; the order has to work.
+
+        A list containing every table but in the wrong sequence passes the
+        check above and fails every fixture, which is precisely what happened.
+        """
+        cs.migrate(self.connection)
+        # Seed one row wherever a foreign key could bite: a client, a grant
+        # referencing it, a refresh family referencing the client, and a token
+        # referencing the family.
+        self.connection.execute(
+            "INSERT INTO control.oauth_clients(client_id, name, redirect_uris,"
+            " scopes, grant_types, token_endpoint_auth_method)"
+            " VALUES('c','n','{}','{}','{}','none')"
+        )
+        self.connection.execute(
+            "INSERT INTO control.oauth_grants(grant_id, client_id, subject,"
+            " scopes) VALUES('g','c','op','{}')"
+        )
+        self.connection.execute(
+            "INSERT INTO control.oauth_refresh_families(family_id, grant_id,"
+            " client_id, scope, absolute_expires_at)"
+            " VALUES('f','g','c','apply', now() + interval '30 days')"
+        )
+        self.connection.execute(
+            "INSERT INTO control.oauth_refresh_tokens(token_hash, family_id,"
+            " idle_expires_at) VALUES('t','f', now() + interval '12 hours')"
+        )
+        for table in cs.TABLES_IN_DELETE_ORDER:
+            with self.subTest(table=table):
+                self.connection.execute(
+                    sql.SQL("DELETE FROM {schema}.{table}").format(
+                        schema=sql.Identifier(cs.SCHEMA),
+                        table=sql.Identifier(table),
+                    )
+                )
 
     def test_every_migration_has_a_rollback(self) -> None:
         """The drift guard. A migration added without one reintroduces the door."""

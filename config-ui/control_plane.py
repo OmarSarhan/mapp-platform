@@ -256,7 +256,7 @@ class ControlStore:
                 _atomic_json(operation_path, operation)
 
     @contextlib.contextmanager
-    def _db(self):
+    def _db(self, *, migrate: bool = True):
         """A connection to the control schema, closed when the call ends.
 
         One connection per operation rather than one held per store. Holding
@@ -266,13 +266,27 @@ class ControlStore:
         CONNECTION LIMIT of 8 as soon as more than a handful existed at once.
         Connecting per call keeps that limit meaningful; the cost is a few
         milliseconds on a dashboard request.
+
+        ``migrate=False`` is for the operations that are *about* the schema
+        version. Migrating on first use is right for ordinary work -- the store
+        is built at module import, so an eager connect would break every suite
+        that never touches the control plane -- but it is exactly wrong for the
+        ladder commands. `migrate-rollback --to N` without `--confirm` promises
+        to print a plan and change nothing, and it was applying the entire
+        forward ladder before computing that plan: a schema at version 4 came
+        back at 6, and the command then exited 2 saying nothing had happened.
+        The recovery-epoch precondition had the same defect from the same
+        cause: it checks for migration 5 on a connection that had already
+        migrated past it, so the refusal the restore procedure documents could
+        never fire.
         """
         connection = control_schema.connect()
         try:
-            with self._db_lock:
-                if not self._migrated:
-                    control_schema.migrate(connection)
-                    self._migrated = True
+            if migrate:
+                with self._db_lock:
+                    if not self._migrated:
+                        control_schema.migrate(connection)
+                        self._migrated = True
             yield connection
         finally:
             connection.close()
@@ -380,7 +394,7 @@ class ControlStore:
         hand -- a hardcoded paragraph goes stale the first time a migration is
         added, and this one is read under pressure.
         """
-        with self._db() as connection:
+        with self._db(migrate=False) as connection:
             applied = control_schema.applied_versions(connection)
         undo = [version for version in sorted(applied, reverse=True) if version > to_version]
         return {
@@ -400,7 +414,7 @@ class ControlStore:
 
     def rollback_schema(self, to_version: int, *, accept_data_loss: bool) -> list[int]:
         """Step the schema ladder down. Returns the versions undone."""
-        with self._db() as connection:
+        with self._db(migrate=False) as connection:
             return control_schema.rollback(
                 connection, to_version, accept_data_loss=accept_data_loss
             )
@@ -408,7 +422,7 @@ class ControlStore:
     # -- recovery epoch --------------------------------------------------
 
     def recovery_epoch(self) -> int:
-        with self._db() as connection:
+        with self._db(migrate=False) as connection:
             self._require_initialized(connection)
             row = connection.execute(
                 "SELECT control.current_recovery_epoch() AS epoch"
@@ -462,7 +476,7 @@ class ControlStore:
         """
         revoked: dict[str, int] = {}
         deleted: dict[str, int] = {}
-        with self._db() as connection:
+        with self._db(migrate=False) as connection:
             self._require_initialized(connection)
             connection.execute("BEGIN")
             try:
@@ -493,15 +507,42 @@ class ControlStore:
                     " RETURNING value::bigint AS epoch"
                 ).fetchone()
                 epoch = int(row["epoch"])
+                # Which of them can record *why*. Only some carry a
+                # revoked_reason: oauth_grants and oauth_refresh_families do,
+                # `tokens` and `oauth_tokens` do not. Derived rather than
+                # listed, so a migration that adds the column starts being
+                # used without anyone remembering to update a constant -- and
+                # so this cannot assume a column that is not there, which is
+                # what a first attempt at recording the reason did.
+                reasoned = {
+                    row["table_name"]
+                    for row in connection.execute(
+                        "SELECT table_name FROM information_schema.columns"
+                        " WHERE table_schema = %s AND column_name = 'revoked_reason'",
+                        (control_schema.SCHEMA,),
+                    ).fetchall()
+                }
+                note = f"recovery-epoch:{reason}"[:200]
                 for table in control_schema.EPOCH_REVOKED_TABLES:
-                    result = connection.execute(
-                        control_schema.sql.SQL(
+                    if table in reasoned:
+                        statement = control_schema.sql.SQL(
+                            "UPDATE {schema}.{table}"
+                            "   SET revoked_at = now(), revoked_reason = %s"
+                            " WHERE revoked_at IS NULL"
+                        )
+                        parameters = (note,)
+                    else:
+                        statement = control_schema.sql.SQL(
                             "UPDATE {schema}.{table} SET revoked_at = now()"
                             " WHERE revoked_at IS NULL"
-                        ).format(
+                        )
+                        parameters = ()
+                    result = connection.execute(
+                        statement.format(
                             schema=control_schema.sql.Identifier(control_schema.SCHEMA),
                             table=control_schema.sql.Identifier(table),
                         ),
+                        parameters,
                     )
                     revoked[table] = result.rowcount
                 for table in control_schema.EPOCH_DELETED_TABLES:
@@ -565,12 +606,33 @@ class ControlStore:
             raise ValueError(f"Redirect URI must not carry a fragment: {value!r}")
         if parsed.username or parsed.password:
             raise ValueError(f"Redirect URI must not carry userinfo: {value!r}")
-        if parsed.scheme == "http" and parsed.hostname not in cls.LOOPBACK_HOSTS:
+        scheme = parsed.scheme.lower()
+        if scheme == "http" and parsed.hostname not in cls.LOOPBACK_HOSTS:
             raise ValueError(
                 f"Redirect URI must use https unless it is loopback: {value!r}"
             )
-        if parsed.scheme in {"http", "https"} and not parsed.netloc:
-            raise ValueError(f"Redirect URI has no host: {value!r}")
+        if scheme in {"http", "https"}:
+            if not parsed.netloc:
+                raise ValueError(f"Redirect URI has no host: {value!r}")
+        elif "." not in scheme:
+            # RFC 8252 s7.1: a native app's private-use scheme is a reverse-DNS
+            # name it controls. Without that rule the "any other scheme"
+            # allowance admitted javascript:, data: and file: -- which have no
+            # business being a redirect target and were accepted outright.
+            raise ValueError(
+                f"A private-use redirect scheme must be a reverse-DNS name the"
+                f" application controls, as RFC 8252 requires: {value!r}"
+            )
+        # Compared against the raw text, not against parsed.scheme: urlsplit
+        # lower-cases the scheme itself, so comparing the two is comparing a
+        # value with itself and the normalisation never fired.
+        raw_scheme = value[: len(scheme)]
+        if raw_scheme != scheme:
+            # Schemes are case-insensitive (RFC 3986 s3.1) but the
+            # authorization server matches redirect URIs byte for byte, so a
+            # stored mixed-case scheme would only ever match a client that
+            # repeated the same casing.
+            value = scheme + value[len(scheme):]
         return value
 
     @staticmethod

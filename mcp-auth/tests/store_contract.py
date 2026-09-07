@@ -252,3 +252,194 @@ class StoreContractTests:
             ),
         )
         self.assertEqual(0, self.store.exchanged_token_count("oauth:contract", 60))
+
+    # -- rotating refresh families ---------------------------------------
+
+    def _open_family(self, raw="mapp_r_1", family="fam", **bounds) -> None:
+        """A family on the contract's own grant, using only store calls."""
+        if self.store.query_client("contract-actor") is None:
+            self._contract_client("contract-actor")
+            self._contract_client("contract-broker")
+        if self.store.query_grant("oauth:contract") is None:
+            self.store.save_grant(
+                Grant(
+                    grant_id="oauth:contract",
+                    client_id="contract-actor",
+                    subject="operator",
+                    scopes=("apply",),
+                )
+            )
+        self.store.start_refresh_family(
+            raw,
+            family_id=family,
+            grant_id="oauth:contract",
+            client_id="contract-actor",
+            scope="apply",
+            **bounds,
+        )
+
+    def test_a_refresh_token_rotates_once(self) -> None:
+        self._open_family()
+        result = self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.assertEqual("rotated", result["outcome"])
+        self.assertEqual("oauth:contract", result["grant_id"])
+        self.assertEqual("contract-actor", result["client_id"])
+        self.assertEqual("apply", result["scope"])
+
+    def test_rotation_records_the_chain(self) -> None:
+        """Not needed to authorise anything; needed to read an audit after a replay."""
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        spent = self.store.refresh_token_state("mapp_r_1")
+        successor = self.store.refresh_token_state("mapp_r_2")
+        self.assertIsNotNone(spent["consumed_at"])
+        self.assertIsNotNone(spent["replaced_by"])
+        self.assertIsNone(successor["consumed_at"])
+        self.assertEqual(spent["family_id"], successor["family_id"])
+
+    def test_replaying_a_spent_token_revokes_the_family_and_the_grant(self) -> None:
+        """Section 4's rule, and the whole reason spent tokens are kept.
+
+        A deleted row would make a replay indistinguishable from a token that
+        never existed -- and those two have opposite consequences.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        result = self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil")
+        self.assertEqual("replayed", result["outcome"])
+        self.assertEqual("oauth:contract", result["grant_revoked"])
+        self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])
+        self.assertTrue(self.store.query_grant("oauth:contract").is_revoked())
+        # And no replacement was issued for the replay.
+        self.assertIsNone(self.store.refresh_token_state("mapp_r_evil"))
+
+    def test_a_replay_also_kills_the_legitimate_live_token(self) -> None:
+        """That is the containment, and it is also the cost O7 records.
+
+        A client that retried after a timeout is indistinguishable from an
+        attacker replaying, and loses the operator's consent either way.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil")
+        self.assertEqual(
+            "grant-revoked",
+            self.store.rotate_refresh_token("mapp_r_2", "mapp_r_3")["outcome"],
+        )
+
+    def test_an_unknown_refresh_token_is_not_a_replay(self) -> None:
+        """It revokes nothing: a guess must not be able to destroy a consent."""
+        self._open_family()
+        self.assertEqual(
+            "unknown",
+            self.store.rotate_refresh_token("mapp_r_nosuch", "mapp_r_2")["outcome"],
+        )
+        self.assertIsNone(self.store.query_refresh_family("fam")["revoked_at"])
+        self.assertFalse(self.store.query_grant("oauth:contract").is_revoked())
+
+    def test_a_refresh_requires_a_live_grant(self) -> None:
+        self._open_family()
+        self.assertTrue(self.store.revoke_grant("oauth:contract", "test"))
+        self.assertEqual(
+            "grant-revoked",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")["outcome"],
+        )
+
+    def test_a_revoked_family_stops_rotating(self) -> None:
+        self._open_family()
+        self.assertTrue(self.store.revoke_refresh_family("fam", "operator"))
+        self.assertFalse(self.store.revoke_refresh_family("fam", "again"))
+        self.assertEqual(
+            "family-revoked",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")["outcome"],
+        )
+        # Revoking a family does not withdraw the consent.
+        self.assertFalse(self.store.query_grant("oauth:contract").is_revoked())
+
+    def test_the_idle_deadline_stops_rotation(self) -> None:
+        self._open_family(idle_seconds=-1)
+        self.assertEqual(
+            "idle-expired",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")["outcome"],
+        )
+
+    def expire_family_absolutely(self, family_id: str) -> None:
+        """Move a family's absolute deadline into the past.
+
+        Store-specific because the schema forbids creating a family that is
+        already dead -- `absolute_expires_at > created_at` is a CHECK, and
+        rightly so. The state is reachable in production only by time passing,
+        so the setup differs per store while the assertion below does not.
+        """
+        raise NotImplementedError
+
+    def test_the_absolute_deadline_stops_rotation(self) -> None:
+        """Rotation moves the idle deadline and never the absolute one.
+
+        Otherwise an indefinitely-refreshed session would outlive the consent
+        it came from.
+        """
+        self._open_family()
+        self.expire_family_absolutely("fam")
+        self.assertEqual(
+            "family-expired",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")["outcome"],
+        )
+
+    def test_rotation_does_not_extend_the_absolute_deadline(self) -> None:
+        self._open_family()
+        before = self.store.query_refresh_family("fam")["absolute_expires_at"]
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.assertEqual(before, self.store.query_refresh_family("fam")["absolute_expires_at"])
+
+    def test_reopening_a_family_id_is_refused(self) -> None:
+        """It is a primary key in SQL, so the double must not accept it either."""
+        self._open_family()
+        with self.assertRaises(Exception):
+            self._open_family(raw="mapp_r_other")
+
+    def test_revoking_a_grants_families_leaves_another_grants_alone(self) -> None:
+        self._open_family()
+        self.store.save_grant(
+            Grant(
+                grant_id="oauth:other",
+                client_id="contract-actor",
+                subject="operator",
+                scopes=("apply",),
+            )
+        )
+        self.store.start_refresh_family(
+            "mapp_r_other",
+            family_id="fam-other",
+            grant_id="oauth:other",
+            client_id="contract-actor",
+            scope="apply",
+        )
+        self.assertEqual(
+            1, self.store.revoke_refresh_families_for_grant("oauth:contract", "test")
+        )
+        self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])
+        self.assertIsNone(self.store.query_refresh_family("fam-other")["revoked_at"])
+
+    def test_a_spent_token_after_a_revocation_is_not_reported_as_a_replay(self) -> None:
+        """Revocation is checked before consumption, and the order matters.
+
+        After a restore revokes a family, the client's already-spent token is
+        re-presented on its next attempt. Classifying that as "replayed" raises
+        a stolen-credential signal for something the operator's own restore
+        caused -- and the containment it triggers has already happened.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.assertTrue(self.store.revoke_refresh_family("fam", "recovery-epoch"))
+        result = self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")
+        self.assertEqual("family-revoked", result["outcome"])
+
+    def test_a_replay_on_a_live_family_is_still_a_replay(self) -> None:
+        """The reordering must not blunt the signal it exists to raise."""
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.assertEqual(
+            "replayed",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")["outcome"],
+        )
