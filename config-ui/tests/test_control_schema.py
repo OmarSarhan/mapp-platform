@@ -412,3 +412,296 @@ class OneShotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_database
+class RollbackLadderTests(unittest.TestCase):
+    """The half of the ladder that did not exist until Phase 1.
+
+    Forward-only migrations made every schema change a one-way door: a bad
+    migration could only be fixed by another one, under whatever pressure
+    produced the first. Phase 1 requires "tested forward and rollback
+    migrations before issuing production-like state", and the interesting word
+    is tested -- writing the down-steps by reading the up-steps produced two
+    ownership errors that only a round trip found.
+    """
+
+    def setUp(self) -> None:
+        reset_schema()
+        self.connection = cs.connect(DATABASE_URL)
+        self.addCleanup(self.connection.close)
+
+    # -- structure -------------------------------------------------------
+
+    def test_every_migration_has_a_rollback(self) -> None:
+        """The drift guard. A migration added without one reintroduces the door."""
+        self.assertEqual(sorted(cs.MIGRATIONS), sorted(cs.ROLLBACKS))
+
+    def test_every_destructive_rollback_is_a_real_migration(self) -> None:
+        self.assertTrue(set(cs.DESTRUCTIVE_ROLLBACKS) <= set(cs.MIGRATIONS))
+
+    def test_each_loss_description_says_what_is_lost(self) -> None:
+        for version, loss in cs.DESTRUCTIVE_ROLLBACKS.items():
+            with self.subTest(version=version):
+                self.assertGreater(len(loss), 20, "a warning must name the loss")
+
+    # -- the round trip --------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Everything the ladder is responsible for building."""
+        run = self.connection.execute
+        return {
+            "tables": sorted(
+                row["table_name"]
+                for row in run(
+                    "SELECT table_name FROM information_schema.tables"
+                    " WHERE table_schema = 'control'"
+                ).fetchall()
+            ),
+            "columns": sorted(
+                (row["table_name"], row["column_name"])
+                for row in run(
+                    "SELECT table_name, column_name FROM information_schema.columns"
+                    " WHERE table_schema = 'control'"
+                ).fetchall()
+            ),
+            "indexes": sorted(
+                row["indexname"]
+                for row in run(
+                    "SELECT indexname FROM pg_indexes WHERE schemaname = 'control'"
+                ).fetchall()
+            ),
+            "constraints": sorted(
+                row["conname"]
+                for row in run(
+                    "SELECT conname FROM pg_constraint c"
+                    " JOIN pg_namespace n ON n.oid = c.connamespace"
+                    " WHERE n.nspname = 'control'"
+                ).fetchall()
+            ),
+        }
+
+    def test_the_ladder_goes_down_and_back_up_to_the_same_schema(self) -> None:
+        """The headline property, and the only one that caught the real bugs.
+
+        Both errors were ownership mistakes -- a rollback dropping something a
+        different migration owned. Neither is visible in the down-step alone;
+        both are obvious the moment the ladder is rebuilt.
+        """
+        cs.migrate(self.connection)
+        before = self.snapshot()
+        self.assertEqual(
+            [4, 3, 2, 1], cs.rollback(self.connection, 0, accept_data_loss=True)
+        )
+        self.assertEqual([], cs.applied_versions(self.connection))
+        self.assertEqual(sorted(cs.MIGRATIONS), cs.migrate(self.connection))
+        self.assertEqual(before, self.snapshot())
+
+    def test_descending_one_step_at_a_time_undoes_exactly_one_version(self) -> None:
+        """Each step is a single version, not everything above the target.
+
+        `rollback(n)` undoes every applied version above `n`, so descending has
+        to be done a step at a time to exercise the per-step path -- asking for
+        `version - 1` from a full ladder undoes the whole top instead, which is
+        how this test was wrong first time.
+        """
+        cs.migrate(self.connection)
+        before = self.snapshot()
+        for version in sorted(cs.MIGRATIONS, reverse=True):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    [version],
+                    cs.rollback(
+                        self.connection, version - 1, accept_data_loss=True
+                    ),
+                )
+        self.assertEqual([], cs.applied_versions(self.connection))
+        self.assertEqual(sorted(cs.MIGRATIONS), cs.migrate(self.connection))
+        self.assertEqual(before, self.snapshot())
+
+    def test_undoing_the_newest_migration_and_recovering(self) -> None:
+        """The operator scenario this exists for: one bad migration, undone.
+
+        A different path from a full teardown, and the one that will actually
+        be used -- a migration goes wrong and has to come back out without
+        taking the rest of the schema with it.
+        """
+        cs.migrate(self.connection)
+        before = self.snapshot()
+        top = max(cs.MIGRATIONS)
+        self.assertEqual(
+            [top], cs.rollback(self.connection, top - 1, accept_data_loss=True)
+        )
+        self.assertEqual(
+            [version for version in sorted(cs.MIGRATIONS) if version < top],
+            cs.applied_versions(self.connection),
+        )
+        self.assertEqual([top], cs.migrate(self.connection))
+        self.assertEqual(before, self.snapshot())
+
+    # -- the two ownership bugs the round trip found ---------------------
+
+    def test_rolling_back_the_binding_keeps_single_use(self) -> None:
+        """`single_use` belongs to migration 2, not 3.
+
+        An earlier draft dropped it here, which left the schema unable to
+        re-apply migration 3 at all -- its CHECK references that column.
+        """
+        cs.migrate(self.connection)
+        cs.rollback(self.connection, 2, accept_data_loss=True)
+        columns = {
+            row["column_name"]
+            for row in self.connection.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'control' AND table_name = 'oauth_tokens'"
+            ).fetchall()
+        }
+        self.assertIn("single_use", columns)
+        self.assertFalse(
+            columns
+            & {"operation_id", "request_digest", "actor_client_id", "broker_client_id"}
+        )
+
+    def test_rolling_back_the_grant_drops_its_table(self) -> None:
+        """oauth_grants belongs to migration 4.
+
+        An earlier draft assumed migration 2 owned it and dropped only the two
+        indexes, so re-applying 4 failed on a duplicate table.
+        """
+        cs.migrate(self.connection)
+        cs.rollback(self.connection, 3, accept_data_loss=True)
+        tables = {
+            row["table_name"]
+            for row in self.connection.execute(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_schema = 'control'"
+            ).fetchall()
+        }
+        self.assertNotIn("oauth_grants", tables)
+        self.assertIn("oauth_tokens", tables, "migration 2's tables must survive")
+
+    # -- refusals --------------------------------------------------------
+
+    def test_a_destructive_rollback_is_refused_and_names_the_loss(self) -> None:
+        """An operator reaching for this under pressure learns the cost first.
+
+        Checked one step at a time. The ladder descends newest-first, so a
+        multi-step request is refused by whichever step it reaches first --
+        which would leave the deeper warnings untested.
+        """
+        cs.migrate(self.connection)
+        for version in sorted(cs.DESTRUCTIVE_ROLLBACKS, reverse=True):
+            with self.subTest(version=version):
+                with self.assertRaises(cs.IrreversibleMigration) as caught:
+                    cs.rollback(self.connection, version - 1)
+                message = str(caught.exception)
+                self.assertIn(f"migration {version}", message)
+                self.assertIn(cs.DESTRUCTIVE_ROLLBACKS[version], message)
+                # Nothing moved, so the next subtest starts where this did.
+                self.assertIn(version, cs.applied_versions(self.connection))
+            cs.rollback(self.connection, version - 1, accept_data_loss=True)
+
+    def test_a_step_not_declared_destructive_needs_no_confirmation(self) -> None:
+        """The mechanism, exercised rather than assumed.
+
+        Every migration in the ladder today carries state, so every rollback is
+        declared destructive and the unconfirmed path has no live example. That
+        makes it exactly the branch worth driving deliberately: a future
+        structural-only migration must not demand a confirmation an operator
+        then learns to supply reflexively.
+        """
+        cs.migrate(self.connection)
+        original = dict(cs.DESTRUCTIVE_ROLLBACKS)
+        top = max(cs.MIGRATIONS)
+        cs.DESTRUCTIVE_ROLLBACKS.pop(top, None)
+        try:
+            self.assertEqual([top], cs.rollback(self.connection, top - 1))
+        finally:
+            cs.DESTRUCTIVE_ROLLBACKS.clear()
+            cs.DESTRUCTIVE_ROLLBACKS.update(original)
+        self.assertEqual([top], cs.migrate(self.connection))
+
+    def test_a_rollback_to_the_current_version_does_nothing(self) -> None:
+        cs.migrate(self.connection)
+        self.assertEqual([], cs.rollback(self.connection, max(cs.MIGRATIONS)))
+        self.assertEqual([], cs.rollback(self.connection, max(cs.MIGRATIONS) + 5))
+        self.assertEqual(sorted(cs.MIGRATIONS), cs.applied_versions(self.connection))
+
+    def test_a_migration_with_no_rollback_refuses_rather_than_skipping(self) -> None:
+        """The drift case, driven rather than assumed.
+
+        test_every_migration_has_a_rollback catches a missing entry in the
+        registry. This catches what happens at runtime if one is missing
+        anyway: the ladder must refuse to step past it, because silently
+        skipping would leave the schema holding that migration's objects while
+        the ledger claims it was undone -- and the next migrate would not
+        re-apply it.
+
+        Exercised by removing an entry, since every migration has one today,
+        which is what let this branch survive a mutation.
+        """
+        cs.migrate(self.connection)
+        top = max(cs.MIGRATIONS)
+        original = cs.ROLLBACKS.pop(top)
+        try:
+            with self.assertRaises(cs.IrreversibleMigration) as caught:
+                cs.rollback(self.connection, 0, accept_data_loss=True)
+            self.assertIn(f"Migration {top} has no rollback", str(caught.exception))
+        finally:
+            cs.ROLLBACKS[top] = original
+        # And nothing moved: the refusal happens inside the transaction.
+        self.assertEqual(sorted(cs.MIGRATIONS), cs.applied_versions(self.connection))
+
+    def test_a_negative_target_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            cs.rollback(self.connection, -1)
+
+    def test_a_failed_rollback_leaves_the_ledger_agreeing_with_the_schema(self) -> None:
+        """One transaction, so a mid-ladder failure is not a half-rolled schema.
+
+        Simulated by a rollback that raises: the ledger must be untouched, not
+        partially decremented, or the next migrate would try to re-apply
+        something still present.
+        """
+        cs.migrate(self.connection)
+        original = cs.ROLLBACKS[3]
+
+        def explode(connection):
+            raise RuntimeError("simulated failure part-way down")
+
+        cs.ROLLBACKS[3] = explode
+        try:
+            with self.assertRaises(RuntimeError):
+                cs.rollback(self.connection, 1, accept_data_loss=True)
+        finally:
+            cs.ROLLBACKS[3] = original
+        self.assertEqual(sorted(cs.MIGRATIONS), cs.applied_versions(self.connection))
+        self.assertIn("oauth_grants", self.snapshot()["tables"])
+
+    def test_concurrent_rollbacks_serialise(self) -> None:
+        """Same advisory lock as migrate, so one waits rather than racing a DROP."""
+        cs.migrate(self.connection)
+        outcomes: list = []
+
+        def step():
+            connection = cs.connect(DATABASE_URL)
+            try:
+                outcomes.append(
+                    cs.rollback(connection, 3, accept_data_loss=True)
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded, then asserted
+                outcomes.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=step) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertTrue(
+            all(isinstance(item, list) for item in outcomes), outcomes
+        )
+        # Exactly one thread did the work; the rest found it already done.
+        self.assertEqual(1, sum(1 for item in outcomes if item == [4]))
+        self.assertEqual(3, sum(1 for item in outcomes if item == []))

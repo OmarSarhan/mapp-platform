@@ -482,5 +482,191 @@ MIGRATIONS = {
 }
 
 
+class IrreversibleMigration(RuntimeError):
+    """Rolling back this far would destroy state that cannot be reconstructed."""
+
+
+#: Which rollbacks lose data, and what. A rollback is refused unless the caller
+#: names the loss, because the ladder's whole purpose is that a bad forward
+#: migration can be undone -- and an operator who reaches for that under
+#: pressure should not discover the cost afterwards.
+#:
+#: "Lossless" here means structural only: the columns and tables a rollback
+#: removes carried no state the platform could not rebuild. Nothing about a
+#: credential is ever reconstructible, so anything holding one is lossy.
+DESTRUCTIVE_ROLLBACKS = {
+    1: "every platform credential: the administrator password, CLI tokens,"
+       " sessions and device authorizations",
+    2: "every OAuth record: clients, authorization codes, tokens, pending"
+       " authorizations and operator sessions",
+    3: "the operation and request-digest binding on every issued token B,"
+       " which is what confines one to a single request",
+    4: "every grant -- the record of what an operator consented to, and the"
+       " subject every issued credential resolves through",
+}
+
+
+def _rollback_1(connection: psycopg.Connection) -> None:
+    connection.execute(
+        sql.SQL(
+            "DROP TABLE IF EXISTS {schema}.device_authorizations,"
+            " {schema}.tokens, {schema}.sessions, {schema}.admin_credential,"
+            " {schema}.metadata"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_2(connection: psycopg.Connection) -> None:
+    """The five tables migration 2 creates. oauth_grants belongs to 4.
+
+    Dropped in one statement: they carry client_id foreign keys into
+    oauth_clients, so a single DROP avoids depending on whatever order
+    PostgreSQL would otherwise pick.
+    """
+    connection.execute(
+        sql.SQL(
+            "DROP TABLE IF EXISTS {schema}.oauth_authorization_codes,"
+            " {schema}.oauth_pending_authorizations, {schema}.oauth_tokens,"
+            " {schema}.oauth_sessions, {schema}.oauth_clients"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_3(connection: psycopg.Connection) -> None:
+    """Undo exactly what migration 3 added, and nothing migration 2 owns.
+
+    `single_use` belongs to migration 2's CREATE TABLE, not here. An earlier
+    draft of this dropped it, which left the schema unable to re-apply
+    migration 3 at all -- its CHECK references that column. Caught by rolling
+    the ladder down and back up rather than by reading it.
+
+    The two CHECK constraints migration 3 added both reference columns dropped
+    here, so PostgreSQL removes them with the columns; they are named anyway,
+    because a reader should not have to know that rule to see the rollback is
+    complete.
+    """
+    connection.execute(
+        sql.SQL(
+            "ALTER TABLE {schema}.oauth_tokens"
+            "  DROP CONSTRAINT IF EXISTS token_single_use_is_bound,"
+            "  DROP CONSTRAINT IF EXISTS token_operation_binding_is_complete,"
+            "  DROP COLUMN IF EXISTS operation_id,"
+            "  DROP COLUMN IF EXISTS request_digest,"
+            "  DROP COLUMN IF EXISTS actor_client_id,"
+            "  DROP COLUMN IF EXISTS broker_client_id"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_4(connection: psycopg.Connection) -> None:
+    """Migration 4 creates oauth_grants, so rolling it back drops the grants.
+
+    An earlier draft assumed migration 2 owned that table and dropped only the
+    two indexes -- which left oauth_grants in place and made re-applying
+    migration 4 fail on a duplicate table. Caught by rolling the ladder down
+    and back up rather than by reading it.
+
+    oauth_grants_live_idx is on that table and goes with it;
+    oauth_tokens_subject_idx is on oauth_tokens, which migration 2 owns, so it
+    has to be dropped explicitly.
+    """
+    connection.execute(
+        sql.SQL(
+            "DROP INDEX IF EXISTS {schema}.oauth_tokens_subject_idx"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+    connection.execute(
+        sql.SQL("DROP TABLE IF EXISTS {schema}.oauth_grants").format(
+            schema=sql.Identifier(SCHEMA)
+        )
+    )
+
+
+ROLLBACKS = {
+    1: _rollback_1,
+    2: _rollback_2,
+    3: _rollback_3,
+    4: _rollback_4,
+}
+
+
+def applied_versions(connection: psycopg.Connection) -> list[int]:
+    """Which migrations this database has, newest last.
+
+    Reads the ledger rather than inspecting the schema: a rollback has to undo
+    what was recorded as applied, not what somebody's DDL happens to look like.
+    """
+    rows = connection.execute(
+        sql.SQL(
+            "SELECT version FROM {schema}.schema_migrations ORDER BY version"
+        ).format(schema=sql.Identifier(SCHEMA))
+    ).fetchall()
+    return [int(row["version"]) for row in rows]
+
+
+def rollback(
+    connection: psycopg.Connection,
+    to_version: int,
+    *,
+    accept_data_loss: bool = False,
+) -> list[int]:
+    """Step the ladder down to ``to_version``. Returns the versions undone.
+
+    The forward half has existed since M4 and this half has not, which made
+    every schema change after it a one-way door: a bad migration could only be
+    fixed by another migration, under whatever pressure caused the first one.
+
+    Same advisory lock and same single transaction as ``migrate``, so a
+    concurrent start blocks rather than racing a ``DROP TABLE``, and a failure
+    part-way leaves the ledger and the schema agreeing with each other.
+
+    Refuses a destructive step unless ``accept_data_loss`` is set, and names
+    what would be lost. PostgreSQL DDL is transactional here, but no
+    transaction brings back a dropped credential.
+    """
+    if to_version < 0:
+        raise ValueError("to_version must be zero or a migration version.")
+    undone: list[int] = []
+    connection.execute("BEGIN")
+    try:
+        connection.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (str(MIGRATION_TIMEOUT_MS),),
+        )
+        connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (MIGRATION_LOCK,)
+        )
+        # Newest first: a rollback undoes in the reverse of the order applied,
+        # or migration 2's DROP would run while migration 3's columns still
+        # depend on its table.
+        for version in sorted(applied_versions(connection), reverse=True):
+            if version <= to_version:
+                break
+            if version not in ROLLBACKS:
+                raise IrreversibleMigration(
+                    f"Migration {version} has no rollback, so the ladder cannot"
+                    f" step below {version}."
+                )
+            loss = DESTRUCTIVE_ROLLBACKS.get(version)
+            if loss and not accept_data_loss:
+                raise IrreversibleMigration(
+                    f"Rolling back migration {version} destroys {loss}."
+                    " Re-run with accept_data_loss=True if that is intended."
+                )
+            ROLLBACKS[version](connection)
+            connection.execute(
+                sql.SQL(
+                    "DELETE FROM {schema}.schema_migrations WHERE version = %s"
+                ).format(schema=sql.Identifier(SCHEMA)),
+                (version,),
+            )
+            undone.append(version)
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+    return undone
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
