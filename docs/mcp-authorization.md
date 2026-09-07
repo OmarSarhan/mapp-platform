@@ -6,32 +6,63 @@ client and the internal token broker will use; it serves no MCP tools itself.
 
 **This is Phase 0 of an unmerged feasibility spike.** It is deployed by the
 normal Compose model and covered by its own suite, but it has not been run in
-production, and one deliberate omission means it cannot yet complete a single
-authorization end to end — see [Phase 0 limitation](#phase-0-limitation-nothing-registers-a-client)
-below. Read every "designed" statement here as designed-but-unproven unless it
-names a test or a check that runs.
+production. Read every "designed" statement here as designed-but-unproven
+unless it names a test or a check that runs.
 
-## Phase 0 limitation: no agent client can be registered
+## Registering an agent client
 
-There is no operator command and no dynamic client registration endpoint —
-RFC 7591 registration is Phase 1 work — so no *agent* client can be
-registered, and an authorization request from one is refused as an unknown
-client. The test suite registers its own, which is why it can prove the flow
-works and cannot prove an agent can reach it.
+An agent client is registered by an operator, never by itself:
+
+```bash
+./bin/mapp mcp-client-register \
+  --name "Claude Code" \
+  --redirect-uri http://127.0.0.1:33418/callback \
+  --scope mcp:connect --scope inspect --scope apply
+
+./bin/mapp mcp-client-list
+./bin/mapp mcp-client-disable --client-id mcp-XXXXXXXX
+```
+
+It prints a `client_id` and **no secret, because there is none**: an agent is a
+public client that authenticates with PKCE alone. Issuing a secret would create
+a credential that has to live unprotected on the operator's machine, and the
+authorization server requires `S256` of every client including confidential
+ones.
+
+There is deliberately no registration endpoint. RFC 7591 dynamic registration
+would let a client register itself, and P2 requires one *pinned* client per
+ecosystem — a person decides which agent may ask for consent.
+
+Registration validates what the authorization server will later match exactly.
+A redirect URI must be absolute, carry no fragment and no userinfo, and use
+`https` unless its host is loopback; the `full` and `admin` scopes are refused
+outright. A permissive redirect URI is a working way to have authorization
+codes delivered somewhere else, and the server matches them with no prefix or
+wildcard allowance, so the validation belongs here.
+
+The scopes are *not* checked against a vocabulary at registration. The
+authorization server decides what it will issue and derives that from the
+operation allowlist; restating the vocabulary in a third place is a drift this
+platform has already been bitten by. A scope the server will not issue produces
+`invalid_scope` at the authorization request, which is a clear failure rather
+than a silent one.
 
 One client is provisioned automatically, and it is deliberately the only one:
 the configuration API's own. `ControlStore.ensure_oauth_client` writes that row
 at start-up from `MCP_AUTH_CLIENT_SECRET`, because the configuration API is a
 resource server calling the control listener rather than a third party asking
 for access — and because the service that owns the schema the row lives in is
-the one writing it. An agent client is a different thing entirely and must be
-registered by a person.
+the one writing it.
 
-Nothing in this document should be read as an operating procedure for issuing
-a token to an agent today. That path is not usable end to end until agent
-registration exists.
+`mcp-auth/tests/test_registered_client.py` drives the whole flow for a client
+registered this way: discovery, authorization, consent, the token endpoint,
+introspection, the exchange and redemption, against the real component with
+the real SQL store. It is the one test that proves the flow is *reachable* and
+not merely correct.
 
-The other absent consumer is `mapp-mcp` itself, which would obtain a token A
+## Phase 0 limitation: no digest producer
+
+`mapp-mcp` does not exist. It would obtain a token A
 and ask for the exchange. The binding columns are written and read by the
 configuration API, and never read outside the
 component.
@@ -234,6 +265,17 @@ then never sent and sign-in silently fails.
 Refresh tokens are not implemented: no refresh grant is registered and only the
 access token is persisted, so a refresh token issued today could never be
 redeemed.
+
+**One consent does not become unlimited effects.** A grant may be exchanged for
+at most 60 token B in a sliding 60-second window, refused with `slow_down` past
+that. Every other bound is per credential — a token B is single-use and lives
+sixty seconds — so a grant minting them in a loop was the only unbounded path,
+and each one authorises a consequential operation. Counted from the token rows
+rather than a counter column, so nothing extra has to be written, expired or
+reconciled, and a spent token still counts: a burst is a burst. Per grant
+rather than global, for the same reason the parked-request cap is per source —
+a global bound lets one busy actor deny everybody. The figure is provisional and
+P11 replaces it with a measured value in Phase 6.
 
 Discovery advertises `mcp:connect` and `inspect` alone, so a greedy client
 cannot auto-request every permission from metadata. The acceptance list is

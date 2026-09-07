@@ -47,6 +47,19 @@ first release.
 - `./bin/mapp` now starts the authorization component, `./bin/mapp verify`
   probes its origin and confirms the internal endpoints are not edge-reachable,
   and `./bin/mapp test` runs its suite.
+- Added `./bin/mapp mcp-client-register`, `mcp-client-list` and
+  `mcp-client-disable`. An agent client is registered by an operator and is a
+  public client: the command prints a `client_id` and no secret, because an
+  agent authenticates with PKCE alone. Redirect URIs are validated against what
+  the authorization server will later match exactly — absolute, no fragment, no
+  userinfo, `https` unless loopback — and `full` and `admin` are refused. There
+  is deliberately no registration endpoint: a person decides which agent may
+  ask for consent. Until this existed a correctly deployed component refused
+  every authorization request as an unknown client.
+- A grant may be exchanged for at most 60 token B in a sliding 60-second
+  window, refused with `slow_down`. Every other bound was per credential, so
+  one consent minting them in a loop was the only way to turn a single approval
+  into an unlimited number of consequential effects.
 
 - Added an optional request-time `progress` snapshot to nonterminal
   derived operations. `GET /api/operations/<id>` reports a version-1

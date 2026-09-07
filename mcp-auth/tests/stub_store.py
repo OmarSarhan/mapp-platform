@@ -277,6 +277,20 @@ class StubStore:
                 return None
             return dict(binding)
 
+    def exchanged_token_count(self, subject: str, window_seconds: int) -> int:
+        """In-memory twin: the same count, over the same window."""
+        import time as _time
+
+        cutoff = _time.time() - window_seconds
+        with self._lock:
+            return sum(
+                1
+                for digest, binding in self._exchanged.items()
+                if (record := self._tokens.get(digest)) is not None
+                and record.subject == subject
+                and record.issued_at > cutoff
+            )
+
     def token_count(self) -> int:
         with self._lock:
             return len(self._tokens)

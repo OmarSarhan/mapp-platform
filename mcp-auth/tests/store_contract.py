@@ -201,3 +201,54 @@ class StoreContractTests:
             grant.is_revoked(), "the Grant handed to the caller changed underneath it"
         )
         self.assertTrue(self.store.query_grant("oauth:contract").is_revoked())
+
+    def test_the_exchange_budget_counts_this_grant_only(self) -> None:
+        """The abuse budget's input, so it has to mean the same in both stores.
+
+        One consent must not become an unbounded number of effects. The count
+        is per grant, over a window, and a consumed token still counts -- it
+        was still minted.
+        """
+        self._mint_token_b("mapp_b_budget_1")
+        self._mint_token_b("mapp_b_budget_2")
+        self.assertEqual(2, self.store.exchanged_token_count("oauth:contract", 60))
+
+        # A different grant is counted separately.
+        if self.store.query_grant("oauth:other") is None:
+            self.store.save_grant(
+                Grant(
+                    grant_id="oauth:other",
+                    client_id="contract-actor",
+                    subject="operator",
+                    scopes=("apply",),
+                )
+            )
+        self._mint_token_b("mapp_b_budget_3", subject="oauth:other")
+        self.assertEqual(2, self.store.exchanged_token_count("oauth:contract", 60))
+        self.assertEqual(1, self.store.exchanged_token_count("oauth:other", 60))
+
+        # Spending one does not return budget: a burst is a burst.
+        self.assertIsNotNone(
+            self.store.consume_exchanged_token(
+                "mapp_b_budget_1", "proposals.apply", DIGEST
+            )
+        )
+        self.assertEqual(2, self.store.exchanged_token_count("oauth:contract", 60))
+
+    def test_a_token_a_is_not_counted_against_the_exchange_budget(self) -> None:
+        """Only the exchange sets operation_id, and only its output is capped."""
+        if self.store.query_client("budget-client") is None:
+            self._contract_client("budget-client")
+        self.store.save_token(
+            "mapp_a_not_counted",
+            Token(
+                token_hash="",
+                client_id="budget-client",
+                scope="apply",
+                subject="oauth:contract",
+                issued_at=int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                expires_in=900,
+                audience=AUDIENCE,
+            ),
+        )
+        self.assertEqual(0, self.store.exchanged_token_count("oauth:contract", 60))

@@ -7,7 +7,8 @@ go/no-go recommendation.
 
 - **Branch:** `spike/mcp-phase0`, unmerged
 - **Owner:** to be assigned at approval
-- **Status:** submitted for go/no-go; **not approved**
+- **Status:** ADR and threat model **accepted by the owner** for this version.
+  Phase 1 design work approved; implementation gated on the conditions below.
 
 Every figure below was produced from the tree rather than recalled. Where a
 gate item is unsatisfied the row says so; several are, and the recommendation
@@ -40,8 +41,8 @@ issuer refused to issue.
 
 | Suite | Tests | Notes |
 | --- | --- | --- |
-| `mcp-auth/tests` | 361 | Zero skips with a control database attached |
-| `config-ui/tests` | 935 | Includes the token-B validation, envelope and canonicalization-agreement suites |
+| `mcp-auth/tests` | 375 | Zero skips with a control database attached. Includes the registered-client spike |
+| `config-ui/tests` | 956 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
 | `scripts/tests` | 168 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
 All three run in CI, each behind a `grep -q "skipped="` guard: a suite that
@@ -51,8 +52,8 @@ unnoticed-dead.
 **Mutation testing.** Every control introduced in the last three milestones was
 mutation-tested, and the figure is recorded in each commit rather than totalled
 here: 12 for the grant and introspection work (`9c030f0`), 30 for the audit
-fixes and platform wiring (`1451d97`), and 26 for the operation binding
-(`371b226`). All were caught. Six survived on first attempt; every one was a
+fixes and platform wiring (`1451d97`), 26 for the operation binding
+(`371b226`), and 11 for the client registry and abuse budget. All were caught. Six survived on first attempt; every one was a
 weak test rather than weak code, and each is now covered.
 
 The instructive case: a test named for refusing lower-case percent-escapes used
@@ -89,9 +90,9 @@ records an amendment.
 | Item | Status | Evidence |
 | --- | --- | --- |
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
-| Atomic one-time consumption, expiry cleanup, quota failure | **partial** | Consumption and cleanup done and measured. **Quotas do not exist** — no quota column anywhere in the schema |
+| Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
 | Independent canonicalization prototypes for mapp-mcp, broker and API | **2 of 3** | Broker and API each vendored and cross-checked. `mapp-mcp` does not exist |
-| Target-client spikes (Claude, Codex, Gemini) | **not started** | No client work of any kind |
+| Target-client spikes (Claude, Codex, Gemini) | **1 of 3** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component. Codex/OpenAI and Gemini untested |
 
 ### Tested
 
@@ -106,32 +107,37 @@ records an amendment.
 
 | Item | Status |
 | --- | --- |
-| ADR, threat model, decision log, client matrix, prototype findings approved | **partial** — ADR, threat model and findings exist and are unapproved; **no client matrix** |
+| ADR, threat model, decision log, client matrix, prototype findings approved | **partial** — ADR and threat model **accepted for this version**, with two unmitigated rows carried knowingly. The client matrix covers 1 of 3 ecosystems |
 | Open assumptions, accepted risks, rejected alternatives with revisit conditions | **done** — ADR, final two sections |
 
 ### Phase evidence and gate
 
 | Item | Status |
 | --- | --- |
-| Phase 0 evidence bundle | **this document**; owner and date pending approval |
+| Phase 0 evidence bundle | **this document** |
 | Effort and sequencing re-estimated from prototype evidence | **done** — below |
-| Phase 0 go/no-go approved | **not approved** |
+| Phase 0 go/no-go approved | **conditional go** for Phase 1 design; implementation gated below |
 
 ## Open items Phase 0 can now speak to
 
-**O18 — early acknowledgement.** The premise is now verified rather than
-assumed. `_json` answers 239 of the configuration API's call sites as one
+**O18 — early acknowledgement. RESOLVED: state-based reconciliation is the only
+path.** Of the three options, only reconciliation needs no new platform
+capability. mapp-mcp treats a lost response as unknown and re-reads state; it
+must never re-send a consequential effect. Phase 1 owes the unambiguous
+proposal state that makes that decidable. The premise was verified rather than
+assumed: `_json` answers 239 of the configuration API's call sites as one
 buffered write; the three paths that answer outside it serve artifacts, icons
 and `OPTIONS`. There is no chunked, streaming or early-acknowledgement path
 anywhere, and `recover_interrupted_operations` recovers operations but not
 proposals. So for `proposals apply`, `xyz reload` and `derived drop` the
-acknowledgement *is* the response that was lost. **Still open**, but the options
-are now a design choice rather than an investigation.
+acknowledgement *is* the response that was lost.
 
-**O19 — standing-window eligibility.** Unchanged. `ACTION_SCHEMAS` publishes one
-`risk` and one `scope` per action (plus a `requiredScopes` array added for the
-allowlist), and none of those expresses which action classes a standing approval
-window may cover. **Still open.**
+**O19 — standing-window eligibility. RESOLVED: the flag is required.** Without
+it, adding an action to the manifest could silently fall inside an operator's
+existing standing window, so a new high-risk action would inherit an approval
+nobody gave it. The flag makes a window fail closed on anything it does not
+name. Publication lands in Contract 1.7, which is deferred past Phase 0 by
+decision; Phase 0 built no standing approval, so nothing depends on it yet.
 
 **O20 — `form-action 'self'` across the consent redirect.** **Still open, and
 unclosable in this harness.** The suite drives `http.client`, which enforces no
@@ -157,7 +163,11 @@ commit with the effect, which the current file-backed audit does not.
 
 ## Recommendation
 
-**Conditional go, for Phase 1 design work only. No merge, and no public route.**
+**Conditional go. Phase 1 design work approved. No public route.**
+
+Updated after the owner's decisions: agent client registration now exists, so
+the merge blocker is closed and the authorization flow is proven end to end
+for an operator-registered client.
 
 The authorization design works against the real platform. The properties that
 mattered are built and pinned: audience separation, a non-widening exchange,
@@ -166,33 +176,37 @@ single-use consumption under real concurrency, and an operation binding that
 confines a credential to one request. Phase 0's purpose was to find out whether
 the design survives contact, and it did — with amendments the ADR records.
 
-What it did not do is make anything usable. Three gate items are unsatisfied in
-ways documentation cannot close:
+Two gate items remain unsatisfied in ways documentation cannot close, and
+neither blocks design work:
 
-1. **No agent client can be registered.** A correctly deployed component refuses
-   every authorization request from an agent. This is the single blocker.
-2. **No client acceptance work.** P2's matrix is untouched, and SDK support is
-   not client acceptance. Nothing can be said about how Claude, Codex or Gemini
-   behave against this component.
-3. **The third canonicalization implementation is absent**, because `mapp-mcp`
+1. **Client acceptance is 1 of 3.** The authorization column is proven for one
+   client against the real component. Codex/OpenAI and Gemini are untested, and
+   SDK support is not client acceptance. Blocking for release, not for Phase 1.
+2. **The third canonicalization implementation is absent**, because `mapp-mcp`
    is absent. Two independent implementations agree; the specification's own
    reason for wanting three is that two might both be wrong in the same way.
+   Closing this is part of building `mapp-mcp`.
 
-Conditions on the go:
+Conditions carried into Phase 1:
 
-- Merge is gated on agent client registration existing, because until then the
-  component cannot serve its purpose and merging it would put an unreachable
-  surface in `main`.
-- O20 must be checked manually in three browser engines before any public route.
-- The ADR and threat model require approval by the platform, security and MCP
-  owners. Two threat-model rows carry no mitigation (approval fatigue, client
-  attestation); accepting those is an owner's decision, not an author's.
-- Quotas and the transactional audit table are Phase 1 scope, not Phase 0 debt
-  to be forgotten.
+- **O20 must be checked manually in Chromium, Firefox and Safari before any
+  public route.** It is the only open item needing no engineering — one person
+  and three browsers — and it cannot be closed by any test in this harness.
+- **Connection pooling is a Phase 1 requirement**, not a revisit condition,
+  because multi-operator use is expected and the ceiling of 8 is a ceiling.
+- **Phase 1 owes the unambiguous proposal state** that O18's reconciliation
+  answer depends on, and the per-action eligibility flag O19 requires, both in
+  Contract 1.7.
+- **Two threat-model rows stay open by decision**: approval fatigue entirely,
+  client attestation in part. Each has a revisit condition in the ADR.
+- **Deferred by decision, and not to be forgotten:** Contract 1.7 until after
+  Phase 0, the transactional audit table until after Phase 1, and restore-time
+  credential invalidation with the cheaper bulk-invalidation shape recorded in
+  the ADR rather than the epoch predicate.
 
-**No-go on Phase 1 implementation** until the ADR and threat model are approved,
-which is what the gate says and what the first two conditions above make
-material rather than procedural.
+**Merge** is now a judgement rather than a blocker. The component works end to
+end for a registered client; what argues for keeping it on the branch is that
+`mapp-mcp` does not exist, so nothing in `main` would use it.
 
 ## Reproducing this
 

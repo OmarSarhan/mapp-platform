@@ -50,6 +50,16 @@ CONTEXT_VERSION = canonical.SCHEME
 #: cannot collide with a future registered RFC 8693 parameter.
 CONTEXT_PARAMETER = "mapp_operation_context"
 
+#: How many token B may be minted for one grant inside the window below.
+#: Provisional (P11): generous for interactive agent work -- one per second
+#: sustained -- and low enough that a runaway loop is bounded rather than
+#: unbounded. A legitimate burst that hits it is delayed, not refused
+#: permanently: the window slides.
+EXCHANGE_BUDGET_PER_GRANT = 60
+
+#: Seconds the budget is counted over.
+EXCHANGE_BUDGET_WINDOW = 60
+
 #: scheme name, then exactly one sha256 in lower-case hex.
 DIGEST_PATTERN = re.compile(re.escape(canonical.SCHEME) + r":[0-9a-f]{64}")
 
@@ -238,6 +248,24 @@ def exchange(
             "invalid_scope",
             "The request must ask for exactly the scopes this operation requires: "
             + " ".join(sorted(operation.required_scopes)),
+        )
+
+    # -- abuse budget ------------------------------------------------------
+    # One consent must not become an unbounded number of effects. Every other
+    # bound here is per credential -- a token B is single-use and lives sixty
+    # seconds -- but nothing stopped a grant minting them in a loop, and each
+    # one authorises a consequential operation. The cap is per grant rather
+    # than per client or per source, because the grant is what the operator
+    # approved and is the unit revocation acts on.
+    #
+    # Provisional, as P11 requires: replaced by measured values in Phase 6.
+    # Counted from the tokens already issued rather than a counter column, so
+    # nothing new has to be written, expired or reconciled.
+    minted = store.exchanged_token_count(record.subject, EXCHANGE_BUDGET_WINDOW)
+    if minted >= EXCHANGE_BUDGET_PER_GRANT:
+        raise ExchangeError(
+            "slow_down",
+            "This grant has reached its exchange budget. Retry shortly.",
         )
 
     # -- issue -------------------------------------------------------------

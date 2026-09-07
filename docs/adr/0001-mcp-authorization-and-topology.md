@@ -1,6 +1,10 @@
 # ADR 0001 — MCP authorization and deployment topology
 
-- **Status:** proposed, pending the Phase 0 go/no-go decision
+- **Status:** accepted for Phase 0. The owner accepted this record and the
+  threat model as functional and safe for this version, with the two
+  unmitigated threat-model rows (approval fatigue in full, client attestation
+  in part) knowingly carried as accepted risks. Phase 1 implementation remains
+  gated on the conditions in the evidence bundle.
 - **Scope:** the authorization design for `mapp-mcp`, its deployment topology,
   and the state it owns
 - **Supersedes:** nothing. First ADR in this repository.
@@ -94,10 +98,19 @@ vectors, and a further test compares the copies directly.
 packaged image is 17. Nothing in the control schema depends on the difference,
 but the assumption was wrong and is recorded so no one plans around it.
 
-**Quotas do not exist.** The plan expected M4 to create quota columns with
-enforcement deferred. It created none: there is no quota, rate-limit or budget
-column anywhere in the control schema. P11's budgets are entirely Phase 1. This
-is a correction to the plan, not to the specification.
+**One abuse budget exists; P11's full budgets do not.** The plan expected M4 to
+create quota columns with enforcement deferred, and it created none. Rather
+than add columns, Phase 0 added the one bound whose absence was a multiplier:
+**token B minted per grant per window**, capped at 60 in 60 seconds and counted
+from the token rows themselves, so nothing new has to be written, expired or
+reconciled. Every other bound was per credential — a token B is single-use and
+lives sixty seconds — so a grant minting them in a loop was the only unbounded
+path, and each one authorises a consequential operation. The cap is per grant
+because that is what the operator approved and what revocation acts on; a
+global cap would let one busy grant deny a quiet one, which is the mistake P21
+already corrected for parked requests. Refuses with `slow_down` on a sliding
+window, so a legitimate burst is delayed rather than denied. Provisional, as
+P11 requires: replaced by measured values in Phase 6.
 
 **`recovery_epoch` is reserved storage, not a mechanism.** The column is
 declared on eight tables and never written or read. A restore today invalidates
@@ -116,6 +129,57 @@ The audit log deliberately remains at `var/control/audit.jsonl` while
 authorization state moved into the database. P19 asks for an append-only audit
 table committed with the effect; that is Phase 1. The current arrangement is
 consistent with the ownership matrix and is recorded as an accepted gap.
+
+**Agent clients are registered by an operator command, not an endpoint.**
+`./bin/mapp mcp-client-register` writes a *public* client — PKCE and no secret,
+because an agent is a native or desktop application that cannot keep one, and
+issuing a secret would create a credential that has to live on the operator's
+machine unprotected. Redirect URIs are validated at registration (absolute, no
+fragment, no userinfo, https unless loopback) because the authorization server
+matches them exactly and a permissive entry is a working way to have
+authorization codes delivered elsewhere. `full` and `admin` are refused
+outright. RFC 7591 dynamic registration is rejected rather than deferred: P2
+requires one *pinned* client per ecosystem, and a person decides which agent
+may ask for consent.
+
+**O18 is resolved as state-based reconciliation.** Of the three options — a
+two-phase response, background-submittable apply and reload, or reconciliation
+— only reconciliation needs no new platform capability, and Phase 0 verified
+the premise rather than assuming it. mapp-mcp treats a lost response as unknown
+and re-reads state; it must never re-send a consequential effect. Phase 1 owes
+the unambiguous proposal state that makes that decidable.
+
+**O19 is resolved as "the flag is required."** Without a per-action eligibility
+flag, adding an action to the manifest could silently fall inside an existing
+standing-approval window, so a new high-risk action would inherit an approval
+nobody gave it. The flag makes a window fail closed on anything it does not
+name. Publication lands in Contract 1.7.
+
+**Contract 1.7 stays closed until after Phase 0**, by decision. Only
+`mcp:connect` is a genuinely new scope — `apply`, `derive`,
+`federation:provision`, `semantic:apply` and `semantic:inspect` already exist
+in the platform's token vocabulary — so P5's "hard cutover" is far smaller than
+the specification implies.
+
+**Multi-operator use is expected, so connection pooling becomes a Phase 1
+requirement** rather than a revisit condition. The measured ceiling of 8 with
+no pooling refuses the ninth caller cleanly and recovers on release, which is
+adequate for one operator and not for several. Raising the limit without
+pooling only moves the number.
+
+**`recovery_epoch` is not being wired, on measured grounds.** The columns exist
+on eight tables, but wiring them means an epoch predicate on 46 statements
+across two components plus a new metadata row, a bump command and a mirrored
+implementation in the test double — re-engineering rather than filling in a
+field. Nothing in the gate requires it. If restore-time invalidation is wanted,
+the cheaper and arguably better shape is a single bulk invalidation run as a
+documented restore step: after a restore an operator generally *wants*
+everything re-consented, not selectively filtered. Recorded as the Phase 1
+recommendation; the columns stay reserved storage and say so.
+
+**The audit table (P19) is deferred past Phase 1**, by decision. The audit log
+stays append-only at `var/control/audit.jsonl` and does not share a transaction
+with the authorization decision.
 
 ## Consequences
 
@@ -159,14 +223,14 @@ four paths on the MCP origin. Both are asserted, in different suites.
 
 | # | Item | Accepted because | Revisit condition |
 | --- | --- | --- | --- |
-| 1 | No agent client can be registered | Registration is a Phase 1 deliverable and an agent client must be registered by a person | Blocking for any agent use; Phase 1 |
+| 1 | ~~No agent client can be registered~~ **Closed in Phase 0** | `./bin/mapp mcp-client-register` registers a public client, and the full flow is proven end to end against one | — |
 | 2 | The digest producer does not exist | `mapp-mcp` is Phase 1. The verifying boundary is built and proven against the broker over real HTTP | Phase 1; the third independent canonicalizer is required at that point |
-| 3 | Quotas and abuse budgets absent | P11 says provisional budgets are replaced by measured values in Phase 6 | Phase 1 for enforcement, Phase 6 for figures |
-| 4 | Audit not transactional with the effect | Matches the current ownership matrix; the file store is durable and append-only | P19 requires the table in Phase 1 |
+| 3 | Only one abuse budget exists | The per-grant exchange cap closes the one unbounded multiplier; P11's remaining budgets are provisional and measured in Phase 6 | Phase 6 for figures |
+| 4 | Audit not transactional with the effect | Owner decision: deferred past Phase 1. The file store is durable and append-only | After Phase 1 |
 | 5 | `recovery_epoch` unimplemented | No restore-invalidation control is claimed anywhere in operation | When restore-time invalidation is needed |
 | 6 | O20 — `form-action 'self'` across the consent redirect | The Phase 0 harness drives `http.client`, which enforces no CSP, so this is unverifiable by construction in that harness | Needs one manual check in Chromium, Firefox and Safari before any public route |
-| 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover; adequate for a single-operator platform | Any multi-operator or bursty workload |
-| 8 | No client acceptance testing | P2's target-client matrix is untouched. SDK support is not client acceptance | Blocking for release; Phase 0 gate item |
+| 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
+| 8 | Client acceptance is 1 of 3 | The authorization column is proven for one client against the real component. Codex/OpenAI and Gemini are untested, and SDK support is not client acceptance | Blocking for release |
 
 ## References
 

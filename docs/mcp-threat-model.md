@@ -10,8 +10,11 @@ intention — a threat model whose mitigations are aspirations is worse than non
 because it stops people looking.
 
 **Read this as covering an unmerged feasibility spike.** Two of the assets below
-have no producer yet, and one whole class of attacker — a registered agent
-client — cannot currently exist because registration does not.
+have no producer yet: `mapp-mcp` does not exist, so nothing produces a request
+digest in anger.
+
+**Accepted by the owner for this version**, with the two unmitigated rows below
+— approval fatigue in full, client attestation in part — carried knowingly.
 
 ## Assets
 
@@ -161,6 +164,13 @@ Expiry cleanup runs opportunistically on write; under 16 concurrent writers and
 4 concurrent sweeps it removed 100 expired records, removed no live record, and
 did not deadlock.
 
+Token B minted per grant is capped at 60 in a sliding 60-second window, which
+closes the one unbounded multiplier: every other bound was per credential, so a
+grant minting them in a loop was the only way one consent became an unlimited
+number of consequential effects. Per grant rather than global, for the reason
+the parked-request cap is per source — a global bound lets one busy actor deny
+everybody. Refuses with `slow_down`, so a legitimate burst is delayed.
+
 Login attempts are throttled per remote address. Request bodies are bounded at
 16 KiB on the control endpoints and 512 KiB at the MCP origin in Caddy.
 
@@ -196,10 +206,18 @@ and for an already-issued token B — the last of which required checking the
 Revoking the grant invalidates every credential derived from it at once,
 including a token B issued and not yet spent.
 
-**Residual:** there is no client attestation. `private_key_jwt` is deferred (see
-the ADR for the concrete reason), so a client secret is a bearer secret. And
-P2's client acceptance matrix is untouched, so no statement can be made about how
-any real client behaves.
+A client is registered by an operator, never by itself. Registration validates
+the redirect URIs the authorization server will later match exactly, and
+refuses `full` and `admin` outright.
+
+**Residual, and accepted:** there is no client attestation. An agent is a
+public client — it holds no secret at all, and PKCE binds the code to the
+requesting instance rather than proving which application it is.
+`private_key_jwt` is deferred for a concrete reason recorded in the ADR. So a
+hostile application that can register itself as an agent, or take over a
+registered agent's redirect URI on the operator's own machine, is bounded only
+by the scopes that agent was granted. P2's client acceptance matrix is 1 of 3,
+so nothing can be said about how Codex/OpenAI or Gemini behave.
 
 ## Attacker capabilities the design does not defend against
 
@@ -215,8 +233,11 @@ Stated plainly, because a threat model that implies otherwise is misleading:
   HTTP on an internal Docker network. The specification's own transport threat
   model raises mTLS for this; it is not implemented.
 - **Restore-time credential invalidation.** `recovery_epoch` exists as columns
-  and nothing reads them, so restoring a backup reinstates credentials that were
-  valid at snapshot time.
+  and nothing reads them, so restoring a backup reinstates credentials that
+  were valid at snapshot time — including ones revoked since. Deliberately not
+  wired: the measured cost is an epoch predicate on 46 statements across two
+  components, and a single bulk invalidation as a documented restore step would
+  close the same hole more cheaply. Either way it is open.
 
 ## Review status
 
@@ -224,4 +245,9 @@ The abuse cases the Phase 0 gate names are covered above: replay, confused
 deputy, SSRF, credential theft, approval forgery, state exhaustion, approval
 fatigue and compromised client. Two carry no mitigation (approval fatigue in
 full, client attestation in part) and one carries an unverified control (O20).
-Approval of this document is a gate item and has not been given.
+
+The owner has accepted this document for this version with those two rows
+carried knowingly. That acceptance is not a claim they are mitigated — it is a
+decision to proceed with them open, and each has a revisit condition in the
+ADR. O20 still needs one manual check in three browser engines before any
+public route.

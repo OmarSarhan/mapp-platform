@@ -370,6 +370,181 @@ class ControlStore:
                 (client_id, name, digest),
             )
 
+    # -- agent OAuth clients ---------------------------------------------
+
+    #: Hosts for which plain http is an acceptable redirect target. RFC 8252
+    #: s7.3 makes loopback the native-app pattern; anything else on http would
+    #: carry an authorization code over plaintext.
+    LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+    @classmethod
+    def check_redirect_uri(cls, value: str) -> str:
+        """Validate one redirect URI, or refuse.
+
+        The authorization server matches these exactly -- no prefix, no
+        wildcard -- so a permissive entry here is the whole vulnerability: a
+        redirect URI an attacker can influence is a working way to have
+        authorization codes delivered to them.
+        """
+        from urllib.parse import urlsplit
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("A redirect URI is required.")
+        # Checked before stripping, not after. Stripping first silently accepted
+        # a trailing CRLF as the stripped value -- a normalization where the
+        # rule everywhere else here is refusal, and the one input shape that
+        # matters most is the one that looks like header injection.
+        if any(character in value for character in ("\r", "\n", "\t", "\x00")):
+            raise ValueError("Redirect URI contains a control character.")
+        # A plain leading or trailing space is shell copy-paste, so it is
+        # trimmed; an interior space is not, and is refused below.
+        value = value.strip(" ")
+        if " " in value:
+            raise ValueError(f"Redirect URI contains whitespace: {value!r}")
+        parsed = urlsplit(value)
+        if not parsed.scheme:
+            raise ValueError(f"Redirect URI must be absolute: {value!r}")
+        if parsed.fragment:
+            # RFC 6749 s3.1.2: the endpoint URI must not include a fragment.
+            raise ValueError(f"Redirect URI must not carry a fragment: {value!r}")
+        if parsed.username or parsed.password:
+            raise ValueError(f"Redirect URI must not carry userinfo: {value!r}")
+        if parsed.scheme == "http" and parsed.hostname not in cls.LOOPBACK_HOSTS:
+            raise ValueError(
+                f"Redirect URI must use https unless it is loopback: {value!r}"
+            )
+        if parsed.scheme in {"http", "https"} and not parsed.netloc:
+            raise ValueError(f"Redirect URI has no host: {value!r}")
+        return value
+
+    @staticmethod
+    def check_scope(value: str) -> str:
+        """Validate a scope's shape, not its membership of a vocabulary.
+
+        Deliberately not checked against a list here. The authorization server
+        decides which scopes it will issue, and it derives that from the
+        operation allowlist; restating the vocabulary in a third place is the
+        drift this platform has already been bitten by. A scope the server will
+        not issue produces a refusal at the authorization request, which is a
+        clear failure rather than a silent one.
+        """
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("A scope is required.")
+        value = value.strip()
+        if any(character.isspace() for character in value):
+            raise ValueError(f"A scope may not contain whitespace: {value!r}")
+        if not all(character.isprintable() for character in value):
+            raise ValueError(f"A scope must be printable: {value!r}")
+        return value
+
+    def register_oauth_client(
+        self, *, name: str, redirect_uris, scopes
+    ) -> str:
+        """Register a public agent client and return its generated id.
+
+        Public, not confidential: an agent is a native or desktop application
+        that cannot keep a secret, so it authenticates with PKCE alone -- the
+        authorization server requires S256 of every client, including
+        confidential ones. Issuing a secret here would create a credential that
+        has to live on the operator's machine and could not be protected.
+
+        Registration is deliberately an operator command rather than an
+        endpoint. RFC 7591 dynamic registration would let a client register
+        itself, and P2 requires one *pinned* client per ecosystem -- a person
+        decides which agent may ask for consent.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("A client name is required.")
+        uris = tuple(self.check_redirect_uri(item) for item in redirect_uris)
+        if not uris:
+            raise ValueError("At least one redirect URI is required.")
+        if len(set(uris)) != len(uris):
+            raise ValueError("Duplicate redirect URIs.")
+        wanted = tuple(self.check_scope(item) for item in scopes)
+        if not wanted:
+            raise ValueError("At least one scope is required.")
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("Duplicate scopes.")
+        for reserved in ("full", "admin"):
+            if reserved in wanted:
+                # Never issued for the MCP resource, and `full` is on the
+                # broker's hard deny-list, so a client holding it could reach
+                # every unclassified route.
+                raise ValueError(f"The {reserved!r} scope is never issued to an agent.")
+        client_id = "mcp-" + secrets.token_urlsafe(12)
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute(
+                "INSERT INTO control.oauth_clients"
+                "(client_id, name, redirect_uris, scopes, grant_types,"
+                " token_endpoint_auth_method, client_secret_hash)"
+                " VALUES(%s,%s,%s,%s,'{authorization_code}','none',NULL)",
+                (client_id, name.strip(), list(uris), list(wanted)),
+            )
+        return client_id
+
+    def list_oauth_clients(self) -> list[dict]:
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT client_id, name, redirect_uris, scopes,"
+                " token_endpoint_auth_method, created_at, disabled_at"
+                " FROM control.oauth_clients ORDER BY created_at, client_id"
+            ).fetchall()
+        return [
+            {
+                "clientId": row["client_id"],
+                "name": row["name"],
+                "redirectUris": list(row["redirect_uris"]),
+                "scopes": list(row["scopes"]),
+                "confidential": row["token_endpoint_auth_method"] != "none",
+                "created": iso(row["created_at"]),
+                "disabled": iso(row["disabled_at"]) if row["disabled_at"] else None,
+            }
+            for row in rows
+        ]
+
+    def disable_oauth_client(self, client_id: str) -> bool:
+        """Disable a client, reporting whether this call was the one that did it.
+
+        Disabling takes effect immediately at introspection, at the exchange
+        and for an already-issued token B, because the checks resolve the
+        grant's client rather than the token's. It does not revoke the grants
+        themselves: an operator withdrawing a client is not necessarily
+        withdrawing the consents, and revoking a grant is a separate act with
+        its own audit meaning.
+
+        Refuses a confidential client. Those are service identities rather than
+        agents -- the configuration API's own row is the only one -- and
+        ensure_oauth_client re-enables them on every start-up from the
+        deployment's secret, so disabling one here would quietly undo itself at
+        the next restart. Clearing MCP_AUTH_CLIENT_SECRET is the lever for
+        that, and it turns the feature off rather than leaving it half on.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            existing = connection.execute(
+                "SELECT token_endpoint_auth_method FROM control.oauth_clients"
+                " WHERE client_id = %s",
+                (client_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["token_endpoint_auth_method"] != "none"
+            ):
+                raise ValueError(
+                    f"{client_id!r} is a confidential service client, not an"
+                    " agent. Disabling it here would be undone at the next"
+                    " start-up; clear MCP_AUTH_CLIENT_SECRET instead."
+                )
+            row = connection.execute(
+                "UPDATE control.oauth_clients SET disabled_at = now()"
+                " WHERE client_id = %s AND disabled_at IS NULL"
+                " RETURNING client_id",
+                (client_id,),
+            ).fetchone()
+        return row is not None
+
     def pagination_key(self) -> bytes:
         """Return a stable private key for integrity-bound opaque cursors.
 

@@ -477,6 +477,24 @@ class SqlStore:
         return dict(row) if row is not None else None
 
     #: Test-only. Nothing in the flow counts tokens; assertions about growth do.
+    def exchanged_token_count(self, subject: str, window_seconds: int) -> int:
+        """How many token B this grant has been issued inside the window.
+
+        Counted from the rows themselves rather than a counter column: a
+        counter would need writing, expiring and reconciling, and a consumed
+        or revoked token still counts against a burst -- it was still minted.
+        operation_id is what distinguishes a token B from a token A; only the
+        exchange sets it.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT count(*) AS n FROM control.oauth_tokens"
+                " WHERE subject = %s AND operation_id IS NOT NULL"
+                "   AND issued_at > now() - make_interval(secs => %s)",
+                (subject, window_seconds),
+            ).fetchone()
+        return int(row["n"])
+
     def token_count(self) -> int:
         with self._connect() as connection:
             row = connection.execute(

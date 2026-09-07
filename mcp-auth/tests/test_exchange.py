@@ -832,3 +832,60 @@ class ExchangeOverHttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExchangeBudgetTests(ExchangeTestCase):
+    """One consent must not become an unbounded number of effects.
+
+    Every other bound is per credential: a token B is single-use and lives
+    sixty seconds. Nothing stopped a grant minting them in a loop, and each one
+    authorises a consequential operation, so the multiplier was the grant.
+    """
+
+    def mint_many(self, count: int) -> None:
+        issued = dt.datetime.now(dt.timezone.utc)
+        for index in range(count):
+            self.store.save_exchanged_token(
+                f"mapp_b_budget_{index}",
+                client_id="mapp-mcp-broker",
+                actor_client_id="mcp-client",
+                subject="oauth:grant-1",
+                scope="apply",
+                audience=RESOURCE,
+                issued_at=issued,
+                expires_at=issued + dt.timedelta(seconds=60),
+                operation_id="proposals.apply",
+                request_digest=canonical.digest({"n": index}),
+                single_use=True,
+            )
+
+    def test_an_exchange_under_the_budget_succeeds(self) -> None:
+        self.mint_many(exchange.EXCHANGE_BUDGET_PER_GRANT - 1)
+        token = self.run_exchange()
+        self.assertTrue(token["access_token"].startswith(exchange.TOKEN_B_PREFIX))
+
+    def test_the_budget_refuses_rather_than_minting_forever(self) -> None:
+        self.mint_many(exchange.EXCHANGE_BUDGET_PER_GRANT)
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            self.run_exchange()
+        # slow_down rather than invalid_grant: the credential is fine and the
+        # caller should retry, which is what a sliding window means.
+        self.assertEqual("slow_down", caught.exception.error)
+
+    def test_the_budget_is_per_grant_not_global(self) -> None:
+        """A busy grant must not deny a quiet one.
+
+        The per-source pending cap exists because a global bound let one
+        caller deny everybody. The same reasoning applies here.
+        """
+        self.mint_many(exchange.EXCHANGE_BUDGET_PER_GRANT)
+        self.store.save_grant(
+            Grant(grant_id="oauth:grant-2", client_id="mcp-client",
+                  subject="operator", scopes=("apply", "derive", "semantic:inspect"))
+        )
+        self._seed_subject(
+            "mapp_a_quiet", "apply derive semantic:inspect",
+            subject="oauth:grant-2",
+        )
+        token = self.run_exchange(form(subject_token="mapp_a_quiet"))
+        self.assertTrue(token["access_token"].startswith(exchange.TOKEN_B_PREFIX))
