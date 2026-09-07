@@ -191,7 +191,8 @@ Conditions carried into Phase 1:
 
 - **O20 must be checked manually in Chromium, Firefox and Safari before any
   public route.** It is the only open item needing no engineering — one person
-  and three browsers — and it cannot be closed by any test in this harness.
+  and three browsers — and it cannot be closed by any test in this harness. Deferred by the owner
+  more than once, deliberately; the trigger is a public route, not a date.
 - **Connection pooling is a Phase 1 requirement**, not a revisit condition,
   because multi-operator use is expected and the ceiling of 8 is a ceiling.
 - **Phase 1 owes the unambiguous proposal state** that O18's reconciliation
@@ -200,9 +201,12 @@ Conditions carried into Phase 1:
 - **Two threat-model rows stay open by decision**: approval fatigue entirely,
   client attestation in part. Each has a revisit condition in the ADR.
 - **Deferred by decision, and not to be forgotten:** Contract 1.7 until after
-  Phase 0, the transactional audit table until after Phase 1, and restore-time
-  credential invalidation with the cheaper bulk-invalidation shape recorded in
-  the ADR rather than the epoch predicate.
+  Phase 0, and the transactional audit table until after Phase 1.
+- **Not scheduled at all, by decision:** restore-time credential invalidation.
+  `recovery_epoch` stays reserved storage, so a restore reinstates credentials
+  valid at snapshot time including ones revoked since. Treated as a
+  nice-to-have and revisited at the end of the project; the ADR records the
+  cheaper shape if it is ever picked up.
 
 **Merge** is now a judgement rather than a blocker. The component works end to
 end for a registered client; what argues for keeping it on the branch is that

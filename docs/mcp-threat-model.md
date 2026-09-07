@@ -235,9 +235,10 @@ Stated plainly, because a threat model that implies otherwise is misleading:
 - **Restore-time credential invalidation.** `recovery_epoch` exists as columns
   and nothing reads them, so restoring a backup reinstates credentials that
   were valid at snapshot time — including ones revoked since. Deliberately not
-  wired: the measured cost is an epoch predicate on 46 statements across two
+  wired and not scheduled: the measured cost is an epoch predicate on 46 statements across two
   components, and a single bulk invalidation as a documented restore step would
-  close the same hole more cheaply. Either way it is open.
+  close the same hole more cheaply. Accepted as an open hole by owner
+  decision, revisited at the end of the project.
 
 ## Review status
 

@@ -167,15 +167,19 @@ no pooling refuses the ninth caller cleanly and recovers on release, which is
 adequate for one operator and not for several. Raising the limit without
 pooling only moves the number.
 
-**`recovery_epoch` is not being wired, on measured grounds.** The columns exist
-on eight tables, but wiring them means an epoch predicate on 46 statements
+**`recovery_epoch` is not being wired, and is not Phase 1 scope.** The
+columns exist on eight tables, but wiring them means an epoch predicate on 46 statements
 across two components plus a new metadata row, a bump command and a mirrored
 implementation in the test double — re-engineering rather than filling in a
-field. Nothing in the gate requires it. If restore-time invalidation is wanted,
-the cheaper and arguably better shape is a single bulk invalidation run as a
-documented restore step: after a restore an operator generally *wants*
-everything re-consented, not selectively filtered. Recorded as the Phase 1
-recommendation; the columns stay reserved storage and say so.
+field. Nothing in the gate requires it.
+
+Owner decision: **a nice-to-have, revisited at the end of the project rather
+than scheduled.** The consequence, stated so it is not forgotten: restoring a
+backup reinstates credentials that were valid at snapshot time, including ones
+revoked since. If it is picked up, the cheaper and arguably better shape is a
+single bulk invalidation run as a documented restore step: after a restore an
+operator generally *wants* everything re-consented, not selectively filtered.
+The columns stay reserved storage and say so.
 
 **The audit table (P19) is deferred past Phase 1**, by decision. The audit log
 stays append-only at `var/control/audit.jsonl` and does not share a transaction
@@ -227,8 +231,8 @@ four paths on the MCP origin. Both are asserted, in different suites.
 | 2 | The digest producer does not exist | `mapp-mcp` is Phase 1. The verifying boundary is built and proven against the broker over real HTTP | Phase 1; the third independent canonicalizer is required at that point |
 | 3 | Only one abuse budget exists | The per-grant exchange cap closes the one unbounded multiplier; P11's remaining budgets are provisional and measured in Phase 6 | Phase 6 for figures |
 | 4 | Audit not transactional with the effect | Owner decision: deferred past Phase 1. The file store is durable and append-only | After Phase 1 |
-| 5 | `recovery_epoch` unimplemented | No restore-invalidation control is claimed anywhere in operation | When restore-time invalidation is needed |
-| 6 | O20 — `form-action 'self'` across the consent redirect | The Phase 0 harness drives `http.client`, which enforces no CSP, so this is unverifiable by construction in that harness | Needs one manual check in Chromium, Firefox and Safari before any public route |
+| 5 | `recovery_epoch` unimplemented | Owner decision: a nice-to-have, not Phase 1 scope. No restore-invalidation control is claimed anywhere in operation | End of project, or the first time a restore has to preserve a revocation |
+| 6 | O20 — `form-action 'self'` across the consent redirect | The Phase 0 harness drives `http.client`, which enforces no CSP, so this is unverifiable by construction in that harness. Deferred by the owner more than once, deliberately: the flow is otherwise proven end to end | Before any public route. One manual check in Chromium, Firefox and Safari; if it fails, widen the directive to name the registered redirect origins |
 | 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
 | 8 | Client acceptance is 1 of 3 | The authorization column is proven for one client against the real component. Codex/OpenAI and Gemini are untested, and SDK support is not client acceptance | Blocking for release |
 
