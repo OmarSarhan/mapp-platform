@@ -461,6 +461,9 @@ Read: [`security.md`](security.md)
 | [`backup-restore.md`](backup-restore.md) | What to back up and how to restore it |
 | [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation, XYZ framework policy |
 | [`mcp-authorization.md`](mcp-authorization.md) | The Phase 0 MCP authorization component: its origin, endpoints, state and limits |
+| [`adr/0001-mcp-authorization-and-topology.md`](adr/0001-mcp-authorization-and-topology.md) | The authorization ADR: what the decisions became when they were built, and what Phase 0 changed |
+| [`mcp-threat-model.md`](mcp-threat-model.md) | Assets, trust boundaries and the eight abuse cases, with what is and is not mitigated |
+| [`mcp-phase0-evidence.md`](mcp-phase0-evidence.md) | Phase 0 evidence: measured capacity, gate status and the go/no-go recommendation |
 | [`api-contract.md`](api-contract.md) | Every route, its scope and its shape |
 
 ---

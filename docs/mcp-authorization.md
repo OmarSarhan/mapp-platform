@@ -292,12 +292,17 @@ token B with no indication why.
 
 Redemption happens after authentication and after the scope check, so a
 request refused for want of a scope does not burn a single-use credential.
-`_json` is the configuration API's only response helper and refuses to emit a
-success for an unredeemed exchanged token, which makes that a property of the
-response layer rather than something every handler has to remember. It is a
-backstop rather than the gate: by the time a response is written a mutation has
-already been applied, which is why redemption happens in `_authorized` before
-any handler dispatches.
+`_json` answers 239 of the configuration API's call sites and refuses to emit
+a success for an unredeemed exchanged token, which makes that a property of the
+response layer rather than something every handler has to remember. Three
+paths answer outside it — `/api/artifacts/`, the SVG prefix and `do_OPTIONS` —
+and none is reachable with an exchanged credential, because no manifest
+template matches them and the binding gate refuses an unresolvable route
+before dispatch. That gate, not this guard, is the control.
+
+The guard is a backstop in any case: by the time a response is written a
+mutation has already been applied, which is why redemption happens in
+`_authorized` before any handler dispatches.
 
 ## Sign-in and consent
 

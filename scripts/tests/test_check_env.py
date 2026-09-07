@@ -424,7 +424,10 @@ class CheckEnvironmentTests(unittest.TestCase):
             advertised.update(match.group(1).split("|"))
         self.assertIn("verify", advertised, "usage parsing found nothing")
 
-        documents = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md"))
+        # Recursive: docs/adr/ holds decision records, which are exactly the
+        # kind of document that keeps a command name after it is renamed. A
+        # non-recursive glob silently exempted the whole subdirectory.
+        documents = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").rglob("*.md"))
         documents.append(ROOT / "etl/README.md")
         unknown: dict[str, set[str]] = {}
         for document in documents:

@@ -6201,11 +6201,17 @@ class Handler(SimpleHTTPRequestHandler):
             and not self._exchanged_token_redeemed
             and 200 <= int(status) < 300
         ):
-            # Fail closed. _json is the only response helper in this
-            # service -- 239 call sites and no other way to answer -- so this
-            # makes "an exchanged credential never gets a success it did not
-            # redeem for" a property of the response layer rather than
-            # something every handler has to remember.
+            # Fail closed. _json answers 239 of this service's call sites,
+            # so putting the check here makes "an exchanged credential never
+            # gets a success it did not redeem for" a property of the response
+            # layer rather than something every handler has to remember.
+            #
+            # It is not literally every response: /api/artifacts/, the SVG
+            # prefix and do_OPTIONS write to wfile directly. None of them is
+            # reachable with an exchanged credential, and the reason is the
+            # binding gate rather than this guard -- no template matches those
+            # paths, so _resolve_operation refuses them before dispatch. That
+            # is what test_raw_response_paths_are_unreachable pins.
             #
             # It is a backstop, not the gate: redemption happens in
             # _authorized before any handler dispatches, because by the time a

@@ -451,6 +451,27 @@ class FailClosedGuardTests(TokenBTestCase):
         handler._json(HTTPStatus.OK, {"applied": True})
         self.assertEqual([HTTPStatus.OK], self.written)
 
+    def test_raw_response_paths_are_unreachable(self) -> None:
+        """_json is not literally every response, so the guard is not the control.
+
+        /api/artifacts/ and the SVG prefix write to wfile directly and would
+        bypass this guard entirely. What actually stops an exchanged credential
+        reaching them is the binding gate: no manifest template matches, so
+        _resolve_operation refuses before dispatch. Pinned here because the
+        comfortable reading -- "the guard covers everything" -- is false, and a
+        future raw-write handler on an allowlisted route would need the gate,
+        not this.
+        """
+        handler = object.__new__(app.Handler)
+        for path in ("/api/artifacts/shot.png", "/instance/svg/bus.svg"):
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    app.Handler._resolve_operation(handler, "GET", path)
+                )
+        # And the SVG prefix is outside /api/, so it is never authorized at
+        # all -- an exchanged credential presented there is simply ignored.
+        self.assertFalse("/instance/svg/bus.svg".startswith("/api/"))
+
     def test_an_error_response_is_not_rewritten(self) -> None:
         """Only a 2xx is a claim that the effect happened."""
         handler = self.make()

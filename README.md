@@ -100,7 +100,14 @@ line each.
 The platform's own state — the administrator credential, dashboard sessions,
 CLI tokens, device authorizations and the OAuth records of the Phase 0
 [MCP authorization component](docs/mcp-authorization.md) — lives in the
-`control` schema of the packaged database, not in files under `var/`.
+`control` schema of the packaged database, not in files under `var/`. Its
+design decisions are recorded in
+[ADR 0001](docs/adr/0001-mcp-authorization-and-topology.md), its
+[threat model](docs/mcp-threat-model.md) covers the abuse cases, and the
+[Phase 0 evidence bundle](docs/mcp-phase0-evidence.md) carries the measured
+capacity and the gate status. That component is an unmerged feasibility spike:
+no agent client can be registered yet, so it cannot complete an authorization
+end to end.
 
 ## The remote client
 
