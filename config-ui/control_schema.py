@@ -474,11 +474,92 @@ def _migration_4(connection: psycopg.Connection) -> None:
     )
 
 
+#: Every table whose rows carry authority and are stamped with the epoch they
+#: were minted under. Split by how each is invalidated, because they do not
+#: share a column: three record a revocation, the rest are ephemeral and are
+#: removed outright.
+EPOCH_REVOKED_TABLES = ("tokens", "oauth_tokens", "oauth_grants")
+
+#: Sessions, one-shot codes and in-flight authorizations. Nothing here is worth
+#: keeping as evidence after a restore, and none of them has a revoked_at to
+#: mark. `tokens` is deliberately *not* in this list: a revoked token's
+#: case-insensitive name must stay reserved, so it is revoked and kept.
+EPOCH_DELETED_TABLES = (
+    "sessions",
+    "oauth_sessions",
+    "device_authorizations",
+    "oauth_authorization_codes",
+    "oauth_pending_authorizations",
+)
+
+
+def _migration_5(connection: psycopg.Connection) -> None:
+    """Make `recovery_epoch` a mechanism instead of reserved storage.
+
+    The columns have existed since migration 1 and nothing ever wrote or read
+    them, so a restore reinstated every credential that was valid at snapshot
+    time -- including ones revoked since. Phase 1 requires the opposite: "a
+    restore advances the recovery epoch and cannot make a pre-restore
+    grant/A mapping, refresh family or B usable".
+
+    The cheap way to do that is the point of this migration. An earlier
+    analysis costed the epoch as a read-time predicate -- `AND recovery_epoch =
+    current` on every credential read, 46 statements across two components --
+    and concluded it was not worth it. That was the wrong design. Every read
+    already filters on a revocation, so the epoch only has to be applied
+    *once, at restore*, by revoking what predates it. Reads never change.
+
+    Which leaves one problem: rows inserted after an advance must carry the new
+    epoch, or the next advance would sweep them too. Rather than pass it at
+    every INSERT -- which is where the 46 statements came from -- the column
+    default calls a function that reads the current value. No application code
+    changes at all.
+    """
+    connection.execute(
+        sql.SQL(
+            "INSERT INTO {schema}.metadata(key, value) VALUES('recovery_epoch', '0')"
+            " ON CONFLICT (key) DO NOTHING"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+    # STABLE, not IMMUTABLE: the value changes between statements, and marking
+    # it immutable would let the planner fold a stale value into a cached plan.
+    # Schema-qualified inside, because the control role's search_path puts
+    # pg_catalog first and a function body resolves at call time.
+    connection.execute(
+        sql.SQL(
+            """
+            CREATE OR REPLACE FUNCTION {schema}.current_recovery_epoch()
+            RETURNS bigint
+            LANGUAGE sql
+            STABLE
+            AS $$
+                SELECT COALESCE(
+                    (SELECT value::bigint FROM {schema}.metadata
+                      WHERE key = 'recovery_epoch'),
+                    0
+                )
+            $$
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+    for table in EPOCH_REVOKED_TABLES + EPOCH_DELETED_TABLES:
+        # A DEFAULT change is catalogue-only in PostgreSQL, so this rewrites no
+        # table and takes no long lock however large they are.
+        connection.execute(
+            sql.SQL(
+                "ALTER TABLE {schema}.{table}"
+                " ALTER COLUMN recovery_epoch"
+                " SET DEFAULT {schema}.current_recovery_epoch()"
+            ).format(schema=sql.Identifier(SCHEMA), table=sql.Identifier(table))
+        )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
 }
 
 
@@ -503,6 +584,9 @@ DESTRUCTIVE_ROLLBACKS = {
        " which is what confines one to a single request",
     4: "every grant -- the record of what an operator consented to, and the"
        " subject every issued credential resolves through",
+    5: "the recovery-epoch counter. No credential state goes with it, but a"
+       " later advance would restart from zero and would not invalidate"
+       " anything already stamped above it",
 }
 
 
@@ -582,11 +666,40 @@ def _rollback_4(connection: psycopg.Connection) -> None:
     )
 
 
+def _rollback_5(connection: psycopg.Connection) -> None:
+    """Put the epoch back to reserved storage.
+
+    Loses the counter, which is why this is declared destructive. No credential
+    state goes with it -- an advance records itself as a revocation, and those
+    survive -- but a future advance would restart from zero and would not
+    invalidate rows already stamped above it.
+    """
+    for table in EPOCH_REVOKED_TABLES + EPOCH_DELETED_TABLES:
+        connection.execute(
+            sql.SQL(
+                "ALTER TABLE {schema}.{table}"
+                " ALTER COLUMN recovery_epoch SET DEFAULT 0"
+            ).format(schema=sql.Identifier(SCHEMA), table=sql.Identifier(table))
+        )
+    # After the defaults, or the drop fails on the dependency.
+    connection.execute(
+        sql.SQL("DROP FUNCTION IF EXISTS {schema}.current_recovery_epoch()").format(
+            schema=sql.Identifier(SCHEMA)
+        )
+    )
+    connection.execute(
+        sql.SQL(
+            "DELETE FROM {schema}.metadata WHERE key = 'recovery_epoch'"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 ROLLBACKS = {
     1: _rollback_1,
     2: _rollback_2,
     3: _rollback_3,
     4: _rollback_4,
+    5: _rollback_5,
 }
 
 

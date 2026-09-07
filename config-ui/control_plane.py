@@ -405,6 +405,127 @@ class ControlStore:
                 connection, to_version, accept_data_loss=accept_data_loss
             )
 
+    # -- recovery epoch --------------------------------------------------
+
+    def recovery_epoch(self) -> int:
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "SELECT control.current_recovery_epoch() AS epoch"
+            ).fetchone()
+            return int(row["epoch"])
+
+    def advance_recovery_epoch(self, *, reason: str = "restore") -> dict:
+        """Invalidate every credential minted before now. Returns what it did.
+
+        The control for the one hole a database restore opens: a snapshot
+        contains credentials that were valid when it was taken, including ones
+        revoked since, so restoring it hands them back. Phase 1 requires that a
+        restore "cannot make a pre-restore grant/A mapping, refresh family or B
+        usable", and this is how.
+
+        Applied once, at restore, rather than as a predicate on every read.
+        The epoch is bumped and everything stamped below it is invalidated in
+        the same transaction, so ordinary reads -- which already filter on a
+        revocation -- need no knowledge of any of this.
+
+        Two shapes of invalidation, because the tables do not share a column.
+        Anything with a revocation records one, so the trail survives and a
+        replay is still distinguishable from an unrecognised credential.
+        Sessions, one-shot codes and in-flight authorizations are removed:
+        none has a revoked_at, and none is worth keeping as evidence. `tokens`
+        is revoked rather than removed because a revoked token's
+        case-insensitive name must stay reserved.
+
+        Every live credential is invalidated, not only those stamped below the
+        new epoch. That is deliberate, and it took a surviving mutation to see
+        why: at sweep time nothing can legitimately carry the new epoch, so an
+        epoch predicate selects exactly the same rows as "all live" -- except
+        in one case, where it selects fewer. Restoring a *newer* snapshot over
+        an older database leaves rows stamped above the current counter, and a
+        `recovery_epoch < new` filter would leave precisely those live. They
+        are credentials from a state this database does not recognise, so they
+        are the last ones that should survive.
+
+        The stamp therefore records which restore era a credential was minted
+        in -- useful when reading an audit trail, and what makes the column
+        default worth having -- but it is not the filter. The filter is "is it
+        live", and the reason that is safe is that this runs once, inside the
+        advance, so anything minted afterwards comes after the sweep.
+
+        **Assumes nothing else is minting credentials.** A restore is a
+        quiesced operation; a credential created between the sweep and the
+        commit would survive it. Two concurrent advances cannot interleave: the
+        counter upsert takes a row lock held to commit, which serialises the
+        whole transaction -- measured, rather than assumed, which is why there
+        is no separate advisory lock here.
+        """
+        revoked: dict[str, int] = {}
+        deleted: dict[str, int] = {}
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute("BEGIN")
+            try:
+                # The precondition is the function, not the row. If migration
+                # 5 has not run there is no mechanism at all and an advance
+                # would silently do nothing useful.
+                present = connection.execute(
+                    "SELECT 1 FROM pg_proc p"
+                    "  JOIN pg_namespace n ON n.oid = p.pronamespace"
+                    " WHERE n.nspname = %s AND p.proname = 'current_recovery_epoch'",
+                    (control_schema.SCHEMA,),
+                ).fetchone()
+                if present is None:
+                    raise RuntimeError(
+                        "The recovery epoch is not available; migration 5 has"
+                        " not been applied, so a restore cannot invalidate"
+                        " pre-restore credentials."
+                    )
+                # Upsert, not update. A missing row means zero -- which is what
+                # current_recovery_epoch() already reports -- and an absent row
+                # must not be able to brick the one control that matters at
+                # restore time.
+                row = connection.execute(
+                    "INSERT INTO control.metadata(key, value)"
+                    " VALUES('recovery_epoch', '1')"
+                    " ON CONFLICT (key) DO UPDATE"
+                    "   SET value = ((control.metadata.value::bigint) + 1)::text"
+                    " RETURNING value::bigint AS epoch"
+                ).fetchone()
+                epoch = int(row["epoch"])
+                for table in control_schema.EPOCH_REVOKED_TABLES:
+                    result = connection.execute(
+                        control_schema.sql.SQL(
+                            "UPDATE {schema}.{table} SET revoked_at = now()"
+                            " WHERE revoked_at IS NULL"
+                        ).format(
+                            schema=control_schema.sql.Identifier(control_schema.SCHEMA),
+                            table=control_schema.sql.Identifier(table),
+                        ),
+                    )
+                    revoked[table] = result.rowcount
+                for table in control_schema.EPOCH_DELETED_TABLES:
+                    result = connection.execute(
+                        control_schema.sql.SQL(
+                            "DELETE FROM {schema}.{table}"
+                        ).format(
+                            schema=control_schema.sql.Identifier(control_schema.SCHEMA),
+                            table=control_schema.sql.Identifier(table),
+                        ),
+                    )
+                    deleted[table] = result.rowcount
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        self.audit(
+            "control.recovery_epoch_advanced",
+            actor="operator",
+            details={"epoch": epoch, "reason": reason,
+                     "revoked": revoked, "deleted": deleted},
+        )
+        return {"epoch": epoch, "revoked": revoked, "deleted": deleted}
+
     # -- agent OAuth clients ---------------------------------------------
 
     #: Hosts for which plain http is an acceptable redirect target. RFC 8252

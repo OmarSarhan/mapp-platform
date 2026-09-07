@@ -106,14 +106,15 @@ class MigrateRollbackCommandTests(ControlStoreTestCase):
     def test_with_confirm_it_rolls_back_and_says_how_to_recover(self) -> None:
         import control_schema as cs
 
+        undone = sorted((v for v in cs.MIGRATIONS if v > 2), reverse=True)
         handled, output = self.run_command("--to", "2", "--confirm")
         self.assertTrue(handled)
-        self.assertIn("[4, 3]", output)
+        self.assertIn(str(undone), output)
         self.assertIn("forward ladder", output)
         self.assertEqual([1, 2], self.store.rollback_plan(0)["applied"])
         # And the forward ladder is how you come back up.
         with self.store._db() as connection:
-            self.assertEqual([3, 4], cs.migrate(connection))
+            self.assertEqual(sorted(undone), cs.migrate(connection))
 
     def test_a_rollback_short_of_migration_one_keeps_the_credential(self) -> None:
         """Migration 1 owns admin_credential, so stopping above it is safe.

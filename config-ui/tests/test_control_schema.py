@@ -490,8 +490,11 @@ class RollbackLadderTests(unittest.TestCase):
         """
         cs.migrate(self.connection)
         before = self.snapshot()
+        # Derived, not written out: a hardcoded list breaks on every migration
+        # added, which is churn masquerading as a failing test.
         self.assertEqual(
-            [4, 3, 2, 1], cs.rollback(self.connection, 0, accept_data_loss=True)
+            sorted(cs.MIGRATIONS, reverse=True),
+            cs.rollback(self.connection, 0, accept_data_loss=True),
         )
         self.assertEqual([], cs.applied_versions(self.connection))
         self.assertEqual(sorted(cs.MIGRATIONS), cs.migrate(self.connection))
@@ -681,13 +684,15 @@ class RollbackLadderTests(unittest.TestCase):
     def test_concurrent_rollbacks_serialise(self) -> None:
         """Same advisory lock as migrate, so one waits rather than racing a DROP."""
         cs.migrate(self.connection)
+        top = max(cs.MIGRATIONS)
+        expected = [top]
         outcomes: list = []
 
         def step():
             connection = cs.connect(DATABASE_URL)
             try:
                 outcomes.append(
-                    cs.rollback(connection, 3, accept_data_loss=True)
+                    cs.rollback(connection, top - 1, accept_data_loss=True)
                 )
             except BaseException as exc:  # noqa: BLE001 - recorded, then asserted
                 outcomes.append(exc)
@@ -703,5 +708,5 @@ class RollbackLadderTests(unittest.TestCase):
             all(isinstance(item, list) for item in outcomes), outcomes
         )
         # Exactly one thread did the work; the rest found it already done.
-        self.assertEqual(1, sum(1 for item in outcomes if item == [4]))
+        self.assertEqual(1, sum(1 for item in outcomes if item == expected))
         self.assertEqual(3, sum(1 for item in outcomes if item == []))
