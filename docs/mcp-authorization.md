@@ -92,10 +92,10 @@ itself — `${MCP_SITE}/mcp`, the audience token A is issued for — is not
 published at all: it arrives with `mapp-mcp` in a later phase.
 
 The metadata document advertises the authorization and token endpoints, `code`,
-`authorization_code`, PKCE `S256`, the two client authentication methods, the
-advertised scopes and RFC 9207 issuer identification. It carries no
-`registration_endpoint`, which is what makes the missing registration below a
-refusal rather than an oversight.
+`authorization_code` and `refresh_token`, PKCE `S256`, the two client
+authentication methods, the advertised scopes and RFC 9207 issuer
+identification. It carries no `registration_endpoint`, which is what makes the
+refused dynamic registration above a refusal rather than an oversight.
 
 The site block sets no `Content-Security-Policy`. That is deliberate: Caddy's
 `header` directive replaces the upstream value, and the consent and login pages
@@ -260,11 +260,28 @@ then never sent and sign-in silently fails.
 | Authorization code | short, single use | Authorization code with PKCE `S256`, required of every client including confidential ones |
 | Token A (`mapp_a_`) | 15 minutes | What an MCP client holds; audience is `MCP_RESOURCE` |
 | Token B (`mapp_b_`) | at most 60 seconds | Issued only by the internal exchange, for one allowlisted configuration-API operation against one canonical request; single-use when that operation mutates |
+| Refresh token (`mapp_r_`) | 12 hours idle, 30 days absolute | Rotated on every use; a family belongs to one grant |
 | Operator session cookie | 30 minutes | `mapp_oauth_session`, absolute expiry, for the consent screen only |
 
-Refresh tokens are not implemented: no refresh grant is registered and only the
-access token is persisted, so a refresh token issued today could never be
-redeemed.
+**Refresh rotates, and a replay costs the grant.** Each consent opens one
+refresh family. Every use spends the presented token and issues its successor
+in the same transaction, so two simultaneous presentations cannot both succeed.
+Presenting a token that has already been spent is treated as a stolen
+credential: the family and the grant are both revoked, which ends the consent.
+That is deliberate and it has a price — a client retrying after a network
+timeout is indistinguishable from an attacker replaying, and loses the
+operator's consent. Whether to soften it is open item O7.
+
+A family is never extended: its absolute expiry is fixed when it opens, so an
+indefinitely refreshed session cannot outlive the consent. Expired families and
+their tokens are removed by the periodic sweep; a live family keeps its spent
+tokens, because those are what make a replay detectable.
+
+Whether a client may refresh at all is its registered grant types, in both
+directions — the server will not issue a refresh token to a client without
+`refresh_token`, and will not accept one from it. `offline_access` is not part
+of the vocabulary and has no role here: it is not what turns refresh on, and a
+client asking for it is told what it was actually granted.
 
 **One consent does not become unlimited effects.** A grant may be exchanged for
 at most 60 token B in a sliding 60-second window, refused with `slow_down` past
@@ -380,21 +397,20 @@ which is recreated on start; do not restore it.
 
 ## Not built yet
 
-Phase 0 stops deliberately short in several places. Beyond the missing client
-registration above:
+Phase 0 stops deliberately short in several places:
 
 - the operation allowlist covers a handful of configuration-API actions
   rather than the whole surface, and adding one is a deliberate act;
 - there is no dashboard view of grants, and revocation is reachable only
   through the internal endpoint or by disabling a client;
-- rotating refresh tokens with family replay detection are not implemented;
 - the audit log records authorization decisions from the configuration
   service, but the authorization component itself writes no audit events;
 - `mapp-mcp` does not exist, so nothing produces a request digest in anger and
   the third independent canonicalization implementation is absent.
 
-Three entries left this list in Phase 1 and one in M7, which is worth naming
+Five entries left this list in Phase 1 and one in M7, which is worth naming
 because a stale limitations list is worse than none: the configuration API
-re-checks the token-B operation and request binding (M7), the migration ladder
-has a tested rollback, and `recovery_epoch` is a working restore-time
-invalidation rather than reserved storage.
+re-checks the token-B operation and request binding (M7), an operator can
+register a client, the migration ladder has a tested rollback, `recovery_epoch`
+is a working restore-time invalidation rather than reserved storage, and
+refresh tokens rotate with family replay detection.

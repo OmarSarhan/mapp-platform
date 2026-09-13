@@ -543,6 +543,9 @@ class StubStore:
         500 live records. The Postgres form is a periodic
         ``DELETE WHERE expires_at < now()``.
         """
+        import time as _time
+
+        now = _time.time()
         removed = 0
         with self._lock:
             for key in [k for k, v in self._pending.items() if v.is_expired()]:
@@ -554,6 +557,24 @@ class StubStore:
             for key in [k for k, v in self._sessions.items() if v.is_expired()]:
                 del self._sessions[key]
                 removed += 1
+            # The SQL form deletes the family and lets the foreign key take
+            # its tokens; here the tokens are removed explicitly so a double
+            # that "swept" while leaving them behind cannot report a
+            # containment PostgreSQL performs and this does not.
+            expired = [
+                family_id
+                for family_id, family in self._refresh_families.items()
+                if family["absolute_expires_at"] < now
+            ]
+            for family_id in expired:
+                del self._refresh_families[family_id]
+                removed += 1
+            for digest in [
+                d
+                for d, token in self._refresh_tokens.items()
+                if token["family_id"] in expired
+            ]:
+                del self._refresh_tokens[digest]
         return removed
 
     # -- browser sessions ------------------------------------------------

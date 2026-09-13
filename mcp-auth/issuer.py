@@ -18,14 +18,17 @@ import secrets
 import time
 
 from authlib.oauth2.rfc6749 import AuthorizationServer
+from authlib.oauth2.rfc6749.errors import InvalidGrantError
 from authlib.oauth2.rfc6749.errors import InvalidRequestError
 from authlib.oauth2.rfc6749.grants import AuthorizationCodeGrant
+from authlib.oauth2.rfc6749.grants import RefreshTokenGrant
 from authlib.oauth2.rfc7636 import CodeChallenge
 from authlib.oauth2.rfc9207 import IssuerParameter
 
 from authlib_adapter import MappResponse
 from authlib_adapter import build_request
 from models import AuthorizationCode
+from models import RotatedRefresh
 from models import Token
 
 #: P6: token A lives 15 minutes.
@@ -33,10 +36,6 @@ ACCESS_TOKEN_EXPIRES_IN = 900
 
 TOKEN_A_PREFIX = "mapp_a_"
 REFRESH_TOKEN_PREFIX = "mapp_r_"
-#: No RefreshTokenGrant is registered and save_token persists only the access
-#: token, so a refresh token issued now could never be redeemed. Flip this in
-#: the slice that adds the grant and its storage, not before.
-REFRESH_TOKENS_IMPLEMENTED = False
 
 
 def _hash(value: str) -> str:
@@ -146,6 +145,89 @@ class MappAuthorizationCodeGrant(AuthorizationCodeGrant):
         return authorization_code.subject
 
 
+class MappRefreshTokenGrant(RefreshTokenGrant):
+    """P6's rotating refresh families, over the store's atomic rotation.
+
+    Public MCP clients present no secret, so the refresh token is a bearer
+    credential and rotation is what limits what a stolen one is worth: every
+    use spends the presented token and issues its successor, and a second
+    presentation of a spent token revokes the whole family and the grant.
+    """
+
+    #: Same as the code grant: a public MCP client authenticates with nothing
+    #: and the confidential broker with a secret. The base class allows only
+    #: client_secret_basic, which would refuse every agent.
+    TOKEN_ENDPOINT_AUTH_METHODS = ["none", "client_secret_basic"]
+
+    #: False even though a successor *is* returned. The flag only decides
+    #: whether authlib asks the token generator for a fresh value, and the
+    #: successor is not generated here -- it is the one the rotation already
+    #: wrote and which a row already matches. ``issue_token`` attaches that
+    #: one, so asking the generator would mint a value only to discard it.
+    INCLUDE_NEW_REFRESH_TOKEN = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._successor = ""
+
+    def authenticate_refresh_token(self, refresh_token):
+        """Spend the presented token here, because this is the only point that races.
+
+        The same reasoning as ``query_authorization_code``: authlib validates,
+        mints, saves and only then calls ``revoke_old_credential``, so
+        consuming at that last step leaves a window in which N simultaneous
+        presentations of one refresh token all validate and all receive tokens.
+        The conditional UPDATE inside ``rotate_refresh_token`` is the authority,
+        and exactly one caller can win it.
+
+        A presentation that is spent here and then refused downstream -- a
+        wrong client, a widened scope -- does not get the token back. The
+        client's next attempt is therefore a replay, which costs it the grant.
+        That is the specification's own open item O7, and it is the safe
+        direction: a refresh token presented twice is indistinguishable from a
+        stolen one.
+        """
+        successor = REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        result = self.server.store.rotate_refresh_token(refresh_token, successor)
+        if result["outcome"] != "rotated":
+            # One error for every refusal. Which of replayed, revoked, expired
+            # or unknown applies is exactly what a holder of a stolen token
+            # would like to learn, and RFC 6749 s5.2 has one code for all of
+            # them. The store has already acted on a replay by the time this
+            # is reached.
+            raise InvalidGrantError()
+        self._successor = successor
+        # What save_token reads to know this refresh token already has a
+        # family. The grant type would answer the same question today, but it
+        # answers it by naming the *other* grant: a third grant issuing a
+        # refresh token would silently get no family and hand the client an
+        # inert credential. This says the thing itself -- the rotation wrote
+        # the row, so nothing else should.
+        self.request.rotated_family = result["family_id"]
+        return RotatedRefresh(
+            family_id=result["family_id"],
+            grant_id=result["grant_id"],
+            client_id=result["client_id"],
+            scope=result["scope"],
+        )
+
+    def authenticate_user(self, refresh_token):
+        # P3 again: the actor is the grant. The family records which grant it
+        # belongs to, so the refreshed token A inherits the same subject the
+        # original consent produced rather than anything the client supplied.
+        return refresh_token.grant_id
+
+    def revoke_old_credential(self, refresh_token):
+        # Already spent by authenticate_refresh_token, which is the only step
+        # that can decide the race. Kept because authlib calls it unconditionally.
+        return None
+
+    def issue_token(self, user, refresh_token):
+        token = super().issue_token(user, refresh_token)
+        token["refresh_token"] = self._successor
+        return token
+
+
 class S256OnlyCodeChallenge(CodeChallenge):
     """Refuse the ``plain`` challenge method.
 
@@ -241,6 +323,7 @@ class MappAuthorizationServer(AuthorizationServer):
         self.secure_cookies = secure_cookies
         self.register_token_generator("default", self._generate_token)
         self.register_grant(MappAuthorizationCodeGrant, [S256OnlyCodeChallenge(required=True)])
+        self.register_grant(MappRefreshTokenGrant)
         self._issuer_parameter = MappIssuerParameter(issuer)
         self.register_extension(self._register_issuer_parameter)
 
@@ -289,6 +372,19 @@ class MappAuthorizationServer(AuthorizationServer):
                 audience=self.resource,
             ),
         )
+        refresh = token.get("refresh_token")
+        # A rotation has already written its successor's row, and opening a
+        # second family for it would give one consent two independent
+        # families -- so revoking the replayed one would leave the other
+        # alive. Every other path that mints a refresh token needs one.
+        if refresh and getattr(request, "rotated_family", None) is None:
+            self.store.start_refresh_family(
+                refresh,
+                family_id="fam-" + secrets.token_urlsafe(18),
+                grant_id=request.user or "",
+                client_id=request.client.get_client_id(),
+                scope=token.get("scope", ""),
+            )
 
     def create_oauth2_request(self, request):
         # The handler has already built it; authlib re-enters with the object.
@@ -330,18 +426,14 @@ class MappAuthorizationServer(AuthorizationServer):
         # so honouring it here makes the client's registered grant types the actual
         # control over whether a refresh token exists. Ignoring the flag would leave
         # this generator as the real control while the client record only looked
-        # like it was — and a test asserting "no refresh_token" would then pass for
+        # like it was -- and a test asserting "no refresh_token" would then pass for
         # the wrong reason.
         #
-        # But the flag alone is not sufficient authority to *issue* one: nothing
-        # persists a refresh token and no RefreshTokenGrant is registered, so a
-        # minted `mapp_r_` value is inert -- redeeming it returns
-        # unsupported_grant_type. Handing a client a credential that can never
-        # work is worse than handing it none, and P6's rotation and
-        # family-replay rules have no substrate until the grant exists. Both
-        # conditions must hold, and REFRESH_TOKENS_IMPLEMENTED is what a later
-        # slice flips once the grant and its storage land.
-        if include_refresh_token and REFRESH_TOKENS_IMPLEMENTED:
+        # The value minted here is inert until save_token opens a family for it;
+        # the two are one act, and nothing else in this class mints one. The
+        # refresh grant deliberately does not come through here: its successor
+        # is written by the rotation, not generated.
+        if include_refresh_token:
             token["refresh_token"] = REFRESH_TOKEN_PREFIX + secrets.token_urlsafe(32)
         return token
 
@@ -382,7 +474,7 @@ class MappAuthorizationServer(AuthorizationServer):
             "authorization_endpoint": f"{base}/oauth/authorize",
             "token_endpoint": f"{base}/oauth/token",
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
             # The advertised set, not the acceptance allowlist (P2).

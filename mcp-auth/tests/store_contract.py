@@ -15,6 +15,7 @@ is a property of the *contract*, not of either implementation.
 from __future__ import annotations
 
 import datetime as dt
+import time
 
 from models import Client, Grant, Token
 
@@ -420,6 +421,41 @@ class StoreContractTests:
         )
         self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])
         self.assertIsNone(self.store.query_refresh_family("fam-other")["revoked_at"])
+
+    def test_the_sweep_removes_a_family_past_its_absolute_expiry(self) -> None:
+        """Every consent opens one and every rotation adds a row.
+
+        Nothing else removes either, so without this the two tables grow for
+        the life of the deployment. The tokens have to go with the family: a
+        sweep that left them would leave rows whose family cannot be resolved,
+        which ``rotate_refresh_token`` reads as a revoked grant rather than as
+        an unknown token.
+        """
+        # A millisecond, not a negative interval: the schema's
+        # refresh_family_absolute_after_creation CHECK refuses a family that
+        # expires before it was created, and the double must not be given a
+        # state PostgreSQL would not accept. The wait is ten times the
+        # lifetime -- the in-memory store reaches the sweep in microseconds,
+        # so "two round trips have passed" is only true of the SQL one.
+        self._open_family(absolute_seconds=0.001)
+        time.sleep(0.01)
+        self.store.sweep_expired()
+        self.assertIsNone(self.store.query_refresh_family("fam"))
+        self.assertIsNone(self.store.refresh_token_state("mapp_r_1"))
+
+    def test_the_sweep_leaves_a_live_family_alone(self) -> None:
+        """Including its spent tokens, which are the replay evidence."""
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.store.sweep_expired()
+        self.assertIsNotNone(self.store.query_refresh_family("fam"))
+        self.assertIsNotNone(
+            self.store.refresh_token_state("mapp_r_1"),
+            "a spent token is what makes a replay detectable",
+        )
+        self.assertEqual(
+            "replayed", self.store.rotate_refresh_token("mapp_r_1", "mapp_r_x")["outcome"]
+        )
 
     def test_a_spent_token_after_a_revocation_is_not_reported_as_a_replay(self) -> None:
         """Revocation is checked before consumption, and the order matters.

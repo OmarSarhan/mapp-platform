@@ -23,7 +23,7 @@ API's validation of the credential it issues.
 | --- | --- |
 | Edge listener | 6 method/path routes across the 4 public paths Caddy publishes, over an `AF_UNIX` socket |
 | Control listener | `/healthz`, `/internal/oauth/exchange`, `/internal/oauth/introspect`, `/internal/oauth/revoke`, `/internal/oauth/redeem` — `mcp-control` network only |
-| Control schema | 12 tables, 4 migrations, owned by `mapp_control` |
+| Control schema | 14 tables, 6 migrations, owned by `mapp_control` |
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker and the configuration API |
 | Operation allowlist | 5 of the platform's 52 actions |
 | Scope vocabulary | 9 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
@@ -41,9 +41,9 @@ issuer refused to issue.
 
 | Suite | Tests | Notes |
 | --- | --- | --- |
-| `mcp-auth/tests` | 375 | Zero skips with a control database attached. Includes the registered-client spike |
-| `config-ui/tests` | 956 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
-| `scripts/tests` | 168 | Compose isolation, Caddy contract, production validation, benchmark invariants |
+| `mcp-auth/tests` | 447 | Zero skips with a control database attached. Includes the registered-client spike |
+| `config-ui/tests` | 1013 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
+| `scripts/tests` | 173 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
 All three run in CI, each behind a `grep -q "skipped="` guard: a suite that
 silently skips fails the job. That guard exists because a whole suite once went
@@ -53,7 +53,8 @@ unnoticed-dead.
 mutation-tested, and the figure is recorded in each commit rather than totalled
 here: 12 for the grant and introspection work (`9c030f0`), 30 for the audit
 fixes and platform wiring (`1451d97`), 26 for the operation binding
-(`371b226`), and 11 for the client registry and abuse budget. All were caught. Six survived on first attempt; every one was a
+(`371b226`), 11 for the client registry and abuse budget, and 8 for the
+refresh wiring. All were caught. Six survived on first attempt; every one was a
 weak test rather than weak code, and each is now covered.
 
 The instructive case: a test named for refusing lower-case percent-escapes used

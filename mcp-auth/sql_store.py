@@ -884,6 +884,20 @@ class SqlStore:
                     )
                 )
                 removed += cursor.rowcount or 0
+            # Refresh families expire on their own column, and their tokens
+            # go with them through the foreign key. Nothing rotated after the
+            # absolute expiry, so no replay evidence is lost by then: a
+            # presentation of one of these tokens was already refused.
+            # Without this the two tables grow for the life of the
+            # deployment -- every consent opens a family and every rotation
+            # adds a row, and neither is removed by anything else.
+            cursor = connection.execute(
+                sql.SQL(
+                    "DELETE FROM {s}.oauth_refresh_families"
+                    " WHERE absolute_expires_at < now()"
+                ).format(s=sql.Identifier(SCHEMA))
+            )
+            removed += cursor.rowcount or 0
         return removed
 
     # -- browser sessions ------------------------------------------------

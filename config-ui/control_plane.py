@@ -696,7 +696,14 @@ class ControlStore:
                 "INSERT INTO control.oauth_clients"
                 "(client_id, name, redirect_uris, scopes, grant_types,"
                 " token_endpoint_auth_method, client_secret_hash)"
-                " VALUES(%s,%s,%s,%s,'{authorization_code}','none',NULL)",
+                # Both grant types. The authorization code is how a grant
+                # begins; refresh is how it survives token A's 15 minutes
+                # without sending the operator back to the consent screen
+                # every quarter of an hour. The grant type is also what
+                # MappRefreshTokenGrant checks before accepting a refresh, so
+                # omitting it here would issue a credential and then refuse it.
+                " VALUES(%s,%s,%s,%s,'{authorization_code,refresh_token}',"
+                "'none',NULL)",
                 (client_id, name.strip(), list(uris), list(wanted)),
             )
         return client_id

@@ -58,11 +58,11 @@ class Client(ClientMixin):
     #: rest is a credential -- and check_client_secret hashes the supplied
     #: value before comparing, so both stores compare like with like.
     secret_is_hashed: bool = False
-    #: Refresh is gated twice. authlib asks check_grant_type("refresh_token")
-    #: and passes the answer to the token generator, so omitting the grant type
-    #: here suppresses a refresh token -- but it is not currently the decisive
-    #: condition: issuer.REFRESH_TOKENS_IMPLEMENTED is False, so adding the
-    #: grant type alone changes nothing until the grant and its storage exist.
+    #: What decides whether this client gets a refresh token, in both
+    #: directions. authlib asks check_grant_type("refresh_token") and passes
+    #: the answer to the token generator, and MappRefreshTokenGrant asks it
+    #: again before accepting a refresh request -- so omitting the grant type
+    #: here both suppresses issuance and refuses redemption.
     grant_types: tuple[str, ...] = ("authorization_code",)
     #: A disabled client authorises nothing. The SQL store already filtered on
     #: disabled_at; the model had no way to say it, so the in-memory store
@@ -198,6 +198,28 @@ class Token(TokenMixin):
     def is_revoked(self) -> bool:
         return self.revoked
 
+
+@dataclass
+class RotatedRefresh:
+    """What one successful rotation hands back to authlib.
+
+    Not a stored record: the row is already spent and its successor already
+    written by the time this exists. It carries the family's own answers to the
+    two questions authlib asks of a refresh credential -- whose client is it,
+    and what scope does it carry -- so those are answered from the family rather
+    than from anything the presenter sent.
+    """
+
+    family_id: str
+    grant_id: str
+    client_id: str
+    scope: str
+
+    def check_client(self, client: ClientMixin) -> bool:
+        return self.client_id == client.get_client_id()
+
+    def get_scope(self) -> str:
+        return self.scope
 
 
 @dataclass

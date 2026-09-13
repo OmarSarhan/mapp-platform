@@ -252,8 +252,25 @@ class RegisteredClientFlowTests(unittest.TestCase):
         token = json.loads(body)
         self.assertEqual("Bearer", token["token_type"])
         self.assertEqual(900, token["expires_in"])
-        self.assertNotIn("refresh_token", token)
+        # The registration command grants refresh_token as well as
+        # authorization_code, so a real operator-registered client is handed
+        # one here. Kept on the instance rather than returned so the many
+        # callers that only want token A are unaffected.
+        self.issued = token
+        self.assertTrue(token["refresh_token"].startswith("mapp_r_"))
         return token["access_token"]
+
+    def refresh(self, refresh_token: str):
+        return self.request(
+            self.edge,
+            "POST",
+            "/oauth/token",
+            body={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.client_id,
+            },
+        )
 
     def test_a_registered_client_completes_the_authorization_flow(self) -> None:
         """The claim that was false for most of Phase 0.
@@ -364,6 +381,191 @@ class RegisteredClientFlowTests(unittest.TestCase):
         # trustworthy once the client is resolved, so this must not be a 302.
         self.assertNotEqual(302, status)
         self.assertIsNone(headers.get("Location"))
+
+    # -- P6's refresh family ---------------------------------------------
+    #
+    # The storage layer had no caller outside its own tests: a family could be
+    # opened and rotated by a test, and nothing in the running component ever
+    # did either. These drive it through /oauth/token instead.
+
+    def test_a_refresh_buys_a_new_token_a_and_a_new_refresh_token(self) -> None:
+        first = self.obtain_token_a()
+        original = self.issued["refresh_token"]
+
+        status, _, body = self.refresh(original)
+        self.assertEqual(200, status, body)
+        refreshed = json.loads(body)
+        self.assertTrue(refreshed["access_token"].startswith("mapp_a_"))
+        self.assertNotEqual(first, refreshed["access_token"])
+        # Rotation: the successor is a different value, and it is not the one
+        # the generator would have minted -- it is the one the store wrote.
+        self.assertNotEqual(original, refreshed["refresh_token"])
+        self.assertIsNotNone(
+            self.store.refresh_token_state(refreshed["refresh_token"]),
+            "the successor handed to the client must be the persisted one",
+        )
+
+    def test_the_refreshed_token_a_carries_the_same_grant_and_audience(self) -> None:
+        """Otherwise refresh would be a way to acquire authority sideways."""
+        original_a = self.obtain_token_a()
+        before = self.store.query_token(original_a)
+        status, _, body = self.refresh(self.issued["refresh_token"])
+        self.assertEqual(200, status, body)
+        after = self.store.query_token(json.loads(body)["access_token"])
+        self.assertEqual(before.subject, after.subject)
+        self.assertEqual(before.scope, after.scope)
+        self.assertEqual(MCP_RESOURCE, after.audience)
+        self.assertEqual(self.client_id, after.client_id)
+
+    def test_the_spent_refresh_token_is_replay_and_costs_the_grant(self) -> None:
+        """Section 4, and the price O7 records.
+
+        Detection and consequence are one transaction in the store, so what
+        this asserts at the endpoint is that the endpoint reaches it.
+        """
+        token_a = self.obtain_token_a()
+        original = self.issued["refresh_token"]
+        grant_id = self.store.query_token(token_a).subject
+
+        status, _, body = self.refresh(original)
+        self.assertEqual(200, status, body)
+        successor = json.loads(body)["refresh_token"]
+
+        status, _, body = self.refresh(original)
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_grant", json.loads(body)["error"])
+
+        grant = self.store.query_grant(grant_id)
+        self.assertTrue(grant.is_revoked(), "a replay must revoke the grant")
+        # And the successor dies with the family, so the legitimate holder is
+        # not left refreshing against a revoked consent.
+        status, _, body = self.refresh(successor)
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_grant", json.loads(body)["error"])
+
+    def test_revoking_the_grant_stops_the_refresh(self) -> None:
+        """The grant is the unit of revocation, so it has to reach this too."""
+        token_a = self.obtain_token_a()
+        grant_id = self.store.query_token(token_a).subject
+        self.assertTrue(self.store.revoke_grant(grant_id, "operator"))
+        status, _, body = self.refresh(self.issued["refresh_token"])
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_grant", json.loads(body)["error"])
+
+    def test_a_refresh_cannot_widen_the_scope(self) -> None:
+        """RFC 6749 s6, and the same rule the exchange follows.
+
+        The refused request still spends the presented token -- rotation
+        happens where the race is decided, before authlib checks the scope --
+        so this also pins that the client is refused rather than quietly
+        given what it asked for.
+        """
+        self.obtain_token_a(scope="apply")
+        status, _, body = self.request(
+            self.edge,
+            "POST",
+            "/oauth/token",
+            body={
+                "grant_type": "refresh_token",
+                "refresh_token": self.issued["refresh_token"],
+                "client_id": self.client_id,
+                "scope": "apply inspect",
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_scope", json.loads(body)["error"])
+
+    def test_a_refresh_may_narrow_the_scope(self) -> None:
+        self.obtain_token_a(scope="inspect apply")
+        status, _, body = self.request(
+            self.edge,
+            "POST",
+            "/oauth/token",
+            body={
+                "grant_type": "refresh_token",
+                "refresh_token": self.issued["refresh_token"],
+                "client_id": self.client_id,
+                "scope": "inspect",
+            },
+        )
+        self.assertEqual(200, status, body)
+        refreshed = json.loads(body)
+        self.assertEqual("inspect", refreshed["scope"])
+        self.assertEqual("inspect", self.store.query_token(
+            refreshed["access_token"]
+        ).scope)
+
+    def test_offline_access_never_becomes_a_granted_scope(self) -> None:
+        """Refresh is decided by the client's grant types, not by a scope.
+
+        MCP clients commonly ask for `offline_access` out of habit. It is not
+        in the operation-derived vocabulary and no client is registered for
+        it, so ``get_allowed_scope`` drops it: the grant, the token and the
+        response's ``scope`` all carry only what was registered, and RFC 6749
+        s5.1 makes that member the client's notice that its request was
+        narrowed. Asked for alone it is refused outright, because a narrowing
+        to nothing is not a narrowing.
+
+        What must never happen is the other reading -- that the presence of
+        the string is what turns refresh on. Refresh arrives here without it.
+        """
+        token_a = self.obtain_token_a(scope="apply offline_access")
+        self.assertEqual("apply", self.issued["scope"])
+        self.assertTrue(self.issued["refresh_token"].startswith("mapp_r_"))
+        self.assertEqual(("apply",), self.store.query_grant(
+            self.store.query_token(token_a).subject
+        ).scopes)
+
+        status, headers, _ = self.request(
+            self.edge, "GET", self.authorize_url("offline_access")
+        )
+        self.assertEqual(302, status)
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(headers["Location"]).query
+        )
+        self.assertEqual(["invalid_scope"], query["error"])
+
+    def test_another_client_cannot_spend_this_grants_refresh_token(self) -> None:
+        """A refresh token is a bearer credential, so the family says whose.
+
+        The presenting client is compared against the family's, not against
+        anything in the request. The presentation still spends the token --
+        rotation is where the race is decided -- which is the right direction
+        for a credential that has demonstrably left its owner.
+        """
+        self.obtain_token_a()
+        stolen = self.issued["refresh_token"]
+        other = self.control.register_oauth_client(
+            name="Another agent",
+            redirect_uris=["http://127.0.0.1:33419/callback"],
+            scopes=["apply"],
+        )
+        status, _, body = self.request(
+            self.edge,
+            "POST",
+            "/oauth/token",
+            body={
+                "grant_type": "refresh_token",
+                "refresh_token": stolen,
+                "client_id": other,
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_grant", json.loads(body)["error"])
+
+    def test_a_refresh_family_belongs_to_one_grant(self) -> None:
+        """Two consents are two families, so revoking one cannot free the other."""
+        self.obtain_token_a()
+        first = self.issued["refresh_token"]
+        first_family = self.store.refresh_token_state(first)["family_id"]
+        self.obtain_token_a()
+        second = self.issued["refresh_token"]
+        second_family = self.store.refresh_token_state(second)["family_id"]
+        self.assertNotEqual(first_family, second_family)
+        self.assertNotEqual(
+            self.store.query_refresh_family(first_family)["grant_id"],
+            self.store.query_refresh_family(second_family)["grant_id"],
+        )
 
 
 if __name__ == "__main__":
