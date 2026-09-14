@@ -41,7 +41,7 @@ issuer refused to issue.
 
 | Suite | Tests | Notes |
 | --- | --- | --- |
-| `mcp-auth/tests` | 447 | Zero skips with a control database attached. Includes the registered-client spike |
+| `mcp-auth/tests` | 456 | Zero skips with a control database attached. Includes the registered-client spike |
 | `config-ui/tests` | 1013 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
 | `scripts/tests` | 173 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
@@ -53,9 +53,13 @@ unnoticed-dead.
 mutation-tested, and the figure is recorded in each commit rather than totalled
 here: 12 for the grant and introspection work (`9c030f0`), 30 for the audit
 fixes and platform wiring (`1451d97`), 26 for the operation binding
-(`371b226`), 11 for the client registry and abuse budget, and 8 for the
-refresh wiring. All were caught. Six survived on first attempt; every one was a
-weak test rather than weak code, and each is now covered.
+(`371b226`), 11 for the client registry and abuse budget, 8 for the refresh
+wiring and 8 for the retry window. All were caught. Six survived on first attempt; every one was a
+weak test rather than weak code, and each is now covered. The most recent:
+deleting the `FOR UPDATE` that stops two simultaneous retries forking a refresh
+family survived, because the general concurrency test never overlapped two
+retries. A test that has every thread present the same spent token catches it
+in all four rounds.
 
 The instructive case: a test named for refusing lower-case percent-escapes used
 `%2f`, which the *separator* rule refuses, so it passed with the hex-case check

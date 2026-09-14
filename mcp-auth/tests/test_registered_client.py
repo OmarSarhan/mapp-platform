@@ -417,12 +417,46 @@ class RegisteredClientFlowTests(unittest.TestCase):
         self.assertEqual(MCP_RESOURCE, after.audience)
         self.assertEqual(self.client_id, after.client_id)
 
+    def test_a_retry_just_after_a_refresh_keeps_the_consent(self) -> None:
+        """What an operator meets in practice, over the real endpoint.
+
+        The response is two socket writes -- headers, then body -- and the
+        rotation commits before either, so a dropped connection leaves the
+        client holding a token the server has already spent. Without the retry
+        window that costs the operator an interactive sign-in; here the retry
+        is answered with a working token and the consent survives.
+        """
+        token_a = self.obtain_token_a()
+        original = self.issued["refresh_token"]
+        grant_id = self.store.query_token(token_a).subject
+
+        status, _, body = self.refresh(original)
+        self.assertEqual(200, status, body)
+        first = json.loads(body)["refresh_token"]
+
+        status, _, body = self.refresh(original)
+        self.assertEqual(200, status, body)
+        second = json.loads(body)["refresh_token"]
+
+        self.assertNotEqual(first, second)
+        self.assertFalse(self.store.query_grant(grant_id).is_revoked())
+        # The one the client never received is superseded, so the family still
+        # holds exactly one live token.
+        self.assertIsNotNone(self.store.refresh_token_state(first)["consumed_at"])
+        self.assertIsNone(self.store.refresh_token_state(second)["consumed_at"])
+
     def test_the_spent_refresh_token_is_replay_and_costs_the_grant(self) -> None:
         """Section 4, and the price O7 records.
 
         Detection and consequence are one transaction in the store, so what
         this asserts at the endpoint is that the endpoint reaches it.
+
+        The window is closed on this store instance because the two requests
+        are a fraction of a second apart and would otherwise be read as the
+        retry they resemble. Closing it is what a deployment choosing strict
+        OAuth 2.1 behaviour does, so this is also that configuration's test.
         """
+        self.store.REFRESH_GRACE_SECONDS = 0
         token_a = self.obtain_token_a()
         original = self.issued["refresh_token"]
         grant_id = self.store.query_token(token_a).subject

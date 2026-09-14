@@ -306,7 +306,13 @@ class StoreContractTests:
         """
         self._open_family()
         self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
-        result = self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil")
+        # grace_seconds=0 because these two calls are microseconds apart and
+        # would otherwise land inside the retry window. A replay is a
+        # presentation that is *late*, and the window is how lateness is
+        # measured -- so a test of the replay path has to close it.
+        result = self.store.rotate_refresh_token(
+            "mapp_r_1", "mapp_r_evil", grace_seconds=0
+        )
         self.assertEqual("replayed", result["outcome"])
         self.assertEqual("oauth:contract", result["grant_revoked"])
         self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])
@@ -322,11 +328,82 @@ class StoreContractTests:
         """
         self._open_family()
         self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
-        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil")
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil", grace_seconds=0)
         self.assertEqual(
             "grant-revoked",
             self.store.rotate_refresh_token("mapp_r_2", "mapp_r_3")["outcome"],
         )
+
+    # -- the retry window ------------------------------------------------
+
+    def test_a_retry_just_after_a_rotation_is_not_a_replay(self) -> None:
+        """The case that costs an operator a sign-in, and the one to get right.
+
+        A lost response, a restart between the commit and the reply, and two
+        concurrent refreshes all arrive here: a token spent moments ago,
+        presented again by its rightful holder. Revoking the consent for that
+        is what OAuth 2.1 s4.3.1 specifies and what every deployment with a
+        grace window declines to do.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        result = self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")
+        self.assertEqual("rotated", result["outcome"])
+        self.assertTrue(result["grace"], "the retry must be recorded as one")
+        self.assertEqual("oauth:contract", result["grant_id"])
+        self.assertIsNone(self.store.query_refresh_family("fam")["revoked_at"])
+        self.assertFalse(self.store.query_grant("oauth:contract").is_revoked())
+        self.assertIsNotNone(self.store.refresh_token_state("mapp_r_3"))
+
+    def test_a_retry_leaves_the_family_with_exactly_one_live_token(self) -> None:
+        """Otherwise the window would fork the family rather than heal it.
+
+        The successor of the lost response cannot be handed over again -- only
+        its hash was kept -- so a fresh one is issued and the old live token is
+        superseded. Two live tokens would mean a stolen one could survive
+        alongside the client's, which is the property rotation exists to deny.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")
+        superseded = self.store.refresh_token_state("mapp_r_2")
+        self.assertIsNotNone(superseded["consumed_at"], "mapp_r_2 must be spent")
+        self.assertIsNone(self.store.refresh_token_state("mapp_r_3")["consumed_at"])
+        # And the superseded one is itself a spent token: presenting it late
+        # is a replay like any other.
+        self.assertEqual(
+            "replayed",
+            self.store.rotate_refresh_token(
+                "mapp_r_2", "mapp_r_evil", grace_seconds=0
+            )["outcome"],
+        )
+
+    def test_the_retry_window_does_not_outlive_the_family(self) -> None:
+        """Grace may not carry a family past the expiry its consent fixed.
+
+        Without this bound a holder of any spent token could present it after
+        the absolute expiry and be issued a live one, renewing the family for
+        ever from a credential that should have died with it.
+        """
+        self._open_family(absolute_seconds=0.5)
+        self.assertEqual(
+            "rotated", self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")["outcome"]
+        )
+        time.sleep(0.7)
+        self.assertNotEqual(
+            "rotated",
+            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")["outcome"],
+        )
+        self.assertIsNone(self.store.refresh_token_state("mapp_r_3"))
+
+    def test_the_default_window_is_thirty_seconds_and_not_zero(self) -> None:
+        """The tests pass grace_seconds explicitly; deployment does not.
+
+        A default of zero would leave every test above green while the running
+        system had no window at all -- the failure mode this project has hit
+        by hardcoding in a test what only the source should say.
+        """
+        self.assertEqual(30, self.store.REFRESH_GRACE_SECONDS)
 
     def test_an_unknown_refresh_token_is_not_a_replay(self) -> None:
         """It revokes nothing: a guess must not be able to destroy a consent."""
@@ -454,7 +531,10 @@ class StoreContractTests:
             "a spent token is what makes a replay detectable",
         )
         self.assertEqual(
-            "replayed", self.store.rotate_refresh_token("mapp_r_1", "mapp_r_x")["outcome"]
+            "replayed",
+            self.store.rotate_refresh_token(
+                "mapp_r_1", "mapp_r_x", grace_seconds=0
+            )["outcome"],
         )
 
     def test_a_spent_token_after_a_revocation_is_not_reported_as_a_replay(self) -> None:
@@ -477,5 +557,7 @@ class StoreContractTests:
         self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
         self.assertEqual(
             "replayed",
-            self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")["outcome"],
+            self.store.rotate_refresh_token(
+                "mapp_r_1", "mapp_r_3", grace_seconds=0
+            )["outcome"],
         )

@@ -263,14 +263,31 @@ then never sent and sign-in silently fails.
 | Refresh token (`mapp_r_`) | 12 hours idle, 30 days absolute | Rotated on every use; a family belongs to one grant |
 | Operator session cookie | 30 minutes | `mapp_oauth_session`, absolute expiry, for the consent screen only |
 
-**Refresh rotates, and a replay costs the grant.** Each consent opens one
+**Refresh rotates, and a late replay costs the grant.** Each consent opens one
 refresh family. Every use spends the presented token and issues its successor
-in the same transaction, so two simultaneous presentations cannot both succeed.
-Presenting a token that has already been spent is treated as a stolen
-credential: the family and the grant are both revoked, which ends the consent.
-That is deliberate and it has a price — a client retrying after a network
-timeout is indistinguishable from an attacker replaying, and loses the
-operator's consent. Whether to soften it is open item O7.
+in the same transaction. Presenting a token that has already been spent is
+treated as a stolen credential: the family and the grant are both revoked,
+which ends the consent and requires a fresh interactive sign-in. That is what
+OAuth 2.1 §4.3.1 specifies, and it is stricter than RFC 9700, which revokes
+only the token.
+
+**Within thirty seconds it is a retry, not a replay.** Three ordinary events
+produce a second presentation of a spent token: a response lost after the
+rotation committed, a restart between the commit and the reply, and two
+concurrent refreshes from one agent. Each is indistinguishable from theft, and
+without a window each costs the operator a browser sign-in. Inside the window
+the presentation is answered with a fresh token and the family's live token is
+superseded, so the family still holds exactly one — a fork would let a stolen
+token live alongside the client's, which is the property rotation exists to
+deny. The window may not carry a family past the absolute expiry its consent
+fixed.
+
+Thirty seconds is Okta's default and the middle of the range Cognito allows;
+Auth0 and Ory ship the same mechanism. The cost is exact and bounded: somebody
+holding a stolen refresh token has thirty seconds to use it alongside the
+legitimate client before either trips detection, rather than the twelve hours
+the token would otherwise be worth. Set `SqlStore.REFRESH_GRACE_SECONDS` to 0
+for strict OAuth 2.1 behaviour. This is the mitigation open item O7 asked for.
 
 A family is never extended: its absolute expiry is fixed when it opens, so an
 indefinitely refreshed session cannot outlive the consent. Expired families and

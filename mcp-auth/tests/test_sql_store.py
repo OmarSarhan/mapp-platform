@@ -705,7 +705,73 @@ class RefreshRotationConcurrencyTests(unittest.TestCase):
             scope="mcp:connect",
         )
 
-    def test_simultaneous_rotations_yield_one_replacement(self) -> None:
+    def test_simultaneous_retries_cannot_fork_the_family(self) -> None:
+        """Aimed squarely at the FOR UPDATE in the retry branch.
+
+        The general concurrency test above does not reliably provoke this: one
+        thread takes the ordinary rotation and the rest arrive at the retry
+        branch spread out. Here every thread presents the *same already-spent*
+        token, so all of them enter the retry branch together, which is the
+        only way to overlap two supersede statements.
+
+        Without the family lock each transaction INSERTs its successor and
+        then runs a supersede whose READ COMMITTED snapshot was taken before
+        the others inserted, so nobody consumes anybody and every racer's
+        token stays live. Several rounds, because one interleaving proves
+        nothing about a race.
+        """
+        for round_number in range(4):
+            family = f"fam-{round_number}"
+            start = f"mapp_r_round_{round_number}"
+            self.store.start_refresh_family(
+                start,
+                family_id=family,
+                grant_id="oauth:grant-1",
+                client_id="mcp-client",
+                scope="mcp:connect",
+            )
+            # Spend it once, so every thread below takes the retry branch.
+            self.store.rotate_refresh_token(start, f"{start}_first")
+            names = [f"{start}_retry_{n}" for n in range(8)]
+            errors: list = []
+
+            def retry(name):
+                try:
+                    SqlStore(DATABASE_URL).rotate_refresh_token(start, name)
+                except BaseException as exc:  # noqa: BLE001 - asserted below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=retry, args=(n,)) for n in names]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+            self.assertEqual([], errors, "a retry raised")
+
+            live = [
+                name
+                for name in names + [f"{start}_first"]
+                if (state := self.store.refresh_token_state(name)) is not None
+                and state["consumed_at"] is None
+            ]
+            with self.subTest(round=round_number):
+                self.assertEqual(1, len(live), f"the family forked: {live}")
+
+    def test_simultaneous_refreshes_survive_and_leave_one_live_token(self) -> None:
+        """The case an agent actually produces, and what the window is for.
+
+        Two tool calls noticing an expired token A at the same moment present
+        the same refresh token together. Before the retry window this revoked
+        the consent -- one thread won, the rest were replays, and the operator
+        had to sign in again because their agent did something ordinary.
+
+        What must still hold is the property rotation exists for: however many
+        threads arrive, the family ends with exactly *one* live token. Two
+        would mean a stolen token could live alongside the client's. That is
+        why the retry branch takes the family row FOR UPDATE; without it the
+        supersede statements run on snapshots that predate each other's
+        inserts and every racer's token survives.
+        """
         outcomes: list = []
 
         def rotate(index):
@@ -722,52 +788,31 @@ class RefreshRotationConcurrencyTests(unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
-
         self.assertTrue(all(isinstance(item, dict) for item in outcomes), outcomes)
-        rotated = [item for item in outcomes if item["outcome"] == "rotated"]
-        self.assertEqual(1, len(rotated), outcomes)
-        # Exactly one replacement exists, and it is the winner's.
-        winner = rotated[0]
+        for item in outcomes:
+            with self.subTest(outcome=item["outcome"]):
+                # "unknown" is the racer that read inside the winner's window
+                # and saw the token still unconsumed; it refuses rather than
+                # guessing. Nothing here may be a replay.
+                self.assertIn(item["outcome"], {"rotated", "unknown"})
+        self.assertGreaterEqual(
+            sum(1 for item in outcomes if item["outcome"] == "rotated"), 1
+        )
         live = [
             index
             for index in range(6)
-            if self.store.refresh_token_state(f"mapp_r_new_{index}") is not None
+            if (state := self.store.refresh_token_state(f"mapp_r_new_{index}"))
+            is not None
+            and state["consumed_at"] is None
         ]
-        self.assertEqual(1, len(live))
-        self.assertEqual("fam", winner["family_id"])
+        self.assertEqual(1, len(live), f"the family forked: {live}")
+        self.assertFalse(self.store.query_grant("oauth:grant-1").is_revoked())
+        self.assertIsNone(self.store.query_refresh_family("fam")["revoked_at"])
 
-    def test_the_losers_are_replays_and_the_family_is_contained(self) -> None:
-        """Whether a loser reports 'replayed' depends on the timing of its read.
-
-        A loser that reaches the diagnostic after the winner committed sees a
-        consumed token and reports a replay; one that reads inside the winner's
-        window sees it unconsumed and reports 'unknown'. Both refuse, which is
-        the property that matters. What must always hold is that a *later*
-        presentation of the spent token is a replay and the family is contained.
-        """
-        outcomes: list = []
-
-        def rotate(index):
-            store = SqlStore(DATABASE_URL)
-            outcomes.append(
-                store.rotate_refresh_token("mapp_r_start", f"mapp_r_new_{index}")
-            )
-
-        threads = [threading.Thread(target=rotate, args=(n,)) for n in range(4)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=30)
-        self.assertEqual(
-            1, sum(1 for item in outcomes if item["outcome"] == "rotated")
+        # And detection is intact: the same token presented late is a replay.
+        after = self.store.rotate_refresh_token(
+            "mapp_r_start", "mapp_r_late", grace_seconds=0
         )
-        for item in outcomes:
-            with self.subTest(outcome=item["outcome"]):
-                self.assertIn(
-                    item["outcome"], {"rotated", "replayed", "unknown", "grant-revoked"}
-                )
-        # Now, unambiguously after the fact:
-        after = self.store.rotate_refresh_token("mapp_r_start", "mapp_r_late")
-        self.assertIn(after["outcome"], {"replayed", "grant-revoked", "family-revoked"})
+        self.assertEqual("replayed", after["outcome"])
         self.assertTrue(self.store.query_grant("oauth:grant-1").is_revoked())
         self.assertIsNotNone(self.store.query_refresh_family("fam")["revoked_at"])

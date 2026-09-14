@@ -167,6 +167,15 @@ class SqlStore:
     #: outliving the consent it came from.
     REFRESH_IDLE_SECONDS = 12 * 60 * 60
     REFRESH_ABSOLUTE_SECONDS = 30 * 24 * 60 * 60
+    #: How long after a rotation a re-presentation is a retry rather than a
+    #: replay. Without it, three ordinary events -- a lost response, two
+    #: concurrent refreshes, a restart between the commit and the reply --
+    #: are indistinguishable from theft, and each costs the operator a
+    #: browser sign-in. Thirty seconds is Okta's default and the middle of
+    #: the 0-60 range Cognito allows. The cost is stated exactly: a thief
+    #: holding a stolen token has this long to use it alongside the
+    #: legitimate client before either of them trips detection.
+    REFRESH_GRACE_SECONDS = 30
 
     def start_refresh_family(
         self,
@@ -212,6 +221,7 @@ class SqlStore:
         new_raw: str,
         *,
         idle_seconds: int | None = None,
+        grace_seconds: float | None = None,
     ) -> dict:
         """Spend one refresh token and issue its successor, or explain why not.
 
@@ -233,6 +243,11 @@ class SqlStore:
         wrong", and an exception type per reason would be worse.
         """
         idle = idle_seconds or self.REFRESH_IDLE_SECONDS
+        # `is None`, not `or`: zero is a meaningful value here -- it turns the
+        # grace window off, which is what a test forcing a replay asks for and
+        # what a deployment wanting the strict OAuth 2.1 behaviour sets. `or`
+        # would silently substitute thirty seconds for it.
+        grace = self.REFRESH_GRACE_SECONDS if grace_seconds is None else grace_seconds
         old_digest = token_digest(old_raw)
         with self._connect() as connection:
             connection.execute("BEGIN")
@@ -286,6 +301,8 @@ class SqlStore:
                 # refusal or evidence of a stolen credential.
                 state = connection.execute(
                     "SELECT t.family_id, t.consumed_at,"
+                    "       t.consumed_at > now() - make_interval(secs => %s)"
+                    "         AS within_grace,"
                     "       t.idle_expires_at <= now() AS idle_expired,"
                     "       f.revoked_at IS NOT NULL AS family_revoked,"
                     "       f.absolute_expires_at <= now() AS family_expired,"
@@ -296,7 +313,7 @@ class SqlStore:
                     "  LEFT JOIN control.oauth_grants g"
                     "    ON g.grant_id = f.grant_id"
                     " WHERE t.token_hash = %s",
-                    (old_digest,),
+                    (grace, old_digest),
                 ).fetchone()
                 if state is None:
                     connection.execute("COMMIT")
@@ -311,6 +328,67 @@ class SqlStore:
                 if state["family_revoked"]:
                     connection.execute("COMMIT")
                     return {"outcome": "family-revoked", "family_id": state["family_id"]}
+                if state["consumed_at"] is not None and state["within_grace"] and not state["family_expired"]:
+                    # A retry, not a replay. The client presented a token that
+                    # was spent moments ago, which is what a lost response, a
+                    # restart or two concurrent refreshes all look like. The
+                    # successor it should have received cannot be handed over
+                    # again -- only the hash was kept -- so this issues a fresh
+                    # one instead, which is also what Okta, Auth0 and Ory do
+                    # inside their grace windows.
+                    #
+                    # The absolute bound still applies: grace may not carry a
+                    # family past the expiry its consent fixed.
+                    # FOR UPDATE, and it is load-bearing. Two retries racing
+                    # would otherwise each INSERT its successor and then run a
+                    # supersede whose READ COMMITTED snapshot predates the
+                    # other's insert -- so neither consumes the other and the
+                    # family ends with two live tokens, which is the fork this
+                    # whole design exists to prevent. The family row orders
+                    # them; the second waits and then sees the first's token.
+                    family = connection.execute(
+                        "SELECT grant_id, client_id, scope"
+                        "  FROM control.oauth_refresh_families"
+                        " WHERE family_id = %s FOR UPDATE",
+                        (state["family_id"],),
+                    ).fetchone()
+                    new_digest = token_digest(new_raw)
+                    # Insert first: replaced_by is a foreign key to this table,
+                    # so the successor has to exist before anything points at it.
+                    connection.execute(
+                        "INSERT INTO control.oauth_refresh_tokens"
+                        "(token_hash, family_id, idle_expires_at)"
+                        " VALUES(%s,%s, now() + make_interval(secs => %s))",
+                        (new_digest, state["family_id"], idle),
+                    )
+                    # Supersede whatever this family's live token was, so the
+                    # family still holds exactly one. Keyed on the family
+                    # rather than on the presented token's replaced_by,
+                    # because the chain may already have moved past it -- and
+                    # two live tokens would be a fork nothing else here
+                    # permits. The token just inserted is excluded, or it
+                    # would consume itself.
+                    connection.execute(
+                        "UPDATE control.oauth_refresh_tokens"
+                        "   SET consumed_at = now(), replaced_by = %s"
+                        " WHERE family_id = %s"
+                        "   AND consumed_at IS NULL"
+                        "   AND token_hash <> %s",
+                        (new_digest, state["family_id"], new_digest),
+                    )
+                    connection.execute("COMMIT")
+                    return {
+                        "outcome": "rotated",
+                        # The decision is the same as an ordinary rotation --
+                        # a distinct outcome would be refused by every caller
+                        # that tests for "rotated" -- but the reason differs,
+                        # and an audit log will want it.
+                        "grace": True,
+                        "family_id": state["family_id"],
+                        "grant_id": family["grant_id"],
+                        "client_id": family["client_id"],
+                        "scope": family["scope"],
+                    }
                 if state["consumed_at"] is not None:
                     # The replay. Revoke the family and the grant in this same
                     # transaction, so the detection and the consequence cannot

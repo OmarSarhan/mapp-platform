@@ -78,6 +78,7 @@ class StubStore:
 
     REFRESH_IDLE_SECONDS = 12 * 60 * 60
     REFRESH_ABSOLUTE_SECONDS = 30 * 24 * 60 * 60
+    REFRESH_GRACE_SECONDS = 30
 
     def start_refresh_family(
         self,
@@ -119,13 +120,20 @@ class StubStore:
             }
 
     def rotate_refresh_token(
-        self, old_raw: str, new_raw: str, *, idle_seconds: int | None = None
+        self,
+        old_raw: str,
+        new_raw: str,
+        *,
+        idle_seconds: int | None = None,
+        grace_seconds: float | None = None,
     ) -> dict:
         """In-memory twin of the SQL rotation, with the same outcomes.
 
-        The replay branch revokes the family and its grant here too. A double
-        that detected a replay without acting would let every test written
-        against it report a containment the real store performs and it does not.
+        The replay branch revokes the family and its grant here too, and the
+        grace branch supersedes the family's live token here too. A double that
+        detected a replay without acting, or that granted grace without
+        closing the fork, would let every test written against it report a
+        containment the real store performs and it does not.
         """
         import time as _time
 
@@ -144,6 +152,43 @@ class StubStore:
                 return {"outcome": "grant-revoked", "family_id": token["family_id"]}
             if family is not None and family["revoked_at"] is not None:
                 return {"outcome": "family-revoked", "family_id": token["family_id"]}
+            grace = (
+                self.REFRESH_GRACE_SECONDS if grace_seconds is None else grace_seconds
+            )
+            if (
+                token["consumed_at"] is not None
+                and token["consumed_at"] > now - grace
+                and family is not None
+                and family["absolute_expires_at"] > now
+            ):
+                # A retry inside the grace window, not a replay. The successor
+                # cannot be handed over again -- only its hash was kept -- so a
+                # fresh one is issued and the family's live token superseded,
+                # leaving exactly one.
+                new_digest = token_digest(new_raw)
+                for digest, other in self._refresh_tokens.items():
+                    if (
+                        other["family_id"] == token["family_id"]
+                        and other["consumed_at"] is None
+                        and digest != new_digest
+                    ):
+                        other["consumed_at"] = now
+                        other["replaced_by"] = new_digest
+                self._refresh_tokens[new_digest] = {
+                    "family_id": token["family_id"],
+                    "issued_at": now,
+                    "idle_expires_at": now + (idle_seconds or self.REFRESH_IDLE_SECONDS),
+                    "consumed_at": None,
+                    "replaced_by": None,
+                }
+                return {
+                    "outcome": "rotated",
+                    "grace": True,
+                    "family_id": family["family_id"],
+                    "grant_id": family["grant_id"],
+                    "client_id": family["client_id"],
+                    "scope": family["scope"],
+                }
             if token["consumed_at"] is not None:
                 if family is not None and family["revoked_at"] is None:
                     family["revoked_at"] = now
