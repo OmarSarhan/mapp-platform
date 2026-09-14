@@ -763,12 +763,63 @@ MCP_SCOPES = frozenset({"mcp:connect", "inspect", "propose", "visual"})
 SUPPORTED_SCOPES = tuple(sorted(MCP_SCOPES | operations.all_required_scopes()))
 
 
+#: The MCP runtime's client id on the control listener. It authenticates here to
+#: introspect a token A and to exchange one for a token B; it holds no redirect
+#: URI and no scopes, because it never appears in an authorization request.
+MCP_RUNTIME_CLIENT_ID = "mapp-mcp"
+
+
+def provision_runtime_client(store) -> bool:
+    """Write mapp-mcp's confidential client row, from the deployment's secret.
+
+    Reports whether it did, so a caller can say which.
+
+    mapp-mcp cannot do what config-ui does. The configuration API provisions its
+    own row because it owns the control schema and holds the DSN, which is why
+    its secret reaches exactly one service and this component never sees the
+    plaintext. mapp-mcp has no database credential by design -- it reaches
+    platform state only through authenticated API calls -- so somebody else has
+    to write the row, and the only candidates are this component, which already
+    holds the DSN, or an operator running a command before the platform works.
+
+    So the plaintext reaches two services rather than one: here, to be hashed,
+    and mapp-mcp, to be presented. That is a real cost and the alternative is
+    worse in a different way -- a platform that does not start until somebody
+    remembers a registration step. Only the digest is stored either way.
+
+    Empty secret means the feature is off, and the row is not written. A blank
+    secret that provisioned a row would be a confidential client authenticated
+    by the empty string.
+    """
+    secret = os.environ.get("MAPP_MCP_CLIENT_SECRET", "").strip()
+    if not secret:
+        return False
+    from models import Client
+
+    store.add_client(
+        Client(
+            client_id=MCP_RUNTIME_CLIENT_ID,
+            name="MAPP MCP runtime",
+            redirect_uris=(),
+            scopes=(),
+            grant_types=(),
+            token_endpoint_auth_method="client_secret_basic",
+            client_secret=secret,
+        )
+    )
+    return True
+
+
 def build_authorization(store=None):
     from issuer import MappAuthorizationServer
 
     issuer = os.environ.get("MCP_ISSUER", "http://mcp.localhost")
+    resolved = store if store is not None else build_store()
+    # Before the server is built, so a runtime that connects immediately after
+    # this component reports healthy finds its row already there.
+    provision_runtime_client(resolved)
     return MappAuthorizationServer(
-        store if store is not None else build_store(),
+        resolved,
         issuer=issuer,
         resource=os.environ.get("MCP_RESOURCE", issuer + "/mcp"),
         config_api_resource=os.environ.get(

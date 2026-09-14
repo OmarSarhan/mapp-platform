@@ -352,6 +352,33 @@ class ComposeIsolationTests(unittest.TestCase):
                 }
                 self.assertEqual({"config-ui"}, holders)
 
+    def test_the_runtime_client_secret_reaches_exactly_its_two_holders(self) -> None:
+        """Two services, and the second one is a cost worth naming.
+
+        MCP_AUTH_CLIENT_SECRET reaches only config-ui because the configuration
+        API provisions its *own* client row -- it owns the control schema and
+        holds the DSN, so the authorization component never sees that plaintext.
+
+        mapp-mcp cannot do the same: it has no database credential, by design,
+        and reaches platform state only through authenticated API calls. So
+        somebody else writes its row, and the plaintext necessarily reaches both
+        the component that hashes it and the runtime that presents it. What this
+        pins is that it reaches no one else.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                holders = {
+                    name
+                    for name, service in model["services"].items()
+                    if "MAPP_MCP_CLIENT_SECRET" in service.get("environment", {})
+                }
+                self.assertLessEqual(
+                    holders,
+                    {"mcp-auth", "mapp-mcp"},
+                    "the runtime client secret reached a service that needs neither"
+                    " to hash it nor to present it",
+                )
+
     def test_the_mcp_origin_reaches_caddy_and_the_component_together(self) -> None:
         """One MCP_SITE, or the identifiers move without the site serving them.
 
