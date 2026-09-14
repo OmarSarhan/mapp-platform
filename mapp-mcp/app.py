@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import os
 
+from authentication import BearerAuthentication
 from era_guard import ProtocolEraGuard
+from introspection_client import IntrospectionClient
 from protected_resource import MetadataApp
 from protected_resource import ProtectedResource
 
@@ -40,15 +42,37 @@ async def _not_implemented(scope, receive, send) -> None:
     await send({"type": "http.response.body", "body": payload})
 
 
-def build_app(*, origin: str | None = None, issuer: str | None = None, inner=None):
-    """Compose the stack. Metadata outermost, then the era guard, then the runtime.
+def build_app(
+    *,
+    origin: str | None = None,
+    issuer: str | None = None,
+    inner=None,
+    introspection=None,
+):
+    """Compose the stack: metadata, era guard, authentication, runtime.
 
-    The metadata document is served in front of the guard so the guard never has
-    to make an exception for it: an unauthenticated read-only GET is not an RPC
-    request and should not meet a protocol-version check at all.
+    The metadata document is served in front of everything so no layer needs an
+    exception for it: an unauthenticated read-only GET is not an RPC request and
+    should meet neither a protocol-version check nor a credential check.
+
+    The era guard runs before authentication, not after. A request in the wrong
+    protocol era is refused whatever credential it carries, and putting
+    authentication first would mean introspecting a token for a request that was
+    never going to be dispatched -- work done, and a revocation window consumed,
+    on behalf of a client this server does not speak to.
     """
     origin = origin or os.environ.get("MCP_SITE", "http://mcp.localhost")
     issuer = issuer or os.environ.get("MCP_ISSUER", origin)
     resource = ProtectedResource(origin=origin, issuer=issuer)
     runtime = inner if inner is not None else _not_implemented
-    return MetadataApp(resource, ProtocolEraGuard(runtime)), resource
+    if introspection is None:
+        introspection = IntrospectionClient(
+            os.environ.get("MCP_AUTH_URL", "http://mcp-auth:8080"),
+            client_id=os.environ.get("MCP_MCP_CLIENT_ID", "mapp-mcp"),
+            client_secret=os.environ.get("MCP_MCP_CLIENT_SECRET", ""),
+            resource=f"{origin.rstrip('/')}/mcp",
+        )
+    authenticated = BearerAuthentication(
+        runtime, introspection=introspection, resource=resource
+    )
+    return MetadataApp(resource, ProtocolEraGuard(authenticated)), resource

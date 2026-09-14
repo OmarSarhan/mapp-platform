@@ -60,3 +60,35 @@ def call(app, *, method="POST", path="/mcp", headers=None, body=b"", chunks=None
 
     asyncio.run(app(scope, receive, send))
     return Response(messages)
+
+
+class StubIntrospection:
+    """An introspection endpoint that answers from a dict, without a network.
+
+    Tests of the guard still go through the real factory, so they need a
+    credential that resolves; tests of authentication need to choose the answer.
+    One stub serves both, and ``calls`` is what proves the cache is a cache.
+    """
+
+    def __init__(self, records=None, *, raises=None) -> None:
+        self.records = records or {}
+        self.raises = raises
+        self.calls = 0
+
+    def introspect(self, token):
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.records.get(token, {"active": False})
+
+
+def active(*, scopes="mcp:connect inspect", audience="http://mcp.localhost/mcp",
+           grant="oauth:test-grant", client="mcp-test-client"):
+    return {
+        "active": True,
+        "scope": scopes,
+        "sub": grant,
+        "client_id": client,
+        "aud": audience,
+        "exp": 9999999999,
+    }

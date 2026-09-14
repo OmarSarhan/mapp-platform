@@ -17,9 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import era_guard  # noqa: E402
 from app import build_app  # noqa: E402
-from asgi_harness import call  # noqa: E402
+from asgi_harness import StubIntrospection, active, call  # noqa: E402
 
-MODERN = {"MCP-Protocol-Version": era_guard.PROTOCOL_VERSION}
+TOKEN = "mapp_a_test"
+#: The guard runs before authentication, but these tests assert what reaches the
+#: runtime, so they carry a credential that resolves. Without one every "the
+#: runtime was reached" assertion would pass or fail on authentication instead.
+MODERN = {
+    "MCP-Protocol-Version": era_guard.PROTOCOL_VERSION,
+    "Authorization": f"Bearer {TOKEN}",
+}
 
 
 class Reached:
@@ -51,7 +58,10 @@ class Reached:
 def guarded(**kwargs):
     inner = Reached(**kwargs)
     app, resource = build_app(
-        origin="http://mcp.localhost", issuer="http://mcp.localhost", inner=inner
+        origin="http://mcp.localhost",
+        issuer="http://mcp.localhost",
+        inner=inner,
+        introspection=StubIntrospection({TOKEN: active()}),
     )
     return app, inner, resource
 
@@ -209,8 +219,14 @@ class PassThroughTests(unittest.TestCase):
         self.assertEqual(1, inner.calls)
 
     def test_a_get_on_the_rpc_path_is_the_runtime_s_answer_not_the_guard_s(self) -> None:
+        """The guard screens POSTs; a GET is the runtime's 405 to give.
+
+        Carries a credential because /mcp is a protected resource, so an
+        anonymous GET is refused by authentication before the question this
+        test asks can be reached.
+        """
         app, inner, _ = guarded()
-        call(app, method="GET", path="/mcp")
+        call(app, method="GET", path="/mcp", headers=MODERN)
         self.assertEqual(1, inner.calls, "the guard only screens POSTs")
 
 
