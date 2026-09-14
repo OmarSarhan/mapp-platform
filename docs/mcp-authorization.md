@@ -572,7 +572,11 @@ Phase 0 stops deliberately short in several places:
 - nothing reads the trail but a store method: there is no dashboard view and
   no operator command, so inspecting it still means SQL;
 - `mapp-mcp` does not exist, so nothing produces a request digest in anger and
-  the third independent canonicalization implementation is absent.
+  the third independent canonicalization implementation is absent. Nothing
+  answers `/mcp` and there is no RFC 9728 protected-resource document, so no
+  MCP client can connect at all — what exists is an authorization server with
+  no resource behind it. [The spike plan](mcp-runtime-spike-plan.md) records
+  what building one requires and what it will run into.
 
 Six entries left this list in Phase 1 and one in M7, which is worth naming
 because a stale limitations list is worse than none: the configuration API

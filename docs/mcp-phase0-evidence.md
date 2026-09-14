@@ -16,8 +16,10 @@ depends on which.
 
 ## What was built
 
-Seven milestones, M1 to M7. A new `mcp-auth` component and the configuration
-API's validation of the credential it issues.
+Seven milestones, M1 to M7, and the Phase 1 work that followed them: rotating
+refresh with a retry window, a durable audit trail, an operator client registry,
+a working recovery epoch and a tested rollback ladder. A new `mcp-auth`
+component and the configuration API's validation of the credential it issues.
 
 | Surface | Detail |
 | --- | --- |
@@ -42,8 +44,8 @@ issuer refused to issue.
 | Suite | Tests | Notes |
 | --- | --- | --- |
 | `mcp-auth/tests` | 468 | Zero skips with a control database attached. Includes the registered-client spike |
-| `config-ui/tests` | 1013 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
-| `scripts/tests` | 173 | Compose isolation, Caddy contract, production validation, benchmark invariants |
+| `config-ui/tests` | 1019 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
+| `scripts/tests` | 179 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
 All three run in CI, each behind a `grep -q "skipped="` guard: a suite that
 silently skips fails the job. That guard exists because a whole suite once went
@@ -96,7 +98,7 @@ records an amendment.
 | --- | --- | --- |
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
 | Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
-| Independent canonicalization prototypes for mapp-mcp, broker and API | **2 of 3** | Broker and API each vendored and cross-checked. `mapp-mcp` does not exist |
+| Independent canonicalization prototypes for mapp-mcp, broker and API | **2 of 3** | Broker and API each vendored and cross-checked. `mapp-mcp` does not exist; [its plan](mcp-runtime-spike-plan.md) records what a third implementation must match, including that `+` decodes to a space in a query and a literal plus in a path |
 | Target-client spikes (Claude, Codex, Gemini) | **1 of 3, and the client half of Claude is now checked** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component, and the same flow was driven by hand through Caddy against the running platform. Claude Code's own requirements were then read rather than assumed: it accepts a pre-registered **public** client and a fixed callback port, so this design fits it, but it defaults to Dynamic Client Registration and sends `offline_access` unconditionally. No MCP client has connected, because `mapp-mcp` does not exist. Codex/OpenAI and Gemini unexamined |
 
 ### Tested
@@ -104,7 +106,7 @@ records an amendment.
 | Item | Status | Evidence |
 | --- | --- | --- |
 | Token A/B audience separation, non-widening exchange, revocation propagation | **done** | All three pinned; revocation reaches an already-issued token B |
-| Canonicalization golden vectors independently in three implementations | **2 of 3** | RFC vectors run against both copies, plus a copy-to-copy comparison |
+| Canonicalization golden vectors independently in three implementations | **2 of 3** | RFC vectors run against both copies, plus a copy-to-copy comparison. One *envelope* digest is now pinned literally (`GoldenVectorTests`); until it existed every envelope test was differential, so two implementations wrong in the same way would have agreed |
 | Benchmark the control schema under contention; record capacity, failure, recovery | **done** | Table above; `scripts/control_plane_benchmark.py` |
 | Threat-model and abuse-case review | **done, unapproved** | [`mcp-threat-model.md`](mcp-threat-model.md) — 8 cases; 1 unmitigated, 1 unverified |
 
