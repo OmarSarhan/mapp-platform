@@ -24,6 +24,7 @@ import secrets
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from models import AuthorizationCode
 from models import Client
@@ -58,6 +59,45 @@ def _utc(value: dt.datetime | float | None) -> dt.datetime | None:
 
 def _epoch(value: dt.datetime | None) -> float | None:
     return None if value is None else value.timestamp()
+
+
+#: Detail keys the audit writer refuses outright. Section 11 forbids logging
+#: authorization headers, raw tokens, codes, refresh identifiers, broker
+#: assertions, cookies, CSRF values and approval state, and a redaction rule
+#: that lives only in a review comment is a rule that will one day be missed.
+#: Refusing is deliberate rather than scrubbing: a silently emptied field
+#: leaves a caller believing it recorded something.
+FORBIDDEN_AUDIT_KEYS = frozenset(
+    {
+        "access_token",
+        "assertion",
+        "authorization",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "cookie",
+        "csrf",
+        "password",
+        "refresh_token",
+        "secret",
+        "subject_token",
+        "token",
+    }
+)
+
+
+class AuditRefused(ValueError):
+    """A detail field would have put a credential in the audit trail."""
+
+
+def _check_audit_detail(detail: dict) -> None:
+    for key in detail:
+        if str(key).lower().replace("-", "_") in FORBIDDEN_AUDIT_KEYS:
+            raise AuditRefused(
+                f"{key!r} may not appear in an audit record; record an"
+                " identifier the credential resolves to instead."
+            )
+
 
 
 class SqlStore:
@@ -376,6 +416,18 @@ class SqlStore:
                         "   AND token_hash <> %s",
                         (new_digest, state["family_id"], new_digest),
                     )
+                    # Recorded as well as permitted. A window that silently
+                    # forgives is a window nobody can size: an operator seeing
+                    # these constantly has a client retrying for a reason, and
+                    # one seeing none can close the window without guessing.
+                    self._write_audit(
+                        connection,
+                        "refresh.retried",
+                        actor=family["grant_id"],
+                        client_id=family["client_id"],
+                        grant_id=family["grant_id"],
+                        detail={"familyId": state["family_id"]},
+                    )
                     connection.execute("COMMIT")
                     return {
                         "outcome": "rotated",
@@ -406,9 +458,38 @@ class SqlStore:
                         "     SELECT grant_id FROM control.oauth_refresh_families"
                         "      WHERE family_id = %s)"
                         "   AND revoked_at IS NULL"
-                        " RETURNING grant_id",
+                        " RETURNING grant_id, client_id",
                         ("refresh-replay", state["family_id"]),
-                    ).fetchone()
+                    ).fetchone()  # noqa: E501 - RETURNING carries the client for the audit
+                    # In this transaction, not after it. A replay that
+                    # revoked a grant and left no record is exactly the state
+                    # an operator cannot diagnose: the agent stops, the error
+                    # is invalid_grant, and revoked_reason is a column nothing
+                    # reads. P19 requires the record to commit with the change.
+                    if grant is not None:
+                        # The same event name an operator revocation writes.
+                        # "Why is this grant dead" must be one query whatever
+                        # killed it; refresh.replayed below adds what is
+                        # specific to this cause rather than replacing it.
+                        self._write_audit(
+                            connection,
+                            "grant.revoked",
+                            actor=grant["grant_id"],
+                            client_id=grant["client_id"],
+                            grant_id=grant["grant_id"],
+                            detail={"reason": "refresh-replay"},
+                        )
+                    self._write_audit(
+                        connection,
+                        "refresh.replayed",
+                        actor=grant["grant_id"] if grant else "unknown",
+                        grant_id=grant["grant_id"] if grant else None,
+                        detail={
+                            "familyId": state["family_id"],
+                            "grantRevoked": grant is not None,
+                            "consequence": "family and grant revoked",
+                        },
+                    )
                     connection.execute("COMMIT")
                     return {
                         "outcome": "replayed",
@@ -506,11 +587,29 @@ class SqlStore:
     # -- grants ----------------------------------------------------------
 
     def save_grant(self, grant: Grant) -> Grant:
+        """Write the consent, and the record of it, together.
+
+        This row *is* the consent -- the operator looked at a scope list and
+        approved it -- so it is the one event whose absence would leave the
+        audit trail showing credentials arriving from nowhere.
+        """
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO control.oauth_grants"
                 "(grant_id, client_id, subject, scopes) VALUES(%s,%s,%s,%s)",
                 (grant.grant_id, grant.client_id, grant.subject, list(grant.scopes)),
+            )
+            self._write_audit(
+                connection,
+                "grant.created",
+                # The operator session that approved it, not the grant: this
+                # is the one moment a human acted, and the actor column should
+                # say so. Every later event on this grant has the grant as its
+                # actor, which is what P3 means by the grant being the actor.
+                actor=grant.subject or "operator",
+                client_id=grant.client_id,
+                grant_id=grant.grant_id,
+                detail={"scopes": list(grant.scopes)},
             )
         return grant
 
@@ -529,6 +628,81 @@ class SqlStore:
             scopes=tuple(row["scopes"]),
             revoked_at=_epoch(row["revoked_at"]),
         )
+
+    # -- the durable audit trail -----------------------------------------
+
+    @staticmethod
+    def _write_audit(
+        connection,
+        event: str,
+        *,
+        actor: str,
+        client_id: str | None = None,
+        grant_id: str | None = None,
+        detail: dict | None = None,
+    ) -> str:
+        """Append one record on an existing connection.
+
+        Takes the connection rather than opening one, because P19 requires the
+        record to commit with the change it describes. A caller that is already
+        inside a transaction passes it in and the two are one act; a crash
+        between them is not possible, so a revoked grant nobody can explain is
+        not possible either.
+        """
+        detail = detail or {}
+        _check_audit_detail(detail)
+        event_id = secrets.token_urlsafe(18)
+        connection.execute(
+            "INSERT INTO control.audit_event"
+            "(event_id, event, actor, client_id, grant_id, detail)"
+            " VALUES(%s,%s,%s,%s,%s,%s)",
+            (event_id, event, actor, client_id, grant_id, Jsonb(detail)),
+        )
+        return event_id
+
+    def record_audit(
+        self,
+        event: str,
+        *,
+        actor: str,
+        client_id: str | None = None,
+        grant_id: str | None = None,
+        detail: dict | None = None,
+    ) -> str:
+        """Append one record in its own transaction.
+
+        For decisions that are not themselves a database write. Anything that
+        *is* one writes through _write_audit on the same connection instead.
+        """
+        with self._connect() as connection:
+            return self._write_audit(
+                connection,
+                event,
+                actor=actor,
+                client_id=client_id,
+                grant_id=grant_id,
+                detail=detail,
+            )
+
+    def audit_tail(self, limit: int = 200, *, grant_id: str | None = None) -> list[dict]:
+        """The recent tail, newest first -- the query an operator actually runs."""
+        with self._connect() as connection:
+            if grant_id is None:
+                rows = connection.execute(
+                    "SELECT event_id, recorded_at, event, actor, client_id,"
+                    " grant_id, detail FROM control.audit_event"
+                    " ORDER BY recorded_at DESC, event_id DESC LIMIT %s",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT event_id, recorded_at, event, actor, client_id,"
+                    " grant_id, detail FROM control.audit_event"
+                    " WHERE grant_id = %s"
+                    " ORDER BY recorded_at DESC, event_id DESC LIMIT %s",
+                    (grant_id, limit),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def revoke_grant(self, grant_id: str, reason: str = "") -> bool:
         """Revoke a grant, reporting whether this call was the one that did it.
@@ -550,9 +724,22 @@ class SqlStore:
                 "UPDATE control.oauth_grants"
                 "   SET revoked_at = now(), revoked_reason = %s"
                 " WHERE grant_id = %s AND revoked_at IS NULL"
-                " RETURNING grant_id",
+                " RETURNING grant_id, client_id",
                 (reason or None, grant_id),
             ).fetchone()
+            # Only when this call was the one that revoked. The statement is
+            # conditional precisely so two callers cannot both believe they
+            # acted, and an audit trail claiming two revocations of one grant
+            # would undo that.
+            if row is not None:
+                self._write_audit(
+                    connection,
+                    "grant.revoked",
+                    actor=grant_id,
+                    client_id=row["client_id"],
+                    grant_id=grant_id,
+                    detail={"reason": reason or "unspecified"},
+                )
         return row is not None
 
     # -- authorization codes ---------------------------------------------

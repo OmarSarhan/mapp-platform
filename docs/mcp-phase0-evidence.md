@@ -23,7 +23,7 @@ API's validation of the credential it issues.
 | --- | --- |
 | Edge listener | 6 method/path routes across the 4 public paths Caddy publishes, over an `AF_UNIX` socket |
 | Control listener | `/healthz`, `/internal/oauth/exchange`, `/internal/oauth/introspect`, `/internal/oauth/revoke`, `/internal/oauth/redeem` — `mcp-control` network only |
-| Control schema | 14 tables, 6 migrations, owned by `mapp_control` |
+| Control schema | 15 tables, 7 migrations, owned by `mapp_control` |
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker and the configuration API |
 | Operation allowlist | 5 of the platform's 52 actions |
 | Scope vocabulary | 9 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
@@ -41,7 +41,7 @@ issuer refused to issue.
 
 | Suite | Tests | Notes |
 | --- | --- | --- |
-| `mcp-auth/tests` | 456 | Zero skips with a control database attached. Includes the registered-client spike |
+| `mcp-auth/tests` | 468 | Zero skips with a control database attached. Includes the registered-client spike |
 | `config-ui/tests` | 1013 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
 | `scripts/tests` | 173 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
@@ -54,7 +54,7 @@ mutation-tested, and the figure is recorded in each commit rather than totalled
 here: 12 for the grant and introspection work (`9c030f0`), 30 for the audit
 fixes and platform wiring (`1451d97`), 26 for the operation binding
 (`371b226`), 11 for the client registry and abuse budget, 8 for the refresh
-wiring and 8 for the retry window. All were caught. Six survived on first attempt; every one was a
+wiring, 8 for the retry window and 8 for the audit trail. All were caught. Six survived on first attempt; every one was a
 weak test rather than weak code, and each is now covered. The most recent:
 deleting the `FOR UPDATE` that stops two simultaneous retries forking a refresh
 family survived, because the general concurrency test never overlapped two

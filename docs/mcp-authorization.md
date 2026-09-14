@@ -412,6 +412,46 @@ schema and are captured by the database dump described in
 [backup and restore](backup-restore.md). `var/mcp-auth` holds only the socket,
 which is recreated on start; do not restore it.
 
+## The audit trail
+
+P19 makes durable audit an append-only `control.audit_event` table rather than
+an exported file, and requires each record to commit in the same transaction as
+the change it describes. A rotating file cannot join that transaction: a crash
+between a revocation and its log entry would leave a revoked grant nobody could
+explain, which is exactly the state an operator cannot diagnose — the client is
+told only `invalid_grant`.
+
+That constraint also settles where it lives. The authorization component runs
+`read_only` with the edge socket as its only mount, so it cannot write
+`var/control/audit.jsonl` at all; the database is both the only place it *can*
+write and the only place that can hold the transaction. `audit.jsonl` remains
+the operator-facing projection that may lag.
+
+| Event | Written when | Committed with |
+| --- | --- | --- |
+| `grant.created` | An operator approves a consent | The grant row |
+| `grant.revoked` | Any revocation, whatever caused it | The revocation |
+| `refresh.replayed` | A spent token is presented late | The family and grant revocation |
+| `refresh.retried` | A spent token is presented inside the window | The replacement token |
+
+`grant.revoked` is written by a replay as well as by an operator, deliberately:
+"why is this grant dead" must be one query whatever killed it, and
+`refresh.replayed` adds what is specific to the cause rather than replacing it.
+A revocation that changed nothing writes nothing — the statement is conditional
+so two callers cannot both believe they acted, and a trail showing one grant
+revoked twice would undo that.
+
+**Detail fields are refused, not scrubbed.** A record carrying a key such as
+`token`, `code`, `authorization`, `csrf` or `client_secret` raises rather than
+being written with the value stripped: an emptied field leaves the caller
+believing it recorded something. Correlate through the ids instead — the grant,
+the client, the family.
+
+Retention is not implemented, which is bounded rather than overlooked: every
+event above follows an authenticated, consented flow, so no unauthenticated
+caller can grow the table. Recording a refused authorization or a failed
+sign-in is what makes P19's 90-day floor and purge-under-pressure required.
+
 ## Not built yet
 
 Phase 0 stops deliberately short in several places:
@@ -420,14 +460,20 @@ Phase 0 stops deliberately short in several places:
   rather than the whole surface, and adding one is a deliberate act;
 - there is no dashboard view of grants, and revocation is reachable only
   through the internal endpoint or by disabling a client;
-- the audit log records authorization decisions from the configuration
-  service, but the authorization component itself writes no audit events;
+- the durable audit trail covers the grant lifecycle and the refresh outcomes,
+  but not yet a refused authorization or a failed operator sign-in — and those
+  are the events an unauthenticated caller can provoke, so recording them is
+  what makes P19's retention floor and purge-under-pressure required rather
+  than deferred;
+- nothing reads the trail but a store method: there is no dashboard view and
+  no operator command, so inspecting it still means SQL;
 - `mapp-mcp` does not exist, so nothing produces a request digest in anger and
   the third independent canonicalization implementation is absent.
 
-Five entries left this list in Phase 1 and one in M7, which is worth naming
+Six entries left this list in Phase 1 and one in M7, which is worth naming
 because a stale limitations list is worse than none: the configuration API
 re-checks the token-B operation and request binding (M7), an operator can
 register a client, the migration ladder has a tested rollback, `recovery_epoch`
-is a working restore-time invalidation rather than reserved storage, and
-refresh tokens rotate with family replay detection.
+is a working restore-time invalidation rather than reserved storage, refresh
+tokens rotate with family replay detection, and the authorization component
+writes a durable audit trail.

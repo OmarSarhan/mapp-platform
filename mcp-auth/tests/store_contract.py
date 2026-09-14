@@ -254,6 +254,112 @@ class StoreContractTests:
         )
         self.assertEqual(0, self.store.exchanged_token_count("oauth:contract", 60))
 
+    # -- the durable audit trail -----------------------------------------
+
+    def test_a_consent_and_its_record_arrive_together(self) -> None:
+        """The one event whose absence makes the rest unreadable.
+
+        Without it the trail shows credentials acting on behalf of a grant
+        that, so far as any record goes, was never created.
+        """
+        self._contract_client("contract-actor")
+        self.store.save_grant(
+            Grant(
+                grant_id="oauth:audited",
+                client_id="contract-actor",
+                subject="operator",
+                scopes=("apply", "inspect"),
+            )
+        )
+        record = self.store.audit_tail(grant_id="oauth:audited")[0]
+        self.assertEqual("grant.created", record["event"])
+        # The operator session, because this is the one moment a human acted.
+        self.assertEqual("operator", record["actor"])
+        self.assertEqual("contract-actor", record["client_id"])
+        self.assertEqual(["apply", "inspect"], list(record["detail"]["scopes"]))
+
+    def test_a_replay_records_itself_beside_the_revocation(self) -> None:
+        """P19's rule, and the reason the record is a table and not a file.
+
+        The revocation and the record are one transaction. A file could not
+        join it, so a crash between them would leave a revoked grant and no
+        explanation -- which is precisely the state an operator cannot
+        diagnose, because the client is told only `invalid_grant`.
+        """
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_evil", grace_seconds=0)
+
+        events = self.store.audit_tail(grant_id="oauth:contract")
+        kinds = [record["event"] for record in events]
+        # Exact order, newest first, and it is why the column defaults to
+        # clock_timestamp() rather than now(): both records are written inside
+        # one transaction, so transaction time would stamp them identically
+        # and leave the tie broken by a random event_id -- an audit trail that
+        # cannot say which happened first.
+        self.assertEqual(["refresh.replayed", "grant.revoked", "grant.created"], kinds)
+        # And the timestamps must actually differ. Asserting only the order
+        # above passes half the time under now(): both rows take the same
+        # transaction time and the tie falls to a random event_id, so the
+        # sequence is a coin flip rather than a record. This is the assertion
+        # that fails deterministically if the default is weakened.
+        self.assertLess(
+            events[1]["recorded_at"],
+            events[0]["recorded_at"],
+            "two records written in one transaction must be separable in time",
+        )
+        replay = next(r for r in events if r["event"] == "refresh.replayed")
+        self.assertEqual("fam", replay["detail"]["familyId"])
+        self.assertTrue(replay["detail"]["grantRevoked"])
+
+    def test_a_retry_is_recorded_too(self) -> None:
+        """A window that silently forgives is a window nobody can size."""
+        self._open_family()
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_2")
+        self.store.rotate_refresh_token("mapp_r_1", "mapp_r_3")
+        kinds = [r["event"] for r in self.store.audit_tail(grant_id="oauth:contract")]
+        self.assertIn("refresh.retried", kinds)
+        self.assertNotIn("refresh.replayed", kinds)
+        self.assertNotIn("grant.revoked", kinds)
+
+    def test_a_revocation_that_did_nothing_records_nothing(self) -> None:
+        """The statement is conditional so two callers cannot both have acted.
+
+        A trail showing one grant revoked twice would undo exactly that.
+        """
+        self._open_family()
+        self.assertTrue(self.store.revoke_grant("oauth:contract", "operator"))
+        self.assertFalse(self.store.revoke_grant("oauth:contract", "again"))
+        revocations = [
+            r
+            for r in self.store.audit_tail(grant_id="oauth:contract")
+            if r["event"] == "grant.revoked"
+        ]
+        self.assertEqual(1, len(revocations))
+        self.assertEqual("operator", revocations[0]["detail"]["reason"])
+
+    def test_a_credential_in_a_detail_field_is_refused(self) -> None:
+        """Refused, not scrubbed: an emptied field reads as nothing happened.
+
+        Section 11 forbids tokens, codes, secrets, cookies and CSRF values in
+        any log. A rule kept only in a review comment is one that gets missed,
+        so the writer enforces it and this is what pins that it does.
+        """
+        for key in ("token", "access_token", "code", "Authorization", "csrf"):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.store.record_audit(
+                        "probe.attempt", actor="operator", detail={key: "secret-value"}
+                    )
+        self.assertEqual([], self.store.audit_tail())
+
+    def test_the_tail_is_newest_first_and_bounded(self) -> None:
+        for index in range(5):
+            self.store.record_audit(f"probe.{index}", actor="operator")
+        tail = self.store.audit_tail(limit=3)
+        self.assertEqual(3, len(tail))
+        self.assertEqual(["probe.4", "probe.3", "probe.2"], [r["event"] for r in tail])
+
     # -- rotating refresh families ---------------------------------------
 
     def _open_family(self, raw="mapp_r_1", family="fam", **bounds) -> None:

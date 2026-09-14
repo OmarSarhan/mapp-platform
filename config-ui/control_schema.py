@@ -12,14 +12,15 @@ exactly one caller can win a race, and the loser learns it lost from an empty
 result rather than from a second query. Consumed rows are kept rather than
 deleted, so a replay is detectably a replay instead of merely unknown.
 
-**Authority carries a recovery epoch -- as storage, not yet as a control.**
-Every table whose rows can authorise something has ``recovery_epoch``. The
-design is that restoring a snapshot bumps the epoch and every lookup compares
-against it, so a restore invalidates what was issued before it without
-deleting the audit trail. *None of that is implemented*: nothing writes the
-column and nothing reads it, so every row sits at 0 forever. It is reserved
-storage so the eventual writer needs no migration, and it must not be mistaken
-for a live control -- a restore today invalidates nothing.
+**Authority carries a recovery epoch, and it is a live control.** Every table
+whose rows can authorise something has ``recovery_epoch``, defaulted by
+``control.current_recovery_epoch()`` so an insert stamps itself with no
+application change. ``advance-recovery-epoch`` bumps the counter and sweeps
+every live credential in the same transaction, which is what makes restoring a
+snapshot invalidate what it brings back. The sweep is a write, not a read-time
+predicate: nothing compares against the epoch on the authorisation path, so the
+cost is paid once at the restore rather than on every lookup. The audit trail is
+not swept -- a restore invalidates authority, not the record of it.
 
 No table uses a sequence or an identity column: primary keys are sha256 hashes
 of secrets the client already holds. That is partly least-privilege --
@@ -484,6 +485,8 @@ def _migration_4(connection: psycopg.Connection) -> None:
 #: to update, and a test below that fails if a migration adds a table and
 #: forgets it.
 TABLES_IN_DELETE_ORDER = (
+    # References nothing, so it goes first and stays independent of the rest.
+    "audit_event",
     "oauth_refresh_tokens",
     "oauth_refresh_families",
     "oauth_authorization_codes",
@@ -709,6 +712,80 @@ def _migration_6(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_7(connection: psycopg.Connection) -> None:
+    """P19's durable audit: an append-only table, not a file.
+
+    The authorization component cannot write ``var/control/audit.jsonl`` -- it
+    runs ``read_only`` with the socket directory as its only mount -- so until
+    now nothing it decided was recorded anywhere. A replay revoked a grant and
+    set ``revoked_reason``, and no code read that column: an operator whose
+    agent stopped working could only find out why with raw SQL.
+
+    A table rather than an exported file because P19 requires the record to
+    commit *with* the change it describes. A rotating file cannot join that
+    transaction, so a crash between the revocation and the log entry would
+    leave a revoked grant nobody could explain. ``audit.jsonl`` stays as the
+    operator-facing projection that may lag.
+
+    No sequence: ``test_database_access_contract`` asserts ``ON SEQUENCES``
+    appears in no grant, and every other key here is already a hash or a
+    token. ``clock_timestamp()`` rather than ``now()`` because several events
+    can share one transaction -- the replay writes its record beside the
+    revocation -- and ``now()`` would stamp them identically, leaving the order
+    in which they happened unrecoverable.
+
+    No recovery_epoch. The epoch invalidates authority, and these rows
+    authorise nothing; the schema's own rule is that a restore must not delete
+    the audit trail.
+
+    Retention is not implemented here, and that is a bounded exposure rather
+    than an oversight: every event written today follows an authenticated,
+    consented flow, so nothing an unauthenticated caller does can grow this
+    table. P19's 90-day floor and purge-under-pressure become required the
+    moment a failed sign-in or a refused authorization is recorded.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+            CREATE TABLE {schema}.audit_event (
+                event_id    text        PRIMARY KEY,
+                recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                -- Dotted and coarse: "refresh.replayed", not a sentence. What
+                -- varies belongs in detail, or an operator cannot filter.
+                event       text        NOT NULL,
+                -- Who acted, in the vocabulary the rest of the schema uses: a
+                -- grant id for an agent, "operator" for a console action.
+                actor       text        NOT NULL,
+                client_id   text,
+                grant_id    text,
+                -- Never a raw token, code, secret or header. The hashes and
+                -- ids above are what correlate a record to a credential, and
+                -- test_audit_event pins that a token handed to the writer is
+                -- refused rather than stored.
+                detail      jsonb       NOT NULL DEFAULT '{{}}'::jsonb
+            );
+
+            -- The only query an operator runs: the recent tail, newest first.
+            CREATE INDEX audit_event_recorded_idx
+                ON {schema}.audit_event (recorded_at DESC, event_id DESC);
+
+            -- And the forensic one: everything that happened to one grant.
+            CREATE INDEX audit_event_grant_idx
+                ON {schema}.audit_event (grant_id, recorded_at DESC)
+                WHERE grant_id IS NOT NULL;
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_7(connection: psycopg.Connection) -> None:
+    connection.execute(
+        sql.SQL("DROP TABLE IF EXISTS {schema}.audit_event").format(
+            schema=sql.Identifier(SCHEMA)
+        )
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -716,6 +793,7 @@ MIGRATIONS = {
     4: _migration_4,
     5: _migration_5,
     6: _migration_6,
+    7: _migration_7,
 }
 
 
@@ -746,6 +824,9 @@ DESTRUCTIVE_ROLLBACKS = {
        " than half-working",
     6: "every rotating refresh family and its tokens, so each client has to"
        " complete a fresh authorization instead of refreshing",
+    7: "the durable audit trail -- every recorded authorization decision,"
+       " including the replays that revoked a grant. Nothing reconstructs it,"
+       " and audit.jsonl is a lossy projection that never held these events",
 }
 
 
@@ -885,6 +966,7 @@ ROLLBACKS = {
     4: _rollback_4,
     5: _rollback_5,
     6: _rollback_6,
+    7: _rollback_7,
 }
 
 

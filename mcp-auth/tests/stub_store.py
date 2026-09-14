@@ -29,6 +29,17 @@ from models import Session
 from models import Token
 
 
+def _audit_now() -> float:
+    """Wall clock, as clock_timestamp() is in SQL -- not a transaction time.
+
+    Several records can be written inside one act, and a shared timestamp
+    would lose the order they happened in.
+    """
+    import time as _time
+
+    return _time.time()
+
+
 def token_digest(raw: str) -> str:
     """The single definition of how a bearer secret is keyed at rest."""
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -53,6 +64,9 @@ class StubStore:
         self._refresh_tokens: dict[str, dict] = {}
         self._pending: dict[str, PendingAuthorization] = {}
         self._sessions: dict[str, Session] = {}
+        #: Append-only, like the table. A list rather than a dict because the
+        #: order records *are written in* is the thing being kept.
+        self._audit: list[dict] = []
 
     # -- clients ---------------------------------------------------------
 
@@ -181,6 +195,13 @@ class StubStore:
                     "consumed_at": None,
                     "replaced_by": None,
                 }
+                self._write_audit(
+                    "refresh.retried",
+                    actor=family["grant_id"],
+                    client_id=family["client_id"],
+                    grant_id=family["grant_id"],
+                    detail={"familyId": token["family_id"]},
+                )
                 return {
                     "outcome": "rotated",
                     "grace": True,
@@ -197,6 +218,24 @@ class StubStore:
                 if grant is not None and grant.revoked_at is None:
                     grant.revoked_at = now
                     revoked_grant = grant.grant_id
+                if revoked_grant is not None:
+                    self._write_audit(
+                        "grant.revoked",
+                        actor=revoked_grant,
+                        client_id=grant.client_id if grant is not None else None,
+                        grant_id=revoked_grant,
+                        detail={"reason": "refresh-replay"},
+                    )
+                self._write_audit(
+                    "refresh.replayed",
+                    actor=grant.grant_id if grant is not None else "unknown",
+                    grant_id=grant.grant_id if grant is not None else None,
+                    detail={
+                        "familyId": token["family_id"],
+                        "grantRevoked": grant is not None,
+                        "consequence": "family and grant revoked",
+                    },
+                )
                 return {
                     "outcome": "replayed",
                     "family_id": token["family_id"],
@@ -269,6 +308,65 @@ class StubStore:
 
     # -- grants ----------------------------------------------------------
 
+    # -- the durable audit trail -----------------------------------------
+
+    def _write_audit(
+        self,
+        event: str,
+        *,
+        actor: str,
+        client_id: str | None = None,
+        grant_id: str | None = None,
+        detail: dict | None = None,
+    ) -> str:
+        # The refusal rule is imported, not restated. Two copies of a
+        # credential allowlist drift, and the copy that drifts is the one that
+        # lets a token into the trail.
+        from sql_store import _check_audit_detail
+
+        detail = detail or {}
+        _check_audit_detail(detail)
+        event_id = f"audit-{len(self._audit)}"
+        self._audit.append(
+            {
+                "event_id": event_id,
+                "recorded_at": _audit_now(),
+                "event": event,
+                "actor": actor,
+                "client_id": client_id,
+                "grant_id": grant_id,
+                "detail": dict(detail),
+            }
+        )
+        return event_id
+
+    def record_audit(
+        self,
+        event: str,
+        *,
+        actor: str,
+        client_id: str | None = None,
+        grant_id: str | None = None,
+        detail: dict | None = None,
+    ) -> str:
+        with self._lock:
+            return self._write_audit(
+                event,
+                actor=actor,
+                client_id=client_id,
+                grant_id=grant_id,
+                detail=detail,
+            )
+
+    def audit_tail(self, limit: int = 200, *, grant_id: str | None = None) -> list[dict]:
+        with self._lock:
+            rows = [
+                dict(row)
+                for row in self._audit
+                if grant_id is None or row["grant_id"] == grant_id
+            ]
+        return list(reversed(rows))[:limit]
+
     def save_grant(self, grant: Grant) -> Grant:
         with self._lock:
             if grant.grant_id in self._grants:
@@ -278,6 +376,13 @@ class StubStore:
                 # revoked grant come back live.
                 raise ValueError(f"Grant {grant.grant_id!r} already exists.")
             self._grants[grant.grant_id] = grant
+            self._write_audit(
+                "grant.created",
+                actor=grant.subject or "operator",
+                client_id=grant.client_id,
+                grant_id=grant.grant_id,
+                detail={"scopes": list(grant.scopes)},
+            )
         return grant
 
     def query_grant(self, grant_id: str) -> Grant | None:
@@ -301,6 +406,13 @@ class StubStore:
             if grant is None or grant.revoked_at is not None:
                 return False
             grant.revoked_at = _time.time()
+            self._write_audit(
+                "grant.revoked",
+                actor=grant_id,
+                client_id=grant.client_id,
+                grant_id=grant_id,
+                detail={"reason": reason or "unspecified"},
+            )
             return True
 
     # -- authorization codes ---------------------------------------------
