@@ -109,12 +109,26 @@ seed_one() {
   "${compose[@]}" exec -T "${service}" psql \
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
     --set reader_user="${READER_USER}" \
-    --set reader_password="${READER_PASSWORD}" <<'SQL' >/dev/null
+    --set reader_password="${READER_PASSWORD}" \
+    --set source_user="${SOURCE_USER}" \
+    --set source_password="${password}" <<'SQL' >/dev/null
 -- Retained source volumes keep their roles when .env credentials are rotated.
 -- Reconcile the demo-owned read-only login on every load, just as the bundled
 -- database upgrade reconciles its service roles.
 ALTER ROLE :"reader_user" LOGIN PASSWORD :'reader_password';
 ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
+-- And the owner, which POSTGRES_PASSWORD sets only when the data directory is
+-- first created. A retained volume therefore keeps whatever password it was
+-- initialised with, and the load a few lines below connects as this role over
+-- the network -- where pg_hba requires scram, unlike the local socket this
+-- statement arrives on, which is trusted. So the failure is invisible until
+-- the ETL runs, and reads as a plain "password authentication failed" for a
+-- credential that is correct everywhere it is written down.
+--
+-- Reconciling the reader but not the owner was the gap: both are demo-owned
+-- logins into a database MAPP recreates at will, and both have to survive a
+-- rotated .env.
+ALTER ROLE :"source_user" LOGIN PASSWORD :'source_password';
 SQL
 
   "${compose[@]}" exec -T "${service}" psql \
