@@ -352,18 +352,16 @@ class ComposeIsolationTests(unittest.TestCase):
                 }
                 self.assertEqual({"config-ui"}, holders)
 
-    def test_the_runtime_client_secret_reaches_exactly_its_two_holders(self) -> None:
-        """Two services, and the second one is a cost worth naming.
+    def test_the_runtime_client_secret_reaches_only_the_runtime(self) -> None:
+        """One service: the one that presents it.
 
-        MCP_AUTH_CLIENT_SECRET reaches only config-ui because the configuration
-        API provisions its *own* client row -- it owns the control schema and
-        holds the DSN, so the authorization component never sees that plaintext.
-
-        mapp-mcp cannot do the same: it has no database credential, by design,
-        and reaches platform state only through authenticated API calls. So
-        somebody else writes its row, and the plaintext necessarily reaches both
-        the component that hashes it and the runtime that presents it. What this
-        pins is that it reaches no one else.
+        An operator registers the MCP runtime's client with
+        `./bin/mapp mcp-runtime-register`, which mints the secret and stores
+        only its digest, so the authorization component never holds the
+        plaintext even though it is the component that verifies it. An earlier
+        version had that component provision the row from its own environment,
+        which put the secret in a second configuration, made rotation a restart
+        of the authorization server, and left the act without an author.
         """
         for mode, model in self.models.items():
             with self.subTest(mode=mode):
@@ -374,9 +372,8 @@ class ComposeIsolationTests(unittest.TestCase):
                 }
                 self.assertLessEqual(
                     holders,
-                    {"mcp-auth", "mapp-mcp"},
-                    "the runtime client secret reached a service that needs neither"
-                    " to hash it nor to present it",
+                    {"mapp-mcp"},
+                    "only the runtime presents this secret; nothing else needs it",
                 )
 
     def test_the_mcp_origin_reaches_caddy_and_the_component_together(self) -> None:

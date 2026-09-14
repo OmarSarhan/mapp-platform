@@ -21,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
             "mcp-client-register",
             "mcp-client-list",
             "mcp-client-disable",
+            "mcp-runtime-register",
             "migrate-rollback",
             "advance-recovery-epoch",
         ),
@@ -187,6 +188,12 @@ def migrate_rollback_command(args, store) -> bool:
     return True
 
 
+#: The MCP runtime's client id on the control listener. Shared with mcp-auth's
+#: server module and with mapp-mcp's own configuration, so it is written once
+#: here and imported rather than spelled out three times.
+MCP_RUNTIME_CLIENT_ID = "mapp-mcp"
+
+
 def mcp_client_command(args, store) -> bool:
     """The agent-client registry. Returns True when it handled the command.
 
@@ -220,6 +227,25 @@ def mcp_client_command(args, store) -> bool:
             print(f"Client {args.client_id} disabled.")
         else:
             print(f"Client {args.client_id} is unknown or already disabled.")
+        return True
+    if args.command == "mcp-runtime-register":
+        # Mints the secret rather than accepting one. An operator who had to
+        # supply it would paste it into a shell, where it lands in history and
+        # in whatever records that shell keeps; generating it here means the
+        # only copies are this output and the deployment's own configuration.
+        secret = secrets.token_urlsafe(32)
+        store.ensure_oauth_client(
+            MCP_RUNTIME_CLIENT_ID, secret, name="MAPP MCP runtime"
+        )
+        print(f"Registered the MCP runtime client: {MCP_RUNTIME_CLIENT_ID}")
+        print(f"    secret (shown once): {secret}")
+        print()
+        print("Put it in .env as MAPP_MCP_CLIENT_SECRET and restart mapp-mcp.")
+        print(
+            "Re-running this rotates the secret: the new one takes effect for"
+            " the authorization component immediately, and for the runtime"
+            " when it next starts."
+        )
         return True
     if args.command == "mcp-client-register":
         try:

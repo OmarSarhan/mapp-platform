@@ -277,6 +277,71 @@ class DisableTests(RegistryTestCase):
         self.assertIn(client_id, clients, "the row must survive being disabled")
 
 
+class RuntimeClientTests(RegistryTestCase):
+    """The MCP runtime's confidential client, registered by an operator.
+
+    It cannot register itself: it holds no database credential by design and
+    reaches platform state only through authenticated API calls. The
+    authorization component could have written the row from its own environment
+    and did for one commit, but that put the plaintext in a second service's
+    configuration, made rotation a restart of the authorization server, and left
+    the act without an author -- which matters once more than one person
+    operates the platform.
+    """
+
+    RUNTIME = "mapp-mcp"
+
+    def register(self, secret="runtime-secret"):
+        self.store.ensure_oauth_client(
+            self.RUNTIME, secret, name="MAPP MCP runtime"
+        )
+        return next(
+            item
+            for item in self.store.list_oauth_clients()
+            if item["clientId"] == self.RUNTIME
+        )
+
+    def test_it_is_confidential_and_holds_nothing_else(self) -> None:
+        """No redirect URI, no scopes: it never appears in an authorization
+        request, so either would be a capability with no purpose."""
+        client = self.register()
+        self.assertTrue(client["confidential"])
+        self.assertEqual([], client["scopes"])
+        self.assertEqual([], client["redirectUris"])
+        self.assertIsNone(client["disabled"])
+
+    def test_registering_again_rotates_the_secret(self) -> None:
+        """The reason an operator command beats an environment variable.
+
+        Rotation is this call, and it takes effect for the authorization
+        component immediately -- no restart, and nothing else holds the old
+        value to get out of step with.
+        """
+        self.register("first")
+        self.register("second")
+        with self.store._db() as connection:
+            row = connection.execute(
+                "SELECT client_secret_hash FROM control.oauth_clients"
+                " WHERE client_id = %s",
+                (self.RUNTIME,),
+            ).fetchone()
+        import hashlib
+
+        self.assertEqual(
+            hashlib.sha256(b"second").hexdigest(), row["client_secret_hash"]
+        )
+
+    def test_the_plaintext_is_never_stored(self) -> None:
+        self.register("runtime-secret")
+        with self.store._db() as connection:
+            row = connection.execute(
+                "SELECT client_secret_hash FROM control.oauth_clients"
+                " WHERE client_id = %s",
+                (self.RUNTIME,),
+            ).fetchone()
+        self.assertNotIn("runtime-secret", str(row))
+
+
 class EmptyRegistryTests(RegistryTestCase):
     def test_an_empty_registry_lists_nothing(self) -> None:
         """The state a correct deployment starts in, before an operator acts."""

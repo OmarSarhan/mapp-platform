@@ -47,6 +47,7 @@ usage() {
     "  mcp-client-register --name N --redirect-uri U --scope S  register an MCP agent client" \
     "  mcp-client-list list registered MCP clients" \
     "  mcp-client-disable --client-id ID  disable an MCP client" \
+    "  mcp-runtime-register register or rotate the MCP runtime's own credential" \
     "  migrate-rollback --to N [--confirm]  step the control schema ladder down; destructive, prints the plan first" \
     "  advance-recovery-epoch [--confirm]  invalidate every credential a restored database brought back; destructive, prints the plan first" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
@@ -1092,7 +1093,7 @@ case "${1:-}" in
     "${compose[@]}" run --rm --no-deps config-ui \
       python config_admin.py migrate-rollback --root /control "${@:2}"
     ;;
-  mcp-client-register|mcp-client-list|mcp-client-disable)
+  mcp-client-register|mcp-client-list|mcp-client-disable|mcp-runtime-register)
     # The agent-client registry. Nothing else registers a client, so without
     # this the authorization component starts with an empty client table and
     # refuses every authorization request as an unknown client.

@@ -38,12 +38,23 @@ compared, never fetched. All live work goes to `http://mcp-auth:8080`, the
 control listener, as config-ui already does. An implementation that fetches
 issuer metadata to validate a token hangs until its timeout.
 
-**mcp-auth provisions mapp-mcp's broker client row** at start-up from its own
-environment. mapp-mcp has no database credential and is not on `backend`, so it
-cannot self-provision the way config-ui does; having config-ui do it would hand
-one service another service's secret. Without that row every
+**An operator registers mapp-mcp's client row**, with
+`./bin/mapp mcp-runtime-register`. Without that row every
 `/internal/oauth/exchange` call fails in `_authenticate_broker` and the whole
 token-B path is dead with an opaque error.
+
+It cannot register itself: it holds no database credential by design. The first
+version had mcp-auth write the row from its own environment, which starts
+without an operator step but costs three things that matter once more than one
+person runs the platform -- the plaintext sits in a second service's
+configuration, rotation means restarting the authorization server, and the act
+has no author. The command mints the secret rather than accepting one, so it
+never passes through a shell history, and stores only the digest: the component
+that *verifies* the secret never holds it.
+
+The trade is that mapp-mcp does not work until somebody registers it. That is
+acceptable where the administrator credential was not, because this gates one
+optional service rather than every way of signing in.
 
 **mapp-mcp joins `mcp-control`**, as P12 requires. The specification asks for a
 renewed transport threat model for any additional peer on that network; this
