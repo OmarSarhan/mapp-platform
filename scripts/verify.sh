@@ -827,14 +827,27 @@ if [[ -n "${demo_sources}" ]] \
   && ! relation_present census-db leeds.census_2021_england_oa; then
   printf 'Demo sources are configured but census-db holds no census content; skipping its content checks. Load it with ./bin/mapp demo.\n'
 elif [[ -n "${demo_sources}" ]]; then
+  # The same extent the census ETL was told to repair within, from the same
+  # definition it reads. Asserting validity outside it would assert something
+  # about the publisher's national data rather than about this load: the demo
+  # deliberately leaves geometry it does not map as published.
+  census_repair_extent="$(python3 "${ROOT_DIR}/scripts/workspace_repair_extent.py")"
+  if [[ -n "${census_repair_extent}" ]]; then
+    printf 'Census geometry is asserted valid within the repaired extent %s.\n' \
+      "${census_repair_extent}"
+  else
+    printf 'Census geometry is asserted valid everywhere: no repair extent is configured.\n'
+  fi
   "${compose[@]}" exec -T \
     -e "MAPP_VERIFY_CENSUS_GEOMETRY_SHA256=${census_geometry_sha256}" \
     -e "MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON=${census_topic_hashes_json}" \
+    -e "MAPP_VERIFY_CENSUS_REPAIR_EXTENT=${census_repair_extent}" \
     census-db sh -c \
     'exec psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
       --set ON_ERROR_STOP=1 \
       --set=census_geometry_sha256="$MAPP_VERIFY_CENSUS_GEOMETRY_SHA256" \
-      --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON"' <<'CENSUS_SQL'
+      --set=census_topic_hashes_json="$MAPP_VERIFY_CENSUS_TOPIC_HASHES_JSON" \
+      --set=census_repair_extent="$MAPP_VERIFY_CENSUS_REPAIR_EXTENT"' <<'CENSUS_SQL'
 SELECT set_config(
 'mapp.verify.census_geometry_sha256',
 :'census_geometry_sha256',
@@ -843,6 +856,11 @@ false
 SELECT set_config(
 'mapp.verify.census_topic_hashes_json',
 :'census_topic_hashes_json',
+false
+);
+SELECT set_config(
+'mapp.verify.census_repair_extent',
+:'census_repair_extent',
 false
 );
 
@@ -870,12 +888,29 @@ expected_geometry_sha256 text :=
   current_setting('mapp.verify.census_geometry_sha256');
 expected_topic_hashes jsonb :=
   current_setting('mapp.verify.census_topic_hashes_json')::jsonb;
+-- NULL when no extent is configured, which reads as "assert everywhere" in the
+-- filter below. The ETL treats an absent extent the same way -- it repairs
+-- everything -- so the two halves stay symmetric.
+repair_extent text := nullif(
+  current_setting('mapp.verify.census_repair_extent'), ''
+);
+repair_box geometry;
 expected_topic_hash_count integer;
 variable_topic_hash_mismatch_count integer;
 BEGIN
 IF census_relation IS NULL THEN
   RAISE NOTICE 'Optional Census relation leeds.census_2021_england_oa is absent; skipped Census verification';
   RETURN;
+END IF;
+
+IF repair_extent IS NOT NULL THEN
+  repair_box := ST_MakeEnvelope(
+    split_part(repair_extent, ',', 1)::double precision,
+    split_part(repair_extent, ',', 2)::double precision,
+    split_part(repair_extent, ',', 3)::double precision,
+    split_part(repair_extent, ',', 4)::double precision,
+    4326
+  );
 END IF;
 
 
@@ -886,14 +921,23 @@ SELECT
     WHERE oa21cd IS NULL OR oa21cd !~ '^E[0-9]{8}$'
   )::bigint,
   count(*) FILTER (
+    -- Unconditional: a missing geometry or a wrong SRID is this load being
+    -- broken, wherever the row sits, and no repair extent excuses it.
     WHERE geom IS NULL
        OR ST_SRID(geom) <> 4326
-       OR ST_IsEmpty(geom)
-       OR NOT ST_IsValid(geom)
        OR geom_3857 IS NULL
        OR ST_SRID(geom_3857) <> 3857
-       OR ST_IsEmpty(geom_3857)
-       OR NOT ST_IsValid(geom_3857)
+       -- Bounded by the repaired extent: emptiness and invalidity are the
+       -- publisher's data quality, and the demo repairs only what it maps.
+       OR (
+            (repair_box IS NULL OR geom && repair_box)
+            AND (
+              ST_IsEmpty(geom)
+              OR NOT ST_IsValid(geom)
+              OR ST_IsEmpty(geom_3857)
+              OR NOT ST_IsValid(geom_3857)
+            )
+          )
   )::bigint
 INTO
   row_total,
@@ -918,8 +962,9 @@ IF distinct_code_count <> row_total THEN
 END IF;
 IF invalid_geometry_count <> 0 THEN
   RAISE EXCEPTION
-    'Census relation has % invalid, empty, or incorrectly projected geometries',
-    invalid_geometry_count;
+    'Census relation has % invalid, empty, or incorrectly projected geometries%',
+    invalid_geometry_count,
+    coalesce(' within the repaired extent ' || repair_extent, '');
 END IF;
 
 SELECT attribute.attgenerated::text

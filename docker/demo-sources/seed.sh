@@ -36,38 +36,11 @@ CENSUS_DB="$(dotenv_value CENSUS_POSTGRES_DB)"
 OPS_DB="$(dotenv_value OPS_POSTGRES_DB)"
 
 workspace_repair_extent() {
-  # Demo source repair must follow the versioned demo workspace, not whichever
-  # mutable workspace happens to be live when the command starts. Otherwise a
-  # custom live extent can produce source geometry that does not cover the map
-  # this same demo run publishes.
-  local workspace="${ROOT_DIR}/docker/demo-sources/workspace-demo.json"
-  if [[ ! -f "${workspace}" ]]; then
-    workspace="${ROOT_DIR}/instance/workspace.seed.json"
-  fi
-  python3 - "${workspace}" <<'PY'
-import json
-import math
-import sys
-
-try:
-    workspace = json.load(open(sys.argv[1], encoding="utf-8"))
-except OSError:
-    raise SystemExit(0)
-extent = ((workspace.get("locale") or {}).get("extent") or {})
-try:
-    west = float(extent["west"])
-    south = float(extent["south"])
-    east = float(extent["east"])
-    north = float(extent["north"])
-except (KeyError, TypeError, ValueError):
-    raise SystemExit(0)
-if (
-    all(math.isfinite(value) for value in (west, south, east, north))
-    and -180 <= west <= east <= 180
-    and -90 <= south <= north <= 90
-):
-    print(f"{west},{south},{east},{north}")
-PY
+  # One definition, in scripts/workspace_repair_extent.py, because verify has
+  # to bound its census validity assertion by the same extent this bounds the
+  # repair by. While the two were separate, verify asserted validity across all
+  # of England and a correct demo run failed on geometry no layer reads.
+  python3 "${ROOT_DIR}/scripts/workspace_repair_extent.py"
 }
 
 # Census metadata travels with the measures: census_variables carries the ONS
