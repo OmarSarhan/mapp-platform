@@ -712,6 +712,17 @@ case "${1:-}" in
         exit 2
         ;;
     esac
+    # The administrator credential lives in the control schema, so a platform
+    # that gains the control plane -- an existing volume upgraded rather than
+    # created -- comes up with nowhere to sign in and no command to fix it:
+    # bootstrap ran only from `init`, which rewrites .env, and from
+    # `reset-system`, which destroys the database. Neither is something an
+    # operator should have to do to adopt a schema migration.
+    #
+    # Safe on every start because `config_admin init` refuses to overwrite an
+    # existing credential and says so, and report_admin_bootstrap prints a
+    # password only when one was actually minted.
+    bootstrap_admin_credential ""
     ensure_caddy_bindings
     ;;
   config-ui)

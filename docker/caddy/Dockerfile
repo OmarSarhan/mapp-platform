@@ -34,7 +34,7 @@ FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4
 
 RUN apk add --no-cache --upgrade \
       c-ares=1.34.8-r0 \
-      curl=8.20.0-r0 \
-      libcurl=8.20.0-r0
+      curl=8.22.0-r0 \
+      libcurl=8.22.0-r0
 
 COPY --from=caddy-builder /out/caddy /usr/bin/caddy

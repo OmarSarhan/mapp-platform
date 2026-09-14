@@ -156,8 +156,8 @@ class BaseImagePolicyTests(unittest.TestCase):
         self.assertIn("golang.org/x/text@v0.39.0", caddy)
         self.assertIn("google.golang.org/grpc@v1.82.1", caddy)
         self.assertIn("c-ares=1.34.8-r0", caddy)
-        self.assertIn("curl=8.20.0-r0", caddy)
-        self.assertIn("libcurl=8.20.0-r0", caddy)
+        self.assertIn("curl=8.22.0-r0", caddy)
+        self.assertIn("libcurl=8.22.0-r0", caddy)
         self.assertIn(
             "GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513",
             postgis,
