@@ -154,8 +154,8 @@ separate things, and the output names each one:
 
 Then open:
 
-- the map — <http://localhost:3000>
-- the configuration dashboard — <http://config.localhost:3000>
+- the map — <http://localhost>
+- the configuration dashboard — <http://config.localhost>
 
 The dashboard password was printed by `init`. If you have lost it,
 `./bin/mapp reset-config-password` issues a new one.

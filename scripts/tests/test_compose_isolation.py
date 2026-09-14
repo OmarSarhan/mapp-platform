@@ -373,6 +373,53 @@ class ComposeIsolationTests(unittest.TestCase):
                     services["mcp-auth"]["environment"]["MCP_RESOURCE"],
                 )
 
+    def test_the_published_edge_port_matches_the_port_the_sites_carry(self) -> None:
+        """The edge must answer on the port its own origins name.
+
+        Nothing asserted this, and a real defect lived in the gap: HTTP_PORT
+        was 3000 while every site carried no port, so anything following an
+        absolute URL built from an origin arrived at port 80 and found
+        nothing. Browsers never noticed -- the dashboard's links are relative
+        -- and the MCP authorization server's metadata document, which
+        publishes absolute endpoint URLs a client is required to follow, was
+        the first thing on the platform that could not tolerate it.
+
+        Asserted from the resolved model rather than from .env, so it holds
+        for whatever the deployment actually resolves to.
+
+        The production models are excluded, and not to make this pass. They
+        resolve a production overlay -- whose sites are https -- against the
+        development port values, a combination no deployment runs: a real one
+        sets MAPP_ENVIRONMENT=production, and validate_production_env then
+        requires HTTP_PORT=80 and HTTPS_PORT=443, which is this same invariant
+        enforced where that combination actually exists. Asserting it here as
+        well would only pin the artefact of mixing the two.
+        """
+        for mode, model in self.models.items():
+            if "production" in mode:
+                continue
+            with self.subTest(mode=mode):
+                caddy = model["services"]["caddy"]
+                published = {
+                    str(entry["published"]): str(entry["target"])
+                    for entry in caddy.get("ports", [])
+                }
+                self.assertTrue(published, "the edge publishes nothing")
+                for key in ("MAP_SITE", "CONFIG_SITE", "MCP_SITE"):
+                    site = caddy["environment"].get(key)
+                    if not site:
+                        continue
+                    parts = urlsplit(site)
+                    port = parts.port or (443 if parts.scheme == "https" else 80)
+                    self.assertIn(
+                        str(port),
+                        published,
+                        f"{key} is {site}, which names port {port}, but the"
+                        f" edge publishes {sorted(published)}. A client"
+                        " following an absolute URL from this origin would"
+                        " reach nothing.",
+                    )
+
     def test_gemini_credential_is_available_only_to_config_ui(self) -> None:
         for mode, model in self.models.items():
             with self.subTest(mode=mode):

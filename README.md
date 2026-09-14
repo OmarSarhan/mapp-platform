@@ -27,8 +27,8 @@ Docker with Compose, and about 4 GB free. Nothing is installed on the host.
 `demo` takes around fifteen minutes, most of it downloading the England Census
 2021 Output Area dataset. Then open:
 
-- the map — <http://localhost:3000>
-- the dashboard — <http://config.localhost:3000>
+- the map — <http://localhost>
+- the dashboard — <http://config.localhost>
 
 The dashboard password was printed by `init`; `./bin/mapp reset-config-password`
 issues a new one if you have lost it.

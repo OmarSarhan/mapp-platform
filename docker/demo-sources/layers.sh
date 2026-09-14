@@ -41,7 +41,7 @@ warn_sweep_failed() {
 CONFIG_SITE="$(dotenv_value CONFIG_SITE | tr ',' '\n' | head -n 1 | tr -d ' ')"
 CONFIG_HOST="${CONFIG_SITE#*://}"
 HTTP_PORT="$(dotenv_value HTTP_PORT)"
-BASE="http://localhost:${HTTP_PORT:-3000}"
+BASE="http://localhost:${HTTP_PORT:-80}"
 
 # There is no CLI path for minting a token: POST /api/admin/tokens needs an
 # administrator session. The control store is the supported seam, and it writes

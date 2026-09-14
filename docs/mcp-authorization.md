@@ -480,14 +480,18 @@ dropped and the response's `scope` says what was actually granted — which is
 why the whole request is not refused. Refresh still works, because refresh is
 gated on the client's registered grant types rather than on a scope.
 
-**The issuer and the published port must agree.** Locally `HTTP_PORT` is 3000
-while `MCP_SITE` is `http://mcp.localhost`, so discovery succeeds on `:3000`
-and then hands the client an `authorization_endpoint` on port 80 with nothing
-behind it. A browser never noticed because the dashboard's links are relative;
-an OAuth client follows absolute URLs out of the metadata document, so it is
-the first thing here that cares. Set `HTTP_PORT=80`, or set `MCP_SITE` to
-carry the port — but note `MCP_SITE` is also the Caddy site address, so it
-changes what Caddy listens on and the published mapping has to move with it.
+**The issuer and the published port must agree**, and this is why `HTTP_PORT`
+is 80 in development as well as production. It used to be 3000, so discovery
+succeeded on `:3000` and then handed the client an `authorization_endpoint` on
+port 80 with nothing behind it. A browser never noticed, because the
+dashboard's links are relative; an OAuth client follows absolute URLs out of
+the metadata document, so this is the first thing on the platform that cares.
+
+Moving the edge rather than putting the port into `MCP_SITE` was deliberate:
+`MCP_SITE` is also the Caddy site address, so carrying a port there changes
+what Caddy listens on *inside* the container, and the published mapping would
+have to move with it. The port is a local convention; the issuer is a protocol
+identity a client records and compares. The convention is what should bend.
 
 ## The audit trail
 

@@ -2962,6 +2962,39 @@ probe_endpoint "The configuration service public identity" config_headers \
 # schema, or if the issuer is misconfigured.
 probe_endpoint "The MCP authorization server metadata" mcp_headers \
   "${mcp_url}/.well-known/oauth-authorization-server"
+# Fetching that document is not enough, and believing it was is what let a real
+# defect through every green run: the endpoints inside it are ABSOLUTE URLs
+# built from the issuer, and a client follows those rather than the address it
+# discovered on. HTTP_PORT was 3000 while the issuer carried no port, so
+# discovery succeeded and the authorization endpoint it handed back pointed at
+# port 80, where nothing listened. Nothing noticed, because a browser only ever
+# follows the dashboard's relative links.
+#
+# So compare the advertised port against the published one. A reachability
+# probe would be a stronger check but a worse one here: it would depend on
+# *.localhost resolving on the machine running verify, which is not universal,
+# and would fail for a reason unrelated to what is being asserted.
+advertised_endpoint="$(curl --silent --show-error "${mcp_headers[@]}" \
+  "${mcp_url}/.well-known/oauth-authorization-server" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["authorization_endpoint"], end="")')"
+advertised_port="$(printf '%s' "${advertised_endpoint}" | python3 -c '
+import sys, urllib.parse
+parts = urllib.parse.urlsplit(sys.stdin.read())
+print(parts.port or (443 if parts.scheme == "https" else 80), end="")')"
+if [[ "${production}" == true ]]; then
+  expected_edge_port="${https_port}"
+else
+  expected_edge_port="${published_http##*:}"
+fi
+if [[ "${advertised_port}" != "${expected_edge_port}" ]]; then
+  printf 'The MCP authorization server advertises %s, on port %s, but the edge is published on port %s.\n' \
+    "${advertised_endpoint}" "${advertised_port}" "${expected_edge_port}" >&2
+  printf '  A client reads that URL out of the metadata document and follows it, so it would reach nothing.\n' >&2
+  printf '  Make HTTP_PORT match the port in MCP_SITE (no port means 80).\n' >&2
+  exit 1
+fi
+printf 'The MCP authorization endpoint it advertises is on the published edge port (%s).\n' \
+  "${advertised_port}"
 # And the control endpoints must not be reachable from the edge. The component
 # owns that as a property of its route tables; the Caddy allowlist is the
 # second, independent control. Both are asserted here because this is the only
