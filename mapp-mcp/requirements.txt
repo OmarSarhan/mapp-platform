@@ -1,0 +1,10 @@
+# Three packages, all pure Python, verified to install on musl with no native
+# extension and no build toolchain. That is the whole runtime dependency: the
+# era guard, the metadata surface and the authentication middleware are stdlib.
+#
+# Deliberately NOT the official MCP SDK, which resolves to 28 packages
+# including cryptography, pydantic-core and rpds-py. Adopting it is a change of
+# posture for an image that currently has almost none, and it is a decision to
+# take with a running service in front of us rather than as a side effect of
+# needing something to serve ASGI.
+uvicorn==0.53.0
