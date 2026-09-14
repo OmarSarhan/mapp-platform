@@ -385,19 +385,14 @@ class ComposeIsolationTests(unittest.TestCase):
         the first thing on the platform that could not tolerate it.
 
         Asserted from the resolved model rather than from .env, so it holds
-        for whatever the deployment actually resolves to.
-
-        The production models are excluded, and not to make this pass. They
-        resolve a production overlay -- whose sites are https -- against the
-        development port values, a combination no deployment runs: a real one
-        sets MAPP_ENVIRONMENT=production, and validate_production_env then
-        requires HTTP_PORT=80 and HTTPS_PORT=443, which is this same invariant
-        enforced where that combination actually exists. Asserting it here as
-        well would only pin the artefact of mixing the two.
+        for whatever the deployment actually resolves to, and across all four
+        models including the production overlays -- whose sites are https and
+        so name 443. That is only possible because the development ports are
+        the standard ones too; while HTTPS_PORT was 3443 the production models
+        resolved a production overlay against development ports and could not
+        satisfy this, which was itself the same defect one layer down.
         """
         for mode, model in self.models.items():
-            if "production" in mode:
-                continue
             with self.subTest(mode=mode):
                 caddy = model["services"]["caddy"]
                 published = {
