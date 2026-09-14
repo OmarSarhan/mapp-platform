@@ -32,6 +32,11 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read the administrator password from standard input.",
     )
+    parser.add_argument(
+        "--secret-stdin",
+        action="store_true",
+        help="Read the MCP runtime client secret from standard input.",
+    )
     parser.add_argument("--name", help="Display name for an MCP client.")
     parser.add_argument(
         "--redirect-uri",
@@ -233,11 +238,27 @@ def mcp_client_command(args, store) -> bool:
         # supply it would paste it into a shell, where it lands in history and
         # in whatever records that shell keeps; generating it here means the
         # only copies are this output and the deployment's own configuration.
-        secret = secrets.token_urlsafe(32)
+        # --secret-stdin mirrors --password-stdin: the deployment already
+        # generated this value into its own configuration, and registering a
+        # different one would leave the runtime holding a secret the control
+        # schema has never seen. Without the flag the command mints one, which
+        # is the interactive path.
+        secret = (
+            sys.stdin.readline().rstrip("\r\n")
+            if args.secret_stdin
+            else secrets.token_urlsafe(32)
+        )
+        if not secret:
+            raise SystemExit("No secret was supplied on standard input.")
         store.ensure_oauth_client(
             MCP_RUNTIME_CLIENT_ID, secret, name="MAPP MCP runtime"
         )
         print(f"Registered the MCP runtime client: {MCP_RUNTIME_CLIENT_ID}")
+        if args.secret_stdin:
+            # Not echoed: the caller supplied it and already has it, and this
+            # output goes to a terminal and whatever records it.
+            print("    secret: taken from the deployment configuration")
+            return True
         print(f"    secret (shown once): {secret}")
         print()
         print("Put it in .env as MAPP_MCP_CLIENT_SECRET and restart mapp-mcp.")

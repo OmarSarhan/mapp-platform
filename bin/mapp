@@ -369,6 +369,34 @@ report_admin_bootstrap() {
   fi
 }
 
+ensure_runtime_client_registered() {
+  # The MCP runtime presents a confidential client secret to the authorization
+  # component's control listener, and that client has to exist in the control
+  # schema before any call it makes can succeed. Registering it here is what
+  # makes the demo work from a fresh clone: the alternative is a platform that
+  # starts, looks healthy, and refuses every MCP call until somebody finds the
+  # command.
+  #
+  # Still a registration rather than an environment variable on the component:
+  # only the digest is stored, so the component that verifies the secret never
+  # holds it, and rotating it is this call rather than a restart of the
+  # authorization server.
+  local secret
+  secret="$(dotenv_value MAPP_MCP_CLIENT_SECRET)"
+  if [[ -z "${secret}" || "${secret}" == CHANGEME_* ]]; then
+    # Blank is a deliberate configuration: run without the MCP runtime.
+    return 0
+  fi
+  if ! printf '%s\n' "${secret}" \
+    | "${compose[@]}" run --rm --no-deps -T config-ui \
+        python config_admin.py mcp-runtime-register \
+          --root /control --secret-stdin >/dev/null 2>&1; then
+    printf 'Could not register the MCP runtime client; MCP calls will be refused.\n' >&2
+    printf '  Retry with ./bin/mapp mcp-runtime-register once the platform is up.\n' >&2
+    return 0
+  fi
+}
+
 bootstrap_admin_credential() {
   # The administrator credential lives in the control schema, so it cannot be
   # created on the host: the packaged database publishes no port, and its DSN
@@ -498,6 +526,7 @@ init_env() {
     -e "s/CHANGEME_SEMANTIC_READER$/$(openssl rand -hex 24)/"
     -e "s/CHANGEME_CONTROL$/$(openssl rand -hex 24)/"
     -e "s/CHANGEME_MCP_AUTH$/$(openssl rand -hex 32)/"
+    -e "s/CHANGEME_MAPP_MCP$/$(openssl rand -hex 32)/"
     -e "s/^CONFIG_UID=.*/CONFIG_UID=$(id -u)/"
     -e "s/^CONFIG_GID=.*/CONFIG_GID=$(id -g)/"
   )
@@ -584,7 +613,7 @@ compose=(
   --file "${ROOT_DIR}/compose.yaml"
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-runtime_services=(db semantic-service mcp-auth xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+runtime_services=(db semantic-service mcp-auth mapp-mcp xyz xyz-preview config-ui browser-runner egress-proxy caddy)
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
 # an alias using them could be registered, or recreating config-ui silently
 # strips the reference and the periodic verifier withdraws that source. One
@@ -724,6 +753,7 @@ case "${1:-}" in
     # existing credential and says so, and report_admin_bootstrap prints a
     # password only when one was actually minted.
     bootstrap_admin_credential ""
+    ensure_runtime_client_registered
     ensure_caddy_bindings
     ;;
   config-ui)
@@ -967,6 +997,30 @@ case "${1:-}" in
       exit 1
     fi
     rm -f "${mcp_auth_log}"
+    # The MCP runtime. No database and no network: the era guard, the metadata
+    # surface and the authentication middleware are driven directly over the
+    # ASGI contract, because that is where their obligations live -- "never
+    # emits Mcp-Session-Id" is a claim about a response message, not about a
+    # rendered page. The skip guard applies for the same reason as the others:
+    # a suite that quietly stops running is worse than one that fails.
+    mapp_mcp_log="$(mktemp)"
+    if ! "${compose[@]}" run --rm --no-deps \
+      --volume "${ROOT_DIR}:/workspace:ro" \
+      --env PYTHONPATH=/app:/workspace/mapp-mcp/tests \
+      --env PYTHONDONTWRITEBYTECODE=1 \
+      --entrypoint python \
+      mapp-mcp \
+      -m unittest discover -s /workspace/mapp-mcp/tests -v 2>&1 \
+      | tee "${mapp_mcp_log}"; then
+      rm -f "${mapp_mcp_log}"
+      exit 1
+    fi
+    if grep -q "skipped=" "${mapp_mcp_log}"; then
+      rm -f "${mapp_mcp_log}"
+      printf 'MCP runtime tests skipped; none of them may be conditional.\n' >&2
+      exit 1
+    fi
+    rm -f "${mapp_mcp_log}"
     # The semantic-service suite exercises real SQL against a real server: a
     # mocked cursor cannot fail the way PostgreSQL fails when it parses a
     # statement, which is the whole reason those tests exist. Without

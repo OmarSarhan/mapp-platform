@@ -93,6 +93,21 @@ jobs:
             exit 1
           fi
 
+      - name: Test MCP runtime
+        # No database and no network: the era guard, the metadata surface and
+        # the authentication middleware are driven directly over the ASGI
+        # contract, which is where their obligations live. Nothing here is
+        # conditional, so the guard is stricter than the others -- any skip at
+        # all means a test stopped running rather than a dependency being absent.
+        run: |
+          set -o pipefail
+          PYTHONPATH=mapp-mcp:mapp-mcp/tests python -m unittest discover \
+            -s mapp-mcp/tests -v 2>&1 | tee /tmp/mapp-mcp-tests.log
+          if grep -q "skipped=" /tmp/mapp-mcp-tests.log; then
+            echo "::error::MCP runtime tests skipped; none of them may be conditional"
+            exit 1
+          fi
+
       - name: Test ETL
         run: PYTHONPATH=etl/src python -m unittest discover -s etl/tests -v
 

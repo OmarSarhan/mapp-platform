@@ -68,8 +68,8 @@ def build_app(
     if introspection is None:
         introspection = IntrospectionClient(
             os.environ.get("MCP_AUTH_URL", "http://mcp-auth:8080"),
-            client_id=os.environ.get("MCP_MCP_CLIENT_ID", "mapp-mcp"),
-            client_secret=os.environ.get("MCP_MCP_CLIENT_SECRET", ""),
+            client_id=os.environ.get("MAPP_MCP_CLIENT_ID", "mapp-mcp"),
+            client_secret=os.environ.get("MAPP_MCP_CLIENT_SECRET", ""),
             resource=f"{origin.rstrip('/')}/mcp",
         )
     authenticated = BearerAuthentication(
