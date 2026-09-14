@@ -412,6 +412,83 @@ schema and are captured by the database dump described in
 [backup and restore](backup-restore.md). `var/mcp-auth` holds only the socket,
 which is recreated on start; do not restore it.
 
+## Connecting Claude Code
+
+Not yet possible, and not for a configuration reason: `mapp-mcp` does not
+exist, so nothing answers `/mcp` and there is no RFC 9728 protected-resource
+document to point a client at. What follows is what the authorization half
+will need when it does, verified against Claude Code's documentation rather
+than assumed.
+
+It fits this design, which was not a given. Claude Code defaults to Dynamic
+Client Registration — refused here — but accepts a pre-registered client, and
+accepts a **public** one: "if the server uses a public OAuth client with no
+secret, use only `--client-id` without `--client-secret`". That is exactly
+what `mcp-client-register` issues.
+
+```
+./bin/mapp mcp-client-register --name "Claude Code" \
+    --redirect-uri http://localhost:8080/callback \
+    --redirect-uri http://127.0.0.1:8080/callback \
+    --scope mcp:connect --scope inspect
+```
+
+Then either the CLI:
+
+```
+claude mcp add --transport http \
+    --client-id <the id printed above> --callback-port 8080 \
+    mapp http://mcp.localhost/mcp
+```
+
+or, for the IDE extension, the same thing as configuration — the `oauth`
+object is what carries the pre-registered client, and without it the client
+attempts Dynamic Client Registration and is refused:
+
+```json
+{
+  "mcpServers": {
+    "mapp": {
+      "type": "http",
+      "url": "http://mcp.localhost/mcp",
+      "oauth": {
+        "clientId": "<the id printed above>",
+        "callbackPort": 8080,
+        "scopes": "mcp:connect inspect"
+      }
+    }
+  }
+}
+```
+
+Three things to know, each of which would otherwise be found the hard way.
+
+**Register both loopback spellings.** Claude Code v2.1.229 sent
+`http://127.0.0.1:PORT/callback` and v2.1.231 restored
+`http://localhost:PORT/callback`; its own release notes record that servers
+matching the registered URI exactly rejected the sign-in in between. This
+server matches exactly and always will, so registering both forms is what
+makes it survive that flipping.
+
+**Fix the callback port.** Without `--callback-port` the loopback port is
+ephemeral, and an unpredictable port cannot be pre-registered. Exact matching
+and dynamic ports are mutually exclusive.
+
+**`offline_access` will arrive whether or not it is advertised.** Claude Code
+requests it unconditionally. It is not in this server's vocabulary, so it is
+dropped and the response's `scope` says what was actually granted — which is
+why the whole request is not refused. Refresh still works, because refresh is
+gated on the client's registered grant types rather than on a scope.
+
+**The issuer and the published port must agree.** Locally `HTTP_PORT` is 3000
+while `MCP_SITE` is `http://mcp.localhost`, so discovery succeeds on `:3000`
+and then hands the client an `authorization_endpoint` on port 80 with nothing
+behind it. A browser never noticed because the dashboard's links are relative;
+an OAuth client follows absolute URLs out of the metadata document, so it is
+the first thing here that cares. Set `HTTP_PORT=80`, or set `MCP_SITE` to
+carry the port — but note `MCP_SITE` is also the Caddy site address, so it
+changes what Caddy listens on and the published mapping has to move with it.
+
 ## The audit trail
 
 P19 makes durable audit an append-only `control.audit_event` table rather than

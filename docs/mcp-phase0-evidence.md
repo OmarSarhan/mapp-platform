@@ -97,7 +97,7 @@ records an amendment.
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
 | Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
 | Independent canonicalization prototypes for mapp-mcp, broker and API | **2 of 3** | Broker and API each vendored and cross-checked. `mapp-mcp` does not exist |
-| Target-client spikes (Claude, Codex, Gemini) | **1 of 3** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component. Codex/OpenAI and Gemini untested |
+| Target-client spikes (Claude, Codex, Gemini) | **1 of 3, and the client half of Claude is now checked** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component, and the same flow was driven by hand through Caddy against the running platform. Claude Code's own requirements were then read rather than assumed: it accepts a pre-registered **public** client and a fixed callback port, so this design fits it, but it defaults to Dynamic Client Registration and sends `offline_access` unconditionally. No MCP client has connected, because `mapp-mcp` does not exist. Codex/OpenAI and Gemini unexamined |
 
 ### Tested
 
