@@ -31,6 +31,12 @@ def digest(**overrides):
         "path": "/api/proposals/p1/apply",
         "query": "",
         "body": {"approved": True},
+        # P10's last three members. Null everywhere until the curated manifest
+        # and the approval flow exist; build() requires them, so they are here
+        # rather than defaulted away.
+        "resolved_defaults": None,
+        "confirmation_fields": None,
+        "revision_binding": None,
     }
     fields.update(overrides)
     return envelope.digest(**fields)
@@ -242,6 +248,8 @@ class EnvelopeMemberTests(unittest.TestCase):
             instance=INSTANCE, method="POST", operation_id="proposals.apply",
             path_template=TEMPLATE, path="/api/proposals/p1/apply",
             query="", body=None,
+            resolved_defaults=None, confirmation_fields=None,
+            revision_binding=None,
         )
         self.assertEqual(canonical.SCHEME, built["version"])
 
@@ -269,14 +277,98 @@ class EnvelopeMemberTests(unittest.TestCase):
             instance=INSTANCE, method="POST", operation_id="proposals.apply",
             path_template=TEMPLATE, path="/api/proposals/p1/apply",
             query="", body=None,
+            resolved_defaults=None, confirmation_fields=None,
+            revision_binding=None,
         )
         self.assertEqual(
             {
                 "version", "instance", "method", "operationId", "pathTemplate",
                 "pathParameters", "path", "query", "body",
+                # P10: "the envelope is the twelve-member definition normative
+                # in section 7, not a shorter restatement". This set was the
+                # nine the module built, so the test that exists to pin the
+                # membership pinned the shortfall instead of catching it.
+                "resolvedDefaults", "confirmationFields", "revisionBinding",
             },
             set(built),
         )
+
+
+class GoldenVectorTests(unittest.TestCase):
+    """One digest written down, because every other test here is differential.
+
+    The rest compute two digests and compare them, which proves the envelope
+    reacts to a change but cannot prove it produces the *right* value. Two
+    implementations wrong in the same way agree with each other perfectly, and
+    mapp-mcp is about to become the third -- so a vector nobody recomputes is
+    the only thing that can catch a shared mistake.
+
+    If a change to the envelope or the canonicalizer fails this test, that is
+    the test working: the digest is a wire contract, and moving it means
+    already-minted credentials no longer match. Move the scheme version with
+    it, do not edit the constant to match the new output.
+    """
+
+    #: GET with a query, because the query decoder is the subtle half, and no
+    #: body, because a null body is distinguishable from {} in the digest.
+    VECTOR = dict(
+        instance="instance-1",
+        method="GET",
+        operation_id="layers.values",
+        path_template="/api/layers/{layerKey}/values",
+        path="/api/layers/roads/values",
+        query="field=name&limit=10",
+        body=None,
+        resolved_defaults=None,
+        confirmation_fields=None,
+        revision_binding=None,
+    )
+    EXPECTED = (
+        "mapp-jcs-v1:"
+        "8d6e7d1699c903b06892e5c499350a241c7505a2bd1cf629162a79f439fd6c4e"
+    )
+
+    def test_the_pinned_vector_still_digests_to_its_recorded_value(self) -> None:
+        self.assertEqual(self.EXPECTED, envelope.digest(**self.VECTOR))
+
+    def test_the_vector_envelope_has_all_twelve_members(self) -> None:
+        self.assertEqual(12, len(envelope.build(**self.VECTOR)))
+
+
+class QueryPlusDecodingTests(unittest.TestCase):
+    """`+` means a space in a query and a literal plus in a path.
+
+    Nothing recorded this and nothing tested it, and it is the likeliest way a
+    second implementation of this envelope disagrees with the first. The query
+    decoder is ``urllib.parse.parse_qsl``, which is unquote_*plus*; the path
+    decoder is not. A reimplementation written from the phrase "percent-decoded
+    exactly once" produces a literal plus for the query, disagrees on every
+    value containing one, and the only symptom is a blanket 403 with no
+    diagnostic.
+
+    Pinned rather than fixed: changing the rule would move every digest for
+    every request carrying a `+`, and the two sides agree today. This says what
+    the rule *is* so the next implementation can match it.
+    """
+
+    def test_a_plus_in_a_query_value_decodes_to_a_space(self) -> None:
+        self.assertEqual([["f", "a b"]], envelope.query_pairs("f=a+b"))
+
+    def test_an_encoded_plus_in_a_query_value_decodes_to_a_plus(self) -> None:
+        self.assertEqual([["f", "a+b"]], envelope.query_pairs("f=a%2Bb"))
+
+    def test_a_plus_in_a_path_segment_stays_a_plus(self) -> None:
+        """The asymmetry itself: the same byte, two rules, one envelope."""
+        self.assertEqual(
+            {"layerKey": "a+b"},
+            envelope.path_parameters(
+                "/api/layers/{layerKey}/values", "/api/layers/a+b/values"
+            ),
+        )
+
+    def test_the_two_spellings_do_not_share_a_digest(self) -> None:
+        """Because they are different requests, and the binding must say so."""
+        self.assertNotEqual(digest(query="f=a+b"), digest(query="f=a%2Bb"))
 
 
 if __name__ == "__main__":

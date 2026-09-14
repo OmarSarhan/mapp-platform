@@ -181,6 +181,9 @@ class BindingTests(TokenBTestCase):
             path="/api/proposals/p1/apply",
             query="",
             body={"approved": True},
+            resolved_defaults=None,
+            confirmation_fields=None,
+            revision_binding=None,
         )
         self.assertEqual(
             [("mapp_b_credential", "proposals.apply", expected)],
@@ -203,6 +206,9 @@ class BindingTests(TokenBTestCase):
             path="/api/layers/roads/values",
             query="field=name&limit=10",
             body=None,
+            resolved_defaults=None,
+            confirmation_fields=None,
+            revision_binding=None,
         )
         self.assertEqual(expected, self.tokens.redeemed[0][2])
 
@@ -594,6 +600,8 @@ class RealComponentLoopTests(unittest.TestCase):
             instance=INSTANCE, method="POST", operation_id="proposals.apply",
             path_template="/api/proposals/{proposalId}/apply", path=path,
             query="", body={"approved": True} if body is None else body,
+            resolved_defaults=None, confirmation_fields=None,
+            revision_binding=None,
         )
 
     def test_introspection_resolves_the_grant_over_http(self) -> None:

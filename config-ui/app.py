@@ -6473,6 +6473,13 @@ class Handler(SimpleHTTPRequestHandler):
                 path=parsed.path,
                 query=parsed.query,
                 body=body,
+                # Null until the curated manifest and the approval flow supply
+                # them. Passed explicitly because build() requires them: the
+                # day either exists, this call site is where the value has to
+                # arrive, and a default would let it be forgotten silently.
+                resolved_defaults=None,
+                confirmation_fields=None,
+                revision_binding=None,
             )
         except (
             canonical.CanonicalizationError,

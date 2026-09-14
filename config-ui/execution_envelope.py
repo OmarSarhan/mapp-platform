@@ -153,6 +153,9 @@ def build(
     path: str,
     query: str,
     body: Any,
+    resolved_defaults: Any,
+    confirmation_fields: Any,
+    revision_binding: Any,
     repeatable_query: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Assemble the envelope. Every member is required; none defaults silently.
@@ -162,6 +165,25 @@ def build(
     outside the I-JSON domain on the way in, at this trust boundary, before a
     normal parser can collapse them. ``None`` means the request had no body at
     all, which the digest distinguishes from a body of ``{}``.
+
+    The last three members carry ``None`` everywhere today, and they are
+    keyword-only *required* arguments rather than defaulting to it. P10 is
+    explicit that "the envelope is the twelve-member definition normative in
+    section 7, not a shorter restatement", because dropping resolved defaults
+    or confirmation fields "would let two materially different requests share
+    one digest". This module built nine and so had exactly that weakness.
+
+    Their values come from the curated manifest and the approval flow, neither
+    of which exists yet, and section 7 says the binding field then "carries its
+    action-specific preflight value or an explicit null". An explicit null is
+    not the same as an absent member: the member is in the digest now, so the
+    day a manifest supplies a value it changes the digest rather than the
+    envelope's shape. Requiring the argument is what makes that wiring a
+    visible edit at every call site instead of a default nobody notices.
+
+    The scheme version does not move for this. ``mapp-jcs-v1`` always denoted
+    the twelve-member envelope; nine was the implementation falling short of
+    it, not an earlier version of it.
     """
     if method != method.upper():
         raise EnvelopeError("Method must be upper case.")
@@ -179,6 +201,11 @@ def build(
         "path": path,
         "query": query_pairs(query, repeatable=repeatable_query),
         "body": body,
+        # The three P10 members that were missing. Present with an explicit
+        # null rather than omitted -- see the docstring.
+        "resolvedDefaults": resolved_defaults,
+        "confirmationFields": confirmation_fields,
+        "revisionBinding": revision_binding,
     }
 
 

@@ -338,8 +338,9 @@ sees the downstream request, so it cannot recompute anything. The
 configuration API rebuilds the canonical `mapp-jcs-v1` envelope from the
 request in front of it — version, target instance, upper-case method,
 operation id, manifest path template, typed path parameters, normalized path,
-ordered query pairs and the exact body — digests that, and presents the result
-to `/internal/oauth/redeem`. For a mutating operation the redemption consumes
+ordered query pairs, the exact body, resolved defaults, server-generated
+confirmation fields and the revision or preflight binding — digests that, and
+presents the result to `/internal/oauth/redeem`. For a mutating operation the redemption consumes
 the token in one conditional statement, with the operation and digest as
 predicates, so two presentations cannot both proceed.
 
@@ -357,6 +358,28 @@ accident:
 - **The credential is not a member of the envelope.** A token cannot be an
   input to the digest that authorises it, so the `Authorization` header, CSRF
   values and trace headers are excluded by construction.
+- **All twelve members are present even when three of them are null.** Resolved
+  defaults, confirmation fields and the revision binding have no source until
+  the curated manifest and the approval flow exist. They carry an explicit
+  null rather than being omitted, because an absent member and a null member
+  digest differently: the day a value arrives it changes the digest, not the
+  envelope's shape. The builder requires them as arguments so that wiring is a
+  visible edit at each call site rather than a default nobody notices.
+
+**One digest is written down.** `GoldenVectorTests` pins a fixed envelope to a
+literal digest. Every other test here is differential — it computes two digests
+and compares them — which proves the envelope reacts to a change but not that
+it produces the right value, and two implementations wrong in the same way
+agree perfectly. A failure there is the test working: the digest is a wire
+contract, so move the scheme version rather than the constant.
+
+**`+` is a space in a query and a plus in a path.** The query decoder is
+`parse_qsl`, which is unquote_*plus*; the path decoder is not. Nothing recorded
+this and nothing tested it, and it is the likeliest way a second implementation
+disagrees with the first — written from "percent-decoded exactly once" it
+yields a literal plus, disagrees on every value containing one, and the only
+symptom is a blanket 403 with no diagnostic. `QueryPlusDecodingTests` pins the
+rule as it is rather than changing it.
 
 The canonicalizer is vendored into both components rather than shared, because
 they ship as separate images with no shared package. Each copy is verified
