@@ -257,7 +257,9 @@ class ComposeIsolationTests(unittest.TestCase):
                     for name, service in services.items()
                     if "mcp-control" in service.get("networks", {})
                 }
-                self.assertEqual({"config-ui", "mcp-auth"}, control_members)
+                self.assertEqual(
+                    {"config-ui", "mcp-auth", "mapp-mcp"}, control_members
+                )
 
     def test_the_authorization_component_waits_for_its_database(self) -> None:
         """Its credentials live in the control schema, so it cannot start first.

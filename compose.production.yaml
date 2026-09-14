@@ -29,3 +29,12 @@ services:
       # needs no escape hatch. Leaving it set in production would accept a
       # plain-http issuer.
       AUTHLIB_INSECURE_TRANSPORT: ""
+
+  mapp-mcp:
+    environment:
+      # The same origin the authorization component issues for, and the same
+      # one it names as the resource. If these three ever disagreed a client
+      # would discover one identity and be handed a token for another, which
+      # presents as an audience refusal with nothing to say where it came from.
+      MCP_SITE: ${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}
+      MCP_ISSUER: ${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}

@@ -146,6 +146,57 @@ services:
     # bundled-db overlay is what supplies `db`; in the external-PostgreSQL
     # model there is no such service and the health check is the only gate.
 
+  mapp-mcp:
+    image: mapp-mcp:local
+    build:
+      context: ./mapp-mcp
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      # The origin it serves, and the issuer it compares. Separate values
+      # because the issuer is never fetched from here: this service sits on an
+      # internal-only network where the public origin does not resolve, so a
+      # runtime that tried to read issuer metadata would hang until its timeout.
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
+      # Every live call goes here instead: the authorization component's control
+      # listener, which is reachable on mcp-control and nowhere else.
+      MCP_AUTH_URL: http://mcp-auth:8080
+      MCP_RUNTIME_SOCKET: /run/mapp-mcp/mapp-mcp.sock
+      # Registered by `./bin/mapp mcp-runtime-register`, which mints it and
+      # stores only its digest. This is the one service that holds the
+      # plaintext, and a test pins that it reaches no other.
+      MAPP_MCP_CLIENT_SECRET: ${MAPP_MCP_CLIENT_SECRET:-}
+    volumes:
+      # The only shared mount, and the same shape mcp-auth uses: the runtime
+      # directory holding the edge socket. No database credential, no workspace,
+      # no control state, no Docker socket.
+      - ./var/mapp-mcp:/run/mapp-mcp
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import http.client, os, socket; c = http.client.HTTPConnection('localhost'); c.sock = socket.socket(socket.AF_UNIX); c.sock.settimeout(2); c.sock.connect(os.environ['MCP_RUNTIME_SOCKET']); c.request('GET', '/.well-known/oauth-protected-resource/mcp'); raise SystemExit(0 if c.getresponse().status == 200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      # mcp-control alone. It needs the authorization component and nothing
+      # else -- no database, because it holds no credential for one and reaches
+      # platform state only through authenticated API calls, and no edge,
+      # because its public surface is the Unix socket Caddy proxies.
+      - mcp-control
+    depends_on:
+      mcp-auth:
+        condition: service_healthy
+        restart: true
+
   config-ui:
     image: mapp-config-ui:local
     build:
@@ -245,6 +296,7 @@ services:
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./var/mcp-auth:/run/mapp-auth
+      - ./var/mapp-mcp:/run/mapp-mcp
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

@@ -219,6 +219,39 @@ registered agent's redirect URI on the operator's own machine, is bounded only
 by the scopes that agent was granted. P2's client acceptance matrix is 1 of 3,
 so nothing can be said about how Codex/OpenAI or Gemini behave.
 
+## Delta: a fourth peer on `mcp-control`
+
+The specification asks for a renewed transport threat model whenever another
+service joins that network. This is a recorded delta rather than a renewal, and
+saying which is the point: the original analysis is not re-derived here, so a
+reader should treat the two together rather than this alone.
+
+`mapp-mcp` joins, as P12 requires. What changes:
+
+- **One more peer can reach the control listener.** It authenticates as a
+  confidential client like config-ui, so the listener's admission rule is
+  unchanged; what grows is the number of processes holding a credential that
+  passes it. The credential is registered by an operator and stored as a digest,
+  so compromising the authorization component does not yield it and compromising
+  `mapp-mcp` yields only its own.
+- **It reaches nothing else.** No `backend`, so no database, and no `edge`. It
+  holds no database credential by design and reaches platform state only through
+  authenticated API calls, which is the constraint the whole topology rests on.
+- **Its public surface is a Unix socket**, mode 0660, in a directory shared with
+  Caddy alone. That is the same shape as the authorization component's edge
+  socket, and it is why `mapp-mcp` needs no edge network: nothing can reach it
+  from a network at all, so a misconfigured route cannot expose it.
+- **What it can do with its credential is bounded by what the listener offers**:
+  introspect a token A, and exchange one for a token B against an allowlisted
+  operation. It cannot mint a token A, revoke a grant belongs to the operator
+  surface, and the exchange refuses anything the presented grant does not
+  already carry.
+
+What this delta does **not** cover, and a renewal would: whether three peers on
+one internal network is still the right shape, or whether the control listener
+should distinguish its callers more finely than "a confidential client that
+authenticated". Both become worth asking if a fourth arrives.
+
 ## Attacker capabilities the design does not defend against
 
 Stated plainly, because a threat model that implies otherwise is misleading:
