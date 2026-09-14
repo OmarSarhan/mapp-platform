@@ -48,7 +48,7 @@ class McpOriginTests(unittest.TestCase):
     def setUp(self) -> None:
         self.block = site_block("{$MCP_SITE:http://mcp.localhost} {")
 
-    def test_exactly_four_public_paths_reach_the_socket(self) -> None:
+    def test_exactly_four_authorization_paths_reach_that_socket(self) -> None:
         matcher = re.search(r"@auth_public path ([^\n]+)", self.block)
         self.assertIsNotNone(matcher, "the public path allowlist is gone")
         self.assertEqual(
@@ -59,6 +59,42 @@ class McpOriginTests(unittest.TestCase):
                 "/oauth/login",
             ],
             matcher.group(1).split(),
+        )
+
+    def test_exactly_three_runtime_paths_reach_the_runtime_socket(self) -> None:
+        """The resource, and the two spellings of the document that names it.
+
+        Held to an exact list for the same reason the authorization set is: a
+        matcher that grew a path would publish a surface nobody reviewed, and
+        this origin's whole design is that everything not named here is a 404.
+        """
+        matcher = re.search(r"@mcp_public path ([^\n]+)", self.block)
+        self.assertIsNotNone(matcher, "the runtime path allowlist is gone")
+        self.assertEqual(
+            [
+                "/mcp",
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/oauth-protected-resource/mcp",
+            ],
+            matcher.group(1).split(),
+        )
+
+    def test_the_two_sockets_are_not_confused(self) -> None:
+        """Each allowlist reaches its own component.
+
+        Routing the RPC path to the authorization socket would answer 404 from
+        a component that does not serve it, which reads as "the runtime is
+        down" rather than "the edge is misrouted".
+        """
+        auth_handle = self.block.index("handle @auth_public")
+        mcp_handle = self.block.index("handle @mcp_public")
+        self.assertIn(
+            "unix//run/mapp-auth/mapp-auth.sock",
+            self.block[auth_handle:mcp_handle],
+        )
+        self.assertIn(
+            "unix//run/mapp-mcp/mapp-mcp.sock",
+            self.block[mcp_handle:self.block.index("handle {")],
         )
 
     def test_everything_else_on_this_origin_is_a_404(self) -> None:

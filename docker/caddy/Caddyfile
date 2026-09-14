@@ -76,6 +76,22 @@
 			header_up X-Forwarded-Host {host}
 		}
 	}
+	# The MCP resource itself, and the RFC 9728 metadata that names it. Both
+	# well-known spellings, because a client may derive either from the resource
+	# URL, and they serve the same document.
+	@mcp_public path /mcp /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp
+	handle @mcp_public {
+		reverse_proxy unix//run/mapp-mcp/mapp-mcp.sock {
+			# Same rule as the authorization socket above: over an exclusive
+			# Unix socket the only peer is Caddy, so a client-supplied
+			# forwarding header is indistinguishable from the real address.
+			header_up -Forwarded
+			header_up -X-Real-IP
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
 	handle {
 		header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
 		respond 404
