@@ -117,7 +117,7 @@ def rpc_result(text):
     return json.loads(text) if text.strip() else None
 
 
-def composed():
+def composed(scopes=SCOPES):
     """The shipped stack, with only the platform behind the tools replaced.
 
     The runtime is handed back alongside the composed application because the
@@ -134,7 +134,7 @@ def composed():
         issuer=ORIGIN,
         inner=runtime,
         introspection=StubIntrospection(
-            {TOKEN: active(scopes=SCOPES, audience=f"{ORIGIN}/mcp")}
+            {TOKEN: active(scopes=scopes, audience=f"{ORIGIN}/mcp")}
         ),
     )
     return app, runtime, exchange, config_api
@@ -272,6 +272,70 @@ MODERN_META = {
     "io.modelcontextprotocol/protocolVersion": era_guard.MODERN_VERSION,
     "io.modelcontextprotocol/clientCapabilities": {},
 }
+
+
+class ToolFailureVisibilityTests(unittest.TestCase):
+    """What the *client* is given when a tool refuses.
+
+    This is the test that was missing. Every other test of `layer_values` calls
+    the registered function and inspects the exception it raises, which is true
+    of the function and says nothing about what crosses the wire. The SDK puts a
+    `ToolError`'s text into the result and replaces everything else with "Error
+    executing tool layer_values" -- so the tool raised `ValueError`, every
+    carefully worded refusal was discarded, and the unit tests passed throughout
+    because they never went through the SDK.
+
+    Driving a real client against the deployed stack is what exposed it. These
+    assertions are on `result.content`, the only place the answer is real.
+    """
+
+    def call_with(self, scopes):
+        app, runtime, _, _ = composed(scopes=scopes)
+
+        async def session():
+            async with runtime.router.lifespan_context(runtime):
+                return await Session(app).request(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "layer_values",
+                            "arguments": {"layer_key": "L", "field": "f"},
+                        },
+                    },
+                    version=era_guard.HANDSHAKE_VERSION,
+                )
+
+        status, _, body = run(session())
+        self.assertEqual(200, status, body[:200])
+        result = rpc_result(body)["result"]
+        return result, " ".join(
+            part.get("text", "") for part in result.get("content", [])
+        )
+
+    def test_a_scope_refusal_reaches_the_client_with_its_text_intact(self) -> None:
+        """The message exists to be acted on, so it has to arrive."""
+        result, text = self.call_with("mcp:connect inspect")
+        self.assertTrue(result.get("isError"), "a refusal was reported as success")
+        # The SDK prefixes both kinds with "Error executing tool <name>". What
+        # separates them is what follows: a crash is that string and nothing
+        # else, an anticipated failure appends ": " and the real message. So the
+        # bare string is the exact signature of the bug.
+        self.assertNotEqual(
+            "Error executing tool layer_values",
+            text.strip(),
+            "the SDK discarded the message: the tool raised a type it calls a crash",
+        )
+        # The two things a caller needs: what is missing, and what to ask for.
+        self.assertIn("derive", text)
+        self.assertIn("semantic:inspect", text)
+        self.assertIn("Re-authorize", text)
+
+    def test_the_refusal_names_only_what_is_actually_missing(self) -> None:
+        _, text = self.call_with("mcp:connect inspect derive")
+        self.assertIn("semantic:inspect", text)
+        self.assertNotIn("does not carry derive", text)
 
 
 class ModernSessionTests(unittest.TestCase):

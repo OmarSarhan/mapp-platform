@@ -37,6 +37,7 @@ from config_api_client import layer_values_query
 from exchange_client import ExchangeRefused
 from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 
 #: Advertised to clients as the server's identity. Not a version of the
@@ -139,19 +140,31 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         Rebuilding it for the request would be two constructions of the same
         string and one chance for them to differ -- which surfaces as a refusal
         naming no cause.
+
+        Every anticipated failure is raised as ``ToolError``, and that choice is
+        load-bearing rather than stylistic. The SDK treats ``ToolError`` as "a
+        failure you saw coming" and puts its text in the result the model reads;
+        *any other exception* it treats as a crash, replacing the text with
+        "Error executing tool layer_values" and logging a traceback at ERROR.
+        These raises were ``ValueError`` and ``RuntimeError``, so every message
+        written here to be acted on -- which scope to ask for, which platform
+        code refused -- was discarded before it reached the caller, and routine
+        scope refusals were logged as crashes. Found by driving a real client
+        against the deployed stack; the unit tests called the tool function
+        directly and so agreed with the code while the property was false.
         """
         caller = CURRENT_CALLER.get()
         if caller is None:
             # Unreachable through the middleware, which refuses before
             # dispatch. Checked anyway, because the alternative if it ever
             # became reachable is an unauthenticated platform call.
-            raise ValueError("This tool requires an authenticated caller.")
+            raise ToolError("This tool requires an authenticated caller.")
         missing = [s for s in LAYER_VALUES["scopes"] if s not in caller.scopes]
         if missing:
             # Refused here rather than at the exchange, so the message names the
             # scopes to ask for. The broker would refuse it too, with an error
             # that says the scope exceeded the grant and not which scope.
-            raise ValueError(
+            raise ToolError(
                 "This grant does not carry "
                 + " and ".join(sorted(missing))
                 + ". Re-authorize requesting "
@@ -175,23 +188,23 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 scope=" ".join(LAYER_VALUES["scopes"]),
             )
         except ExchangeRefused as refusal:
-            raise ValueError(f"The platform refused this request: {refusal}") from None
+            raise ToolError(f"The platform refused this request: {refusal}") from None
         except ExchangeUnavailable:
             # Deliberately not the underlying text: it describes this
             # component's plumbing, and an agent cannot act on it.
-            raise RuntimeError(
+            raise ToolError(
                 "The authorization component is unavailable; try again."
             ) from None
 
         try:
             return config_api.get(path=path, query=query, token=token_b)
         except ConfigApiRefused as refusal:
-            raise ValueError(
+            raise ToolError(
                 f"The platform refused this request: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
             ) from None
         except ConfigApiUnavailable:
-            raise RuntimeError(
+            raise ToolError(
                 "The configuration API is unavailable; try again."
             ) from None
 

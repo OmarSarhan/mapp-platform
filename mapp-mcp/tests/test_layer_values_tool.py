@@ -22,6 +22,7 @@ from config_api_client import ConfigApiUnavailable  # noqa: E402
 from config_api_client import layer_values_query  # noqa: E402
 from exchange_client import ExchangeRefused  # noqa: E402
 from exchange_client import ExchangeUnavailable  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from protected_resource import ProtectedResource  # noqa: E402
 from runtime import build_runtime  # noqa: E402
 
@@ -91,7 +92,7 @@ class ScopeTests(ToolTestCase):
         exchange = FakeExchange()
         tool = self.build(exchange=exchange)
         self.as_caller(caller(scopes="mcp:connect inspect"))
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="Census_OA_Population", field="population_quintile")
         message = str(caught.exception)
         self.assertIn("derive", message)
@@ -101,7 +102,7 @@ class ScopeTests(ToolTestCase):
     def test_a_partial_grant_names_only_what_is_missing(self) -> None:
         tool = self.build()
         self.as_caller(caller(scopes="mcp:connect derive"))
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="L", field="f")
         self.assertIn("semantic:inspect", str(caught.exception))
         self.assertNotIn("does not carry derive", str(caught.exception))
@@ -111,7 +112,7 @@ class ScopeTests(ToolTestCase):
         if it ever became reachable is an unauthenticated platform call."""
         tool = self.build()
         self.as_caller(None)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ToolError):
             tool(layer_key="L", field="f")
 
 
@@ -185,19 +186,28 @@ class FailureReportingTests(ToolTestCase):
             exchange=FakeExchange(raises=ExchangeRefused("scope exceeds the grant"))
         )
         self.as_caller(caller())
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="L", field="f")
         self.assertIn("exceeds the grant", str(caught.exception))
 
     def test_an_outage_does_not_read_as_a_permissions_problem(self) -> None:
         """Telling an agent its scopes are wrong during an outage sends it to
-        re-authorize, which cannot help and costs the operator a sign-in."""
+        re-authorize, which cannot help and costs the operator a sign-in.
+
+        Asserted on what the message says rather than on its class. Both are
+        `ToolError` now -- that is what makes either message reach the model at
+        all -- so the distinction the caller acts on lives in the words, and a
+        test keyed on the type would pass for a message that said the wrong
+        thing.
+        """
         tool = self.build(exchange=FakeExchange(raises=ExchangeUnavailable("down")))
         self.as_caller(caller())
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="L", field="f")
-        self.assertNotIsInstance(caught.exception, ValueError)
-        self.assertIn("unavailable", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("unavailable", message)
+        for misleading in ("Re-authorize", "does not carry", "refused this request"):
+            self.assertNotIn(misleading, message)
 
     def test_a_binding_refusal_carries_the_platform_s_code(self) -> None:
         """auth.binding_refused is the one an operator needs to see: it means
@@ -210,16 +220,76 @@ class FailureReportingTests(ToolTestCase):
             )
         )
         self.as_caller(caller())
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="L", field="f")
         self.assertIn("auth.binding_refused", str(caught.exception))
 
     def test_an_unavailable_configuration_api_is_not_a_refusal_either(self) -> None:
         tool = self.build(config_api=FakeConfigApi(raises=ConfigApiUnavailable("down")))
         self.as_caller(caller())
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(ToolError) as caught:
             tool(layer_key="L", field="f")
-        self.assertNotIsInstance(caught.exception, ValueError)
+        message = str(caught.exception)
+        self.assertIn("unavailable", message)
+        self.assertNotIn("refused this request", message)
+
+
+class AnticipatedFailureTests(ToolTestCase):
+    """Every refusal must be the SDK's anticipated-failure type.
+
+    The SDK puts a `ToolError`'s text in the result the model reads and treats
+    every other exception as a crash -- replacing the message with "Error
+    executing tool layer_values" and logging a traceback at ERROR. So the class
+    of these exceptions is the whole reason any of the messages above exist.
+
+    `ValueError` is called out by name because that is what they were, and
+    because it is the reflex: it reads as the right exception for a bad
+    argument and is silently the wrong one here.
+    """
+
+    def failures(self):
+        return [
+            ("no caller", self.build(), None, dict(layer_key="L", field="f")),
+            ("missing scopes", self.build(), caller(scopes="mcp:connect"),
+             dict(layer_key="L", field="f")),
+            ("broker refusal",
+             self.build(exchange=FakeExchange(raises=ExchangeRefused("no"))),
+             caller(), dict(layer_key="L", field="f")),
+            ("broker outage",
+             self.build(exchange=FakeExchange(raises=ExchangeUnavailable("down"))),
+             caller(), dict(layer_key="L", field="f")),
+            ("platform refusal",
+             self.build(config_api=FakeConfigApi(
+                 raises=ConfigApiRefused("no", status=403, code="auth.binding_refused"))),
+             caller(), dict(layer_key="L", field="f")),
+            ("platform outage",
+             self.build(config_api=FakeConfigApi(raises=ConfigApiUnavailable("down"))),
+             caller(), dict(layer_key="L", field="f")),
+        ]
+
+    def test_no_failure_path_raises_a_type_the_sdk_would_call_a_crash(self) -> None:
+        for name, tool, who, kwargs in self.failures():
+            with self.subTest(failure=name):
+                self.as_caller(who)
+                with self.assertRaises(Exception) as caught:
+                    tool(**kwargs)
+                self.assertIsInstance(
+                    caught.exception,
+                    ToolError,
+                    f"{name} raises {type(caught.exception).__name__};"
+                    " the SDK discards its message and logs a crash",
+                )
+
+    def test_every_failure_says_something_a_caller_can_act_on(self) -> None:
+        """A message that survives is only worth surviving if it says what to do."""
+        for name, tool, who, kwargs in self.failures():
+            with self.subTest(failure=name):
+                self.as_caller(who)
+                with self.assertRaises(ToolError) as caught:
+                    tool(**kwargs)
+                message = str(caught.exception)
+                self.assertTrue(message.strip(), f"{name} raised an empty message")
+                self.assertNotIn("Error executing tool", message)
 
 
 if __name__ == "__main__":

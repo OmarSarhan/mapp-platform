@@ -191,6 +191,74 @@ Every era decision, verified on the wire through the edge:
 The three middle rows are the ones that matter: each is a revision the SDK
 behind the guard would have served.
 
+### The authenticated journey, driven by the real client
+
+Provisioned headlessly: a public client registered with
+`./bin/mapp mcp-client-register`, the administrator password set to a known
+value, then the authorization-code + PKCE flow driven with six HTTP calls
+(authorize -> login -> consent -> code -> token). Claude Code was given the
+resulting token A through `.mcp.json`'s `headers` key, which is the supported
+way to hand an HTTP MCP server a static credential and avoids depending on the
+undocumented shape of its OAuth credential store.
+
+| Step | Result |
+|---|---|
+| `claude mcp list` | `✔ Connected` |
+| `describe_instance` | `protocolVersions: ["2025-11-25","2026-07-28"]` |
+| `layer_values` on a queryable layer | 6,147 output areas across 5 quintiles |
+| `layer_values` with a narrow grant | refused, naming the scopes to request |
+| same call after scope step-up | succeeds |
+
+That is P2's release-gate journey for the Claude ecosystem, minus the approval
+and elicitation legs, which apply to mutating operations this surface does not
+expose.
+
+Two properties checked while a live credential existed:
+
+- **Audience separation holds.** A token A presented directly to the
+  configuration API is refused `401 auth.authentication_required`. Only an
+  exchange-minted token B, bound to one request, is spent there.
+- **Disabling a client cuts off new credentials immediately, and the residual
+  window is bounded.** `query_client` filters `disabled_at IS NULL`
+  (mcp-auth/sql_store.py:177), so after `./bin/mapp mcp-client-disable` a
+  refresh with an *unspent* refresh token is refused `400 invalid_client`. An
+  already-issued token A keeps working until it expires -- at most 15 minutes,
+  because introspection resolves the token record rather than the client. That
+  is ordinary OAuth behaviour and it is bounded, but it is worth stating
+  plainly: client disable is not instantaneous revocation of live access.
+
+  Measured carefully on the second attempt. The first run refreshed *before*
+  disabling, which rotated the token, so the refusal afterwards could equally
+  have been replay detection -- the two are indistinguishable from the status
+  code alone. Re-run with an unspent token against a disabled client, the
+  answer is `invalid_client`, which names the client rather than the grant.
+
+### The defect the live client found
+
+`layer_values` raised `ValueError` for every anticipated refusal -- a grant
+missing a scope, a broker refusal, a binding refusal -- and `RuntimeError` for
+unavailability. The SDK treats **only** `ToolError` as an anticipated failure
+and puts its text in the result the model reads; everything else is a crash,
+replaced with `Error executing tool layer_values` and logged at ERROR with a
+traceback.
+
+So every message written here to be acted on was discarded before reaching the
+caller, and routine scope refusals were logged as crashes. The agent saw four
+words and could do nothing with them.
+
+The unit tests passed throughout, because they call the registered function and
+assert on the exception it raises -- true of the function, and silent about what
+crosses the wire. This is the same shape as the handshake failure recorded
+above, and the same lesson: the assertion has to be made where the client reads
+the answer. `ToolFailureVisibilityTests` in `tests/test_legacy_session.py` is
+that assertion, and it discriminates on the exact signature of the bug -- the
+SDK prefixes both kinds with `Error executing tool <name>`, and only a crash
+stops there with nothing after it.
+
+After the fix, driven against the deployed stack, the client is told: *"This
+grant does not carry derive and semantic:inspect. Re-authorize requesting derive
+semantic:inspect to use this tool."* -- and acts on it.
+
 `tests/test_legacy_session.py` drives the whole sequence through the composed
 application -- guard, authentication, real SDK runtime, real tool registry --
 because the failure this section records was invisible to every per-layer test
