@@ -1,21 +1,39 @@
 """The protocol-era guard: outer ASGI middleware that runs before SDK dispatch.
 
-The official Python SDK's Streamable HTTP application serves both the modern and
-the legacy handshake eras and exposes no protocol-version allowlist, and
-``stateless_http`` changes only legacy session storage rather than disabling that
-era. So the allowlist has to live outside it, and it has to be able to answer
-without ever calling in.
+The official Python SDK's Streamable HTTP application serves both the modern
+per-request era and the legacy handshake era, and exposes no protocol-version
+allowlist. ``stateless_http`` changes only legacy session storage rather than
+disabling that era. So the allowlist has to live outside it, and it has to be
+able to answer without ever calling in.
 
-Four obligations, each separately testable:
+This server serves two revisions, and the second one is the reason the guard is
+more than a string comparison. Measured against the installed SDK, an
+``initialize`` is negotiated to *whatever the client offers* -- 2024-11-05 and
+2025-03-26 are accepted as readily as 2025-11-25, and an unrecognisable offer
+such as ``"zzz"`` is silently counter-offered 2025-11-25 rather than refused.
+Nothing in the SDK constrains the handshake to one revision. So admitting the
+handshake era without reading the offered version out of the body would not
+admit one legacy revision; it would admit every one the SDK has ever spoken.
 
-1. Admit only an exact ``MCP-Protocol-Version: 2026-07-28``.
+Five obligations, each separately testable:
+
+1. Admit only ``MCP-Protocol-Version`` values in :data:`SERVED_VERSIONS`.
 2. Report a *missing or malformed* header as a validation error and a *declared
-   older* revision as an unsupported-version error. These are different answers
-   to different questions, and fabricating a version error for a request that
-   named no version tells a client to go and fix something it never sent.
-3. Refuse ``initialize``: it is the legacy handshake, and in the modern era it is
-   simply not a method. That forces the guard to decode the body before dispatch.
-4. Never mint or echo ``Mcp-Session-Id``.
+   unserved* revision as an unsupported-version error. These are different
+   answers to different questions, and fabricating a version error for a request
+   that named no version tells a client to go and fix something it never sent.
+3. Admit ``initialize`` only as the handshake era, and only when the version it
+   offers in the body is exactly :data:`HANDSHAKE_VERSION`. Under the modern
+   revision ``initialize`` is not a method at all and is refused as one. That
+   forces the guard to decode the body before dispatch.
+4. Never mint or echo ``Mcp-Session-Id``. Serving the handshake era does not
+   relax this: with ``stateless_http`` the SDK completes a full legacy session
+   -- initialize, notification, list, call -- and mints no session identifier,
+   so the obligation survives the era being admitted rather than being traded
+   away for it.
+5. Admit a header-less request only when it is a lone handshake ``initialize``.
+   That request is the one place the revision cannot be in the header, because
+   it is what decides the revision; everything after it carries one.
 
 It must not touch the RFC 9728 metadata GET, which is unauthenticated and
 read-only by design, nor anything that is not a POST to the RPC path.
@@ -26,21 +44,37 @@ from __future__ import annotations
 import json
 from typing import Any
 
-#: The only revision this server speaks. Compared with ``==`` rather than a
-#: prefix or an ordering: "2026-07-28-beta" is not this revision, and a client
-#: that sends it has not agreed to this contract.
-PROTOCOL_VERSION = "2026-07-28"
+#: The per-request-envelope era: no handshake, a revision on every request.
+MODERN_VERSION = "2026-07-28"
+
+#: The one handshake revision admitted. Real clients still speak it -- Claude
+#: Code 2.1.272 offers it and nothing else -- so refusing it means refusing the
+#: ecosystem rather than holding a line. Exactly one, not "the newest legacy
+#: one": the SDK will negotiate anything offered, so the set of legacy
+#: revisions this server speaks is whatever is written here and nowhere else.
+HANDSHAKE_VERSION = "2025-11-25"
+
+#: Membership is tested with ``in`` against exact strings rather than a prefix
+#: or an ordering: "2026-07-28-beta" is not a revision this server speaks, and a
+#: client that sends it has not agreed to this contract.
+SERVED_VERSIONS = (HANDSHAKE_VERSION, MODERN_VERSION)
 
 VERSION_HEADER = b"mcp-protocol-version"
 SESSION_HEADER = b"mcp-session-id"
 
-#: JSON-RPC codes. The specification fixes the *distinction* between a
-#: validation failure and a version failure, not the numbers, so these are
-#: project choices -- named here so both sides of a test read the same constant
-#: rather than a literal that drifts.
+#: JSON-RPC codes. The first two are the JSON-RPC standard ones. The third is
+#: the code the MCP ecosystem uses -- it is ``mcp_types.UNSUPPORTED_PROTOCOL_-
+#: VERSION`` in the installed SDK, asserted against it by test. It was a
+#: project-chosen number until that constant was found, which meant this server
+#: answered a version complaint in a dialect no client could read.
+#:
+#: Restated here rather than imported, because this module is stdlib-only by
+#: design and importing the SDK for one integer would end that. The join is a
+#: test that asserts the two are equal; it is unconditional, because a suite
+#: that quietly stops running is worse than one that fails.
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
-UNSUPPORTED_PROTOCOL_VERSION = -32001
+UNSUPPORTED_PROTOCOL_VERSION = -32022
 
 #: Read ceiling for the body peek. Caddy already caps the MCP origin at 512KiB,
 #: but a guard that depends on the proxy in front of it is a guard that stops
@@ -68,35 +102,32 @@ class ProtocolEraGuard:
 
         headers = _headers(scope)
         declared = headers.get(VERSION_HEADER)
-        if declared is None or not declared.strip():
-            await _reject(
-                send,
-                INVALID_REQUEST,
-                "Missing MCP-Protocol-Version.",
-                reason="protocol-version-missing",
-            )
-            return
-        version = declared.decode("latin-1").strip()
-        if not _well_formed(version):
-            # Malformed is a validation fault, not a version fault: the value is
-            # not a revision at all, so there is no revision to call unsupported.
-            await _reject(
-                send,
-                INVALID_REQUEST,
-                "Malformed MCP-Protocol-Version.",
-                reason="protocol-version-malformed",
-            )
-            return
-        if version != PROTOCOL_VERSION:
-            await _reject(
-                send,
-                UNSUPPORTED_PROTOCOL_VERSION,
-                f"Unsupported MCP protocol version {version}.",
-                reason="unsupported-protocol-version",
-                supported=[PROTOCOL_VERSION],
-            )
-            return
-
+        version = None
+        if declared is not None and declared.strip():
+            version = declared.decode("latin-1").strip()
+            if not _well_formed(version):
+                # Malformed is a validation fault, not a version fault: the
+                # value is not a revision at all, so there is no revision to
+                # call unsupported.
+                await _reject(
+                    send,
+                    INVALID_REQUEST,
+                    "Malformed MCP-Protocol-Version.",
+                    reason="protocol-version-malformed",
+                )
+                return
+            if version not in SERVED_VERSIONS:
+                await _reject(
+                    send,
+                    UNSUPPORTED_PROTOCOL_VERSION,
+                    f"Unsupported MCP protocol version {version}.",
+                    reason="unsupported-protocol-version",
+                    supported=list(SERVED_VERSIONS),
+                )
+                return
+        # A declared revision that is served still does not settle the request:
+        # only the body says whether this is a handshake, and only the body
+        # carries the revision a handshake is actually asking for.
         body, replay = await _buffer(receive)
         if body is _TOO_LARGE:
             await _reject(
@@ -106,15 +137,51 @@ class ProtocolEraGuard:
                 reason="body-too-large",
             )
             return
-        if _is_initialize(body):
-            # The legacy handshake. Refused as a method rather than as a version
-            # so a client that sends it learns the method does not exist here,
-            # which is true: the modern era replaced it.
+        offered = _initialize_offer(body)
+
+        if offered is _BATCHED:
+            # The handshake is a single request by construction. Batched, it is
+            # either a mistake or an attempt to ride other calls in beside a
+            # request that has no declared revision of its own.
+            await _reject(
+                send,
+                METHOD_NOT_FOUND,
+                "initialize may not appear in a batch.",
+                reason="batched-initialize",
+            )
+            return
+        if offered is _NOT_INITIALIZE:
+            if version is None:
+                await _reject(
+                    send,
+                    INVALID_REQUEST,
+                    "Missing MCP-Protocol-Version.",
+                    reason="protocol-version-missing",
+                )
+                return
+        elif version == MODERN_VERSION:
+            # Refused as a method rather than as a version, because that is what
+            # it is: the modern revision replaced the handshake, so a client
+            # that declared the modern revision and then sent `initialize`
+            # contradicted itself, and the method genuinely does not exist.
             await _reject(
                 send,
                 METHOD_NOT_FOUND,
                 "initialize is not a method in this protocol revision.",
                 reason="legacy-initialize",
+            )
+            return
+        elif offered != HANDSHAKE_VERSION:
+            # The obligation the SDK does not discharge. Left to it, the offer
+            # is simply accepted -- any older revision verbatim, anything
+            # unrecognisable counter-offered the newest handshake revision --
+            # so this is the only place the legacy era is held to one revision.
+            await _reject(
+                send,
+                UNSUPPORTED_PROTOCOL_VERSION,
+                f"Unsupported MCP protocol version {offered}.",
+                reason="unsupported-protocol-version",
+                supported=list(SERVED_VERSIONS),
             )
             return
         await self._app(scope, replay, self._strip_session(send))
@@ -142,11 +209,24 @@ class ProtocolEraGuard:
         return guarded
 
 
-class _TooLarge:
-    pass
+class _Sentinel:
+    """Distinguishable from any value a request body could contain.
+
+    ``_NOT_INITIALIZE`` in particular cannot be ``None``: ``None`` is a real
+    answer, meaning an ``initialize`` that offered no revision, and conflating
+    the two would admit it.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return self._name
 
 
-_TOO_LARGE = _TooLarge()
+_TOO_LARGE = _Sentinel("<too large>")
+_NOT_INITIALIZE = _Sentinel("<not initialize>")
+_BATCHED = _Sentinel("<batched initialize>")
 
 
 def _headers(scope) -> dict[bytes, bytes]:
@@ -215,8 +295,15 @@ async def _buffer(receive):
     return body, replay
 
 
-def _is_initialize(body: bytes) -> bool:
-    """True when the payload calls ``initialize``, batch or not.
+def _initialize_offer(body: bytes):
+    """What revision this payload's ``initialize`` asks for, if it is one.
+
+    Three answers, because the caller has three things to do about them:
+    :data:`_NOT_INITIALIZE` for an ordinary request, :data:`_BATCHED` when
+    ``initialize`` appears inside a batch, and otherwise the offered revision as
+    written in ``params.protocolVersion`` -- ``None`` where the payload names no
+    revision at all, which is not a revision this server serves and is refused
+    as such.
 
     An undecodable body is not an initialize: it is the inner app's parse error
     to report, and swallowing it here would answer the wrong question.
@@ -224,12 +311,21 @@ def _is_initialize(body: bytes) -> bool:
     try:
         payload: Any = json.loads(body or b"null")
     except (ValueError, UnicodeDecodeError):
-        return False
-    candidates = payload if isinstance(payload, list) else [payload]
-    return any(
-        isinstance(item, dict) and item.get("method") == "initialize"
-        for item in candidates
-    )
+        return _NOT_INITIALIZE
+    if isinstance(payload, list):
+        return (
+            _BATCHED
+            if any(
+                isinstance(item, dict) and item.get("method") == "initialize"
+                for item in payload
+            )
+            else _NOT_INITIALIZE
+        )
+    if not isinstance(payload, dict) or payload.get("method") != "initialize":
+        return _NOT_INITIALIZE
+    params = payload.get("params")
+    offered = params.get("protocolVersion") if isinstance(params, dict) else None
+    return offered if isinstance(offered, str) else None
 
 
 async def _reject(send, code: int, message: str, *, reason: str, **extra) -> None:

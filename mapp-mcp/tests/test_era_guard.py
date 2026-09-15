@@ -1,9 +1,17 @@
-"""The four obligations of the protocol-era guard, one test class each.
+"""The obligations of the protocol-era guard, one test class each.
 
 The specification pre-emptively refuses the convenient proof: "enabling
 `stateless_http` is not accepted as evidence that the legacy era is disabled".
 So every assertion here is about what crosses the ASGI boundary, not about how
 the inner application was configured.
+
+That rule now cuts the other way too. This server serves the 2025-11-25
+handshake as well as the modern revision, and the reason the guard did not
+simply get shorter is measurable against the installed SDK: left to itself it
+negotiates an `initialize` to whatever the client offers -- 2024-11-05 verbatim,
+`"zzz"` counter-offered 2025-11-25 -- so the offered revision has to be read out
+of the body and checked here. `HandshakeAdmissionTests` is that control, and
+every refusal in it is a revision the SDK behind the guard would have served.
 """
 
 from __future__ import annotations
@@ -24,9 +32,17 @@ TOKEN = "mapp_a_test"
 #: runtime, so they carry a credential that resolves. Without one every "the
 #: runtime was reached" assertion would pass or fail on authentication instead.
 MODERN = {
-    "MCP-Protocol-Version": era_guard.PROTOCOL_VERSION,
+    "MCP-Protocol-Version": era_guard.MODERN_VERSION,
     "Authorization": f"Bearer {TOKEN}",
 }
+HANDSHAKE = {
+    "MCP-Protocol-Version": era_guard.HANDSHAKE_VERSION,
+    "Authorization": f"Bearer {TOKEN}",
+}
+#: A credential and no declared revision -- the shape of the one request that
+#: cannot carry one, and the shape every "reaches the runtime" assertion below
+#: needs, since the guard admitting a request only moves it on to authentication.
+UNVERSIONED = {"Authorization": f"Bearer {TOKEN}"}
 
 
 class Reached:
@@ -115,10 +131,25 @@ class VersionAdmissionTests(unittest.TestCase):
             era_guard.UNSUPPORTED_PROTOCOL_VERSION, response.json()["error"]["code"]
         )
         self.assertEqual("unsupported-protocol-version", response.reason)
-        # And it says what it does speak, so the client need not guess.
+        # And it says what it does speak, so the client need not guess. Both
+        # revisions: a client told only about the modern one cannot discover
+        # that the handshake it already speaks would have been accepted.
         self.assertEqual(
-            [era_guard.PROTOCOL_VERSION], response.json()["error"]["data"]["supported"]
+            list(era_guard.SERVED_VERSIONS),
+            response.json()["error"]["data"]["supported"],
         )
+        self.assertIn(era_guard.HANDSHAKE_VERSION, response.json()["error"]["data"]["supported"])
+
+    def test_the_code_is_the_one_the_ecosystem_uses(self) -> None:
+        """Not a project-chosen number, which is what it was.
+
+        A version complaint is only actionable if the client recognises it. The
+        SDK defines the constant; this module restates it because it is
+        stdlib-only by design, so this is the join that keeps the two in step.
+        """
+        from mcp_types import UNSUPPORTED_PROTOCOL_VERSION
+
+        self.assertEqual(UNSUPPORTED_PROTOCOL_VERSION, era_guard.UNSUPPORTED_PROTOCOL_VERSION)
 
     def test_the_two_faults_do_not_share_a_code(self) -> None:
         """If they did, the distinction above would be decorative."""
@@ -130,27 +161,181 @@ class VersionAdmissionTests(unittest.TestCase):
         self.assertNotEqual(missing, older)
 
 
+def initialize(offer=era_guard.HANDSHAKE_VERSION):
+    """A handshake request offering `offer`, or offering nothing when None."""
+    import json
+
+    params = {"capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}
+    if offer is not None:
+        params["protocolVersion"] = offer
+    return json.dumps(
+        {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": params}
+    ).encode()
+
+
 class LegacyInitializeTests(unittest.TestCase):
-    def test_initialize_never_reaches_the_runtime(self) -> None:
+    def test_initialize_under_the_modern_revision_is_not_a_method(self) -> None:
+        """A client that declared the modern revision and then sent the
+        handshake contradicted itself, and the method genuinely does not exist
+        there -- so it is refused as a method, not as a version."""
         app, inner, _ = guarded()
-        response = call(app, headers=MODERN, body=b'{"jsonrpc":"2.0","method":"initialize"}')
+        response = call(app, headers=MODERN, body=initialize())
         self.assertEqual(400, response.status)
         self.assertEqual("legacy-initialize", response.reason)
         self.assertEqual(era_guard.METHOD_NOT_FOUND, response.json()["error"]["code"])
         self.assertEqual(0, inner.calls)
 
-    def test_initialize_hidden_in_a_batch_is_still_refused(self) -> None:
-        """Otherwise the guard is bypassed by adding a bracket."""
-        app, inner, _ = guarded()
+    def test_initialize_hidden_in_a_batch_is_refused_whatever_the_header(self) -> None:
+        """Otherwise the guard is bypassed by adding a bracket.
+
+        Now that a header-less initialize is admitted, the bracket is worth more
+        than it was: a batch would carry other calls in beside a request that
+        declared no revision of its own.
+        """
         body = b'[{"method":"tools/list"},{"method":"initialize"}]'
-        self.assertEqual("legacy-initialize", call(app, headers=MODERN, body=body).reason)
-        self.assertEqual(0, inner.calls)
+        for headers in (MODERN, HANDSHAKE, {}):
+            with self.subTest(headers=headers):
+                app, inner, _ = guarded()
+                self.assertEqual("batched-initialize", call(app, headers=headers, body=body).reason)
+                self.assertEqual(0, inner.calls)
 
     def test_an_undecodable_body_is_not_treated_as_initialize(self) -> None:
         """A parse error belongs to the runtime; guessing here answers the wrong question."""
         app, inner, _ = guarded()
         self.assertEqual(200, call(app, headers=MODERN, body=b"not json").status)
         self.assertEqual(1, inner.calls)
+
+    def test_an_undecodable_body_without_a_header_is_still_missing_a_version(self) -> None:
+        """The header-less door is open only to a handshake, and an unparseable
+        body has not shown it is one."""
+        app, inner, _ = guarded()
+        response = call(app, body=b"not json")
+        self.assertEqual("protocol-version-missing", response.reason)
+        self.assertEqual(0, inner.calls)
+
+
+class HandshakeAdmissionTests(unittest.TestCase):
+    """The legacy era, held to exactly one revision.
+
+    Every refusal here is a revision the SDK behind this guard would have
+    served: measured against the installed version, an offer of 2024-11-05 is
+    negotiated verbatim and an offer of "zzz" is counter-offered 2025-11-25. So
+    these are not restatements of SDK behaviour -- they are the only thing
+    standing between "we serve 2025-11-25" and "we serve whatever is asked".
+    """
+
+    def test_a_header_less_handshake_reaches_the_runtime(self) -> None:
+        """The request a real client actually sends.
+
+        Claude Code 2.1.272 opens with `initialize` carrying no
+        MCP-Protocol-Version header at all -- there is nothing it could put
+        there, because this request is what decides the revision. Refusing it
+        for a missing header is what made this server unreachable.
+        """
+        app, inner, _ = guarded()
+        self.assertEqual(200, call(app, headers=UNVERSIONED, body=initialize()).status)
+        self.assertEqual(1, inner.calls)
+
+    def test_an_uncredentialed_handshake_is_a_401_not_a_protocol_error(self) -> None:
+        """How the client discovers where to authenticate.
+
+        A real client opens with an unauthenticated `initialize`, reads the
+        RFC 9728 pointer out of the 401, and comes back with a token. If the
+        guard answered this with a protocol complaint instead, the client would
+        be told to fix a revision when what it needs is to sign in.
+        """
+        app, _, _ = guarded()
+        response = call(app, body=initialize())
+        self.assertEqual(401, response.status)
+
+    def test_a_declared_handshake_reaches_the_runtime(self) -> None:
+        app, inner, _ = guarded()
+        self.assertEqual(200, call(app, headers=HANDSHAKE, body=initialize()).status)
+        self.assertEqual(1, inner.calls)
+
+    def test_ordinary_traffic_under_the_handshake_revision_is_served(self) -> None:
+        """Everything after the handshake does carry the header, and must pass."""
+        app, inner, _ = guarded()
+        body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+        self.assertEqual(200, call(app, headers=HANDSHAKE, body=body).status)
+        self.assertEqual(1, inner.calls)
+
+    def test_an_older_offer_is_refused_though_the_sdk_would_serve_it(self) -> None:
+        """The whole reason the guard reads the body.
+
+        These three are `HANDSHAKE_PROTOCOL_VERSIONS` minus the one admitted.
+        Left to the SDK each is negotiated verbatim, so without this check
+        "admit the handshake era" would have admitted four revisions.
+        """
+        for offer in ("2024-11-05", "2025-03-26", "2025-06-18"):
+            with self.subTest(offer=offer):
+                app, inner, _ = guarded()
+                response = call(app, headers=UNVERSIONED, body=initialize(offer))
+                # Status first: an admitted request answers 200 with no error
+                # object at all, and reaching into one that is not there reports
+                # a TypeError rather than "this revision was served".
+                self.assertEqual(400, response.status, f"{offer} was admitted")
+                self.assertEqual(
+                    era_guard.UNSUPPORTED_PROTOCOL_VERSION,
+                    response.json()["error"]["code"],
+                )
+                self.assertEqual("unsupported-protocol-version", response.reason)
+                self.assertIn(offer, response.json()["error"]["message"])
+                self.assertEqual(0, inner.calls)
+
+    def test_an_unrecognisable_offer_is_refused_rather_than_counter_offered(self) -> None:
+        """The SDK answers "zzz" with a 2025-11-25 counter-offer and carries on.
+
+        That is a server deciding, on a client's behalf, that a revision it
+        could not parse was close enough -- which is exactly the silent
+        widening the allowlist exists to prevent.
+        """
+        for offer in ("zzz", "1999-01-01", "2026-07-28-beta", ""):
+            with self.subTest(offer=offer):
+                app, inner, _ = guarded()
+                response = call(app, headers=UNVERSIONED, body=initialize(offer))
+                self.assertEqual(400, response.status, f"{offer!r} was admitted")
+                self.assertEqual("unsupported-protocol-version", response.reason)
+                self.assertEqual(0, inner.calls)
+
+    def test_a_handshake_offering_no_revision_is_refused(self) -> None:
+        """Absent is not the admitted revision, and must not read as one."""
+        app, inner, _ = guarded()
+        response = call(app, headers=UNVERSIONED, body=initialize(None))
+        self.assertEqual(400, response.status, "a handshake naming no revision was admitted")
+        self.assertEqual("unsupported-protocol-version", response.reason)
+        self.assertEqual(0, inner.calls)
+
+    def test_the_handshake_cannot_reach_the_modern_revision(self) -> None:
+        """The two eras are different protocols, not two numbers.
+
+        The SDK agrees -- an `initialize` offering 2026-07-28 is negotiated
+        *down* to 2025-11-25 -- but a client that asked for the modern revision
+        and was silently given the legacy one has been told nothing about it.
+        """
+        app, inner, _ = guarded()
+        response = call(app, headers=HANDSHAKE, body=initialize(era_guard.MODERN_VERSION))
+        self.assertEqual(400, response.status, "the modern revision was reached by handshake")
+        self.assertEqual("unsupported-protocol-version", response.reason)
+        self.assertEqual(0, inner.calls)
+
+    def test_a_header_less_request_that_is_not_a_handshake_is_still_refused(self) -> None:
+        """The door opened for `initialize` is not a door for everything else."""
+        app, inner, _ = guarded()
+        for body in (b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}', b"{}"):
+            with self.subTest(body=body):
+                response = call(app, body=body)
+                self.assertEqual("protocol-version-missing", response.reason)
+        self.assertEqual(0, inner.calls)
+
+    def test_a_malformed_header_is_not_rescued_by_a_valid_handshake(self) -> None:
+        """A client that sent a version header at all is held to it."""
+        app, inner, _ = guarded()
+        response = call(
+            app, headers={"MCP-Protocol-Version": "banana"}, body=initialize()
+        )
+        self.assertEqual("protocol-version-malformed", response.reason)
+        self.assertEqual(0, inner.calls)
 
 
 class SessionHeaderTests(unittest.TestCase):

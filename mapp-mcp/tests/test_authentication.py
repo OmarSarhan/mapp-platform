@@ -52,7 +52,7 @@ def stack(records=None, *, raises=None):
 
 
 def rpc(app, *, token=None, body=b"{}"):
-    headers = {"MCP-Protocol-Version": era_guard.PROTOCOL_VERSION}
+    headers = {"MCP-Protocol-Version": era_guard.MODERN_VERSION}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     return call(app, headers=headers, body=body)
@@ -72,7 +72,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(200, call(
             app,
             headers={
-                "MCP-Protocol-Version": era_guard.PROTOCOL_VERSION,
+                "MCP-Protocol-Version": era_guard.MODERN_VERSION,
                 "Authorization": f"bEaReR {TOKEN}",
             },
             body=b"{}",
@@ -172,7 +172,7 @@ class RefusalTests(unittest.TestCase):
                 response = call(
                     app,
                     headers={
-                        "MCP-Protocol-Version": era_guard.PROTOCOL_VERSION,
+                        "MCP-Protocol-Version": era_guard.MODERN_VERSION,
                         "Authorization": value,
                     },
                     body=b"{}",

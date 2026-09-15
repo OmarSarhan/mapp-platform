@@ -9,10 +9,12 @@ across revisions, whose failure mode is the worst kind -- passes curl, fails a
 real client.
 
 It is contained rather than trusted wholesale, and the containment is not
-theoretical. The SDK serves both the modern and legacy handshake eras and
-exposes no protocol-version allowlist, so ``era_guard`` runs in front of it and
-refuses the legacy era before dispatch. ``stateless_http`` changes only legacy
-session storage and is not accepted as evidence the era is off.
+theoretical. The SDK serves both the modern and legacy handshake eras, exposes
+no protocol-version allowlist, and negotiates a handshake to whatever revision
+the client offers -- so ``era_guard`` runs in front of it and holds the served
+set to the two revisions in ``era_guard.SERVED_VERSIONS``. ``stateless_http``
+changes only legacy session storage and is not accepted as evidence about which
+eras are served.
 
 Nothing here decides authorization. By the time a request arrives the caller has
 been resolved and its grant is on the ASGI scope, so a handler reads what the
@@ -26,6 +28,7 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
 
+import era_guard
 from authentication import CURRENT_CALLER
 from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
@@ -88,7 +91,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         description=(
             "The MAPP instance this server speaks for: its resource identity,"
             " the authorization server that issues credentials for it, and the"
-            " protocol revision in use."
+            " protocol revisions it serves."
         ),
     )
     def describe_instance() -> dict:
@@ -103,7 +106,11 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         return {
             "resource": resource.resource,
             "authorizationServer": resource.issuer,
-            "protocolVersion": "2026-07-28",
+            # Read from the guard rather than restated. A literal here was a
+            # single revision that stayed "2026-07-28" while a caller reached
+            # this tool over 2025-11-25 -- a server reporting an era it was not
+            # speaking to the very client asking.
+            "protocolVersions": list(era_guard.SERVED_VERSIONS),
             "runtime": f"{RUNTIME_NAME}/{RUNTIME_VERSION}",
         }
 
@@ -219,11 +226,16 @@ def build_runtime_app(*, resource, exchange=None, config_api=None):
     host = urlsplit(resource.origin).hostname or "localhost"
     return server.streamable_http_app(
         streamable_http_path=RPC_PATH,
-        # No session state, because this server can never have any: the era
-        # guard refuses `initialize` and strips `Mcp-Session-Id`, so the SDK
-        # would wait for a session that cannot be established and return
-        # without answering at all -- "ASGI callable returned without starting
-        # response", which says nothing about why.
+        # No session state. Under the handshake era the SDK would otherwise
+        # mint and require `Mcp-Session-Id`, which the guard strips -- the
+        # client would send back a session the server had been told to forget,
+        # and every request after initialize would be refused.
+        #
+        # Measured, not assumed: with this on, a full legacy session --
+        # initialize, notifications/initialized, tools/list, tools/call --
+        # completes and no session identifier is ever emitted. That is what
+        # lets the legacy era be served without giving up the no-session
+        # obligation.
         #
         # This is a consequence of the era decision, not the control that
         # enforces it. The specification is explicit that enabling it "is not
