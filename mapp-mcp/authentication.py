@@ -21,6 +21,7 @@ something to repair rather than something to obtain.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 
 from introspection_client import IntrospectionUnavailable
@@ -28,6 +29,21 @@ from introspection_client import IntrospectionUnavailable
 #: What a client must hold merely to open a session. Anything a tool needs is
 #: checked per tool, against the grant, later.
 CONNECT_SCOPE = "mcp:connect"
+
+#: The caller a handler is serving, for the duration of one request.
+#:
+#: A contextvar rather than the ASGI scope, because the SDK owns everything
+#: between this middleware and a tool and offers no way through it. Verified
+#: empirically to survive the SDK's task boundaries rather than assumed -- a
+#: tool that silently saw None would fall back to "no credential" and report a
+#: permissions problem during what is actually a plumbing one.
+#:
+#: Reading the Authorization header again inside the tool was the alternative,
+#: and it would re-derive trust this middleware has already established, and
+#: still not carry the resolved scopes.
+CURRENT_CALLER: contextvars.ContextVar = contextvars.ContextVar(
+    "mapp_mcp_caller", default=None
+)
 
 
 class Authenticated:
@@ -141,6 +157,10 @@ class BearerAuthentication:
 
         scope = dict(scope)
         scope["mapp.caller"] = caller
+        # Set per request. Nothing resets it afterwards on purpose: each request
+        # runs in its own context, so a value from another one cannot be read
+        # here, and clearing it would only matter if that were false.
+        CURRENT_CALLER.set(caller)
         await self._app(scope, receive, send)
 
     async def _refuse(self, send, status, message, *, error="", scope="") -> None:

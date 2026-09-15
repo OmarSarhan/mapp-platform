@@ -94,6 +94,38 @@ class CredentialCarriageTests(unittest.TestCase):
         rpc(app, token=TOKEN)
         self.assertEqual(TOKEN, inner.caller.token)
 
+    def test_the_caller_is_published_where_a_tool_can_read_it(self) -> None:
+        """The middleware sets a contextvar; a tool is the only thing that reads it.
+
+        Removing the set survived mutation until this existed, because the tool
+        tests set it themselves -- which is right for testing a tool and leaves
+        the publishing untested. In production every tool would then refuse
+        with "requires an authenticated caller" on a request that was properly
+        authenticated, and the suite would stay green.
+        """
+        from authentication import CURRENT_CALLER
+
+        seen = {}
+
+        class Reader:
+            async def __call__(self, scope, receive, send):
+                seen["caller"] = CURRENT_CALLER.get()
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-length", b"0")],
+                })
+                await send({"type": "http.response.body", "body": b""})
+
+        app, resource = build_app(
+            origin=ORIGIN, issuer=ORIGIN, inner=Reader(),
+            introspection=StubIntrospection({TOKEN: active()}),
+        )
+        rpc(app, token=TOKEN)
+        self.assertIsNotNone(seen["caller"], "nothing published the caller")
+        self.assertEqual("oauth:test-grant", seen["caller"].grant_id)
+        self.assertEqual(TOKEN, seen["caller"].token)
+
     def test_the_credential_is_not_in_the_repr(self) -> None:
         """Because this object lands in tracebacks and in anything logging scope.
 

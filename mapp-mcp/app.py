@@ -51,9 +51,32 @@ def build_app(
         # tests run without the SDK installed. Importing it at the top would
         # make 28 packages a prerequisite for testing code that does not use
         # them.
+        from config_api_client import ConfigApiClient
+        from exchange_client import ExchangeClient
         from runtime import build_runtime_app
 
-        runtime = build_runtime_app(resource=resource)
+        config_api_endpoint = os.environ.get(
+            "MCP_CONFIG_API_URL", "http://config-ui:8080"
+        )
+        runtime = build_runtime_app(
+            resource=resource,
+            exchange=ExchangeClient(
+                broker_endpoint=os.environ.get(
+                    "MCP_AUTH_URL", "http://mcp-auth:8080"
+                ),
+                config_api_endpoint=config_api_endpoint,
+                # What a token B is for. Must differ from this server's own
+                # resource, or a token A and a token B would share an audience
+                # and the separation the design rests on would be gone.
+                config_api_resource=os.environ.get(
+                    "MCP_CONFIG_API_RESOURCE",
+                    "http://config.localhost/api",
+                ),
+                client_id=os.environ.get("MAPP_MCP_CLIENT_ID", "mapp-mcp"),
+                client_secret=os.environ.get("MAPP_MCP_CLIENT_SECRET", ""),
+            ),
+            config_api=ConfigApiClient(endpoint=config_api_endpoint),
+        )
     if introspection is None:
         introspection = IntrospectionClient(
             os.environ.get("MCP_AUTH_URL", "http://mcp-auth:8080"),

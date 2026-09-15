@@ -164,6 +164,15 @@ services:
       # listener, which is reachable on mcp-control and nowhere else.
       MCP_AUTH_URL: http://mcp-auth:8080
       MCP_RUNTIME_SOCKET: /run/mapp-mcp/mapp-mcp.sock
+      # The configuration API, reached over the control link. Used for two
+      # things: its unauthenticated identity document, which is where the
+      # instance the digest binds to comes from, and the request a token B is
+      # spent on.
+      MCP_CONFIG_API_URL: http://config-ui:8080
+      # What a token B is *for*. Must differ from MCP_SITE's resource, or a
+      # token A and a token B would share an audience and either could be
+      # presented where the other belongs.
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
       # Registered by `./bin/mapp mcp-runtime-register`, which mints it and
       # stores only its digest. This is the one service that holds the
       # plaintext, and a test pins that it reaches no other.

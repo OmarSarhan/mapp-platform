@@ -23,8 +23,16 @@ check would find nothing to check with.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 from urllib.parse import urlsplit
 
+from authentication import CURRENT_CALLER
+from config_api_client import ConfigApiClient
+from config_api_client import ConfigApiRefused
+from config_api_client import ConfigApiUnavailable
+from config_api_client import layer_values_query
+from exchange_client import ExchangeRefused
+from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -43,11 +51,27 @@ INSPECT_SCOPE = "inspect"
 RPC_PATH = "/mcp"
 
 
-def build_runtime(*, resource) -> Any:
+#: The operation this tool acts through, as the broker's allowlist names it.
+#: Not a vendored copy of that table: one tool, one operation, and a fourth copy
+#: of the allowlist would be a fourth thing to keep in step.
+LAYER_VALUES = {
+    "operation_id": "layers.values",
+    "method": "GET",
+    "path_template": "/api/layers/{layerKey}/values",
+    # The action declares `derive` and additionally needs `semantic:inspect` to
+    # read the field it aggregates over. Neither is advertised in discovery, so
+    # a client holding only the bootstrap scopes has to ask for them.
+    "scopes": ("derive", "semantic:inspect"),
+}
+
+
+def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     """The SDK application, with the read-only surface registered.
 
     `resource` is the protected-resource description, so the runtime can report
     the identity a client discovered rather than composing a second one.
+    `exchange` and `config_api` are injected so the tools can be driven without
+    a broker or a platform behind them.
     """
     server = MCPServer(
         name=RUNTIME_NAME,
@@ -83,10 +107,91 @@ def build_runtime(*, resource) -> Any:
             "runtime": f"{RUNTIME_NAME}/{RUNTIME_VERSION}",
         }
 
+    @server.tool(
+        name="layer_values",
+        description=(
+            "Bounded category counts for one field of one configured layer."
+            " Returns aggregate counts from the layer's effective restrictions,"
+            " never raw rows."
+        ),
+    )
+    def layer_values(
+        layer_key: str,
+        field: str,
+        locale: str | None = None,
+        limit: int | None = None,
+    ) -> dict:
+        """One read, through the full binding.
+
+        The credential this obtains authorises exactly this request and no
+        other: the path and query are digested at exchange time and sent
+        unchanged, and the configuration API recomputes the digest from what
+        actually arrives before it will spend the credential.
+
+        The query is built once, here, by the helper that also fixes its order.
+        Rebuilding it for the request would be two constructions of the same
+        string and one chance for them to differ -- which surfaces as a refusal
+        naming no cause.
+        """
+        caller = CURRENT_CALLER.get()
+        if caller is None:
+            # Unreachable through the middleware, which refuses before
+            # dispatch. Checked anyway, because the alternative if it ever
+            # became reachable is an unauthenticated platform call.
+            raise ValueError("This tool requires an authenticated caller.")
+        missing = [s for s in LAYER_VALUES["scopes"] if s not in caller.scopes]
+        if missing:
+            # Refused here rather than at the exchange, so the message names the
+            # scopes to ask for. The broker would refuse it too, with an error
+            # that says the scope exceeded the grant and not which scope.
+            raise ValueError(
+                "This grant does not carry "
+                + " and ".join(sorted(missing))
+                + ". Re-authorize requesting "
+                + " ".join(LAYER_VALUES["scopes"])
+                + " to use this tool."
+            )
+
+        path = LAYER_VALUES["path_template"].replace(
+            "{layerKey}", quote(layer_key, safe="")
+        )
+        query = layer_values_query(field=field, locale=locale, limit=limit)
+        try:
+            token_b = exchange.exchange(
+                subject_token=caller.token,
+                operation_id=LAYER_VALUES["operation_id"],
+                method=LAYER_VALUES["method"],
+                path_template=LAYER_VALUES["path_template"],
+                path=path,
+                query=query,
+                body=None,
+                scope=" ".join(LAYER_VALUES["scopes"]),
+            )
+        except ExchangeRefused as refusal:
+            raise ValueError(f"The platform refused this request: {refusal}") from None
+        except ExchangeUnavailable:
+            # Deliberately not the underlying text: it describes this
+            # component's plumbing, and an agent cannot act on it.
+            raise RuntimeError(
+                "The authorization component is unavailable; try again."
+            ) from None
+
+        try:
+            return config_api.get(path=path, query=query, token=token_b)
+        except ConfigApiRefused as refusal:
+            raise ValueError(
+                f"The platform refused this request: {refusal}"
+                + (f" ({refusal.code})" if refusal.code else "")
+            ) from None
+        except ConfigApiUnavailable:
+            raise RuntimeError(
+                "The configuration API is unavailable; try again."
+            ) from None
+
     return server
 
 
-def build_runtime_app(*, resource):
+def build_runtime_app(*, resource, exchange=None, config_api=None):
     """The ASGI application the guard wraps.
 
     Mounted at the path the request actually carries. Nothing strips it on the
@@ -98,7 +203,9 @@ def build_runtime_app(*, resource):
     ``RPC_PATH`` is shared with the guard for that reason: two places deciding
     what the RPC path is means one of them is eventually wrong.
     """
-    server = build_runtime(resource=resource)
+    server = build_runtime(
+        resource=resource, exchange=exchange, config_api=config_api
+    )
     # DNS-rebinding protection, pointed at the origin this server actually
     # serves. It is on by default and defaults to 127.0.0.1, which is why an
     # otherwise correct request through the edge answers 421 "Invalid Host
