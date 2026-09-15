@@ -350,3 +350,73 @@ class EmptyRegistryTests(RegistryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistryAuditTests(RegistryTestCase):
+    """Deciding which agent may ask for consent is an authorization decision.
+
+    It was unaudited while registration was an operator command, which was
+    already a gap and becomes a larger one now the dashboard can do it: an
+    administrator issuing a client leaves a record, or nobody can answer "who
+    let this agent in, and when".
+    """
+
+    def events(self, name: str) -> list[dict]:
+        return [event for event in self.store.audit_tail() if event["event"] == name]
+
+    def test_registering_records_who_did_it_and_what_was_granted(self) -> None:
+        client_id = self.store.register_oauth_client(
+            name="Claude Code",
+            redirect_uris=["https://a.example/cb"],
+            scopes=["mcp:connect", "inspect"],
+            actor="admin",
+        )
+        (event,) = self.events("oauth.client_registered")
+        self.assertEqual("admin", event["actor"])
+        self.assertEqual(client_id, event["details"]["clientId"])
+        self.assertEqual("Claude Code", event["details"]["name"])
+        self.assertEqual(["mcp:connect", "inspect"], event["details"]["scopes"])
+        self.assertEqual(["https://a.example/cb"], event["details"]["redirectUris"])
+
+    def test_the_command_line_and_the_dashboard_are_distinguishable(self) -> None:
+        """Both register clients. An audit log that called them the same thing
+        could not answer which surface was used."""
+        self.store.register_oauth_client(
+            name="From the CLI", redirect_uris=["https://a.example/cb"], scopes=["inspect"]
+        )
+        self.store.register_oauth_client(
+            name="From the dashboard", redirect_uris=["https://b.example/cb"],
+            scopes=["inspect"], actor="admin",
+        )
+        self.assertEqual(
+            ["local-admin", "admin"],
+            [event["actor"] for event in self.events("oauth.client_registered")],
+        )
+
+    def test_disabling_is_recorded_only_when_it_actually_disabled(self) -> None:
+        """A second call changes nothing, and recording it would show a
+        withdrawal that did not happen."""
+        client_id = self.store.register_oauth_client(
+            name="Agent", redirect_uris=["https://a.example/cb"], scopes=["inspect"],
+        )
+        self.assertTrue(self.store.disable_oauth_client(client_id, actor="admin"))
+        self.assertFalse(self.store.disable_oauth_client(client_id, actor="admin"))
+        (event,) = self.events("oauth.client_disabled")
+        self.assertEqual("admin", event["actor"])
+        self.assertEqual(client_id, event["details"]["clientId"])
+
+    def test_an_unknown_client_records_nothing(self) -> None:
+        self.assertFalse(self.store.disable_oauth_client("mcp-nosuch", actor="admin"))
+        self.assertEqual([], self.events("oauth.client_disabled"))
+
+    def test_the_entry_carries_no_credential(self) -> None:
+        """There is none to carry -- a public client has no secret -- and the
+        assertion is here so that stays true if one is ever added."""
+        self.store.register_oauth_client(
+            name="Agent", redirect_uris=["https://a.example/cb"], scopes=["inspect"],
+            actor="admin",
+        )
+        (event,) = self.events("oauth.client_registered")
+        serialized = str(event).lower()
+        for forbidden in ("secret", "password", "token", "hash"):
+            self.assertNotIn(forbidden, serialized)

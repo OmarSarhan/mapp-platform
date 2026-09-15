@@ -234,6 +234,10 @@ services:
       # the two would disagree about which audience this service accepts and
       # every exchanged token would be refused here.
       MCP_AUTH_URL: ${MCP_AUTH_URL:-http://mcp-auth:8080}
+      # Read only to compose the connection details the dashboard hands an
+      # operator for an agent client. Never fetched from here: this service has
+      # no route to the public origin.
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
       MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
       MCP_AUTH_CLIENT_ID: ${MCP_AUTH_CLIENT_ID:-mapp-config-api}
       MCP_AUTH_CLIENT_SECRET: ${MCP_AUTH_CLIENT_SECRET:-}

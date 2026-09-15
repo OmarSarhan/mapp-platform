@@ -7721,6 +7721,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
             else:
                 self._json(HTTPStatus.OK, {"events": CONTROL.audit_tail()})
+        elif path == "/api/admin/mcp-clients":
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+            else:
+                # The origin is returned with the list so the dashboard can
+                # compose a connection snippet an operator can hand over
+                # verbatim. It is configuration, not a second source of truth:
+                # one deployment value, read in one place.
+                site = os.environ.get("MCP_SITE", "http://mcp.localhost").rstrip("/")
+                self._json(HTTPStatus.OK, {
+                    "clients": CONTROL.list_oauth_clients(),
+                    "mcpUrl": f"{site}/mcp",
+                })
         elif path == "/api/proposals":
             try:
                 query = parse_qs(
@@ -8572,6 +8585,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/visual-test",
             "/api/admin/tokens", "/api/admin/password", "/api/auth/logout",
             "/api/admin/device-authorizations/approve",
+            "/api/admin/mcp-clients",
             "/api/sql/test",
             "/api/derived-layers",
             "/api/derived-layers/plan",
@@ -8589,6 +8603,10 @@ class Handler(SimpleHTTPRequestHandler):
         )
         token_revoke_path = re.fullmatch(
             r"/api/admin/tokens/([A-Za-z0-9._-]+)/revoke",
+            request_path,
+        )
+        mcp_client_disable_path = re.fullmatch(
+            r"/api/admin/mcp-clients/([A-Za-z0-9._-]+)/disable",
             request_path,
         )
         proposal_visual_path = re.fullmatch(
@@ -8615,6 +8633,7 @@ class Handler(SimpleHTTPRequestHandler):
             request_path not in allowed
             and not proposal_action_path
             and not token_revoke_path
+            and not mcp_client_disable_path
             and not proposal_visual_path
             and not derived_action_path
             and not federation_alias_action_path
@@ -9549,6 +9568,41 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 token_id = token_revoke_path.group(1)
                 self._json(HTTPStatus.OK if CONTROL.revoke_token(token_id) else HTTPStatus.NOT_FOUND, {"revoked": token_id})
+                return
+            if request_path == "/api/admin/mcp-clients":
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                unexpected = sorted(
+                    set(payload) - {"name", "redirectUris", "scopes"}
+                )
+                if unexpected:
+                    raise ValueError(
+                        "Client request contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                client_id = CONTROL.register_oauth_client(
+                    name=payload.get("name", ""),
+                    redirect_uris=payload.get("redirectUris") or [],
+                    scopes=payload.get("scopes") or [],
+                    actor="admin",
+                )
+                # No secret, because a public client has none. The id is not a
+                # credential: it identifies which client is asking, and consent
+                # is what authorizes it. So unlike a CLI token there is nothing
+                # here that has to be shown once and never again.
+                self._json(HTTPStatus.CREATED, {"clientId": client_id})
+                return
+            if mcp_client_disable_path:
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                client_id = mcp_client_disable_path.group(1)
+                disabled = CONTROL.disable_oauth_client(client_id, actor="admin")
+                self._json(
+                    HTTPStatus.OK if disabled else HTTPStatus.NOT_FOUND,
+                    {"disabled": client_id},
+                )
                 return
             if proposal_visual_path:
                 proposal_id, action = proposal_visual_path.groups()

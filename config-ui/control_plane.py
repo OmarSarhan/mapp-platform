@@ -663,7 +663,7 @@ class ControlStore:
         return value
 
     def register_oauth_client(
-        self, *, name: str, redirect_uris, scopes
+        self, *, name: str, redirect_uris, scopes, actor: str = "local-admin"
     ) -> str:
         """Register a public agent client and return its generated id.
 
@@ -713,6 +713,20 @@ class ControlStore:
                 "'none',NULL)",
                 (client_id, name.strip(), list(uris), list(wanted)),
             )
+        # Auditable because it is an authorization decision: an operator has
+        # decided which agent may ask for consent at all. Nothing here is
+        # secret -- a public client has no secret, and the client id is the
+        # value the operator hands to the user to put in their configuration.
+        self.audit(
+            "oauth.client_registered",
+            actor=actor,
+            details={
+                "clientId": client_id,
+                "name": name.strip(),
+                "scopes": list(wanted),
+                "redirectUris": list(uris),
+            },
+        )
         return client_id
 
     def list_oauth_clients(self) -> list[dict]:
@@ -736,7 +750,7 @@ class ControlStore:
             for row in rows
         ]
 
-    def disable_oauth_client(self, client_id: str) -> bool:
+    def disable_oauth_client(self, client_id: str, *, actor: str = "local-admin") -> bool:
         """Disable a client, reporting whether this call was the one that did it.
 
         Disabling takes effect immediately at introspection, at the exchange
@@ -775,7 +789,17 @@ class ControlStore:
                 " RETURNING client_id",
                 (client_id,),
             ).fetchone()
-        return row is not None
+        disabled = row is not None
+        if disabled:
+            # Only when this call was the one that did it. Auditing an
+            # already-disabled client would record a withdrawal that did not
+            # happen, and the return value exists to tell them apart.
+            self.audit(
+                "oauth.client_disabled",
+                actor=actor,
+                details={"clientId": client_id},
+            )
+        return disabled
 
     def pagination_key(self) -> bytes:
         """Return a stable private key for integrity-bound opaque cursors.

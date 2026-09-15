@@ -13,11 +13,16 @@ import {
   Dashboard,
   DerivedLayers,
   Root,
+  MCP_CLIENT_PRESETS,
+  MCP_SCOPE_OPTIONS,
   Security,
   TOKEN_ACCESS_PRESETS,
   TOKEN_SCOPE_OPTIONS,
   derivedLayerFormDefinition,
   geometryKind,
+  mcpClientCommand,
+  mcpClientConfig,
+  mcpRedirectUris,
   reconcileDerivedWorkspace,
 } from './main.jsx';
 
@@ -51,6 +56,11 @@ describe('Scoped token administration', () => {
     }));
     vi.stubGlobal('navigator', {...navigator, clipboard: {writeText}});
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         return response({token: 'mapp_copy_me', record: {id: 'token-copy'}}, 201);
       }
@@ -90,6 +100,11 @@ describe('Scoped token administration', () => {
   test('offers semantic privilege tiers and provisions the selected scopes', async () => {
     const created = [];
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
         return response({token: 'mapp_one_time', record: {id: 'token-1'}}, 201);
@@ -218,6 +233,11 @@ describe('Scoped token administration', () => {
       },
     ];
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/admin/tokens') return response({tokens});
       if (path === '/api/admin/device-authorizations') {
         return response({authorizations: []});
@@ -265,6 +285,11 @@ describe('Scoped token administration', () => {
   test('provisions every named access level without expanding its scopes', async () => {
     const created = [];
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
         return response({
@@ -316,6 +341,11 @@ describe('Scoped token administration', () => {
   test('narrows full access before custom selection and confirms no expiry', async () => {
     const created = [];
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
         return response({token: 'mapp_custom', record: {id: 'token-2'}}, 201);
@@ -398,6 +428,11 @@ describe('Scoped token administration', () => {
       status: 'pending',
     };
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (
         options.method === 'POST'
         && path === '/api/admin/device-authorizations/approve'
@@ -466,6 +501,11 @@ describe('Scoped token administration', () => {
       status: 'pending',
     };
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/admin/tokens') {
         return response({tokens: []});
       }
@@ -736,6 +776,11 @@ describe('Dashboard managed save lifecycle', () => {
     let listKind = 'materialized';
     vi.stubGlobal('confirm', vi.fn(() => true));
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [{...materialized, kind: listKind}]});
       }
@@ -801,6 +846,11 @@ describe('Dashboard managed save lifecycle', () => {
   test('scopes create requests and reports the successful materialization estimate', async () => {
     let createPayload;
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -847,6 +897,11 @@ describe('Dashboard managed save lifecycle', () => {
     const confirm = vi.fn(() => true);
     vi.stubGlobal('confirm', confirm);
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -887,6 +942,11 @@ describe('Dashboard managed save lifecycle', () => {
     const confirm = vi.fn(() => true);
     vi.stubGlobal('confirm', confirm);
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -941,6 +1001,11 @@ describe('Dashboard managed save lifecycle', () => {
 
   test('explains a query policy rejection without misclassifying it as H3 cost', async () => {
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -985,6 +1050,11 @@ describe('Dashboard managed save lifecycle', () => {
 
   test('does not claim an unchanged database state for an indeterminate operation', async () => {
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -1036,6 +1106,11 @@ describe('Dashboard managed save lifecycle', () => {
     const confirm = vi.fn(() => true);
     vi.stubGlobal('confirm', confirm);
     vi.stubGlobal('fetch', vi.fn(async (path, options = {}) => {
+      // The Security panel loads agent clients alongside tokens, devices and
+      // audit; every mock needs it or Promise.all rejects and nothing renders.
+      if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
+        return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [materialized]});
       }
@@ -1952,5 +2027,152 @@ describe('Dashboard authentication lifecycle', () => {
 
     expect(await screen.findByRole('button', {name: 'Sign in'})).toBeTruthy();
     expect(sessionStorage.getItem('mapp-csrf')).toBeNull();
+  });
+});
+
+describe('MCP agent client administration', () => {
+  const clientsMock = (clients = []) => vi.fn(async (path, options = {}) => {
+    if (path === '/api/admin/mcp-clients' && options.method === 'POST') {
+      return response({clientId: 'mcp-NEWLYISSUED'}, 201);
+    }
+    if (path === '/api/admin/mcp-clients') {
+      return response({clients, mcpUrl: 'http://mcp.localhost/mcp'});
+    }
+    if (path.startsWith('/api/admin/mcp-clients/')) return response({disabled: true});
+    if (path === '/api/admin/tokens') return response({tokens: []});
+    if (path === '/api/admin/device-authorizations') return response({authorizations: []});
+    if (path === '/api/admin/audit') return response({events: []});
+    throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
+  });
+
+  test('the default preset is exactly what the shipped tools need', () => {
+    // Not a style choice. A client registered without `derive` and
+    // `semantic:inspect` connects, lists both tools and is refused on the first
+    // call -- which is a correct refusal and a poor first run.
+    const [recommended] = MCP_CLIENT_PRESETS;
+    expect(recommended.scopes).toEqual([
+      'mcp:connect', 'inspect', 'derive', 'semantic:inspect',
+    ]);
+    for (const scope of recommended.scopes) {
+      expect(MCP_SCOPE_OPTIONS.some(option => option.id === scope)).toBe(true);
+    }
+  });
+
+  test('no preset can ask for a scope the broker refuses to issue', () => {
+    // `full` and `admin` are never issued for the MCP resource, and `full` is
+    // on the broker's deny-list. Offering either in the dashboard would produce
+    // a client that fails at the authorization request instead of here.
+    for (const preset of MCP_CLIENT_PRESETS) {
+      expect(preset.scopes).not.toContain('full');
+      expect(preset.scopes).not.toContain('admin');
+    }
+    for (const option of MCP_SCOPE_OPTIONS) {
+      expect(['full', 'admin']).not.toContain(option.id);
+    }
+  });
+
+  test('the handed-over configuration is what the client actually needs', () => {
+    // This string is the deliverable: an operator pastes it, and a user who
+    // retypes it gets the redirect URI or the oauth object wrong.
+    const config = JSON.parse(mcpClientConfig({
+      mcpUrl: 'http://mcp.localhost/mcp',
+      clientId: 'mcp-ABC',
+      scopes: ['mcp:connect', 'inspect'],
+    }));
+    const server = config.mcpServers.mapp;
+    expect(server.type).toBe('http');
+    expect(server.url).toBe('http://mcp.localhost/mcp');
+    // Without the oauth object the client attempts dynamic registration, which
+    // this server refuses; the scopes are a space-separated string, not a list.
+    expect(server.oauth.clientId).toBe('mcp-ABC');
+    expect(server.oauth.scopes).toBe('mcp:connect inspect');
+    expect(server.oauth.callbackPort).toBe(8484);
+  });
+
+  test('the callback port agrees with the registered redirect URIs', () => {
+    // Redirect URIs are matched byte for byte with no port flexibility, so a
+    // snippet whose port differs from what was registered cannot complete the
+    // flow -- and the failure appears at the redirect, naming nothing.
+    const config = JSON.parse(mcpClientConfig({
+      mcpUrl: 'http://mcp.localhost/mcp', clientId: 'mcp-ABC', scopes: ['mcp:connect'],
+    }));
+    const port = config.mcpServers.mapp.oauth.callbackPort;
+    expect(mcpRedirectUris()).toEqual([
+      `http://localhost:${port}/callback`,
+      `http://127.0.0.1:${port}/callback`,
+    ]);
+    expect(mcpClientCommand({mcpUrl: 'http://mcp.localhost/mcp', clientId: 'mcp-ABC'}))
+      .toContain(`--callback-port ${port}`);
+  });
+
+  test('registering hands over a ready configuration naming the new client', async () => {
+    const fetchMock = clientsMock();
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Security close={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Register MCP client'}));
+
+    // Targeted at the .mcp.json block specifically: the client id appears in
+    // the confirmation line and in both copy blocks, so a bare text query is
+    // ambiguous and fails for a reason unrelated to what is being asserted.
+    const block = (await screen.findByText('Project .mcp.json')).closest('.mcp-copy-block');
+    const config = JSON.parse(within(block).getByText(/mcpServers/).textContent);
+    expect(config.mcpServers.mapp.oauth.clientId).toBe('mcp-NEWLYISSUED');
+    expect(config.mcpServers.mapp.url).toBe('http://mcp.localhost/mcp');
+    // The recommended preset, carried through to what the user is given.
+    expect(config.mcpServers.mapp.oauth.scopes)
+      .toBe('mcp:connect inspect derive semantic:inspect');
+
+    const request = fetchMock.mock.calls.find(
+      ([path, options]) => path === '/api/admin/mcp-clients' && options?.method === 'POST',
+    );
+    const sent = JSON.parse(request[1].body);
+    expect(sent.scopes).toEqual(['mcp:connect', 'inspect', 'derive', 'semantic:inspect']);
+    expect(sent.redirectUris).toEqual(mcpRedirectUris());
+  });
+
+  test('no secret is ever presented, because a public client has none', async () => {
+    // A reveal-once box here would be a lie: the id is not a credential, and
+    // treating it as one teaches an operator to guard the wrong thing.
+    vi.stubGlobal('fetch', clientsMock());
+    render(<Security close={() => {}}/>);
+    fireEvent.click(await screen.findByRole('button', {name: 'Register MCP client'}));
+    await screen.findByText('Project .mcp.json');
+    // The CLI-token panel says "Copy now - this token is shown once." Nothing
+    // in the client panel may, because there is no secret to lose.
+    expect(screen.queryByText(/shown once/i)).toBeNull();
+    expect(screen.getByText(/no secret to copy/i)).toBeTruthy();
+    expect(screen.queryByRole('button', {name: /Copy API token/})).toBeNull();
+  });
+
+  test('an existing agent client can be withdrawn', async () => {
+    const fetchMock = clientsMock([{
+      clientId: 'mcp-EXISTING', name: 'Someone’s laptop',
+      redirectUris: ['http://localhost:8484/callback'],
+      scopes: ['mcp:connect', 'inspect'], confidential: false,
+      created: '2026-09-01T00:00:00Z', disabled: null,
+    }]);
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Security close={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Disable Someone’s laptop'}));
+    await waitFor(() => expect(fetchMock.mock.calls.some(
+      ([path, options]) => path === '/api/admin/mcp-clients/mcp-EXISTING/disable'
+        && options?.method === 'POST',
+    )).toBe(true));
+  });
+
+  test('a service client offers no disable control', async () => {
+    // Disabling one would be undone at the next start-up, because
+    // ensure_oauth_client re-creates it from the deployment's secret.
+    vi.stubGlobal('fetch', clientsMock([{
+      clientId: 'mapp-config-api', name: 'MAPP configuration API',
+      redirectUris: [], scopes: [], confidential: true,
+      created: '2026-09-01T00:00:00Z', disabled: null,
+    }]));
+    render(<Security close={() => {}}/>);
+    await screen.findByText('MCP agent clients');
+    expect(screen.queryByRole('button', {name: /Disable MAPP configuration API/})).toBeNull();
+    expect(screen.getByText('No agent clients registered.')).toBeTruthy();
   });
 });

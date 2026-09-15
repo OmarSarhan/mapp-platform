@@ -547,6 +547,69 @@ export const TOKEN_ACCESS_PRESETS=[
  {id:'federation-operator',label:'Federation operator',scopes:['federation:observe','federation:register','federation:provision'],help:'Run the whole source lifecycle from the CLI: register, observe, provision, retire. Includes the only scope that can serve a third-party database.'},
  {id:'full',label:'Full platform operator',scopes:['full'],help:'Every bearer-token workspace, semantic and federation capability, including federation:provision, which can expose a third-party database through the platform. Credential, device-approval, and audit administration remains dashboard-session-only.'},
 ];
+//: What an agent client may ask for. Deliberately not the CLI token scopes:
+//: those are bearer-token capabilities, these are what an operator consents to
+//: on the MCP authorization screen, and `full` and `admin` are never among them.
+export const MCP_SCOPE_OPTIONS=[
+ {id:'mcp:connect',label:'Connect',help:'Open an authorized MCP session. Advertised in protected-resource metadata as a discovery scope.'},
+ {id:'inspect',label:'List tools',help:'Required for a tool to appear in tools/list at all. Without it an agent connects and sees nothing.'},
+ {id:'derive',label:'Read derived layers',help:'Needed by layer_values to aggregate over a managed derived relation.'},
+ {id:'semantic:inspect',label:'Read semantic catalog',help:'Needed by layer_values to resolve the field it aggregates over.'},
+];
+export const MCP_CLIENT_PRESETS=[
+ {id:'analysis',label:'Read-only analysis (recommended)',scopes:['mcp:connect','inspect','derive','semantic:inspect'],help:'Everything the shipped read-only tools need. An agent with less connects, lists the tools and is refused on the first call.'},
+ {id:'discovery',label:'Connect and list only',scopes:['mcp:connect','inspect'],help:'Connects and lists tools, but every tool refuses. Useful to hand someone a connection before deciding what they may read.'},
+];
+//: Pinned rather than chosen by the client, because redirect URIs are matched
+//: byte for byte with no loopback or port flexibility -- a client that picks its
+//: own port cannot match what was registered.
+export const MCP_CALLBACK_PORT=8484;
+export const mcpRedirectUris=(port=MCP_CALLBACK_PORT)=>[`http://localhost:${port}/callback`,`http://127.0.0.1:${port}/callback`];
+
+//: Built here, as one string, because this is the artefact the operator hands
+//: over: a user who retypes it gets the byte-exact redirect URI wrong, or omits
+//: the `oauth` object and the client falls back to dynamic registration, which
+//: this server refuses.
+export function mcpClientConfig({mcpUrl,clientId,scopes,port=MCP_CALLBACK_PORT,name='mapp'}){
+ return JSON.stringify({mcpServers:{[name]:{type:'http',url:mcpUrl,oauth:{clientId,callbackPort:port,scopes:[...scopes].join(' ')}}}},null,2);
+}
+export const mcpClientCommand=({mcpUrl,clientId,port=MCP_CALLBACK_PORT,name='mapp'})=>
+ `claude mcp add --transport http --client-id ${clientId} --callback-port ${port} ${name} ${mcpUrl}`;
+
+function CopyBlock({label,value,ariaLabel}){
+ const [copied,setCopied]=useState(false),timer=useRef(null);
+ useEffect(()=>()=>clearTimeout(timer.current),[]);
+ const copy=async()=>{try{await navigator.clipboard.writeText(value);clearTimeout(timer.current);setCopied(true);timer.current=setTimeout(()=>setCopied(false),900)}catch{setCopied(false)}};
+ return <div className="mcp-copy-block"><div className="mcp-copy-head"><strong>{label}</strong><button type="button" aria-label={copied?`${ariaLabel} copied to clipboard`:`Copy ${ariaLabel}`} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copy}>{copied?'Copied':'Copy'}</button></div><pre className="mcp-snippet">{value}</pre></div>;
+}
+
+function McpClient({client,busy,disable}){
+ return <div className="token-row permission-row"><div className="permission-info"><strong>{client.name}</strong><small>{client.clientId} · {client.confidential?'service client':'public client'} · {client.disabled?`disabled ${client.disabled}`:`created ${client.created}`}</small><details className="permission-details"><summary>Consented scopes ({client.scopes.length}) and redirect URIs</summary><div className="token-scope-grid">{client.scopes.map(id=>{const scope=MCP_SCOPE_OPTIONS.find(option=>option.id===id);return <label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unrecognized scope'}</strong><small>{id}{scope?` · ${scope.help}`:' · this dashboard does not describe this scope'}</small></span></label>})}</div><p className="muted">Redirect URIs: {client.redirectUris.join(', ')||'none'}</p></details></div>{!client.disabled&&!client.confidential&&<button className="danger" aria-label={`Disable ${client.name}`} disabled={busy} onClick={()=>disable(client.clientId)}>Disable</button>}</div>;
+}
+
+export function McpClients({clients,mcpUrl,busy,register,disable}){
+ const [name,setName]=useState('Claude Code'),[preset,setPreset]=useState(MCP_CLIENT_PRESETS[0].id),[scopes,setScopes]=useState(MCP_CLIENT_PRESETS[0].scopes),[issued,setIssued]=useState(null);
+ const choosePreset=id=>{const selected=MCP_CLIENT_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
+ const toggleScope=(id,enabled)=>{setPreset('custom');setScopes(current=>enabled?[...new Set([...current,id])]:current.filter(scope=>scope!==id))};
+ const create=async()=>{const clientId=await register({name,scopes,redirectUris:mcpRedirectUris()});if(clientId)setIssued({clientId,scopes:[...scopes]})};
+ const presetHelp=MCP_CLIENT_PRESETS.find(item=>item.id===preset)?.help||'Custom scope selection.';
+ const agents=clients.filter(client=>!client.confidential);
+ return <><h3>MCP agent clients</h3>
+  <p className="muted">Register the agent, then hand the person its configuration. They cannot register it themselves: this server refuses dynamic client registration on purpose, so that a person decides which agent may ask for consent. Registering grants nothing on its own — the operator still signs in and approves the scopes when the agent first connects.</p>
+  <div className="token-provision">
+   <label><span>Client name</span><input aria-label="MCP client name" value={name} onChange={event=>setName(event.target.value)}/></label>
+   <label><span>Access level</span><select aria-label="MCP client access level" value={preset} onChange={event=>choosePreset(event.target.value)}>{MCP_CLIENT_PRESETS.map(item=><option key={item.id} value={item.id}>{item.label}</option>)}{preset==='custom'&&<option value="custom">Custom scopes</option>}</select></label>
+   <p className="muted">{presetHelp}</p>
+   <details><summary>Customize scopes</summary><div className="token-scope-grid">{MCP_SCOPE_OPTIONS.map(scope=><label className="token-scope" key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={event=>toggleScope(scope.id,event.target.checked)}/><span><strong>{scope.label}</strong><small>{scope.id} · {scope.help}</small></span></label>)}</div></details>
+   <p className="muted">Callback: {mcpRedirectUris().join(' and ')} — both spellings, because redirect URIs are matched byte for byte.</p>
+   <button disabled={busy||!name.trim()||scopes.length===0} onClick={create}>{busy?'Registering…':'Register MCP client'}</button>
+  </div>
+  {issued&&<div className="mcp-issued"><p><strong>Registered {issued.clientId}.</strong> There is no secret to copy: an agent is a public client and proves itself with PKCE. Send the person either of these.</p><CopyBlock label="Project .mcp.json" ariaLabel="MCP client configuration" value={mcpClientConfig({mcpUrl,clientId:issued.clientId,scopes:issued.scopes})}/><CopyBlock label="Or one command" ariaLabel="MCP client command" value={mcpClientCommand({mcpUrl,clientId:issued.clientId})}/></div>}
+  {agents.map(client=><McpClient key={client.clientId} client={client} busy={busy} disable={disable}/>)}
+  {agents.length===0&&<p className="muted">No agent clients registered.</p>}
+ </>;
+}
+
 const FULL_TOKEN_PRESET_ID='full';
 const ALL_NARROW_TOKEN_SCOPES=TOKEN_SCOPE_OPTIONS.map(scope=>scope.id);
 function DeviceAuthorization({device,busy,approve}){
@@ -559,9 +622,9 @@ function ApiToken({token,busy,revoke}){
 }
 export function Security({close}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
- const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events)};
+ const load=async()=>{const [t,d,a,c]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl)};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -571,6 +634,8 @@ export function Security({close}){
  const copyRevealed=async()=>{setError('');try{await navigator.clipboard.writeText(revealed);clearTimeout(copiedTimer.current);setCopied(true);copiedTimer.current=setTimeout(()=>setCopied(false),900)}catch{setCopied(false);setError('Could not copy the API token to the clipboard.')}};
  const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load();return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
+ const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const presetHelp=TOKEN_ACCESS_PRESETS.find(item=>item.id===preset)?.help||'Custom least-privilege scope selection.';
  const visibleScopes=scopes.includes('full')?ALL_NARROW_TOKEN_SCOPES:scopes;
  const selectedScopesLabel=scopes.includes('full')?'full (all bearer-token workspace and semantic scopes)':(scopes.join(', ')||'none');
@@ -596,6 +661,7 @@ export function Security({close}){
   {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button type="button" aria-label={copied?'API token copied to clipboard':'Copy API token'} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>{copied?'Copied':'Copy'}</button></div>}
   <h3>CLI tokens</h3>
   {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
+  <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
  </section></div>;
 }

@@ -9543,3 +9543,181 @@ class FederationVerifierLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpClientRouteTests(unittest.TestCase):
+    """The dashboard's agent-client surface.
+
+    Registration used to be an operator command only, which meant the person who
+    runs the platform and the person who runs the agent had to be the same
+    person, or had to exchange a client id out of band. These routes are what
+    let an administrator issue one from the dashboard and hand it over.
+
+    They are administrator-session routes, not bearer-token routes, for the same
+    reason token issuance is: deciding which agent may ask for consent is
+    credential administration, and a `full` bearer must not reach it.
+    """
+
+    @staticmethod
+    def handler(path, actor="admin", payload=None):
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: payload or {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_listing_returns_the_clients_and_the_origin_to_connect_to(self):
+        """The origin travels with the list because the dashboard composes a
+        connection snippet from both, and a second source for it would drift."""
+        handler, responses = self.handler("/api/admin/mcp-clients")
+        control = MagicMock()
+        control.list_oauth_clients.return_value = [{"clientId": "mcp-a"}]
+        with patch.object(app, "CONTROL", control), patch.dict(
+            app.os.environ, {"MCP_SITE": "https://mcp.example.test"}, clear=False
+        ):
+            handler.do_GET()
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([{"clientId": "mcp-a"}], responses[0][1]["clients"])
+        self.assertEqual("https://mcp.example.test/mcp", responses[0][1]["mcpUrl"])
+
+    def test_a_trailing_slash_on_the_origin_does_not_double(self):
+        handler, responses = self.handler("/api/admin/mcp-clients")
+        control = MagicMock()
+        control.list_oauth_clients.return_value = []
+        with patch.object(app, "CONTROL", control), patch.dict(
+            app.os.environ, {"MCP_SITE": "https://mcp.example.test/"}, clear=False
+        ):
+            handler.do_GET()
+        self.assertEqual("https://mcp.example.test/mcp", responses[0][1]["mcpUrl"])
+
+    def test_registration_passes_the_request_through_and_names_the_admin(self):
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={
+                "name": "Claude Code",
+                "redirectUris": ["http://localhost:8484/callback"],
+                "scopes": ["mcp:connect", "inspect"],
+            },
+        )
+        control = MagicMock()
+        control.register_oauth_client.return_value = "mcp-ISSUED"
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertEqual((HTTPStatus.CREATED, {"clientId": "mcp-ISSUED"}), responses[0])
+        control.register_oauth_client.assert_called_once_with(
+            name="Claude Code",
+            redirect_uris=["http://localhost:8484/callback"],
+            scopes=["mcp:connect", "inspect"],
+            # Not the CLI's "local-admin": the audit entry has to say who did it.
+            actor="admin",
+        )
+
+    def test_no_secret_is_ever_returned(self):
+        """A public client has none, and returning a field that looked like one
+        would teach an operator to guard a value that is not a credential."""
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={"name": "n", "redirectUris": ["http://localhost:1/c"], "scopes": ["s"]},
+        )
+        control = MagicMock()
+        control.register_oauth_client.return_value = "mcp-ISSUED"
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertEqual({"clientId"}, set(responses[0][1]))
+
+    def test_an_unsupported_property_is_refused_rather_than_ignored(self):
+        """Silently dropping a field means an operator who asked for something
+        gets a client that does not have it and is told it worked."""
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={"name": "n", "redirectUris": ["http://localhost:1/c"],
+                     "scopes": ["s"], "clientSecret": "please"},
+        )
+        control = MagicMock()
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertNotEqual(HTTPStatus.CREATED, responses[0][0])
+        self.assertIn("clientSecret", str(responses[0][1]))
+        control.register_oauth_client.assert_not_called()
+
+    def test_disabling_reports_not_found_when_nothing_changed(self):
+        for disabled, expected in ((True, HTTPStatus.OK), (False, HTTPStatus.NOT_FOUND)):
+            with self.subTest(disabled=disabled):
+                handler, responses = self.handler(
+                    "/api/admin/mcp-clients/mcp-abc/disable"
+                )
+                control = MagicMock()
+                control.disable_oauth_client.return_value = disabled
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+                self.assertEqual(expected, responses[0][0])
+                control.disable_oauth_client.assert_called_once_with(
+                    "mcp-abc", actor="admin"
+                )
+
+    def test_every_route_refuses_a_full_bearer(self):
+        """A `full` token is the widest bearer credential the platform issues,
+        and it must still not administer credentials. Checked on each route
+        rather than once, because the guard is written out per route."""
+        cases = (
+            ("/api/admin/mcp-clients", "do_GET", "list_oauth_clients"),
+            ("/api/admin/mcp-clients", "do_POST", "register_oauth_client"),
+            ("/api/admin/mcp-clients/mcp-abc/disable", "do_POST", "disable_oauth_client"),
+        )
+        for path, method, control_method in cases:
+            with self.subTest(path=path, method=method):
+                handler, responses = self.handler(
+                    path,
+                    actor="token:full",
+                    payload={"name": "n", "redirectUris": ["http://localhost:1/c"],
+                             "scopes": ["s"]},
+                )
+                control = MagicMock()
+                with patch.object(app, "CONTROL", control):
+                    getattr(handler, method)()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                getattr(control, control_method).assert_not_called()
+
+
+class AdminSurfaceGuardTests(unittest.TestCase):
+    """Every administrator read, derived from the source rather than listed.
+
+    The existing table of admin reads is maintained by hand, which is the shape
+    that agrees with the code however wrong both are: a new `/api/admin/` read
+    added without a matching row is unguarded and silently untested. This reads
+    the dispatch itself, so the set under test cannot fall behind it.
+    """
+
+    @staticmethod
+    def admin_read_paths() -> set:
+        import re
+
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        return set(re.findall(r'elif path == "(/api/admin/[a-z-]+)"', source))
+
+    def test_the_surface_is_not_empty(self):
+        """Otherwise the guard below passes by finding nothing to check."""
+        self.assertGreaterEqual(len(self.admin_read_paths()), 4)
+
+    def test_no_administrator_read_answers_a_full_bearer(self):
+        for path in sorted(self.admin_read_paths()):
+            with self.subTest(path=path):
+                responses: list[tuple[HTTPStatus, dict]] = []
+                handler = object.__new__(app.Handler)
+                handler.path = path
+                handler._host_allowed = lambda: True
+                handler._authorized = lambda state_change=False: "token:full"
+                handler._json = lambda status, body: responses.append((status, body))
+                handler.send_error = lambda status: responses.append((status, {}))
+                with patch.object(app, "CONTROL", MagicMock()):
+                    handler.do_GET()
+                self.assertEqual(
+                    HTTPStatus.FORBIDDEN,
+                    responses[0][0],
+                    f"{path} answered a full bearer token",
+                )
