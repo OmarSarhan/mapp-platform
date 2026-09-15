@@ -786,6 +786,45 @@ def _rollback_7(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_8(connection: psycopg.Connection) -> None:
+    """What each confidential client is allowed to ask the control listener for.
+
+    The listener authenticated its callers and then treated them all alike: any
+    registered confidential client could introspect, exchange, revoke and
+    redeem. So the configuration API's credential could mint an execution token
+    for an allowlisted operation, which is precisely the privilege the exchange
+    exists to gate -- and the dashboard is the component with the largest attack
+    surface on the platform. Authenticating a caller and not asking what it is
+    for is most of an access control.
+
+    A column rather than a table of names in the component, because this schema
+    has been bitten before by a client property that lived on the model with
+    nothing behind it: the SQL store could neither write nor read it, so a
+    client narrowed at registration came back from the database permissive.
+
+    Empty by default, and that is the safe direction: a client registered before
+    this migration, or by a path that does not set it, can do nothing on the
+    control listener rather than everything. Agent clients never get any -- they
+    authorise at the edge and never speak to this listener at all.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+            ALTER TABLE {schema}.oauth_clients
+                ADD COLUMN capabilities text[] NOT NULL DEFAULT '{{}}';
+            """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_8(connection: psycopg.Connection) -> None:
+    connection.execute(
+        sql.SQL(
+            "ALTER TABLE {schema}.oauth_clients DROP COLUMN IF EXISTS capabilities"
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -794,6 +833,7 @@ MIGRATIONS = {
     5: _migration_5,
     6: _migration_6,
     7: _migration_7,
+    8: _migration_8,
 }
 
 
@@ -827,6 +867,9 @@ DESTRUCTIVE_ROLLBACKS = {
     7: "the durable audit trail -- every recorded authorization decision,"
        " including the replays that revoked a grant. Nothing reconstructs it,"
        " and audit.jsonl is a lossy projection that never held these events",
+    8: "which control-listener operations each confidential client may ask"
+       " for. After this rollback the listener authenticates its callers and"
+       " then permits all of them everything, as it did before migration 8",
 }
 
 
@@ -967,6 +1010,7 @@ ROLLBACKS = {
     5: _rollback_5,
     6: _rollback_6,
     7: _rollback_7,
+    8: _rollback_8,
 }
 
 

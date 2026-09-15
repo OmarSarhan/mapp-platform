@@ -137,8 +137,9 @@ class SqlStore:
             connection.execute(
                 "INSERT INTO control.oauth_clients"
                 "(client_id, name, redirect_uris, scopes, grant_types,"
-                " token_endpoint_auth_method, client_secret_hash, disabled_at)"
-                " VALUES(%s,%s,%s,%s,%s,%s,%s,"
+                " token_endpoint_auth_method, client_secret_hash, capabilities,"
+                " disabled_at)"
+                " VALUES(%s,%s,%s,%s,%s,%s,%s,%s,"
                 "        CASE WHEN %s THEN now() ELSE NULL END)"
                 " ON CONFLICT (client_id) DO UPDATE SET"
                 "   name = EXCLUDED.name,"
@@ -147,6 +148,7 @@ class SqlStore:
                 "   grant_types = EXCLUDED.grant_types,"
                 "   token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method,"
                 "   client_secret_hash = EXCLUDED.client_secret_hash,"
+                "   capabilities = EXCLUDED.capabilities,"
                 "   disabled_at = EXCLUDED.disabled_at",
                 (
                     client.client_id,
@@ -158,6 +160,7 @@ class SqlStore:
                     # Stored hashed: a client secret at rest is a credential,
                     # and the comparison happens on the digest either way.
                     token_digest(client.client_secret) if client.client_secret else None,
+                    list(client.capabilities),
                     # Without this the SQL store could not express a disabled
                     # client at all, so the rule was only ever exercised
                     # against the in-memory double and the two stores could
@@ -183,6 +186,7 @@ class SqlStore:
             scopes=tuple(row["scopes"]),
             token_endpoint_auth_method=row["token_endpoint_auth_method"],
             grant_types=tuple(row["grant_types"]),
+            capabilities=tuple(row["capabilities"]),
             # The stored value is already a digest, and Client.check_client_secret
             # compares digests, so the raw secret never has to exist here.
             client_secret=row["client_secret_hash"] or "",

@@ -559,6 +559,34 @@ def healthz(handler) -> None:
     MappResponse(200, json.dumps({"status": "ok", "version": VERSION}), JSON_HEADERS).write_to(handler)
 
 
+#: What the control listener offers, as capability names. A client carries the
+#: subset it needs and nothing else -- see models.Client.capabilities for why
+#: authenticating a caller without asking what it is for was not enough.
+INTROSPECT = "introspect"
+EXCHANGE = "exchange"
+REVOKE = "revoke"
+REDEEM = "redeem"
+
+
+def _refuse_capability(handler, capability: str) -> None:
+    """403, not 401. The credential is fine; it is not for this.
+
+    A 401 would tell a correctly configured component to go and fix its
+    credential, which is the one thing that is not wrong.
+    """
+    MappResponse(
+        403,
+        json.dumps({
+            "error": "unauthorized_client",
+            "error_description": (
+                f"This client is not permitted to {capability} on the control"
+                " listener."
+            ),
+        }),
+        JSON_HEADERS,
+    ).write_to(handler)
+
+
 def _authenticate_broker(handler):
     """HTTP Basic, resolving to a confidential client, or None.
 
@@ -608,6 +636,14 @@ def exchange_endpoint(handler) -> None:
             JSON_HEADERS + [("WWW-Authenticate", 'Basic realm="exchange"')],
         ).write_to(handler)
         return
+    # The one that matters most. Minting a credential for an allowlisted
+    # configuration-API operation is the privilege this whole design exists to
+    # gate, and until now any authenticated confidential client could do it --
+    # including the configuration API itself, which is the component with the
+    # largest attack surface on the platform.
+    if not client.may(EXCHANGE):
+        _refuse_capability(handler, EXCHANGE)
+        return
     try:
         token = exchange.exchange(
             datalist=datalist,
@@ -627,7 +663,7 @@ def exchange_endpoint(handler) -> None:
     MappResponse(200, json.dumps(token), JSON_HEADERS).write_to(handler)
 
 
-def _control_endpoint(handler, action):
+def _control_endpoint(handler, action, capability):
     """Shared shape for the authenticated control endpoints.
 
     The body is read before the caller is authenticated, so the connection
@@ -650,6 +686,9 @@ def _control_endpoint(handler, action):
             JSON_HEADERS + [("WWW-Authenticate", 'Basic realm="control"')],
         ).write_to(handler)
         return
+    if not client.may(capability):
+        _refuse_capability(handler, capability)
+        return
     try:
         payload = action(datalist=datalist, store=server.store)
     except introspection.IntrospectionError as exc:
@@ -663,15 +702,15 @@ def _control_endpoint(handler, action):
 
 
 def introspect_endpoint(handler) -> None:
-    _control_endpoint(handler, introspection.introspect)
+    _control_endpoint(handler, introspection.introspect, INTROSPECT)
 
 
 def revoke_endpoint(handler) -> None:
-    _control_endpoint(handler, introspection.revoke)
+    _control_endpoint(handler, introspection.revoke, REVOKE)
 
 
 def redeem_endpoint(handler) -> None:
-    _control_endpoint(handler, introspection.redeem)
+    _control_endpoint(handler, introspection.redeem, REDEEM)
 
 
 class EdgeServer(ThreadingHTTPServer):

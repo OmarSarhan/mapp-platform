@@ -334,6 +334,12 @@ if MCP_TOKENS is not None:
         os.environ["MCP_AUTH_CLIENT_ID"],
         os.environ["MCP_AUTH_CLIENT_SECRET"],
         name="MAPP configuration API",
+        # What this service actually calls, and nothing else. Notably not
+        # "exchange": minting an execution credential is the MCP runtime's job,
+        # and this is the component with the largest attack surface on the
+        # platform. "revoke" is here because withdrawing a consent is an
+        # operator act and this is the operator-facing service.
+        capabilities=("introspect", "redeem", "revoke"),
     )
 
 #: Resolved from the platform's own action table rather than restated. The

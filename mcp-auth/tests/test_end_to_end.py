@@ -75,6 +75,7 @@ class FullFlowTests(unittest.TestCase):
                 redirect_uris=(),
                 scopes=(),
                 token_endpoint_auth_method="client_secret_basic",
+                capabilities=("introspect", "exchange", "revoke", "redeem"),
                 client_secret=BROKER_SECRET,
             )
         )

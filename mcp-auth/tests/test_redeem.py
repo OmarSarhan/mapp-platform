@@ -50,6 +50,7 @@ class RedeemTestCase(unittest.TestCase):
                 client_id="mapp-mcp-broker", name="Broker", redirect_uris=(),
                 scopes=(), token_endpoint_auth_method="client_secret_basic",
                 client_secret=BROKER_SECRET,
+                capabilities=("introspect", "exchange", "revoke", "redeem"),
             )
         )
         self.store.add_client(

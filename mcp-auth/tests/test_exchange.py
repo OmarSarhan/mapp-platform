@@ -82,6 +82,7 @@ class ExchangeTestCase(unittest.TestCase):
             redirect_uris=(),
             scopes=(),
             token_endpoint_auth_method="client_secret_basic",
+            capabilities=("introspect", "exchange", "revoke", "redeem"),
             client_secret="broker-secret",
         )
         self.store.add_client(self.broker)
@@ -719,6 +720,7 @@ class ExchangeOverHttpTests(unittest.TestCase):
                 redirect_uris=(),
                 scopes=(),
                 token_endpoint_auth_method="client_secret_basic",
+                capabilities=("introspect", "exchange", "revoke", "redeem"),
                 client_secret="broker-secret",
             )
         )

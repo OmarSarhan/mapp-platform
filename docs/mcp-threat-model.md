@@ -247,10 +247,18 @@ reader should treat the two together rather than this alone.
   surface, and the exchange refuses anything the presented grant does not
   already carry.
 
-What this delta does **not** cover, and a renewal would: whether three peers on
-one internal network is still the right shape, or whether the control listener
-should distinguish its callers more finely than "a confidential client that
-authenticated". Both become worth asking if a fourth arrives.
+One of those questions has since been answered rather than left open. The
+listener used to permit any authenticated confidential client everything it
+offered, so the configuration API's credential could mint an execution token
+for an allowlisted operation -- the privilege the exchange exists to gate, held
+by the component with the largest attack surface on the platform. Each client
+now carries the capabilities it needs and is refused the rest: the configuration
+API may introspect, redeem and revoke; the runtime may introspect and exchange.
+Neither can do the other's job.
+
+What this delta still does **not** cover, and a renewal would: whether three
+peers on one internal network is the right shape at all. That becomes worth
+asking if a fourth arrives.
 
 ## Attacker capabilities the design does not defend against
 

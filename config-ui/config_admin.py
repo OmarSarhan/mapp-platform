@@ -251,7 +251,13 @@ def mcp_client_command(args, store) -> bool:
         if not secret:
             raise SystemExit("No secret was supplied on standard input.")
         store.ensure_oauth_client(
-            MCP_RUNTIME_CLIENT_ID, secret, name="MAPP MCP runtime"
+            MCP_RUNTIME_CLIENT_ID,
+            secret,
+            name="MAPP MCP runtime",
+            # It resolves the token A on every call, and exchanges one for an
+            # execution credential when a tool acts. It never redeems -- the
+            # configuration API spends the credential -- and never revokes.
+            capabilities=("introspect", "exchange"),
         )
         print(f"Registered the MCP runtime client: {MCP_RUNTIME_CLIENT_ID}")
         if args.secret_stdin:

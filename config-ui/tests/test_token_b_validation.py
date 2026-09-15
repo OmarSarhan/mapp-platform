@@ -557,6 +557,11 @@ class RealComponentLoopTests(unittest.TestCase):
                 redirect_uris=(), scopes=(),
                 token_endpoint_auth_method="client_secret_basic",
                 client_secret="config-secret",
+                # What the deployed configuration API is granted. Notably not
+                # "exchange": minting an execution credential is the runtime's
+                # job, and this suite drives the real control listener, which
+                # now refuses a capability the client does not hold.
+                capabilities=("introspect", "redeem", "revoke"),
             )
         )
         self.store.add_client(

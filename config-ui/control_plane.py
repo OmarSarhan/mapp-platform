@@ -340,7 +340,12 @@ class ControlStore:
             return row["value"]
 
     def ensure_oauth_client(
-        self, client_id: str, client_secret: str, *, name: str
+        self,
+        client_id: str,
+        client_secret: str,
+        *,
+        name: str,
+        capabilities: tuple[str, ...] = (),
     ) -> None:
         """Provision this service's own confidential client, idempotently.
 
@@ -369,8 +374,9 @@ class ControlStore:
             connection.execute(
                 "INSERT INTO control.oauth_clients"
                 "(client_id, name, redirect_uris, scopes, grant_types,"
-                " token_endpoint_auth_method, client_secret_hash, disabled_at)"
-                " VALUES(%s,%s,'{}','{}','{}','client_secret_basic',%s,NULL)"
+                " token_endpoint_auth_method, client_secret_hash, capabilities,"
+                " disabled_at)"
+                " VALUES(%s,%s,'{}','{}','{}','client_secret_basic',%s,%s,NULL)"
                 " ON CONFLICT (client_id) DO UPDATE SET"
                 "   name = EXCLUDED.name,"
                 "   client_secret_hash = EXCLUDED.client_secret_hash,"
@@ -380,8 +386,9 @@ class ControlStore:
                 # intent: the secret is supplied by the deployment, so a
                 # restart with a valid secret is the deployment asserting this
                 # client should work.
+                "   capabilities = EXCLUDED.capabilities,"
                 "   disabled_at = NULL",
-                (client_id, name, digest),
+                (client_id, name, digest, list(capabilities)),
             )
 
     # -- schema ladder ---------------------------------------------------

@@ -64,6 +64,18 @@ class Client(ClientMixin):
     #: again before accepting a refresh request -- so omitting the grant type
     #: here both suppresses issuance and refuses redemption.
     grant_types: tuple[str, ...] = ("authorization_code",)
+    #: What this client may ask the control listener for: any of "introspect",
+    #: "exchange", "revoke", "redeem". Empty by default, which is the safe
+    #: direction -- a client that nobody granted anything can do nothing there.
+    #:
+    #: Authenticating a caller and then permitting it everything is most of an
+    #: access control. Before this existed the configuration API's credential
+    #: could mint an execution token for an allowlisted operation, which is the
+    #: privilege the exchange exists to gate.
+    #:
+    #: Agent clients never carry any: they authorise at the edge and never speak
+    #: to the control listener at all.
+    capabilities: tuple[str, ...] = ()
     #: A disabled client authorises nothing. The SQL store already filtered on
     #: disabled_at; the model had no way to say it, so the in-memory store
     #: could not express a client state the real one enforces.
@@ -142,6 +154,10 @@ class Client(ClientMixin):
 
     def check_grant_type(self, grant_type: str) -> bool:
         return grant_type in self.grant_types
+
+    def may(self, capability: str) -> bool:
+        """Whether the control listener should let this client do that."""
+        return capability in self.capabilities
 
 
 @dataclass
