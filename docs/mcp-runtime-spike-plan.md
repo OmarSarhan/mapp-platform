@@ -218,20 +218,26 @@ Two properties checked while a live credential existed:
 - **Audience separation holds.** A token A presented directly to the
   configuration API is refused `401 auth.authentication_required`. Only an
   exchange-minted token B, bound to one request, is spent there.
-- **Disabling a client cuts off new credentials immediately, and the residual
-  window is bounded.** `query_client` filters `disabled_at IS NULL`
-  (mcp-auth/sql_store.py:177), so after `./bin/mapp mcp-client-disable` a
-  refresh with an *unspent* refresh token is refused `400 invalid_client`. An
-  already-issued token A keeps working until it expires -- at most 15 minutes,
-  because introspection resolves the token record rather than the client. That
-  is ordinary OAuth behaviour and it is bounded, but it is worth stating
-  plainly: client disable is not instantaneous revocation of live access.
+- **Disabling a client withdraws credentials already issued, not merely future
+  ones.** `introspect` resolves the token to its *grant's* client, and
+  `query_client` excludes disabled rows, so `client is None` returns the flat
+  inactive response (mcp-auth/introspection.py:100-113,
+  mcp-auth/sql_store.py:177). An already-issued token A therefore stops working
+  without waiting for its 15-minute expiry. Refresh is refused too: an
+  *unspent* refresh token against a disabled client gets `400 invalid_client`.
 
-  Measured carefully on the second attempt. The first run refreshed *before*
-  disabling, which rotated the token, so the refusal afterwards could equally
-  have been replay detection -- the two are indistinguishable from the status
-  code alone. Re-run with an unspent token against a disabled client, the
-  answer is `invalid_client`, which names the client rather than the grant.
+  The only delay is `mapp-mcp`'s positive introspection cache, bounded hard at
+  30 seconds (mapp-mcp/introspection_client.py:25-27). Measured: a live token
+  answered `200` immediately after the disable and `401` four seconds later,
+  when its cache entry lapsed.
+
+  Both halves of this were measured wrong the first time, and the way they were
+  wrong is worth keeping. The refresh check was run *before* the disable, which
+  rotated the token, so the later refusal could equally have been replay
+  detection -- indistinguishable from the status code alone. And the token-A
+  check was made inside the cache window and read as "disable does not affect
+  live tokens", which would have understated the control badly. Re-run past the
+  cache, with an unspent refresh token, both answers reverse.
 
 ### The defect the live client found
 
