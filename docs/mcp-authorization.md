@@ -16,12 +16,20 @@ An agent client is registered by an operator, never by itself:
 ```bash
 ./bin/mapp mcp-client-register \
   --name "Claude Code" \
-  --redirect-uri http://127.0.0.1:33418/callback \
-  --scope mcp:connect --scope inspect --scope apply
+  --redirect-uri http://localhost:8484/callback \
+  --redirect-uri http://127.0.0.1:8484/callback \
+  --scope mcp:connect --scope inspect \
+  --scope derive --scope semantic:inspect
 
 ./bin/mapp mcp-client-list
 ./bin/mapp mcp-client-disable --client-id mcp-XXXXXXXX
 ```
+
+The scopes are the ones the shipped tools actually need -- `mcp:connect` and
+`inspect` to connect and be listed, `derive` and `semantic:inspect` for
+`layer_values` to run. See "Can Claude Code connect today?" for why all four,
+and register both loopback spellings because redirect URIs are matched byte for
+byte.
 
 It prints a `client_id` and **no secret, because there is none**: an agent is a
 public client that authenticates with PKCE alone. Issuing a secret would create
@@ -437,11 +445,15 @@ which is recreated on start; do not restore it.
 
 ## Connecting Claude Code
 
-Not yet possible, and not for a configuration reason: `mapp-mcp` does not
-exist, so nothing answers `/mcp` and there is no RFC 9728 protected-resource
-document to point a client at. What follows is what the authorization half
-will need when it does, verified against Claude Code's documentation rather
-than assumed.
+Yes, and driven end to end against the deployed stack rather than inferred
+from documentation. Claude Code 2.1.272 connects, lists both tools, and calls
+them; the full transcript is in `mcp-runtime-spike-plan.md`.
+
+Two things had to be true and now are. The server serves the **2025-11-25**
+handshake alongside 2026-07-28, because the shipped client speaks only the
+former (decision P2a). And the RFC 9728 protected-resource document is served
+unauthenticated at `/.well-known/oauth-protected-resource/mcp`, which is what
+turns the first `401` into a sign-in rather than a dead end.
 
 It fits this design, which was not a given. Claude Code defaults to Dynamic
 Client Registration — refused here — but accepts a pre-registered client, and
@@ -453,8 +465,20 @@ what `mcp-client-register` issues.
 ./bin/mapp mcp-client-register --name "Claude Code" \
     --redirect-uri http://localhost:8080/callback \
     --redirect-uri http://127.0.0.1:8080/callback \
-    --scope mcp:connect --scope inspect
+    --scope mcp:connect --scope inspect \
+    --scope derive --scope semantic:inspect
 ```
+
+Four scopes, not two. `mcp:connect` and `inspect` are the discovery pair --
+they are what protected-resource metadata advertises, and `inspect` is what
+makes a tool *appear* in `tools/list` at all. `layer_values` additionally needs
+`derive` and `semantic:inspect` to run, and a client registered without them
+connects, lists both tools, and is refused on the first call with a message
+naming what to re-authorize for. That refusal works and is actionable, but
+there is no reason to walk into it on a fresh install.
+
+Register both loopback spellings. Redirect URIs are matched byte for byte with
+no loopback or port flexibility, and clients differ in which they use.
 
 Then either the CLI:
 
