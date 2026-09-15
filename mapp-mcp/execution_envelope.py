@@ -1,30 +1,27 @@
 """The canonical execution request a token B is bound to.
 
-A token B authorises **one operation on one request**, and this is where that
-becomes true rather than recorded. The broker validates the shape of the digest
-it is handed and stores it; it never sees the downstream request and cannot
-recompute anything. So this module is the only place the binding is actually
-checked, and a defect here turns a request-bound credential back into a plain
-scoped bearer token.
+**A vendored copy of config-ui/execution_envelope.py.** This is the *asserting*
+side: this runtime builds the envelope, digests it, and hands that digest to the
+broker at exchange time. The configuration API rebuilds it from the request that
+actually arrives and compares.
 
-All twelve members from the scope document's canonical-execution-request
-section: canonicalization version, target instance, uppercase method,
-allowlisted operation ID, manifest path template, typed path parameters,
-normalized absolute path, ordered query pairs, the exact downstream JSON body,
-resolved defaults, server-generated confirmation fields and the revision or
-preflight binding.
+The asymmetry decides where a disagreement surfaces. The broker records whatever
+digest it is handed and never recomputes anything, so if this file and the
+configuration API's copy differ by one byte, nothing fails here: every token B is
+refused there instead, as a 403 with no indication of which of the twelve members
+disagreed. Change one, change both, in the same commit --
+tests/test_envelope_agreement.py is what makes that a failure rather than a
+mystery.
 
-The last three carry an explicit null everywhere today -- their values come from
-the curated manifest and the approval flow, neither of which exists. Present
-rather than omitted, because a null member and an absent member digest
-differently: the day a manifest supplies a value it changes the digest rather
-than the envelope's shape. This module built nine for a while, which is the
-shorter restatement P10 refuses by name, and two materially different requests
-could have shared one digest.
+Two rules that are easy to reimplement wrongly, and are pinned by tests rather
+than left to a reader:
 
-The control-field boundary is non-circular: the Authorization header, the token
-itself, CSRF values and trace headers are *not* members. A credential cannot be
-an input to the digest that authorises it.
+* ``+`` in a query value decodes to a *space*, because the decoder is
+  ``parse_qsl``; ``+`` in a path segment stays a literal plus. A strict RFC 3986
+  reading gets the query wrong and disagrees on every value containing one.
+* Query pair *order* is part of the digest, and MCP tool arguments arrive as an
+  unordered JSON object -- so the order has to be settled deterministically here
+  before the digest is computed, not left to whatever the caller iterated.
 """
 
 from __future__ import annotations

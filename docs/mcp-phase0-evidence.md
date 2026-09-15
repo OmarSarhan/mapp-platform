@@ -98,7 +98,7 @@ records an amendment.
 | --- | --- | --- |
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
 | Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
-| Independent canonicalization prototypes for mapp-mcp, broker and API | **2 of 3** | Broker and API each vendored and cross-checked. `mapp-mcp` does not exist; [its plan](mcp-runtime-spike-plan.md) records what a third implementation must match, including that `+` decodes to a space in a query and a literal plus in a path |
+| Independent canonicalization prototypes for mapp-mcp, broker and API | **3 of 3** | All three vendored and cross-checked against each other over a corpus chosen to drift, on what they emit *and* on what they refuse. `mapp-mcp` also carries the envelope builder, checked against the configuration API's copy and against the pinned golden vector |
 | Target-client spikes (Claude, Codex, Gemini) | **1 of 3, and the client half of Claude is now checked** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component, and the same flow was driven by hand through Caddy against the running platform. Claude Code's own requirements were then read rather than assumed: it accepts a pre-registered **public** client and a fixed callback port, so this design fits it, but it defaults to Dynamic Client Registration and sends `offline_access` unconditionally. No MCP client has connected, because `mapp-mcp` does not exist. Codex/OpenAI and Gemini unexamined |
 
 ### Tested
@@ -106,7 +106,7 @@ records an amendment.
 | Item | Status | Evidence |
 | --- | --- | --- |
 | Token A/B audience separation, non-widening exchange, revocation propagation | **done** | All three pinned; revocation reaches an already-issued token B |
-| Canonicalization golden vectors independently in three implementations | **2 of 3** | RFC vectors run against both copies, plus a copy-to-copy comparison. One *envelope* digest is now pinned literally (`GoldenVectorTests`); until it existed every envelope test was differential, so two implementations wrong in the same way would have agreed |
+| Canonicalization golden vectors independently in three implementations | **3 of 3** | RFC vectors run against all three copies, plus cross-copy comparison. One *envelope* digest is pinned literally and recomputed independently by both builders, which is what differential agreement alone could not give: two copies wrong in the same way agree perfectly |
 | Benchmark the control schema under contention; record capacity, failure, recovery | **done** | Table above; `scripts/control_plane_benchmark.py` |
 | Threat-model and abuse-case review | **done, unapproved** | [`mcp-threat-model.md`](mcp-threat-model.md) — 8 cases; 1 unmitigated, 1 unverified |
 

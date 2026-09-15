@@ -16,7 +16,7 @@ COPY requirements.txt /app/
 # none of them needs the --no-deps treatment Authlib does.
 RUN pip install --no-cache-dir --requirement /app/requirements.txt
 
-COPY --chown=mappmcp:mappmcp VERSION app.py authentication.py era_guard.py introspection_client.py protected_resource.py server.py /app/
+COPY --chown=mappmcp:mappmcp VERSION app.py authentication.py canonical.py era_guard.py execution_envelope.py introspection_client.py protected_resource.py server.py /app/
 
 USER mappmcp:mappmcp
 WORKDIR /app
