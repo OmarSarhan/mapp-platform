@@ -7721,6 +7721,11 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
             else:
                 self._json(HTTPStatus.OK, {"events": CONTROL.audit_tail()})
+        elif path == "/api/admin/mcp-grants":
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+            else:
+                self._json(HTTPStatus.OK, {"grants": CONTROL.list_oauth_grants()})
         elif path == "/api/admin/mcp-clients":
             if actor != "admin":
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
@@ -8609,6 +8614,14 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/admin/mcp-clients/([A-Za-z0-9._-]+)/disable",
             request_path,
         )
+        mcp_grant_revoke_path = re.fullmatch(
+            # A colon, because every grant id has one: they are minted as
+            # "oauth:" + token_urlsafe(18) (mcp-auth/server.py), so a pattern
+            # without it matches no real grant at all and answers 404 to every
+            # revocation. The rest is the base64url alphabet.
+            r"/api/admin/mcp-grants/([A-Za-z0-9._:-]+)/revoke",
+            request_path,
+        )
         proposal_visual_path = re.fullmatch(
             r"/api/proposals/([A-Za-z0-9._-]+)/(visual-plan|visual-test|screenshot)",
             request_path,
@@ -8634,6 +8647,7 @@ class Handler(SimpleHTTPRequestHandler):
             and not proposal_action_path
             and not token_revoke_path
             and not mcp_client_disable_path
+            and not mcp_grant_revoke_path
             and not proposal_visual_path
             and not derived_action_path
             and not federation_alias_action_path
@@ -9592,6 +9606,27 @@ class Handler(SimpleHTTPRequestHandler):
                 # is what authorizes it. So unlike a CLI token there is nothing
                 # here that has to be shown once and never again.
                 self._json(HTTPStatus.CREATED, {"clientId": client_id})
+                return
+            if mcp_grant_revoke_path:
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                grant_id = mcp_grant_revoke_path.group(1)
+                unexpected = sorted(set(payload) - {"reason"})
+                if unexpected:
+                    raise ValueError(
+                        "Revocation request contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                revoked = CONTROL.revoke_oauth_grant(
+                    grant_id,
+                    reason=str(payload.get("reason") or ""),
+                    actor="admin",
+                )
+                self._json(
+                    HTTPStatus.OK if revoked else HTTPStatus.NOT_FOUND,
+                    {"revoked": grant_id},
+                )
                 return
             if mcp_client_disable_path:
                 if actor != "admin":

@@ -750,6 +750,100 @@ class ControlStore:
             for row in rows
         ]
 
+    def list_oauth_grants(self) -> list[dict]:
+        """Every consent an operator has given, live or withdrawn.
+
+        A grant is what an administrator actually approved on the consent
+        screen: one client, one scope set, at one moment. Registering a client
+        grants nothing -- this is the record of the separate act that did.
+
+        The live-family count is the difference between "this consent exists"
+        and "something is still using it": a grant whose families are all spent
+        or revoked cannot mint another access token, even before it is revoked.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT g.grant_id, g.client_id, c.name AS client_name,"
+                "       g.subject, g.scopes, g.created_at, g.revoked_at,"
+                "       g.revoked_reason,"
+                "       (SELECT count(*) FROM control.oauth_refresh_families f"
+                "         WHERE f.grant_id = g.grant_id"
+                "           AND f.revoked_at IS NULL) AS live_families"
+                "  FROM control.oauth_grants g"
+                "  JOIN control.oauth_clients c ON c.client_id = g.client_id"
+                " ORDER BY g.created_at DESC, g.grant_id"
+            ).fetchall()
+        return [
+            {
+                "grantId": row["grant_id"],
+                "clientId": row["client_id"],
+                "clientName": row["client_name"],
+                "subject": row["subject"],
+                "scopes": list(row["scopes"]),
+                "created": iso(row["created_at"]),
+                "revoked": iso(row["revoked_at"]) if row["revoked_at"] else None,
+                "revokedReason": row["revoked_reason"],
+                "liveFamilies": int(row["live_families"]),
+            }
+            for row in rows
+        ]
+
+    def revoke_oauth_grant(
+        self, grant_id: str, *, reason: str = "", actor: str = "local-admin"
+    ) -> bool:
+        """Withdraw a consent, reporting whether this call was the one that did it.
+
+        This is the lever that actually stops an agent, and it is not the same
+        as disabling its client. Disabling says "this software may no longer
+        ask"; revoking says "what it was already allowed to do is withdrawn",
+        and it works even while the client stays registered and usable by
+        somebody else.
+
+        One conditional statement, so two operators revoking at once cannot
+        both believe they acted. Nothing else has to be touched for the
+        revocation to bite: introspection, the exchange and both halves of the
+        token-B surface all resolve the grant, so this single write invalidates
+        every credential derived from it -- including a token B already issued
+        and not yet spent, which is the difference between the design's claim
+        and an aspiration.
+
+        The refresh families are revoked for legibility rather than
+        correctness. The rotation statement joins the grant and would refuse
+        them anyway; leaving them live-looking only gives an operator something
+        to puzzle over.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.oauth_grants"
+                "   SET revoked_at = now(), revoked_reason = %s"
+                " WHERE grant_id = %s AND revoked_at IS NULL"
+                " RETURNING grant_id, client_id",
+                (reason or None, grant_id),
+            ).fetchone()
+            families = 0
+            if row is not None:
+                families = connection.execute(
+                    "UPDATE control.oauth_refresh_families"
+                    "   SET revoked_at = now(), revoked_reason = %s"
+                    " WHERE grant_id = %s AND revoked_at IS NULL",
+                    (reason or None, grant_id),
+                ).rowcount
+        if row is None:
+            return False
+        self.audit(
+            "oauth.grant_revoked",
+            actor=actor,
+            details={
+                "grantId": grant_id,
+                "clientId": row["client_id"],
+                "reason": reason or "unspecified",
+                "refreshFamiliesRevoked": families,
+            },
+        )
+        return True
+
     def disable_oauth_client(self, client_id: str, *, actor: str = "local-admin") -> bool:
         """Disable a client, reporting whether this call was the one that did it.
 

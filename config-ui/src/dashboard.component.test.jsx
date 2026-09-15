@@ -15,6 +15,7 @@ import {
   Root,
   MCP_CLIENT_PRESETS,
   MCP_SCOPE_OPTIONS,
+  McpGrants,
   Security,
   TOKEN_ACCESS_PRESETS,
   TOKEN_SCOPE_OPTIONS,
@@ -61,6 +62,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         return response({token: 'mapp_copy_me', record: {id: 'token-copy'}}, 201);
       }
@@ -104,6 +108,9 @@ describe('Scoped token administration', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -238,6 +245,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (path === '/api/admin/tokens') return response({tokens});
       if (path === '/api/admin/device-authorizations') {
         return response({authorizations: []});
@@ -289,6 +299,9 @@ describe('Scoped token administration', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -345,6 +358,9 @@ describe('Scoped token administration', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -433,6 +449,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (
         options.method === 'POST'
         && path === '/api/admin/device-authorizations/approve'
@@ -505,6 +524,9 @@ describe('Scoped token administration', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (path === '/api/admin/tokens') {
         return response({tokens: []});
@@ -781,6 +803,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [{...materialized, kind: listKind}]});
       }
@@ -851,6 +876,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -902,6 +930,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -946,6 +977,9 @@ describe('Dashboard managed save lifecycle', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1006,6 +1040,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
       }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -1054,6 +1091,9 @@ describe('Dashboard managed save lifecycle', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1110,6 +1150,9 @@ describe('Dashboard managed save lifecycle', () => {
       // audit; every mock needs it or Promise.all rejects and nothing renders.
       if (path === '/api/admin/mcp-clients' && options.method !== 'POST') {
         return response({clients: [], mcpUrl: 'http://mcp.localhost/mcp'});
+      }
+      if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
+        return response({grants: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [materialized]});
@@ -2039,6 +2082,7 @@ describe('MCP agent client administration', () => {
       return response({clients, mcpUrl: 'http://mcp.localhost/mcp'});
     }
     if (path.startsWith('/api/admin/mcp-clients/')) return response({disabled: true});
+    if (path === '/api/admin/mcp-grants') return response({grants: []});
     if (path === '/api/admin/tokens') return response({tokens: []});
     if (path === '/api/admin/device-authorizations') return response({authorizations: []});
     if (path === '/api/admin/audit') return response({events: []});
@@ -2174,5 +2218,58 @@ describe('MCP agent client administration', () => {
     await screen.findByText('MCP agent clients');
     expect(screen.queryByRole('button', {name: /Disable MAPP configuration API/})).toBeNull();
     expect(screen.getByText('No agent clients registered.')).toBeTruthy();
+  });
+});
+
+
+describe('MCP consent administration', () => {
+  const GRANT = {
+    grantId: 'grant-live', clientId: 'mcp-abc', clientName: 'Someone\u2019s laptop',
+    subject: 'admin', scopes: ['mcp:connect', 'inspect'],
+    created: '2026-09-01T00:00:00Z', revoked: null, revokedReason: null,
+    liveFamilies: 2,
+  };
+  const WITHDRAWN = {
+    ...GRANT, grantId: 'grant-gone', revoked: '2026-09-02T00:00:00Z',
+    revokedReason: 'laptop lost', liveFamilies: 0,
+  };
+
+  test('a live consent can be withdrawn and names what it covers', () => {
+    const revoke = vi.fn();
+    render(<McpGrants grants={[GRANT]} busy={false} revoke={revoke}/>);
+    // The count is the difference between "this consent exists" and "something
+    // is still using it", so it has to be visible before deciding to revoke.
+    expect(screen.getByText(/2 live refresh families/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Revoke consent for Someone\u2019s laptop',
+    }));
+    expect(revoke).toHaveBeenCalledWith('grant-live');
+  });
+
+  test('a withdrawn consent offers no revoke control and says why', () => {
+    render(<McpGrants grants={[WITHDRAWN]} busy={false} revoke={vi.fn()}/>);
+    expect(screen.queryByRole('button', {name: /^Revoke consent/})).toBeNull();
+    expect(screen.getByText('No live consents.')).toBeTruthy();
+    fireEvent.click(screen.getByText(/Withdrawn consents \(1\)/));
+    expect(screen.getByText(/laptop lost/)).toBeTruthy();
+  });
+
+  test('withdrawn consents are kept, not hidden away', () => {
+    // A revoked grant is the evidence that a consent existed and was
+    // withdrawn. Dropping it from the surface would make the audit trail the
+    // only place an operator could see it happened.
+    render(<McpGrants grants={[GRANT, WITHDRAWN]} busy={false} revoke={vi.fn()}/>);
+    expect(screen.getByText(/Withdrawn consents \(1\)/)).toBeTruthy();
+    expect(screen.getAllByRole('button', {name: /^Revoke consent/})).toHaveLength(1);
+  });
+
+  test('the singular reads correctly for one family', () => {
+    render(<McpGrants grants={[{...GRANT, liveFamilies: 1}]} busy={false} revoke={vi.fn()}/>);
+    expect(screen.getByText(/1 live refresh family/)).toBeTruthy();
+  });
+
+  test('nothing is offered while a request is in flight', () => {
+    render(<McpGrants grants={[GRANT]} busy={true} revoke={vi.fn()}/>);
+    expect(screen.getByRole('button', {name: /^Revoke consent/}).disabled).toBe(true);
   });
 });

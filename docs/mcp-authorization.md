@@ -11,7 +11,21 @@ unless it names a test or a check that runs.
 
 ## Registering an agent client
 
-An agent client is registered by an operator, never by itself:
+An agent client is registered by an operator, never by itself. Two surfaces do
+it, and they write the same row.
+
+**From the dashboard** — Access and audit → *MCP agent clients*. Pick a name and
+an access level, register, and the panel renders the `.mcp.json` the user pastes
+and the equivalent `claude mcp add` command. This is the path to hand someone a
+connection: they cannot register a client themselves, because the authorization
+server refuses dynamic client registration on purpose, and a client id retyped
+by hand gets the byte-exact redirect URI wrong.
+
+Registering grants nothing on its own. The operator still signs in and approves
+the scopes when the agent first connects, and *MCP consents* on the same panel
+is where those approvals are listed and withdrawn.
+
+**From the command line** — the same thing, for scripted setup:
 
 ```bash
 ./bin/mapp mcp-client-register \
@@ -27,7 +41,26 @@ An agent client is registered by an operator, never by itself:
 
 The scopes are the ones the shipped tools actually need -- `mcp:connect` and
 `inspect` to connect and be listed, `derive` and `semantic:inspect` for
-`layer_values` to run. See "Can Claude Code connect today?" for why all four,
+`layer_values` to run.
+
+## Withdrawing access
+
+Two different acts, and the difference matters when something has gone wrong.
+
+**Disabling the client** says the software may no longer ask. New authorizations
+and refreshes are refused immediately (`query_client` excludes disabled rows), and
+an already-issued token A stops working as soon as its introspection answer
+lapses -- at most 30 seconds, the runtime's positive cache bound.
+
+**Revoking a grant** withdraws what an agent was already allowed to do, and
+leaves the client registered and usable by someone else. One conditional write
+invalidates every credential derived from that consent, including an exchanged
+token B that has been issued and not yet spent, because introspection, the
+exchange and both halves of the token-B surface all resolve the grant.
+
+Both are on the dashboard's Access and audit panel, and both are audited.
+Measured against the deployed stack: after revoking a live consent, the agent's
+next call answered `401` and its refresh token answered `invalid_grant`. See "Can Claude Code connect today?" for why all four,
 and register both loopback spellings because redirect URIs are matched byte for
 byte.
 

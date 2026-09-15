@@ -9684,6 +9684,123 @@ class McpClientRouteTests(unittest.TestCase):
                 getattr(control, control_method).assert_not_called()
 
 
+#: Shaped like a real one. The first version of these tests used "g1", which
+#: routed fine and matched nothing the platform ever mints: grant ids carry a
+#: colon, and the route pattern did not accept one, so every real revocation
+#: answered 404 while the suite passed. Derived from the generator's own form.
+GRANT_ID = "oauth:" + "g-nX6S3bwmAI1n0QjTAq9KAu"
+
+
+class McpGrantRouteTests(unittest.TestCase):
+    """Withdrawing a consent, which is the lever that actually stops an agent.
+
+    Distinct from disabling its client: disabling says the software may no
+    longer ask, revoking withdraws what it was already allowed to do, and a
+    client can stay registered and usable by somebody else.
+    """
+
+    @staticmethod
+    def handler(path, actor="admin", payload=None):
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: payload or {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_listing_returns_the_grants(self):
+        handler, responses = self.handler("/api/admin/mcp-grants")
+        control = MagicMock()
+        control.list_oauth_grants.return_value = [{"grantId": "g1"}]
+        with patch.object(app, "CONTROL", control):
+            handler.do_GET()
+        self.assertEqual((HTTPStatus.OK, {"grants": [{"grantId": "g1"}]}), responses[0])
+
+    def test_revoking_reports_not_found_when_nothing_changed(self):
+        """A second revocation changes nothing, and reporting success would
+        tell an operator they withdrew a consent that was already gone."""
+        for revoked, expected in ((True, HTTPStatus.OK), (False, HTTPStatus.NOT_FOUND)):
+            with self.subTest(revoked=revoked):
+                handler, responses = self.handler(f"/api/admin/mcp-grants/{GRANT_ID}/revoke")
+                control = MagicMock()
+                control.revoke_oauth_grant.return_value = revoked
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+                self.assertEqual(expected, responses[0][0])
+                control.revoke_oauth_grant.assert_called_once_with(
+                    GRANT_ID, reason="", actor="admin"
+                )
+
+    def test_a_reason_is_carried_through(self):
+        handler, responses = self.handler(
+            f"/api/admin/mcp-grants/{GRANT_ID}/revoke", payload={"reason": "laptop lost"}
+        )
+        control = MagicMock()
+        control.revoke_oauth_grant.return_value = True
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        control.revoke_oauth_grant.assert_called_once_with(
+            GRANT_ID, reason="laptop lost", actor="admin"
+        )
+
+    def test_an_unsupported_property_is_refused(self):
+        handler, responses = self.handler(
+            f"/api/admin/mcp-grants/{GRANT_ID}/revoke", payload={"grantId": "somethingelse"}
+        )
+        control = MagicMock()
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertNotEqual(HTTPStatus.OK, responses[0][0])
+        control.revoke_oauth_grant.assert_not_called()
+
+    def test_the_route_accepts_ids_shaped_as_the_broker_mints_them(self):
+        """Generated here rather than written out, so the pattern is tested
+        against the real alphabet instead of one example of it.
+
+        The authorization component mints `"oauth:" + secrets.token_urlsafe(18)`
+        (mcp-auth/server.py). token_urlsafe draws from base64url, so a `-` or a
+        `_` appears in most ids and a pattern missing either would fail
+        intermittently -- the worst way for this to be wrong.
+        """
+        import secrets
+
+        for _ in range(200):
+            grant_id = "oauth:" + secrets.token_urlsafe(18)
+            handler, responses = self.handler(
+                f"/api/admin/mcp-grants/{grant_id}/revoke"
+            )
+            control = MagicMock()
+            control.revoke_oauth_grant.return_value = True
+            with patch.object(app, "CONTROL", control):
+                handler.do_POST()
+            self.assertEqual(
+                HTTPStatus.OK,
+                responses[0][0],
+                f"{grant_id} did not route; the pattern rejects part of the alphabet",
+            )
+            control.revoke_oauth_grant.assert_called_once_with(
+                grant_id, reason="", actor="admin"
+            )
+
+    def test_both_routes_refuse_a_full_bearer(self):
+        cases = (
+            ("/api/admin/mcp-grants", "do_GET", "list_oauth_grants"),
+            (f"/api/admin/mcp-grants/{GRANT_ID}/revoke", "do_POST", "revoke_oauth_grant"),
+        )
+        for path, method, control_method in cases:
+            with self.subTest(path=path):
+                handler, responses = self.handler(path, actor="token:full")
+                control = MagicMock()
+                with patch.object(app, "CONTROL", control):
+                    getattr(handler, method)()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                getattr(control, control_method).assert_not_called()
+
+
 class AdminSurfaceGuardTests(unittest.TestCase):
     """Every administrator read, derived from the source rather than listed.
 

@@ -587,6 +587,21 @@ function McpClient({client,busy,disable}){
  return <div className="token-row permission-row"><div className="permission-info"><strong>{client.name}</strong><small>{client.clientId} · {client.confidential?'service client':'public client'} · {client.disabled?`disabled ${client.disabled}`:`created ${client.created}`}</small><details className="permission-details"><summary>Consented scopes ({client.scopes.length}) and redirect URIs</summary><div className="token-scope-grid">{client.scopes.map(id=>{const scope=MCP_SCOPE_OPTIONS.find(option=>option.id===id);return <label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unrecognized scope'}</strong><small>{id}{scope?` · ${scope.help}`:' · this dashboard does not describe this scope'}</small></span></label>})}</div><p className="muted">Redirect URIs: {client.redirectUris.join(', ')||'none'}</p></details></div>{!client.disabled&&!client.confidential&&<button className="danger" aria-label={`Disable ${client.name}`} disabled={busy} onClick={()=>disable(client.clientId)}>Disable</button>}</div>;
 }
 
+function McpGrant({grant,busy,revoke}){
+ const live=!grant.revoked;
+ return <div className={`token-row permission-row${live?'':' withdrawn'}`}><div className="permission-info"><strong>{grant.clientName}</strong><small>{grant.grantId} · consented {grant.created}{live?` · ${grant.liveFamilies} live refresh famil${grant.liveFamilies===1?'y':'ies'}`:` · withdrawn ${grant.revoked}${grant.revokedReason?` (${grant.revokedReason})`:''}`}</small><details className="permission-details"><summary>Approved scopes ({grant.scopes.length})</summary><div className="token-scope-grid">{grant.scopes.map(id=>{const scope=MCP_SCOPE_OPTIONS.find(option=>option.id===id);return <label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unrecognized scope'}</strong><small>{id}{scope?` · ${scope.help}`:''}</small></span></label>})}</div></details></div>{live&&<button className="danger" aria-label={`Revoke consent for ${grant.clientName}`} disabled={busy} onClick={()=>revoke(grant.grantId)}>Revoke</button>}</div>;
+}
+
+export function McpGrants({grants,busy,revoke}){
+ const live=grants.filter(grant=>!grant.revoked);
+ return <><h3>MCP consents</h3>
+  <p className="muted">One row per approval an administrator gave on the consent screen. Revoking withdraws it immediately: every credential derived from it stops working, including an exchanged token that has been issued and not yet spent. This is not the same as disabling the client — disabling says the software may no longer ask, revoking withdraws what it was already allowed to do.</p>
+  {live.map(grant=><McpGrant key={grant.grantId} grant={grant} busy={busy} revoke={revoke}/>)}
+  {live.length===0&&<p className="muted">No live consents.</p>}
+  {grants.length>live.length&&<details className="permission-details"><summary>Withdrawn consents ({grants.length-live.length})</summary>{grants.filter(grant=>grant.revoked).map(grant=><McpGrant key={grant.grantId} grant={grant} busy={busy} revoke={revoke}/>)}</details>}
+ </>;
+}
+
 export function McpClients({clients,mcpUrl,busy,register,disable}){
  const [name,setName]=useState('Claude Code'),[preset,setPreset]=useState(MCP_CLIENT_PRESETS[0].id),[scopes,setScopes]=useState(MCP_CLIENT_PRESETS[0].scopes),[issued,setIssued]=useState(null);
  const choosePreset=id=>{const selected=MCP_CLIENT_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -622,9 +637,9 @@ function ApiToken({token,busy,revoke}){
 }
 export function Security({close}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
- const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a,c]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl)};
+ const load=async()=>{const [t,d,a,c,g]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants)};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -636,6 +651,7 @@ export function Security({close}){
  const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load();return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
  const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const revokeGrant=async grantId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-grants/${grantId}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const presetHelp=TOKEN_ACCESS_PRESETS.find(item=>item.id===preset)?.help||'Custom least-privilege scope selection.';
  const visibleScopes=scopes.includes('full')?ALL_NARROW_TOKEN_SCOPES:scopes;
  const selectedScopesLabel=scopes.includes('full')?'full (all bearer-token workspace and semantic scopes)':(scopes.join(', ')||'none');
@@ -662,6 +678,7 @@ export function Security({close}){
   <h3>CLI tokens</h3>
   {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
   <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
+  <McpGrants grants={grants} busy={busy} revoke={revokeGrant}/>
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
  </section></div>;
 }
