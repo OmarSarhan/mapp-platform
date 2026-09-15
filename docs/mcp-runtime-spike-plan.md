@@ -82,6 +82,58 @@ renewed transport threat model for any additional peer on that network; this
 version records a delta rather than claiming a full renewal, which is
 proportionate for a spike and at least visible.
 
+## The finding the spike existed to produce
+
+**Claude Code 2.1.272 cannot connect to a specification-conformant mapp-mcp,
+and the specification already says what to do about it.**
+
+Driven for real: the CLI installed in an ephemeral container on the host
+network, this session's credential mounted, the server registered with a fixed
+callback port and both loopback spellings. It reached the era guard and was
+refused by it, with the guard's own error --
+`400 Missing MCP-Protocol-Version {"reason": "protocol-version-missing"}`.
+
+Its first request, captured verbatim from an echo server:
+
+```json
+{"method":"initialize",
+ "params":{"protocolVersion":"2025-11-25",
+           "clientInfo":{"name":"claude-code","version":"2.1.272"}},
+ "jsonrpc":"2.0","id":0}
+```
+
+Three refusals, each correct:
+
+- no `MCP-Protocol-Version` header at all -- the revision is negotiated in the
+  `initialize` body, which is the older handshake;
+- the method is `initialize`, which the guard refuses as a method that does not
+  exist in the modern era;
+- the revision it offers is **2025-11-25**, and this server accepts 2026-07-28
+  and nothing else.
+
+So the platform targets a revision *newer* than the shipped client speaks. This
+is not a defect in either: it is the gap the spike was built to measure, and it
+was invisible until a real client was put in front of the real server.
+
+P2 decided the response in advance (:2046): support "the ecosystems that pass
+and document the remainder as unsupported -- do not add a legacy transport path
+to accommodate it". Taken literally, Claude Code is unsupported until it speaks
+2026-07-28, and that is a decision to reaffirm knowingly rather than discover
+later. The alternative -- admitting 2025-11-25 -- is the legacy path P2 refuses,
+and the era guard exists precisely because the SDK would otherwise serve it.
+
+Two smaller things the same run established:
+
+- **`*.localhost` is resolved to loopback by the client regardless of
+  `/etc/hosts`.** A container that mapped `mcp.localhost` to a bridge address
+  could not reach the server at all; on the host network, where the name really
+  is loopback, it connected immediately. Anyone testing from a container needs
+  the host network or a hostname that is not `*.localhost`.
+- The registration side is right: a **public** client with `--client-id`, no
+  secret, and a fixed `callbackPort` is accepted in `.mcp.json`, and the server
+  is discovered, approved and health-checked without complaint. Everything up to
+  the protocol revision works.
+
 ## Traps that cost hours if unknown
 
 Each was established by reading the code, not inferred.
