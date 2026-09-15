@@ -43,11 +43,12 @@ issuer refused to issue.
 
 | Suite | Tests | Notes |
 | --- | --- | --- |
-| `mcp-auth/tests` | 468 | Zero skips with a control database attached. Includes the registered-client spike |
-| `config-ui/tests` | 1019 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
-| `scripts/tests` | 179 | Compose isolation, Caddy contract, production validation, benchmark invariants |
+| `mcp-auth/tests` | 473 | Zero skips with a control database attached. Includes the registered-client spike and the control-listener capability separation |
+| `config-ui/tests` | 1022 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
+| `mapp-mcp/tests` | 60 | The protocol-era guard, RFC 9728 metadata, token-A authentication and three-way canonicalization agreement. No database and no network: driven over the ASGI contract, where the obligations live |
+| `scripts/tests` | 182 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
-All three run in CI, each behind a `grep -q "skipped="` guard: a suite that
+All four run in CI, each behind a `grep -q "skipped="` guard: a suite that
 silently skips fails the job. That guard exists because a whole suite once went
 unnoticed-dead.
 

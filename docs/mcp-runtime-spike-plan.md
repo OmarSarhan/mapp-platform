@@ -5,8 +5,29 @@ different model. It records what a scoping pass established so that work does
 not have to be repeated, and what it found that would otherwise be discovered
 by failure.
 
-**Status: not started.** Nothing of mapp-mcp exists. `/mcp` is 404 and there is
-no RFC 9728 document. Everything below is preparation.
+**Status: the authorization half is built and deployed; the tool surface is
+not.** `mapp-mcp` runs as a service, Caddy routes `/mcp` and both RFC 9728
+well-known paths to it, and a real token A obtained through the authorization
+flow reaches it. What it answers with is a 501 placeholder, because no tool
+exists yet.
+
+Done: the protocol-era guard, the RFC 9728 document and challenge, token-A
+authentication by introspection, the confidential client the runtime
+authenticates with, the image, the compose service, the edge routes, and the
+vendored canonicalizer and envelope checked against the other two copies and
+the pinned golden vector.
+
+Not done: JSON-RPC dispatch, `tools/list`, `tools/call`, and therefore any
+tool. That needs the decision below.
+
+**The open decision.** The specification says to use the official MCP SDK. It
+resolves to 28 packages including `cryptography`, `pydantic-core` and `rpds-py`,
+against a runtime that currently has three pure-Python ones. The counter-argument
+is not only weight: the era guard exists *because* the SDK serves both handshake
+eras and exposes no version allowlist, so the SDK is already being worked around
+at the point where it matters most, and the read-only surface this spike needs is
+small. Weigh it with the running service in front of you -- that was the reason
+for deploying before deciding.
 
 ## What the spike is for
 
@@ -117,10 +138,12 @@ and are byte-exact. Query pair *order* is load-bearing, and MCP tool arguments
 arrive as an unordered JSON object — so the ordering must be decided somewhere
 deterministic before the digest is computed.
 
-**One digest is written down.** `GoldenVectorTests` in
-`config-ui/tests/test_execution_envelope.py` pins a fixed envelope to a literal
-value. Check the third implementation against it: every other test is
-differential, and two implementations wrong in the same way agree perfectly.
+**One digest is written down**, and the third implementation is now checked
+against it. `GoldenVectorTests` in `config-ui/tests/test_execution_envelope.py`
+pins a fixed envelope to a literal value, and
+`mapp-mcp/tests/test_envelope_agreement.py` recomputes it and compares all three
+canonicalizer copies on what they emit and on what they refuse. Every other test
+is differential, and two implementations wrong in the same way agree perfectly.
 
 ## Files that must change together
 
