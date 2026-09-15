@@ -80,6 +80,45 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(401, rpc(app, token=TOKEN.upper()).status)
 
 
+class CredentialCarriageTests(unittest.TestCase):
+    """The raw token reaches a handler, and reaches nothing else.
+
+    A tool that acts has to present the caller's token A as the subject of an
+    exchange, so the runtime has to keep it. Keeping a live credential on the
+    request scope is worth a test in both directions: that it is there, and that
+    it does not come out anywhere it should not.
+    """
+
+    def test_the_handler_receives_the_credential_it_will_exchange(self) -> None:
+        app, inner, _, _ = stack({TOKEN: active()})
+        rpc(app, token=TOKEN)
+        self.assertEqual(TOKEN, inner.caller.token)
+
+    def test_the_credential_is_not_in_the_repr(self) -> None:
+        """Because this object lands in tracebacks and in anything logging scope.
+
+        A default repr over __slots__ would print a live token A into both.
+        Making the unsafe rendering impossible beats remembering not to log it.
+        """
+        app, inner, _, _ = stack({TOKEN: active()})
+        rpc(app, token=TOKEN)
+        rendered = repr(inner.caller)
+        self.assertNotIn(TOKEN, rendered)
+        # Still useful: the grant is what an operator needs to correlate.
+        self.assertIn("oauth:test-grant", rendered)
+
+    def test_the_credential_is_not_an_ordinary_attribute(self) -> None:
+        """`vars()` and anything walking __dict__ finds nothing.
+
+        __slots__ already means there is no __dict__, which is what stops a
+        generic "log the object" helper from finding it.
+        """
+        app, inner, _, _ = stack({TOKEN: active()})
+        rpc(app, token=TOKEN)
+        with self.assertRaises(TypeError):
+            vars(inner.caller)
+
+
 class RefusalTests(unittest.TestCase):
     def test_no_credential_is_401_with_no_bearer_error_code(self) -> None:
         """Nothing is wrong with the credential; there is not one.

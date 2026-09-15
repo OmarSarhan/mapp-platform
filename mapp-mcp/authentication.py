@@ -33,14 +33,40 @@ CONNECT_SCOPE = "mcp:connect"
 class Authenticated:
     """The resolved caller, carried on the ASGI scope for handlers to read."""
 
-    __slots__ = ("grant_id", "client_id", "scopes", "audience", "expires_at")
+    __slots__ = (
+        "grant_id", "client_id", "scopes", "audience", "expires_at", "_token"
+    )
 
-    def __init__(self, record: dict) -> None:
+    def __init__(self, record: dict, token: str = "") -> None:
         self.grant_id = record.get("sub") or ""
         self.client_id = record.get("client_id") or ""
         self.scopes = frozenset((record.get("scope") or "").split())
         self.audience = record.get("aud") or ""
         self.expires_at = record.get("exp")
+        #: The credential itself, kept because a tool that acts has to present
+        #: it as the subject token of an exchange. Underscored and excluded from
+        #: repr deliberately: it is the one field here that is a secret, and
+        #: everything else about this object is safe to print.
+        self._token = token
+
+    @property
+    def token(self) -> str:
+        """The raw token A, for presenting to the exchange and nowhere else."""
+        return self._token
+
+    def __repr__(self) -> str:
+        """Never the credential.
+
+        This object ends up in tracebacks and in anything that logs the ASGI
+        scope, and a default repr over __slots__ would put a live token A in
+        both. Section 11 forbids exactly that, and the cheapest way to keep the
+        rule is to make the unsafe rendering impossible rather than remembered.
+        """
+        return (
+            f"Authenticated(grant_id={self.grant_id!r},"
+            f" client_id={self.client_id!r},"
+            f" scopes={sorted(self.scopes)!r})"
+        )
 
     def has(self, *required: str) -> bool:
         return set(required).issubset(self.scopes)
@@ -93,7 +119,7 @@ class BearerAuthentication:
             )
             return
 
-        caller = Authenticated(record)
+        caller = Authenticated(record, token)
         if caller.audience != self._resource.resource:
             # The component already compares audiences, because the resource is
             # sent on every introspection. Checked again here because an
