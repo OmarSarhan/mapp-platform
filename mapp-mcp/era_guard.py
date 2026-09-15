@@ -194,11 +194,23 @@ async def _buffer(receive):
     sent = False
 
     async def replay():
+        """The buffered body once, then the real stream underneath.
+
+        Returning ``http.disconnect`` on the second call looks harmless -- the
+        body is finished, so what else is there to say -- and it is not. A
+        streaming application keeps reading to notice the client going away, so
+        a fabricated disconnect tells it the caller left and it abandons the
+        response without sending one. The symptom is "ASGI callable returned
+        without starting response" and no traceback, because nothing raised.
+
+        Delegating instead means the disconnect arrives when it actually
+        happens.
+        """
         nonlocal sent
-        if sent:
-            return {"type": "http.disconnect"}
-        sent = True
-        return {"type": "http.request", "body": body, "more_body": False}
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
 
     return body, replay
 

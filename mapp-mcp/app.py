@@ -21,27 +21,6 @@ from protected_resource import MetadataApp
 from protected_resource import ProtectedResource
 
 
-async def _not_implemented(scope, receive, send) -> None:
-    """Stands in for the SDK application until it is wired.
-
-    Deliberately a 501 rather than a stub success: everything in front of it --
-    the era guard, the metadata document, the challenge -- is real and testable
-    now, and a fake success here would make those tests pass for a reason that
-    has nothing to do with them.
-    """
-    payload = b'{"jsonrpc":"2.0","id":null,"error":{"code":-32603,' \
-              b'"message":"The MCP runtime is not wired yet."}}'
-    await send({
-        "type": "http.response.start",
-        "status": 501,
-        "headers": [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(payload)).encode()),
-        ],
-    })
-    await send({"type": "http.response.body", "body": payload})
-
-
 def build_app(
     *,
     origin: str | None = None,
@@ -64,7 +43,17 @@ def build_app(
     origin = origin or os.environ.get("MCP_SITE", "http://mcp.localhost")
     issuer = issuer or os.environ.get("MCP_ISSUER", origin)
     resource = ProtectedResource(origin=origin, issuer=issuer)
-    runtime = inner if inner is not None else _not_implemented
+    if inner is not None:
+        runtime = inner
+    else:
+        # Imported here rather than at module scope: the guard, the metadata
+        # surface and the authentication middleware are stdlib-only and their
+        # tests run without the SDK installed. Importing it at the top would
+        # make 28 packages a prerequisite for testing code that does not use
+        # them.
+        from runtime import build_runtime_app
+
+        runtime = build_runtime_app(resource=resource)
     if introspection is None:
         introspection = IntrospectionClient(
             os.environ.get("MCP_AUTH_URL", "http://mcp-auth:8080"),

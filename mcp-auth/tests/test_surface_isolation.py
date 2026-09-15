@@ -321,10 +321,18 @@ class ThrottleTableTests(unittest.TestCase):
 class DependencySurfaceTests(unittest.TestCase):
     """The component must not acquire a native cryptography stack.
 
-    Every platform image is musl-based and `cryptography` publishes no musl
-    wheel, so pulling it in turns a pip install into a source build. The RFCs
-    this component uses -- rfc6749, 6750, 7636, 8414, 9207 -- need
-    none of it, which is why Authlib is installed with --no-deps.
+    The original reason was that `cryptography` published no musl wheel, so
+    pulling it in turned a pip install into a source build. That has since
+    stopped being true -- cryptography 50.0.1 installs from a musllinux wheel on
+    python:3.12-alpine with no toolchain, checked rather than assumed -- so the
+    decision now rests on the surviving reason alone: the RFCs this component
+    uses (rfc6749, 6750, 7636, 8414, 9207) need none of it, and a dependency
+    that does nothing for you is surface you maintain for nothing.
+
+    Worth knowing because the MCP runtime made the opposite call deliberately:
+    it takes the official SDK, and cryptography with it, in exchange for
+    protocol conformance it would otherwise have to write and keep correct.
+    Same evidence, different trade, both recorded.
 
     The assertion is on the Dockerfile rather than on what happens to be
     importable here: this repository's devcontainer has `cryptography`

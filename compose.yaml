@@ -168,6 +168,11 @@ services:
       # stores only its digest. This is the one service that holds the
       # plaintext, and a test pins that it reaches no other.
       MAPP_MCP_CLIENT_SECRET: ${MAPP_MCP_CLIENT_SECRET:-}
+      # Quiet by default: the component answers its own errors, and uvicorn's
+      # access log would record every RPC path. Raisable without a rebuild,
+      # because the first thing wanted when this misbehaves is the traceback it
+      # otherwise swallows.
+      MCP_RUNTIME_LOG_LEVEL: ${MCP_RUNTIME_LOG_LEVEL:-warning}
     volumes:
       # The only shared mount, and the same shape mcp-auth uses: the runtime
       # directory holding the edge socket. No database credential, no workspace,

@@ -58,8 +58,10 @@ def main() -> int:
         workers=1,
         access_log=False,
         # The component answers its own errors; uvicorn's default handler would
-        # render an HTML page for a JSON-RPC client.
-        log_level="warning",
+        # render an HTML page for a JSON-RPC client. Raisable without a rebuild,
+        # because the first thing wanted when this misbehaves is the traceback
+        # it is currently swallowing.
+        log_level=os.environ.get("MCP_RUNTIME_LOG_LEVEL", "warning"),
     )
     return 0
 

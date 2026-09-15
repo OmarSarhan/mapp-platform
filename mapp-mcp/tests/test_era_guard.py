@@ -194,6 +194,82 @@ class BodyHandlingTests(unittest.TestCase):
         self.assertEqual(0, inner.calls)
 
 
+class ReceiveDelegationTests(unittest.TestCase):
+    """After the body, the guard must hand back the real stream underneath.
+
+    The guard buffers the body to look for `initialize`, so it owes the inner
+    application a `receive` that replays it. The first version then answered
+    `http.disconnect` to every later call, which looks harmless -- the body is
+    finished, what else is there to say.
+
+    A streaming application keeps reading `receive` to notice the client going
+    away. A fabricated disconnect therefore tells it the caller left, and it
+    abandons the response without ever starting one. The symptom is uvicorn's
+    "ASGI callable returned without starting response" and no traceback, because
+    nothing raised. Every test here passed throughout: a non-streaming double
+    reads once and never asks again.
+    """
+
+    def test_a_later_read_reaches_the_real_receive(self) -> None:
+        seen = []
+
+        class Streaming:
+            async def __call__(self, scope, receive, send):
+                seen.append(await receive())
+                # What a streaming app does while it works: watch for the
+                # client leaving rather than assume it has.
+                seen.append(await receive())
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-length", b"0")],
+                })
+                await send({"type": "http.response.body", "body": b""})
+
+        app, _ = build_app(
+            origin="http://mcp.localhost",
+            issuer="http://mcp.localhost",
+            inner=Streaming(),
+            introspection=StubIntrospection({TOKEN: active()}),
+        )
+
+        # Driven directly rather than through the harness, because the harness
+        # answers http.disconnect once its queue empties -- the very value the
+        # bug fabricates, so a test using it cannot tell the two apart. This
+        # receive yields a marker no guard could invent.
+        import asyncio
+
+        body = b'{"method":"tools/list"}'
+        queue = [
+            {"type": "http.request", "body": body, "more_body": False},
+            {"type": "http.request", "body": b"", "more_body": False, "marker": True},
+        ]
+        messages = []
+
+        async def receive():
+            return queue.pop(0) if queue else {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http", "method": "POST", "path": "/mcp",
+            "headers": [
+                (name.lower().encode(), value.encode())
+                for name, value in MODERN.items()
+            ],
+        }
+        asyncio.run(app(scope, receive, send))
+
+        start = next(m for m in messages if m["type"] == "http.response.start")
+        self.assertEqual(200, start["status"], "the runtime abandoned the response")
+        self.assertEqual(body, seen[0]["body"])
+        self.assertTrue(
+            seen[1].get("marker"),
+            "the guard answered its own disconnect instead of the real stream",
+        )
+
+
 class PassThroughTests(unittest.TestCase):
     def test_the_metadata_get_never_meets_the_version_check(self) -> None:
         """It is unauthenticated and read-only: a client reads it *before* it

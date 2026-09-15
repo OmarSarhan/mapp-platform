@@ -1,10 +1,25 @@
-# Three packages, all pure Python, verified to install on musl with no native
-# extension and no build toolchain. That is the whole runtime dependency: the
-# era guard, the metadata surface and the authentication middleware are stdlib.
+# The official MCP SDK, and the ASGI server that runs it.
 #
-# Deliberately NOT the official MCP SDK, which resolves to 28 packages
-# including cryptography, pydantic-core and rpds-py. Adopting it is a change of
-# posture for an image that currently has almost none, and it is a decision to
-# take with a running service in front of us rather than as a side effect of
-# needing something to serve ASGI.
+# This is a deliberate exception to the platform's near-zero-dependency posture,
+# not an oversight. `mcp` resolves to 28 packages including cryptography,
+# pydantic-core and rpds-py, against a runtime that otherwise needs three pure
+# Python ones. All install from musllinux wheels with no build toolchain, which
+# was checked rather than assumed.
+#
+# The trade: MCP 2026-07-28 is not a small protocol to serve correctly. Beyond
+# tools/list and tools/call it wants server/discover, both the JSON and SSE
+# response paths, notification rejection, mandatory resultType, ttlMs and
+# cacheScope on cacheable results, Origin and Host policy, stream closure and
+# keep-alives. Hand-writing that is a second piece of software to keep correct
+# across protocol revisions, and its failure mode is the worst kind -- works
+# against curl, fails against a real client.
+#
+# Conformance is scored by an external wire-level suite
+# (@modelcontextprotocol/conformance), so either choice could have been proved
+# correct. The SDK is simply the one built to pass it.
+#
+# The SDK is contained rather than trusted wholesale: it serves both the modern
+# and legacy handshake eras and exposes no protocol-version allowlist, so
+# era_guard.py runs in front of it and refuses the legacy era before dispatch.
+mcp==2.2.0
 uvicorn==0.53.0
