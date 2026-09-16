@@ -470,7 +470,9 @@ CATALOG = {
                      {"name": "population_quintile", "type": "integer"},
                      {"name": "geom_3857", "type": "geometry"}]},
         {"schema": "source_ops", "table": "bus_stops",
-         "columns": [{"name": "town", "type": "text"}]},
+         # A nameless entry, because the fixture without one let "drop columns
+         # with no name" survive mutation: nothing exercised the guard.
+         "columns": [{"name": "town", "type": "text"}, {"type": "text"}]},
     ],
 }
 
@@ -520,6 +522,15 @@ class CatalogTests(ToolTestCase):
         self.tool(exchange=exchange)()
         self.assertEqual("inspect", exchange.calls[0]["scope"])
         self.assertEqual("catalog.list", exchange.calls[0]["operation_id"])
+
+    def test_a_column_with_no_name_is_dropped(self) -> None:
+        """A nameless column would reach the agent as {"name": null}, which it
+        can only pass back to `layers_values` for a guaranteed refusal."""
+        self.as_caller(caller())
+        result = self.tool()(table="bus_stops")
+        names = [c["name"] for c in result["relations"][0]["columns"]]
+        self.assertEqual(["town"], names)
+        self.assertNotIn(None, names)
 
     def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
         for payload in ({}, {"tables": None}, {"tables": ["x"]}):
