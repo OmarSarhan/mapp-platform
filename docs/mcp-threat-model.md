@@ -344,13 +344,18 @@ Stated plainly, because a threat model that implies otherwise is misleading:
 - **Traffic interception inside the deployment.** The control listener is plain
   HTTP on an internal Docker network. The specification's own transport threat
   model raises mTLS for this; it is not implemented.
-- **Restore-time credential invalidation.** `recovery_epoch` exists as columns
-  and nothing reads them, so restoring a backup reinstates credentials that
-  were valid at snapshot time — including ones revoked since. Deliberately not
-  wired and not scheduled: the measured cost is an epoch predicate on 46 statements across two
-  components, and a single bulk invalidation as a documented restore step would
-  close the same hole more cheaply. Accepted as an open hole by owner
-  decision, revisited at the end of the project.
+- ~~**Restore-time credential invalidation.**~~ **No longer true — this was
+  closed and this document said otherwise for a revision.** The deferral was
+  recorded against a cost estimate — an epoch predicate on 46 statements across
+  two components — that was for the wrong design. Every credential read already
+  filters on a revocation, so the epoch is applied once, at restore, by revoking
+  what predates it; reads never changed, and not one `INSERT` changed either,
+  because rows are stamped by a function-backed column default.
+  `./bin/mapp advance-recovery-epoch --confirm` is step 5 of the restore
+  procedure, before the stack starts, because a pre-restore credential is usable
+  until it has run. The sweep invalidates every *live* credential rather than
+  only those below the counter, which is what makes a newer snapshot restored
+  over an older database behave correctly.
 
 ## Review status
 

@@ -281,11 +281,13 @@ Conditions carried into Phase 1:
   client attestation in part. Each has a revisit condition in the ADR.
 - **Deferred by decision, and not to be forgotten:** Contract 1.7 until after
   Phase 0, and the transactional audit table until after Phase 1.
-- **Not scheduled at all, by decision:** restore-time credential invalidation.
-  `recovery_epoch` stays reserved storage, so a restore reinstates credentials
-  valid at snapshot time including ones revoked since. Treated as a
-  nice-to-have and revisited at the end of the project; the ADR records the
-  cheaper shape if it is ever picked up.
+- **Closed since this was written:** restore-time credential invalidation.
+  `recovery_epoch` is no longer reserved storage. It is wired, audited, covered
+  by 20 tests in `config-ui` and by an effect test in `mcp-auth`, and
+  `./bin/mapp advance-recovery-epoch --confirm` is step 5 of the restore
+  procedure. This condition, the ADR's accepted-risk row and the threat model
+  all still described it as deferred; the ADR's own amendment section did not,
+  so the documents disagreed with each other and with the code.
 
 **Merge.** The single argument for keeping this on the branch was that
 `mapp-mcp` did not exist, so nothing in `main` would use it. That argument has

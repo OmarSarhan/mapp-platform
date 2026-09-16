@@ -5,6 +5,11 @@
   unmitigated threat-model rows (approval fatigue in full, client attestation
   in part) knowingly carried as accepted risks. Phase 1 implementation remains
   gated on the conditions in the evidence bundle.
+- **Revised 2026-09-16**, after `mapp-mcp` was built and a real MCP client drove
+  it end to end. Three amendments are new (P2a, the dashboard registration
+  surface, the consent-withdrawal surface) and two accepted risks are closed.
+  **The new material postdates the owner's acceptance** and is recorded rather
+  than approved.
 - **Scope:** the authorization design for `mapp-mcp`, its deployment topology,
   and the state it owns
 - **Supersedes:** nothing. First ADR in this repository.
@@ -88,11 +93,15 @@ token B — was true of introspection alone for one milestone. Both statements
 that spend or verify a token B now resolve the grant. A token B lives sixty
 seconds, and expiring is not revoking.
 
-**The canonicalizer is vendored twice, not shared.** The components ship as
-separate images with no shared package, and the specification asks for each
+**The canonicalizer is vendored three times, not shared.** The components ship
+as separate images with no shared package, and the specification asks for each
 trust boundary to evaluate the scheme independently so a defective shared helper
 cannot make a bad digest look correct everywhere. Each copy runs the RFC's own
-vectors, and a further test compares the copies directly.
+vectors, and a further test compares the copies directly. The third copy arrived
+with `mapp-mcp`, which also carries the envelope builder; one envelope digest is
+pinned literally and recomputed independently by both builders, which is what
+differential agreement alone cannot give — two copies wrong in the same way
+agree perfectly.
 
 **PostgreSQL is 17, not 13.** The repository's general guidance assumes 13; the
 packaged image is 17. Nothing in the control schema depends on the difference,
@@ -131,17 +140,55 @@ authorization state moved into the database. P19 asks for an append-only audit
 table committed with the effect; that is Phase 1. The current arrangement is
 consistent with the ownership matrix and is recorded as an accepted gap.
 
-**Agent clients are registered by an operator command, not an endpoint.**
-`./bin/mapp mcp-client-register` writes a *public* client — PKCE and no secret,
-because an agent is a native or desktop application that cannot keep one, and
-issuing a secret would create a credential that has to live on the operator's
-machine unprotected. Redirect URIs are validated at registration (absolute, no
-fragment, no userinfo, https unless loopback) because the authorization server
-matches them exactly and a permissive entry is a working way to have
-authorization codes delivered elsewhere. `full` and `admin` are refused
-outright. RFC 7591 dynamic registration is rejected rather than deferred: P2
-requires one *pinned* client per ecosystem, and a person decides which agent
-may ask for consent.
+**Agent clients are registered by a person, from either of two operator
+surfaces.** `./bin/mapp mcp-client-register` and the dashboard's Access and
+audit panel write the same *public* client — PKCE and no secret, because an
+agent is a native or desktop application that cannot keep one, and issuing a
+secret would create a credential that has to live on the operator's machine
+unprotected. Redirect URIs are validated at registration (absolute, no fragment,
+no userinfo, https unless loopback) because the authorization server matches them
+exactly and a permissive entry is a working way to have authorization codes
+delivered elsewhere. `full` and `admin` are refused outright. RFC 7591 dynamic
+registration is rejected rather than deferred: P2 requires one *pinned* client
+per ecosystem, and a person decides which agent may ask for consent.
+
+*Amended after Phase 0.* The command was originally the only surface, which made
+the person who runs the platform and the person who runs the agent the same
+person, or required them to exchange a client id out of band. The dashboard
+route is administrator-session only and refuses a bearer token including `full`;
+it composes the configuration the operator hands over, because a client id
+retyped by hand gets the byte-exact redirect URI wrong. Registration still
+grants nothing by itself — the operator signs in and consents before the client
+can do anything — which is what keeps a second registration surface from being a
+second privilege.
+
+**Consent has an operator surface, and until Phase 0 ended it did not.** A grant
+is the unit of revocation in this design, and revoking one was reachable only
+from `mcp-auth`'s control listener, which no operator-facing path called. The
+strongest claim the design makes — that withdrawing a consent invalidates every
+credential derived from it, including an exchanged token already issued and not
+yet spent — was therefore reachable only from a test. The dashboard now lists
+every grant with the client holding it and a live refresh-family count, and
+revokes on one conditional write. Measured against the running platform:
+the agent's next call answered `401` and its refresh answered `invalid_grant`.
+
+**P2a — two protocol revisions are served, not one.** The specification fixed
+`2026-07-28` and told Phase 0 to document any ecosystem that could not reach it
+as unsupported rather than add a legacy transport path. Claude Code 2.1.272
+offers `2025-11-25` and nothing else, so under the original rule the
+three-ecosystem release gate could be met by no shipped client at all.
+
+The amendment costs less than the rule assumed, which is why it is an amendment
+rather than a deviation: the SDK already serves the handshake era, so admitting
+it removed a refusal rather than adding a transport, and `stateless_http`
+completes a full legacy session without minting a session identifier. It also
+made the guard stricter. The SDK negotiates an `initialize` to whatever the
+client offers — 2024-11-05 verbatim, an unrecognisable offer counter-offered
+2025-11-25 — so letting the method through unpoliced would have admitted four
+revisions and a fallback. The guard reads the offered revision out of the body
+and refuses everything that is not the single admitted handshake revision.
+Authorization is untouched: the guard runs before authentication and no
+credential, audience or binding rule differs between the eras.
 
 **O18 is resolved as state-based reconciliation.** Of the three options — a
 two-phase response, background-submittable apply and reload, or reconciliation
@@ -243,13 +290,14 @@ four paths on the MCP origin. Both are asserted, in different suites.
 | # | Item | Accepted because | Revisit condition |
 | --- | --- | --- | --- |
 | 1 | ~~No agent client can be registered~~ **Closed in Phase 0** | `./bin/mapp mcp-client-register` registers a public client, and the full flow is proven end to end against one | — |
-| 2 | The digest producer does not exist | `mapp-mcp` is Phase 1. The verifying boundary is built and proven against the broker over real HTTP | Phase 1; the third independent canonicalizer is required at that point |
+| 2 | ~~The digest producer does not exist~~ **Closed** | `mapp-mcp` is built. It carries the third independent canonicalizer and the envelope builder, cross-checked against the other copies and against a pinned golden vector, and a real client has driven a digest-bound request end to end | — |
 | 3 | Only one abuse budget exists | The per-grant exchange cap closes the one unbounded multiplier; P11's remaining budgets are provisional and measured in Phase 6 | Phase 6 for figures |
 | 4 | Audit not transactional with the effect | Owner decision: deferred past Phase 1. The file store is durable and append-only | After Phase 1 |
-| 5 | `recovery_epoch` unimplemented | Owner decision: a nice-to-have, not Phase 1 scope. No restore-invalidation control is claimed anywhere in operation | End of project, or the first time a restore has to preserve a revocation |
+| 5 | ~~`recovery_epoch` unimplemented~~ **Closed** | Wired in Phase 1, as the amendment above records: `control.current_recovery_epoch()`, a function-backed column default, `./bin/mapp advance-recovery-epoch --confirm` as step 5 of the restore procedure, and the sweep audited. Covered by 20 tests in `config-ui/tests/test_recovery_epoch.py` and by `mcp-auth/tests/test_recovery_epoch_effect.py`, which asserts the effect on the component that reads the credentials. This row contradicted the amendment for one revision | — |
 | 6 | O20 — `form-action 'self'` across the consent redirect | The Phase 0 harness drives `http.client`, which enforces no CSP, so this is unverifiable by construction in that harness. Deferred by the owner more than once, deliberately: the flow is otherwise proven end to end | Before any public route. One manual check in Chromium, Firefox and Safari; if it fails, widen the directive to name the registered redirect origins |
 | 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
-| 8 | Client acceptance is 1 of 3 | The authorization column is proven for one client against the real component. Codex/OpenAI and Gemini are untested, and SDK support is not client acceptance | Blocking for release |
+| 8 | Client acceptance is 1 of 3 | The Claude column is now complete rather than only its authorization half: Claude Code 2.1.272 connected to the running platform, listed the tools and called them. Codex/OpenAI and Gemini are untested, and SDK support is still not client acceptance. The container harness that proved Claude transfers directly, so this is scheduled work rather than open research | Blocking for release |
+| 9 | Two threat-model rows postdate the owner's acceptance | Credential administration from a browser session and serving a second protocol era were added after the surfaces were built. Both are mitigated and recorded; neither has been through an acceptance decision | At the next acceptance review, before any public route |
 
 ## References
 
