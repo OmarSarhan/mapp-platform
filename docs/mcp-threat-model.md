@@ -16,8 +16,10 @@ remains unbuilt is the approval flow: P8's receipts and review packets are Phase
 1, so the approval-forgery row below still describes a control that is designed
 and not yet built.
 
-**Accepted by the owner for this version**, with the two unmitigated rows below
-— approval fatigue in full, client attestation in part — carried knowingly.
+**Accepted by the owner**, most recently on 2026-09-16 covering all ten abuse
+cases, with the two unmitigated rows below — approval fatigue in full, client
+attestation in part — carried knowingly. O20, carried as an unverified control
+through Phase 0, is now measured and closed.
 
 ## Assets
 
@@ -133,10 +135,17 @@ move away from constant-time comparison and is documented at the call site.
 
 **Residual:** `SameSite=Lax` is required — the specification's own diagnosis is
 that `Strict` will not ride the agent's top-level handoff navigation — so it is
-weaker than `Strict` by necessity. And **O20 is unresolved**: whether
-`form-action 'self'` survives the cross-origin redirect the consent POST answers
-with is unverified, because the Phase 0 harness enforces no CSP. This needs a
-manual check in three engines before any public route.
+weaker than `Strict` by necessity.
+
+**O20 is resolved, and it had failed.** Driven in Chromium, Firefox and WebKit,
+`form-action 'self'` did not survive the cross-origin redirect the consent POST
+answers with: Chromium and WebKit re-check the directive across the redirect and
+refused to follow it. All three delivered the POST first, so the grant existed
+and only the authorization code was lost — consent recorded, agent silent. The
+directive now names the client's own redirect origin, taken from the pending
+record the server has already matched exactly; re-measured, all three engines
+reach the callback. WebKit is the engine Safari ships, driven here through
+Playwright rather than Safari itself.
 
 ### Approval forgery
 
@@ -371,9 +380,9 @@ here because the surface changed rather than because the gate asked — a threat
 model that only ever answers its original checklist stops describing the system
 it is about.
 
-**The owner's acceptance predates those two rows.** It was given for the eight
-above; these are recorded, not yet accepted, and the acceptance line at the top
-of this document should be re-taken with them in view.
+**Both were accepted by the owner on 2026-09-16**, together with the rest of
+this revision. The acceptance line at the top of this document now covers ten
+cases rather than eight.
 
 The owner has accepted this document for this version with those two rows
 carried knowingly. That acceptance is not a claim they are mitigated — it is a

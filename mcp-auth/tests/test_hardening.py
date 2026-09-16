@@ -715,3 +715,62 @@ class PasswordInteropTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FormActionSourceTests(unittest.TestCase):
+    """The CSP source derived from a client's redirect URI.
+
+    O20 measured what `form-action 'self'` alone does to the consent redirect:
+    Chromium and WebKit block it, Firefox does not, and all three deliver the
+    POST first -- so the grant exists and the code is lost. This is the value
+    that fixes it, so what it emits for each shape of redirect URI is the whole
+    control.
+    """
+
+    def source(self, uri):
+        import pages
+
+        return pages.form_action_source(uri)
+
+    def test_a_loopback_origin_keeps_its_port(self) -> None:
+        """The port is part of the origin. Dropping it would fail to match the
+        redirect and re-open exactly what this closes."""
+        self.assertEqual("http://127.0.0.1:8484", self.source("http://127.0.0.1:8484/callback"))
+        self.assertEqual("http://localhost:8484", self.source("http://localhost:8484/callback"))
+
+    def test_the_path_and_query_are_dropped(self) -> None:
+        """An origin source, deliberately: CSP path matching has its own rules,
+        and the redirect URI is already matched exactly by the server before
+        this page renders."""
+        self.assertEqual(
+            "https://agent.example", self.source("https://agent.example/cb?x=1#f")
+        )
+
+    def test_a_private_use_scheme_becomes_a_scheme_source(self) -> None:
+        """A native client's `com.example.app:/cb` has no authority, and CSP
+        expresses those as a bare scheme source."""
+        self.assertEqual("com.example.app:", self.source("com.example.app:/callback"))
+
+    def test_anything_unparseable_widens_nothing(self) -> None:
+        """Failing closed leaves the policy at 'self', which is a visible
+        failure rather than a silently widened one."""
+        for value in ("", "/relative/only", "not a uri", "???"):
+            with self.subTest(value=value):
+                self.assertEqual("", self.source(value))
+
+    def test_the_policy_falls_back_to_self_when_the_source_is_empty(self) -> None:
+        import pages
+
+        policy = pages.content_security_policy("n0nce", form_action=("",))
+        self.assertIn("form-action 'self';", policy)
+
+    def test_the_policy_never_emits_a_wildcard(self) -> None:
+        import pages
+
+        for uri in ("http://localhost:8484/cb", "https://a.example/cb", "app.x:/cb"):
+            with self.subTest(uri=uri):
+                policy = pages.content_security_policy(
+                    "n0nce", form_action=(pages.form_action_source(uri),)
+                )
+                self.assertNotIn("*", policy)
+                self.assertIn("default-src 'none'", policy)

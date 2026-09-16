@@ -208,10 +208,29 @@ nobody gave it. The flag makes a window fail closed on anything it does not
 name. Publication lands in Contract 1.7, which is deferred past Phase 0 by
 decision; Phase 0 built no standing approval, so nothing depends on it yet.
 
-**O20 — `form-action 'self'` across the consent redirect.** **Still open, and
-unclosable in this harness.** The suite drives `http.client`, which enforces no
-CSP. Needs one manual check in Chromium, Firefox and Safari. If it fails, widen
-the directive to name the registered redirect origins.
+**O20 — `form-action 'self'` across the consent redirect. RESOLVED: it failed,
+and the directive is widened.** Unclosable in the unit harness, which drives
+`http.client` and enforces no CSP, so it was driven headlessly in Chromium,
+Firefox and WebKit against the running platform.
+
+| Engine | Before | After |
+| --- | --- | --- |
+| Chromium | blocked the redirect | reaches the callback |
+| Firefox | followed the redirect | reaches the callback |
+| WebKit | blocked the redirect | reaches the callback |
+
+Two of three blocked it, which is the answer the item existed to get. The
+failure mode matters more than the count: every engine delivered the consent
+POST *before* blocking, so the grant was created each time and only the
+authorization code was lost. The operator had consented, the platform held a
+live grant, and the agent received nothing — worse than a clean refusal, because
+one side looks like success and the other like silence. Three grants per run,
+one per engine, confirmed in `control.oauth_grants`.
+
+`form-action` now names the client's own redirect origin, derived from the
+pending authorization record — the redirect the server has already matched
+exactly, so no submission can widen it. Safari itself was not driven; WebKit,
+the engine it ships, was, through Playwright on Linux.
 
 ## Re-estimate
 
@@ -233,6 +252,13 @@ commit with the effect, which the current file-backed audit does not.
 ## Recommendation
 
 **Conditional go. Phase 1 design work approved. No public route.**
+
+**Owner decision, 2026-09-16: go.** Phase 1 design work approved, and the
+conditions below accepted as recorded — refresh semantics as built, P2a's two
+revisions, dashboard credential administration, and the two threat-model rows
+added this revision. Merge approved with one condition: **the MCP feature stays
+off `main`.** That condition has two possible readings and is recorded here
+verbatim rather than interpreted — see the merge note below.
 
 Updated twice. First after the owner's decisions, when agent client
 registration closed the merge blocker. Again on 2026-09-16, after `mapp-mcp` was
@@ -268,10 +294,13 @@ this document exists to prevent.
 
 Conditions carried into Phase 1:
 
-- **O20 must be checked manually in Chromium, Firefox and Safari before any
-  public route.** It is the only open item needing no engineering — one person
-  and three browsers — and it cannot be closed by any test in this harness. Deferred by the owner
-  more than once, deliberately; the trigger is a public route, not a date.
+- ~~**O20 must be checked manually in Chromium, Firefox and Safari**~~
+  **Closed 2026-09-16, and it failed before it passed.** Driven headlessly in
+  all three engines against the running platform: `form-action 'self'` did not
+  survive the consent redirect in Chromium or WebKit, and every engine delivered
+  the POST first — so the grant was created and only the code was lost. The
+  directive now names the client's own redirect origin and all three reach the
+  callback. Safari itself was not driven; WebKit, the engine it ships, was.
 - **Connection pooling is a Phase 1 requirement**, not a revisit condition,
   because multi-operator use is expected and the ceiling of 8 is a ceiling.
 - **Phase 1 owes the unambiguous proposal state** that O18's reconciliation
@@ -304,10 +333,24 @@ warning enumerated only dashboard authentication, CLI API tokens and device
 authorizations. The recovery-epoch command names grants; the reset did not, so
 the two disagreed about what the database contains.
 
-Recommended: prepare the merge — confirm the migration ladder applies to an
-existing volume, and land it behind the existing "no public route" condition.
-Keeping a proven component unmerged has its own cost, which is that every
-subsequent change is made against a branch nobody else runs.
+The owner has approved merging with the condition that **the MCP feature stays
+off `main`**. That admits two readings, and they are not close:
+
+1. **Merge the code, keep the feature dormant.** Everything lands on `main`, and
+   `mapp-mcp` and `mcp-auth` do not start, are not routed, and are not reachable
+   unless explicitly enabled. `main` carries and tests the code; the running
+   product is unchanged.
+2. **Merge only what is not MCP.** The MCP components stay on the branch
+   entirely. Since nearly every commit here is MCP work, this merges very
+   little — mainly the reset-system warning fix and the recovery-epoch work.
+
+Reading 1 keeps the benefit the merge was argued for, which is that the code
+stops being maintained against a branch nobody else runs. Reading 2 keeps `main`
+free of the control schema and the `mapp_control` role entirely. **Not yet
+resolved; the decision is the owner's and this document does not assume one.**
+
+Either way the merge preparation is the same: confirm the migration ladder
+applies to an existing volume, and keep the "no public route" condition.
 
 ## Reproducing this
 

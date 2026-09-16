@@ -346,6 +346,42 @@ class AuthorizationFlowTests(unittest.TestCase):
         ).metadata_document()
         AuthorizationServerMetadata(production).validate(metadata_classes=[IssMetadata])
 
+    def test_the_consent_policy_admits_the_client_s_own_redirect_origin(
+        self,
+    ) -> None:
+        """O20, measured in three engines and then fixed here.
+
+        The consent POST is answered with a 302 to the client's cross-origin
+        redirect_uri. Chromium and WebKit re-check `form-action` across that
+        redirect and blocked it; Firefox did not. All three delivered the POST
+        first, so the grant was created every time and only the authorization
+        code was lost -- the operator had consented, the platform held a live
+        grant, and the agent got nothing. A clean refusal would have been
+        better; this looked like success on one side and silence on the other.
+
+        The origin comes from the pending record, which is the redirect the
+        server already matched exactly, so the policy cannot be widened by
+        anything a submission proposes.
+        """
+        cookie, rid = self.sign_in()
+        _, headers, _ = self.request(
+            "GET", f"/oauth/authorize?rid={rid}", cookie=cookie
+        )
+        policy = headers["Content-Security-Policy"]
+        origin = "http://127.0.0.1:9"
+        self.assertIn(f"form-action 'self' {origin}", policy)
+        # Still an origin, never the bare path or a wildcard.
+        self.assertNotIn("*", policy)
+        self.assertNotIn("/callback", policy)
+
+    def test_the_login_policy_stays_self_only(self) -> None:
+        """Only the consent submission crosses origins. Widening the login page
+        too would extend the directive to a page that never needs it."""
+        _, _, _ = self.request("GET", self.authorize_url())
+        cookie, rid = self.sign_in()
+        _, headers, _ = self.request("GET", f"/oauth/login?rid={rid}")
+        self.assertIn("form-action 'self';", headers["Content-Security-Policy"])
+
     def test_content_security_policy_forbids_script(self) -> None:
         status, headers, _ = self.request("GET", self.authorize_url())
         rid = urllib.parse.parse_qs(urllib.parse.urlsplit(headers["Location"]).query)["rid"][0]

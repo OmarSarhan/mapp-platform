@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import html
 import secrets
+import urllib.parse
 
 #: 'form-action' has no default-src fallback in CSP3, so it is stated explicitly.
 #:
@@ -27,15 +28,45 @@ import secrets
 #: nonce's real value is that it stops being correct the moment someone adds an
 #: interpolation, which 'unsafe-inline' would silently tolerate.
 #:
-#: Note 'form-action self' sits on the critical path: the consent POST answers
-#: with a 302 to the client's cross-origin redirect_uri, and some engines have
-#: historically applied form-action across that redirect. The test harness
-#: drives http.client, which enforces no CSP, so this is unverified in a real
-#: browser -- see the open item in the review notes.
+#: 'form-action' sits on the critical path, and `'self'` alone is not enough:
+#: the consent POST answers with a 302 to the client's cross-origin
+#: redirect_uri, and engines disagree about whether form-action is re-checked
+#: across that redirect. Measured in three engines (O20):
+#:
+#:   Firefox   follows the redirect
+#:   Chromium  blocks it, reporting the *form's* action URL, not the redirect
+#:   WebKit    blocks it, naming the redirect target
+#:
+#: All three delivered the POST, so the grant was created every time and only
+#: the authorization code was lost -- the operator sees a blocked page having
+#: already consented, and the platform holds a live grant nobody can use. That
+#: is worse than a clean refusal, which is why the directive names the client's
+#: own redirect origin rather than relying on `'self'`.
+#:
+#: The origin, not the full URI. The redirect_uri is already matched exactly by
+#: the authorization server before this page renders, so the CSP is defence in
+#: depth over a value that has been checked; an origin source avoids CSP's path
+#: matching rules without widening anything the server did not already accept.
 CSP_TEMPLATE = (
-    "default-src 'none'; style-src 'nonce-{nonce}'; form-action 'self'; "
+    "default-src 'none'; style-src 'nonce-{nonce}'; form-action {form_action}; "
     "frame-ancestors 'none'; base-uri 'none'"
 )
+
+
+def form_action_source(redirect_uri: str) -> str:
+    """The CSP source a consent redirect to `redirect_uri` needs, or "".
+
+    A private-use scheme (`com.example.app:/cb`) has no authority, and CSP
+    expresses those as a bare `scheme:` source. Anything unparseable returns
+    empty rather than guessing, which leaves the policy at `'self'` -- strict,
+    and a visible failure rather than a silently widened one.
+    """
+    parts = urllib.parse.urlsplit(redirect_uri)
+    if not parts.scheme:
+        return ""
+    if parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return f"{parts.scheme}:"
 
 STYLE = """
 :root { color-scheme: light dark }
@@ -60,8 +91,15 @@ def new_nonce() -> str:
     return base64.b64encode(secrets.token_bytes(16)).decode()
 
 
-def content_security_policy(nonce: str) -> str:
-    return CSP_TEMPLATE.format(nonce=nonce)
+def content_security_policy(nonce: str, *, form_action: tuple[str, ...] = ()) -> str:
+    """The policy for one page. `form_action` adds origins beyond `'self'`.
+
+    Only the consent page passes any: it is the one page whose submission is
+    answered with a cross-origin redirect. The login page keeps `'self'`, which
+    is what its own POST and same-origin redirect need.
+    """
+    sources = " ".join(("'self'", *(item for item in form_action if item)))
+    return CSP_TEMPLATE.format(nonce=nonce, form_action=sources)
 
 
 def _document(*, title: str, nonce: str, body: str) -> str:

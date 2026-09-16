@@ -6,10 +6,16 @@
   in part) knowingly carried as accepted risks. Phase 1 implementation remains
   gated on the conditions in the evidence bundle.
 - **Revised 2026-09-16**, after `mapp-mcp` was built and a real MCP client drove
-  it end to end. Three amendments are new (P2a, the dashboard registration
-  surface, the consent-withdrawal surface) and two accepted risks are closed.
-  **The new material postdates the owner's acceptance** and is recorded rather
-  than approved.
+  it end to end. Four amendments are new (P2a, the dashboard registration
+  surface, the consent-withdrawal surface, and the consent CSP widened after
+  O20 failed) and three accepted risks are closed.
+- **Accepted by the owner, 2026-09-16**, covering all of the above:
+  refresh-token semantics as built (30-day families, rotation with replay
+  detection, 30-second retry grace); P2a's two-revision support; dashboard
+  credential administration; the two threat-model rows added this revision; and
+  advancing past Phase 0 into Phase 1 design. Merge approved **on the condition
+  that the MCP feature stays off `main`** — see the merge note in the evidence
+  bundle.
 - **Scope:** the authorization design for `mapp-mcp`, its deployment topology,
   and the state it owns
 - **Supersedes:** nothing. First ADR in this repository.
@@ -172,6 +178,26 @@ every grant with the client holding it and a live refresh-family count, and
 revokes on one conditional write. Measured against the running platform:
 the agent's next call answered `401` and its refresh answered `invalid_grant`.
 
+**The consent page's `form-action` names the client's redirect origin, not just
+`'self'` (O20).** This was carried as an open risk through Phase 0 because the
+test harness drives `http.client`, which enforces no CSP. Driven in three real
+engines it failed in two: Chromium and WebKit re-check `form-action` across the
+302 the consent POST answers with, and refused to follow it; Firefox did not.
+
+The failure mode is why this was worth closing rather than carrying. All three
+engines delivered the POST *before* the block, so the grant was created every
+time and only the authorization code was lost — the operator had consented, the
+platform held a live grant, and the agent received nothing. A clean refusal
+would have been better than success on one side and silence on the other.
+
+The origin is derived from the pending authorization record, which is the
+redirect the server has already matched exactly, so nothing a submission
+proposes can widen the policy. An origin rather than the full URI, because CSP
+path matching has its own rules and the path adds no protection over a value
+the server already checked. A private-use scheme becomes a bare `scheme:`
+source; anything unparseable yields nothing and leaves the policy at `'self'`,
+which fails visibly rather than widening silently.
+
 **P2a — two protocol revisions are served, not one.** The specification fixed
 `2026-07-28` and told Phase 0 to document any ecosystem that could not reach it
 as unsupported rather than add a legacy transport path. Claude Code 2.1.272
@@ -294,7 +320,7 @@ four paths on the MCP origin. Both are asserted, in different suites.
 | 3 | Only one abuse budget exists | The per-grant exchange cap closes the one unbounded multiplier; P11's remaining budgets are provisional and measured in Phase 6 | Phase 6 for figures |
 | 4 | Audit not transactional with the effect | Owner decision: deferred past Phase 1. The file store is durable and append-only | After Phase 1 |
 | 5 | ~~`recovery_epoch` unimplemented~~ **Closed** | Wired in Phase 1, as the amendment above records: `control.current_recovery_epoch()`, a function-backed column default, `./bin/mapp advance-recovery-epoch --confirm` as step 5 of the restore procedure, and the sweep audited. Covered by 20 tests in `config-ui/tests/test_recovery_epoch.py` and by `mcp-auth/tests/test_recovery_epoch_effect.py`, which asserts the effect on the component that reads the credentials. This row contradicted the amendment for one revision | — |
-| 6 | O20 — `form-action 'self'` across the consent redirect | The Phase 0 harness drives `http.client`, which enforces no CSP, so this is unverifiable by construction in that harness. Deferred by the owner more than once, deliberately: the flow is otherwise proven end to end | Before any public route. One manual check in Chromium, Firefox and Safari; if it fails, widen the directive to name the registered redirect origins |
+| 6 | ~~O20 — `form-action 'self'` across the consent redirect~~ **Closed** | Measured in three engines and it failed in two: Chromium and WebKit re-check `form-action` across the consent redirect and blocked it, Firefox did not. The directive now names the client's own redirect origin, taken from the pending record. Re-measured: all three reach the callback | — |
 | 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
 | 8 | Client acceptance is 1 of 3 | The Claude column is now complete rather than only its authorization half: Claude Code 2.1.272 connected to the running platform, listed the tools and called them. Codex/OpenAI and Gemini are untested, and SDK support is still not client acceptance. The container harness that proved Claude transfers directly, so this is scheduled work rather than open research | Blocking for release |
 | 9 | Two threat-model rows postdate the owner's acceptance | Credential administration from a browser session and serving a second protocol era were added after the surfaces were built. Both are mitigated and recorded; neither has been through an acceptance decision | At the next acceptance review, before any public route |

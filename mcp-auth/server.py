@@ -158,9 +158,14 @@ def _cookie(handler, name: str) -> str | None:
     return morsel.value if morsel else None
 
 
-def _html(handler, status: int, body: str, nonce: str, extra=()) -> None:
+def _html(handler, status: int, body: str, nonce: str, extra=(), form_action=()) -> None:
     headers = list(HTML_HEADERS)
-    headers.append(("Content-Security-Policy", pages.content_security_policy(nonce)))
+    headers.append(
+        (
+            "Content-Security-Policy",
+            pages.content_security_policy(nonce, form_action=form_action),
+        )
+    )
     headers.extend(extra)
     MappResponse(status, body, headers).write_to(handler)
 
@@ -397,6 +402,11 @@ def authorize_get(handler) -> None:
             scopes=pending.scopes,
         ),
         nonce,
+        # The one page whose submission is answered across origins. Derived
+        # from the pending record rather than the request, so it is the
+        # redirect the server has already matched exactly and will actually
+        # send -- not one a submission could propose.
+        form_action=(pages.form_action_source(pending.redirect_uri),),
     )
 
 
