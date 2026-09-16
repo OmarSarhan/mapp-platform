@@ -9,9 +9,12 @@ pinned. Where there is no control, the row says so rather than describing an
 intention — a threat model whose mitigations are aspirations is worse than none,
 because it stops people looking.
 
-**Read this as covering an unmerged feasibility spike.** Two of the assets below
-have no producer yet: `mapp-mcp` does not exist, so nothing produces a request
-digest in anger.
+**Read this as covering an unmerged feasibility spike.** `mapp-mcp` now exists
+and a real MCP client has driven it end to end, so the request digest and the
+execution binding have a producer and are exercised rather than assumed. What
+remains unbuilt is the approval flow: P8's receipts and review packets are Phase
+1, so the approval-forgery row below still describes a control that is designed
+and not yet built.
 
 **Accepted by the owner for this version**, with the two unmitigated rows below
 — approval fatigue in full, client attestation in part — carried knowingly.
@@ -39,7 +42,7 @@ never stored, never logged.
    Caddy publishes exactly four paths; the component's edge route table
    independently contains no `/internal/*` path.
 3. **The `mcp-control` network.** The control listener, reachable only by
-   `config-ui` and (in Phase 1) `mapp-mcp`. Every call is authenticated as a
+   `config-ui` and `mapp-mcp`. Every call is authenticated as a
    confidential OAuth client over HTTP Basic; network placement is not treated
    as authentication.
 4. **Component → `control` schema**, as `mapp_control`, which can create nothing
@@ -154,6 +157,68 @@ Phase 0 has consent, not per-effect approval, so a grant with `apply` authorises
 any `apply` operation the allowlist permits for its lifetime — the *token* is
 request-bound, the *grant* is not.
 
+### Credential administration from a browser session
+
+New in this revision, and a real change to what a web session can reach. An
+administrator can now register an agent client and revoke a consent from the
+dashboard; previously registration needed shell access to the host and
+revocation had no operator surface at all. So the set of privileged actions
+reachable by riding an authenticated session has grown.
+
+What bounds it:
+
+- **Administrator session only.** Every route checks the session actor and
+  refuses a bearer token, including `full` — the widest credential the platform
+  issues. Credential administration is deliberately not delegable to a token,
+  and the check is written out per route with a test per route, plus one that
+  derives the set of administrator reads from the dispatch so a new one cannot
+  be added unguarded.
+- **Registering a client grants nothing.** This is the property that keeps the
+  new surface from being privilege escalation: a registered client can ask for
+  consent and can do nothing until an operator signs in, is shown the scopes and
+  approves them. An attacker who registers a client has created something that
+  still needs the operator credential to become useful, and the registration is
+  in the audit log.
+- **`full` and `admin` are refused at registration**, so a client cannot be
+  created carrying the scopes the broker's deny-list exists to stop.
+- **Revocation fails safe.** The worst an attacker achieves by revoking is
+  denial of service — consents stop working and operators re-consent. It removes
+  authority and never grants it, which is the direction an attacker does not
+  want and an operator under attack does.
+- **Both actions are audited** with the acting surface distinguished: `admin`
+  for the dashboard, `local-admin` for the command line, so the log answers
+  which route was used and not merely that it happened.
+
+**Residual:** these routes inherit the dashboard's CSRF and cookie posture
+rather than adding their own, so they are exactly as strong as the session that
+reaches them — `SameSite=Strict` on the configuration origin and an
+`X-CSRF-Token` on every state change. A session compromise is already total for
+the dashboard; what this adds is that it now also reaches agent registration.
+The mitigation for that is not in this component but in the operator credential,
+and P20 already records that separation of duty is not enforceable with a single
+shared administrator identity.
+
+### A second protocol era is served
+
+P2a admits the `2025-11-25` handshake alongside `2026-07-28`. Serving two eras
+is the kind of change that usually widens a surface, and here it did not, for
+reasons worth recording rather than re-deriving later:
+
+- **The allowlist got stricter, not laxer.** The SDK behind the guard negotiates
+  an `initialize` to whatever the client offers — 2024-11-05 verbatim, and an
+  unrecognisable offer counter-offered 2025-11-25 — so admitting the method
+  without policing it would have admitted four revisions and a fallback. The
+  guard reads the offered revision out of the body and refuses everything that
+  is not the single admitted handshake revision.
+- **No session identifier is minted.** The handshake era is session-based, so
+  the obvious cost would have been accepting `Mcp-Session-Id` and the state
+  behind it. Measured across a full legacy session — initialize, notification,
+  list, call — none is emitted, and the guard strips the header from anything
+  the inner application sends regardless.
+- **Authorization is untouched by era.** The guard runs before authentication,
+  every scope check is era-independent, and no credential, audience or binding
+  rule differs between the two.
+
 ### State exhaustion
 
 Parked authorization records are capped at 64 per source with a global backstop
@@ -226,7 +291,9 @@ service joins that network. This is a recorded delta rather than a renewal, and
 saying which is the point: the original analysis is not re-derived here, so a
 reader should treat the two together rather than this alone.
 
-`mapp-mcp` joins, as P12 requires. What changes:
+`mapp-mcp` has joined, as P12 requires. This was written before it did; the
+claims below are now checked against the running deployment rather than
+predicted, and each is marked where that changed the evidence. What changes:
 
 - **One more peer can reach the control listener.** It authenticates as a
   confidential client like config-ui, so the listener's admission rule is
@@ -237,8 +304,12 @@ reader should treat the two together rather than this alone.
 - **It reaches nothing else.** No `backend`, so no database, and no `edge`. It
   holds no database credential by design and reaches platform state only through
   authenticated API calls, which is the constraint the whole topology rests on.
+  *Checked on the running container: it is attached to `mcp-control` and to no
+  other network, and its environment carries no database URL of any kind.*
 - **Its public surface is a Unix socket**, mode 0660, in a directory shared with
-  Caddy alone. That is the same shape as the authorization component's edge
+  Caddy alone. *Checked: `srw-rw----`. Worth checking rather than asserting,
+  because uvicorn hard-codes `uds_perms = 0o666`; the component binds the socket
+  itself to avoid that.* That is the same shape as the authorization component's edge
   socket, and it is why `mapp-mcp` needs no edge network: nothing can reach it
   from a network at all, so a misconfigured route cannot expose it.
 - **What it can do with its credential is bounded by what the listener offers**:
@@ -287,6 +358,17 @@ The abuse cases the Phase 0 gate names are covered above: replay, confused
 deputy, SSRF, credential theft, approval forgery, state exhaustion, approval
 fatigue and compromised client. Two carry no mitigation (approval fatigue in
 full, client attestation in part) and one carries an unverified control (O20).
+
+Two further cases were added after the runtime and the dashboard surfaces were
+built, beyond the list the gate names: credential administration from a browser
+session, and serving a second protocol era. Neither is unmitigated, and both are
+here because the surface changed rather than because the gate asked — a threat
+model that only ever answers its original checklist stops describing the system
+it is about.
+
+**The owner's acceptance predates those two rows.** It was given for the eight
+above; these are recorded, not yet accepted, and the acceptance line at the top
+of this document should be re-taken with them in view.
 
 The owner has accepted this document for this version with those two rows
 carried knowingly. That acceptance is not a claim they are mitigated — it is a

@@ -170,7 +170,7 @@ records an amendment.
 | Token A/B audience separation, non-widening exchange, revocation propagation | **done**, and now also measured on the deployed stack | All three pinned by test. Against the running platform: a token A presented to the configuration API is refused `401`; revoking a consent from the dashboard left the agent's next call answering `401` and its refresh answering `invalid_grant`; disabling a client refused a refresh carrying an *unspent* token. The residual window on a live token A is the runtime's positive introspection cache, bounded at 30 seconds — measured at 4 |
 | Canonicalization golden vectors independently in three implementations | **3 of 3** | RFC vectors run against all three copies, plus cross-copy comparison. One *envelope* digest is pinned literally and recomputed independently by both builders, which is what differential agreement alone could not give: two copies wrong in the same way agree perfectly |
 | Benchmark the control schema under contention; record capacity, failure, recovery | **done** | Table above; `scripts/control_plane_benchmark.py` |
-| Threat-model and abuse-case review | **done, unapproved** | [`mcp-threat-model.md`](mcp-threat-model.md) — 8 cases; 1 unmitigated, 1 unverified |
+| Threat-model and abuse-case review | **done; 8 cases accepted, 2 recorded and not yet accepted** | [`mcp-threat-model.md`](mcp-threat-model.md) — 10 cases; 1 unmitigated, 1 unverified. The two added after the runtime and dashboard surfaces were built (credential administration from a browser session, serving a second protocol era) postdate the owner's acceptance |
 
 ### Documented and reviewed
 
