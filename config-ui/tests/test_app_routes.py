@@ -9801,6 +9801,36 @@ class McpGrantRouteTests(unittest.TestCase):
                 getattr(control, control_method).assert_not_called()
 
 
+class OperationRouteIndexTests(unittest.TestCase):
+    """Every action must be reachable by an exchanged credential.
+
+    The index read only `pathTemplate`, and `ACTION_SCHEMAS` writes `path` for a
+    route with no parameters -- so every fixed-path action was missing from it
+    and answered `auth.operation_unresolved`, which reads like a deliberate
+    refusal rather than a route nobody registered. Found when the first MCP tool
+    pointing at one was driven against the deployed stack.
+    """
+
+    def test_every_action_is_indexed(self) -> None:
+        indexed = {name for names in app.OPERATIONS_BY_ROUTE.values() for name in names}
+        missing = sorted(set(app.ACTION_SCHEMAS) - indexed)
+        self.assertEqual([], missing, f"unreachable by an exchanged credential: {missing}")
+
+    def test_fixed_path_actions_are_indexed_under_their_own_path(self) -> None:
+        """Named explicitly, because "every action is indexed" would also pass
+        if fixed paths were indexed under something wrong."""
+        for name, schema in app.ACTION_SCHEMAS.items():
+            if schema.get("pathTemplate") or not schema.get("path"):
+                continue
+            with self.subTest(action=name):
+                key = (schema["method"], schema["path"])
+                self.assertIn(name, app.OPERATIONS_BY_ROUTE.get(key, ()))
+
+    def test_the_index_is_not_empty(self) -> None:
+        """Otherwise both assertions above pass by finding nothing."""
+        self.assertGreater(len(app.OPERATIONS_BY_ROUTE), 20)
+
+
 class AdminSurfaceGuardTests(unittest.TestCase):
     """Every administrator read, derived from the source rather than listed.
 

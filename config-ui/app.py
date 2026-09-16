@@ -355,8 +355,19 @@ if MCP_TOKENS is not None:
 def _operations_by_route(schemas):
     routes: dict[tuple[str, str], tuple[str, ...]] = {}
     for name, schema in schemas.items():
-        if schema.get("pathTemplate"):
-            key = (schema["method"], schema["pathTemplate"])
+        # Either key. `ACTION_SCHEMAS` writes `pathTemplate` when the route
+        # takes parameters and `path` when it does not, and this indexed only
+        # the first -- so every fixed-path action was absent from the index and
+        # could never be resolved for an exchanged credential at all. The route
+        # simply answered `auth.operation_unresolved`, which reads like a
+        # deliberate refusal rather than a route that was never registered.
+        #
+        # A fixed path is a template with no parameters, and the matcher already
+        # treats it as one: `path_parameters` returns {} on an exact match and
+        # refuses a prefix, so nothing about the comparison changes.
+        template = schema.get("pathTemplate") or schema.get("path")
+        if template:
+            key = (schema["method"], template)
             routes[key] = routes.get(key, ()) + (name,)
     return routes
 

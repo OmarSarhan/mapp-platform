@@ -36,6 +36,7 @@ from config_api_client import ConfigApiUnavailable
 from config_api_client import layer_statistics_query
 from config_api_client import layer_values_query
 from config_api_client import layers_query
+from config_api_client import semantic_search_query
 from exchange_client import ExchangeRefused
 from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
@@ -82,6 +83,27 @@ CATALOG_LIST = {
     "scopes": ("inspect",),
 }
 
+SEMANTIC_CATALOG_LIST = {
+    "operation_id": "semantic.catalog.export",
+    "method": "GET",
+    "path_template": "/api/semantic/catalog",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_CATALOG_SEARCH = {
+    "operation_id": "semantic.catalog.search",
+    "method": "GET",
+    "path_template": "/api/semantic/catalog/search",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_CATALOG_SHOW = {
+    "operation_id": "semantic.catalog.show",
+    "method": "GET",
+    "path_template": "/api/semantic/catalog/objects/{assetId}",
+    "scopes": ("semantic:inspect",),
+}
+
 LAYERS_STATISTICS = {
     "operation_id": "layers.statistics",
     "method": "GET",
@@ -118,6 +140,29 @@ def _layers_of(payload):
             if isinstance(item, dict)
         ]
     return []
+
+
+def _asset_summary(asset):
+    """One catalogue entry, reduced to what identifies it.
+
+    The stored asset carries curated meaning, generated drafts, source state and
+    provenance. The index needs the identifier and enough words to recognise it;
+    `semantic_catalog_show` is where the meaning itself lives, and returning all
+    of it here would answer "what is catalogued?" by spending a context window.
+    """
+    asset = asset if isinstance(asset, dict) else {}
+    curated = asset.get("curated") if isinstance(asset.get("curated"), dict) else {}
+    description = curated.get("description")
+    return {
+        "assetId": asset.get("id"),
+        "name": curated.get("displayName"),
+        # Truncated deliberately. These run to paragraphs, and the whole point
+        # of an index is that it fits beside the other ten.
+        "description": (description[:200] + "…")
+        if isinstance(description, str) and len(description) > 200
+        else description,
+        "tags": curated.get("tags") or [],
+    }
 
 
 def _layer_summary(key, layer):
@@ -388,6 +433,76 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 + (f" Available: {', '.join(sorted(known))}." if known else "")
             )
         return {"databases": payload.get("databases"), "relations": relations}
+
+    @server.tool(
+        name="semantic_catalog_list",
+        description=(
+            "Every catalogued semantic asset: what the platform records about"
+            " what its data means. An index of identifier, name and summary;"
+            " semantic_catalog_show returns one asset's full meaning."
+        ),
+    )
+    def semantic_catalog_list() -> dict:
+        """What is described, as opposed to what exists.
+
+        `layers_list` and `catalog_list` answer what the platform holds and what
+        shape it is in. This answers what any of it *means* -- which is the
+        difference between an agent that can query a column and one that knows
+        whether the column is worth querying.
+        """
+        payload = spend(
+            SEMANTIC_CATALOG_LIST, path=SEMANTIC_CATALOG_LIST["path_template"]
+        )
+        assets = payload.get("assets")
+        return {
+            "catalogRevision": payload.get("catalogRevision"),
+            "assets": [
+                _asset_summary(asset)
+                for asset in (assets if isinstance(assets, list) else [])
+            ],
+        }
+
+    @server.tool(
+        name="semantic_catalog_search",
+        description=(
+            "Search catalogued semantic assets by text. Returns matches ranked"
+            " by relevance with their identifiers, for semantic_catalog_show."
+        ),
+    )
+    def semantic_catalog_search(query: str, limit: int | None = None) -> dict:
+        """The entry point when the question is about meaning rather than shape.
+
+        An agent asked "which layer covers air quality" cannot answer it from
+        layer keys and column names -- the words it is given are the ones a
+        person used, and those live in the catalogue's descriptions.
+        """
+        return spend(
+            SEMANTIC_CATALOG_SEARCH,
+            path=SEMANTIC_CATALOG_SEARCH["path_template"],
+            query=semantic_search_query(query=query, limit=limit),
+        )
+
+    @server.tool(
+        name="semantic_catalog_show",
+        description=(
+            "One semantic asset in full: its description, per-field meaning,"
+            " caveats and tags. Takes an assetId from semantic_catalog_search"
+            " or semantic_catalog_list."
+        ),
+    )
+    def semantic_catalog_show(asset_id: str) -> dict:
+        """Where the per-field meaning is, which is the point of the wave.
+
+        `catalog_list` says a relation has a column called `population_quintile`
+        of type integer. This says what a quintile means here, what it was
+        derived from, and what the curator warned about it -- and those caveats
+        are the difference between an agent reporting a number and an agent
+        reporting a number that means something.
+        """
+        path = SEMANTIC_CATALOG_SHOW["path_template"].replace(
+            "{assetId}", quote(asset_id, safe="")
+        )
+        return spend(SEMANTIC_CATALOG_SHOW, path=path)
 
     @server.tool(
         name="layers_statistics",

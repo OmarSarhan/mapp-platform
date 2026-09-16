@@ -84,6 +84,29 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("derive", "semantic:inspect"),
         mutating=False,
     ),
+    "semantic.catalog.export": Operation(
+        operation_id="semantic.catalog.export",
+        method="GET",
+        path_template="/api/semantic/catalog",
+        # Curated meaning, not data. `semantic:inspect` is the read scope for
+        # the catalogue and is already in the recommended agent preset.
+        required_scopes=("semantic:inspect",),
+        mutating=False,
+    ),
+    "semantic.catalog.search": Operation(
+        operation_id="semantic.catalog.search",
+        method="GET",
+        path_template="/api/semantic/catalog/search",
+        required_scopes=("semantic:inspect",),
+        mutating=False,
+    ),
+    "semantic.catalog.show": Operation(
+        operation_id="semantic.catalog.show",
+        method="GET",
+        path_template="/api/semantic/catalog/objects/{assetId}",
+        required_scopes=("semantic:inspect",),
+        mutating=False,
+    ),
     "derived-layers.refresh": Operation(
         operation_id="derived-layers.refresh",
         method="POST",

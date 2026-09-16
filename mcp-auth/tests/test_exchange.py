@@ -587,12 +587,40 @@ class AllowlistDriftTests(unittest.TestCase):
             with self.subTest(operation=name):
                 self.assertIn(name, self.actions)
 
+    @staticmethod
+    def _declared_path(action):
+        """The platform's path for an action, under either of the two keys.
+
+        `ACTION_SCHEMAS` writes `pathTemplate` when the route takes parameters
+        and `path` when it does not. This test read only the first, so a
+        fixed-path action raised `KeyError` rather than being compared -- which
+        meant the drift guard silently covered none of them. Found when the
+        first broker operation pointing at a fixed-path action was added.
+        """
+        template, fixed = action.get("pathTemplate"), action.get("path")
+        if (template is None) == (fixed is None):
+            raise AssertionError(
+                "an action must declare exactly one of pathTemplate or path"
+            )
+        return template or fixed
+
     def test_method_and_path_match_the_platform(self) -> None:
         for name, operation in operations.OPERATIONS.items():
             action = self.actions[name]
             with self.subTest(operation=name):
                 self.assertEqual(action["method"], operation.method)
-                self.assertEqual(action["pathTemplate"], operation.path_template)
+                self.assertEqual(self._declared_path(action), operation.path_template)
+
+    def test_every_platform_action_declares_exactly_one_path_key(self) -> None:
+        """Across the whole table, not only the operations the broker allows.
+
+        The guard above can only compare what it can read, and it could not read
+        a fixed-path action at all. Checking every entry means a new one cannot
+        arrive in a shape the comparison silently skips.
+        """
+        for name, action in self.actions.items():
+            with self.subTest(action=name):
+                self._declared_path(action)
 
     #: Risk classes that describe a pure read. Everything else writes, probes
     #: or produces an artifact, and its token must not be replayable.

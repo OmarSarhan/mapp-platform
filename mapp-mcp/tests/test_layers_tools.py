@@ -22,6 +22,7 @@ from config_api_client import ConfigApiUnavailable  # noqa: E402
 from config_api_client import layer_statistics_query  # noqa: E402
 from config_api_client import layer_values_query  # noqa: E402
 from config_api_client import layers_query  # noqa: E402
+from config_api_client import semantic_search_query  # noqa: E402
 from exchange_client import ExchangeRefused  # noqa: E402
 from exchange_client import ExchangeUnavailable  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
@@ -612,3 +613,132 @@ class StatisticsQueryTests(unittest.TestCase):
         self.assertEqual(
             "field=a%2Bb", layer_statistics_query(field="a+b", locale=None, bins=None)
         )
+
+
+CATALOGUE = {
+    "catalogRevision": 53,
+    "assets": [
+        {"id": "asset-1", "curated": {
+            "displayName": "Census OA Population",
+            "description": "x" * 260,
+            "tags": ["census", "population"],
+            "fields": {"population_quintile": "Quintile of resident count."},
+            "caveats": ["Drafted from a sample of 14 rows."],
+        }},
+        {"id": "asset-2", "curated": {"displayName": "Bus Stops"}},
+    ],
+}
+
+
+class SemanticCatalogTests(ToolTestCase):
+    """Meaning, as distinct from shape.
+
+    `catalog_list` says a relation has `population_quintile` of type integer.
+    These say what a quintile means here and what the curator warned about it,
+    which is the difference between reporting a number and reporting a number
+    that means something.
+    """
+
+    def tool(self, name, payload=CATALOGUE, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_the_index_identifies_assets_without_carrying_their_meaning(self) -> None:
+        """The stored asset holds curated meaning, generated drafts, source
+        state and provenance. An index of eleven of those is a context window."""
+        self.as_caller(caller())
+        result = self.tool("semantic_catalog_list")()
+        self.assertEqual(53, result["catalogRevision"])
+        first = result["assets"][0]
+        self.assertEqual("asset-1", first["assetId"])
+        self.assertEqual("Census OA Population", first["name"])
+        self.assertEqual(["census", "population"], first["tags"])
+        # The meaning itself is semantic_catalog_show's job.
+        self.assertNotIn("fields", first)
+        self.assertNotIn("caveats", first)
+
+    def test_a_long_description_is_truncated_in_the_index(self) -> None:
+        """These run to paragraphs; the point of an index is that it fits."""
+        self.as_caller(caller())
+        description = self.tool("semantic_catalog_list")()["assets"][0]["description"]
+        self.assertLessEqual(len(description), 201)
+        self.assertTrue(description.endswith("…"))
+
+    def test_an_asset_with_no_curated_meaning_still_lists(self) -> None:
+        """A generated-but-uncurated asset is a normal state, not an error."""
+        self.as_caller(caller())
+        entry = self.tool("semantic_catalog_list", payload={"assets": [{"id": "a"}]})()
+        self.assertEqual("a", entry["assets"][0]["assetId"])
+        self.assertIsNone(entry["assets"][0]["name"])
+
+    def test_show_passes_the_asset_through_whole(self) -> None:
+        """Truncating here would remove the per-field meaning this exists for.
+
+        The fixture is the shape the platform actually returns -- the asset
+        wrapped alongside `catalogRevision` -- because the first version of this
+        test invented an unwrapped one and passed against it while the live call
+        returned something else. A fixture is a claim about the far side, and an
+        invented one is a claim nobody checked.
+        """
+        detail = {
+            "catalogRevision": 53,
+            "asset": {"id": "asset-1", "curated": {
+                "displayName": "Census OA Population",
+                "fields": {"population_quintile": "Quintile of resident count."},
+                "caveats": ["Drafted from a sample of 14 rows."],
+            }},
+        }
+        self.as_caller(caller())
+        result = self.tool("semantic_catalog_show", payload=detail)(asset_id="asset-1")
+        curated = result["asset"]["curated"]
+        self.assertEqual(
+            {"population_quintile": "Quintile of resident count."}, curated["fields"]
+        )
+        self.assertEqual(["Drafted from a sample of 14 rows."], curated["caveats"])
+        # The revision travels with it: an agent quoting meaning should be able
+        # to say which revision of the catalogue it read.
+        self.assertEqual(53, result["catalogRevision"])
+
+    def test_the_asset_id_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool("semantic_catalog_show", exchange=exchange)(asset_id="odd/id")
+        self.assertEqual(
+            "/api/semantic/catalog/objects/odd%2Fid", exchange.calls[0]["path"]
+        )
+
+    def test_all_three_cost_only_the_semantic_read_scope(self) -> None:
+        """None of them reads data, so none should cost a data scope."""
+        for name, kwargs in (
+            ("semantic_catalog_list", {}),
+            ("semantic_catalog_search", {"query": "population"}),
+            ("semantic_catalog_show", {"asset_id": "a"}),
+        ):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller(scopes="mcp:connect inspect semantic:inspect"))
+                self.tool(name, exchange=exchange)(**kwargs)
+                self.assertEqual("semantic:inspect", exchange.calls[0]["scope"])
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"assets": None}, {"assets": "x"}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                self.assertEqual(
+                    [], self.tool("semantic_catalog_list", payload=payload)()["assets"]
+                )
+
+
+class SemanticSearchQueryTests(unittest.TestCase):
+    def test_the_order_is_fixed_and_the_term_is_encoded(self) -> None:
+        self.assertEqual(
+            "q=air%20quality&limit=5",
+            semantic_search_query(query="air quality", limit=5),
+        )
+
+    def test_an_absent_limit_is_absent_rather_than_empty(self) -> None:
+        self.assertEqual("q=x", semantic_search_query(query="x", limit=None))
+
+    def test_a_plus_is_not_a_space(self) -> None:
+        self.assertEqual("q=a%2Bb", semantic_search_query(query="a+b", limit=None))

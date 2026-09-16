@@ -101,6 +101,21 @@ def layer_statistics_query(
     )
 
 
+def semantic_search_query(*, query: str, limit: int | None) -> str:
+    """The semantic search query, in one fixed order.
+
+    Same contract as the other builders: digested at exchange time, sent at
+    request time, built once so the two cannot disagree.
+    """
+    pairs = [("q", query)]
+    if limit is not None:
+        pairs.append(("limit", str(limit)))
+    return "&".join(
+        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
+        for name, value in pairs
+    )
+
+
 def layers_query(*, locale: str | None) -> str:
     """The query string for the layer listing, in the one fixed order.
 
