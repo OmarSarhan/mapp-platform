@@ -564,6 +564,75 @@ class AllowlistDriftTests(unittest.TestCase):
 
         cls.actions = control_api.ACTION_SCHEMAS
 
+    #: Scopes the dashboard must never offer for an agent grant, whatever the
+    #: broker will technically issue. `federation:provision` is the only scope
+    #: that can serve a third-party database; the rest mutate.
+    NEVER_OFFERED_TO_AGENTS = frozenset({
+        "full", "admin", "federation:provision", "federation:register",
+        "semantic:apply", "semantic:admin", "semantic:generate",
+        "semantic:source", "semantic:data", "apply", "propose", "visual",
+        "reload",
+    })
+
+    @staticmethod
+    def dashboard_scope_options() -> set:
+        """The scopes the dashboard offers for an MCP client, read from it.
+
+        Read rather than restated, because the two lists are maintained in
+        different languages and nothing linked them: `federation:observe` was
+        issuable by the broker, enforced by the configuration API and used by
+        the CLI, and could not be granted from the dashboard at all -- so the
+        tools that needed it were unusable however correct they were.
+        """
+        import re
+
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "config-ui" / "src" / "main.jsx"
+        ).read_text(encoding="utf-8")
+        start = source.index("export const MCP_SCOPE_OPTIONS=[")
+        block = source[start : source.index("];", start)]
+        return set(re.findall(r"\{id:'([^']+)'", block))
+
+    def test_the_dashboard_offers_only_scopes_the_broker_will_issue(self) -> None:
+        """Offering one it will not issue produces a client whose authorization
+        request is refused, with nothing on the consent screen to explain it."""
+        import server
+
+        offered = self.dashboard_scope_options()
+        self.assertTrue(offered, "no scope options found in the dashboard source")
+        unissuable = offered - set(server.SUPPORTED_SCOPES)
+        self.assertEqual(
+            set(),
+            unissuable,
+            f"the dashboard offers {sorted(unissuable)}, which the broker"
+            " will not issue",
+        )
+
+    def test_the_dashboard_offers_every_scope_an_allowlisted_read_needs(self) -> None:
+        """The direction that actually bit. A tool can be correct, allowlisted
+        and enforced, and still unusable because no operator can grant it."""
+        needed = set()
+        for operation in operations.OPERATIONS.values():
+            if not operation.mutating:
+                needed.update(operation.required_scopes)
+        missing = needed - self.dashboard_scope_options()
+        self.assertEqual(
+            set(),
+            missing,
+            f"no dashboard option grants {sorted(missing)}, so the read"
+            " operations needing it cannot be used by any agent",
+        )
+
+    def test_the_dashboard_never_offers_a_privileged_scope(self) -> None:
+        """The other direction. `federation:provision` is issuable and must
+        never appear in a list an operator clicks through."""
+        offered = self.dashboard_scope_options()
+        forbidden = offered & self.NEVER_OFFERED_TO_AGENTS
+        self.assertEqual(
+            set(), forbidden, f"the dashboard offers {sorted(forbidden)} to agents"
+        )
+
     def test_every_allowlisted_scope_can_actually_be_issued(self) -> None:
         """The allowlist and the issuer must share one vocabulary.
 

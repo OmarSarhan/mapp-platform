@@ -352,6 +352,43 @@ if MCP_TOKENS is not None:
 #: is every name that claims the route, not the last one to be seen. A dict
 #: keyed this way silently kept one of them, which would have resolved an
 #: ambiguous route to an arbitrary operation. Ambiguity is refused instead.
+#: Actor identifiers as this platform writes them. `admin` and `local-admin`
+#: name a role; these two name a *credential* -- which CLI token, or which MCP
+#: grant, performed an action.
+ACTOR_CREDENTIAL_PREFIXES = ("token:", "oauth:")
+
+#: What an exchanged credential sees in their place. A placeholder rather than a
+#: removed key, so an agent learns the attribution exists and is not for it,
+#: instead of concluding there was none.
+WITHHELD_ACTOR = "[withheld]"
+
+
+def redact_actor_credentials(value):
+    """Replace credential identifiers anywhere in a response body.
+
+    Several read endpoints attribute records to the credential that created
+    them -- `createdBy` on a derived layer, `registeredBy` and `approvedBy` on a
+    federated alias -- and those are written from the authenticated principal on
+    purpose. They are the right answer for an operator at a dashboard, and the
+    wrong one for a delegated agent: a scope to read the source registry is not
+    a scope to enumerate the operator credentials behind it.
+
+    Matched by value rather than by key name. A key-based list is a second thing
+    to keep in step, and it had already drifted before this existed: the MCP
+    runtime filtered these fields out of its federation tools and passed the
+    identical field through in its derived-layer tool, in the same release. A
+    value that begins `token:` or `oauth:` is a credential identifier wherever
+    it appears, including in a field nobody has added yet.
+    """
+    if isinstance(value, dict):
+        return {key: redact_actor_credentials(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_actor_credentials(item) for item in value]
+    if isinstance(value, str) and value.startswith(ACTOR_CREDENTIAL_PREFIXES):
+        return WITHHELD_ACTOR
+    return value
+
+
 def _operations_by_route(schemas):
     routes: dict[tuple[str, str], tuple[str, ...]] = {}
     for name, schema in schemas.items():
@@ -6247,6 +6284,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "error": "The credential was not redeemed for this request.",
                 "code": "auth.binding_not_redeemed",
             }
+        if self._exchanged_token is not None:
+            # Every response to an exchanged credential, for the same reason the
+            # redemption backstop above lives here: a property of the response
+            # layer rather than something each handler has to remember. Agents
+            # reach only allowlisted operations, so this walks a small and known
+            # set of responses rather than arbitrary workspace content.
+            payload = redact_actor_credentials(payload)
         payload = dict(payload)
         meta = payload.get("meta")
         if not isinstance(meta, dict):

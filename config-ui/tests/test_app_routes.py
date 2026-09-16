@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import threading
 import tempfile
@@ -9799,6 +9800,90 @@ class McpGrantRouteTests(unittest.TestCase):
                     getattr(handler, method)()
                 self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
                 getattr(control, control_method).assert_not_called()
+
+
+class ActorRedactionTests(unittest.TestCase):
+    """What a delegated agent is not told about who did things.
+
+    Several read endpoints attribute records to the credential that created
+    them, written from the authenticated principal on purpose. That is the right
+    answer for an operator and the wrong one for an agent: a scope to read the
+    federated source registry is not a scope to enumerate the operator
+    credentials behind it.
+
+    Enforced at the response layer rather than per consumer, because per
+    consumer had already drifted -- the MCP runtime filtered these fields from
+    its federation tools and passed the identical field through in its
+    derived-layer tool, in the same release.
+    """
+
+    def test_credential_identifiers_are_replaced_wherever_they_appear(self) -> None:
+        payload = {
+            "derivedLayers": [{"name": "x", "createdBy": "token:28fee603566a89e6"}],
+            "aliases": [{"registeredBy": "token:a", "approvedBy": "oauth:g-1"}],
+            "nested": {"deep": [{"someFutureField": "token:b"}]},
+        }
+        redacted = app.redact_actor_credentials(payload)
+        rendered = json.dumps(redacted)
+        self.assertNotIn("token:", rendered)
+        self.assertNotIn("oauth:", rendered)
+        # A placeholder, not a removed key: the agent learns attribution exists.
+        self.assertEqual(app.WITHHELD_ACTOR, redacted["derivedLayers"][0]["createdBy"])
+        self.assertEqual(
+            app.WITHHELD_ACTOR, redacted["nested"]["deep"][0]["someFutureField"]
+        )
+
+    def test_it_matches_on_value_not_on_key_name(self) -> None:
+        """A key-based list is a second thing to keep in step. A field nobody
+        has added yet still carries a credential identifier."""
+        redacted = app.redact_actor_credentials({"anythingAtAll": "token:x"})
+        self.assertEqual(app.WITHHELD_ACTOR, redacted["anythingAtAll"])
+
+    def test_ordinary_values_are_untouched(self) -> None:
+        """Over-redaction would corrupt the answer rather than protect it."""
+        payload = {
+            "name": "census_oa_population_quintiles",
+            "description": "Tokens are discussed here but this is not one.",
+            "count": 6147,
+            "flag": True,
+            "nothing": None,
+            "role": "admin",
+        }
+        self.assertEqual(payload, app.redact_actor_credentials(payload))
+
+    def test_a_dashboard_response_keeps_its_attribution(self) -> None:
+        """An operator at the dashboard is the audience these fields were
+        written for. Redacting for everyone would remove a real feature."""
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/derived-layers"
+        handler.command = "GET"
+        handler._exchanged_token = None
+        handler._exchanged_token_redeemed = False
+        handler._request_id = "r"
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+        handler.wfile = io.BytesIO()
+        handler._json(HTTPStatus.OK, {"createdBy": "token:28fee603566a89e6"})
+        self.assertIn("token:28fee603566a89e6", handler.wfile.getvalue().decode())
+
+    def test_an_exchanged_credential_gets_the_placeholder(self) -> None:
+        """The same response, to an agent."""
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/derived-layers"
+        handler.command = "GET"
+        handler._exchanged_token = "mapp_b_something"
+        handler._exchanged_token_redeemed = True
+        handler._request_id = "r"
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+        handler.wfile = io.BytesIO()
+        handler._json(HTTPStatus.OK, {"createdBy": "token:28fee603566a89e6"})
+        body = handler.wfile.getvalue().decode()
+        self.assertNotIn("28fee603566a89e6", body)
+        self.assertIn(app.WITHHELD_ACTOR, body)
 
 
 class OperationRouteIndexTests(unittest.TestCase):
