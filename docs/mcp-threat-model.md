@@ -229,6 +229,13 @@ not, for reasons worth recording rather than re-deriving later:
   behind it. Measured across a full legacy session — initialize, notification,
   list, call — none is emitted, and the guard strips the header from anything
   the inner application sends regardless.
+- **The standalone event stream is refused.** A GET to the RPC path is where the
+  handshake era puts its server-to-client channel, and the SDK serves one: an
+  authenticated GET returned `200 text/event-stream` and held the connection
+  open. With `stateless_http` there is no session for it to belong to, so it
+  carries nothing and costs a held connection per caller — a cheap way to occupy
+  the runtime. The guard answers `405`. No target client needs it: all three
+  completed a session through a proxy that implemented POST and nothing else.
 - **Authorization is untouched by era.** The guard runs before authentication,
   every scope check is era-independent, and no credential, audience or binding
   rule differs between them.
