@@ -8,6 +8,7 @@ a caller when the platform says no.
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -742,3 +743,216 @@ class SemanticSearchQueryTests(unittest.TestCase):
 
     def test_a_plus_is_not_a_space(self) -> None:
         self.assertEqual("q=a%2Bb", semantic_search_query(query="a+b", limit=None))
+
+
+DERIVED = {"derivedLayers": [
+    {"name": "census_oa_population_quintiles", "recipe": "quintile",
+     "sources": ["source_ops.census_oa"], "refreshedAt": "2026-08-01T00:00:00Z"},
+    {"name": "definitive_paths_length_costs", "recipe": "length-cost"},
+]}
+
+#: Shaped as the platform actually answers, including the fields an agent is
+#: deliberately not given. A fixture without them could not show they are gone.
+ALIASES = {
+    "host": {"federationReady": True, "role": "mapp_federation", "database": "mapp"},
+    "aliases": [
+        {"alias": "census", "displayName": "Census 2021 (federated)",
+         "kind": "postgresql", "status": "active", "groups": ["census"],
+         "allowedRelations": ["leeds.census_2021_england_oa"],
+         "registeredBy": "token:28fee603566a89e6",
+         "approvedBy": "token:38e77aa97a8aab1f",
+         "lastObservationId": 1882,
+         "lastObservation": {
+             "connectivity": "reachable", "schema": "current",
+             "lastConnected": "2026-09-16T15:48:04Z", "sourceFreshness": "unknown",
+             "schemaFingerprint": "cf0a770e" * 8,
+             "extensionVersions": {"postgis": "3.5.7", "proj": "9.8.1 …"},
+         }},
+        {"alias": "ops", "status": "active"},
+    ],
+}
+
+
+class DerivedLayerTests(ToolTestCase):
+    """Provenance for the relations `catalog_list` reports the shape of.
+
+    Most of this instance's layers read `derived_layers.*`, which are built
+    rather than ingested, so "where did this number come from" has an answer
+    only these can give.
+    """
+
+    def tool(self, name, payload=DERIVED, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_the_listing_is_passed_through(self) -> None:
+        self.as_caller(caller())
+        result = self.tool("derived_layers_list")()
+        self.assertEqual(2, len(result["derivedLayers"]))
+
+    def test_show_returns_one_entry(self) -> None:
+        self.as_caller(caller())
+        entry = self.tool("derived_layers_show")(name="census_oa_population_quintiles")
+        self.assertEqual(["source_ops.census_oa"], entry["sources"])
+
+    def test_an_unknown_name_lists_the_managed_relations(self) -> None:
+        """The alternatives are already in hand; making the agent call again to
+        learn them wastes a turn and a credential."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as caught:
+            self.tool("derived_layers_show")(name="nope")
+        message = str(caught.exception)
+        self.assertIn("census_oa_population_quintiles", message)
+        self.assertIn("definitive_paths_length_costs", message)
+
+    def test_it_costs_only_the_discovery_scope(self) -> None:
+        """Reading how a relation was built is configuration, not data."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        self.tool("derived_layers_list", exchange=exchange)()
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"derivedLayers": None}, {"derivedLayers": "x"}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                with self.assertRaises(ToolError):
+                    self.tool("derived_layers_show", payload=payload)(name="any")
+
+
+class FederationTests(ToolTestCase):
+    """Where data comes from when it does not come from here.
+
+    Separated from the other reads by scope on purpose: these describe the
+    platform's dependencies on other people's databases, which is a different
+    disclosure from anything the instance's own configuration reveals.
+    """
+
+    def tool(self, name, payload=ALIASES, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_both_cost_the_read_scope_and_never_the_provisioning_one(self) -> None:
+        """`federation:provision` is the only scope that can serve a third-party
+        database. Looking at the registry must never require it."""
+        shown = {"alias": {"alias": "census", "status": "active"}}
+        for name, payload, kwargs in (
+            ("federation_list", ALIASES, {}),
+            ("federation_show", shown, {"alias": "census"}),
+        ):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(
+                    caller(scopes="mcp:connect inspect federation:observe")
+                )
+                self.tool(name, payload=payload, exchange=exchange)(**kwargs)
+                self.assertEqual("federation:observe", exchange.calls[0]["scope"])
+                self.assertNotIn("provision", exchange.calls[0]["scope"])
+
+    def test_a_grant_without_the_federation_scope_is_refused(self) -> None:
+        """It is not in the recommended preset, so most agents will not hold it
+        and the message has to say which scope to ask for."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as caught:
+            self.tool("federation_list", exchange=exchange)()
+        self.assertIn("federation:observe", str(caught.exception))
+        self.assertEqual([], exchange.calls)
+
+    def test_the_alias_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        self.tool(
+            "federation_show",
+            payload={"alias": {"alias": "odd/alias"}},
+            exchange=exchange,
+        )(alias="odd/alias")
+        self.assertEqual(
+            "/api/federation/aliases/odd%2Falias", exchange.calls[0]["path"]
+        )
+
+
+class FederationDisclosureTests(ToolTestCase):
+    """What a `federation:observe` grant is *not* a grant to read.
+
+    The scope permits reading the source registry and the evidence behind each
+    alias. It is not a grant to enumerate the operator credentials that acted on
+    them, nor to learn this instance's own database role -- and the raw response
+    carries both.
+    """
+
+    def tool(self, name, payload=ALIASES, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_credential_identifiers_never_reach_the_agent(self) -> None:
+        """`registeredBy` and `approvedBy` name the token that acted. An agent
+        asking which sources exist has no use for them, and they identify a
+        person's credential."""
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        shown = {"alias": dict(ALIASES["aliases"][0])}
+        for name, payload, kwargs in (
+            ("federation_list", ALIASES, {}),
+            ("federation_show", shown, {"alias": "census"}),
+        ):
+            with self.subTest(tool=name):
+                rendered = json.dumps(self.tool(name, payload=payload)(**kwargs))
+                self.assertNotIn("registeredBy", rendered)
+                self.assertNotIn("approvedBy", rendered)
+                self.assertNotIn("28fee603566a89e6", rendered)
+
+    def test_an_unrecognised_payload_is_refused_not_passed_through(self) -> None:
+        """The failure this test class exists for.
+
+        `federation_show` fell back to detailing the whole response when it
+        found no alias record, so a shape it did not expect carried every
+        withheld field to the agent. Withholding that depends on the response
+        being the shape you assumed is not withholding.
+        """
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        for payload in (ALIASES, {}, {"alias": "not-a-record"}):
+            with self.subTest(payload=str(payload)[:40]):
+                with self.assertRaises(ToolError):
+                    self.tool("federation_show", payload=payload)(alias="census")
+
+    def test_the_instance_s_own_role_and_database_are_not_disclosed(self) -> None:
+        """`host` answers whether federation works. Its role and database name
+        describe this deployment, not the federated sources."""
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        result = self.tool("federation_list")()
+        self.assertTrue(result["federationReady"])
+        rendered = json.dumps(result)
+        self.assertNotIn("mapp_federation", rendered)
+        self.assertNotIn("\"database\"", rendered)
+
+    def test_schema_fingerprints_and_extension_versions_are_dropped(self) -> None:
+        """Hundreds of characters per alias answering nothing an agent can act
+        on, which push the useful fields out of the window."""
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        rendered = json.dumps(self.tool("federation_list")())
+        self.assertNotIn("schemaFingerprint", rendered)
+        self.assertNotIn("extensionVersions", rendered)
+
+    def test_what_the_agent_does_get_is_enough_to_answer_with(self) -> None:
+        """Withholding is only defensible if the useful part survives."""
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        entry = self.tool("federation_list")()["aliases"][0]
+        self.assertEqual("census", entry["alias"])
+        self.assertEqual("active", entry["status"])
+        self.assertEqual(["leeds.census_2021_england_oa"], entry["allowedRelations"])
+        self.assertEqual("reachable", entry["observation"]["connectivity"])
+
+    def test_show_keeps_the_record_minus_what_is_withheld(self) -> None:
+        detail = {"alias": {"alias": "census", "tlsPolicy": "require",
+                            "registeredBy": "token:x",
+                            "lastObservation": {"connectivity": "reachable",
+                                                "schemaFingerprint": "abc"}}}
+        self.as_caller(caller(scopes="mcp:connect inspect federation:observe"))
+        result = self.tool("federation_show", payload=detail)(alias="census")
+        self.assertEqual("require", result["tlsPolicy"])
+        self.assertEqual("reachable", result["observation"]["connectivity"])
+        self.assertNotIn("registeredBy", json.dumps(result))
+        self.assertNotIn("schemaFingerprint", json.dumps(result))

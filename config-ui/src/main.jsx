@@ -554,10 +554,12 @@ export const MCP_SCOPE_OPTIONS=[
  {id:'mcp:connect',label:'Connect',help:'Open an authorized MCP session. Advertised in protected-resource metadata as a discovery scope.'},
  {id:'inspect',label:'List tools',help:'Required for a tool to appear in tools/list at all. Without it an agent connects and sees nothing.'},
  {id:'derive',label:'Read derived layers',help:'Needed by layer_values to aggregate over a managed derived relation.'},
- {id:'semantic:inspect',label:'Read semantic catalog',help:'Needed by layer_values to resolve the field it aggregates over.'},
+ {id:'semantic:inspect',label:'Read semantic catalog',help:'Needed by the semantic tools, and by layer_values to resolve the field it aggregates over.'},
+ {id:'federation:observe',label:'Read federated sources',help:'Needed by federation_list and federation_show. Reveals which third-party databases this instance reads; it cannot expose or withdraw one, which is federation:provision.'},
 ];
 export const MCP_CLIENT_PRESETS=[
- {id:'analysis',label:'Read-only analysis (recommended)',scopes:['mcp:connect','inspect','derive','semantic:inspect'],help:'Everything the shipped read-only tools need. An agent with less connects, lists the tools and is refused on the first call.'},
+ {id:'analysis',label:'Read-only analysis (recommended)',scopes:['mcp:connect','inspect','derive','semantic:inspect'],help:'What the shipped tools need to read this instance: its layers, their data, and the meaning recorded for them. Deliberately excludes federation:observe, which discloses the third-party databases behind the platform rather than the platform itself.'},
+ {id:'analysis-federated',label:'Read-only analysis, including sources',scopes:['mcp:connect','inspect','derive','semantic:inspect','federation:observe'],help:'The same, plus the federated source registry. Choose this when an agent needs to answer where data came from, not only what it says.'},
  {id:'discovery',label:'Connect and list only',scopes:['mcp:connect','inspect'],help:'Connects and lists tools, but every tool refuses. Useful to hand someone a connection before deciding what they may read.'},
 ];
 //: Pinned rather than chosen by the client, because redirect URIs are matched

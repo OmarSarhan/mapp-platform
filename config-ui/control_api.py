@@ -1030,6 +1030,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "derived-layers.list": {
+        "method": "GET",
+        "path": "/api/derived-layers",
+        # Which managed relations exist and how they were built. Configuration
+        # and provenance, not the rows -- reading those is `derive`, through
+        # layers.values against a layer that reads the relation.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "derived-layers.map-extent": {
         "method": "GET",
         "path": "/api/derived-layers/map-extent",

@@ -505,6 +505,14 @@ what `mcp-client-register` issues.
     --scope derive --scope semantic:inspect
 ```
 
+Add `--scope federation:observe` as well if the agent should be able to answer
+where data came from: it reaches the federated source registry, which names the
+third-party databases behind the platform. It cannot expose or withdraw one --
+that is `federation:provision`, which is never granted to an agent. The
+dashboard offers it as a separate preset rather than folding it into the
+recommendation, because disclosing an instance's external dependencies is a
+different disclosure from describing the instance.
+
 Four scopes, not two. `mcp:connect` and `inspect` are the discovery pair --
 they are what protected-resource metadata advertises, and `inspect` is what
 makes a tool *appear* in `tools/list` at all. `layer_values` additionally needs

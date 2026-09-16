@@ -2102,6 +2102,29 @@ describe('MCP agent client administration', () => {
     }
   });
 
+  test('the federated preset is the recommended one plus source visibility', () => {
+    // Separate presets rather than one wider default. federation:observe
+    // discloses which third-party databases sit behind the platform, which is a
+    // different disclosure from anything the other scopes permit -- so it is
+    // offered deliberately rather than folded into the recommendation.
+    const byId = Object.fromEntries(MCP_CLIENT_PRESETS.map(p => [p.id, p.scopes]));
+    expect(byId.analysis).not.toContain('federation:observe');
+    expect(byId['analysis-federated']).toEqual(
+      [...byId.analysis, 'federation:observe'],
+    );
+  });
+
+  test('every preset scope is one the panel can describe', () => {
+    // A preset naming a scope with no entry renders as "Unrecognized scope",
+    // which tells an operator nothing about what they are approving.
+    const described = new Set(MCP_SCOPE_OPTIONS.map(o => o.id));
+    for (const preset of MCP_CLIENT_PRESETS) {
+      for (const scope of preset.scopes) {
+        expect(described.has(scope)).toBe(true);
+      }
+    }
+  });
+
   test('no preset can ask for a scope the broker refuses to issue', () => {
     // `full` and `admin` are never issued for the MCP resource, and `full` is
     // on the broker's deny-list. Offering either in the dashboard would produce

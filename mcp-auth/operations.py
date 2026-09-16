@@ -107,6 +107,29 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("semantic:inspect",),
         mutating=False,
     ),
+    "derived-layers.list": Operation(
+        operation_id="derived-layers.list",
+        method="GET",
+        path_template="/api/derived-layers",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
+    "federation.aliases.list": Operation(
+        operation_id="federation.aliases.list",
+        method="GET",
+        path_template="/api/federation/aliases",
+        # The *read* federation scope. `federation:provision` is the one that
+        # can serve a third-party database and is never needed to look.
+        required_scopes=("federation:observe",),
+        mutating=False,
+    ),
+    "federation.aliases.show": Operation(
+        operation_id="federation.aliases.show",
+        method="GET",
+        path_template="/api/federation/aliases/{alias}",
+        required_scopes=("federation:observe",),
+        mutating=False,
+    ),
     "derived-layers.refresh": Operation(
         operation_id="derived-layers.refresh",
         method="POST",

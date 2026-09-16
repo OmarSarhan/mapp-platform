@@ -83,6 +83,29 @@ CATALOG_LIST = {
     "scopes": ("inspect",),
 }
 
+DERIVED_LAYERS_LIST = {
+    "operation_id": "derived-layers.list",
+    "method": "GET",
+    "path_template": "/api/derived-layers",
+    "scopes": ("inspect",),
+}
+
+FEDERATION_LIST = {
+    "operation_id": "federation.aliases.list",
+    "method": "GET",
+    "path_template": "/api/federation/aliases",
+    # The read scope. `federation:provision` can serve a third-party database
+    # and is never needed to look at the registry.
+    "scopes": ("federation:observe",),
+}
+
+FEDERATION_SHOW = {
+    "operation_id": "federation.aliases.show",
+    "method": "GET",
+    "path_template": "/api/federation/aliases/{alias}",
+    "scopes": ("federation:observe",),
+}
+
 SEMANTIC_CATALOG_LIST = {
     "operation_id": "semantic.catalog.export",
     "method": "GET",
@@ -140,6 +163,54 @@ def _layers_of(payload):
             if isinstance(item, dict)
         ]
     return []
+
+
+#: Fields of a federated-alias record that an agent is not given.
+#:
+#: `registeredBy` and `approvedBy` are credential identifiers -- which token
+#: registered or approved a source. That is audit information about a *person's*
+#: credential, and `federation:observe` is a grant to read the source registry,
+#: not to enumerate the operator credentials behind it.
+#:
+#: The observation's `schemaFingerprint` and `extensionVersions` are the
+#: platform's own verification machinery: several hundred characters per alias
+#: that answer no question an agent can act on, and which push the useful fields
+#: out of a context window.
+ALIAS_WITHHELD = ("registeredBy", "approvedBy", "lastObservationId")
+OBSERVATION_KEPT = ("connectivity", "schema", "lastConnected", "sourceFreshness")
+
+
+def _observation_summary(observation):
+    """Whether the source is reachable and current, without the fingerprints."""
+    if not isinstance(observation, dict):
+        return None
+    return {key: observation.get(key) for key in OBSERVATION_KEPT}
+
+
+def _alias_summary(alias):
+    """One registry entry: what it is, what it serves, and whether it is live."""
+    alias = alias if isinstance(alias, dict) else {}
+    return {
+        "alias": alias.get("alias"),
+        "displayName": alias.get("displayName"),
+        "kind": alias.get("kind"),
+        "status": alias.get("status"),
+        "allowedRelations": alias.get("allowedRelations") or [],
+        "groups": alias.get("groups") or [],
+        "dataHandlingClassification": alias.get("dataHandlingClassification"),
+        "observation": _observation_summary(alias.get("lastObservation")),
+    }
+
+
+def _alias_detail(alias):
+    """The whole record bar the credential identifiers and the fingerprints."""
+    alias = alias if isinstance(alias, dict) else {}
+    detail = {
+        key: value for key, value in alias.items()
+        if key not in ALIAS_WITHHELD and key != "lastObservation"
+    }
+    detail["observation"] = _observation_summary(alias.get("lastObservation"))
+    return detail
 
 
 def _asset_summary(asset):
@@ -433,6 +504,113 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 + (f" Available: {', '.join(sorted(known))}." if known else "")
             )
         return {"databases": payload.get("databases"), "relations": relations}
+
+    @server.tool(
+        name="derived_layers_list",
+        description=(
+            "Managed derived relations: which exist, and how each was built."
+            " This is where a layer's numbers come from -- the recipe, its"
+            " sources and when it was last refreshed."
+        ),
+    )
+    def derived_layers_list() -> dict:
+        """Provenance for the relations `catalog_list` reports the shape of.
+
+        Most of this instance's layers read `derived_layers.*`, which are built
+        rather than ingested. An agent quoting a number from one should be able
+        to say where it came from, and this is the only tool that can answer it.
+        """
+        return spend(
+            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
+        )
+
+    @server.tool(
+        name="derived_layers_show",
+        description=(
+            "One managed derived relation in full: its recipe, source"
+            " relations, and refresh state. Takes a name from"
+            " derived_layers_list."
+        ),
+    )
+    def derived_layers_show(name: str) -> dict:
+        """One entry from the same read.
+
+        There is no per-name route -- the configuration API serves the set and
+        the CLI filters client-side -- so this does the same, for the same
+        reason `layers_get` does: a bounded answer matters more to a model than
+        to a terminal.
+        """
+        payload = spend(
+            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
+        )
+        entries = payload.get("derivedLayers")
+        entries = entries if isinstance(entries, list) else []
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("name") == name:
+                return entry
+        known = [
+            entry.get("name") for entry in entries
+            if isinstance(entry, dict) and entry.get("name")
+        ]
+        raise ToolError(
+            f"No derived layer {name!r} on this instance."
+            + (f" Managed relations: {', '.join(sorted(known))}." if known else "")
+        )
+
+    @server.tool(
+        name="federation_list",
+        description=(
+            "External sources federated into this instance, with each alias's"
+            " status. Reveals which third-party databases the platform is"
+            " configured to read; needs the federation:observe scope."
+        ),
+    )
+    def federation_list() -> dict:
+        """Where data comes from when it does not come from here.
+
+        Separated from the other reads by scope on purpose. The others describe
+        this instance; this describes its dependencies on other people's
+        databases, which is a different question and a different grant.
+        """
+        payload = spend(FEDERATION_LIST, path=FEDERATION_LIST["path_template"])
+        aliases = payload.get("aliases")
+        host = payload.get("host") if isinstance(payload.get("host"), dict) else {}
+        return {
+            # Whether federation works at all, without naming the database or
+            # the role it runs as -- those are this instance's internals and
+            # answer nothing about the sources.
+            "federationReady": host.get("federationReady"),
+            "aliases": [
+                _alias_summary(alias)
+                for alias in (aliases if isinstance(aliases, list) else [])
+            ],
+        }
+
+    @server.tool(
+        name="federation_show",
+        description=(
+            "One federated source alias: its status, the evidence accepted for"
+            " it, and the group labels it carries. Takes an alias from"
+            " federation_list. Needs the federation:observe scope."
+        ),
+    )
+    def federation_show(alias: str) -> dict:
+        """One alias, including the evidence behind its current state."""
+        path = FEDERATION_SHOW["path_template"].replace(
+            "{alias}", quote(alias, safe="")
+        )
+        payload = spend(FEDERATION_SHOW, path=path)
+        record = payload.get("alias")
+        if not isinstance(record, dict):
+            # Fail closed rather than pass an unrecognised payload through.
+            # The first version fell back to detailing the whole response, so a
+            # shape this did not expect carried every withheld field straight to
+            # the agent -- withholding that depends on the response being the
+            # shape you assumed is not withholding.
+            raise ToolError(
+                f"The registry returned no alias record for {alias!r}."
+            )
+        return _alias_detail(record)
 
     @server.tool(
         name="semantic_catalog_list",
