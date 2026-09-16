@@ -75,6 +75,15 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("derive", "semantic:inspect"),
         mutating=False,
     ),
+    "layers.statistics": Operation(
+        operation_id="layers.statistics",
+        method="GET",
+        path_template="/api/layers/{layerKey}/statistics",
+        # Same pair as layers.values and for the same reason: `derive` to read
+        # the data, `semantic:inspect` to resolve the field it summarises.
+        required_scopes=("derive", "semantic:inspect"),
+        mutating=False,
+    ),
     "derived-layers.refresh": Operation(
         operation_id="derived-layers.refresh",
         method="POST",

@@ -19,6 +19,7 @@ from authentication import Authenticated  # noqa: E402
 from authentication import CURRENT_CALLER  # noqa: E402
 from config_api_client import ConfigApiRefused  # noqa: E402
 from config_api_client import ConfigApiUnavailable  # noqa: E402
+from config_api_client import layer_statistics_query  # noqa: E402
 from config_api_client import layer_values_query  # noqa: E402
 from config_api_client import layers_query  # noqa: E402
 from exchange_client import ExchangeRefused  # noqa: E402
@@ -537,3 +538,77 @@ class CatalogTests(ToolTestCase):
             with self.subTest(payload=payload):
                 self.as_caller(caller())
                 self.assertEqual([], self.tool(payload=payload)()["relations"])
+
+
+class StatisticsTests(ToolTestCase):
+    """The numeric counterpart to `layers_values`.
+
+    Counting categories and summarising a distribution are different questions,
+    and an agent holding only the first reaches for it on continuous data and
+    gets thousands of distinct values back.
+    """
+
+    def tool(self, *, exchange=None, config_api=None):
+        return self.build_named(
+            "layers_statistics", exchange=exchange, config_api=config_api
+        )
+
+    def test_the_request_exchanged_for_is_the_request_made(self) -> None:
+        exchange, config_api = FakeExchange(), FakeConfigApi()
+        self.as_caller(caller())
+        self.tool(exchange=exchange, config_api=config_api)(
+            layer_key="Census_OA_Population", field="population", bins=5
+        )
+        minted, spent = exchange.calls[0], config_api.calls[0]
+        self.assertEqual(minted["path"], spent["path"])
+        self.assertEqual(minted["query"], spent["query"])
+        self.assertEqual("layers.statistics", minted["operation_id"])
+
+    def test_the_layer_key_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(layer_key="odd/key", field="f")
+        self.assertEqual(
+            "/api/layers/odd%2Fkey/statistics", exchange.calls[0]["path"]
+        )
+
+    def test_it_costs_the_same_scopes_as_reading_values(self) -> None:
+        """Both read the data behind a layer, so neither is the cheaper way in."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(layer_key="L", field="f")
+        self.assertEqual("derive semantic:inspect", exchange.calls[0]["scope"])
+
+    def test_a_grant_without_derive_is_refused_before_anything_is_spent(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        with self.assertRaises(ToolError) as caught:
+            self.tool(exchange=exchange)(layer_key="L", field="f")
+        self.assertIn("derive", str(caught.exception))
+        self.assertEqual([], exchange.calls)
+
+
+class StatisticsQueryTests(unittest.TestCase):
+    """The query is digested byte for byte, so its shape is a contract."""
+
+    def test_the_order_is_fixed_regardless_of_argument_order(self) -> None:
+        self.assertEqual(
+            "field=f&locale=en&bins=5",
+            layer_statistics_query(field="f", locale="en", bins=5),
+        )
+
+    def test_absent_optionals_are_absent_rather_than_empty(self) -> None:
+        """`bins=` is a different request from no bins, and is refused."""
+        self.assertEqual(
+            "field=f", layer_statistics_query(field="f", locale=None, bins=None)
+        )
+
+    def test_a_space_travels_as_percent_twenty(self) -> None:
+        """Not as `+`: the configuration API decodes with parse_qsl, which reads
+        `+` as a space, so a literal plus would arrive as one."""
+        self.assertEqual(
+            "field=a%20b", layer_statistics_query(field="a b", locale=None, bins=None)
+        )
+        self.assertEqual(
+            "field=a%2Bb", layer_statistics_query(field="a+b", locale=None, bins=None)
+        )

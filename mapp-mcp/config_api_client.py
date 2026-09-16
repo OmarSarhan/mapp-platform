@@ -75,6 +75,32 @@ class ConfigApiClient:
             ) from None
 
 
+def layer_statistics_query(
+    *, field: str, locale: str | None, bins: int | None
+) -> str:
+    """The statistics query, in one fixed order.
+
+    Same contract as the other builders: digested at exchange time, sent at
+    request time, built once so the two cannot disagree.
+
+    `threshold` and `break` are accepted by the platform and deliberately not
+    offered here. They are arrays, and an array in a digested query string is a
+    repeated parameter whose order and encoding both have to match what the far
+    side reconstructs -- a byte of disagreement surfaces as a refusal naming no
+    cause. They can be added when something needs them, with a test that pins
+    the encoding.
+    """
+    pairs = [("field", field)]
+    if locale is not None:
+        pairs.append(("locale", locale))
+    if bins is not None:
+        pairs.append(("bins", str(bins)))
+    return "&".join(
+        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
+        for name, value in pairs
+    )
+
+
 def layers_query(*, locale: str | None) -> str:
     """The query string for the layer listing, in the one fixed order.
 

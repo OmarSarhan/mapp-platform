@@ -33,6 +33,7 @@ from authentication import CURRENT_CALLER
 from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
 from config_api_client import ConfigApiUnavailable
+from config_api_client import layer_statistics_query
 from config_api_client import layer_values_query
 from config_api_client import layers_query
 from exchange_client import ExchangeRefused
@@ -79,6 +80,13 @@ CATALOG_LIST = {
     "method": "GET",
     "path_template": "/api/catalog",
     "scopes": ("inspect",),
+}
+
+LAYERS_STATISTICS = {
+    "operation_id": "layers.statistics",
+    "method": "GET",
+    "path_template": "/api/layers/{layerKey}/statistics",
+    "scopes": ("derive", "semantic:inspect"),
 }
 
 LAYERS_VALUES = {
@@ -380,6 +388,41 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 + (f" Available: {', '.join(sorted(known))}." if known else "")
             )
         return {"databases": payload.get("databases"), "relations": relations}
+
+    @server.tool(
+        name="layers_statistics",
+        description=(
+            "Distribution summary for one numeric column of one layer: range,"
+            " central tendency and a histogram. Takes a column name from"
+            " catalog_list, as layers_values does. Aggregates only, never rows."
+        ),
+    )
+    def layers_statistics(
+        layer_key: str,
+        field: str,
+        locale: str | None = None,
+        bins: int | None = None,
+    ) -> dict:
+        """The numeric counterpart to `layers_values`.
+
+        `layers_values` counts categories, which answers "what values are
+        there"; this summarises a distribution, which answers "what does it look
+        like". A layer field is usually one or the other, and an agent that has
+        only the first reaches for it on continuous data and gets thousands of
+        distinct values back.
+
+        Same field rule as `layers_values`: a real selectable column of the
+        layer's relation, which `catalog_list` resolves. The platform refuses
+        anything else, naming the column it could not find.
+        """
+        path = LAYERS_STATISTICS["path_template"].replace(
+            "{layerKey}", quote(layer_key, safe="")
+        )
+        return spend(
+            LAYERS_STATISTICS,
+            path=path,
+            query=layer_statistics_query(field=field, locale=locale, bins=bins),
+        )
 
     @server.tool(
         name="layers_values",
