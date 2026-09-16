@@ -40,7 +40,9 @@ Five obligations, each separately testable:
    carries the revision in ``params._meta`` and requires the two to agree.
 
 It must not touch the RFC 9728 metadata GET, which is unauthenticated and
-read-only by design, nor anything that is not a POST to the RPC path.
+read-only by design. On the RPC path it screens POST and refuses GET -- the SDK
+serves a standalone event stream there, which this server does not offer -- and
+leaves DELETE to the inner app, which already declines session termination.
 """
 
 from __future__ import annotations
@@ -107,9 +109,29 @@ class ProtocolEraGuard:
         if scope.get("type") != "http":
             await self._app(scope, receive, send)
             return
-        # Everything but a POST to the RPC path is somebody else's business:
-        # the metadata GET is unauthenticated and read-only, and GET/DELETE on
-        # the RPC path are the inner app's 405 to give.
+        if scope.get("path") == self._rpc_path and scope.get("method") == "GET":
+            # The standalone event stream, refused here because the SDK serves
+            # it. Measured: an authenticated GET returns 200 text/event-stream
+            # and holds the connection open, which the specification says this
+            # server does not do -- and which no target client needs. All three
+            # ecosystems completed a session through a proxy that implemented
+            # POST and nothing else.
+            #
+            # Left open it is a connection held per caller for no benefit: with
+            # `stateless_http` there is no session for the stream to belong to,
+            # so it can carry nothing. DELETE needs no such handling; the SDK
+            # already answers "session termination not supported".
+            await _reject(
+                send,
+                METHOD_NOT_FOUND,
+                "The standalone event stream is not served.",
+                reason="event-stream-not-served",
+                status=405,
+            )
+            return
+        # Everything else that is not a POST to the RPC path is somebody else's
+        # business: the metadata GET is unauthenticated and read-only, and
+        # DELETE on the RPC path is the inner app's 405 to give.
         if scope.get("path") != self._rpc_path or scope.get("method") != "POST":
             await self._app(scope, receive, self._strip_session(send))
             return
@@ -350,13 +372,15 @@ def _initialize_offer(body: bytes):
     return offered if isinstance(offered, str) else None
 
 
-async def _reject(send, code: int, message: str, *, reason: str, **extra) -> None:
+async def _reject(
+    send, code: int, message: str, *, reason: str, status: int = 400, **extra
+) -> None:
     error: dict[str, Any] = {"code": code, "message": message, "data": {"reason": reason}}
     error["data"].update(extra)
     payload = json.dumps({"jsonrpc": "2.0", "id": None, "error": error}).encode()
     await send({
         "type": "http.response.start",
-        "status": 400,
+        "status": status,
         "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(payload)).encode()),

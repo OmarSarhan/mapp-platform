@@ -565,16 +565,38 @@ class PassThroughTests(unittest.TestCase):
         self.assertEqual(200, response.status)
         self.assertEqual(1, inner.calls)
 
-    def test_a_get_on_the_rpc_path_is_the_runtime_s_answer_not_the_guard_s(self) -> None:
-        """The guard screens POSTs; a GET is the runtime's 405 to give.
+    def test_a_standalone_event_stream_is_refused(self) -> None:
+        """The SDK serves one on a GET to the RPC path -- measured against the
+        deployed stack as `200 text/event-stream` with the connection held open.
 
-        Carries a credential because /mcp is a protected resource, so an
-        anonymous GET is refused by authentication before the question this
-        test asks can be reached.
+        The specification says this server offers no standalone GET event
+        stream, and no target client needs one: all three ecosystems completed a
+        session through a proxy that implemented POST and nothing else. With
+        `stateless_http` there is no session for such a stream to belong to, so
+        leaving it open holds a connection per caller and carries nothing.
         """
         app, inner, _ = guarded()
-        call(app, method="GET", path="/mcp", headers=MODERN)
-        self.assertEqual(1, inner.calls, "the guard only screens POSTs")
+        response = call(app, method="GET", headers=MODERN, body=b"")
+        self.assertEqual(405, response.status)
+        self.assertEqual("event-stream-not-served", response.reason)
+        self.assertEqual(0, inner.calls, "the stream reached the runtime")
+
+    def test_delete_is_still_the_runtime_s_answer(self) -> None:
+        """Only GET is taken over. The SDK already declines session termination
+        with its own message, and duplicating that here would be a second place
+        to keep right."""
+        app, inner, _ = guarded()
+        call(app, method="DELETE", headers=MODERN, body=b"")
+        self.assertEqual(1, inner.calls)
+
+    def test_the_metadata_get_is_untouched_by_the_rpc_path_rule(self) -> None:
+        """The refusal is scoped to the RPC path. RFC 9728 discovery is a GET
+        and must stay reachable, unauthenticated."""
+        app, _, _ = guarded()
+        response = call(
+            app, method="GET", path="/.well-known/oauth-protected-resource/mcp"
+        )
+        self.assertEqual(200, response.status)
 
 
 if __name__ == "__main__":
