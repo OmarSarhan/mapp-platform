@@ -630,6 +630,27 @@ def _live_visual_input_schema() -> dict[str, Any]:
 
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "catalog.list": {
+        "method": "GET",
+        "pathTemplate": "/api/catalog",
+        # Column names and types, never row values.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "layers.list": {
+        "method": "GET",
+        "pathTemplate": "/api/layers",
+        # Workspace configuration, not layer data: which layers exist, what they
+        # are called and which fields they expose. `layers.values` reads the
+        # data behind one of them and costs `derive` accordingly.
+        "risk": "inspect",
+        "scope": "inspect",
+        "querySchema": {
+            "type": "object",
+            "properties": {"locale": {"type": "string", "minLength": 1}},
+            "additionalProperties": False,
+        },
+    },
     "layers.values": {
         "method": "GET",
         "pathTemplate": "/api/layers/{layerKey}/values",

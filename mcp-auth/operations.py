@@ -45,6 +45,27 @@ class Operation:
 
 #: Keyed by operation ID exactly as the configuration API names it.
 OPERATIONS: dict[str, Operation] = {
+    "catalog.list": Operation(
+        operation_id="catalog.list",
+        method="GET",
+        path_template="/api/catalog",
+        # Relation *metadata* -- schema, table, column names and types -- and no
+        # row values. That is what makes it an `inspect` read: it describes the
+        # shape of the data without reading any of it.
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
+    "layers.list": Operation(
+        operation_id="layers.list",
+        method="GET",
+        path_template="/api/layers",
+        # The configuration API's GET catch-all scope. Listing layers exposes
+        # workspace configuration and nothing from the data itself, which is why
+        # it costs `inspect` -- the same discovery scope a client already holds
+        # to see the tools at all -- rather than `derive`.
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
     "layers.values": Operation(
         operation_id="layers.values",
         method="GET",

@@ -117,6 +117,22 @@ def rpc_result(text):
     return json.loads(text) if text.strip() else None
 
 
+def registered_tool_names():
+    """The tool names the runtime registers, read from it rather than restated.
+
+    A literal list here needed editing every time a tool was added, which is the
+    shape that eventually disagrees with the code for a release. What these
+    tests assert is that *what the runtime registers* is what a client is shown
+    over each era -- not what somebody remembered to type.
+    """
+    resource = ProtectedResource(origin=ORIGIN, issuer=ORIGIN)
+    from runtime import build_runtime
+
+    server = build_runtime(resource=resource, exchange=FakeExchange(),
+                           config_api=FakeConfigApi())
+    return sorted(server._tool_manager._tools)
+
+
 def composed(scopes=SCOPES):
     """The shipped stack, with only the platform behind the tools replaced.
 
@@ -225,7 +241,8 @@ class LegacySessionTests(unittest.TestCase):
         transcript, _, _ = self.drive()
         listed = rpc_result(transcript["tools/list"][2])["result"]["tools"]
         self.assertEqual(
-            ["describe_instance", "layer_values"], sorted(t["name"] for t in listed)
+            registered_tool_names(),
+            sorted(t["name"] for t in listed),
         )
 
     def test_a_tool_reaches_the_platform_with_the_caller_s_own_credential(self) -> None:
@@ -241,7 +258,7 @@ class LegacySessionTests(unittest.TestCase):
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "layer_values",
+                    "name": "layers_values",
                     "arguments": {"layer_key": "Census_OA", "field": "quintile"},
                 },
             }
@@ -350,7 +367,7 @@ class ModernEraReachabilityTests(unittest.TestCase):
 class ToolFailureVisibilityTests(unittest.TestCase):
     """What the *client* is given when a tool refuses.
 
-    This is the test that was missing. Every other test of `layer_values` calls
+    This is the test that was missing. Every other test of `layers_values` calls
     the registered function and inspects the exception it raises, which is true
     of the function and says nothing about what crosses the wire. The SDK puts a
     `ToolError`'s text into the result and replaces everything else with "Error
@@ -373,7 +390,7 @@ class ToolFailureVisibilityTests(unittest.TestCase):
                         "id": 2,
                         "method": "tools/call",
                         "params": {
-                            "name": "layer_values",
+                            "name": "layers_values",
                             "arguments": {"layer_key": "L", "field": "f"},
                         },
                     },
@@ -396,7 +413,7 @@ class ToolFailureVisibilityTests(unittest.TestCase):
         # else, an anticipated failure appends ": " and the real message. So the
         # bare string is the exact signature of the bug.
         self.assertNotEqual(
-            "Error executing tool layer_values",
+            "Error executing tool layers_values",
             text.strip(),
             "the SDK discarded the message: the tool raised a type it calls a crash",
         )
@@ -438,7 +455,8 @@ class ModernSessionTests(unittest.TestCase):
         self.assertEqual(200, status, body[:200])
         listed = rpc_result(body)["result"]["tools"]
         self.assertEqual(
-            ["describe_instance", "layer_values"], sorted(t["name"] for t in listed)
+            registered_tool_names(),
+            sorted(t["name"] for t in listed),
         )
 
     def test_initialize_is_still_not_a_modern_method(self) -> None:

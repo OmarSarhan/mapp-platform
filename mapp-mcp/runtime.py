@@ -34,6 +34,7 @@ from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
 from config_api_client import ConfigApiUnavailable
 from config_api_client import layer_values_query
+from config_api_client import layers_query
 from exchange_client import ExchangeRefused
 from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
@@ -55,10 +56,32 @@ INSPECT_SCOPE = "inspect"
 RPC_PATH = "/mcp"
 
 
-#: The operation this tool acts through, as the broker's allowlist names it.
-#: Not a vendored copy of that table: one tool, one operation, and a fourth copy
-#: of the allowlist would be a fourth thing to keep in step.
-LAYER_VALUES = {
+#: The operations these tools act through, named exactly as the broker's
+#: allowlist names them. Not a vendored copy of that table: the broker decides
+#: what may be exchanged for, and a second copy of that decision would be a
+#: second thing to keep in step.
+#:
+#: Tool names follow the CLI's command vocabulary with spaces as underscores --
+#: `layers list` is `layers_list` -- so an operator reading a transcript and an
+#: operator at a terminal are using the same words for the same thing.
+LAYERS_LIST = {
+    "operation_id": "layers.list",
+    "method": "GET",
+    "path_template": "/api/layers",
+    # The GET catch-all scope. Listing exposes workspace configuration and
+    # nothing from the data, so it costs the discovery scope a client already
+    # holds to see the tools at all.
+    "scopes": ("inspect",),
+}
+
+CATALOG_LIST = {
+    "operation_id": "catalog.list",
+    "method": "GET",
+    "path_template": "/api/catalog",
+    "scopes": ("inspect",),
+}
+
+LAYERS_VALUES = {
     "operation_id": "layers.values",
     "method": "GET",
     "path_template": "/api/layers/{layerKey}/values",
@@ -67,6 +90,62 @@ LAYER_VALUES = {
     # a client holding only the bootstrap scopes has to ask for them.
     "scopes": ("derive", "semantic:inspect"),
 }
+
+
+def _layers_of(payload):
+    """The (key, layer) pairs in a layer-listing response, whatever its shape.
+
+    The configuration API returns layers as an object keyed by layer key. A
+    tolerant reader here means a shape change downstream degrades to an empty
+    list rather than an exception the agent cannot act on -- and the tools above
+    report an empty workspace honestly rather than crashing.
+    """
+    layers = (payload or {}).get("layers")
+    if isinstance(layers, dict):
+        return list(layers.items())
+    if isinstance(layers, list):
+        return [
+            (item.get("key") or item.get("layer") or "", item)
+            for item in layers
+            if isinstance(item, dict)
+        ]
+    return []
+
+
+def _layer_summary(key, layer):
+    """One index entry: enough to choose a layer, not enough to describe it.
+
+    `table` is the load-bearing part. `layers_values` accepts only a real
+    selectable *column* of the layer's relation -- the configuration API checks
+    it against `information_schema` -- and the relation is what `catalog_list`
+    resolves to columns.
+
+    `displayFields` is named for what it is. These come from `infoj`, which
+    describes what the map shows: some entries are calculated, some are
+    geometry, and they are not interchangeable with columns. An earlier version
+    of this returned them as `fields`, and the first live call chose one and was
+    refused -- "the field 'population_display' is not a selectable column on
+    this layer". Presenting them as queryable was the bug; presenting them at
+    all is still useful, because they are what a person calls the data.
+    """
+    layer = layer if isinstance(layer, dict) else {}
+    info = layer.get("infoj")
+    display = [
+        entry.get("field")
+        for entry in (info if isinstance(info, list) else [])
+        if isinstance(entry, dict) and entry.get("field")
+    ]
+    table = layer.get("table")
+    return {
+        "key": key,
+        "name": layer.get("name") or key,
+        "group": layer.get("group"),
+        # A zoom-keyed mapping rather than one relation is a valid layer shape
+        # and is not queryable by `layers_values`; reported as-is rather than
+        # flattened into something that looks usable.
+        "table": table if isinstance(table, str) else None,
+        "displayFields": display,
+    }
 
 
 def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
@@ -115,51 +194,36 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "runtime": f"{RUNTIME_NAME}/{RUNTIME_VERSION}",
         }
 
-    @server.tool(
-        name="layer_values",
-        description=(
-            "Bounded category counts for one field of one configured layer."
-            " Returns aggregate counts from the layer's effective restrictions,"
-            " never raw rows."
-        ),
-    )
-    def layer_values(
-        layer_key: str,
-        field: str,
-        locale: str | None = None,
-        limit: int | None = None,
-    ) -> dict:
-        """One read, through the full binding.
+    def spend(operation, *, path, query=""):
+        """Obtain one request-bound credential and spend it. The whole path.
 
-        The credential this obtains authorises exactly this request and no
-        other: the path and query are digested at exchange time and sent
-        unchanged, and the configuration API recomputes the digest from what
-        actually arrives before it will spend the credential.
+        Every tool that touches the platform goes through here, so the scope
+        check, the exchange, the binding and the failure vocabulary exist once.
+        The alternative is each tool repeating forty lines, which is how the
+        fourth tool ends up subtly different from the first.
 
-        The query is built once, here, by the helper that also fixes its order.
-        Rebuilding it for the request would be two constructions of the same
-        string and one chance for them to differ -- which surfaces as a refusal
-        naming no cause.
+        The credential authorises exactly this request and no other: the path
+        and query are digested at exchange time and sent unchanged, so they are
+        built once by the caller and passed here rather than reassembled. Two
+        constructions of the same string is one chance for them to differ, and
+        that surfaces at the configuration API as a refusal naming no cause.
 
-        Every anticipated failure is raised as ``ToolError``, and that choice is
-        load-bearing rather than stylistic. The SDK treats ``ToolError`` as "a
-        failure you saw coming" and puts its text in the result the model reads;
-        *any other exception* it treats as a crash, replacing the text with
-        "Error executing tool layer_values" and logging a traceback at ERROR.
-        These raises were ``ValueError`` and ``RuntimeError``, so every message
-        written here to be acted on -- which scope to ask for, which platform
-        code refused -- was discarded before it reached the caller, and routine
-        scope refusals were logged as crashes. Found by driving a real client
-        against the deployed stack; the unit tests called the tool function
-        directly and so agreed with the code while the property was false.
+        Every anticipated failure is a ``ToolError``, and that is load-bearing
+        rather than stylistic. The SDK puts a ``ToolError``'s text in the result
+        the model reads and treats any other exception as a crash -- replacing
+        the message with "Error executing tool <name>" and logging a traceback.
+        These were ``ValueError`` and ``RuntimeError`` once, so every message
+        written to be acted on was discarded before reaching the caller. Found
+        by driving a real client; the unit tests called the functions directly
+        and agreed with the code while the property was false.
         """
         caller = CURRENT_CALLER.get()
         if caller is None:
-            # Unreachable through the middleware, which refuses before
-            # dispatch. Checked anyway, because the alternative if it ever
-            # became reachable is an unauthenticated platform call.
+            # Unreachable through the middleware, which refuses before dispatch.
+            # Checked anyway, because the alternative if it ever became
+            # reachable is an unauthenticated platform call.
             raise ToolError("This tool requires an authenticated caller.")
-        missing = [s for s in LAYER_VALUES["scopes"] if s not in caller.scopes]
+        missing = [s for s in operation["scopes"] if s not in caller.scopes]
         if missing:
             # Refused here rather than at the exchange, so the message names the
             # scopes to ask for. The broker would refuse it too, with an error
@@ -168,24 +232,19 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 "This grant does not carry "
                 + " and ".join(sorted(missing))
                 + ". Re-authorize requesting "
-                + " ".join(LAYER_VALUES["scopes"])
+                + " ".join(operation["scopes"])
                 + " to use this tool."
             )
-
-        path = LAYER_VALUES["path_template"].replace(
-            "{layerKey}", quote(layer_key, safe="")
-        )
-        query = layer_values_query(field=field, locale=locale, limit=limit)
         try:
             token_b = exchange.exchange(
                 subject_token=caller.token,
-                operation_id=LAYER_VALUES["operation_id"],
-                method=LAYER_VALUES["method"],
-                path_template=LAYER_VALUES["path_template"],
+                operation_id=operation["operation_id"],
+                method=operation["method"],
+                path_template=operation["path_template"],
                 path=path,
                 query=query,
                 body=None,
-                scope=" ".join(LAYER_VALUES["scopes"]),
+                scope=" ".join(operation["scopes"]),
             )
         except ExchangeRefused as refusal:
             raise ToolError(f"The platform refused this request: {refusal}") from None
@@ -195,7 +254,6 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             raise ToolError(
                 "The authorization component is unavailable; try again."
             ) from None
-
         try:
             return config_api.get(path=path, query=query, token=token_b)
         except ConfigApiRefused as refusal:
@@ -207,6 +265,150 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             raise ToolError(
                 "The configuration API is unavailable; try again."
             ) from None
+
+    @server.tool(
+        name="layers_list",
+        description=(
+            "Every configured layer in the workspace, as a compact index:"
+            " key, display name, group, the relation it reads, and the fields"
+            " it displays. Use this to discover a layer_key. Note that"
+            " layers_values needs a *column* of the layer's table, which"
+            " catalog_list resolves -- displayFields are not always columns."
+        ),
+    )
+    def layers_list(locale: str | None = None) -> dict:
+        """Discovery, and the reason the other layer tools are usable at all.
+
+        `layers_values` needs a layer key and a field name, and before this
+        existed an agent had no way to learn either -- every test of it required
+        a key found by reading the workspace file by hand.
+
+        Deliberately an index rather than the configuration itself. The
+        underlying response carries every layer in full, which is far more than
+        an agent needs to choose one and costs tokens in a conversation where
+        the next question is "and what is in it". `layers_get` returns one
+        layer whole, which is the shape that actually wants detail.
+        """
+        query = layers_query(locale=locale)
+        payload = spend(LAYERS_LIST, path=LAYERS_LIST["path_template"], query=query)
+        return {
+            "revision": payload.get("revision"),
+            "locale": payload.get("locale"),
+            "layers": [_layer_summary(key, layer)
+                       for key, layer in _layers_of(payload)],
+        }
+
+    @server.tool(
+        name="layers_get",
+        description=(
+            "One configured layer in full: its data source, fields, styling and"
+            " filters. Takes a layer_key from layers_list."
+        ),
+    )
+    def layers_get(layer_key: str, locale: str | None = None) -> dict:
+        """The same read as `layers_list`, returning one layer rather than an index.
+
+        There is no per-layer endpoint -- the configuration API serves the whole
+        set and the CLI filters client-side, so this does the same. Filtering
+        here rather than making the agent do it keeps the response bounded,
+        which matters more for a model than for a terminal.
+        """
+        query = layers_query(locale=locale)
+        payload = spend(LAYERS_LIST, path=LAYERS_LIST["path_template"], query=query)
+        for key, layer in _layers_of(payload):
+            if key == layer_key:
+                return {
+                    "revision": payload.get("revision"),
+                    "locale": payload.get("locale"),
+                    "key": key,
+                    "layer": layer,
+                }
+        known = [key for key, _ in _layers_of(payload)]
+        # Naming the alternatives, because a wrong key is the likeliest mistake
+        # and the agent can act on the list without a second round trip.
+        raise ToolError(
+            f"No layer {layer_key!r} in this workspace."
+            + (f" Configured layers: {', '.join(sorted(known))}." if known else "")
+        )
+
+    @server.tool(
+        name="catalog_list",
+        description=(
+            "Database relations available to this instance, with each column's"
+            " name and type. This is where a queryable field name comes from:"
+            " layers_values accepts a column of the layer's table, which"
+            " layers_list reports. Metadata only -- never row values."
+        ),
+    )
+    def catalog_list(table: str | None = None) -> dict:
+        """Column metadata, which is the only honest source of a queryable field.
+
+        `layers_list` reports which relation a layer reads; this reports what is
+        in that relation. The pair is what makes `layers_values` callable
+        without guessing, which it was not before: the first live attempt used a
+        display field and was refused.
+
+        `table` filters to one relation, matched against "schema.table" or the
+        bare table name. Filtering happens here rather than in the agent so a
+        large deployment does not answer "which column?" with every column in
+        the database.
+        """
+        payload = spend(CATALOG_LIST, path=CATALOG_LIST["path_template"])
+        wanted = (table or "").strip().lower()
+        relations = []
+        for item in (payload.get("tables") or []):
+            if not isinstance(item, dict):
+                continue
+            qualified = f"{item.get('schema')}.{item.get('table')}"
+            if wanted and wanted not in (qualified.lower(), str(item.get("table")).lower()):
+                continue
+            relations.append({
+                "relation": qualified,
+                "columns": [
+                    {"name": column.get("name"), "type": column.get("type")}
+                    for column in (item.get("columns") or [])
+                    if isinstance(column, dict) and column.get("name")
+                ],
+            })
+        if wanted and not relations:
+            known = [
+                f"{i.get('schema')}.{i.get('table')}"
+                for i in (payload.get("tables") or []) if isinstance(i, dict)
+            ]
+            raise ToolError(
+                f"No relation matching {table!r}."
+                + (f" Available: {', '.join(sorted(known))}." if known else "")
+            )
+        return {"databases": payload.get("databases"), "relations": relations}
+
+    @server.tool(
+        name="layers_values",
+        description=(
+            "Bounded category counts for one field of one configured layer."
+            " Returns aggregate counts from the layer's effective restrictions,"
+            " never raw rows."
+        ),
+    )
+    def layers_values(
+        layer_key: str,
+        field: str,
+        locale: str | None = None,
+        limit: int | None = None,
+    ) -> dict:
+        """One read, through the full binding.
+
+        Renamed from `layer_values` to match the CLI's `layers values`. The
+        vocabulary is shared on purpose: an operator reading an agent transcript
+        and an operator at a terminal should be using the same words.
+        """
+        path = LAYERS_VALUES["path_template"].replace(
+            "{layerKey}", quote(layer_key, safe="")
+        )
+        return spend(
+            LAYERS_VALUES,
+            path=path,
+            query=layer_values_query(field=field, locale=locale, limit=limit),
+        )
 
     return server
 

@@ -1,4 +1,4 @@
-"""The tool's own decisions, with the platform stubbed out.
+"""The layer tools' own decisions, with the platform stubbed out.
 
 What it does with a broker and a configuration API is proved end to end against
 the running stack. What is worth pinning here is the part that is this tool's
@@ -20,6 +20,7 @@ from authentication import CURRENT_CALLER  # noqa: E402
 from config_api_client import ConfigApiRefused  # noqa: E402
 from config_api_client import ConfigApiUnavailable  # noqa: E402
 from config_api_client import layer_values_query  # noqa: E402
+from config_api_client import layers_query  # noqa: E402
 from exchange_client import ExchangeRefused  # noqa: E402
 from exchange_client import ExchangeUnavailable  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
@@ -52,7 +53,12 @@ class FakeConfigApi:
         return self.answer
 
 
-def caller(scopes="derive semantic:inspect mcp:connect", token="mapp_a_live"):
+#: `inspect` is in the default because any caller that can *see* a tool holds
+#: it -- it is the listing scope -- so a caller without it is not a realistic
+#: grant. Tests about a missing scope name the narrower set explicitly.
+def caller(
+    scopes="mcp:connect inspect derive semantic:inspect", token="mapp_a_live"
+):
     return Authenticated(
         {"sub": "oauth:grant", "scope": scopes, "aud": "http://mcp.localhost/mcp"},
         token,
@@ -60,6 +66,17 @@ def caller(scopes="derive semantic:inspect mcp:connect", token="mapp_a_live"):
 
 
 class ToolTestCase(unittest.TestCase):
+    def build_named(self, name, *, exchange=None, config_api=None):
+        resource = ProtectedResource(
+            origin="http://mcp.localhost", issuer="http://mcp.localhost"
+        )
+        server = build_runtime(
+            resource=resource,
+            exchange=exchange or FakeExchange(),
+            config_api=config_api or FakeConfigApi(),
+        )
+        return server._tool_manager._tools[name].fn
+
     def build(self, *, exchange=None, config_api=None):
         resource = ProtectedResource(
             origin="http://mcp.localhost", issuer="http://mcp.localhost"
@@ -72,7 +89,7 @@ class ToolTestCase(unittest.TestCase):
         # Reach the registered function rather than dispatching through the
         # SDK: the SDK's own path is exercised against the deployed stack, and
         # what these assert is the tool's logic.
-        return server._tool_manager._tools["layer_values"].fn
+        return server._tool_manager._tools["layers_values"].fn
 
     def as_caller(self, who):
         token = CURRENT_CALLER.set(who)
@@ -294,3 +311,218 @@ class AnticipatedFailureTests(ToolTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+#: One layer-listing response, shaped as the configuration API returns it.
+LISTING = {
+    "revision": "rev-1",
+    "locale": "en",
+    "layers": {
+        "Census_OA_Population": {
+            "name": "Census OA Population",
+            "group": "Census",
+            "table": "derived_layers.census_oa_population_quintiles",
+            "infoj": [
+                {"field": "oa_id", "type": "text"},
+                {"field": "population_quintile", "type": "integer"},
+                {"type": "geometry"},
+            ],
+        },
+        "Bus_Stops": {"name": "Bus Stops", "infoj": [{"field": "town"}]},
+    },
+}
+
+
+class ListingTests(ToolTestCase):
+    """`layers_list` exists because `layers_values` was unusable without it.
+
+    Every test of the values tool had to name a layer key found by reading the
+    workspace file by hand. An agent cannot do that, so in a conversation the
+    first question -- "what is there?" -- had no answer.
+    """
+
+    def tool(self, name, payload=LISTING, exchange=None):
+        return self.build_named(
+            name,
+            exchange=exchange,
+            config_api=FakeConfigApi(answer=payload),
+        )
+
+    def test_the_index_carries_what_is_needed_to_choose_and_no_more(self) -> None:
+        """Enough to pick a layer and a field; not the whole configuration.
+
+        The underlying response holds every layer in full. Returning that would
+        answer "what is there?" by spending most of a context window, and the
+        next question is always "and what is in it".
+        """
+        self.as_caller(caller())
+        result = self.tool("layers_list")()
+        self.assertEqual("rev-1", result["revision"])
+        entries = {item["key"]: item for item in result["layers"]}
+        self.assertEqual({"Census_OA_Population", "Bus_Stops"}, set(entries))
+        census = entries["Census_OA_Population"]
+        self.assertEqual("Census OA Population", census["name"])
+        self.assertEqual("Census", census["group"])
+        # The relation is the point: it is what catalog_list resolves to the
+        # columns layers_values will actually accept.
+        self.assertEqual(
+            "derived_layers.census_oa_population_quintiles", census["table"]
+        )
+        # Display fields are named for what they are, never as "fields".
+        self.assertEqual(["oa_id", "population_quintile"], census["displayFields"])
+        self.assertNotIn("fields", census)
+        self.assertNotIn("infoj", census)
+
+    def test_a_geometry_entry_contributes_no_display_field(self) -> None:
+        self.as_caller(caller())
+        fields = self.tool("layers_list")()["layers"][0]["displayFields"]
+        self.assertNotIn(None, fields)
+        self.assertNotIn("", fields)
+
+    def test_display_fields_are_never_presented_as_queryable(self) -> None:
+        """The bug the first live call found.
+
+        `infoj` describes what the map shows. `layers_values` accepts only a
+        real selectable column, checked against `information_schema`. The index
+        returned these as `fields`, the agent picked one, and the platform
+        refused: "the field 'population_display' is not a selectable column on
+        this layer". The names differ per layer, so nothing but the key name
+        stops the two being confused again.
+        """
+        self.as_caller(caller())
+        entry = self.tool("layers_list")()["layers"][0]
+        self.assertIn("displayFields", entry)
+        self.assertIn("table", entry)
+        self.assertNotIn("fields", entry)
+
+    def test_a_zoom_keyed_table_is_not_reported_as_a_relation(self) -> None:
+        """A layer may map zoom levels to different relations. That shape is not
+        queryable by `layers_values`, so reporting it as one relation would
+        point the agent at a request that cannot work."""
+        payload = {"layers": {"Bus_Stops": {
+            "name": "Bus Stops", "table": {"0": None, "15": "source_ops.bus_stops"},
+        }}}
+        self.as_caller(caller())
+        entry = self.tool("layers_list", payload=payload)()["layers"][0]
+        self.assertIsNone(entry["table"])
+
+    def test_the_listing_costs_only_the_discovery_scope(self) -> None:
+        """A grant holding just the advertised pair can discover what exists.
+        Needing `derive` to list would make discovery a privileged act."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        self.tool("layers_list", exchange=exchange)()
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
+        self.assertEqual("layers.list", exchange.calls[0]["operation_id"])
+
+    def test_get_returns_one_layer_whole(self) -> None:
+        self.as_caller(caller())
+        result = self.tool("layers_get")(layer_key="Census_OA_Population")
+        self.assertEqual("Census_OA_Population", result["key"])
+        # The detail the index deliberately omits.
+        self.assertEqual(
+            "derived_layers.census_oa_population_quintiles", result["layer"]["table"]
+        )
+
+    def test_an_unknown_key_names_the_ones_that_exist(self) -> None:
+        """A wrong key is the likeliest mistake, and the alternatives are
+        already in hand -- making the agent call again to learn them wastes a
+        turn and a credential."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as caught:
+            self.tool("layers_get")(layer_key="Nope")
+        message = str(caught.exception)
+        self.assertIn("Nope", message)
+        self.assertIn("Census_OA_Population", message)
+        self.assertIn("Bus_Stops", message)
+
+    def test_an_empty_workspace_is_reported_not_crashed(self) -> None:
+        self.as_caller(caller())
+        self.assertEqual([], self.tool("layers_list", payload={"layers": {}})()["layers"])
+        with self.assertRaises(ToolError):
+            self.tool("layers_get", payload={"layers": {}})(layer_key="anything")
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        """A downstream shape change should reach the agent as "nothing here",
+        which it can report, rather than a crash it cannot."""
+        for payload in ({}, {"layers": None}, {"layers": []}, {"layers": "x"}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                self.assertEqual([], self.tool("layers_list", payload=payload)()["layers"])
+
+
+class ListingQueryTests(unittest.TestCase):
+    """The query is digested byte for byte, so its shape is a contract."""
+
+    def test_no_locale_is_no_parameter(self) -> None:
+        """`locale=` is a different request from no locale, and is refused."""
+        self.assertEqual("", layers_query(locale=None))
+
+    def test_a_locale_is_encoded(self) -> None:
+        self.assertEqual("locale=en%20GB", layers_query(locale="en GB"))
+
+
+CATALOG = {
+    "databases": ["MAPP"],
+    "tables": [
+        {"schema": "derived_layers", "table": "census_oa_population_quintiles",
+         "columns": [{"name": "oa_id", "type": "text"},
+                     {"name": "population_quintile", "type": "integer"},
+                     {"name": "geom_3857", "type": "geometry"}]},
+        {"schema": "source_ops", "table": "bus_stops",
+         "columns": [{"name": "town", "type": "text"}]},
+    ],
+}
+
+
+class CatalogTests(ToolTestCase):
+    """`catalog_list` is what makes a field name knowable rather than guessed."""
+
+    def tool(self, payload=CATALOG, exchange=None):
+        return self.build_named(
+            "catalog_list", exchange=exchange,
+            config_api=FakeConfigApi(answer=payload),
+        )
+
+    def test_it_reports_columns_with_their_types(self) -> None:
+        """The column list is the whole point: `layers_values` accepts a column
+        and nothing else, and before this the only way to learn one was to read
+        the database by hand."""
+        self.as_caller(caller())
+        result = self.tool()()
+        relations = {r["relation"]: r for r in result["relations"]}
+        self.assertIn("derived_layers.census_oa_population_quintiles", relations)
+        columns = relations["derived_layers.census_oa_population_quintiles"]["columns"]
+        self.assertIn(
+            {"name": "population_quintile", "type": "integer"}, columns
+        )
+
+    def test_it_filters_to_one_relation_qualified_or_bare(self) -> None:
+        """Filtering here rather than in the agent, so a large deployment does
+        not answer "which column?" with every column in the database."""
+        self.as_caller(caller())
+        for wanted in ("derived_layers.census_oa_population_quintiles",
+                       "census_oa_population_quintiles",
+                       "CENSUS_OA_POPULATION_QUINTILES"):
+            with self.subTest(table=wanted):
+                result = self.tool()(table=wanted)
+                self.assertEqual(1, len(result["relations"]))
+
+    def test_an_unknown_relation_names_the_ones_that_exist(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as caught:
+            self.tool()(table="nope")
+        self.assertIn("source_ops.bus_stops", str(caught.exception))
+
+    def test_it_costs_only_the_discovery_scope(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        self.tool(exchange=exchange)()
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
+        self.assertEqual("catalog.list", exchange.calls[0]["operation_id"])
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"tables": None}, {"tables": ["x"]}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                self.assertEqual([], self.tool(payload=payload)()["relations"])

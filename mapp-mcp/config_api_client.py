@@ -75,6 +75,20 @@ class ConfigApiClient:
             ) from None
 
 
+def layers_query(*, locale: str | None) -> str:
+    """The query string for the layer listing, in the one fixed order.
+
+    Same rule as `layer_values_query` and for the same reason: the query is
+    digested at exchange time and sent at request time, so it is built once and
+    used twice rather than constructed twice and hoped to match. An absent
+    locale is an absent parameter, not an empty one -- `locale=` is a different
+    request and the configuration API refuses it.
+    """
+    if locale is None:
+        return ""
+    return f"locale={urllib.parse.quote(locale, safe='')}"
+
+
 def layer_values_query(*, field: str, locale: str | None, limit: int | None) -> str:
     """The query string, in a fixed order, built once.
 
