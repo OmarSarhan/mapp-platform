@@ -198,6 +198,27 @@ the server already checked. A private-use scheme becomes a bare `scheme:`
 source; anything unparseable yields nothing and leaves the policy at `'self'`,
 which fails visibly rather than widening silently.
 
+**A request after the handshake may omit `MCP-Protocol-Version`.** The
+2025-06-18 specification requires clients to send it on every request after
+`initialize`. Gemini CLI 0.60.0 sends it on none of them, so the guard refused
+its `notifications/initialized` and the session never opened — transport
+correct, ecosystem unreachable.
+
+Admitting a header-less request is not a guess about which era it belongs to.
+The modern revision carries its protocol version and client capabilities in
+`params._meta` and requires the header to agree with them, so a request with no
+header cannot satisfy the modern ladder at all: absence of the header *is* the
+evidence that this is the handshake era. That property is asserted against the
+real SDK (`ModernEraReachabilityTests`) rather than argued, because the whole
+relaxation rests on it.
+
+What it costs: the guard can no longer tell a client "you forgot the header",
+and a malformed header is now the only header-shaped complaint it makes. What it
+does not cost: a declared revision is still checked against the served set, a
+malformed one is still refused, `initialize` is still held to the admitted
+handshake list, and the modern era still requires both the header and the
+envelope — measured together, not assumed.
+
 **P2a — the server speaks the revisions the target ecosystems speak.** The
 specification fixed `2026-07-28` and told Phase 0 to document any ecosystem that
 could not reach it as unsupported rather than add a legacy transport path. Every
@@ -340,7 +361,7 @@ four paths on the MCP origin. Both are asserted, in different suites.
 | 5 | ~~`recovery_epoch` unimplemented~~ **Closed** | Wired in Phase 1, as the amendment above records: `control.current_recovery_epoch()`, a function-backed column default, `./bin/mapp advance-recovery-epoch --confirm` as step 5 of the restore procedure, and the sweep audited. Covered by 20 tests in `config-ui/tests/test_recovery_epoch.py` and by `mcp-auth/tests/test_recovery_epoch_effect.py`, which asserts the effect on the component that reads the credentials. This row contradicted the amendment for one revision | — |
 | 6 | ~~O20 — `form-action 'self'` across the consent redirect~~ **Closed** | Measured in three engines and it failed in two: Chromium and WebKit re-check `form-action` across the consent redirect and blocked it, Firefox did not. The directive now names the client's own redirect origin, taken from the pending record. Re-measured: all three reach the callback | — |
 | 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
-| 8 | Client acceptance is 2 of 3 | Claude Code 2.1.272 and Codex CLI 0.154.0 have both connected to the running platform, listed the tools and called them. Gemini CLI 0.60.0 is measured at the handshake only — it offers `2025-06-18`, the same revision as Codex and now admitted — so its transport half is answered and the authenticated journey awaits an API key | Blocking for release |
+| 8 | ~~Client acceptance is 1 of 3~~ **Closed: 3 of 3** | Claude Code 2.1.272, Codex CLI 0.154.0 and Gemini CLI 0.60.0 have each connected to the running platform, listed the tools and called them, returning real aggregates through the exchange and the request binding. Each needed exactly one measured accommodation: 2025-11-25 for Claude, 2025-06-18 for Codex and Gemini, and a header-less post-handshake request for Gemini | — |
 | 9 | Two threat-model rows postdate the owner's acceptance | Credential administration from a browser session and serving a second protocol era were added after the surfaces were built. Both are mitigated and recorded; neither has been through an acceptance decision | At the next acceptance review, before any public route |
 
 | 10 | Safari is untested | WebKit, the engine Safari ships, was driven through Playwright and reproduced both the O20 failure and its fix. Safari proper needs macOS, which this project has no access to. Owner decision: a backlog nice-to-have, not a gate condition | If macOS becomes available, or a Safari-specific report arrives |

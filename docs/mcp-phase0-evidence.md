@@ -161,7 +161,7 @@ records an amendment.
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
 | Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
 | Independent canonicalization prototypes for mapp-mcp, broker and API | **3 of 3** | All three vendored and cross-checked against each other over a corpus chosen to drift, on what they emit *and* on what they refuse. `mapp-mcp` also carries the envelope builder, checked against the configuration API's copy and against the pinned golden vector |
-| Target-client spikes (Claude, Codex, Gemini) | **2 of 3 complete; the third is handshake-compatible and awaiting a key** | Claude Code 2.1.272 has connected to the running platform and used it: discovery, consent, token, `tools/list`, and `layer_values` returning real aggregates through the exchange and the request binding. Driven from an ephemeral container against the deployed stack, not a harness. The earlier revision recorded this row as blocked "because `mapp-mcp` does not exist"; it exists. Two things the run established that reading documentation had not: the shipped client speaks **2025-11-25 only**, which forced decision P2a, and it accepts a static `Authorization` header, which is how a headless test supplies a token without its OAuth store. `mcp-auth/tests/test_registered_client.py` still drives the authorization column against the real component. **Codex CLI 0.154.0** has since done the same: connected, listed the tools and called `layer_values`, returning real aggregates through the exchange and the request binding. **Gemini CLI 0.60.0** was measured at the handshake — it offers `2025-06-18`, the same revision as Codex, which the server now admits — but its authenticated journey is untested pending an API key |
+| Target-client spikes (Claude, Codex, Gemini) | **3 of 3 complete** | Claude Code 2.1.272 has connected to the running platform and used it: discovery, consent, token, `tools/list`, and `layer_values` returning real aggregates through the exchange and the request binding. Driven from an ephemeral container against the deployed stack, not a harness. The earlier revision recorded this row as blocked "because `mapp-mcp` does not exist"; it exists. Two things the run established that reading documentation had not: the shipped client speaks **2025-11-25 only**, which forced decision P2a, and it accepts a static `Authorization` header, which is how a headless test supplies a token without its OAuth store. `mcp-auth/tests/test_registered_client.py` still drives the authorization column against the real component. **Codex CLI 0.154.0** has since done the same: connected, listed the tools and called `layer_values`, returning real aggregates through the exchange and the request binding. **Gemini CLI 0.60.0** likewise: it offers `2025-06-18` and, uniquely, sends no `MCP-Protocol-Version` on anything after `initialize` — which its own specification requires — so the guard's header requirement was relaxed for the handshake era before it could connect. It then listed both tools and called them |
 
 ### Tested
 
@@ -276,16 +276,25 @@ the design survives contact, and it did — with amendments the ADR records.
 **One** gate item remains unsatisfied in a way documentation cannot close, and
 it does not block design work:
 
-1. **Client acceptance is 2 of 3.** Claude and Codex are both complete —
-   connected, listed and called against the running platform, not merely
-   SDK-compatible. Gemini is measured at the handshake only: its CLI offers
-   `2025-06-18`, the same revision as Codex and now admitted, so the transport
-   half is answered and the authenticated journey awaits an API key. Blocking
-   for release, not for Phase 1.
+1. ~~**Client acceptance is 1 of 3.**~~ **Closed: 3 of 3.** Claude Code 2.1.272,
+   Codex CLI 0.154.0 and Gemini CLI 0.60.0 have each connected to the running
+   platform, listed the tools and called them, returning real aggregates through
+   the exchange and the request binding. Not SDK compatibility — the clients
+   themselves, driven from ephemeral containers against the deployed stack.
 
-   Each ecosystem cost one measurement and one allowlist entry, and the pattern
-   held both times: the shipped client sat behind the specification's target
-   revision, and reading its documentation would not have told us which one.
+   Each cost exactly one measured accommodation, and none was predictable from
+   documentation:
+
+   | Ecosystem | Client | Needed |
+   | --- | --- | --- |
+   | Claude | Claude Code 2.1.272 | `2025-11-25` admitted |
+   | Codex/OpenAI | Codex CLI 0.154.0 | `2025-06-18` admitted |
+   | Gemini | Gemini CLI 0.60.0 | `2025-06-18`, plus a header-less post-handshake request |
+
+   The pattern held three times out of three: **no shipped client speaks the
+   specification's target revision**, and one of them does not follow the
+   handshake specification it does speak. A transport rule written from the
+   specification alone would have supported none of them.
 
 The previous revision listed a second item — the absent third canonicalization
 implementation — on the grounds that `mapp-mcp` did not exist. It does, it

@@ -284,9 +284,28 @@ specification's target revision.**
 | Codex CLI 0.154.0 | `2025-06-18` | the guard's own `-32022` refusal, in Codex's log |
 | Gemini CLI 0.60.0 | `2025-06-18` | echo server capturing the raw `initialize` |
 
-Codex and Gemini agree, so one allowlist entry served both. The served set is
-now `2025-06-18`, `2025-11-25` and `2026-07-28`; `2024-11-05` and `2025-03-26`
-remain refused, because no target ecosystem needs them.
+Codex and Gemini agree on the revision, so one allowlist entry served both. The
+served set is now `2025-06-18`, `2025-11-25` and `2026-07-28`; `2024-11-05` and
+`2025-03-26` remain refused, because no target ecosystem needs them.
+
+Gemini needed one thing more. Its `initialize` succeeded and its very next
+request was refused:
+
+```
+-> {"method":"notifications/initialized","jsonrpc":"2.0"}
+<- 400 Missing MCP-Protocol-Version
+```
+
+It sends that header on nothing after the handshake, which the 2025-06-18
+specification requires of clients. Proved to be the *only* remaining gap by
+putting a proxy in front that injected the header and nothing else: with it,
+Gemini completed initialize, the notification and `prompts/list` cleanly. So the
+guard now admits a header-less request to the handshake era, bounded by the fact
+that the modern era cannot be entered that way — it carries its version in
+`params._meta` and requires the header to agree.
+
+All three ecosystems then listed the tools and called them against the running
+platform.
 
 Two things are worth carrying forward.
 

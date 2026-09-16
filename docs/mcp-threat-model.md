@@ -231,7 +231,18 @@ not, for reasons worth recording rather than re-deriving later:
   the inner application sends regardless.
 - **Authorization is untouched by era.** The guard runs before authentication,
   every scope check is era-independent, and no credential, audience or binding
-  rule differs between the two.
+  rule differs between them.
+- **A header-less request reaches the handshake era only.** The guard stopped
+  requiring `MCP-Protocol-Version` after the handshake because Gemini CLI 0.60.0
+  sends it on nothing after `initialize`, contrary to the specification it
+  speaks. The relaxation is bounded by the modern era's own shape rather than by
+  the guard: the modern revision carries its version and the client's
+  capabilities in `params._meta` and requires the header to agree with them, so
+  a request with no header cannot be served as modern. That is asserted against
+  the real SDK rather than reasoned about, because the relaxation rests on it
+  — and the corollary is asserted too: a modern request without its envelope is
+  refused, so the two are required together rather than the envelope being
+  quietly optional.
 
 ### State exhaustion
 

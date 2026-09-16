@@ -19,10 +19,10 @@ admit the listed revisions; it would admit every one the SDK has ever spoken.
 Five obligations, each separately testable:
 
 1. Admit only ``MCP-Protocol-Version`` values in :data:`SERVED_VERSIONS`.
-2. Report a *missing or malformed* header as a validation error and a *declared
-   unserved* revision as an unsupported-version error. These are different
-   answers to different questions, and fabricating a version error for a request
-   that named no version tells a client to go and fix something it never sent.
+2. Report a *malformed* header as a validation error and a *declared unserved*
+   revision as an unsupported-version error. These are different answers to
+   different questions, and fabricating a version error for a request whose
+   header was not a revision at all tells a client to fix the wrong thing.
 3. Admit ``initialize`` only as the handshake era, and only when the version it
    offers in the body is one of :data:`HANDSHAKE_VERSIONS`. Under the modern
    revision ``initialize`` is not a method at all and is refused as one. That
@@ -32,9 +32,12 @@ Five obligations, each separately testable:
    -- initialize, notification, list, call -- and mints no session identifier,
    so the obligation survives the era being admitted rather than being traded
    away for it.
-5. Admit a header-less request only when it is a lone handshake ``initialize``.
-   That request is the one place the revision cannot be in the header, because
-   it is what decides the revision; everything after it carries one.
+5. Admit a header-less request to the handshake era, never the modern one. The
+   ``initialize`` that opens a handshake cannot carry the header, because it is
+   what decides the revision; and a client may omit it afterwards too -- Gemini
+   CLI 0.60.0 does, against its own specification's requirement. The modern era
+   is unreachable without it by construction rather than by this guard, since it
+   carries the revision in ``params._meta`` and requires the two to agree.
 
 It must not touch the RFC 9728 metadata GET, which is unauthenticated and
 read-only by design, nor anything that is not a POST to the RPC path.
@@ -162,14 +165,22 @@ class ProtocolEraGuard:
             )
             return
         if offered is _NOT_INITIALIZE:
-            if version is None:
-                await _reject(
-                    send,
-                    INVALID_REQUEST,
-                    "Missing MCP-Protocol-Version.",
-                    reason="protocol-version-missing",
-                )
-                return
+            # A header-less request after the handshake is admitted to the
+            # handshake era, and the absence of the header is what says so.
+            #
+            # The modern era cannot be entered this way: it carries the revision
+            # and the client capabilities in `params._meta` and requires the
+            # header to agree with them, and the SDK refuses the request when
+            # they disagree or are missing. So "no header" is not an ambiguous
+            # request whose era must be guessed -- it is structurally not modern.
+            #
+            # This was a refusal until Gemini CLI 0.60.0 was measured: it sends
+            # no `MCP-Protocol-Version` on anything after `initialize`, which
+            # the 2025-06-18 specification requires of clients. Refusing it made
+            # the transport correct and the ecosystem unreachable, and the
+            # release gate needs all three. Relaxed deliberately, with the
+            # modern era's unreachability asserted rather than assumed.
+            pass
         elif version == MODERN_VERSION:
             # Refused as a method rather than as a version, because that is what
             # it is: the modern revision replaced the handshake, so a client

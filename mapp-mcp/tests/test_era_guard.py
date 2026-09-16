@@ -112,20 +112,29 @@ class VersionAdmissionTests(unittest.TestCase):
                 self.assertEqual(400, response.status)
                 self.assertEqual(0, inner.calls)
 
-    def test_a_missing_version_is_a_validation_fault_not_a_version_fault(self) -> None:
-        """The distinction the specification names explicitly.
+    def test_an_absent_header_is_admitted_to_the_handshake_era(self) -> None:
+        """This was a refusal, and Gemini CLI 0.60.0 is why it is not.
 
-        "Missing or malformed modern metadata receives the appropriate
-        validation error, not a fabricated version error." A client that sent no
-        version told to fix its version goes looking for a revision to change.
+        It sends no `MCP-Protocol-Version` on anything after `initialize`, which
+        its own specification requires of clients. Refusing that made the
+        transport correct and the ecosystem unreachable.
+
+        Admitting it is not a guess about the era. The modern revision carries
+        its version in `params._meta` and requires the header to agree, so a
+        header-less request is structurally not modern -- asserted against the
+        real SDK in `test_legacy_session.ModernEraReachabilityTests` rather than
+        argued here.
         """
         app, inner, _ = guarded()
         for headers in ({}, {"MCP-Protocol-Version": "   "}):
             with self.subTest(headers=headers):
-                response = call(app, headers=headers, body=b"{}")
-                self.assertEqual(era_guard.INVALID_REQUEST, response.json()["error"]["code"])
-                self.assertEqual("protocol-version-missing", response.reason)
-        self.assertEqual(0, inner.calls)
+                response = call(
+                    app,
+                    headers={**headers, "Authorization": f"Bearer {TOKEN}"},
+                    body=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                )
+                self.assertEqual(200, response.status)
+        self.assertEqual(2, inner.calls)
 
     def test_a_malformed_version_is_also_a_validation_fault(self) -> None:
         app, _, _ = guarded()
@@ -164,13 +173,17 @@ class VersionAdmissionTests(unittest.TestCase):
         self.assertEqual(UNSUPPORTED_PROTOCOL_VERSION, era_guard.UNSUPPORTED_PROTOCOL_VERSION)
 
     def test_the_two_faults_do_not_share_a_code(self) -> None:
-        """If they did, the distinction above would be decorative."""
+        """A value that is not a revision, and a revision that is not served,
+        are different complaints. If they shared a code a client could not tell
+        "fix your header" from "this server will never speak that"."""
         app, _, _ = guarded()
-        missing = call(app, body=b"{}").json()["error"]["code"]
+        malformed = call(
+            app, headers={"MCP-Protocol-Version": "banana"}, body=b"{}"
+        ).json()["error"]["code"]
         older = call(
             app, headers={"MCP-Protocol-Version": REFUSED}, body=b"{}"
         ).json()["error"]["code"]
-        self.assertNotEqual(missing, older)
+        self.assertNotEqual(malformed, older)
 
 
 def initialize(offer=NEWEST_HANDSHAKE):
@@ -217,13 +230,15 @@ class LegacyInitializeTests(unittest.TestCase):
         self.assertEqual(200, call(app, headers=MODERN, body=b"not json").status)
         self.assertEqual(1, inner.calls)
 
-    def test_an_undecodable_body_without_a_header_is_still_missing_a_version(self) -> None:
-        """The header-less door is open only to a handshake, and an unparseable
-        body has not shown it is one."""
+    def test_an_undecodable_body_without_a_header_is_the_runtime_s_parse_error(
+        self,
+    ) -> None:
+        """Not the guard's to answer. It cannot tell an unparseable body from a
+        valid one it does not understand, and inventing a protocol complaint
+        for a JSON syntax error sends the client to the wrong problem."""
         app, inner, _ = guarded()
-        response = call(app, body=b"not json")
-        self.assertEqual("protocol-version-missing", response.reason)
-        self.assertEqual(0, inner.calls)
+        self.assertEqual(200, call(app, headers=UNVERSIONED, body=b"not json").status)
+        self.assertEqual(1, inner.calls)
 
 
 class HandshakeAdmissionTests(unittest.TestCase):
@@ -390,14 +405,14 @@ class HandshakeAdmissionTests(unittest.TestCase):
         self.assertEqual("unsupported-protocol-version", response.reason)
         self.assertEqual(0, inner.calls)
 
-    def test_a_header_less_request_that_is_not_a_handshake_is_still_refused(self) -> None:
-        """The door opened for `initialize` is not a door for everything else."""
+    def test_ordinary_traffic_without_a_header_is_admitted(self) -> None:
+        """What Gemini sends after its handshake, and what used to be refused."""
         app, inner, _ = guarded()
         for body in (b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}', b"{}"):
             with self.subTest(body=body):
-                response = call(app, body=body)
-                self.assertEqual("protocol-version-missing", response.reason)
-        self.assertEqual(0, inner.calls)
+                response = call(app, headers=UNVERSIONED, body=body)
+                self.assertEqual(200, response.status)
+        self.assertEqual(2, inner.calls)
 
     def test_a_malformed_header_is_not_rescued_by_a_valid_handshake(self) -> None:
         """A client that sent a version header at all is held to it."""

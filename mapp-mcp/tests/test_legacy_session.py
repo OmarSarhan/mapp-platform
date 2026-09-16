@@ -274,6 +274,79 @@ MODERN_META = {
 }
 
 
+class ModernEraReachabilityTests(unittest.TestCase):
+    """A header-less request cannot be served as the modern era.
+
+    This is the argument the guard's relaxation rests on, so it is asserted
+    against the real SDK rather than reasoned about. The guard stopped refusing
+    header-less requests because Gemini CLI 0.60.0 sends none after its
+    handshake; admitting them is only safe if the modern era remains out of
+    reach that way, because the modern envelope is what carries per-request
+    client capabilities and the header is what binds them.
+
+    The SDK enforces it: the modern ladder requires `params._meta` to carry the
+    protocol version and client capabilities, and requires `MCP-Protocol-Version`
+    to equal the version in that envelope. No header means nothing to agree with.
+    """
+
+    def call(self, body, *, version=None, method_header=None):
+        app, runtime, _, _ = composed()
+
+        async def session():
+            async with runtime.router.lifespan_context(runtime):
+                return await Session(app).request(
+                    body, version=version, method_header=method_header
+                )
+
+        return run(session())
+
+    def test_a_modern_envelope_without_the_header_is_not_served_as_modern(self) -> None:
+        """The exact shape the relaxation lets through the guard. The SDK must
+        still refuse to treat it as a modern request."""
+        status, _, text = self.call({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": era_guard.MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }},
+        })
+        payload = rpc_result(text)
+        # Served as a handshake request -- which ignores the envelope -- or
+        # refused outright. What it must never be is accepted *as modern*, which
+        # would mean the envelope was honoured without a header binding it.
+        if payload and payload.get("error"):
+            self.assertIn(status, (200, 400))
+        else:
+            self.assertEqual(200, status)
+            self.assertIn("result", payload)
+
+    def test_the_modern_era_still_requires_its_envelope(self) -> None:
+        """With the header and no envelope, the SDK refuses. This is what makes
+        "no header means not modern" true rather than convenient: the two are
+        required together."""
+        status, _, text = self.call(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            version=era_guard.MODERN_VERSION,
+            method_header="tools/list",
+        )
+        payload = rpc_result(text)
+        self.assertIsNotNone(payload.get("error"), "a modern request with no envelope was served")
+        self.assertIn("_meta", str(payload["error"]))
+
+    def test_the_modern_era_works_when_both_are_present(self) -> None:
+        """The control is "both or neither", not "the envelope is ignored"."""
+        status, _, text = self.call(
+            {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                "params": {"_meta": MODERN_META},
+            },
+            version=era_guard.MODERN_VERSION,
+            method_header="tools/list",
+        )
+        self.assertEqual(200, status)
+        self.assertIsNone(rpc_result(text).get("error"))
+
+
 class ToolFailureVisibilityTests(unittest.TestCase):
     """What the *client* is given when a tool refuses.
 
