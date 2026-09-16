@@ -198,23 +198,41 @@ the server already checked. A private-use scheme becomes a bare `scheme:`
 source; anything unparseable yields nothing and leaves the policy at `'self'`,
 which fails visibly rather than widening silently.
 
-**P2a — two protocol revisions are served, not one.** The specification fixed
-`2026-07-28` and told Phase 0 to document any ecosystem that could not reach it
-as unsupported rather than add a legacy transport path. Claude Code 2.1.272
-offers `2025-11-25` and nothing else, so under the original rule the
-three-ecosystem release gate could be met by no shipped client at all.
+**P2a — the server speaks the revisions the target ecosystems speak.** The
+specification fixed `2026-07-28` and told Phase 0 to document any ecosystem that
+could not reach it as unsupported rather than add a legacy transport path. Every
+shipped client measured sits behind it:
+
+| Revision | Era | Measured in |
+| --- | --- | --- |
+| `2026-07-28` | modern, per-request envelope | the specification's target |
+| `2025-11-25` | handshake | Claude Code 2.1.272 |
+| `2025-06-18` | handshake | Codex CLI 0.154.0, Gemini CLI 0.60.0 |
+
+Under the original rule the three-ecosystem release gate could be met by no
+client at all, which is not a line held but a gate made unreachable. P2 names
+those three ecosystems and gates release on one pinned client from each, so the
+governing decision is that all three are supported.
 
 The amendment costs less than the rule assumed, which is why it is an amendment
 rather than a deviation: the SDK already serves the handshake era, so admitting
-it removed a refusal rather than adding a transport, and `stateless_http`
-completes a full legacy session without minting a session identifier. It also
-made the guard stricter. The SDK negotiates an `initialize` to whatever the
-client offers — 2024-11-05 verbatim, an unrecognisable offer counter-offered
-2025-11-25 — so letting the method through unpoliced would have admitted four
-revisions and a fallback. The guard reads the offered revision out of the body
-and refuses everything that is not the single admitted handshake revision.
-Authorization is untouched: the guard runs before authentication and no
-credential, audience or binding rule differs between the eras.
+a revision removes a refusal rather than adding a transport, and `stateless_http`
+completes a full handshake session without minting a session identifier.
+
+**The control is not the number of revisions but that the set is explicit and
+enforced here.** `2024-11-05` and `2025-03-26` are served by the SDK and refused
+by this guard, because no target ecosystem needs them. The SDK cannot be left to
+make that distinction: it negotiates an `initialize` to whatever the client
+offers, and an unrecognisable offer is counter-offered the newest handshake
+revision rather than refused. The guard reads the offered revision out of the
+body and admits only the listed set — so admitting these revisions made the
+guard stricter than leaving the era refused-by-default would have been, because
+the alternative was never "no handshake" but "whatever the SDK decides".
+
+The list should shrink rather than grow: each entry exists for a client that has
+not caught up, and should be removed when its ecosystem does. Authorization is
+untouched by any of it — the guard runs before authentication and no credential,
+audience or binding rule differs between the eras.
 
 **O18 is resolved as state-based reconciliation.** Of the three options — a
 two-phase response, background-submittable apply and reload, or reconciliation
@@ -322,8 +340,10 @@ four paths on the MCP origin. Both are asserted, in different suites.
 | 5 | ~~`recovery_epoch` unimplemented~~ **Closed** | Wired in Phase 1, as the amendment above records: `control.current_recovery_epoch()`, a function-backed column default, `./bin/mapp advance-recovery-epoch --confirm` as step 5 of the restore procedure, and the sweep audited. Covered by 20 tests in `config-ui/tests/test_recovery_epoch.py` and by `mcp-auth/tests/test_recovery_epoch_effect.py`, which asserts the effect on the component that reads the credentials. This row contradicted the amendment for one revision | — |
 | 6 | ~~O20 — `form-action 'self'` across the consent redirect~~ **Closed** | Measured in three engines and it failed in two: Chromium and WebKit re-check `form-action` across the consent redirect and blocked it, Firefox did not. The directive now names the client's own redirect origin, taken from the pending record. Re-measured: all three reach the callback | — |
 | 7 | Connection ceiling of 8 with no pooling | Measured to refuse cleanly and recover. Multi-operator use is expected, so this is now a Phase 1 requirement rather than a risk to revisit | Phase 1 |
-| 8 | Client acceptance is 1 of 3 | The Claude column is now complete rather than only its authorization half: Claude Code 2.1.272 connected to the running platform, listed the tools and called them. Codex/OpenAI and Gemini are untested, and SDK support is still not client acceptance. The container harness that proved Claude transfers directly, so this is scheduled work rather than open research | Blocking for release |
+| 8 | Client acceptance is 2 of 3 | Claude Code 2.1.272 and Codex CLI 0.154.0 have both connected to the running platform, listed the tools and called them. Gemini CLI 0.60.0 is measured at the handshake only — it offers `2025-06-18`, the same revision as Codex and now admitted — so its transport half is answered and the authenticated journey awaits an API key | Blocking for release |
 | 9 | Two threat-model rows postdate the owner's acceptance | Credential administration from a browser session and serving a second protocol era were added after the surfaces were built. Both are mitigated and recorded; neither has been through an acceptance decision | At the next acceptance review, before any public route |
+
+| 10 | Safari is untested | WebKit, the engine Safari ships, was driven through Playwright and reproduced both the O20 failure and its fix. Safari proper needs macOS, which this project has no access to. Owner decision: a backlog nice-to-have, not a gate condition | If macOS becomes available, or a Safari-specific report arrives |
 
 ## References
 

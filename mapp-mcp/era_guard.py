@@ -6,14 +6,15 @@ allowlist. ``stateless_http`` changes only legacy session storage rather than
 disabling that era. So the allowlist has to live outside it, and it has to be
 able to answer without ever calling in.
 
-This server serves two revisions, and the second one is the reason the guard is
-more than a string comparison. Measured against the installed SDK, an
-``initialize`` is negotiated to *whatever the client offers* -- 2024-11-05 and
-2025-03-26 are accepted as readily as 2025-11-25, and an unrecognisable offer
-such as ``"zzz"`` is silently counter-offered 2025-11-25 rather than refused.
+This server serves three revisions -- two handshake, one modern -- and the
+handshake ones are why the guard is more than a string comparison. Measured
+against the installed SDK, an ``initialize`` is negotiated to *whatever the
+client offers*: 2024-11-05 and 2025-03-26 are accepted as readily as the two
+admitted here, and an unrecognisable offer such as ``"zzz"`` is silently
+counter-offered the newest handshake revision rather than refused.
 Nothing in the SDK constrains the handshake to one revision. So admitting the
 handshake era without reading the offered version out of the body would not
-admit one legacy revision; it would admit every one the SDK has ever spoken.
+admit the listed revisions; it would admit every one the SDK has ever spoken.
 
 Five obligations, each separately testable:
 
@@ -23,7 +24,7 @@ Five obligations, each separately testable:
    answers to different questions, and fabricating a version error for a request
    that named no version tells a client to go and fix something it never sent.
 3. Admit ``initialize`` only as the handshake era, and only when the version it
-   offers in the body is exactly :data:`HANDSHAKE_VERSION`. Under the modern
+   offers in the body is one of :data:`HANDSHAKE_VERSIONS`. Under the modern
    revision ``initialize`` is not a method at all and is refused as one. That
    forces the guard to decode the body before dispatch.
 4. Never mint or echo ``Mcp-Session-Id``. Serving the handshake era does not
@@ -47,17 +48,27 @@ from typing import Any
 #: The per-request-envelope era: no handshake, a revision on every request.
 MODERN_VERSION = "2026-07-28"
 
-#: The one handshake revision admitted. Real clients still speak it -- Claude
-#: Code 2.1.272 offers it and nothing else -- so refusing it means refusing the
-#: ecosystem rather than holding a line. Exactly one, not "the newest legacy
-#: one": the SDK will negotiate anything offered, so the set of legacy
-#: revisions this server speaks is whatever is written here and nowhere else.
-HANDSHAKE_VERSION = "2025-11-25"
+#: The handshake revisions admitted, and no others. Each is here because a
+#: shipped client of a target ecosystem speaks it and nothing newer, measured
+#: rather than assumed:
+#:
+#:   2025-06-18  Codex CLI 0.154.0, Gemini CLI 0.60.0
+#:   2025-11-25  Claude Code 2.1.272
+#:
+#: An explicit list rather than "everything older", and that distinction is the
+#: whole control. The SDK will negotiate anything a client offers, so the set of
+#: revisions this server speaks is whatever is written here and nowhere else --
+#: 2024-11-05 and 2025-03-26 are served by the SDK and refused by this guard.
+#:
+#: Adding one is a deliberate act with a name attached. The list grew from one
+#: to two when Codex and Gemini both turned out to sit a revision behind Claude;
+#: it should not grow because something "looked old enough".
+HANDSHAKE_VERSIONS = ("2025-06-18", "2025-11-25")
 
 #: Membership is tested with ``in`` against exact strings rather than a prefix
 #: or an ordering: "2026-07-28-beta" is not a revision this server speaks, and a
 #: client that sends it has not agreed to this contract.
-SERVED_VERSIONS = (HANDSHAKE_VERSION, MODERN_VERSION)
+SERVED_VERSIONS = (*HANDSHAKE_VERSIONS, MODERN_VERSION)
 
 VERSION_HEADER = b"mcp-protocol-version"
 SESSION_HEADER = b"mcp-session-id"
@@ -171,11 +182,11 @@ class ProtocolEraGuard:
                 reason="legacy-initialize",
             )
             return
-        elif offered != HANDSHAKE_VERSION:
+        elif offered not in HANDSHAKE_VERSIONS:
             # The obligation the SDK does not discharge. Left to it, the offer
             # is simply accepted -- any older revision verbatim, anything
             # unrecognisable counter-offered the newest handshake revision --
-            # so this is the only place the legacy era is held to one revision.
+            # so this is the only place the handshake era is held to a list.
             await _reject(
                 send,
                 UNSUPPORTED_PROTOCOL_VERSION,

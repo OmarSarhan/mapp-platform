@@ -154,7 +154,7 @@ class LegacySessionTests(unittest.TestCase):
         async def session():
             async with runtime.router.lifespan_context(runtime):
                 client = Session(app)
-                V = era_guard.HANDSHAKE_VERSION
+                V = era_guard.HANDSHAKE_VERSIONS[-1]
                 # 1. The handshake, carrying no version header -- there is
                 #    nothing it could carry, since this request decides it.
                 transcript["initialize"] = await client.request(
@@ -204,7 +204,7 @@ class LegacySessionTests(unittest.TestCase):
         session could succeed on a revision this server never agreed to."""
         transcript, _, _ = self.drive()
         result = rpc_result(transcript["initialize"][2])["result"]
-        self.assertEqual(era_guard.HANDSHAKE_VERSION, result["protocolVersion"])
+        self.assertEqual(era_guard.HANDSHAKE_VERSIONS[-1], result["protocolVersion"])
 
     def test_no_session_identifier_is_ever_minted(self) -> None:
         """The obligation that serving this era was most likely to cost.
@@ -261,7 +261,7 @@ class LegacySessionTests(unittest.TestCase):
         transcript, _, _ = self.drive()
         payload = rpc_result(transcript["tools/call"][2])["result"]
         described = json.loads(payload["content"][0]["text"])
-        self.assertIn(era_guard.HANDSHAKE_VERSION, described["protocolVersions"])
+        self.assertIn(era_guard.HANDSHAKE_VERSIONS[-1], described["protocolVersions"])
         self.assertEqual(list(era_guard.SERVED_VERSIONS), described["protocolVersions"])
 
 
@@ -304,7 +304,7 @@ class ToolFailureVisibilityTests(unittest.TestCase):
                             "arguments": {"layer_key": "L", "field": "f"},
                         },
                     },
-                    version=era_guard.HANDSHAKE_VERSION,
+                    version=era_guard.HANDSHAKE_VERSIONS[-1],
                 )
 
         status, _, body = run(session())
@@ -378,7 +378,7 @@ class ModernSessionTests(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 0,
                         "method": "initialize",
-                        "params": {"protocolVersion": era_guard.HANDSHAKE_VERSION},
+                        "params": {"protocolVersion": era_guard.HANDSHAKE_VERSIONS[-1]},
                     },
                     version=era_guard.MODERN_VERSION,
                 )

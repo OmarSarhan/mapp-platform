@@ -207,18 +207,23 @@ The mitigation for that is not in this component but in the operator credential,
 and P20 already records that separation of duty is not enforceable with a single
 shared administrator identity.
 
-### A second protocol era is served
+### More than one protocol revision is served
 
-P2a admits the `2025-11-25` handshake alongside `2026-07-28`. Serving two eras
-is the kind of change that usually widens a surface, and here it did not, for
-reasons worth recording rather than re-deriving later:
+P2a admits two handshake revisions alongside the modern one, because that is
+what the three target ecosystems speak: `2025-11-25` for Claude Code 2.1.272 and
+`2025-06-18` for Codex CLI 0.154.0 and Gemini CLI 0.60.0. Serving several
+revisions is the kind of change that usually widens a surface, and here it did
+not, for reasons worth recording rather than re-deriving later:
 
 - **The allowlist got stricter, not laxer.** The SDK behind the guard negotiates
   an `initialize` to whatever the client offers — 2024-11-05 verbatim, and an
-  unrecognisable offer counter-offered 2025-11-25 — so admitting the method
-  without policing it would have admitted four revisions and a fallback. The
-  guard reads the offered revision out of the body and refuses everything that
-  is not the single admitted handshake revision.
+  unrecognisable offer counter-offered the newest handshake revision — so
+  admitting the method without policing it would have admitted every revision
+  the SDK has ever spoken, plus a fallback. The guard reads the offered revision
+  out of the body and admits only the listed set; `2024-11-05` and `2025-03-26`
+  are refused because no target ecosystem needs them. The relevant property is
+  not how many revisions are listed but that the list is this project's and is
+  enforced before dispatch.
 - **No session identifier is minted.** The handshake era is session-based, so
   the obvious cost would have been accepting `Mcp-Session-Id` and the state
   behind it. Measured across a full legacy session — initialize, notification,

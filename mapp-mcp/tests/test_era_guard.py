@@ -5,13 +5,19 @@ The specification pre-emptively refuses the convenient proof: "enabling
 So every assertion here is about what crosses the ASGI boundary, not about how
 the inner application was configured.
 
-That rule now cuts the other way too. This server serves the 2025-11-25
-handshake as well as the modern revision, and the reason the guard did not
-simply get shorter is measurable against the installed SDK: left to itself it
-negotiates an `initialize` to whatever the client offers -- 2024-11-05 verbatim,
-`"zzz"` counter-offered 2025-11-25 -- so the offered revision has to be read out
-of the body and checked here. `HandshakeAdmissionTests` is that control, and
-every refusal in it is a revision the SDK behind the guard would have served.
+That rule now cuts the other way too. This server serves two handshake
+revisions as well as the modern one, and the reason the guard did not simply get
+shorter is measurable against the installed SDK: left to itself it negotiates an
+`initialize` to whatever the client offers -- 2024-11-05 verbatim, `"zzz"`
+counter-offered the newest handshake revision -- so the offered revision has to
+be read out of the body and checked here. `HandshakeAdmissionTests` is that
+control, and every refusal in it is a revision the SDK behind the guard would
+have served.
+
+Nothing here writes out a refused revision as a literal. The admitted list grew
+once already, and a literal that happened to name a newly admitted revision
+would assert the opposite of the truth while still passing, because the test and
+the code get edited together. `REFUSED` is derived instead.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import era_guard  # noqa: E402
 from app import build_app  # noqa: E402
-from asgi_harness import StubIntrospection, active, call  # noqa: E402
+from asgi_harness import StubIntrospection, active, call, refused_revision  # noqa: E402
 
 TOKEN = "mapp_a_test"
 #: The guard runs before authentication, but these tests assert what reaches the
@@ -35,14 +41,19 @@ MODERN = {
     "MCP-Protocol-Version": era_guard.MODERN_VERSION,
     "Authorization": f"Bearer {TOKEN}",
 }
+#: A representative admitted handshake revision. Tests that care about *all* of
+#: them iterate `era_guard.HANDSHAKE_VERSIONS` instead of trusting this one.
+NEWEST_HANDSHAKE = era_guard.HANDSHAKE_VERSIONS[-1]
 HANDSHAKE = {
-    "MCP-Protocol-Version": era_guard.HANDSHAKE_VERSION,
+    "MCP-Protocol-Version": NEWEST_HANDSHAKE,
     "Authorization": f"Bearer {TOKEN}",
 }
 #: A credential and no declared revision -- the shape of the one request that
 #: cannot carry one, and the shape every "reaches the runtime" assertion below
 #: needs, since the guard admitting a request only moves it on to authentication.
 UNVERSIONED = {"Authorization": f"Bearer {TOKEN}"}
+
+REFUSED = refused_revision()
 
 
 class Reached:
@@ -126,7 +137,7 @@ class VersionAdmissionTests(unittest.TestCase):
 
     def test_a_well_formed_older_revision_is_a_version_fault(self) -> None:
         app, _, _ = guarded()
-        response = call(app, headers={"MCP-Protocol-Version": "2025-06-18"}, body=b"{}")
+        response = call(app, headers={"MCP-Protocol-Version": REFUSED}, body=b"{}")
         self.assertEqual(
             era_guard.UNSUPPORTED_PROTOCOL_VERSION, response.json()["error"]["code"]
         )
@@ -138,7 +149,8 @@ class VersionAdmissionTests(unittest.TestCase):
             list(era_guard.SERVED_VERSIONS),
             response.json()["error"]["data"]["supported"],
         )
-        self.assertIn(era_guard.HANDSHAKE_VERSION, response.json()["error"]["data"]["supported"])
+        for admitted in era_guard.HANDSHAKE_VERSIONS:
+            self.assertIn(admitted, response.json()["error"]["data"]["supported"])
 
     def test_the_code_is_the_one_the_ecosystem_uses(self) -> None:
         """Not a project-chosen number, which is what it was.
@@ -156,12 +168,12 @@ class VersionAdmissionTests(unittest.TestCase):
         app, _, _ = guarded()
         missing = call(app, body=b"{}").json()["error"]["code"]
         older = call(
-            app, headers={"MCP-Protocol-Version": "2025-06-18"}, body=b"{}"
+            app, headers={"MCP-Protocol-Version": REFUSED}, body=b"{}"
         ).json()["error"]["code"]
         self.assertNotEqual(missing, older)
 
 
-def initialize(offer=era_guard.HANDSHAKE_VERSION):
+def initialize(offer=NEWEST_HANDSHAKE):
     """A handshake request offering `offer`, or offering nothing when None."""
     import json
 
@@ -260,14 +272,73 @@ class HandshakeAdmissionTests(unittest.TestCase):
         self.assertEqual(200, call(app, headers=HANDSHAKE, body=body).status)
         self.assertEqual(1, inner.calls)
 
+    def test_the_admitted_set_is_exactly_what_was_decided(self) -> None:
+        """Pinned deliberately, because everything else here is derived.
+
+        `REFUSED` adapts to whatever the guard admits, which is right for "does
+        it refuse what the SDK would serve" and wrong as the only check: a
+        widened list would simply shrink the refused set and every other test
+        would go on passing. This is the assertion someone has to edit on
+        purpose, so the list cannot grow quietly.
+
+        Each entry earns its place by a measured client, not by age:
+
+          2025-06-18  Codex CLI 0.154.0 and Gemini CLI 0.60.0 offer it
+          2025-11-25  Claude Code 2.1.272 offers it
+
+        The two the SDK also serves -- 2024-11-05 and 2025-03-26 -- are refused
+        because no target ecosystem needs them.
+        """
+        self.assertEqual(("2025-06-18", "2025-11-25"), era_guard.HANDSHAKE_VERSIONS)
+        self.assertEqual(
+            ("2025-06-18", "2025-11-25", "2026-07-28"), era_guard.SERVED_VERSIONS
+        )
+
+    def test_every_admitted_handshake_revision_is_served(self) -> None:
+        """Each entry is here because a shipped client of a target ecosystem
+        speaks it and nothing newer, so each has to actually work.
+
+        Iterated rather than spot-checked: the list grew from one to two when
+        Codex and Gemini turned out to sit a revision behind Claude, and a test
+        pinned to one of them would have passed while the other was refused.
+        """
+        for offer in era_guard.HANDSHAKE_VERSIONS:
+            with self.subTest(offer=offer):
+                app, inner, _ = guarded()
+                response = call(app, headers=UNVERSIONED, body=initialize(offer))
+                self.assertEqual(200, response.status, f"{offer} was refused")
+                self.assertEqual(1, inner.calls)
+                # And the same revision declared in the header afterwards.
+                app, inner, _ = guarded()
+                self.assertEqual(
+                    200,
+                    call(
+                        app,
+                        headers={"MCP-Protocol-Version": offer,
+                                 "Authorization": f"Bearer {TOKEN}"},
+                        body=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                    ).status,
+                )
+
     def test_an_older_offer_is_refused_though_the_sdk_would_serve_it(self) -> None:
         """The whole reason the guard reads the body.
 
-        These three are `HANDSHAKE_PROTOCOL_VERSIONS` minus the one admitted.
-        Left to the SDK each is negotiated verbatim, so without this check
-        "admit the handshake era" would have admitted four revisions.
+        Derived as "what the SDK will negotiate, minus what this server admits"
+        rather than written out. The literal list had `2025-06-18` in it, and
+        when that revision was admitted for Codex and Gemini the test would have
+        gone on asserting it was refused -- passing only because the assertion
+        and the code were edited together, which is the coupling a derived list
+        removes.
         """
-        for offer in ("2024-11-05", "2025-03-26", "2025-06-18"):
+        from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+
+        refused = [
+            version
+            for version in HANDSHAKE_PROTOCOL_VERSIONS
+            if version not in era_guard.HANDSHAKE_VERSIONS
+        ]
+        self.assertTrue(refused, "the SDK serves nothing this guard refuses")
+        for offer in refused:
             with self.subTest(offer=offer):
                 app, inner, _ = guarded()
                 response = call(app, headers=UNVERSIONED, body=initialize(offer))

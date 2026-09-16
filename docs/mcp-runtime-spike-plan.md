@@ -86,7 +86,8 @@ proportionate for a spike and at least visible.
 
 **Claude Code 2.1.272 could not connect to a specification-conformant mapp-mcp.
 The spike existed to find exactly this, and it changed the specification: P2a
-now admits the 2025-11-25 handshake alongside 2026-07-28.**
+now admits the handshake revisions the target ecosystems speak
+alongside 2026-07-28 — see "Every ecosystem sat behind the target" below.**
 
 Driven for real: the CLI installed in an ephemeral container on the host
 network, this session's credential mounted, the server registered with a fixed
@@ -204,7 +205,7 @@ undocumented shape of its OAuth credential store.
 | Step | Result |
 |---|---|
 | `claude mcp list` | `✔ Connected` |
-| `describe_instance` | `protocolVersions: ["2025-11-25","2026-07-28"]` |
+| `describe_instance` | `protocolVersions: ["2025-11-25","2026-07-28"]` at the time; `2025-06-18` was added later for Codex and Gemini |
 | `layer_values` on a queryable layer | 6,147 output areas across 5 quintiles |
 | `layer_values` with a narrow grant | refused, naming the scopes to request |
 | same call after scope step-up | succeeds |
@@ -270,6 +271,38 @@ application -- guard, authentication, real SDK runtime, real tool registry --
 because the failure this section records was invisible to every per-layer test
 in the directory. Each layer was correct and the client still could not connect.
 A test per layer cannot see a handshake.
+
+## Every ecosystem sat behind the target
+
+The Claude finding above repeated itself twice, which turns a one-off into a
+pattern worth stating: **no shipped client of any target ecosystem speaks the
+specification's target revision.**
+
+| Client | Offers | Measured how |
+|---|---|---|
+| Claude Code 2.1.272 | `2025-11-25` | echo server capturing the raw `initialize` |
+| Codex CLI 0.154.0 | `2025-06-18` | the guard's own `-32022` refusal, in Codex's log |
+| Gemini CLI 0.60.0 | `2025-06-18` | echo server capturing the raw `initialize` |
+
+Codex and Gemini agree, so one allowlist entry served both. The served set is
+now `2025-06-18`, `2025-11-25` and `2026-07-28`; `2024-11-05` and `2025-03-26`
+remain refused, because no target ecosystem needs them.
+
+Two things are worth carrying forward.
+
+**The refusal was actionable because the error code was right.** Codex logged
+`-32022: Unsupported MCP protocol version 2025-06-18` *and the supported list*,
+because the guard uses the code the MCP ecosystem defines rather than the
+project-chosen number it originally had. A client that cannot parse the refusal
+reports "connection failed", and the next hour goes into the wrong question.
+
+**Reading the documentation would not have answered it.** Each revision was
+established by putting the client in front of the server, and in Gemini's case
+by capturing the raw handshake — its bundle contains half a dozen revision
+strings, and picking the right one by inspection would have been a guess.
+
+The list is expected to shrink rather than grow. Each entry exists for a client
+that has not caught up, and should be removed when its ecosystem does.
 
 ## Traps that cost hours if unknown
 

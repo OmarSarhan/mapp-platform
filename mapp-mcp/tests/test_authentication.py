@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import era_guard  # noqa: E402
 from app import build_app  # noqa: E402
-from asgi_harness import StubIntrospection, active, call  # noqa: E402
+from asgi_harness import StubIntrospection, active, call, refused_revision  # noqa: E402
 from introspection_client import IntrospectionUnavailable  # noqa: E402
 
 ORIGIN = "http://mcp.localhost"
@@ -285,7 +285,8 @@ class CacheTests(unittest.TestCase):
         app, _, introspection, _ = stack({TOKEN: active()})
         response = call(
             app,
-            headers={"MCP-Protocol-Version": "2025-06-18", "Authorization": f"Bearer {TOKEN}"},
+            headers={"MCP-Protocol-Version": refused_revision(),
+                     "Authorization": f"Bearer {TOKEN}"},
             body=b"{}",
         )
         self.assertEqual(400, response.status)

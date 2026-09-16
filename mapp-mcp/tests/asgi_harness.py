@@ -92,3 +92,23 @@ def active(*, scopes="mcp:connect inspect", audience="http://mcp.localhost/mcp",
         "aud": audience,
         "exp": 9999999999,
     }
+
+
+def refused_revision() -> str:
+    """A revision the SDK will negotiate and this server refuses.
+
+    Derived, never written out. `2025-06-18` was a literal in three tests --
+    "a well-formed older revision", "the two faults do not share a code" and
+    "the guard refuses before a credential is resolved" -- and when Codex and
+    Gemini turned out to need that revision, all three would have gone on
+    asserting it was refused. They would have failed loudly here, which is the
+    good case; the bad case is a literal that keeps passing while meaning the
+    opposite. Deriving it removes the choice.
+    """
+    import era_guard
+    from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+
+    for version in HANDSHAKE_PROTOCOL_VERSIONS:
+        if version not in era_guard.SERVED_VERSIONS:
+            return version
+    raise AssertionError("the SDK serves no revision this guard refuses")

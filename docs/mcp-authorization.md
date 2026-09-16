@@ -482,9 +482,12 @@ Yes, and driven end to end against the deployed stack rather than inferred
 from documentation. Claude Code 2.1.272 connects, lists both tools, and calls
 them; the full transcript is in `mcp-runtime-spike-plan.md`.
 
-Two things had to be true and now are. The server serves the **2025-11-25**
-handshake alongside 2026-07-28, because the shipped client speaks only the
-former (decision P2a). And the RFC 9728 protected-resource document is served
+Two things had to be true and now are. The server serves the handshake
+revisions the target ecosystems speak alongside 2026-07-28 (decision P2a) —
+`2025-11-25` for Claude Code 2.1.272, `2025-06-18` for Codex CLI 0.154.0 and
+Gemini CLI 0.60.0. No shipped client of any of the three speaks the modern
+revision yet, so serving only it would have made the release gate unreachable
+rather than held a line. And the RFC 9728 protected-resource document is served
 unauthenticated at `/.well-known/oauth-protected-resource/mcp`, which is what
 turns the first `401` into a sign-in rather than a dead end.
 
