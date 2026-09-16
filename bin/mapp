@@ -805,7 +805,7 @@ case "${1:-}" in
       printf '%s\n' \
         'This permanently removes the packaged PostgreSQL database and everything in it: derived layers, the federation registry and its group labels, and the whole semantic catalogue -- generated profiles, curated meaning, semantic proposals and their history.' \
         'Back the database up first if any of that matters. Active derived semantic profiles are archived beforehand, but archival records the state, it does not survive the volume.' \
-        'Destroys: the packaged database volume, and with it dashboard authentication, every CLI API token and every device authorization. Authentication is reinitialized afterwards and a new administrator password is printed, leaving the platform as ./bin/mapp init leaves it.' \
+        'Destroys: the packaged database volume, and with it dashboard authentication, every CLI API token, every device authorization, every registered MCP agent client and every consent those agents hold. Authentication is reinitialized afterwards and a new administrator password is printed, leaving the platform as ./bin/mapp init leaves it; agent clients have to be registered again and their operators have to consent again.' \
         'Not touched: the source databases holding the spatial data, and the audit log, workspace proposals, artifacts and public assets under var. The live workspace is replaced by instance/workspace.seed.json.' \
         'Run ./bin/mapp reset-system --confirm to continue.' >&2
       exit 2

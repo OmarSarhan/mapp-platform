@@ -171,6 +171,38 @@ class ResetCommandSafetyTests(unittest.TestCase):
             document.index("Initialize or clear stale live and preview reload"),
         )
 
+    def test_reset_system_names_every_credential_class_the_volume_holds(
+        self,
+    ) -> None:
+        """The warning is the only thing standing between an operator and an
+        irreversible loss they did not expect.
+
+        It enumerated dashboard authentication, CLI API tokens and device
+        authorizations, and stopped there -- written before the control schema
+        also held registered agent clients and the consents they carry. Both
+        are destroyed with the volume, and neither comes back by signing in:
+        every client has to be registered again and every operator has to
+        consent again.
+
+        The recovery-epoch command already named grants, so for a while the two
+        destructive commands disagreed about what the database contains.
+        """
+        start = self.script.index("  reset-system)")
+        warning = self.script[start : self.script.index("exit 2", start)]
+        for named in (
+            "dashboard authentication",
+            "CLI API token",
+            "device authorization",
+            "MCP agent client",
+            "consent",
+        ):
+            with self.subTest(names=named):
+                self.assertIn(
+                    named,
+                    warning,
+                    f"reset-system destroys {named}s without saying so",
+                )
+
     def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
         self.assertIn("is_buildkit_lease_failure()", self.script)
         self.assertIn("run_with_buildkit_lease_retry()", self.script)

@@ -9,6 +9,10 @@ go/no-go recommendation.
 - **Owner:** to be assigned at approval
 - **Status:** ADR and threat model **accepted by the owner** for this version.
   Phase 1 design work approved; implementation gated on the conditions below.
+- **Revised 2026-09-16**, after `mapp-mcp` was built. The earlier revision was
+  written while the runtime did not exist and said so in several places; those
+  rows are now answered by measurement rather than deferred. What changed is
+  listed under "What the runtime changed" below.
 
 Every figure below was produced from the tree rather than recalled. Where a
 gate item is unsatisfied the row says so; several are, and the recommendation
@@ -25,8 +29,10 @@ component and the configuration API's validation of the credential it issues.
 | --- | --- |
 | Edge listener | 6 method/path routes across the 4 public paths Caddy publishes, over an `AF_UNIX` socket |
 | Control listener | `/healthz`, `/internal/oauth/exchange`, `/internal/oauth/introspect`, `/internal/oauth/revoke`, `/internal/oauth/redeem` — `mcp-control` network only |
-| Control schema | 15 tables, 7 migrations, owned by `mapp_control` |
-| Canonicalization | `mapp-jcs-v1`, vendored independently into the broker and the configuration API |
+| MCP runtime | `mapp-mcp`: the official Python SDK behind a protocol-era guard, two read-only tools, RFC 9728 metadata, token-A authentication per call |
+| Control schema | 15 tables, 8 migrations, owned by `mapp_control` |
+| Canonicalization | `mapp-jcs-v1`, vendored independently into the broker, the configuration API and the MCP runtime — three copies, cross-checked |
+| Credential administration | Dashboard: agent-client issuance and consent inspection and revocation, both audited, administrator-session only |
 | Operation allowlist | 5 of the platform's 52 actions |
 | Scope vocabulary | 9 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
 
@@ -44,13 +50,15 @@ issuer refused to issue.
 | Suite | Tests | Notes |
 | --- | --- | --- |
 | `mcp-auth/tests` | 473 | Zero skips with a control database attached. Includes the registered-client spike and the control-listener capability separation |
-| `config-ui/tests` | 1022 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
-| `mapp-mcp/tests` | 60 | The protocol-era guard, RFC 9728 metadata, token-A authentication and three-way canonicalization agreement. No database and no network: driven over the ASGI contract, where the obligations live |
+| `config-ui/tests` | 1049 | Token-B validation, the canonical envelope, canonicalization agreement, and the agent-client registry |
+| `mapp-mcp/tests` | 118 | The protocol-era guard, RFC 9728 metadata, token-A authentication, three-way canonicalization agreement, and a complete legacy session driven through the composed application. No database and no network: driven over the ASGI contract, where the obligations live |
 | `scripts/tests` | 182 | Compose isolation, Caddy contract, production validation, benchmark invariants |
 
-All four run in CI, each behind a `grep -q "skipped="` guard: a suite that
-silently skips fails the job. That guard exists because a whole suite once went
-unnoticed-dead.
+The three container suites run in CI behind a `grep -q "skipped="` guard: a
+suite that silently skips fails the job. That guard exists because a whole suite
+once went unnoticed-dead. `scripts/tests` carries no such guard and skips 22 on
+a host without Docker-in-Docker, which is a gap in the same shape as the one the
+guard was written for.
 
 **Mutation testing.** Every control introduced in the last three milestones was
 mutation-tested, and the figure is recorded in each commit rather than totalled
@@ -87,6 +95,59 @@ also where the introspection timing signal came from before it was equalised.
 And the connection limit is a **ceiling, not headroom** — the ninth caller is
 refused rather than queued.
 
+## What the runtime changed
+
+The previous revision was written with the authorization half built and the MCP
+runtime absent. Four things are answered now that were deferred then, and each
+was found by putting a real client in front of the real server rather than by
+reasoning about either.
+
+**The transport era had to be amended (P2a).** The specification fixed
+`2026-07-28` and told Phase 0 to document any ecosystem that could not reach it
+as unsupported rather than add a legacy path. Claude Code 2.1.272 opens with
+`initialize` offering **2025-11-25** and no protocol-version header, so under
+the original rule the three-ecosystem release gate could be met by no shipped
+client at all. The amendment costs less than the rule assumed: the SDK already
+serves the handshake era, so admitting it removed a refusal rather than adding a
+transport, and `stateless_http` completes a full legacy session without minting
+a session identifier — so the no-session obligation survived intact.
+
+Admitting it made the guard *stricter*. Measured against the installed SDK, an
+`initialize` is negotiated to whatever the client offers — 2024-11-05 verbatim,
+and an unrecognisable offer counter-offered 2025-11-25 — so letting the method
+through would have admitted four revisions and a fallback. The guard now reads
+the offered revision out of the body and refuses everything that is not the one
+admitted handshake revision.
+
+**A real client found a defect no unit test could.** `layer_values` raised
+`ValueError` for every anticipated refusal. The SDK treats only `ToolError` as
+anticipated and puts its text in the result the model reads; everything else is
+a crash, replaced with `Error executing tool layer_values` and logged at ERROR.
+So every message written to be acted on — which scope to ask for, which platform
+code refused — was discarded before reaching the caller, and routine scope
+refusals were logged as crashes. The unit tests passed throughout, because they
+call the registered function and assert on the exception it raises: true of the
+function, and silent about what crosses the wire.
+
+**Credential administration moved to the dashboard.** Registering an agent
+client was an operator command, so the person who runs the platform and the
+person who runs the agent had to be the same person. An administrator now issues
+a client from Access and audit and is given the configuration to hand over, and
+the consents that client holds are listed and revocable on the same panel.
+Before this, `mcp-auth` could revoke a grant through its control listener and
+nothing an operator could reach ever called it — the design's strongest claim
+was reachable only from a test.
+
+**The claims about withdrawal are now measurements.** Revoking a consent from
+the dashboard left the agent's next call answering `401` and its refresh
+answering `invalid_grant`. Disabling a client refused a refresh carrying an
+unspent token while a live token A kept working for the remainder of the
+runtime's 30-second introspection cache — measured at 4 seconds, not the
+15-minute token lifetime. That second figure was initially recorded the other
+way round, from a reading taken inside the cache window; the correction is in
+the spike plan, because understating a control the design depends on is the more
+dangerous error.
+
 ## Gate status
 
 The Phase 0 checklist, item by item. "Decided and designed" (P1–P12, P19–P21)
@@ -100,13 +161,13 @@ records an amendment.
 | Authorization-code issuance, A-to-B exchange, narrowing, introspection, revocation | **done**, with one amendment | The exchange *refuses* rather than narrows — deliberate, see ADR |
 | Atomic one-time consumption, expiry cleanup, quota failure | **done** | Consumption and cleanup measured under contention. The per-grant exchange budget refuses with `slow_down` past 60 in 60 seconds; P11's remaining budgets are Phase 6 |
 | Independent canonicalization prototypes for mapp-mcp, broker and API | **3 of 3** | All three vendored and cross-checked against each other over a corpus chosen to drift, on what they emit *and* on what they refuse. `mapp-mcp` also carries the envelope builder, checked against the configuration API's copy and against the pinned golden vector |
-| Target-client spikes (Claude, Codex, Gemini) | **1 of 3, and the client half of Claude is now checked** | `mcp-auth/tests/test_registered_client.py` drives discovery, authorization, consent, token, introspection, exchange and redemption for an operator-registered client against the real component, and the same flow was driven by hand through Caddy against the running platform. Claude Code's own requirements were then read rather than assumed: it accepts a pre-registered **public** client and a fixed callback port, so this design fits it, but it defaults to Dynamic Client Registration and sends `offline_access` unconditionally. No MCP client has connected, because `mapp-mcp` does not exist. Codex/OpenAI and Gemini unexamined |
+| Target-client spikes (Claude, Codex, Gemini) | **1 of 3, and the Claude column is now complete** | Claude Code 2.1.272 has connected to the running platform and used it: discovery, consent, token, `tools/list`, and `layer_values` returning real aggregates through the exchange and the request binding. Driven from an ephemeral container against the deployed stack, not a harness. The earlier revision recorded this row as blocked "because `mapp-mcp` does not exist"; it exists. Two things the run established that reading documentation had not: the shipped client speaks **2025-11-25 only**, which forced decision P2a, and it accepts a static `Authorization` header, which is how a headless test supplies a token without its OAuth store. `mcp-auth/tests/test_registered_client.py` still drives the authorization column against the real component. Codex/OpenAI and Gemini unexamined |
 
 ### Tested
 
 | Item | Status | Evidence |
 | --- | --- | --- |
-| Token A/B audience separation, non-widening exchange, revocation propagation | **done** | All three pinned; revocation reaches an already-issued token B |
+| Token A/B audience separation, non-widening exchange, revocation propagation | **done**, and now also measured on the deployed stack | All three pinned by test. Against the running platform: a token A presented to the configuration API is refused `401`; revoking a consent from the dashboard left the agent's next call answering `401` and its refresh answering `invalid_grant`; disabling a client refused a refresh carrying an *unspent* token. The residual window on a live token A is the runtime's positive introspection cache, bounded at 30 seconds — measured at 4 |
 | Canonicalization golden vectors independently in three implementations | **3 of 3** | RFC vectors run against all three copies, plus cross-copy comparison. One *envelope* digest is pinned literally and recomputed independently by both builders, which is what differential agreement alone could not give: two copies wrong in the same way agree perfectly |
 | Benchmark the control schema under contention; record capacity, failure, recovery | **done** | Table above; `scripts/control_plane_benchmark.py` |
 | Threat-model and abuse-case review | **done, unapproved** | [`mcp-threat-model.md`](mcp-threat-model.md) — 8 cases; 1 unmitigated, 1 unverified |
@@ -173,9 +234,11 @@ commit with the effect, which the current file-backed audit does not.
 
 **Conditional go. Phase 1 design work approved. No public route.**
 
-Updated after the owner's decisions: agent client registration now exists, so
-the merge blocker is closed and the authorization flow is proven end to end
-for an operator-registered client.
+Updated twice. First after the owner's decisions, when agent client
+registration closed the merge blocker. Again on 2026-09-16, after `mapp-mcp` was
+built: the authorization flow is no longer proven only for an operator-registered
+client against the component, but for a real MCP client against the running
+platform, end to end.
 
 The authorization design works against the real platform. The properties that
 mattered are built and pinned: audience separation, a non-widening exchange,
@@ -184,16 +247,24 @@ single-use consumption under real concurrency, and an operation binding that
 confines a credential to one request. Phase 0's purpose was to find out whether
 the design survives contact, and it did — with amendments the ADR records.
 
-Two gate items remain unsatisfied in ways documentation cannot close, and
-neither blocks design work:
+**One** gate item remains unsatisfied in a way documentation cannot close, and
+it does not block design work:
 
-1. **Client acceptance is 1 of 3.** The authorization column is proven for one
-   client against the real component. Codex/OpenAI and Gemini are untested, and
-   SDK support is not client acceptance. Blocking for release, not for Phase 1.
-2. **The third canonicalization implementation is absent**, because `mapp-mcp`
-   is absent. Two independent implementations agree; the specification's own
-   reason for wanting three is that two might both be wrong in the same way.
-   Closing this is part of building `mapp-mcp`.
+1. **Client acceptance is 1 of 3.** Claude is now complete — connected, listed
+   and called against the running platform, not merely SDK-compatible.
+   Codex/OpenAI and Gemini are untested, and SDK support is still not client
+   acceptance. Blocking for release, not for Phase 1. The container harness that
+   proved Claude transfers directly to the other two, so this is scheduled work
+   rather than open research.
+
+The previous revision listed a second item — the absent third canonicalization
+implementation — on the grounds that `mapp-mcp` did not exist. It does, it
+carries its own `canonical.py` and envelope builder, and
+`mapp-mcp/tests/test_envelope_agreement.py` checks all three copies against each
+other and against a pinned golden vector. The gate table above already recorded
+this as 3 of 3 while the recommendation still called it absent; the two said
+different things about the same row for one revision, which is the sort of drift
+this document exists to prevent.
 
 Conditions carried into Phase 1:
 
@@ -216,9 +287,25 @@ Conditions carried into Phase 1:
   nice-to-have and revisited at the end of the project; the ADR records the
   cheaper shape if it is ever picked up.
 
-**Merge** is now a judgement rather than a blocker. The component works end to
-end for a registered client; what argues for keeping it on the branch is that
-`mapp-mcp` does not exist, so nothing in `main` would use it.
+**Merge.** The single argument for keeping this on the branch was that
+`mapp-mcp` did not exist, so nothing in `main` would use it. That argument has
+lapsed: the runtime exists, and a real client uses it. The branch now carries 58
+commits that `main` does not, including the platform's only MCP surface and the
+only dashboard route to revoke a consent, and every suite is green.
+
+What still argues for care is not the code but the blast radius of the schema:
+merging brings eight control-plane migrations and the `mapp_control` role onto
+`main`. One operator-facing message is already out of step and was corrected
+here — `./bin/mapp reset-system --confirm` destroys the packaged volume, which
+now also holds every registered agent client and every MCP consent, while its
+warning enumerated only dashboard authentication, CLI API tokens and device
+authorizations. The recovery-epoch command names grants; the reset did not, so
+the two disagreed about what the database contains.
+
+Recommended: prepare the merge — confirm the migration ladder applies to an
+existing volume, and land it behind the existing "no public route" condition.
+Keeping a proven component unmerged has its own cost, which is that every
+subsequent change is made against a branch nobody else runs.
 
 ## Reproducing this
 
@@ -228,6 +315,15 @@ export CONTROL_TEST_DATABASE_URL=postgresql://…/mapp_control_test
 PYTHONPATH=mcp-auth  python -m unittest discover -s mcp-auth/tests
 PYTHONPATH=config-ui python -m unittest discover -s config-ui/tests
 PYTHONPATH=.         python -m unittest discover -s scripts/tests
+
+# The MCP runtime needs the SDK, so it runs inside its own image rather than
+# on the host. No database and no network.
+docker run --rm -v "$PWD:/workspace:ro" \
+  -e PYTHONPATH=/app:/workspace/mapp-mcp/tests \
+  mapp-mcp:local python -m unittest discover -s /workspace/mapp-mcp/tests
+
+# The dashboard's own suite
+cd config-ui && npm ci && npm test
 
 # Capacity figures
 export CONTROL_BENCHMARK_DATABASE_URL=postgresql://…/scratch
