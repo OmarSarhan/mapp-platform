@@ -148,6 +148,27 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:provision",),
         mutating=True,
     ),
+    "proposals.list": Operation(
+        operation_id="proposals.list",
+        method="GET",
+        path_template="/api/proposals",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
+    "semantic.proposals.list": Operation(
+        operation_id="semantic.proposals.list",
+        method="GET",
+        path_template="/api/semantic/proposals",
+        required_scopes=("semantic:inspect",),
+        mutating=False,
+    ),
+    "semantic.proposals.show": Operation(
+        operation_id="semantic.proposals.show",
+        method="GET",
+        path_template="/api/semantic/proposals/{proposalId}",
+        required_scopes=("semantic:inspect",),
+        mutating=False,
+    ),
     "proposals.apply": Operation(
         operation_id="proposals.apply",
         method="POST",

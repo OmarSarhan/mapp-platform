@@ -23,6 +23,7 @@ from config_api_client import ConfigApiUnavailable  # noqa: E402
 from config_api_client import layer_statistics_query  # noqa: E402
 from config_api_client import layer_values_query  # noqa: E402
 from config_api_client import layers_query  # noqa: E402
+from config_api_client import limit_query  # noqa: E402
 from config_api_client import semantic_search_query  # noqa: E402
 from exchange_client import ExchangeRefused  # noqa: E402
 from exchange_client import ExchangeUnavailable  # noqa: E402
@@ -956,3 +957,107 @@ class FederationDisclosureTests(ToolTestCase):
         self.assertEqual("reachable", result["observation"]["connectivity"])
         self.assertNotIn("registeredBy", json.dumps(result))
         self.assertNotIn("schemaFingerprint", json.dumps(result))
+
+
+QUEUE = {"proposals": [
+    {"id": "p-1", "status": "applied", "created": "2026-09-14T14:28:41Z",
+     "actor": "[withheld]", "explanation": "y" * 260,
+     "candidateHash": "abc", "originalRevision": "rev", 
+     "pluginCatalogueFingerprint": "fp"},
+    {"id": "p-2", "status": "pending", "created": "2026-09-02T17:05:47Z",
+     "explanation": "Rename the sample layer."},
+]}
+
+
+class ProposalQueueTests(ToolTestCase):
+    """The review queue: the half of propose-review-apply that alters nothing.
+
+    A workspace is not edited directly -- a change is proposed, a person reviews
+    it, and applying it is a separate act. Reading the queue says what is
+    waiting and what landed, and that is all this surface offers.
+    """
+
+    def tool(self, name, payload=QUEUE, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_the_index_keeps_the_explanation_and_drops_the_integrity_material(
+        self,
+    ) -> None:
+        """The explanation is why a proposal exists and is what a person reads
+        first. The hashes and fingerprints answer nothing an agent can act on."""
+        self.as_caller(caller())
+        entry = self.tool("proposals_list")()["proposals"][0]
+        self.assertEqual("p-1", entry["proposalId"])
+        self.assertEqual("applied", entry["status"])
+        self.assertTrue(entry["explanation"].startswith("y"))
+        for dropped in ("candidateHash", "originalRevision",
+                        "pluginCatalogueFingerprint"):
+            self.assertNotIn(dropped, entry)
+
+    def test_a_long_explanation_is_truncated(self) -> None:
+        self.as_caller(caller())
+        explanation = self.tool("proposals_list")()["proposals"][0]["explanation"]
+        self.assertLessEqual(len(explanation), 201)
+        self.assertTrue(explanation.endswith("…"))
+
+    def test_status_filters_without_a_second_round_trip(self) -> None:
+        """The API offers no status parameter, so the alternative is the agent
+        fetching everything and filtering, which costs it a context window."""
+        self.as_caller(caller())
+        pending = self.tool("proposals_list")(status="pending")["proposals"]
+        self.assertEqual(["p-2"], [p["proposalId"] for p in pending])
+
+    def test_limit_is_passed_to_the_platform_not_applied_afterwards(self) -> None:
+        """Bounding after the fact still transfers the whole queue; this
+        instance already holds 81."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool("proposals_list", exchange=exchange)(limit=5)
+        self.assertEqual("limit=5", exchange.calls[0]["query"])
+
+    def test_reading_the_queue_never_costs_the_proposing_scope(self) -> None:
+        """`propose` is what it costs to add to the queue. A read tool that
+        asked for it would make looking indistinguishable from writing."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        self.tool("proposals_list", exchange=exchange)()
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
+        self.assertNotIn("propose", exchange.calls[0]["scope"])
+
+    def test_the_semantic_pair_costs_only_the_semantic_read_scope(self) -> None:
+        for name, kwargs in (
+            ("semantic_proposals_list", {}),
+            ("semantic_proposals_show", {"proposal_id": "sp-1"}),
+        ):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller(scopes="mcp:connect inspect semantic:inspect"))
+                self.tool(name, exchange=exchange)(**kwargs)
+                self.assertEqual("semantic:inspect", exchange.calls[0]["scope"])
+
+    def test_the_proposal_id_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool("semantic_proposals_show", exchange=exchange)(proposal_id="odd/id")
+        self.assertEqual(
+            "/api/semantic/proposals/odd%2Fid", exchange.calls[0]["path"]
+        )
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"proposals": None}, {"proposals": "x"}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                self.assertEqual(
+                    [], self.tool("proposals_list", payload=payload)()["proposals"]
+                )
+
+
+class LimitQueryTests(unittest.TestCase):
+    def test_an_absent_limit_is_no_parameter(self) -> None:
+        """`limit=` is a different request from no limit, and is refused."""
+        self.assertEqual("", limit_query(limit=None))
+
+    def test_a_limit_is_rendered_as_one_pair(self) -> None:
+        self.assertEqual("limit=25", limit_query(limit=25))

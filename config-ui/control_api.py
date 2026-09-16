@@ -1217,6 +1217,23 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "proposals.list": {
+        "method": "GET",
+        "path": "/api/proposals",
+        # Which workspace changes are pending or were applied. Reading the
+        # queue is the GET catch-all's `inspect`; `propose` is what it costs to
+        # add to it.
+        "risk": "inspect",
+        "scope": "inspect",
+        "querySchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "cursor": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
     "proposals.check": {
         "method": "POST",
         "path": "/api/proposals/check",

@@ -36,6 +36,7 @@ from config_api_client import ConfigApiUnavailable
 from config_api_client import layer_statistics_query
 from config_api_client import layer_values_query
 from config_api_client import layers_query
+from config_api_client import limit_query
 from config_api_client import semantic_search_query
 from exchange_client import ExchangeRefused
 from exchange_client import ExchangeUnavailable
@@ -104,6 +105,29 @@ FEDERATION_SHOW = {
     "method": "GET",
     "path_template": "/api/federation/aliases/{alias}",
     "scopes": ("federation:observe",),
+}
+
+PROPOSALS_LIST = {
+    "operation_id": "proposals.list",
+    "method": "GET",
+    "path_template": "/api/proposals",
+    # Reading the queue is the GET catch-all's `inspect`; adding to it is
+    # `propose`, which no read tool asks for.
+    "scopes": ("inspect",),
+}
+
+SEMANTIC_PROPOSALS_LIST = {
+    "operation_id": "semantic.proposals.list",
+    "method": "GET",
+    "path_template": "/api/semantic/proposals",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_PROPOSALS_SHOW = {
+    "operation_id": "semantic.proposals.show",
+    "method": "GET",
+    "path_template": "/api/semantic/proposals/{proposalId}",
+    "scopes": ("semantic:inspect",),
 }
 
 SEMANTIC_CATALOG_LIST = {
@@ -211,6 +235,28 @@ def _alias_detail(alias):
     }
     detail["observation"] = _observation_summary(alias.get("lastObservation"))
     return detail
+
+
+def _proposal_summary(proposal):
+    """One queue entry: what changed, when, and whether it landed.
+
+    The explanation is why a proposal exists and is the only field a person
+    reads first, so it survives; `candidateHash`, `originalRevision` and the
+    plugin fingerprint are integrity material that answer nothing an agent can
+    act on. `actor` is not dropped here -- the configuration API withholds
+    credential identifiers from an exchanged credential before this sees them,
+    which is where that decision belongs.
+    """
+    proposal = proposal if isinstance(proposal, dict) else {}
+    explanation = proposal.get("explanation")
+    return {
+        "proposalId": proposal.get("id"),
+        "status": proposal.get("status"),
+        "created": proposal.get("created"),
+        "explanation": (explanation[:200] + "…")
+        if isinstance(explanation, str) and len(explanation) > 200
+        else explanation,
+    }
 
 
 def _asset_summary(asset):
@@ -611,6 +657,72 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 f"The registry returned no alias record for {alias!r}."
             )
         return _alias_detail(record)
+
+    @server.tool(
+        name="proposals_list",
+        description=(
+            "Workspace changes that have been proposed: what was suggested,"
+            " when, and whether it was applied or is still pending review."
+            " Read-only -- proposing and applying are not offered."
+        ),
+    )
+    def proposals_list(limit: int | None = None, status: str | None = None) -> dict:
+        """The review queue, which is how a change reaches this platform.
+
+        A workspace is not edited directly: a change is proposed, a person
+        reviews it, and applying it is a separate act. An agent that can read
+        the queue can say what is waiting and what already landed, which is the
+        useful half of that loop and the half that alters nothing.
+
+        `status` filters here rather than at the API, which offers no such
+        parameter. `limit` is passed through, so a large queue is bounded by the
+        platform rather than after the fact -- this instance already holds 81.
+        """
+        payload = spend(
+            PROPOSALS_LIST,
+            path=PROPOSALS_LIST["path_template"],
+            query=limit_query(limit=limit),
+        )
+        proposals = payload.get("proposals")
+        entries = [
+            _proposal_summary(proposal)
+            for proposal in (proposals if isinstance(proposals, list) else [])
+        ]
+        if status is not None:
+            entries = [entry for entry in entries if entry["status"] == status]
+        return {"proposals": entries}
+
+    @server.tool(
+        name="semantic_proposals_list",
+        description=(
+            "Proposed changes to curated semantic meaning, with their review"
+            " status. The semantic counterpart to proposals_list."
+        ),
+    )
+    def semantic_proposals_list() -> dict:
+        """Meaning is proposed and reviewed like configuration is."""
+        return spend(
+            SEMANTIC_PROPOSALS_LIST, path=SEMANTIC_PROPOSALS_LIST["path_template"]
+        )
+
+    @server.tool(
+        name="semantic_proposals_show",
+        description=(
+            "One proposed semantic change in full, including what it would"
+            " alter. Takes a proposalId from semantic_proposals_list."
+        ),
+    )
+    def semantic_proposals_show(proposal_id: str) -> dict:
+        """The detail a workspace proposal has no endpoint for.
+
+        Worth noting the asymmetry: semantic proposals can be read individually
+        and workspace proposals cannot, so `proposals_list` is the whole of what
+        this surface can say about a pending workspace change.
+        """
+        path = SEMANTIC_PROPOSALS_SHOW["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        return spend(SEMANTIC_PROPOSALS_SHOW, path=path)
 
     @server.tool(
         name="semantic_catalog_list",

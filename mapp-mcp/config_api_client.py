@@ -116,6 +116,18 @@ def semantic_search_query(*, query: str, limit: int | None) -> str:
     )
 
 
+def limit_query(*, limit: int | None) -> str:
+    """A bare `limit`, for the listings that paginate.
+
+    Trivial, and separate rather than inlined for the reason every other builder
+    is: the query is digested at exchange time and sent at request time, so it
+    is built once in a place a test can reach.
+    """
+    if limit is None:
+        return ""
+    return f"limit={urllib.parse.quote(str(limit), safe='')}"
+
+
 def layers_query(*, locale: str | None) -> str:
     """The query string for the layer listing, in the one fixed order.
 
