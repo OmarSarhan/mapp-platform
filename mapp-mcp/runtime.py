@@ -116,6 +116,13 @@ PROPOSALS_LIST = {
     "scopes": ("inspect",),
 }
 
+PROPOSALS_SHOW = {
+    "operation_id": "proposals.show",
+    "method": "GET",
+    "path_template": "/api/proposals/{proposalId}",
+    "scopes": ("inspect",),
+}
+
 SEMANTIC_PROPOSALS_LIST = {
     "operation_id": "semantic.proposals.list",
     "method": "GET",
@@ -256,6 +263,45 @@ def _proposal_summary(proposal):
         "explanation": (explanation[:200] + "…")
         if isinstance(explanation, str) and len(explanation) > 200
         else explanation,
+    }
+
+
+def _change_preview(value):
+    """What a changed value is, in a form that survives a conversation.
+
+    A workspace diff carries whole layer definitions -- the largest on this
+    instance is 44,580 bytes across 46 entries -- so returning values verbatim
+    is not a summary of a change, it is the change. A scalar is already short
+    and is kept: "visible became false" is the answer, not a description of it.
+    A container is reduced to its shape, and for an object that means its keys,
+    because which fields of a layer a proposal sets is the question a reviewer
+    actually asks of it.
+    """
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 120 else value[:120] + "…"
+    if isinstance(value, list):
+        return {"type": "list", "items": len(value)}
+    if isinstance(value, dict):
+        keys = sorted(str(key) for key in value)
+        preview = {"type": "object", "keys": keys[:20]}
+        if len(keys) > 20:
+            preview["truncated"] = len(keys) - 20
+        return preview
+    # Nothing else appears in a stored proposal; named rather than dropped so an
+    # unexpected shape is visible instead of silently becoming null.
+    return {"type": type(value).__name__}
+
+
+def _change_summary(entry):
+    """One diff entry: where it lands, what it does, and what it becomes."""
+    entry = entry if isinstance(entry, dict) else {}
+    return {
+        "op": entry.get("op"),
+        "path": entry.get("path"),
+        "was": _change_preview(entry.get("old")),
+        "becomes": _change_preview(entry.get("value")),
     }
 
 
@@ -693,6 +739,92 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         return {"proposals": entries}
 
     @server.tool(
+        name="proposals_show",
+        description=(
+            "One queued proposal in detail: why it exists, what it would"
+            " change, and any warnings raised against it. Each change gives its"
+            " path, what was there and what it becomes -- scalars in full,"
+            " larger values as their shape; pass `path` to expand one change"
+            " completely. Takes a proposalId from proposals_list. Read-only --"
+            " applying and declining are not offered."
+        ),
+    )
+    def proposals_show(proposal_id: str, path: str | None = None) -> dict:
+        """What a proposal actually changes, which the queue cannot say.
+
+        `proposals_list` says a change is waiting and who it is from. That is
+        enough to report the queue and not enough to review anything: the
+        decision a person makes about a proposal is made on its diff.
+
+        The whole record is not returned, and that is the substance of this
+        tool rather than a caveat. It holds `original` and `candidate` -- the
+        entire workspace before and after, 46,172 bytes each at the top of this
+        instance -- from which the platform already derived `diff`. Returning
+        them would spend a conversation restating a document the agent did not
+        ask for so it could compute a difference that arrived alongside it.
+        The integrity material (`candidateHash`, `originalHash`, the plugin
+        fingerprint) is dropped for a different reason: it answers whether the
+        record is intact, which is the platform's question at apply time and
+        not one an agent can act on.
+
+        `operations` becomes a count, which is a stronger claim than it looks.
+        A stored operation carries the value it would write, so the list
+        reaches 40,263 bytes here; reducing it to verbs and paths still left
+        112 entries restating `changes`. Across all 81 stored proposals its
+        path sequence is identical to the diff's, so the list adds one thing:
+        a write verb (`set`) where the diff says what the change is (`replace`).
+        A reviewer is asking what the proposal does, and `changes` answers that
+        in the same order. The count survives because it is what a divergence
+        would show up in -- an `operationCount` unequal to the number of
+        changes is a proposal whose write plan is not its diff.
+
+        `path` expands one change, because a shape tells a reviewer which
+        fields a layer gains and not what they become. One at a time is
+        deliberate -- expanding all of them reconstitutes the diff this exists
+        to avoid.
+        """
+        target = PROPOSALS_SHOW["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        payload = spend(PROPOSALS_SHOW, path=target)
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        diff = proposal.get("diff")
+        diff = diff if isinstance(diff, list) else []
+        operations = proposal.get("operations")
+        warnings = proposal.get("warnings")
+
+        detail = dict(_proposal_summary(proposal))
+        # The list truncates the explanation at 200 characters because a queue
+        # is scanned; this is the read where the whole reason is the point.
+        detail["explanation"] = proposal.get("explanation")
+        detail["originalRevision"] = proposal.get("originalRevision")
+        detail["operationCount"] = len(
+            operations if isinstance(operations, list) else []
+        )
+        detail["warnings"] = warnings if isinstance(warnings, list) else []
+        detail["changes"] = [_change_summary(entry) for entry in diff]
+
+        if path is not None:
+            matches = [
+                entry for entry in diff
+                if isinstance(entry, dict) and entry.get("path") == path
+            ]
+            if not matches:
+                raise ToolError(
+                    f"This proposal changes nothing at {path}. The paths it"
+                    " changes are listed in `changes` when `path` is omitted."
+                )
+            entry = matches[0]
+            detail["change"] = {
+                "op": entry.get("op"),
+                "path": entry.get("path"),
+                "was": entry.get("old"),
+                "becomes": entry.get("value"),
+            }
+        return detail
+
+    @server.tool(
         name="semantic_proposals_list",
         description=(
             "Proposed changes to curated semantic meaning, with their review"
@@ -715,9 +847,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     def semantic_proposals_show(proposal_id: str) -> dict:
         """The detail a workspace proposal has no endpoint for.
 
-        Worth noting the asymmetry: semantic proposals can be read individually
-        and workspace proposals cannot, so `proposals_list` is the whole of what
-        this surface can say about a pending workspace change.
+        The workspace counterpart is `proposals_show`, which summarises rather
+        than returning the record whole. This does not, because a semantic
+        proposal carries curated meaning and no workspace snapshot, so there is
+        no equivalent bulk to withhold.
         """
         path = SEMANTIC_PROPOSALS_SHOW["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")

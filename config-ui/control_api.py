@@ -1217,6 +1217,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "proposals.show": {
+        "method": "GET",
+        "pathTemplate": "/api/proposals/{proposalId}",
+        # The queue entry in full: its diff, the operations it would run, the
+        # warnings raised against it, and the revision it was cut from. Reading
+        # a proposal is `inspect`; acting on it is not.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "proposals.list": {
         "method": "GET",
         "path": "/api/proposals",

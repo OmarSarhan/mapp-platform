@@ -7855,9 +7855,22 @@ class Handler(SimpleHTTPRequestHandler):
                     {"error": str(exc), "code": "pagination.invalid"},
                 )
         elif path.startswith("/api/proposals/"):
+            proposal_id = path.rsplit("/", 1)[1]
             try:
-                self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, path.rsplit("/", 1)[1])})
-            except (FileNotFoundError, ValueError) as exc:
+                self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, proposal_id)})
+            except FileNotFoundError:
+                # Named rather than `str(exc)`: the exception comes from the
+                # filesystem, so its text is "[Errno 2] ... '/control/proposals/
+                # <id>/proposal.json'" and reporting it hands the caller the
+                # platform's internal layout. The identifier is echoed instead,
+                # and only after proposal_read's own pattern check has accepted
+                # it. The other not-found branches here raise with a name and
+                # are unaffected.
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": f"Unknown proposal: {proposal_id}",
+                    "code": "proposal.not_found",
+                })
+            except ValueError as exc:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         elif path == "/api/xyz/status":
             self._json(HTTPStatus.OK, reload_status())

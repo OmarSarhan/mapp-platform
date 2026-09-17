@@ -1054,6 +1054,198 @@ class ProposalQueueTests(ToolTestCase):
                 )
 
 
+# Cut from var/control/proposals/*/proposal.json rather than composed here: the
+# stored record carries `original` and `candidate` as well as `diff`, and every
+# one of `operations`, `diff[].value` holds whole layer definitions. A fixture
+# that omitted those would agree with the summariser about a bulk that is not
+# there, which is the failure this file has hit before.
+DETAIL = {"proposal": {
+    "id": "1786156792-af56c7e17281-da498c",
+    "status": "pending",
+    "created": "2026-09-14T14:28:41Z",
+    "actor": "[withheld]",
+    "explanation": "e" * 260,
+    "originalRevision": "rev-9",
+    "originalHash": "0" * 64,
+    "candidateHash": "1" * 64,
+    "pluginCatalogueFingerprint": "fp",
+    "original": {"locale": {"layers": {"Existing": {"name": "snapshot-only"}}}},
+    "candidate": {"locale": {"layers": {"Existing": {"name": "snapshot-only"},
+                                        "Arrivals": {"name": "snapshot-only"}}}},
+    "warnings": ["The relation has no spatial index."],
+    "operations": [
+        {"op": "set", "path": "/locale/layers/Arrivals",
+         "value": {"name": "Arrivals", "table": "derived_layers.arrivals_oa"}},
+        {"op": "remove", "path": "/locale/layers/Old"},
+        {"op": "set", "path": "/locale/layers/Existing/display", "value": False},
+    ],
+    "diff": [
+        {"op": "add", "path": "/locale/layers/Arrivals", "old": None,
+         "value": {"name": "Arrivals", "display": True, "format": "mvt",
+                   "dbs": "MAPP", "table": "derived_layers.arrivals_oa",
+                   "geom": "geom_3857", "srid": "3857", "qID": "oa21cd",
+                   "opacity": 1, "infoj": [{"field": "oa21cd"}]}},
+        {"op": "replace", "path": "/locale/layers/Existing/display",
+         "old": True, "value": False},
+    ],
+}}
+
+
+class ProposalDetailTests(ToolTestCase):
+    """What a proposal changes, which is the read a review is made on.
+
+    The queue says a change is waiting. The decision about it is made on its
+    diff, and before this tool there was no path from an MCP credential to one:
+    the endpoint existed and no allowlist named it.
+    """
+
+    def tool(self, payload=DETAIL, exchange=None):
+        return self.build_named(
+            "proposals_show", exchange=exchange,
+            config_api=FakeConfigApi(answer=payload),
+        )
+
+    def test_the_change_paths_are_reported(self) -> None:
+        self.as_caller(caller())
+        changes = self.tool()(proposal_id="p-1")["changes"]
+        self.assertEqual(
+            [("add", "/locale/layers/Arrivals"),
+             ("replace", "/locale/layers/Existing/display")],
+            [(c["op"], c["path"]) for c in changes],
+        )
+
+    def test_a_scalar_change_reports_both_values(self) -> None:
+        """"display became false" is the answer, not a description of it."""
+        self.as_caller(caller())
+        change = self.tool()(proposal_id="p-1")["changes"][1]
+        self.assertEqual(True, change["was"])
+        self.assertEqual(False, change["becomes"])
+
+    def test_a_structured_change_reports_its_keys_not_its_contents(self) -> None:
+        """Which fields a layer gains is the question; the layer itself is the
+        44KB this tool exists to not send."""
+        self.as_caller(caller())
+        change = self.tool()(proposal_id="p-1")["changes"][0]
+        self.assertIsNone(change["was"])
+        self.assertEqual("object", change["becomes"]["type"])
+        self.assertIn("table", change["becomes"]["keys"])
+        self.assertNotIn("derived_layers.arrivals_oa", json.dumps(change))
+
+    def test_the_workspace_snapshots_never_reach_the_agent(self) -> None:
+        """`original` and `candidate` are the whole workspace twice, and the
+        platform already derived `diff` from them."""
+        self.as_caller(caller())
+        detail = self.tool()(proposal_id="p-1")
+        for dropped in ("original", "candidate"):
+            self.assertNotIn(dropped, detail)
+        # Their contents, not merely their keys: a changed path legitimately
+        # names a layer, so the sentinel lives only inside the snapshots.
+        self.assertNotIn("snapshot-only", json.dumps(detail))
+
+    def test_the_integrity_material_is_dropped(self) -> None:
+        """It answers whether the record is intact, which is the platform's
+        question at apply time and not one an agent can act on."""
+        self.as_caller(caller())
+        detail = self.tool()(proposal_id="p-1")
+        for dropped in ("originalHash", "candidateHash",
+                        "pluginCatalogueFingerprint"):
+            self.assertNotIn(dropped, detail)
+
+    def test_operations_become_a_count_because_they_restate_the_diff(self) -> None:
+        """A stored operation carries the value it would write (40,263 bytes
+        here), and across all 81 stored proposals its path sequence is the
+        diff's. The count survives because a divergence would show up in it."""
+        self.as_caller(caller())
+        detail = self.tool()(proposal_id="p-1")
+        # Three against two changes, so a count taken from the diff fails here.
+        self.assertEqual(3, detail["operationCount"])
+        self.assertNotEqual(len(detail["changes"]), detail["operationCount"])
+        self.assertNotIn("operations", detail)
+        self.assertNotIn("/locale/layers/Old", json.dumps(detail))
+
+    def test_the_whole_explanation_survives_unlike_in_the_queue(self) -> None:
+        """The list truncates at 200 because a queue is scanned. This is the
+        read where the whole reason is the point."""
+        self.as_caller(caller())
+        self.assertEqual(260, len(self.tool()(proposal_id="p-1")["explanation"]))
+
+    def test_the_warnings_raised_against_it_survive(self) -> None:
+        self.as_caller(caller())
+        self.assertEqual(
+            ["The relation has no spatial index."],
+            self.tool()(proposal_id="p-1")["warnings"],
+        )
+
+    def test_one_change_can_be_expanded_in_full(self) -> None:
+        """A shape says which fields a layer gains, not what they become."""
+        self.as_caller(caller())
+        detail = self.tool()(proposal_id="p-1",
+                             path="/locale/layers/Arrivals")["change"]
+        self.assertEqual("derived_layers.arrivals_oa", detail["becomes"]["table"])
+        self.assertIsNone(detail["was"])
+
+    def test_expanding_is_opt_in_so_the_default_read_stays_compact(self) -> None:
+        self.as_caller(caller())
+        self.assertNotIn("change", self.tool()(proposal_id="p-1"))
+
+    def test_an_unchanged_path_is_refused_by_name(self) -> None:
+        """Returning an empty expansion would read as "this proposal changes
+        nothing there" and as "you asked for the wrong path" identically."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool()(proposal_id="p-1", path="/locale/layers/Absent")
+        self.assertIn("/locale/layers/Absent", str(raised.exception))
+
+    def test_the_proposal_id_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(proposal_id="odd/id")
+        self.assertEqual("/api/proposals/odd%2Fid", exchange.calls[0]["path"])
+
+    def test_reading_a_proposal_never_costs_the_proposing_scope(self) -> None:
+        """Looking at a change and being able to make one are different
+        authorities, and this tool asks only for the first."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        self.tool(exchange=exchange)(proposal_id="p-1")
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"proposal": None}, {"proposal": {"diff": "x"}},
+                        {"proposal": {"operations": 3}}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                detail = self.tool(payload=payload)(proposal_id="p-1")
+                self.assertEqual([], detail["changes"])
+                self.assertEqual(0, detail["operationCount"])
+
+    def test_a_malformed_change_entry_is_named_rather_than_dropped(self) -> None:
+        """An unexpected value shape should be visible, not silently null."""
+        self.as_caller(caller())
+        payload = {"proposal": {"diff": [{"op": "add", "path": "/x",
+                                          "value": {1, 2}}]}}
+        change = self.tool(payload=payload)(proposal_id="p-1")["changes"][0]
+        self.assertEqual({"type": "set"}, change["becomes"])
+
+    def test_a_long_string_value_is_truncated(self) -> None:
+        self.as_caller(caller())
+        payload = {"proposal": {"diff": [{"op": "replace", "path": "/x",
+                                          "old": None, "value": "z" * 300}]}}
+        becomes = self.tool(payload=payload)(proposal_id="p-1")["changes"][0]["becomes"]
+        self.assertEqual(121, len(becomes))
+        self.assertTrue(becomes.endswith("…"))
+
+    def test_a_wide_object_reports_how_many_keys_it_withheld(self) -> None:
+        """Silently showing 20 of 30 keys reads as a layer with 20 fields."""
+        self.as_caller(caller())
+        value = {f"field{n:02d}": n for n in range(30)}
+        payload = {"proposal": {"diff": [{"op": "add", "path": "/x",
+                                          "old": None, "value": value}]}}
+        becomes = self.tool(payload=payload)(proposal_id="p-1")["changes"][0]["becomes"]
+        self.assertEqual(20, len(becomes["keys"]))
+        self.assertEqual(10, becomes["truncated"])
+
+
 class LimitQueryTests(unittest.TestCase):
     def test_an_absent_limit_is_no_parameter(self) -> None:
         """`limit=` is a different request from no limit, and is refused."""

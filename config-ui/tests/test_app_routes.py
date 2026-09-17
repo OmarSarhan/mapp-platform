@@ -880,6 +880,49 @@ class FederationAliasReadRouteTests(unittest.TestCase):
         self.assertEqual("federation.registry_unavailable", body["code"])
 
 
+class ProposalReadRouteTests(unittest.TestCase):
+    """GET /api/proposals/<id> for an unknown id must name the proposal, not
+    the file. The read is a plain `.read_text()`, so a missing record raises an
+    OSError whose text is "[Errno 2] No such file or directory:
+    '/control/proposals/<id>/proposal.json'". Reporting that verbatim hands any
+    caller the platform's internal layout; it reached an MCP credential once
+    this route was allowlisted for exchange."""
+
+    @staticmethod
+    def handler(path):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "admin"
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_an_unknown_proposal_never_reports_a_filesystem_path(self):
+        handler, responses = self.handler("/api/proposals/no-such-proposal")
+
+        handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("proposal.not_found", body["code"])
+        self.assertEqual("Unknown proposal: no-such-proposal", body["error"])
+        self.assertNotIn("proposal.json", json.dumps(body))
+        self.assertNotIn("Errno", json.dumps(body))
+
+    def test_a_malformed_identifier_keeps_its_own_message(self):
+        """The pattern check raises a ValueError whose text is written here and
+        carries no path, so it is reported rather than replaced."""
+        handler, responses = self.handler("/api/proposals/not a valid id")
+
+        handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("Invalid proposal ID.", body["error"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")

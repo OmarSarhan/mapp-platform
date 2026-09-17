@@ -148,6 +148,13 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:provision",),
         mutating=True,
     ),
+    "proposals.show": Operation(
+        operation_id="proposals.show",
+        method="GET",
+        path_template="/api/proposals/{proposalId}",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
     "proposals.list": Operation(
         operation_id="proposals.list",
         method="GET",
