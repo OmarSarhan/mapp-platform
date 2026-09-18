@@ -556,6 +556,7 @@ export const MCP_SCOPE_OPTIONS=[
  {id:'derive',label:'Read derived layers',help:'Needed by layer_values to aggregate over a managed derived relation.'},
  {id:'semantic:inspect',label:'Read semantic catalog',help:'Needed by the semantic tools, and by layer_values to resolve the field it aggregates over.'},
  {id:'federation:observe',label:'Read federated sources',help:'Needed by federation_list, federation_show and federation_groups. Reveals which third-party databases this instance reads; it cannot expose or withdraw one, which is federation:provision.'},
+ {id:'semantic:source',label:'Read source relations',help:'Needed by semantic_source_relations. Lists the tables and views available to model, including ones no layer uses -- the database inventory rather than the configured workspace. Reads no rows from them. Left out of the presets so it is granted deliberately.'},
 ];
 export const MCP_CLIENT_PRESETS=[
  {id:'analysis',label:'Read-only analysis (recommended)',scopes:['mcp:connect','inspect','derive','semantic:inspect'],help:'What the shipped tools need to read this instance: its layers, their data, and the meaning recorded for them. Deliberately excludes federation:observe, which discloses the third-party databases behind the platform rather than the platform itself.'},

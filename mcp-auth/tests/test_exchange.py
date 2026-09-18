@@ -570,9 +570,15 @@ class AllowlistDriftTests(unittest.TestCase):
     NEVER_OFFERED_TO_AGENTS = frozenset({
         "full", "admin", "federation:provision", "federation:register",
         "semantic:apply", "semantic:admin", "semantic:generate",
-        "semantic:source", "semantic:data", "apply", "propose", "visual",
+        "semantic:data", "apply", "propose", "visual",
         "reload",
     })
+    # `semantic:source` was here and was deliberately removed. It reads the
+    # database's relation inventory -- tables and views including ones no layer
+    # uses -- which is disclosure rather than authority: it writes nothing,
+    # reaches no row, and the aliases it names are already visible to
+    # federation:observe. Kept out of the analysis presets so granting it stays
+    # a choice rather than a default.
 
     @staticmethod
     def dashboard_scope_options() -> set:

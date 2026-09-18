@@ -144,6 +144,16 @@ SEMANTIC_STATUS = {
     "scopes": ("semantic:inspect",),
 }
 
+SEMANTIC_SOURCE_RELATIONS = {
+    "operation_id": "semantic.source.relations",
+    "method": "GET",
+    "path_template": "/api/semantic/source/relations",
+    # Both, because the configuration API demands both: `semantic:source`
+    # authorises the action and `semantic:inspect` is listed alongside it.
+    # Requiring only the first would mint a credential the platform refuses.
+    "scopes": ("semantic:inspect", "semantic:source"),
+}
+
 SEMANTIC_DERIVED_PROFILES_LIST = {
     "operation_id": "semantic.derived-profiles.list",
     "method": "GET",
@@ -967,6 +977,38 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         """
         return _without_meta(
             spend(SEMANTIC_STATUS, path=SEMANTIC_STATUS["path_template"])
+        )
+
+    @server.tool(
+        name="semantic_source_relations",
+        description=(
+            "The tables and views available to model: their source alias,"
+            " schema, relation name, kind, and the catalogued asset each maps"
+            " to. This is the database inventory rather than the configured"
+            " workspace, so it includes relations no layer uses. Needs"
+            " semantic:source, which is granted separately."
+        ),
+    )
+    def semantic_source_relations() -> dict:
+        """What could be modelled, as opposed to what has been.
+
+        Every other read here describes the workspace as configured:
+        `layers_list` the layers, `derived_layers_list` the managed relations,
+        `semantic_catalog_list` the meaning recorded for them. None of them can
+        say what exists but was never used, which is the question behind "is
+        there data for X" -- and answering it by proposing a layer and seeing
+        it fail is a worse way to find out.
+
+        Deliberately the inventory and not the data. It names relations and
+        never reads a row from one; `layers_values` remains the only tool that
+        returns values, and it works over configured layers rather than
+        anything named here.
+        """
+        return _without_meta(
+            spend(
+                SEMANTIC_SOURCE_RELATIONS,
+                path=SEMANTIC_SOURCE_RELATIONS["path_template"],
+            )
         )
 
     @server.tool(

@@ -148,6 +148,13 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:provision",),
         mutating=True,
     ),
+    "semantic.source.relations": Operation(
+        operation_id="semantic.source.relations",
+        method="GET",
+        path_template="/api/semantic/source/relations",
+        required_scopes=("semantic:inspect", "semantic:source"),
+        mutating=False,
+    ),
     "semantic.status": Operation(
         operation_id="semantic.status",
         method="GET",

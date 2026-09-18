@@ -64,6 +64,7 @@ class FakeConfigApi:
 WIDE = (
     "mcp:connect inspect derive semantic:inspect federation:observe"
 )
+WIDEST = WIDE + " semantic:source"
 
 
 def caller(
@@ -1321,6 +1322,70 @@ GROUPS = {
                 "memberCount": 3}],
     "meta": {"requestId": "r6"},
 }
+
+
+RELATIONS = {
+    "relations": [
+        {"alias": "MAPP", "schema": "source_census",
+         "relation": "census_2021_england_oa", "kind": "foreign-table",
+         "assetId": "7fd220ac-8671-58db-8bf9-c6cfec31cbf2"},
+    ],
+    "meta": {"requestId": "r7"},
+}
+
+
+class SourceInventoryTests(ToolTestCase):
+    """What could be modelled, as opposed to what has been.
+
+    Every other read describes the workspace as configured. This names
+    relations that exist and were never used, which is the question behind "is
+    there data for X" -- and it sits behind its own scope because it discloses
+    the database's inventory rather than the platform's configuration.
+    """
+
+    def tool(self, payload=RELATIONS, exchange=None):
+        return self.build_named(
+            "semantic_source_relations", exchange=exchange,
+            config_api=FakeConfigApi(answer=payload),
+        )
+
+    def test_it_reports_the_relation_and_where_it_lives(self) -> None:
+        self.as_caller(caller(scopes=WIDEST))
+        entry = self.tool()()["relations"][0]
+        self.assertEqual("source_census", entry["schema"])
+        self.assertEqual("census_2021_england_oa", entry["relation"])
+        self.assertEqual("MAPP", entry["alias"])
+
+    def test_it_drops_the_request_envelope(self) -> None:
+        self.as_caller(caller(scopes=WIDEST))
+        self.assertNotIn("meta", self.tool()())
+
+    def test_it_costs_both_scopes_the_platform_demands(self) -> None:
+        """The configuration API lists semantic:inspect alongside
+        semantic:source, so a credential minted for only the latter is refused
+        by the platform after the exchange has already succeeded."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=WIDEST))
+        self.tool(exchange=exchange)()
+        self.assertEqual("semantic:inspect semantic:source",
+                         exchange.calls[0]["scope"])
+
+    def test_it_is_refused_without_the_source_scope(self) -> None:
+        """A grant good for every other semantic read must not reach this one:
+        the inventory is disclosed separately from the catalogue."""
+        self.as_caller(caller(scopes="mcp:connect inspect semantic:inspect"))
+        with self.assertRaises(ToolError) as raised:
+            self.tool()()
+        self.assertIn("semantic:source", str(raised.exception))
+
+    def test_it_never_returns_a_row_from_a_relation(self) -> None:
+        """It names relations and reads nothing from them; layers_values stays
+        the only tool that returns values, and only over configured layers."""
+        self.as_caller(caller(scopes=WIDEST))
+        detail = self.tool()()
+        self.assertEqual({"relations"}, set(detail))
+        self.assertEqual({"alias", "schema", "relation", "kind", "assetId"},
+                         set(detail["relations"][0]))
 
 
 class InstanceStateToolTests(ToolTestCase):
