@@ -112,6 +112,20 @@ PROPOSALS_LIST = {
     "scopes": ("inspect",),
 }
 
+PROPOSALS_CHECK = {
+    "operation_id": "proposals.check",
+    "method": "POST",
+    "path_template": "/api/proposals/check",
+    "scopes": ("propose",),
+}
+
+SEMANTIC_PROPOSALS_CHECK = {
+    "operation_id": "semantic.proposals.check",
+    "method": "POST",
+    "path_template": "/api/semantic/proposals/check",
+    "scopes": ("semantic:propose",),
+}
+
 PROPOSALS_SHOW = {
     "operation_id": "proposals.show",
     "method": "GET",
@@ -529,6 +543,31 @@ def _history_entry(entry):
         "proposalId": entry.get("proposalId"),
         "catalogRevision": entry.get("catalogRevision"),
         "actor": entry.get("actor"),
+    }
+
+
+def _semantic_change_summary(entry):
+    """One semantic diff entry, which is not shaped like a workspace one.
+
+    The workspace diff says `old` and `value`; the semantic diff says `before`
+    and `after`, each an object carrying `exists` and, when it does, `value`.
+    The difference is meaningful -- absent and present-but-null are distinct
+    states for a curated field -- so it is preserved rather than flattened into
+    the workspace shape.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+
+    def side(value):
+        value = value if isinstance(value, dict) else {}
+        if not value.get("exists"):
+            return {"exists": False}
+        return {"exists": True, "value": _change_preview(value.get("value"))}
+
+    return {
+        "op": entry.get("op"),
+        "path": entry.get("path"),
+        "was": side(entry.get("before")),
+        "becomes": side(entry.get("after")),
     }
 
 
@@ -1024,6 +1063,111 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         if status is not None:
             entries = [entry for entry in entries if entry["status"] == status]
         return {"proposals": entries}
+
+    @tool(
+        operation=PROPOSALS_CHECK,
+        name="proposals_check",
+        description=(
+            "Validate workspace changes without proposing them: whether they"
+            " are valid, what they would change, and any warnings. Returns a"
+            " checkFingerprint. Takes `operations` and the `revision` they"
+            " apply to, which layers_list reports. Writes nothing."
+        ),
+    )
+    def proposals_check(
+        operations: list[dict],
+        revision: str,
+        explanation: str | None = None,
+    ) -> dict:
+        """The first thing on this surface that costs a write scope to read.
+
+        It changes nothing: the platform applies the operations to a candidate
+        in memory, validates it, and reports what would happen. That makes it
+        the right way to find out whether a change is well-formed before
+        proposing it, and the wrong thing to charge `inspect` for -- knowing
+        what the platform would accept is authoring, and authoring is what
+        `propose` names.
+
+        `revision` is required rather than resolved here. The platform refuses
+        a check against a revision that is no longer current, which is the
+        point: an agent that fetched the workspace, thought about it, and
+        proposes against what it read is told so, instead of silently checking
+        against something it never saw.
+
+        The diff is summarised the way `proposals_show` summarises a stored
+        one, for the same reason and against the same measurements.
+        """
+        body = {"revision": revision, "operations": operations}
+        if explanation is not None:
+            body["explanation"] = explanation
+        payload = spend(
+            PROPOSALS_CHECK, path=PROPOSALS_CHECK["path_template"], body=body
+        )
+        check = payload.get("check")
+        check = check if isinstance(check, dict) else {}
+        diff = check.get("diff")
+        warnings = check.get("warnings")
+        return {
+            "valid": check.get("valid"),
+            # What `proposals_create` will require, and the only reason to keep
+            # a fingerprint here at all.
+            "checkFingerprint": check.get("checkFingerprint"),
+            "originalRevision": check.get("originalRevision"),
+            "warnings": warnings if isinstance(warnings, list) else [],
+            "changes": [
+                _change_summary(entry)
+                for entry in (diff if isinstance(diff, list) else [])
+            ],
+        }
+
+    @tool(
+        operation=SEMANTIC_PROPOSALS_CHECK,
+        name="semantic_proposals_check",
+        description=(
+            "Validate changes to one catalogued asset's curated meaning"
+            " without proposing them. Takes an assetId, the baseVersion it"
+            " applies to, and `operations`. Returns a fingerprint. Writes"
+            " nothing."
+        ),
+    )
+    def semantic_proposals_check(
+        asset_id: str,
+        base_version: int,
+        operations: list[dict],
+        explanation: str | None = None,
+    ) -> dict:
+        """The semantic counterpart, and not quite the same shape.
+
+        `baseVersion` plays the part `revision` plays for the workspace: it
+        names what the operations were written against, so a change composed
+        from a stale reading is refused rather than applied to something else.
+        `semantic_catalog_history` reports it.
+        """
+        body = {
+            "assetId": asset_id,
+            "baseVersion": base_version,
+            "operations": operations,
+        }
+        if explanation is not None:
+            body["explanation"] = explanation
+        payload = spend(
+            SEMANTIC_PROPOSALS_CHECK,
+            path=SEMANTIC_PROPOSALS_CHECK["path_template"],
+            body=body,
+        )
+        check = payload.get("check")
+        check = check if isinstance(check, dict) else {}
+        diff = check.get("diff")
+        return {
+            "assetId": check.get("assetId"),
+            "baseVersion": check.get("baseVersion"),
+            "catalogRevision": payload.get("catalogRevision"),
+            "fingerprint": check.get("fingerprint"),
+            "changes": [
+                _semantic_change_summary(entry)
+                for entry in (diff if isinstance(diff, list) else [])
+            ],
+        }
 
     @tool(
         operation=PROPOSALS_SHOW,

@@ -2105,6 +2105,156 @@ class ToolVisibilityTests(ToolTestCase):
         self.assertEqual({"describe_instance"}, undeclared)
 
 
+# Both cut from live probes of the deployed stack. The two diffs are shaped
+# differently on purpose: the workspace reports `old`/`value`, the semantic
+# catalogue reports `before`/`after` objects carrying `exists`, because absent
+# and present-but-null are distinct states for a curated field.
+CHECK = {"check": {
+    "valid": True,
+    "proposalCreated": False,
+    "originalRevision": "16c8b6dd",
+    "originalHash": "e8eefb22",
+    "candidateHash": "9cade65c",
+    "pluginCatalogueFingerprint": "f77fbba3",
+    "checkFingerprint": "e67d258af19860e4",
+    "operations": [{"op": "set", "path": "/locale/layers/Bus_Stops/name",
+                    "value": "Bus Stops (renamed)"}],
+    "diff": [{"op": "replace", "path": "/locale/layers/Bus_Stops/name",
+              "old": "Bus Stops", "value": "Bus Stops (renamed)"}],
+    "explanation": "probe",
+    "warnings": [],
+}, "meta": {"requestId": "r13"}}
+
+SEMANTIC_CHECK = {"catalogRevision": 53, "check": {
+    "assetId": "440c4b84-4c84-4452-acff-7f4cbb9ca1bd",
+    "baseVersion": 1,
+    "fingerprint": "caf9c8a50647cf4f",
+    "operations": [{"op": "set", "path": "/curated/description",
+                    "value": "probe"}],
+    "diff": [{"op": "set", "path": "/curated/description",
+              "before": {"exists": False},
+              "after": {"exists": True, "value": "probe"}}],
+    "explanation": "probe",
+}, "meta": {"requestId": "r14"}}
+
+AUTHORING = WIDE + " propose semantic:propose"
+
+
+class ProposalCheckTests(ToolTestCase):
+    """Validating a change without proposing it.
+
+    The first tool on this surface that costs a write scope to read. It changes
+    nothing -- the platform applies the operations to a candidate in memory and
+    reports what would happen -- but knowing what the platform would accept is
+    authoring, and `inspect` is the wrong price for that.
+    """
+
+    def tool(self, name="proposals_check", payload=CHECK, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_it_reports_validity_and_the_fingerprint_create_will_need(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool()(
+            operations=[{"op": "set", "path": "/x", "value": 1}],
+            revision="16c8b6dd")
+        self.assertIs(True, detail["valid"])
+        self.assertEqual("e67d258af19860e4", detail["checkFingerprint"])
+
+    def test_the_diff_is_summarised_not_echoed(self) -> None:
+        """Same treatment as a stored proposal, against the same measurements:
+        a real change set carries whole layer definitions."""
+        self.as_caller(caller(scopes=AUTHORING))
+        change = self.tool()(operations=[], revision="r")["changes"][0]
+        self.assertEqual("replace", change["op"])
+        self.assertEqual("Bus Stops", change["was"])
+        self.assertEqual("Bus Stops (renamed)", change["becomes"])
+
+    def test_the_operations_the_caller_sent_are_not_returned(self) -> None:
+        """The platform echoes them; repeating them to the agent that wrote
+        them spends a conversation on what it already knows."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool()(operations=[], revision="r")
+        self.assertNotIn("operations", detail)
+        self.assertNotIn("explanation", detail)
+
+    def test_the_integrity_material_is_dropped(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool()(operations=[], revision="r")
+        for dropped in ("originalHash", "candidateHash",
+                        "pluginCatalogueFingerprint"):
+            self.assertNotIn(dropped, detail)
+
+    def test_the_revision_and_operations_reach_the_platform_as_a_post(self) -> None:
+        api = FakeConfigApi(answer=CHECK)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.build_named("proposals_check", config_api=api)(
+            operations=[{"op": "set", "path": "/x", "value": 1}],
+            revision="rev-9")
+        sent = api.calls[0]
+        self.assertEqual("POST", sent["method"])
+        self.assertEqual("rev-9", sent["body"]["revision"])
+        self.assertEqual([{"op": "set", "path": "/x", "value": 1}],
+                         sent["body"]["operations"])
+
+    def test_an_absent_explanation_is_omitted_rather_than_null(self) -> None:
+        api = FakeConfigApi(answer=CHECK)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.build_named("proposals_check", config_api=api)(
+            operations=[], revision="r")
+        self.assertNotIn("explanation", api.calls[0]["body"])
+
+    def test_it_costs_propose_and_is_refused_without_it(self) -> None:
+        """A grant that can read an instance cannot check a change against it.
+        Reading and authoring are separate things to hand someone."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=AUTHORING))
+        self.tool(exchange=exchange)(operations=[], revision="r")
+        self.assertEqual("propose", exchange.calls[0]["scope"])
+
+        self.as_caller(caller(scopes=WIDE))
+        with self.assertRaises(ToolError) as raised:
+            self.tool()(operations=[], revision="r")
+        self.assertIn("propose", str(raised.exception))
+
+    def test_the_semantic_diff_keeps_its_own_shape(self) -> None:
+        """`before`/`after` with `exists`, not `old`/`value`. Absent and
+        present-but-null are different states for a curated field, and
+        flattening them into the workspace shape would lose that."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("semantic_proposals_check", SEMANTIC_CHECK)(
+            asset_id="a-1", base_version=1, operations=[])
+        change = detail["changes"][0]
+        self.assertEqual({"exists": False}, change["was"])
+        self.assertEqual({"exists": True, "value": "probe"}, change["becomes"])
+        self.assertEqual("caf9c8a50647cf4f", detail["fingerprint"])
+
+    def test_the_semantic_check_sends_the_base_version(self) -> None:
+        """It plays the part `revision` plays for the workspace: a change
+        composed from a stale reading is refused rather than applied."""
+        api = FakeConfigApi(answer=SEMANTIC_CHECK)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.build_named("semantic_proposals_check", config_api=api)(
+            asset_id="a-1", base_version=7, operations=[])
+        self.assertEqual({"assetId": "a-1", "baseVersion": 7, "operations": []},
+                         api.calls[0]["body"])
+
+    def test_the_semantic_check_costs_the_semantic_propose_scope(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=AUTHORING))
+        self.tool("semantic_proposals_check", SEMANTIC_CHECK,
+                  exchange=exchange)(asset_id="a", base_version=1, operations=[])
+        self.assertEqual("semantic:propose", exchange.calls[0]["scope"])
+
+    def test_unexpected_shapes_degrade_rather_than_raising(self) -> None:
+        for payload in ({}, {"check": None}, {"check": {"diff": "x"}}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller(scopes=AUTHORING))
+                detail = self.tool(payload=payload)(operations=[], revision="r")
+                self.assertEqual([], detail["changes"])
+
+
 class MetaEnvelopeTests(unittest.TestCase):
     """No read tool returns the request-correlation envelope.
 

@@ -570,9 +570,15 @@ class AllowlistDriftTests(unittest.TestCase):
     NEVER_OFFERED_TO_AGENTS = frozenset({
         "full", "admin", "federation:provision", "federation:register",
         "semantic:apply", "semantic:admin", "semantic:generate",
-        "semantic:data", "apply", "propose", "visual",
+        "semantic:data", "apply", "visual",
         "reload", "derive:manage",
     })
+    # `propose` and `semantic:propose` were here until Phase 1 wave 2. They
+    # authorise adding to a review queue, which writes a proposal record and
+    # touches no workspace -- a person still decides whether anything happens.
+    # They are offered as their own preset rather than folded into `analysis`,
+    # so reading an instance and being able to propose to it stay separate
+    # things to hand someone.
     # `semantic:source` was here and was deliberately removed. It reads the
     # database's relation inventory -- tables and views including ones no layer
     # uses -- which is disclosure rather than authority: it writes nothing,

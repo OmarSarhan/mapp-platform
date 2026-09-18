@@ -291,6 +291,24 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:observe", ),
         mutating=False,
     ),
+    "proposals.check": Operation(
+        operation_id="proposals.check",
+        method="POST",
+        path_template="/api/proposals/check",
+        required_scopes=("propose",),
+        # A read that costs a write scope. It validates operations against a
+        # revision and returns warnings and a fingerprint; it writes nothing,
+        # so the credential is not single-use -- replaying it re-validates the
+        # same operations and changes nothing.
+        mutating=False,
+    ),
+    "semantic.proposals.check": Operation(
+        operation_id="semantic.proposals.check",
+        method="POST",
+        path_template="/api/semantic/proposals/check",
+        required_scopes=("semantic:propose",),
+        mutating=False,
+    ),
     "proposals.show": Operation(
         operation_id="proposals.show",
         method="GET",

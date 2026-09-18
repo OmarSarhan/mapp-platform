@@ -270,15 +270,18 @@ class LegacySessionTests(unittest.TestCase):
 
     def test_tools_this_grant_cannot_call_are_withheld(self) -> None:
         """The half that matters, stated rather than implied by an equality:
-        this grant carries neither federation:observe nor semantic:source, and
-        the tools needing them are absent."""
+        this grant carries neither federation:observe, semantic:source nor
+        either propose scope, and the tools needing them are absent."""
         transcript, _, _ = self.drive()
         listed = {t["name"] for t in
                   rpc_result(transcript["tools/list"][2])["result"]["tools"]}
         withheld = set(registered_tool_names()) - listed
         self.assertEqual(
             {"federation_list", "federation_show", "federation_groups",
-             "semantic_source_relations"},
+             "semantic_source_relations",
+             # Reads that cost a propose scope. This grant is the analysis
+             # preset, which reads an instance but cannot author against it.
+             "proposals_check", "semantic_proposals_check"},
             withheld,
         )
 
