@@ -649,6 +649,41 @@ CATALOGUE = {
 }
 
 
+# Cut from a live semantic_catalog_show against the deployed stack: `curated`
+# keys its fields by field id while `generated` lists them by name, which is
+# the join the tool now performs. An earlier fixture here keyed curated fields
+# by name -- an invented shape, in a test whose own docstring warns about them.
+ASSET = {
+    "catalogRevision": 53,
+    "asset": {
+        "id": "asset-1",
+        "createdAt": "2026-09-14T14:27:42.604Z",
+        "curated": {
+            "displayName": "Census OA Population",
+            "description": "Resident counts per output area.",
+            "tags": ["census"],
+            "caveats": ["Drafted from a sample of 14 rows."],
+            "fields": {
+                "field:aaa": {"description": "Quintile of resident count."},
+            },
+        },
+        "generated": {
+            "name": "census_oa",
+            "kind": "view",
+            "qualifiedName": "public.census_oa",
+            "binding": {"adapter": "postgresql", "schema": "public"},
+            "fields": [
+                {"id": "field:bbb", "name": "oa21cd", "type": "text",
+                 "nullable": False, "primaryKey": True, "unique": True},
+                {"id": "field:aaa", "name": "population_quintile",
+                 "type": "integer", "nullable": True, "primaryKey": False,
+                 "unique": False},
+            ],
+        },
+    },
+}
+
+
 class SemanticCatalogTests(ToolTestCase):
     """Meaning, as distinct from shape.
 
@@ -700,24 +735,51 @@ class SemanticCatalogTests(ToolTestCase):
         returned something else. A fixture is a claim about the far side, and an
         invented one is a claim nobody checked.
         """
-        detail = {
-            "catalogRevision": 53,
-            "asset": {"id": "asset-1", "curated": {
-                "displayName": "Census OA Population",
-                "fields": {"population_quintile": "Quintile of resident count."},
-                "caveats": ["Drafted from a sample of 14 rows."],
-            }},
-        }
         self.as_caller(caller())
-        result = self.tool("semantic_catalog_show", payload=detail)(asset_id="asset-1")
-        curated = result["asset"]["curated"]
-        self.assertEqual(
-            {"population_quintile": "Quintile of resident count."}, curated["fields"]
-        )
-        self.assertEqual(["Drafted from a sample of 14 rows."], curated["caveats"])
+        result = self.tool("semantic_catalog_show", payload=ASSET)(asset_id="asset-1")
+        # What identifies the asset survives whole; it is small.
+        self.assertEqual("Census OA Population", result["displayName"])
+        self.assertEqual(["Drafted from a sample of 14 rows."], result["caveats"])
+        self.assertEqual("public.census_oa", result["relation"])
         # The revision travels with it: an agent quoting meaning should be able
         # to say which revision of the catalogue it read.
         self.assertEqual(53, result["catalogRevision"])
+        # The fields are named, not described. On this instance the census
+        # asset answers 110,987 bytes of field records; a real agent asked for
+        # it, could not read the reply, and spawned a subagent to chunk it.
+        self.assertEqual(["oa21cd", "population_quintile"], result["fields"])
+        self.assertEqual(2, result["fieldCount"])
+        self.assertEqual(1, result["curatedFieldCount"])
+        self.assertNotIn("Quintile of resident count.", json.dumps(result))
+
+    def test_one_field_joins_its_column_to_its_meaning(self) -> None:
+        """The per-field meaning this tool exists for, still reachable -- and
+        the join done here rather than by the caller. The generated records are
+        a list keyed by name and the curated ones a map keyed by field id, so
+        pairing a column with its meaning means matching one against the
+        other."""
+        self.as_caller(caller())
+        detail = self.tool("semantic_catalog_show", payload=ASSET)(
+            asset_id="asset-1", field="population_quintile")
+        self.assertEqual("integer", detail["column"]["type"])
+        self.assertEqual("Quintile of resident count.",
+                         detail["meaning"]["description"])
+
+    def test_a_field_with_no_curated_meaning_says_so(self) -> None:
+        """470 generated fields against 50 curated ones on this instance, so
+        most columns have no meaning recorded and that has to be visible."""
+        self.as_caller(caller())
+        detail = self.tool("semantic_catalog_show", payload=ASSET)(
+            asset_id="asset-1", field="oa21cd")
+        self.assertEqual("text", detail["column"]["type"])
+        self.assertIsNone(detail["meaning"])
+
+    def test_an_unknown_field_is_refused_by_name(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool("semantic_catalog_show", payload=ASSET)(
+                asset_id="asset-1", field="nope")
+        self.assertIn("nope", str(raised.exception))
 
     def test_the_asset_id_is_encoded_into_the_path(self) -> None:
         exchange = FakeExchange()
@@ -1836,6 +1898,66 @@ class RefusalDetailTests(ToolTestCase):
                 [{"path": f"f{n}", "message": f"m{n}"} for n in range(12)]
             )(layer="Stops", expression="1")
         self.assertEqual(5, str(raised.exception).count("\nf"))
+
+
+class LayersGetBatchTests(ToolTestCase):
+    """One call already reads every layer, so reading six should not be six.
+
+    An agent asked to describe this workspace called layers_get once per layer:
+    six identical fetches of the same response, five of them discarded down to
+    a single entry each.
+    """
+
+    @staticmethod
+    def payload():
+        return {"revision": "rev-1", "locale": "locale", "layers": {
+            "A": {"table": "public.a"},
+            "B": {"table": "public.b"},
+            "C": {"table": "public.c"},
+        }}
+
+    def tool(self, exchange=None):
+        return self.build_named(
+            "layers_get", exchange=exchange,
+            config_api=FakeConfigApi(answer=self.payload()),
+        )
+
+    def test_one_key_is_unchanged(self) -> None:
+        """The common case keeps its shape: a key and a layer, not a list."""
+        self.as_caller(caller())
+        detail = self.tool()(layer_key="B")
+        self.assertEqual("B", detail["key"])
+        self.assertEqual({"table": "public.b"}, detail["layer"])
+        self.assertNotIn("layers", detail)
+
+    def test_several_keys_come_back_in_one_call(self) -> None:
+        api = FakeConfigApi(answer=self.payload())
+        self.as_caller(caller())
+        detail = self.build_named("layers_get", config_api=api)(
+            layer_key="A,C")
+        self.assertEqual(["A", "C"], [e["key"] for e in detail["layers"]])
+        self.assertEqual(1, len(api.calls), "one platform read, not one per key")
+
+    def test_the_order_asked_for_is_the_order_returned(self) -> None:
+        """So a caller reads the reply against its own request rather than
+        re-matching by key."""
+        self.as_caller(caller())
+        detail = self.tool()(layer_key="C,A,B")
+        self.assertEqual(["C", "A", "B"], [e["key"] for e in detail["layers"]])
+
+    def test_whitespace_around_keys_is_tolerated(self) -> None:
+        self.as_caller(caller())
+        detail = self.tool()(layer_key=" A , C ")
+        self.assertEqual(["A", "C"], [e["key"] for e in detail["layers"]])
+
+    def test_an_unknown_key_in_a_batch_is_refused_by_name(self) -> None:
+        """Returning the two that matched would read as "this workspace has
+        two of the three", which is a different and wrong answer."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool()(layer_key="A,nope")
+        self.assertIn("'nope'", str(raised.exception))
+        self.assertIn("A, B, C", str(raised.exception))
 
 
 class ToolVisibilityTests(ToolTestCase):

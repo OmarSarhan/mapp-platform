@@ -778,20 +778,44 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         operation=LAYERS_LIST,
         name="layers_get",
         description=(
-            "One configured layer in full: its data source, fields, styling and"
-            " filters. Takes a layer_key from layers_list."
+            "Configured layers in full: data source, fields, styling and"
+            " filters. Takes one layer_key from layers_list, or several"
+            " separated by commas to get them in a single call."
         ),
     )
     def layers_get(layer_key: str, locale: str | None = None) -> dict:
-        """The same read as `layers_list`, returning one layer rather than an index.
+        """The same read as `layers_list`, returning layers rather than an index.
 
         There is no per-layer endpoint -- the configuration API serves the whole
         set and the CLI filters client-side, so this does the same. Filtering
         here rather than making the agent do it keeps the response bounded,
         which matters more for a model than for a terminal.
+
+        Several keys are accepted because one call already fetches every layer
+        and discards all but one. An agent asked to describe this workspace
+        called it six times, which was six identical reads of the same
+        response; the comma form makes that one. Kept as a single string rather
+        than a list parameter so the common case stays `layer_key="Bus_Stops"`.
         """
         query = layers_query(locale=locale)
         payload = spend(LAYERS_LIST, path=LAYERS_LIST["path_template"], query=query)
+        wanted = [part.strip() for part in layer_key.split(",") if part.strip()]
+        found = {key: layer for key, layer in _layers_of(payload) if key in wanted}
+        if len(wanted) > 1:
+            missing = [key for key in wanted if key not in found]
+            if missing:
+                known = [key for key, _ in _layers_of(payload)]
+                raise ToolError(
+                    f"No layer {missing[0]!r} in this workspace."
+                    f" This workspace has: {', '.join(known)}."
+                )
+            return {
+                "revision": payload.get("revision"),
+                "locale": payload.get("locale"),
+                # Ordered as asked, so a caller can read the reply against its
+                # own request rather than re-matching by key.
+                "layers": [{"key": key, "layer": found[key]} for key in wanted],
+            }
         for key, layer in _layers_of(payload):
             if key == layer_key:
                 return {
@@ -1695,12 +1719,14 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         operation=SEMANTIC_CATALOG_SHOW,
         name="semantic_catalog_show",
         description=(
-            "One semantic asset in full: its description, per-field meaning,"
-            " caveats and tags. Takes an assetId from semantic_catalog_search"
-            " or semantic_catalog_list."
+            "One semantic asset: what it is, what it was derived from, its"
+            " caveats and tags, and the names of its fields. Pass `field` with"
+            " a field name to get that field's type and its curated meaning"
+            " together. Takes an assetId from semantic_catalog_search or"
+            " semantic_catalog_list."
         ),
     )
-    def semantic_catalog_show(asset_id: str) -> dict:
+    def semantic_catalog_show(asset_id: str, field: str | None = None) -> dict:
         """Where the per-field meaning is, which is the point of the wave.
 
         `catalog_list` says a relation has a column called `population_quintile`
@@ -1708,11 +1734,77 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         derived from, and what the curator warned about it -- and those caveats
         are the difference between an agent reporting a number and an agent
         reporting a number that means something.
+
+        The fields are named rather than described, because the census asset on
+        this instance answers 110,987 bytes: 470 generated field records and 50
+        curated ones, against a few hundred bytes for everything else. A real
+        agent asked for it, could not read the reply, and spawned a subagent to
+        chunk it -- which is the failure this shape prevents. Names are what it
+        wanted anyway: it was looking for age columns, and found them by name.
+
+        `field` also does a join the caller would otherwise have to do itself.
+        The generated records are a list keyed by name and the curated ones are
+        a map keyed by field id, so pairing a column with its meaning means
+        matching one against the other; that is done here.
         """
         path = SEMANTIC_CATALOG_SHOW["path_template"].replace(
             "{assetId}", quote(asset_id, safe="")
         )
-        return _without_meta(spend(SEMANTIC_CATALOG_SHOW, path=path))
+        payload = _without_meta(spend(SEMANTIC_CATALOG_SHOW, path=path))
+        asset = payload.get("asset")
+        if not isinstance(asset, dict):
+            return payload
+        curated = asset.get("curated")
+        curated = curated if isinstance(curated, dict) else {}
+        generated = asset.get("generated")
+        generated = generated if isinstance(generated, dict) else {}
+        generated_fields = generated.get("fields")
+        generated_fields = [
+            entry for entry in
+            (generated_fields if isinstance(generated_fields, list) else [])
+            if isinstance(entry, dict)
+        ]
+        curated_fields = curated.get("fields")
+        curated_fields = curated_fields if isinstance(curated_fields, dict) else {}
+
+        if field is not None:
+            matched = next(
+                (entry for entry in generated_fields
+                 if entry.get("name") == field),
+                None,
+            )
+            if matched is None:
+                raise ToolError(
+                    f"This asset has no field named {field!r}. Its field names"
+                    " are listed when `field` is omitted."
+                )
+            return {
+                "assetId": asset.get("id"),
+                "field": field,
+                "column": matched,
+                # Keyed by field id rather than by name, which is why this join
+                # exists here instead of in the caller.
+                "meaning": curated_fields.get(matched.get("id")),
+            }
+
+        detail = {
+            "assetId": asset.get("id"),
+            "catalogRevision": payload.get("catalogRevision"),
+            "displayName": curated.get("displayName"),
+            "description": curated.get("description"),
+            "tags": curated.get("tags") or [],
+            "caveats": curated.get("caveats") or [],
+            "relation": generated.get("qualifiedName"),
+            "kind": generated.get("kind"),
+            "binding": generated.get("binding"),
+            "fieldCount": len(generated_fields),
+            "curatedFieldCount": len(curated_fields),
+            "fields": [
+                entry.get("name") for entry in generated_fields
+                if entry.get("name")
+            ],
+        }
+        return detail
 
     @tool(
         operation=LAYERS_STATISTICS,
