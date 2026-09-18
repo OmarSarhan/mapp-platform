@@ -5,9 +5,15 @@ Phase 0 shipped an authorization broker, a request-bound token exchange and a
 gives an agent the other half of the platform's own loop: propose, review,
 apply.
 
-This plans the order. It is written to be argued with before any of it is
-built, because two of the waves change what an existing scope means and one
-adds a record type the specification has been reserving space for since P10.
+This plans the order. Two of the waves change what an existing scope means,
+one lifts a pin that was set deliberately, and one adds a record type the
+specification has been reserving envelope members for since P10.
+
+The five decisions the plan turned on were settled on 2026-09-18 and are
+recorded in *Decisions taken* below. The largest — that the person driving the
+MCP session approves, in that session — was answered before wave 5 was
+designed, and the elicitation capabilities of all three shipped clients were
+measured rather than assumed before the mechanism was chosen.
 
 ## What already exists
 
@@ -65,9 +71,9 @@ accident away from being no protection at all.
 `layers_statistics`, `sql_test`, `operations_show`. Platform classifier,
 action table, broker allowlist, dashboard options.
 
-**Decide first:** whether `operations.cancel` belongs with the lifecycle or
-with reads. Cancelling someone else's job is a write, but an agent that can
-start work arguably should be able to stop it.
+**Decided:** `operations.cancel` goes with the lifecycle. Cancelling a job is
+a write — it stops work someone else may be waiting on — so it belongs with
+the scope that authorises starting one, not with the reads.
 
 **Verify:** the existing threat-model assertion that only
 `derived-layers.refresh` is reachable by an offered scope should become "no
@@ -103,9 +109,10 @@ safe half of the loop, and `proposals_show` has been readable since wave 5 of
 Phase 0, so a person can review what an agent proposed with the tools that
 already exist.
 
-**Decide first:** whether `propose` should be offered in a dashboard preset at
-all, or only ever ticked individually. My recommendation is a separate
-`authoring` preset, never folded into `analysis`.
+**Decided:** `propose` gets its own preset and is never folded into
+`analysis`. A grant that can read an instance and a grant that can add to its
+review queue are different things to hand someone, and a preset is what an
+operator actually clicks.
 
 **This is the first wave where an agent changes durable state.** It should end
 with a real client driving the full sequence — read the workspace, compose
@@ -121,10 +128,17 @@ attached, and these produce it without applying anything. They are also the
 first tools that create artifacts and run asynchronously, which is what makes
 `operations_show` — already built — load-bearing rather than decorative.
 
-**Watch for:** `visual` is in `NEVER_OFFERED_TO_AGENTS`. Like `semantic:source`
-before it, that pin has to be revisited deliberately or this wave cannot ship.
-The argument differs: a screenshot renders the workspace through a browser, so
-it has a wider blast radius than a catalogue read.
+**Decided:** `visual` comes off `NEVER_OFFERED_TO_AGENTS`. It is necessary —
+without it an agent can propose but cannot attach the evidence a person needs
+to decide, which makes the review step worse than not having the agent. The
+pin is lifted the way `semantic:source` was: reclassified deliberately, with
+the reasoning recorded where the pin used to be, and kept out of the read-only
+presets so granting it stays a choice.
+
+**Watch for:** a screenshot renders the workspace through a real browser, so
+this is the first scope that spends meaningful compute on an agent's say-so.
+The browser-runner already bounds that; the wave should confirm it rather than
+assume it.
 
 ## Wave 5 — approval intent and receipt
 
@@ -134,20 +148,59 @@ everything an agent can do is either reversible or reviewable by a person.
 **Build:** the `control` records the specification has been reserving —
 approval intent carrying the canonical execution digest and its bindings, and
 a single-use receipt bound to that one digest, consumed atomically with the
-effect. Plus the dashboard surface where an operator decides, and the audit
-events for both decisions.
+effect. Plus the approval page the URL path opens, the dashboard surface for
+clients that can elicit neither, and audit events for both decisions.
 
 **This is where the envelope's three null members stop being null.**
 `resolvedDefaults`, `confirmationFields` and `revisionBinding` were made
 required arguments so that wiring them would be a visible edit at every call
 site; this is that edit.
 
-**Decide first, and it is the largest open question in Phase 1:** where the
-operator decides. The dashboard is the only authenticated operator surface
-that exists, and P8 requires a recently authenticated, CSRF-protected browser
-session for standing windows — which implies per-action approval lives there
-too. That makes an agent's mutation synchronous on a human at a browser, which
-is correct and also the thing people will want to route around.
+**Decided: the person driving the MCP session approves, in their own session,
+if their grant carries the right and they are satisfied with the evidence.**
+Not an operator at a separate dashboard. Routing an agent's mutation through a
+different surface makes the loop unusable in a chat, which is the context this
+whole component exists for.
+
+The mechanism is MCP elicitation, and the capability is declared at
+`initialize`, so the server knows per session which path it can take. Measured
+against the three shipped clients on 2026-09-18:
+
+| Client | Advertises | Approval path available |
+| --- | --- | --- |
+| Codex CLI 0.155.0 | `elicitation: {form, url}` | URL — send the person to the approval page |
+| Claude Code 2.1.276 | `elicitation: {}` | Form — the client prompts; evidence must be in the tool reply |
+| Gemini CLI 0.58.0 | none | Dashboard fallback |
+
+So three paths, chosen by what the client can do rather than by preference:
+
+1. **URL elicitation** where offered. The tool call pauses, the person opens an
+   authenticated approval page showing the diff and the rendered evidence, and
+   decides there. This is the best version: the decision is made in a browser
+   session the agent does not control, looking at the actual visual.
+2. **Form elicitation** otherwise. The tool returns the summary and a link to
+   the evidence, and the client prompts the person to confirm. The prompt is
+   rendered by the client, not composed by the model.
+3. **Dashboard** for clients advertising neither, which today is Gemini.
+
+**The property that has to hold in all three:** the agent must not be able to
+approve its own request. Form and URL elicitation both satisfy this because the
+*client* renders the prompt and the *person* answers it — the model cannot
+fabricate an `ElicitResult` any more than it can fabricate a tool result it
+did not receive. A confirmation value merely returned to the agent and echoed
+back would not satisfy it, and is the obvious wrong design here.
+
+**Therefore the receipt is bound to the elicitation outcome, not to a value the
+agent holds.** The intent carries the canonical execution digest; the approval
+resolves against that intent; the receipt is minted by the platform and spent
+by the platform. Nothing approval-shaped is ever a tool argument.
+
+**Watch for:** a person approving in their own session is the same person who
+asked for the change, so this is a confirmation control rather than a
+segregation-of-duties control. It defends against an agent doing something the
+person did not intend; it does not defend against a person doing something they
+should not. That is the right trade for this system and should be stated in the
+threat model rather than left to be inferred.
 
 ## Wave 6 — apply
 
@@ -170,8 +223,25 @@ review queue and no diff to read beforehand. Everything above leaves a record
 a person can inspect before it takes effect; these do not, so they should
 arrive only once approval is real.
 
-**Watch for:** `drop` is the first genuinely destructive tool on the surface.
-It deserves its own decision about whether an agent should have it at all.
+**Decided:** an agent may drop, with guards. `drop` is the first genuinely
+destructive tool on the surface and the guards are the substance of the wave,
+not a caveat on it:
+
+- **Name the relation exactly.** No pattern, no "the one I just made", no
+  implicit target from conversation state.
+- **Refuse if anything depends on it.** `dependencies_list` already answers
+  which configured layers read a relation, and a drop that would break one is
+  refused by name rather than approved and regretted. An agent that wants it
+  gone anyway has to remove the dependents first, which is a separate approval
+  each.
+- **Show what breaks in the approval.** The intent carries the dependent list,
+  so the person approving sees the consequence and not just the verb.
+- **A receipt per drop.** Single-use, bound to that one relation; the
+  credential is already single-use for mutating operations, so this is the
+  approval matching the credential rather than new machinery.
+
+The asymmetry is deliberate: creating is cheap to undo and dropping is not, so
+they sit behind the same scope but not behind the same amount of ceremony.
 
 ## Wave 8 — standing approval windows (P8)
 
@@ -190,16 +260,23 @@ operational experience of how often per-action approval actually bites.
 
 ---
 
-## Open decisions
+## Decisions taken
 
-These change the shape of the work, not just its order.
+All five were settled by the owner on 2026-09-18, and are recorded in the waves
+above rather than only here.
 
-1. **Does `operations.cancel` belong with reads or with the lifecycle?** (Wave 1)
-2. **Should `propose` ever appear in a preset?** (Wave 3)
-3. **Does `visual` come off the never-offered list?** (Wave 4) — without this,
-   agents can propose but cannot attach evidence.
-4. **Where does an operator approve?** (Wave 5) — the largest one.
-5. **Should an agent be able to `drop` a derived layer at all?** (Wave 7)
+1. **`operations.cancel` is a write**, and moves with the lifecycle scope.
+2. **`propose` gets its own preset**, never folded into `analysis`.
+3. **`visual` comes off the never-offered list.** It is necessary: without it an
+   agent can propose but cannot attach evidence.
+4. **The person driving the MCP session approves**, in that session, if their
+   grant carries the right and they are satisfied with the evidence — not an
+   operator at a separate dashboard. This is the decision the rest of wave 5
+   hangs from, and the reason elicitation capability was measured before the
+   design was written rather than after.
+5. **An agent may drop a derived layer**, guarded by exact naming, a
+   dependency check that refuses rather than warns, the dependent list carried
+   into the approval, and a single-use receipt.
 
 ## Not in Phase 1
 
