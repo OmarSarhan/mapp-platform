@@ -1217,6 +1217,100 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "xyz.status": {
+        "method": "GET",
+        "path": "/api/xyz/status",
+        # Whether the tile service picked up the current workspace.
+        # Reading it alters nothing; `xyz.reload` is what costs `reload`.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "operations.show": {
+        "method": "GET",
+        "pathTemplate": "/api/operations/{operationId}",
+        # One asynchronous operation: its kind, status and result.
+        #
+        # `derive` rather than `inspect`, which is not tidiness. The route
+        # itself admits any authenticated credential, and then demands the
+        # scope that the operation's *kind* would have cost to perform --
+        # `visual` for a visual test, `apply` for a proposal apply, `derive`
+        # for derived-layer work. An exchanged credential carries only the one
+        # scope declared here, so declaring `inspect` would make this
+        # unusable for every kind. `derive` is the honest choice: it is
+        # exactly the set of operations an agent could have caused, and the
+        # rest still refuse.
+        "risk": "inspect",
+        "scope": "derive",
+    },
+    "derived-layers.capabilities": {
+        "method": "GET",
+        "path": "/api/derived-layers/capabilities",
+        # What derived-layer work this deployment supports, which is
+        # not uniform across instances.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "sql.capabilities": {
+        "method": "GET",
+        "path": "/api/sql/capabilities",
+        # Which SQL functions an expression may use. Discovery of a
+        # constraint, not permission to run anything.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "capabilities.list": {
+        "method": "GET",
+        "path": "/api/capabilities",
+        # The contract document: every action, its shape and its
+        # cost. Contract discovery, so the platform admits any
+        # authenticated credential; narrowed to `inspect` here.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "schema": {
+        "method": "GET",
+        "path": "/api/schema",
+        # The workspace JSON schema. Needed to author a change
+        # rather than to read one.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "rules": {
+        "method": "GET",
+        "path": "/api/rules",
+        # The authoring rules a candidate workspace must satisfy.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "examples": {
+        "method": "GET",
+        "path": "/api/examples",
+        # Worked examples of valid operations.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "plugins.list": {
+        "method": "GET",
+        "path": "/api/plugins",
+        # Which plugins this instance has configured.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "dependencies.list": {
+        "method": "GET",
+        "path": "/api/dependencies",
+        # Which layers depend on which relations, so a change can be
+        # weighed before it is proposed.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "icons.list": {
+        "method": "GET",
+        "path": "/api/icons",
+        # The icons a layer's styling may reference.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "proposals.show": {
         "method": "GET",
         "pathTemplate": "/api/proposals/{proposalId}",

@@ -1535,6 +1535,162 @@ class InstanceStateToolTests(ToolTestCase):
         self.assertEqual({}, _without_meta(None))
 
 
+# Cut from live responses through config.localhost, as everything else here is.
+XYZ = {"requestedGeneration": 65, "appliedGeneration": 64,
+       "workspaceFingerprint": "4a93161e", "startedAt": "2026-09-17T21:28:13.045Z",
+       "healthy": True, "meta": {"requestId": "r8"}}
+OPERATION = {"operation": {
+    "id": "1182d109999bdf48d63e1141f2aa6af6",
+    "kind": "derived-layer.create", "status": "cancelled", "stage": None,
+    "actor": "[withheld]",
+    "target": {"name": "bus_stop_buffer_population", "action": "create"},
+    "created": "2026-09-01T21:47:59.199341Z",
+    "updated": "2026-09-01T21:52:02.000000Z",
+    # A failed visual test carries 15,381 bytes here and 6,174 in diagnosis,
+    # against 34 bytes of message saying what actually went wrong.
+    "result": {"source": "live", "error": "Browser validation did not pass.",
+               "visual": {"runId": "2026-08-08", "frames": [1, 2, 3]},
+               "plan": {"layer": "X", "layerTitle": "Y"}},
+    "error": {"code": "visual.failed",
+              "message": "Browser validation did not pass.",
+              "diagnosis": {"outcome": "failed", "checks": [{"id": "visual.http"}]}},
+}, "meta": {"requestId": "r9"}}
+CAPABILITIES = {
+    "apiVersion": "1", "contractVersion": "1", "instanceId": "abc",
+    "actions": [
+        {"id": "catalog.list", "method": "GET", "pathTemplate": "/api/catalog",
+         "risk": "inspect", "scope": "inspect"},
+        {"id": "derived-layers.create", "method": "POST",
+         "path": "/api/derived-layers", "risk": "derive", "scope": "derive",
+         # The bulk: the largest real entry is 2,829 bytes, almost all schema.
+         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}}},
+    ],
+    "meta": {"requestId": "r10"},
+}
+SCHEMA_DOC = {"schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "workspace.schema.json", "title": "GEOLYTIX XYZ workspace",
+    "type": "object", "additionalProperties": False,
+    "properties": {"locale": {"type": "object"}},
+    # 30 definitions at 34,600 bytes against 838 for properties.
+    "$defs": {"layer": {"type": "object"}, "color": {"type": "string"}},
+}, "meta": {"requestId": "r11"}}
+
+
+class ContractAndProgressToolTests(ToolTestCase):
+    """The contract an agent authors against, and the progress of work it
+    cannot otherwise follow."""
+
+    def tool(self, name, payload, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_xyz_status_exposes_the_generation_gap(self) -> None:
+        """A workspace change is not live until the tile service reloads, and
+        until then a stale map looks exactly like a failed change."""
+        self.as_caller(caller())
+        detail = self.tool("xyz_status", XYZ)()
+        self.assertEqual(65, detail["requestedGeneration"])
+        self.assertEqual(64, detail["appliedGeneration"])
+
+    def test_an_operations_bulk_is_reduced_to_its_shape(self) -> None:
+        """Kept as shape rather than dropped, so the reduction is visible: an
+        agent can see a `visual` block exists and how many keys it has."""
+        self.as_caller(caller())
+        detail = self.tool("operations_show", OPERATION)(operation_id="op-1")
+        self.assertEqual("derived-layer.create", detail["kind"])
+        # Scalars survive; containers become their shape.
+        self.assertEqual("Browser validation did not pass.",
+                         detail["result"]["error"])
+        self.assertEqual("object", detail["result"]["visual"]["type"])
+        self.assertIn("frames", detail["result"]["visual"]["keys"])
+        self.assertEqual(["frames", "runId"], detail["result"]["visual"]["keys"])
+        self.assertNotIn("2026-08-08", json.dumps(detail))
+        self.assertEqual("visual.failed", detail["error"]["code"])
+        self.assertEqual("object", detail["error"]["diagnosis"]["type"])
+
+    def test_an_operation_costs_derive_not_inspect(self) -> None:
+        """The route admits any credential and then demands the scope the
+        operation's kind would have cost. An exchanged credential carries only
+        what is declared here, so `inspect` would make this unusable for every
+        kind; `derive` is exactly the set an agent could have caused."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool("operations_show", OPERATION, exchange=exchange)(operation_id="o")
+        self.assertEqual("derive", exchange.calls[0]["scope"])
+
+    def test_the_contract_is_indexed_rather_than_returned(self) -> None:
+        """57 actions come to 35,603 bytes, nearly all of it input schemas."""
+        self.as_caller(caller())
+        detail = self.tool("capabilities_list", CAPABILITIES)()
+        self.assertEqual(["catalog.list", "derived-layers.create"],
+                         [a["id"] for a in detail["actions"]])
+        self.assertNotIn("inputSchema", json.dumps(detail))
+        # The path is reported whichever key the platform used.
+        self.assertEqual("/api/derived-layers", detail["actions"][1]["path"])
+
+    def test_one_action_can_be_expanded_with_its_schema(self) -> None:
+        self.as_caller(caller())
+        action = self.tool("capabilities_list", CAPABILITIES)(
+            action="derived-layers.create")["action"]
+        self.assertIn("inputSchema", action)
+
+    def test_an_unknown_action_is_refused_by_name(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool("capabilities_list", CAPABILITIES)(action="nope")
+        self.assertIn("nope", str(raised.exception))
+
+    def test_the_schema_names_its_definitions_rather_than_inlining_them(self) -> None:
+        """30 definitions at 34,600 bytes against 838 for the top level."""
+        self.as_caller(caller())
+        detail = self.tool("schema", SCHEMA_DOC)()
+        self.assertEqual(["color", "layer"], detail["definitions"])
+        self.assertNotIn("$defs", detail)
+        self.assertIn("properties", detail)
+
+    def test_one_definition_can_be_expanded(self) -> None:
+        self.as_caller(caller())
+        detail = self.tool("schema", SCHEMA_DOC)(definition="layer")
+        self.assertEqual({"type": "object"}, detail["schema"])
+
+    def test_an_unknown_definition_is_refused_by_name(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool("schema", SCHEMA_DOC)(definition="nope")
+        self.assertIn("nope", str(raised.exception))
+
+    def test_the_reference_reads_cost_only_inspect(self) -> None:
+        for name in ("xyz_status", "sql_capabilities", "capabilities_list",
+                     "schema", "rules", "examples", "plugins_list",
+                     "dependencies_list", "icons_list",
+                     "derived_layers_capabilities"):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller())
+                payload = {"schema": {}} if name == "schema" else {"actions": []}
+                self.tool(name, payload, exchange=exchange)()
+                self.assertEqual("inspect", exchange.calls[0]["scope"])
+
+    def test_the_operation_id_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool("operations_show", OPERATION, exchange=exchange)(
+            operation_id="odd/id")
+        self.assertEqual("/api/operations/odd%2Fid", exchange.calls[0]["path"])
+
+    def test_unexpected_shapes_degrade_rather_than_raising(self) -> None:
+        for name, payload, kwargs in (
+            ("operations_show", {"operation": None}, {"operation_id": "o"}),
+            ("capabilities_list", {"actions": "x"}, {}),
+            ("schema", {"schema": None}, {}),
+        ):
+            with self.subTest(tool=name):
+                self.as_caller(caller())
+                self.assertIsInstance(self.tool(name, payload)(**kwargs), dict)
+
+
 class MetaEnvelopeTests(unittest.TestCase):
     """No read tool returns the request-correlation envelope.
 

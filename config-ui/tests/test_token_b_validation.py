@@ -389,25 +389,31 @@ class RouteGateAlignmentTests(unittest.TestCase):
 
 
 class DiscoveryRouteTests(TokenBTestCase):
-    """Contract discovery is not reachable with an exchanged credential.
+    """A skipped scope check is not an open route.
 
     _required_scope returns None for the discovery routes, so the scope check
-    is skipped -- but the binding gate still runs, no template matches, and the
-    request is refused. That is the correct answer rather than an oversight: a
-    token B authorises one operation, and none of the discovery routes is an
-    allowlisted operation. An agent reads the contract with its own credential.
+    does not run. What refuses an exchanged credential is the binding gate: a
+    token B authorises exactly one allowlisted operation, and a route no
+    operation names matches no template.
+
+    That distinction is the point of these tests, and it is why the list below
+    shrank rather than the property changing. `/api/capabilities` and
+    `/api/derived-layers/capabilities` are now allowlisted operations --
+    `capabilities.list` and `derived-layers.capabilities` -- so they resolve
+    and are reachable, which is a decision about what an agent may read and
+    not a hole. The routes that remain here are refused for the original
+    reason: nothing names them. `/api/auth/me` is the one that matters most,
+    being a credential's own identity.
 
     Documented by a test because the alternative reading -- that a skipped
     scope check means an open route -- is the dangerous one.
     """
 
-    def test_discovery_routes_refuse_an_exchanged_token(self) -> None:
+    def test_an_unnamed_discovery_route_refuses_an_exchanged_token(self) -> None:
         for path in (
-            "/api/capabilities",
             "/api/contract",
             "/api/connect",
             "/api/auth/me",
-            "/api/derived-layers/capabilities",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(app.Handler._required_scope(path, "GET"))
@@ -416,6 +422,21 @@ class DiscoveryRouteTests(TokenBTestCase):
                 self.assertEqual(
                     "auth.operation_unresolved", self.responses[-1][1]["code"]
                 )
+
+    def test_an_allowlisted_discovery_route_is_reachable(self) -> None:
+        """The other half, stated rather than implied. These two are readable
+        by an agent on purpose: the contract says what actions exist and what
+        each costs, which is what an agent composing a change reads first."""
+        for path, operation in (
+            ("/api/capabilities", "capabilities.list"),
+            ("/api/derived-layers/capabilities", "derived-layers.capabilities"),
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(app.Handler._required_scope(path, "GET"))
+                handler = self.build(method="GET", path=path, body=b"")
+                resolved = app.Handler._resolve_operation(handler, "GET", path)
+                self.assertIsNotNone(resolved, f"{path} resolves no operation")
+                self.assertEqual(operation, resolved[0])
 
 
 class FailClosedGuardTests(TokenBTestCase):

@@ -137,6 +137,83 @@ SEMANTIC_PROPOSALS_SHOW = {
     "scopes": ("semantic:inspect",),
 }
 
+XYZ_STATUS = {
+    "operation_id": "xyz.status",
+    "method": "GET",
+    "path_template": "/api/xyz/status",
+    "scopes": ("inspect",),
+}
+
+OPERATIONS_SHOW = {
+    "operation_id": "operations.show",
+    "method": "GET",
+    "path_template": "/api/operations/{operationId}",
+    "scopes": ("derive",),
+}
+
+DERIVED_LAYERS_CAPABILITIES = {
+    "operation_id": "derived-layers.capabilities",
+    "method": "GET",
+    "path_template": "/api/derived-layers/capabilities",
+    "scopes": ("inspect",),
+}
+
+SQL_CAPABILITIES = {
+    "operation_id": "sql.capabilities",
+    "method": "GET",
+    "path_template": "/api/sql/capabilities",
+    "scopes": ("inspect",),
+}
+
+CAPABILITIES_LIST = {
+    "operation_id": "capabilities.list",
+    "method": "GET",
+    "path_template": "/api/capabilities",
+    "scopes": ("inspect",),
+}
+
+SCHEMA = {
+    "operation_id": "schema",
+    "method": "GET",
+    "path_template": "/api/schema",
+    "scopes": ("inspect",),
+}
+
+RULES = {
+    "operation_id": "rules",
+    "method": "GET",
+    "path_template": "/api/rules",
+    "scopes": ("inspect",),
+}
+
+EXAMPLES = {
+    "operation_id": "examples",
+    "method": "GET",
+    "path_template": "/api/examples",
+    "scopes": ("inspect",),
+}
+
+PLUGINS_LIST = {
+    "operation_id": "plugins.list",
+    "method": "GET",
+    "path_template": "/api/plugins",
+    "scopes": ("inspect",),
+}
+
+DEPENDENCIES_LIST = {
+    "operation_id": "dependencies.list",
+    "method": "GET",
+    "path_template": "/api/dependencies",
+    "scopes": ("inspect",),
+}
+
+ICONS_LIST = {
+    "operation_id": "icons.list",
+    "method": "GET",
+    "path_template": "/api/icons",
+    "scopes": ("inspect",),
+}
+
 SEMANTIC_STATUS = {
     "operation_id": "semantic.status",
     "method": "GET",
@@ -957,6 +1034,260 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "{proposalId}", quote(proposal_id, safe="")
         )
         return _without_meta(spend(SEMANTIC_PROPOSALS_SHOW, path=path))
+
+    @server.tool(
+        name="xyz_status",
+        description=(
+            "Whether the map tile service has picked up the current workspace:"
+            " the generation it was asked for, the generation it applied, and"
+            " whether it is healthy. Use this after a change to tell a stale"
+            " map from a broken one."
+        ),
+    )
+    def xyz_status() -> dict:
+        """Whether what was configured is what is being served.
+
+        A workspace change is not live until the tile service reloads. Until
+        then the map shows the previous generation, which looks identical to a
+        change that failed. `requestedGeneration` against `appliedGeneration`
+        is the difference, and nothing else here reports it.
+        """
+        return _without_meta(spend(XYZ_STATUS, path=XYZ_STATUS["path_template"]))
+
+    @server.tool(
+        name="operations_show",
+        description=(
+            "One asynchronous operation: its kind, status, stage and when it"
+            " changed, with its result and any error reduced to their shape."
+            " Use it to tell finished work from failed work. Takes an"
+            " operationId."
+        ),
+    )
+    def operations_show(operation_id: str) -> dict:
+        """Whether the work finished, and if not, what it said.
+
+        `derived_layers_jobs` says how much work is in flight; this says what
+        happened to one piece of it. Refresh, replace and visual checks all
+        run asynchronously and report nowhere else.
+
+        `result` and `error.diagnosis` are reduced rather than returned: a
+        failed visual test carries 15,381 bytes of run detail and 6,174 of
+        per-check diagnosis, against 34 bytes of message saying what went
+        wrong. The shape is kept so the reduction is visible -- an agent can
+        see that a `visual` block exists and how many keys it has, which is
+        the honest way to say "there is more here than you were given".
+        """
+        path = OPERATIONS_SHOW["path_template"].replace(
+            "{operationId}", quote(operation_id, safe="")
+        )
+        payload = spend(OPERATIONS_SHOW, path=path)
+        operation = payload.get("operation")
+        operation = operation if isinstance(operation, dict) else {}
+        error = operation.get("error")
+        error = error if isinstance(error, dict) else {}
+        result = operation.get("result")
+        result = result if isinstance(result, dict) else {}
+        detail = {
+            key: operation.get(key)
+            for key in ("id", "kind", "status", "stage", "actor", "target",
+                        "created", "updated")
+        }
+        detail["result"] = {
+            key: _change_preview(value) for key, value in result.items()
+        }
+        if error:
+            detail["error"] = {
+                "code": error.get("code"),
+                "message": error.get("message"),
+                "diagnosis": _change_preview(error.get("diagnosis")),
+            }
+        return detail
+
+    @server.tool(
+        name="derived_layers_capabilities",
+        description=(
+            "What derived-layer work this deployment supports: the kinds it"
+            " can build, its spatial scope types, and the guards that bound a"
+            " materialization or query. Not uniform across instances."
+        ),
+    )
+    def derived_layers_capabilities() -> dict:
+        """What may be asked for before asking for it.
+
+        The guards are the useful part: they say how large a derived relation
+        may get and what a query may do, which is the difference between a
+        plan that will be accepted and one that will be refused for reasons
+        an agent cannot otherwise discover.
+        """
+        return _without_meta(
+            spend(
+                DERIVED_LAYERS_CAPABILITIES,
+                path=DERIVED_LAYERS_CAPABILITIES["path_template"],
+            )
+        )
+
+    @server.tool(
+        name="sql_capabilities",
+        description=(
+            "Which SQL an expression may use: the mode, the supported"
+            " constructs, what is prohibited, and the statement timeout."
+            " Discovery of a constraint, not permission to run anything."
+        ),
+    )
+    def sql_capabilities() -> dict:
+        """The rules an expression is judged against, before writing one."""
+        return _without_meta(
+            spend(SQL_CAPABILITIES, path=SQL_CAPABILITIES["path_template"])
+        )
+
+    @server.tool(
+        name="capabilities_list",
+        description=(
+            "The platform's contract: every action with its method, path,"
+            " risk class and the scope it costs. Pass `action` to expand one"
+            " in full, including its input and query schemas."
+        ),
+    )
+    def capabilities_list(action: str | None = None) -> dict:
+        """What this platform can be asked to do, and what each thing costs.
+
+        Returned as an index because the schemas are the bulk: 57 actions come
+        to 35,603 bytes, of which the smallest entry is 110 and the largest
+        2,829. The index answers "what exists and what does it cost"; `action`
+        answers "what shape does this one take", which is only asked once a
+        particular action has been chosen.
+        """
+        payload = spend(CAPABILITIES_LIST, path=CAPABILITIES_LIST["path_template"])
+        actions = payload.get("actions")
+        actions = actions if isinstance(actions, list) else []
+        if action is not None:
+            for entry in actions:
+                if isinstance(entry, dict) and entry.get("id") == action:
+                    return {"action": entry}
+            raise ToolError(
+                f"This platform declares no action {action!r}. The actions it"
+                " declares are listed when `action` is omitted."
+            )
+        return {
+            "apiVersion": payload.get("apiVersion"),
+            "contractVersion": payload.get("contractVersion"),
+            "actions": [
+                {
+                    "id": entry.get("id"),
+                    "method": entry.get("method"),
+                    "path": entry.get("pathTemplate") or entry.get("path"),
+                    "risk": entry.get("risk"),
+                    "scope": entry.get("scope"),
+                }
+                for entry in actions
+                if isinstance(entry, dict)
+            ],
+        }
+
+    @server.tool(
+        name="schema",
+        description=(
+            "The workspace JSON schema: its top level, and the names of the"
+            " definitions it is built from. Pass `definition` to expand one."
+            " Needed to author a change rather than to read one."
+        ),
+    )
+    def schema(definition: str | None = None) -> dict:
+        """The shape a workspace must take, which no read tool implies.
+
+        `layers_list` says what this workspace contains; this says what any
+        workspace may contain, which is the question behind "can a layer have
+        X". The definitions are the bulk -- 30 of them at 34,600 bytes against
+        838 for the top-level properties -- so they are named and expanded one
+        at a time.
+        """
+        payload = spend(SCHEMA, path=SCHEMA["path_template"])
+        document = payload.get("schema")
+        document = document if isinstance(document, dict) else {}
+        defs = document.get("$defs")
+        defs = defs if isinstance(defs, dict) else {}
+        if definition is not None:
+            if definition not in defs:
+                raise ToolError(
+                    f"This schema defines no {definition!r}. Its definitions"
+                    " are listed when `definition` is omitted."
+                )
+            return {"definition": definition, "schema": defs[definition]}
+        return {
+            key: value for key, value in document.items() if key != "$defs"
+        } | {"definitions": sorted(defs)}
+
+    @server.tool(
+        name="rules",
+        description=(
+            "The authoring rules a workspace change must satisfy, each with"
+            " its identifier and what it requires. Read these before"
+            " composing a proposal."
+        ),
+    )
+    def rules() -> dict:
+        """What makes a candidate valid, stated rather than discovered."""
+        return _without_meta(spend(RULES, path=RULES["path_template"]))
+
+    @server.tool(
+        name="examples",
+        description=(
+            "Worked examples of valid workspace operations, each with the"
+            " operations it performs and an explanation. The shapes to copy"
+            " when composing a change."
+        ),
+    )
+    def examples() -> dict:
+        """Known-good operations, which is the fastest way to a valid one."""
+        return _without_meta(spend(EXAMPLES, path=EXAMPLES["path_template"]))
+
+    @server.tool(
+        name="plugins_list",
+        description=(
+            "The plugins this instance has configured: the bundled and"
+            " external sets, the map library version behind them, and whether"
+            " the registry is valid."
+        ),
+    )
+    def plugins_list() -> dict:
+        """What the map can do beyond the layers themselves.
+
+        A layer may reference a plugin that this instance does not load, which
+        is visible nowhere in the layer.
+        """
+        return _without_meta(
+            spend(PLUGINS_LIST, path=PLUGINS_LIST["path_template"])
+        )
+
+    @server.tool(
+        name="dependencies_list",
+        description=(
+            "Which layers depend on which relations, so the reach of a change"
+            " can be weighed before it is made."
+        ),
+    )
+    def dependencies_list() -> dict:
+        """What else a change would disturb.
+
+        Every other read describes one thing at a time. This is the only one
+        that says what is connected to what, which is the question asked
+        before altering anything shared.
+        """
+        return _without_meta(
+            spend(DEPENDENCIES_LIST, path=DEPENDENCIES_LIST["path_template"])
+        )
+
+    @server.tool(
+        name="icons_list",
+        description=(
+            "The icons a layer's styling may reference, with their sources."
+        ),
+    )
+    def icons_list() -> dict:
+        """The set a style may draw from, which styling alone does not say."""
+        return _without_meta(
+            spend(ICONS_LIST, path=ICONS_LIST["path_template"])
+        )
 
     @server.tool(
         name="semantic_status",
