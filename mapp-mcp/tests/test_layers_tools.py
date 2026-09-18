@@ -1470,6 +1470,35 @@ class InstanceStateToolTests(ToolTestCase):
         self.assertEqual({}, _without_meta(None))
 
 
+class MetaEnvelopeTests(unittest.TestCase):
+    """No read tool returns the request-correlation envelope.
+
+    Read from the source rather than asserted tool by tool, because that is how
+    this drifted in the first place: whether a tool leaked `meta` depended on
+    whether its endpoint happened to emit one, so derived_layers_list,
+    semantic_catalog_show and semantic_catalog_search returned it while the
+    tools either side of them did not. A tool added later returning `spend(...)`
+    straight out would rejoin that set silently.
+    """
+
+    def test_no_tool_returns_a_platform_response_unfiltered(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1] / "runtime.py"
+        ).read_text()
+        offenders = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith("return spend(")
+        ]
+        self.assertEqual(
+            [],
+            offenders,
+            "a tool returns the configuration API response unfiltered; wrap it"
+            " in _without_meta so the request envelope is not spent in a"
+            " conversation",
+        )
+
+
 class LimitQueryTests(unittest.TestCase):
     def test_an_absent_limit_is_no_parameter(self) -> None:
         """`limit=` is a different request from no limit, and is refused."""

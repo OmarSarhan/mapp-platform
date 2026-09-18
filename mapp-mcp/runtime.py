@@ -360,6 +360,12 @@ def _without_meta(payload):
     Every configuration API response carries `meta.requestId`. It identifies
     the HTTP call in the platform's own logs and answers nothing an agent
     asked, so it is dropped rather than spent in a conversation.
+
+    Applied by each read tool rather than inside `spend`, which would be the
+    obvious place. `meta` is also where the configuration API puts
+    `operationId` when a response carries an asynchronous operation, so a
+    blanket strip would remove the handle a mutating tool needs to follow its
+    own work. Reads never carry one; mutations are not this surface.
     """
     payload = payload if isinstance(payload, dict) else {}
     return {key: value for key, value in payload.items() if key != "meta"}
@@ -697,8 +703,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         rather than ingested. An agent quoting a number from one should be able
         to say where it came from, and this is the only tool that can answer it.
         """
-        return spend(
-            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
+        return _without_meta(
+            spend(DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"])
         )
 
     @server.tool(
@@ -918,8 +924,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     )
     def semantic_proposals_list() -> dict:
         """Meaning is proposed and reviewed like configuration is."""
-        return spend(
-            SEMANTIC_PROPOSALS_LIST, path=SEMANTIC_PROPOSALS_LIST["path_template"]
+        return _without_meta(
+            spend(SEMANTIC_PROPOSALS_LIST, path=SEMANTIC_PROPOSALS_LIST["path_template"])
         )
 
     @server.tool(
@@ -940,7 +946,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         path = SEMANTIC_PROPOSALS_SHOW["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
-        return spend(SEMANTIC_PROPOSALS_SHOW, path=path)
+        return _without_meta(spend(SEMANTIC_PROPOSALS_SHOW, path=path))
 
     @server.tool(
         name="semantic_status",
@@ -1140,10 +1146,12 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         layer keys and column names -- the words it is given are the ones a
         person used, and those live in the catalogue's descriptions.
         """
-        return spend(
-            SEMANTIC_CATALOG_SEARCH,
-            path=SEMANTIC_CATALOG_SEARCH["path_template"],
-            query=semantic_search_query(query=query, limit=limit),
+        return _without_meta(
+            spend(
+                SEMANTIC_CATALOG_SEARCH,
+                path=SEMANTIC_CATALOG_SEARCH["path_template"],
+                query=semantic_search_query(query=query, limit=limit),
+            )
         )
 
     @server.tool(
@@ -1166,7 +1174,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         path = SEMANTIC_CATALOG_SHOW["path_template"].replace(
             "{assetId}", quote(asset_id, safe="")
         )
-        return spend(SEMANTIC_CATALOG_SHOW, path=path)
+        return _without_meta(spend(SEMANTIC_CATALOG_SHOW, path=path))
 
     @server.tool(
         name="layers_statistics",
@@ -1197,10 +1205,12 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         path = LAYERS_STATISTICS["path_template"].replace(
             "{layerKey}", quote(layer_key, safe="")
         )
-        return spend(
-            LAYERS_STATISTICS,
-            path=path,
-            query=layer_statistics_query(field=field, locale=locale, bins=bins),
+        return _without_meta(
+            spend(
+                LAYERS_STATISTICS,
+                path=path,
+                query=layer_statistics_query(field=field, locale=locale, bins=bins),
+            )
         )
 
     @server.tool(
@@ -1226,10 +1236,12 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         path = LAYERS_VALUES["path_template"].replace(
             "{layerKey}", quote(layer_key, safe="")
         )
-        return spend(
-            LAYERS_VALUES,
-            path=path,
-            query=layer_values_query(field=field, locale=locale, limit=limit),
+        return _without_meta(
+            spend(
+                LAYERS_VALUES,
+                path=path,
+                query=layer_values_query(field=field, locale=locale, limit=limit),
+            )
         )
 
     return server
