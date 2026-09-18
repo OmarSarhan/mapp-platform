@@ -101,12 +101,16 @@ introspection, the exchange and redemption, against the real component with
 the real SQL store. It is the one test that proves the flow is *reachable* and
 not merely correct.
 
-## Phase 0 limitation: no digest producer
+## The digest producer
 
-`mapp-mcp` does not exist. It would obtain a token A
-and ask for the exchange. The binding columns are written and read by the
-configuration API, and never read outside the
-component.
+`mapp-mcp` obtains a token A, asks for the exchange, and is the only thing
+that does. It computes the request digest from the operation it is about to
+spend and sends the path, query and body unchanged; the configuration API
+recomputes the same digest from what arrives and compares. The binding columns
+are written and read by the configuration API and never read outside it.
+
+This section previously said `mapp-mcp` did not exist, which was true when
+Phase 0 began and stopped being true once the runtime shipped.
 
 ## The third public origin
 
@@ -479,8 +483,15 @@ which is recreated on start; do not restore it.
 ## Connecting Claude Code
 
 Yes, and driven end to end against the deployed stack rather than inferred
-from documentation. Claude Code 2.1.272 connects, lists both tools, and calls
-them; the full transcript is in `mcp-runtime-spike-plan.md`.
+from documentation. Claude Code connects, lists the tools its grant can call,
+and calls them.
+
+Re-proved at 37 tools on 2026-09-18 across all three ecosystems — Claude Code
+2.1.276, Codex CLI 0.155.0, Gemini CLI 0.58.0 — each given the same task,
+which required chaining four tools to answer. All three returned identical
+correct answers. That run found two defects: the contract advertised a
+pagination limit the platform refuses, and `capabilities_list` refused a tool
+name where an action id was wanted without naming the near match. Both fixed.
 
 Two things had to be true and now are. The server serves the handshake
 revisions the target ecosystems speak alongside 2026-07-28 (decision P2a) —

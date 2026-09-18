@@ -50,10 +50,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 RUNTIME_NAME = "mapp-mcp"
 RUNTIME_VERSION = "0.1.0"
 
-#: The scope a caller must hold for a tool merely to be listed. Anything a tool
-#: *does* is checked again against the grant when it is called.
-INSPECT_SCOPE = "inspect"
-
 #: The one place the RPC path is written. The edge routes it, the guard screens
 #: it and the SDK mounts at it, and nothing rewrites it in between.
 RPC_PATH = "/mcp"

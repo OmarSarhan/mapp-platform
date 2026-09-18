@@ -16,10 +16,17 @@ remains unbuilt is the approval flow: P8's receipts and review packets are Phase
 1, so the approval-forgery row below still describes a control that is designed
 and not yet built.
 
-**Accepted by the owner**, most recently on 2026-09-16 covering all ten abuse
+**Accepted by the owner**, most recently on 2026-09-16 covering ten abuse
 cases, with the two unmitigated rows below — approval fatigue in full, client
 attestation in part — carried knowingly. O20, carried as an unverified control
 through Phase 0, is now measured and closed.
+
+**Two rows are newer than that acceptance and have not been accepted**:
+disclosure through a read grant, and reading data through an expression. Both
+were added on 2026-09-18, after the read surface grew from two tools to 37.
+Neither is unmitigated, but the first names a residual the owner should decide
+about explicitly — a grant holding a scope sees everything that scope covers,
+with no per-layer or row-level restriction designed.
 
 ## Assets
 
@@ -288,6 +295,60 @@ trade-off and also the one most likely to train an operator to click through.
 Nothing here mitigates it. Recorded so the Phase 1 design does not treat it as
 solved.
 
+### Disclosure through a read grant
+
+The surface this document was first written against had two tools. It now has
+37, all reads, and what a single `inspect` grant discloses is no longer
+self-evident: every layer's configuration including the relation and columns it
+reads, the derived-layer inventory, the review queue with the full diff of
+every proposal ever made, the platform contract, and the workspace JSON schema.
+Adding `semantic:inspect` discloses curated meaning and its change history;
+`derive` discloses aggregate values and distribution summaries over a layer's
+own relation; `federation:observe` names the third-party databases behind the
+instance; `semantic:source` names every table and view in the database,
+including ones no layer uses.
+
+**Partly controlled, and the control is scope separation rather than
+redaction.** The four disclosures above sit behind four different scopes, none
+implied by another, so an operator grants each deliberately: the dashboard's
+analysis preset stops at `derive` and `semantic:inspect`, and both
+`federation:observe` and `semantic:source` are left out of every preset for
+that reason. `full` and `admin` are never issued for this resource, and the
+configuration API withholds credential identifiers from an exchanged
+credential at the response layer, so `actor` fields arrive as `[withheld]`
+whichever tool returns them.
+
+Since 2026-09-18 `tools/list` is filtered to what the grant can call, so a
+narrow grant is not shown the surface it cannot reach. That is a usability
+property first -- an agent was previously told no one tool at a time -- and
+disclosure reduction second: it does not change what any credential may read,
+only what it is told about. The call check is unchanged and remains the
+boundary.
+
+**Not controlled:** a grant that legitimately holds a scope sees everything
+that scope covers. There is no per-layer, per-asset or row-level restriction,
+and none is designed. An instance whose workspace or catalogue is itself
+sensitive should not issue agent credentials for it.
+
+### Reading data through an expression
+
+`sql_test` evaluates a caller-supplied SQL expression against a configured
+layer's own relation and returns a sample value, which is a data read spelled
+as a validation check.
+
+**Controlled at the platform.** The transaction is `READ ONLY`, the statement
+timeout is five seconds, `search_path` is pinned to `pg_catalog, public`, and
+function names are allowlisted and checked against being shadowed by an
+untrusted database function. Driven against the deployed stack on 2026-09-18:
+statement injection is refused as a syntax error because the expression is
+composed as one scalar, and `pg_sleep` and aggregate subqueries are refused by
+name. It costs `derive` -- the scope `layers_values` already needs, and for the
+same reason: both return values from the same relation.
+
+**Residual:** an expression can read any column of a relation a layer is
+already configured to read, which `layers_values` can do too. The bound is the
+set of configured layers, not the database.
+
 ### Compromised client
 
 A registered agent client that turns hostile. Bounded by: scopes it was granted
@@ -396,12 +457,17 @@ deputy, SSRF, credential theft, approval forgery, state exhaustion, approval
 fatigue and compromised client. Two carry no mitigation (approval fatigue in
 full, client attestation in part) and one carries an unverified control (O20).
 
-Two further cases were added after the runtime and the dashboard surfaces were
+Four further cases were added after the runtime and the dashboard surfaces were
 built, beyond the list the gate names: credential administration from a browser
-session, and serving a second protocol era. Neither is unmitigated, and both are
-here because the surface changed rather than because the gate asked — a threat
-model that only ever answers its original checklist stops describing the system
-it is about.
+session, serving a second protocol era, disclosure through a read grant, and
+reading data through an expression. None is unmitigated, and all are here
+because the surface changed rather than because the gate asked — a threat model
+that only ever answers its original checklist stops describing the system it is
+about.
+
+The last two are the clearest case of that. This document was written when the
+runtime had two tools; it now has 37, and what one `inspect` grant discloses
+was not a question the original checklist could have asked.
 
 **Both were accepted by the owner on 2026-09-16**, together with the rest of
 this revision. The acceptance line at the top of this document now covers ten

@@ -312,6 +312,51 @@ filter.
 stays append-only at `var/control/audit.jsonl` and does not share a transaction
 with the authorization decision.
 
+### Decisions taken while building the read surface
+
+Recorded here rather than in the waves that made them, because each one binds
+future work.
+
+**`semantic:source` is a scope an operator may grant.** It was pinned as never
+offered to agents, which made `semantic_source_relations` impossible rather than
+merely unbuilt: one guard requires the dashboard to offer every scope an
+allowlisted read needs and another forbids it offering a privileged one, so the
+scope had to be reclassified or the tool could not exist. Reclassified on the
+owner's decision, on the reasoning that it is disclosure and not authority — it
+names the database's relation inventory, writes nothing, reads no row, and the
+source aliases it exposes were already visible to `federation:observe`. It is
+left out of every dashboard preset, so granting it stays deliberate.
+
+**`operations.show` costs `derive`, not `inspect`.** The route admits any
+authenticated credential and then demands the scope that the operation's *kind*
+would have cost to perform — `visual` for a visual test, `apply` for a proposal
+apply, `derive` for derived-layer work. An exchanged credential carries only
+the single scope declared for its action, so `inspect` made the tool unusable
+for every kind. `derive` is exactly the set of operations an agent could itself
+have caused, and the rest still refuse. This is the first place where the
+per-request credential's narrowness is in tension with a route whose required
+scope depends on the resource being read; Phase 1 will meet it again.
+
+**`sql.test` is classified `aggregate-data-read` and costs `derive`.** It
+evaluates a caller-supplied expression against a configured layer's own
+relation and returns a sample value, which is what `layers.values` already
+does. A read risk rather than a write one because replaying it evaluates the
+same expression and changes nothing.
+
+**`tools/list` is filtered to what the grant can call.** Registration is not
+filtered and `spend` still checks the scope on the way in, so this changes what
+is described rather than what is permitted. Taken because a grant carrying
+`mcp:connect` alone was shown all 37 tools and could invoke none of them, which
+reads to a person as a broken server rather than a narrow grant. It fails
+closed: with no caller in context, only the tool that reaches no platform route
+is listed.
+
+**Read tools strip the response envelope; mutating tools must not.** The
+configuration API puts `operationId` in `meta` when a response carries an
+asynchronous operation, so a blanket strip would remove the handle a mutating
+tool needs to follow its own work. The filter is therefore on the read path and
+not inside `spend`.
+
 ## Consequences
 
 **The three-place routing problem does not apply.** Token B is a credential, not

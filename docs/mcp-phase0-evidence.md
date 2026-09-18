@@ -29,12 +29,12 @@ component and the configuration API's validation of the credential it issues.
 | --- | --- |
 | Edge listener | 6 method/path routes across the 4 public paths Caddy publishes, over an `AF_UNIX` socket |
 | Control listener | `/healthz`, `/internal/oauth/exchange`, `/internal/oauth/introspect`, `/internal/oauth/revoke`, `/internal/oauth/redeem` — `mcp-control` network only |
-| MCP runtime | `mapp-mcp`: the official Python SDK behind a protocol-era guard, 16 read-only tools, RFC 9728 metadata, token-A authentication per call |
+| MCP runtime | `mapp-mcp`: the official Python SDK behind a protocol-era guard, 37 read-only tools, RFC 9728 metadata, token-A authentication per call, `tools/list` filtered to what the grant can call |
 | Control schema | 15 tables, 8 migrations, owned by `mapp_control` |
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker, the configuration API and the MCP runtime — three copies, cross-checked |
 | Credential administration | Dashboard: agent-client issuance and consent inspection and revocation, both audited, administrator-session only |
-| Operation allowlist | 17 of the platform's 55 actions |
-| Scope vocabulary | 9 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
+| Operation allowlist | 38 of the platform's 69 actions |
+| Scope vocabulary | 11 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
 
 Public paths on the MCP origin: `/.well-known/oauth-authorization-server`,
 `/oauth/authorize`, `/oauth/token`, `/oauth/login`. Everything else 404s.
