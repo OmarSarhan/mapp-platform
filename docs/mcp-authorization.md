@@ -547,11 +547,16 @@ different disclosure from describing the instance.
 
 Four scopes, not two. `mcp:connect` and `inspect` are the discovery pair --
 they are what protected-resource metadata advertises, and `inspect` is what
-makes a tool *appear* in `tools/list` at all. `layer_values` additionally needs
-`derive` and `semantic:inspect` to run, and a client registered without them
-connects, lists both tools, and is refused on the first call with a message
-naming what to re-authorize for. That refusal works and is actionable, but
-there is no reason to walk into it on a fresh install.
+makes a tool appear in `tools/list` at all. A grant carrying `mcp:connect`
+alone is shown one tool, the one that reaches no platform route; `inspect`
+brings that to 20, and `derive` with `semantic:inspect` to 33, which is the
+`analysis` preset and what the shipped tools need to read an instance. The
+remaining four need `federation:observe` or `semantic:source`, each granted
+separately because each discloses something beyond the configured workspace.
+
+A client registered without a scope is not shown the tools that need it, and
+is refused by name if it calls one anyway — the listing and the refusal agree.
+There is still no reason to walk into it on a fresh install.
 
 Register both loopback spellings. Redirect URIs are matched byte for byte with
 no loopback or port flexibility, and clients differ in which they use.
@@ -660,28 +665,31 @@ sign-in is what makes P19's 90-day floor and purge-under-pressure required.
 
 Phase 0 stops deliberately short in several places:
 
-- the operation allowlist covers a handful of configuration-API actions
-  rather than the whole surface, and adding one is a deliberate act;
-- there is no dashboard view of grants, and revocation is reachable only
-  through the internal endpoint or by disabling a client;
-- the durable audit trail covers the grant lifecycle and the refresh outcomes,
-  but not yet a refused authorization or a failed operator sign-in — and those
-  are the events an unauthenticated caller can provoke, so recording them is
-  what makes P19's retention floor and purge-under-pressure required rather
-  than deferred;
+- the operation allowlist covers 38 of the platform's 69 actions, all but four
+  of them reads, and adding one is a deliberate act in three places;
+- a refused authorization is not recorded in the audit trail. A failed operator
+  sign-in is (`auth.login_failed`), as are the client and grant lifecycle
+  events, but the one an unauthenticated caller can provoke most cheaply is
+  still missing, and recording it is what makes P19's retention floor and
+  purge-under-pressure required rather than deferred;
+- retention itself is not implemented, and is bounded rather than overlooked
+  for the reason given above;
 - nothing reads the trail but a store method: there is no dashboard view and
   no operator command, so inspecting it still means SQL;
-- `mapp-mcp` does not exist, so nothing produces a request digest in anger and
-  the third independent canonicalization implementation is absent. Nothing
-  answers `/mcp` and there is no RFC 9728 protected-resource document, so no
-  MCP client can connect at all — what exists is an authorization server with
-  no resource behind it. [The spike plan](mcp-runtime-spike-plan.md) records
-  what building one requires and what it will run into.
+- no client attestation. An agent is a public client holding no secret, and
+  PKCE binds the code to the requesting instance rather than proving which
+  application it is. `private_key_jwt` is deferred for the reason in the ADR;
+- mutual TLS on the control listener. It is plain HTTP on an internal Docker
+  network, authenticated per call as a confidential client rather than by
+  placement.
 
-Six entries left this list in Phase 1 and one in M7, which is worth naming
-because a stale limitations list is worse than none: the configuration API
-re-checks the token-B operation and request binding (M7), an operator can
-register a client, the migration ladder has a tested rollback, `recovery_epoch`
-is a working restore-time invalidation rather than reserved storage, refresh
-tokens rotate with family replay detection, and the authorization component
-writes a durable audit trail.
+Eight entries left this list, which is worth naming because a stale
+limitations list is worse than none: the configuration API re-checks the
+token-B operation and request binding, an operator can register a client and
+see and revoke grants from the dashboard, the migration ladder has a tested
+rollback, `recovery_epoch` is a working restore-time invalidation rather than
+reserved storage, refresh tokens rotate with family replay detection, the
+authorization component writes a durable audit trail, a failed sign-in is
+recorded, and `mapp-mcp` exists — it answers `/mcp` behind an RFC 9728
+protected-resource document, produces the request digest, and carries the
+third independent canonicalization implementation.
