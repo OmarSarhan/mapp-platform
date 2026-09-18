@@ -158,6 +158,15 @@ DERIVED_LAYERS_CAPABILITIES = {
     "scopes": ("inspect",),
 }
 
+SQL_TEST = {
+    "operation_id": "sql.test",
+    "method": "POST",
+    "path_template": "/api/sql/test",
+    # The same authority `layers_values` needs, and for the same reason: both
+    # return values read from a configured layer's own relation.
+    "scopes": ("derive",),
+}
+
 SQL_CAPABILITIES = {
     "operation_id": "sql.capabilities",
     "method": "GET",
@@ -441,6 +450,24 @@ def _change_summary(entry):
     }
 
 
+def _refusal_detail(errors):
+    """The platform's field-level errors, rendered for a person to act on.
+
+    Bounded at five because a candidate workspace can fail every rule at once,
+    and a refusal that fills a conversation is its own failure.
+    """
+    entries = []
+    for error in (errors if isinstance(errors, list) else [])[:5]:
+        if not isinstance(error, dict):
+            continue
+        message = error.get("message")
+        if not message:
+            continue
+        path = error.get("path")
+        entries.append(f"{path}: {message}" if path else str(message))
+    return ("\n" + "\n".join(entries)) if entries else ""
+
+
 def _without_meta(payload):
     """The response minus its request-correlation envelope.
 
@@ -588,7 +615,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "runtime": f"{RUNTIME_NAME}/{RUNTIME_VERSION}",
         }
 
-    def spend(operation, *, path, query=""):
+    def spend(operation, *, path, query="", body=None):
         """Obtain one request-bound credential and spend it. The whole path.
 
         Every tool that touches the platform goes through here, so the scope
@@ -637,7 +664,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 path_template=operation["path_template"],
                 path=path,
                 query=query,
-                body=None,
+                body=body,
                 scope=" ".join(operation["scopes"]),
             )
         except ExchangeRefused as refusal:
@@ -649,11 +676,21 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 "The authorization component is unavailable; try again."
             ) from None
         try:
-            return config_api.get(path=path, query=query, token=token_b)
+            if operation["method"] == "GET":
+                return config_api.get(path=path, query=query, token=token_b)
+            # The same body object that was digested, not a rebuild of it.
+            return config_api.post(
+                path=path, query=query, token=token_b, body=body
+            )
         except ConfigApiRefused as refusal:
+            # The field-level entries, where the platform sent any. For a
+            # validation refusal these are the answer: the top-level message
+            # says only that something is wrong, and the entry beneath names
+            # the field and what the database said about it.
             raise ToolError(
                 f"The platform refused this request: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
+                + _refusal_detail(refusal.errors)
             ) from None
         except ConfigApiUnavailable:
             raise ToolError(
@@ -1124,6 +1161,54 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 DERIVED_LAYERS_CAPABILITIES,
                 path=DERIVED_LAYERS_CAPABILITIES["path_template"],
             )
+        )
+
+    @server.tool(
+        name="sql_test",
+        description=(
+            "Try one read-only SQL expression as a calculated field on an"
+            " existing layer, and get back its PostgreSQL type and a sample"
+            " value. Use it to check an expression before proposing it."
+            " sql_capabilities says what an expression may contain. Changes"
+            " nothing."
+        ),
+    )
+    def sql_test(
+        layer: str,
+        expression: str,
+        locale: str | None = None,
+        field: str | None = None,
+        type: str | None = None,
+    ) -> dict:
+        """Whether an expression works, without proposing it to find out.
+
+        A calculated field is the one part of a layer whose correctness cannot
+        be read off the configuration: it is SQL, and whether it parses, what
+        type it yields and whether that matches the declared information type
+        are all facts about the database. The alternative is proposing a
+        change and reading the failure.
+
+        It changes nothing, and that is enforced at the platform rather than
+        promised here: the transaction is READ ONLY, the statement timeout is
+        five seconds, the search_path is pinned to pg_catalog and public, and
+        the function names are allowlisted and checked against being shadowed
+        by an untrusted database function. It does return a sample value from
+        the relation, which is why it costs `derive` -- the same authority
+        `layers_values` needs -- rather than `inspect`.
+
+        The body is built once here and digested at exchange time. It is not
+        reassembled before sending, for the reason the path and query are not:
+        two constructions of one request is one chance for them to disagree.
+        """
+        body = {"layer": layer, "expression": expression}
+        if locale is not None:
+            body["locale"] = locale
+        if field is not None:
+            body["field"] = field
+        if type is not None:
+            body["type"] = type
+        return _without_meta(
+            spend(SQL_TEST, path=SQL_TEST["path_template"], body=body)
         )
 
     @server.tool(

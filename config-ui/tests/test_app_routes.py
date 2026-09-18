@@ -880,6 +880,55 @@ class FederationAliasReadRouteTests(unittest.TestCase):
         self.assertEqual("federation.registry_unavailable", body["code"])
 
 
+class ExpressionTestResolutionTests(unittest.TestCase):
+    """A trial `fieldfx` entry must reach the evaluation that was told about it.
+
+    effective_locales() deep-copies, so /api/sql/test appended its trial entry
+    to a copy that test_info_expression never saw: it re-derived, found the
+    original entry count, and refused an index that was one past the end. The
+    route failed that way for every layer, which is why the CLI's `sql test`
+    could not work either, and no test covered it.
+    """
+
+    WORKSPACE = {"locale": {"layers": {"Stops": {
+        "table": "public.stops", "dbs": "MAPP",
+        "infoj": [{"field": "name", "type": "text"}],
+    }}}}
+
+    def resolved_locales(self):
+        locale_key, locale = app.select_locale(self.WORKSPACE, None)
+        layer = locale["layers"]["Stops"]
+        layer["infoj"] = list(layer["infoj"]) + [
+            {"field": "trial", "fieldfx": "1 + 1", "type": "integer",
+             "display": True},
+        ]
+        return locale_key, locale
+
+    def test_the_appended_entry_is_found_when_its_mapping_is_passed(self):
+        """It gets as far as needing a database, which is past the index check
+        that used to refuse it."""
+        locale_key, locale = self.resolved_locales()
+
+        with patch.dict(app.DB_CONNECTIONS, {}, clear=True):
+            with self.assertRaises(ValueError) as raised:
+                app.test_info_expression(
+                    self.WORKSPACE, locale_key, "Stops", 1,
+                    locales={locale_key: locale},
+                )
+
+        self.assertIn("connection is configured", str(raised.exception))
+
+    def test_without_the_mapping_the_entry_is_lost(self):
+        """The original behaviour, pinned so the reason for the parameter does
+        not quietly stop being true."""
+        locale_key, locale = self.resolved_locales()
+
+        with self.assertRaises(ValueError) as raised:
+            app.test_info_expression(self.WORKSPACE, locale_key, "Stops", 1)
+
+        self.assertIn("no longer exists", str(raised.exception))
+
+
 class ProposalReadRouteTests(unittest.TestCase):
     """GET /api/proposals/<id> for an unknown id must name the proposal, not
     the file. The read is a plain `.read_text()`, so a missing record raises an

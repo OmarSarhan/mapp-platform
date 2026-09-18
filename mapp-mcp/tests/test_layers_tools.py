@@ -52,7 +52,16 @@ class FakeConfigApi:
         self.calls = []
 
     def get(self, **kwargs):
-        self.calls.append(kwargs)
+        self.calls.append({"method": "GET", **kwargs})
+        if self.raises is not None:
+            raise self.raises
+        return self.answer
+
+    def post(self, **kwargs):
+        # Recorded with its method, so a test can assert what was actually
+        # sent rather than what the tool meant to send. Without the marker a
+        # POST routed as a GET reads exactly like a correct call.
+        self.calls.append({"method": "POST", **kwargs})
         if self.raises is not None:
             raise self.raises
         return self.answer
@@ -1689,6 +1698,124 @@ class ContractAndProgressToolTests(ToolTestCase):
             with self.subTest(tool=name):
                 self.as_caller(caller())
                 self.assertIsInstance(self.tool(name, payload)(**kwargs), dict)
+
+
+SQL_RESULT = {"valid": True, "postgresType": "double precision", "sample": 4,
+              "message": "Expression is compatible with the selected"
+                         " information type.",
+              "meta": {"requestId": "r12"}}
+
+
+class SqlTestTests(ToolTestCase):
+    """The only tool that sends a body, and the only read whose answer is a
+    fact about the database rather than about the configuration."""
+
+    def tool(self, payload=SQL_RESULT, exchange=None, config_api=None):
+        return self.build_named(
+            "sql_test", exchange=exchange,
+            config_api=config_api or FakeConfigApi(answer=payload),
+        )
+
+    def test_it_reports_the_type_and_a_sample(self) -> None:
+        self.as_caller(caller())
+        detail = self.tool()(layer="Stops", expression="population * 2")
+        self.assertIs(True, detail["valid"])
+        self.assertEqual("double precision", detail["postgresType"])
+        self.assertNotIn("meta", detail)
+
+    def test_it_reaches_the_platform_as_a_post(self) -> None:
+        """Routed on the operation's method. As a GET the body is never sent
+        at all, and the platform refuses for a reason that names nothing."""
+        api = FakeConfigApi(answer=SQL_RESULT)
+        self.as_caller(caller())
+        self.tool(config_api=api)(layer="Stops", expression="1")
+        self.assertEqual("POST", api.calls[0]["method"])
+        self.assertEqual({"layer": "Stops", "expression": "1"},
+                         api.calls[0]["body"])
+
+    def test_the_body_is_bound_at_exchange_time(self) -> None:
+        """The digest covers the body, so what is sent and what was digested
+        have to be the same object rather than two constructions of it."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(layer="Stops", expression="1 + 1")
+        self.assertEqual({"layer": "Stops", "expression": "1 + 1"},
+                         exchange.calls[0]["body"])
+
+    def test_optional_arguments_are_omitted_rather_than_sent_as_null(self) -> None:
+        """An absent member and a null member are different bodies, and the
+        digest distinguishes them."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(layer="Stops", expression="1", type="integer")
+        body = exchange.calls[0]["body"]
+        self.assertEqual({"layer", "expression", "type"}, set(body))
+        self.assertNotIn("locale", body)
+        self.assertNotIn("field", body)
+
+    def test_it_costs_derive_because_it_returns_a_value(self) -> None:
+        """Not `inspect`: the sample comes out of the layer's own relation,
+        which is the authority layers_values needs."""
+        exchange = FakeExchange()
+        self.as_caller(caller())
+        self.tool(exchange=exchange)(layer="Stops", expression="1")
+        self.assertEqual("derive", exchange.calls[0]["scope"])
+
+    def test_it_is_refused_without_derive(self) -> None:
+        self.as_caller(caller(scopes="mcp:connect inspect"))
+        with self.assertRaises(ToolError) as raised:
+            self.tool()(layer="Stops", expression="1")
+        self.assertIn("derive", str(raised.exception))
+
+
+class RefusalDetailTests(ToolTestCase):
+    """A validation refusal's field-level entries are the answer, not noise.
+
+    "Expression test failed" says only that something is wrong. The entry
+    beneath it names the field and what PostgreSQL said, which for sql_test is
+    the entire product of the call.
+    """
+
+    def build_refusing(self, errors):
+        class Refusing:
+            def get(self, **kwargs):
+                raise ConfigApiRefused("Expression test failed.", status=422,
+                                       code="", errors=errors)
+
+            def post(self, **kwargs):
+                raise ConfigApiRefused("Expression test failed.", status=422,
+                                       code="", errors=errors)
+        return self.build_named("sql_test", config_api=Refusing())
+
+    def test_the_field_errors_reach_the_caller(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.build_refusing(
+                [{"path": "fieldfx", "message": "SQL function is not allowed:"
+                                                " pg_sleep."}]
+            )(layer="Stops", expression="pg_sleep(30)")
+        message = str(raised.exception)
+        self.assertIn("Expression test failed.", message)
+        self.assertIn("fieldfx: SQL function is not allowed: pg_sleep.", message)
+
+    def test_a_refusal_with_no_entries_is_unchanged(self) -> None:
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.build_refusing(None)(layer="Stops", expression="1")
+        self.assertEqual(
+            "The platform refused this request: Expression test failed.",
+            str(raised.exception),
+        )
+
+    def test_the_entries_are_bounded(self) -> None:
+        """A candidate can fail every rule at once, and a refusal that fills a
+        conversation is its own failure."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.build_refusing(
+                [{"path": f"f{n}", "message": f"m{n}"} for n in range(12)]
+            )(layer="Stops", expression="1")
+        self.assertEqual(5, str(raised.exception).count("\nf"))
 
 
 class MetaEnvelopeTests(unittest.TestCase):

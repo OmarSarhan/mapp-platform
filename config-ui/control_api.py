@@ -1217,6 +1217,33 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "sql.test": {
+        "method": "POST",
+        "path": "/api/sql/test",
+        # Tries one expression as a calculated field on an existing layer and
+        # reports its PostgreSQL type and a sample value. It writes nothing:
+        # the transaction is READ ONLY, the statement timeout is 5s, the
+        # search_path is pinned, and the function names are allowlisted and
+        # checked against shadowing. Classified with `layers.values` and
+        # `layers.statistics`, which it matches exactly: a value read from a
+        # configured layer's own relation, costing `derive`. That is a read
+        # class, so the credential is not single-use -- correct here, because
+        # replaying it evaluates the same expression and changes nothing.
+        "risk": "aggregate-data-read",
+        "scope": "derive",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer", "expression"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "expression": {"type": "string", "minLength": 1},
+                "locale": {"type": "string", "minLength": 1},
+                "field": {"type": "string", "minLength": 1},
+                "type": {"type": "string", "minLength": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
     "xyz.status": {
         "method": "GET",
         "path": "/api/xyz/status",

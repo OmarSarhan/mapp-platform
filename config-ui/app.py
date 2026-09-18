@@ -5820,7 +5820,24 @@ def validate_renderable(data: dict, tables: list[dict]) -> list[dict[str, str]]:
     return errors
 
 
-def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index: int) -> dict:
+def test_info_expression(
+    candidate: dict,
+    locale_key: str,
+    layer_key: str,
+    index: int,
+    *,
+    locales: dict | None = None,
+) -> dict:
+    """Evaluate one `fieldfx` entry against the layer's own relation.
+
+    `locales` exists because effective_locales() deep-copies. A caller that
+    resolves the locale, appends a trial entry to it and then lets this
+    re-derive is mutating a copy this function never sees, so the index it
+    passes names an entry that does not exist -- which is exactly how
+    /api/sql/test failed for every layer. Passing the mapping that was
+    actually mutated is the fix; omitting it keeps the previous behaviour for
+    callers that supply a candidate already containing the entry.
+    """
     structural = validate_workspace(candidate, set(DB_CONNECTIONS))
     expression_errors = [
         error for error in structural
@@ -5828,7 +5845,8 @@ def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index
     ]
     if expression_errors:
         raise ValueError(expression_errors[0]["message"])
-    locale = effective_locales(candidate).get(locale_key)
+    resolved = locales if isinstance(locales, dict) else effective_locales(candidate)
+    locale = resolved.get(locale_key)
     layer = (locale.get("layers") or {}).get(layer_key) if isinstance(locale, dict) else None
     entries = layer.get("infoj") if isinstance(layer, dict) else None
     if not isinstance(entries, list) or not 0 <= index < len(entries):
@@ -6677,6 +6695,14 @@ class Handler(SimpleHTTPRequestHandler):
         )
         if proposal_action and proposal_action.group(1) == "apply":
             return "apply"
+        if path == "/api/sql/test":
+            # Evaluates one read-only scalar expression over a configured
+            # layer's own relation and returns a sample value from it. That is
+            # the authority `derive` already names -- /api/layers/<k>/values
+            # returns values from the same relation -- so it is classified with
+            # it rather than left to the `full` catch-all, which would refuse
+            # every credential that is not an administrator.
+            return "derive"
         if path == "/api/xyz/reload":
             return "reload"
         if path == "/api/derived-layers" or path.startswith("/api/derived-layers/"):
@@ -10785,6 +10811,10 @@ class Handler(SimpleHTTPRequestHandler):
                     candidate,
                     payload.get("locale"),
                 )
+                # The mapping the trial entry is appended to, so the evaluation
+                # sees it. select_locale returns a member of a deep copy that
+                # is otherwise discarded.
+                locales = {locale_key: locale}
                 layer = (locale.get("layers") or {}).get(payload.get("layer")) if isinstance(locale, dict) else None
                 if not isinstance(layer, dict):
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "Unknown layer."})
@@ -10798,7 +10828,13 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 layer["infoj"] = entries
                 try:
-                    result = test_info_expression(candidate, locale_key, payload["layer"], len(entries) - 1)
+                    result = test_info_expression(
+                        candidate,
+                        locale_key,
+                        payload["layer"],
+                        len(entries) - 1,
+                        locales=locales,
+                    )
                     self._json(HTTPStatus.OK, result)
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Expression test failed.", "errors": annotated([{"path": "fieldfx", "message": str(exc)}])})

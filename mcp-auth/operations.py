@@ -148,6 +148,16 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:provision",),
         mutating=True,
     ),
+    "sql.test": Operation(
+        operation_id="sql.test",
+        method="POST",
+        path_template="/api/sql/test",
+        required_scopes=("derive",),
+        # Writes nothing: a READ ONLY transaction evaluating one allowlisted
+        # scalar expression. POST because it carries a body, not because it
+        # changes anything.
+        mutating=False,
+    ),
     "xyz.status": Operation(
         operation_id="xyz.status",
         method="GET",

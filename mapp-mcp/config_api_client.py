@@ -28,12 +28,20 @@ class ConfigApiRefused(RuntimeError):
     `auth.binding_refused` means the digest did not match what the API
     recomputed, and `auth.operation_unresolved` means no template matched the
     path -- which is also what a path-encoding disagreement looks like.
+
+    Also carries the platform's field-level `errors`, where it sent any. For a
+    validation refusal those *are* the answer -- "Expression test failed" says
+    only that something is wrong, while the entry beneath it names the field
+    and what PostgreSQL said about it. Dropping them made sql_test, whose whole
+    purpose is to report why an expression does not work, report nothing.
     """
 
-    def __init__(self, message: str, *, status: int, code: str = "") -> None:
+    def __init__(self, message: str, *, status: int, code: str = "",
+                 errors: Any = None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.errors = errors if isinstance(errors, list) else []
 
 
 class ConfigApiUnavailable(RuntimeError):
@@ -47,14 +55,38 @@ class ConfigApiClient:
 
     def get(self, *, path: str, query: str, token: str) -> Any:
         """Exactly the path and query the credential was bound to."""
+        return self._send(path=path, query=query, token=token, method="GET",
+                          body=None)
+
+    def post(self, *, path: str, query: str, token: str, body: Any) -> Any:
+        """The same, with the body the credential was bound to.
+
+        The digest covers the body as a *parsed value*, canonicalised the same
+        way on both sides, so what matters is that this serialises to something
+        that parses back to what was digested. It is serialised once here and
+        not rebuilt anywhere, for the reason the path and query are built once:
+        two constructions of the same request is one chance for them to
+        disagree, and the disagreement surfaces as a refusal naming no cause.
+        """
+        return self._send(path=path, query=query, token=token, method="POST",
+                          body=body)
+
+    def _send(self, *, path: str, query: str, token: str, method: str,
+              body: Any) -> Any:
         url = self.endpoint + path + (f"?{query}" if query else "")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        data = None
+        if body is not None:
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             url,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            method="GET",
+            data=data,
+            headers=headers,
+            method=method,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -68,6 +100,7 @@ class ConfigApiClient:
                 str(detail.get("error") or f"HTTP {exc.code}"),
                 status=exc.code,
                 code=str(detail.get("code") or ""),
+                errors=detail.get("errors"),
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise ConfigApiUnavailable(
