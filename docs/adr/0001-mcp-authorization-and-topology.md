@@ -332,8 +332,15 @@ authenticated credential and then demands the scope that the operation's *kind*
 would have cost to perform — `visual` for a visual test, `apply` for a proposal
 apply, `derive` for derived-layer work. An exchanged credential carries only
 the single scope declared for its action, so `inspect` made the tool unusable
-for every kind. `derive` is exactly the set of operations an agent could itself
-have caused, and the rest still refuse. This is the first place where the
+for every kind. `derive` was, at the time, exactly the set of operations an agent
+could itself have caused.
+
+Splitting `derive` in Phase 1 wave 1 ended that coincidence: performing
+derived-layer work now costs `derive:manage`, while inspecting it still costs
+`derive`. The classification stands on a different footing — inspecting an
+operation is a read, and the derived-layer queue is already listed to any
+`inspect` credential — but the original reasoning no longer applies and is
+recorded here rather than left to look load-bearing. This is the first place where the
 per-request credential's narrowness is in tension with a route whose required
 scope depends on the resource being read; Phase 1 will meet it again.
 

@@ -134,7 +134,7 @@ OPERATIONS: dict[str, Operation] = {
         operation_id="derived-layers.refresh",
         method="POST",
         path_template="/api/derived-layers/{name}/refresh",
-        required_scopes=("derive",),
+        required_scopes=("derive:manage",),
         mutating=True,
     ),
     "federation.aliases.observe": Operation(

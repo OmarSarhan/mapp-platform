@@ -77,13 +77,16 @@ class ThreatModelClaimTests(unittest.TestCase):
 
     def test_no_mutating_operation_is_reachable_by_an_offered_scope(self) -> None:
         """The read surface is read-only in the sense that matters: every
-        mutating operation on the allowlist needs a scope no dashboard preset
-        or option offers, so no credential an operator can issue today reaches
-        one.
+        mutating operation on the allowlist needs a scope no dashboard option
+        offers, so no credential an operator can issue reaches one.
 
-        `derived-layers.refresh` is the exception and is deliberate: it needs
-        only `derive`, which is offered. It is held shut by having no tool, not
-        by the scope check, and that is recorded rather than implied.
+        This had one exception until Phase 1 wave 1. `derived-layers.refresh`
+        needed only `derive`, which is offered and sits in the default analysis
+        preset -- so the scope that lets an agent read aggregate values also
+        authorised replacing the relation they come from, and the only thing
+        holding it shut was that no tool called it. Splitting `derive` from
+        `derive:manage` closed that, and the assertion is now the empty list
+        rather than a named exception.
         """
         start = DASHBOARD.index("export const MCP_SCOPE_OPTIONS=[")
         block = DASHBOARD[start : DASHBOARD.index("];", start)]
@@ -92,7 +95,7 @@ class ThreatModelClaimTests(unittest.TestCase):
             name for name, op in operations.OPERATIONS.items()
             if op.mutating and set(op.required_scopes) <= offered
         )
-        self.assertEqual(["derived-layers.refresh"], reachable)
+        self.assertEqual([], reachable)
 
     def test_the_default_preset_discloses_only_the_configured_workspace(self) -> None:
         """"`analysis` is the default and excludes both of the scopes that

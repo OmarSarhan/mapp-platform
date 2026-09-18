@@ -571,7 +571,7 @@ class AllowlistDriftTests(unittest.TestCase):
         "full", "admin", "federation:provision", "federation:register",
         "semantic:apply", "semantic:admin", "semantic:generate",
         "semantic:data", "apply", "propose", "visual",
-        "reload",
+        "reload", "derive:manage",
     })
     # `semantic:source` was here and was deliberately removed. It reads the
     # database's relation inventory -- tables and views including ones no layer

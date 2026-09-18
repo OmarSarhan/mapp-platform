@@ -6684,7 +6684,10 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/operations/[0-9a-f]{32}/cancel",
             path,
         ):
-            return "derive"
+            # A write. Cancelling stops work somebody may be waiting on, so it
+            # is classified with starting that work rather than with the reads
+            # that merely observe it.
+            return "derive:manage"
         if path in {"/api/visual-plan", "/api/visual-test"} or re.fullmatch(
             r"/api/proposals/[^/]+/(visual-plan|visual-test|screenshot)", path
         ):
@@ -6706,7 +6709,12 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/xyz/reload":
             return "reload"
         if path == "/api/derived-layers" or path.startswith("/api/derived-layers/"):
-            return "derive" if method != "GET" else "inspect"
+            # `derive` used to authorise both halves of this route, which meant
+            # the scope that lets an agent read aggregate values also let it
+            # create, replace and drop the relations those values come from --
+            # and `derive` is in the dashboard's default read-only preset. The
+            # lifecycle now has its own scope; `derive` keeps its read meaning.
+            return "derive:manage" if method != "GET" else "inspect"
         if (
             path in {"/api/proposals", "/api/proposals/check"}
             or proposal_action
@@ -7903,6 +7911,14 @@ class Handler(SimpleHTTPRequestHandler):
         elif path.startswith("/api/operations/"):
             try:
                 operation = CONTROL.read_operation(path.rsplit("/", 1)[1])
+                # Deliberately the *read* scope for the derived-layer kinds,
+                # not the lifecycle one they now cost to perform. Inspecting an
+                # operation is a read: /api/derived-layers already reports the
+                # active queue to any `inspect` credential, so refusing the
+                # detail of a job a grant can already see listed would be
+                # inconsistent as well as unhelpful. What this map is for is
+                # stopping someone learning about a class of work they have no
+                # business in at all.
                 required_scope = {
                     "visual.test": "visual",
                     "proposal.visual-test": "visual",

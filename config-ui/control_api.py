@@ -704,8 +704,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "path": "/api/derived-layers/recipes/area-weighted-h3/plan",
         "risk": "database-plan",
-        "scope": "derive",
-        "requiredScopes": ["derive", "semantic:inspect"],
+        "scope": "derive:manage",
+        "requiredScopes": ["derive:manage", "semantic:inspect"],
         "presentation": {
             **DERIVED_ERROR_PRESENTATION,
             "messageField": "userMessage",
@@ -1055,8 +1055,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "path": "/api/derived-layers",
         "risk": "database-definition",
-        "scope": "derive",
-        "requiredScopes": ["derive", "semantic:inspect"],
+        "scope": "derive:manage",
+        "requiredScopes": ["derive:manage", "semantic:inspect"],
         "operationKind": "derived-layer.create",
         "presentation": {
             **DERIVED_ERROR_PRESENTATION,
@@ -1110,7 +1110,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "pathTemplate": "/api/derived-layers/{name}/refresh",
         "risk": "database-refresh",
-        "scope": "derive",
+        "scope": "derive:manage",
         "operationKind": "derived-layer.refresh",
         "presentation": {
             **DERIVED_ERROR_PRESENTATION,
@@ -1135,8 +1135,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "pathTemplate": "/api/derived-layers/{name}/replace",
         "risk": "database-definition",
-        "scope": "derive",
-        "requiredScopes": ["derive", "semantic:inspect"],
+        "scope": "derive:manage",
+        "requiredScopes": ["derive:manage", "semantic:inspect"],
         "operationKind": "derived-layer.replace",
         "presentation": {
             **DERIVED_ERROR_PRESENTATION,
@@ -1189,7 +1189,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "pathTemplate": "/api/derived-layers/{name}/drop",
         "risk": "database-definition",
-        "scope": "derive",
+        "scope": "derive:manage",
         "presentation": {
             **DERIVED_ERROR_PRESENTATION,
             "messageField": "userMessage",
@@ -1209,7 +1209,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "method": "POST",
         "pathTemplate": "/api/operations/{operationId}/cancel",
         "risk": "database-definition",
-        "scope": "derive",
+        "scope": "derive:manage",
         "inputSchema": {
             "type": "object",
             "required": ["confirmed"],
@@ -1945,8 +1945,8 @@ ACTION_SCHEMAS["derived-layers.plan"] = {
     "method": "POST",
     "path": "/api/derived-layers/plan",
     "risk": "database-plan",
-    "scope": "derive",
-    "requiredScopes": ["derive", "semantic:inspect"],
+    "scope": "derive:manage",
+    "requiredScopes": ["derive:manage", "semantic:inspect"],
     "presentation": {
         **DERIVED_ERROR_PRESENTATION,
         "messageField": "userMessage",

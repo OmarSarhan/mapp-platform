@@ -311,7 +311,9 @@ the derived-layer inventory, the review queue with the full diff of every
 proposal ever made, the platform contract, and the workspace JSON schema.
 Adding `semantic:inspect` discloses curated meaning and its change history;
 `derive` discloses aggregate values and distribution summaries over a layer's
-own relation; `federation:observe` names the third-party databases behind the
+own relation, and nothing more — creating, replacing, refreshing and dropping
+a managed relation moved to `derive:manage` in Phase 1 wave 1, because a scope
+in the default read-only preset must not authorise a write; `federation:observe` names the third-party databases behind the
 instance; `semantic:source` names every table and view in the database,
 including ones no layer uses.
 

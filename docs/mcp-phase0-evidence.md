@@ -34,7 +34,7 @@ component and the configuration API's validation of the credential it issues.
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker, the configuration API and the MCP runtime — three copies, cross-checked |
 | Credential administration | Dashboard: agent-client issuance and consent inspection and revocation, both audited, administrator-session only |
 | Operation allowlist | 38 of the platform's 69 actions |
-| Scope vocabulary | 11 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
+| Scope vocabulary | 12 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
 
 Public paths on the MCP origin: `/.well-known/oauth-authorization-server`,
 `/oauth/authorize`, `/oauth/token`, `/oauth/login`. Everything else 404s.

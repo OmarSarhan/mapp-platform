@@ -964,6 +964,54 @@ class DeclaredPaginationLimitTests(unittest.TestCase):
                     )
 
 
+class DeriveScopeSplitTests(unittest.TestCase):
+    """`derive` reads; `derive:manage` changes what is read.
+
+    One scope used to do both. It authorised reading aggregate values from a
+    managed relation *and* creating, replacing or dropping that relation, and
+    it sits in the dashboard's default read-only preset -- so the split is not
+    tidying. The action table and this classifier are separate places, and the
+    classifier is the one that actually refuses, so it gets its own test.
+    """
+
+    def scope(self, path, method):
+        return app.Handler._required_scope(path, method)
+
+    def test_reading_values_still_costs_the_read_scope(self) -> None:
+        for path in ("/api/layers/Stops/values", "/api/layers/Stops/statistics"):
+            with self.subTest(path=path):
+                self.assertEqual("derive", self.scope(path, "GET"))
+
+    def test_testing_an_expression_still_costs_the_read_scope(self) -> None:
+        """It returns a sample value from a configured layer's relation, which
+        is what layers.values costs and no more."""
+        self.assertEqual("derive", self.scope("/api/sql/test", "POST"))
+
+    def test_the_derived_layer_lifecycle_costs_the_manage_scope(self) -> None:
+        for path in ("/api/derived-layers",
+                     "/api/derived-layers/census_oa/refresh",
+                     "/api/derived-layers/census_oa"):
+            for method in ("POST", "PUT", "DELETE"):
+                with self.subTest(path=path, method=method):
+                    self.assertEqual("derive:manage", self.scope(path, method))
+
+    def test_listing_derived_layers_is_still_an_ordinary_read(self) -> None:
+        self.assertEqual("inspect", self.scope("/api/derived-layers", "GET"))
+
+    def test_cancelling_an_operation_costs_the_manage_scope(self) -> None:
+        """A write: it stops work somebody may be waiting on."""
+        self.assertEqual(
+            "derive:manage",
+            self.scope("/api/operations/" + "a" * 32 + "/cancel", "POST"),
+        )
+
+    def test_reading_an_operation_is_not_gated_by_the_manage_scope(self) -> None:
+        """Deliberate. The queue is already listed to any `inspect` credential,
+        so refusing the detail of a job a grant can see listed would be
+        inconsistent; the kind map inside do_GET carries the same reasoning."""
+        self.assertIsNone(self.scope("/api/operations/" + "a" * 32, "GET"))
+
+
 class ProposalReadRouteTests(unittest.TestCase):
     """GET /api/proposals/<id> for an unknown id must name the proposal, not
     the file. The read is a plain `.read_text()`, so a missing record raises an
