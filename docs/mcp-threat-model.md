@@ -21,12 +21,19 @@ cases, with the two unmitigated rows below — approval fatigue in full, client
 attestation in part — carried knowingly. O20, carried as an unverified control
 through Phase 0, is now measured and closed.
 
-**Two rows are newer than that acceptance and have not been accepted**:
-disclosure through a read grant, and reading data through an expression. Both
-were added on 2026-09-18, after the read surface grew from two tools to 37.
-Neither is unmitigated, but the first names a residual the owner should decide
-about explicitly — a grant holding a scope sees everything that scope covers,
-with no per-layer or row-level restriction designed.
+**Two further rows accepted on 2026-09-18**: disclosure through a read grant,
+and reading data through an expression. Both were added after the read surface
+grew from two tools to 37. The residual in the first was accepted knowingly: a
+grant holding a scope sees everything that scope covers, with no per-layer or
+row-level restriction designed, so an instance whose workspace or catalogue is
+itself sensitive should not issue agent credentials for it.
+
+The claims this document rests on are asserted in
+`mcp-auth/tests/test_threat_model_claims.py`, not merely written here. A
+threat model is read instead of the code, so a sentence in it that quietly
+stops being true is worse than one never written. Writing those tests found
+one such sentence already: this document claimed both wider scopes were kept
+out of every preset, when `federation:observe` has its own.
 
 ## Assets
 
@@ -40,6 +47,7 @@ with no per-layer or row-level restriction designed.
 | Operator session | `control.oauth_sessions` + `mapp_oauth_session` cookie | Consent on behalf of the operator |
 | Client secrets | `control.oauth_clients`, sha256 | Impersonation of the broker or the configuration API to the control listener |
 | Workspace and platform state | outside this component | The effect the whole design exists to gate |
+| Workspace description | read through the configuration API by 37 tools | Disclosure of every layer's configuration and the relation it reads, the derived inventory, curated meaning, the source relation inventory, the federated source registry, and the full diff of every proposal |
 
 Only hashes are persisted for every credential. Raw values are returned once and
 never stored, never logged.
@@ -297,11 +305,10 @@ solved.
 
 ### Disclosure through a read grant
 
-The surface this document was first written against had two tools. It now has
-37, all reads, and what a single `inspect` grant discloses is no longer
-self-evident: every layer's configuration including the relation and columns it
-reads, the derived-layer inventory, the review queue with the full diff of
-every proposal ever made, the platform contract, and the workspace JSON schema.
+What a single `inspect` grant discloses is not self-evident from the scope's
+name: every layer's configuration including the relation and columns it reads,
+the derived-layer inventory, the review queue with the full diff of every
+proposal ever made, the platform contract, and the workspace JSON schema.
 Adding `semantic:inspect` discloses curated meaning and its change history;
 `derive` discloses aggregate values and distribution summaries over a layer's
 own relation; `federation:observe` names the third-party databases behind the
@@ -310,10 +317,12 @@ including ones no layer uses.
 
 **Partly controlled, and the control is scope separation rather than
 redaction.** The four disclosures above sit behind four different scopes, none
-implied by another, so an operator grants each deliberately: the dashboard's
-analysis preset stops at `derive` and `semantic:inspect`, and both
-`federation:observe` and `semantic:source` are left out of every preset for
-that reason. `full` and `admin` are never issued for this resource, and the
+implied by another, so an operator grants each deliberately. The dashboard's
+default `analysis` preset stops at `derive` and `semantic:inspect`;
+`federation:observe` is offered only through a separate `analysis-federated`
+preset, so naming the third-party databases is a different choice from reading
+the workspace; and `semantic:source` is in no preset at all, so the database's
+relation inventory can only be granted by ticking it. `full` and `admin` are never issued for this resource, and the
 configuration API withholds credential identifiers from an exchanged
 credential at the response layer, so `actor` fields arrive as `[withheld]`
 whichever tool returns them.
@@ -356,6 +365,18 @@ and no more; `full` and `admin` never issued for the MCP resource; no direct
 saves, no credential administration, no token issuance or revocation, and no
 dashboard or audit administration exposed; every consequential operation
 requiring a fresh token B bound to one request.
+
+What it gets is disclosure, at the speed of a script. The surface is 37 reads,
+so a hostile client holding an ordinary analysis grant can enumerate the whole
+workspace description in a few dozen calls — every layer and the relation it
+reads, the catalogue, the proposal history — and nothing rate-limits reading.
+The bound is which scopes the grant carries, not how many tools exist or how
+fast they are called. This is the same disclosure the row above describes,
+reached through a client rather than a person; it is listed separately because
+the mitigations differ, and for a compromised client the only ones that bite
+are the scope the operator chose and disabling it afterwards. Which is why the
+preset an operator reaches for matters: `analysis` is the default and excludes
+both of the scopes that disclose anything beyond the configured workspace.
 
 Disabling a client takes effect immediately at introspection, at the exchange,
 and for an already-issued token B — the last of which required checking the
