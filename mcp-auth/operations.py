@@ -291,6 +291,23 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:observe", ),
         mutating=False,
     ),
+    "proposals.create": Operation(
+        operation_id="proposals.create",
+        method="POST",
+        path_template="/api/proposals",
+        required_scopes=("propose",),
+        # Writes a proposal record and no workspace. Single-use anyway: the
+        # risk class is `propose`, which is not a read class, and a replayed
+        # create would add a second identical entry to somebody's queue.
+        mutating=True,
+    ),
+    "semantic.proposals.create": Operation(
+        operation_id="semantic.proposals.create",
+        method="POST",
+        path_template="/api/semantic/proposals",
+        required_scopes=("semantic:propose",),
+        mutating=True,
+    ),
     "proposals.check": Operation(
         operation_id="proposals.check",
         method="POST",

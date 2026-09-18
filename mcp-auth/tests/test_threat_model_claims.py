@@ -75,18 +75,26 @@ class ThreatModelClaimTests(unittest.TestCase):
                         f"{name} reaches the administrative surface {path}",
                     )
 
-    def test_no_mutating_operation_is_reachable_by_an_offered_scope(self) -> None:
-        """The read surface is read-only in the sense that matters: every
-        mutating operation on the allowlist needs a scope no dashboard option
-        offers, so no credential an operator can issue reaches one.
+    #: The mutations an operator can currently grant, pinned so that adding
+    #: one is a deliberate edit here and not a side effect of allowlisting.
+    #: Both write a proposal record and no workspace.
+    REACHABLE_MUTATIONS = ["proposals.create", "semantic.proposals.create"]
 
-        This had one exception until Phase 1 wave 1. `derived-layers.refresh`
-        needed only `derive`, which is offered and sits in the default analysis
-        preset -- so the scope that lets an agent read aggregate values also
-        authorised replacing the relation they come from, and the only thing
-        holding it shut was that no tool called it. Splitting `derive` from
-        `derive:manage` closed that, and the assertion is now the empty list
-        rather than a named exception.
+    def test_only_queue_writing_mutations_are_reachable(self) -> None:
+        """What an agent can change, and what it still cannot.
+
+        Until Phase 1 wave 3 this list was empty and the assertion said so.
+        Allowlisting the two creates is the point at which an agent can write
+        durable state, and the property that replaces "nothing" is narrower
+        than it looks: both write a proposal record and neither touches a
+        workspace. What they produce is an entry in a review queue that a
+        person must still decide on, and `proposals_show` has been readable
+        since Phase 0, so the thing an agent creates is the thing a human
+        reads before anything happens.
+
+        Applying is not on this list and is a different scope. If
+        `proposals.apply` ever appears here, the review step has become
+        optional and this test is where that shows.
         """
         start = DASHBOARD.index("export const MCP_SCOPE_OPTIONS=[")
         block = DASHBOARD[start : DASHBOARD.index("];", start)]
@@ -95,7 +103,21 @@ class ThreatModelClaimTests(unittest.TestCase):
             name for name, op in operations.OPERATIONS.items()
             if op.mutating and set(op.required_scopes) <= offered
         )
-        self.assertEqual([], reachable)
+        self.assertEqual(sorted(self.REACHABLE_MUTATIONS), reachable)
+
+    def test_no_reachable_mutation_changes_a_workspace(self) -> None:
+        """The property the list above rests on, checked rather than asserted
+        in prose: every reachable mutation is a proposal create, whose effect
+        is an entry in a queue. `apply`, `reload` and the derived-layer
+        lifecycle all cost scopes no dashboard option offers.
+        """
+        for name in self.REACHABLE_MUTATIONS:
+            with self.subTest(operation=name):
+                self.assertTrue(
+                    name.endswith("proposals.create"),
+                    f"{name} is reachable and is not a proposal create",
+                )
+                self.assertEqual("propose", ACTION_SCHEMAS[name]["risk"])
 
     def test_the_default_preset_discloses_only_the_configured_workspace(self) -> None:
         """"`analysis` is the default and excludes both of the scopes that

@@ -112,6 +112,20 @@ PROPOSALS_LIST = {
     "scopes": ("inspect",),
 }
 
+PROPOSALS_CREATE = {
+    "operation_id": "proposals.create",
+    "method": "POST",
+    "path_template": "/api/proposals",
+    "scopes": ("propose",),
+}
+
+SEMANTIC_PROPOSALS_CREATE = {
+    "operation_id": "semantic.proposals.create",
+    "method": "POST",
+    "path_template": "/api/semantic/proposals",
+    "scopes": ("semantic:propose",),
+}
+
 PROPOSALS_CHECK = {
     "operation_id": "proposals.check",
     "method": "POST",
@@ -1063,6 +1077,116 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         if status is not None:
             entries = [entry for entry in entries if entry["status"] == status]
         return {"proposals": entries}
+
+    @tool(
+        operation=PROPOSALS_CREATE,
+        name="proposals_create",
+        description=(
+            "Add a workspace change to the review queue. Takes the same"
+            " `operations` and `revision` as proposals_check plus the"
+            " `checkFingerprint` it returned, so a proposal can only be made"
+            " from a change that was validated. Applies nothing: a person"
+            " reviews and applies separately."
+        ),
+    )
+    def proposals_create(
+        operations: list[dict],
+        revision: str,
+        check_fingerprint: str,
+        explanation: str | None = None,
+    ) -> dict:
+        """The first tool here that changes durable state, and the narrowest
+        way to do it.
+
+        What it writes is a queue entry. The workspace is untouched, the map
+        serves what it served before, and somebody has to read the proposal and
+        apply it for anything to happen -- which they can do with the tools
+        that already exist, since `proposals_show` returns the diff.
+
+        `check_fingerprint` is required here although the platform accepts a
+        create without one. The fingerprint binds this proposal to a specific
+        validated candidate: supply a stale one and the platform refuses rather
+        than proposing something nobody checked. Making it required means an
+        agent cannot propose except from a change it has already run through
+        `proposals_check`, which costs one extra call and removes the whole
+        class of proposal that was never validated.
+
+        The reply is summarised for the reason `proposals_show` summarises one:
+        the platform returns the proposal with `original` and `candidate`
+        attached -- 32,579 bytes for a one-line rename, of which 31,640 is the
+        workspace twice.
+        """
+        body = {
+            "revision": revision,
+            "operations": operations,
+            "checkFingerprint": check_fingerprint,
+        }
+        if explanation is not None:
+            body["explanation"] = explanation
+        payload = spend(
+            PROPOSALS_CREATE, path=PROPOSALS_CREATE["path_template"], body=body
+        )
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        diff = proposal.get("diff")
+        warnings = proposal.get("warnings")
+        detail = dict(_proposal_summary(proposal))
+        detail["explanation"] = proposal.get("explanation")
+        detail["originalRevision"] = proposal.get("originalRevision")
+        detail["warnings"] = warnings if isinstance(warnings, list) else []
+        detail["changes"] = [
+            _change_summary(entry)
+            for entry in (diff if isinstance(diff, list) else [])
+        ]
+        return detail
+
+    @tool(
+        operation=SEMANTIC_PROPOSALS_CREATE,
+        name="semantic_proposals_create",
+        description=(
+            "Add a change to one catalogued asset's curated meaning to the"
+            " semantic review queue. Takes the assetId, baseVersion,"
+            " `operations` and the `fingerprint` from"
+            " semantic_proposals_check. Applies nothing."
+        ),
+    )
+    def semantic_proposals_create(
+        asset_id: str,
+        base_version: int,
+        operations: list[dict],
+        fingerprint: str,
+        explanation: str | None = None,
+    ) -> dict:
+        """The semantic counterpart. The platform already requires the
+        fingerprint here, so check-then-create is its rule rather than this
+        tool's addition."""
+        body = {
+            "assetId": asset_id,
+            "baseVersion": base_version,
+            "operations": operations,
+            "fingerprint": fingerprint,
+        }
+        if explanation is not None:
+            body["explanation"] = explanation
+        payload = spend(
+            SEMANTIC_PROPOSALS_CREATE,
+            path=SEMANTIC_PROPOSALS_CREATE["path_template"],
+            body=body,
+        )
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        diff = proposal.get("diff")
+        return {
+            "proposalId": proposal.get("id"),
+            "status": proposal.get("status"),
+            "assetId": proposal.get("assetId"),
+            "baseVersion": proposal.get("baseVersion"),
+            "catalogRevision": payload.get("catalogRevision"),
+            "changes": [
+                _semantic_change_summary(entry)
+                for entry in (diff if isinstance(diff, list) else [])
+            ],
+        }
 
     @tool(
         operation=PROPOSALS_CHECK,

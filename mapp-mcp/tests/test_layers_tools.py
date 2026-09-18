@@ -2255,6 +2255,132 @@ class ProposalCheckTests(ToolTestCase):
                 self.assertEqual([], detail["changes"])
 
 
+# Cut from a live create. The bulk is the point: `original` and `candidate`
+# came to 31,640 of the 32,579 bytes, for a one-line rename.
+CREATED = {"proposal": {
+    "id": "1789749116-af15f72b46fd-217e2c",
+    "status": "pending",
+    "created": "2026-09-18T16:31:56Z",
+    "actor": "[withheld]",
+    "explanation": "shape probe",
+    "originalRevision": "16c8b6dd",
+    "originalHash": "e8eefb22",
+    "candidateHash": "9cade65c",
+    "pluginCatalogueFingerprint": "f77fbba3",
+    "original": {"locale": {"layers": {"Bus_Stops": {"name": "snapshot-only"}}}},
+    "candidate": {"locale": {"layers": {"Bus_Stops": {"name": "snapshot-only"}}}},
+    "warnings": [],
+    "operations": [{"op": "set", "path": "/locale/layers/Bus_Stops/name",
+                    "value": "Bus Stops (shape probe)"}],
+    "diff": [{"op": "replace", "path": "/locale/layers/Bus_Stops/name",
+              "old": "Bus Stops", "value": "Bus Stops (shape probe)"}],
+}, "meta": {"requestId": "r15"}}
+
+SEMANTIC_CREATED = {"catalogRevision": 53, "proposal": {
+    "id": "sp-9", "status": "pending",
+    "assetId": "440c4b84-4c84-4452-acff-7f4cbb9ca1bd", "baseVersion": 1,
+    "diff": [{"op": "set", "path": "/curated/description",
+              "before": {"exists": False},
+              "after": {"exists": True, "value": "probe"}}],
+}, "meta": {"requestId": "r16"}}
+
+
+class ProposalCreateTests(ToolTestCase):
+    """The first tool here that changes durable state.
+
+    What it writes is a queue entry: the workspace is untouched and somebody
+    has to read the proposal and apply it for anything to happen.
+    """
+
+    def tool(self, name="proposals_create", payload=CREATED, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def call(self, fn, **over):
+        args = {"operations": [{"op": "set", "path": "/x", "value": 1}],
+                "revision": "16c8b6dd", "check_fingerprint": "fp-1"}
+        args.update(over)
+        return fn(**args)
+
+    def test_it_reports_the_queue_entry_it_created(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.call(self.tool())
+        self.assertEqual("1789749116-af15f72b46fd-217e2c", detail["proposalId"])
+        self.assertEqual("pending", detail["status"])
+
+    def test_the_workspace_snapshots_never_reach_the_agent(self) -> None:
+        """31,640 of 32,579 bytes for a one-line rename, and the platform has
+        already derived the diff from them."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.call(self.tool())
+        for dropped in ("original", "candidate"):
+            self.assertNotIn(dropped, detail)
+        self.assertNotIn("snapshot-only", json.dumps(detail))
+
+    def test_the_change_it_made_is_reported_back(self) -> None:
+        """So an agent can confirm what it proposed without a second call."""
+        self.as_caller(caller(scopes=AUTHORING))
+        change = self.call(self.tool())["changes"][0]
+        self.assertEqual("Bus Stops", change["was"])
+        self.assertEqual("Bus Stops (shape probe)", change["becomes"])
+
+    def test_the_check_fingerprint_is_required_and_sent(self) -> None:
+        """The platform accepts a create without one. Requiring it here means
+        an agent cannot propose except from a change it has validated."""
+        api = FakeConfigApi(answer=CREATED)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.call(self.build_named("proposals_create", config_api=api),
+                  check_fingerprint="fp-7")
+        self.assertEqual("fp-7", api.calls[0]["body"]["checkFingerprint"])
+        self.assertEqual("POST", api.calls[0]["method"])
+
+        with self.assertRaises(TypeError):
+            self.build_named("proposals_create")(
+                operations=[], revision="r")
+
+    def test_it_costs_propose_and_is_single_use(self) -> None:
+        """A replayed create would add a second identical entry to somebody's
+        queue, which is why the risk class is not a read class."""
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=AUTHORING))
+        self.call(self.tool(exchange=exchange))
+        self.assertEqual("propose", exchange.calls[0]["scope"])
+
+    def test_it_is_refused_without_the_propose_scope(self) -> None:
+        self.as_caller(caller(scopes=WIDE))
+        with self.assertRaises(ToolError) as raised:
+            self.call(self.tool())
+        self.assertIn("propose", str(raised.exception))
+
+    def test_the_semantic_create_sends_what_the_platform_requires(self) -> None:
+        api = FakeConfigApi(answer=SEMANTIC_CREATED)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.build_named("semantic_proposals_create", config_api=api)(
+            asset_id="a-1", base_version=3, operations=[], fingerprint="f-2")
+        self.assertEqual(
+            {"assetId": "a-1", "baseVersion": 3, "operations": [],
+             "fingerprint": "f-2"},
+            api.calls[0]["body"],
+        )
+
+    def test_the_semantic_create_keeps_the_semantic_diff_shape(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.build_named(
+            "semantic_proposals_create",
+            config_api=FakeConfigApi(answer=SEMANTIC_CREATED))(
+            asset_id="a", base_version=1, operations=[], fingerprint="f")
+        self.assertEqual("sp-9", detail["proposalId"])
+        self.assertEqual({"exists": False}, detail["changes"][0]["was"])
+
+    def test_unexpected_shapes_degrade_rather_than_raising(self) -> None:
+        for payload in ({}, {"proposal": None}, {"proposal": {"diff": "x"}}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller(scopes=AUTHORING))
+                detail = self.call(self.tool(payload=payload))
+                self.assertEqual([], detail["changes"])
+
+
 class MetaEnvelopeTests(unittest.TestCase):
     """No read tool returns the request-correlation envelope.
 

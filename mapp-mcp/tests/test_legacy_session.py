@@ -279,9 +279,12 @@ class LegacySessionTests(unittest.TestCase):
         self.assertEqual(
             {"federation_list", "federation_show", "federation_groups",
              "semantic_source_relations",
-             # Reads that cost a propose scope. This grant is the analysis
-             # preset, which reads an instance but cannot author against it.
-             "proposals_check", "semantic_proposals_check"},
+             # The authoring surface. This grant is the analysis preset,
+             # which reads an instance but cannot author against it: neither
+             # the checks that cost a propose scope nor the creates that spend
+             # it are shown to it.
+             "proposals_check", "semantic_proposals_check",
+             "proposals_create", "semantic_proposals_create"},
             withheld,
         )
 
