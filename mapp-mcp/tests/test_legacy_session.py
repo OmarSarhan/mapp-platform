@@ -133,6 +133,26 @@ def registered_tool_names():
     return sorted(server._tool_manager._tools)
 
 
+def permitted_tool_names(scopes=SCOPES):
+    """The tools a grant carrying `scopes` is entitled to see.
+
+    Derived from the runtime's own registration, like registered_tool_names()
+    above and for the same reason. The two differ on purpose: everything stays
+    registered and callable-checked, while the listing shows only what this
+    credential could actually invoke.
+    """
+    resource = ProtectedResource(origin=ORIGIN, issuer=ORIGIN)
+    from runtime import build_runtime
+
+    server = build_runtime(resource=resource, exchange=FakeExchange(),
+                           config_api=FakeConfigApi())
+    held = frozenset(scopes.split())
+    return sorted(
+        name for name in server._tool_manager._tools
+        if frozenset(server.tool_scopes.get(name, ())) <= held
+    )
+
+
 def composed(scopes=SCOPES):
     """The shipped stack, with only the platform behind the tools replaced.
 
@@ -237,12 +257,29 @@ class LegacySessionTests(unittest.TestCase):
             "a session identifier crossed the boundary",
         )
 
-    def test_both_tools_are_listed_over_the_legacy_era(self) -> None:
+    def test_the_listed_tools_are_the_ones_this_grant_can_call(self) -> None:
+        """What a client is shown is what it may invoke, not everything that
+        exists. A grant carrying mcp:connect alone used to be shown all of
+        them and could call none."""
         transcript, _, _ = self.drive()
         listed = rpc_result(transcript["tools/list"][2])["result"]["tools"]
         self.assertEqual(
-            registered_tool_names(),
+            permitted_tool_names(),
             sorted(t["name"] for t in listed),
+        )
+
+    def test_tools_this_grant_cannot_call_are_withheld(self) -> None:
+        """The half that matters, stated rather than implied by an equality:
+        this grant carries neither federation:observe nor semantic:source, and
+        the tools needing them are absent."""
+        transcript, _, _ = self.drive()
+        listed = {t["name"] for t in
+                  rpc_result(transcript["tools/list"][2])["result"]["tools"]}
+        withheld = set(registered_tool_names()) - listed
+        self.assertEqual(
+            {"federation_list", "federation_show", "federation_groups",
+             "semantic_source_relations"},
+            withheld,
         )
 
     def test_a_tool_reaches_the_platform_with_the_caller_s_own_credential(self) -> None:
@@ -455,7 +492,7 @@ class ModernSessionTests(unittest.TestCase):
         self.assertEqual(200, status, body[:200])
         listed = rpc_result(body)["result"]["tools"]
         self.assertEqual(
-            registered_tool_names(),
+            permitted_tool_names(),
             sorted(t["name"] for t in listed),
         )
 

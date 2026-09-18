@@ -613,7 +613,25 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         ),
     )
 
-    @server.tool(
+    #: What each registered tool costs, recorded at registration so the listing
+    #: and the call check read the same value. Restating it would be a second
+    #: place to forget.
+    tool_scopes: dict[str, tuple[str, ...]] = {}
+
+    def tool(*, name, description, operation):
+        """Register a tool and record the scopes it needs.
+
+        `operation` is keyword-only and required, with no default. A tool added
+        without one would be listed to every caller and then refuse, which is
+        exactly the behaviour this exists to remove -- so the omission has to
+        be a visible `operation=None` rather than a silent default.
+        """
+        if operation is not None:
+            tool_scopes[name] = tuple(operation["scopes"])
+        return server.tool(name=name, description=description)
+
+    @tool(
+        operation=None,  # Answers from this process; reaches no platform route.
         name="describe_instance",
         description=(
             "The MAPP instance this server speaks for: its resource identity,"
@@ -723,7 +741,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 "The configuration API is unavailable; try again."
             ) from None
 
-    @server.tool(
+    @tool(
+        operation=LAYERS_LIST,
         name="layers_list",
         description=(
             "Every configured layer in the workspace, as a compact index:"
@@ -755,7 +774,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                        for key, layer in _layers_of(payload)],
         }
 
-    @server.tool(
+    @tool(
+        operation=LAYERS_LIST,
         name="layers_get",
         description=(
             "One configured layer in full: its data source, fields, styling and"
@@ -788,7 +808,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             + (f" Configured layers: {', '.join(sorted(known))}." if known else "")
         )
 
-    @server.tool(
+    @tool(
+        operation=CATALOG_LIST,
         name="catalog_list",
         description=(
             "Database relations available to this instance, with each column's"
@@ -838,7 +859,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         return {"databases": payload.get("databases"), "relations": relations}
 
-    @server.tool(
+    @tool(
+        operation=DERIVED_LAYERS_LIST,
         name="derived_layers_list",
         description=(
             "Managed derived relations: which exist, and how each was built."
@@ -857,7 +879,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=DERIVED_LAYERS_LIST,
         name="derived_layers_show",
         description=(
             "One managed derived relation in full: its recipe, source"
@@ -890,7 +913,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             + (f" Managed relations: {', '.join(sorted(known))}." if known else "")
         )
 
-    @server.tool(
+    @tool(
+        operation=FEDERATION_LIST,
         name="federation_list",
         description=(
             "External sources federated into this instance, with each alias's"
@@ -919,7 +943,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             ],
         }
 
-    @server.tool(
+    @tool(
+        operation=FEDERATION_SHOW,
         name="federation_show",
         description=(
             "One federated source alias: its status, the evidence accepted for"
@@ -945,7 +970,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         return _alias_detail(record)
 
-    @server.tool(
+    @tool(
+        operation=PROPOSALS_LIST,
         name="proposals_list",
         description=(
             "Workspace changes that have been proposed: what was suggested,"
@@ -979,7 +1005,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             entries = [entry for entry in entries if entry["status"] == status]
         return {"proposals": entries}
 
-    @server.tool(
+    @tool(
+        operation=PROPOSALS_SHOW,
         name="proposals_show",
         description=(
             "One queued proposal in detail: why it exists, what it would"
@@ -1065,7 +1092,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             }
         return detail
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_PROPOSALS_LIST,
         name="semantic_proposals_list",
         description=(
             "Proposed changes to curated semantic meaning, with their review"
@@ -1078,7 +1106,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(SEMANTIC_PROPOSALS_LIST, path=SEMANTIC_PROPOSALS_LIST["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_PROPOSALS_SHOW,
         name="semantic_proposals_show",
         description=(
             "One proposed semantic change in full, including what it would"
@@ -1098,7 +1127,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         )
         return _without_meta(spend(SEMANTIC_PROPOSALS_SHOW, path=path))
 
-    @server.tool(
+    @tool(
+        operation=XYZ_STATUS,
         name="xyz_status",
         description=(
             "Whether the map tile service has picked up the current workspace:"
@@ -1117,7 +1147,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         """
         return _without_meta(spend(XYZ_STATUS, path=XYZ_STATUS["path_template"]))
 
-    @server.tool(
+    @tool(
+        operation=OPERATIONS_SHOW,
         name="operations_show",
         description=(
             "One asynchronous operation: its kind, status, stage and when it"
@@ -1166,7 +1197,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             }
         return detail
 
-    @server.tool(
+    @tool(
+        operation=DERIVED_LAYERS_CAPABILITIES,
         name="derived_layers_capabilities",
         description=(
             "What derived-layer work this deployment supports: the kinds it"
@@ -1189,7 +1221,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=SQL_TEST,
         name="sql_test",
         description=(
             "Try one read-only SQL expression as a calculated field on an"
@@ -1237,7 +1270,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(SQL_TEST, path=SQL_TEST["path_template"], body=body)
         )
 
-    @server.tool(
+    @tool(
+        operation=SQL_CAPABILITIES,
         name="sql_capabilities",
         description=(
             "Which SQL an expression may use: the mode, the supported"
@@ -1251,7 +1285,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(SQL_CAPABILITIES, path=SQL_CAPABILITIES["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=CAPABILITIES_LIST,
         name="capabilities_list",
         description=(
             "The platform's contract: every action with its method, path,"
@@ -1297,7 +1332,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             ],
         }
 
-    @server.tool(
+    @tool(
+        operation=SCHEMA,
         name="schema",
         description=(
             "The workspace JSON schema: its top level, and the names of the"
@@ -1330,7 +1366,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             key: value for key, value in document.items() if key != "$defs"
         } | {"definitions": sorted(defs)}
 
-    @server.tool(
+    @tool(
+        operation=RULES,
         name="rules",
         description=(
             "The authoring rules a workspace change must satisfy, each with"
@@ -1342,7 +1379,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         """What makes a candidate valid, stated rather than discovered."""
         return _without_meta(spend(RULES, path=RULES["path_template"]))
 
-    @server.tool(
+    @tool(
+        operation=EXAMPLES,
         name="examples",
         description=(
             "Worked examples of valid workspace operations, each with the"
@@ -1354,7 +1392,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         """Known-good operations, which is the fastest way to a valid one."""
         return _without_meta(spend(EXAMPLES, path=EXAMPLES["path_template"]))
 
-    @server.tool(
+    @tool(
+        operation=PLUGINS_LIST,
         name="plugins_list",
         description=(
             "The plugins this instance has configured: the bundled and"
@@ -1372,7 +1411,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(PLUGINS_LIST, path=PLUGINS_LIST["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=DEPENDENCIES_LIST,
         name="dependencies_list",
         description=(
             "Which layers depend on which relations, so the reach of a change"
@@ -1390,7 +1430,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(DEPENDENCIES_LIST, path=DEPENDENCIES_LIST["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=ICONS_LIST,
         name="icons_list",
         description=(
             "The icons a layer's styling may reference, with their sources."
@@ -1402,7 +1443,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(ICONS_LIST, path=ICONS_LIST["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_STATUS,
         name="semantic_status",
         description=(
             "Whether the semantic service is reachable and what it supports on"
@@ -1423,7 +1465,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(SEMANTIC_STATUS, path=SEMANTIC_STATUS["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_SOURCE_RELATIONS,
         name="semantic_source_relations",
         description=(
             "The tables and views available to model: their source alias,"
@@ -1455,7 +1498,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_DERIVED_PROFILES_LIST,
         name="semantic_derived_profiles_list",
         description=(
             "Derived profiles: the managed relations the semantic service"
@@ -1478,7 +1522,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_DERIVED_PROFILES_SHOW,
         name="semantic_derived_profiles_show",
         description=(
             "One derived profile by name: its relation, kind, catalogued"
@@ -1493,7 +1538,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         )
         return _without_meta(spend(SEMANTIC_DERIVED_PROFILES_SHOW, path=path))
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_CATALOG_HISTORY,
         name="semantic_catalog_history",
         description=(
             "How a catalogued asset's meaning changed over time: each event"
@@ -1528,7 +1574,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             ],
         }
 
-    @server.tool(
+    @tool(
+        operation=DERIVED_LAYERS_JOBS,
         name="derived_layers_jobs",
         description=(
             "Background job capacity for derived layers: how many are"
@@ -1547,7 +1594,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(DERIVED_LAYERS_JOBS, path=DERIVED_LAYERS_JOBS["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=DERIVED_LAYERS_MAP_EXTENT,
         name="derived_layers_map_extent",
         description=(
             "The spatial extent derived-layer work is bounded by: the"
@@ -1570,7 +1618,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=FEDERATION_GROUPS,
         name="federation_groups",
         description=(
             "Federation group labels and how many live sources carry each."
@@ -1590,7 +1639,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             spend(FEDERATION_GROUPS, path=FEDERATION_GROUPS["path_template"])
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_CATALOG_LIST,
         name="semantic_catalog_list",
         description=(
             "Every catalogued semantic asset: what the platform records about"
@@ -1618,7 +1668,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             ],
         }
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_CATALOG_SEARCH,
         name="semantic_catalog_search",
         description=(
             "Search catalogued semantic assets by text. Returns matches ranked"
@@ -1640,7 +1691,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=SEMANTIC_CATALOG_SHOW,
         name="semantic_catalog_show",
         description=(
             "One semantic asset in full: its description, per-field meaning,"
@@ -1662,7 +1714,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         )
         return _without_meta(spend(SEMANTIC_CATALOG_SHOW, path=path))
 
-    @server.tool(
+    @tool(
+        operation=LAYERS_STATISTICS,
         name="layers_statistics",
         description=(
             "Distribution summary for one numeric column of one layer: range,"
@@ -1699,7 +1752,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             )
         )
 
-    @server.tool(
+    @tool(
+        operation=LAYERS_VALUES,
         name="layers_values",
         description=(
             "Bounded category counts for one field of one configured layer."
@@ -1729,6 +1783,40 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 query=layer_values_query(field=field, locale=locale, limit=limit),
             )
         )
+
+    registered = server.list_tools
+
+    async def list_tools():
+        """Only the tools this credential could actually call.
+
+        A grant carrying `mcp:connect` alone was shown all 37 and could invoke
+        none of them; the analysis preset is shown every tool and refused by
+        the federation and source ones. Either way the agent discovers what it
+        may do by being told no, which wastes a turn per tool and reads to a
+        person as a broken server rather than a narrow grant.
+
+        Registration is deliberately not filtered -- `_tool_manager` still
+        holds every tool, and `spend` still checks the scope on the way in.
+        This filters what is *described*, so the listing and the refusal agree
+        instead of contradicting each other. Removing it would widen nothing;
+        the call check is the boundary and this is the presentation of it.
+
+        Fails closed: with no caller in context nothing platform-backed is
+        listed, because a listing that defaulted to everything would be the
+        current behaviour restored the first time the middleware changed.
+        """
+        caller = CURRENT_CALLER.get()
+        held = frozenset(caller.scopes) if caller is not None else frozenset()
+        return [
+            described
+            for described in await registered()
+            if frozenset(tool_scopes.get(described.name, ())) <= held
+        ]
+
+    server.list_tools = list_tools
+    # Exposed so tests can derive what a given grant should see from the same
+    # values the filter uses, rather than restating a list that drifts.
+    server.tool_scopes = tool_scopes
 
     return server
 

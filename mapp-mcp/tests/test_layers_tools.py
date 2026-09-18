@@ -8,6 +8,7 @@ a caller when the platform says no.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import unittest
@@ -1835,6 +1836,117 @@ class RefusalDetailTests(ToolTestCase):
                 [{"path": f"f{n}", "message": f"m{n}"} for n in range(12)]
             )(layer="Stops", expression="1")
         self.assertEqual(5, str(raised.exception).count("\nf"))
+
+
+class ToolVisibilityTests(ToolTestCase):
+    """A tool a grant cannot call is not shown to it.
+
+    Found by acceptance: a grant carrying mcp:connect alone was listed all 37
+    tools and could invoke none of them, and the analysis preset was listed
+    every tool and refused by the federation and source ones. Either way an
+    agent discovers what it may do by being told no, one wasted turn at a time,
+    and a person reads that as a broken server rather than a narrow grant.
+    """
+
+    def listed(self, scopes):
+        server = self.build()
+        self.as_caller(caller(scopes=scopes))
+        return sorted(t.name for t in asyncio.run(server.list_tools()))
+
+    def build(self, *, exchange=None, config_api=None):
+        resource = ProtectedResource(
+            origin="http://mcp.localhost", issuer="http://mcp.localhost"
+        )
+        return build_runtime(
+            resource=resource,
+            exchange=exchange or FakeExchange(),
+            config_api=config_api or FakeConfigApi(),
+        )
+
+    def test_a_connect_only_grant_is_shown_nothing_it_cannot_call(self) -> None:
+        """It can call nothing that reaches the platform, so it is shown
+        nothing that does. describe_instance answers from this process."""
+        self.assertEqual(["describe_instance"], self.listed("mcp:connect"))
+
+    def test_inspect_reveals_the_tools_it_authorises(self) -> None:
+        listed = self.listed("mcp:connect inspect")
+        self.assertIn("layers_list", listed)
+        self.assertIn("proposals_show", listed)
+        # Needs derive; needs semantic:inspect; needs federation:observe.
+        for hidden in ("layers_values", "semantic_status", "federation_list"):
+            self.assertNotIn(hidden, listed)
+
+    def test_each_scope_adds_exactly_the_tools_that_need_it(self) -> None:
+        base = set(self.listed("mcp:connect inspect"))
+        widened = set(self.listed("mcp:connect inspect federation:observe"))
+        self.assertEqual(
+            {"federation_list", "federation_show", "federation_groups"},
+            widened - base,
+        )
+
+    def test_a_tool_needing_two_scopes_appears_only_with_both(self) -> None:
+        """semantic_source_relations requires semantic:inspect alongside
+        semantic:source, because the configuration API demands both. Holding
+        either alone reveals nothing, which is the subset test doing its job
+        rather than a membership test on the action's own scope."""
+        base = set(self.listed("mcp:connect inspect"))
+        for partial in ("semantic:source", "semantic:inspect"):
+            with self.subTest(scopes=partial):
+                widened = set(self.listed(f"mcp:connect inspect {partial}"))
+                self.assertNotIn("semantic_source_relations", widened)
+        both = set(self.listed(
+            "mcp:connect inspect semantic:inspect semantic:source"))
+        self.assertIn("semantic_source_relations", both - base)
+
+    def test_a_widened_grant_is_shown_everything(self) -> None:
+        listed = self.listed(WIDEST)
+        self.assertIn("semantic_source_relations", listed)
+        self.assertIn("federation_groups", listed)
+        self.assertIn("sql_test", listed)
+
+    def test_the_listing_fails_closed_without_a_caller(self) -> None:
+        """A listing that defaulted to everything would be the old behaviour
+        restored the first time the middleware changed."""
+        server = self.build()
+        CURRENT_CALLER.set(None)
+        self.assertEqual(["describe_instance"],
+                         sorted(t.name for t in asyncio.run(server.list_tools())))
+
+    def test_everything_stays_registered_whatever_is_listed(self) -> None:
+        """Registration is not filtered: the call check is the boundary and
+        this is only its presentation. A hidden tool invoked directly is still
+        refused by spend, and still refused by the platform after that."""
+        server = self.build()
+        self.as_caller(caller(scopes="mcp:connect"))
+        self.assertEqual(1, len(asyncio.run(server.list_tools())))
+        self.assertIn("federation_list", server._tool_manager._tools)
+        self.assertIn("sql_test", server._tool_manager._tools)
+
+    def test_the_registration_wrapper_cannot_default_its_operation(self) -> None:
+        """Read from the source, because the failure is in code not yet
+        written. A tool registered without `operation` records no scopes, and
+        no scopes is a subset of every grant -- so it would be shown to
+        everyone, including the connect-only grant this exists to protect.
+        Every tool declares one today, so nothing else here would notice the
+        default being added."""
+        source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
+        self.assertIn("def tool(*, name, description, operation):", source,
+                      "the registration wrapper must require `operation`")
+        registrations = source.count("    @tool(")
+        declared = source.count("        operation=")
+        self.assertEqual(
+            registrations,
+            declared,
+            "every @tool registration must pass operation= explicitly",
+        )
+
+    def test_every_platform_backed_tool_declares_its_scopes(self) -> None:
+        """The registration wrapper requires `operation`, so a tool cannot be
+        added without one. This pins that describe_instance is the only tool
+        that legitimately declares none."""
+        server = self.build()
+        undeclared = set(server._tool_manager._tools) - set(server.tool_scopes)
+        self.assertEqual({"describe_instance"}, undeclared)
 
 
 class MetaEnvelopeTests(unittest.TestCase):
