@@ -7,6 +7,7 @@ def production_values() -> dict[str, str]:
     return {
         "PRODUCTION_MAP_SITE": "https://maps.company.co.uk",
         "PRODUCTION_CONFIG_SITE": "https://config.company.co.uk",
+        "PRODUCTION_MCP_SITE": "https://mcp.company.co.uk",
         "PRODUCTION_CONFIG_ALLOWED_HOSTS": "config.company.co.uk,config-ui",
         "PRODUCTION_CADDY_EMAIL": "operations@company.co.uk",
         "EDGE_BIND_ADDRESS": "0.0.0.0",
@@ -171,3 +172,46 @@ class ProductionEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpOriginTests(unittest.TestCase):
+    """The third public origin gets the same rules as the other two.
+
+    compose.production.yaml makes PRODUCTION_MCP_SITE required, so a missing
+    value already fails the deploy -- but at `compose config`, with an
+    interpolation error, rather than here where the message says what to do.
+    The HTTPS, DNS and reserved-name rules were applied to two origins of
+    three.
+    """
+
+    def test_a_missing_mcp_origin_is_reported(self):
+        values = production_values()
+        del values["PRODUCTION_MCP_SITE"]
+        self.assertTrue(
+            any("PRODUCTION_MCP_SITE" in error for error in validate(values))
+        )
+
+    def test_the_mcp_origin_must_be_https(self):
+        values = production_values()
+        values["PRODUCTION_MCP_SITE"] = "http://mcp.company.co.uk"
+        self.assertTrue(
+            any("PRODUCTION_MCP_SITE" in error for error in validate(values))
+        )
+
+    def test_the_mcp_origin_must_not_be_a_reserved_name(self):
+        values = production_values()
+        values["PRODUCTION_MCP_SITE"] = "https://mcp.localhost"
+        self.assertTrue(
+            any("PRODUCTION_MCP_SITE" in error for error in validate(values))
+        )
+
+    def test_every_pair_of_origins_must_differ(self):
+        for key in ("PRODUCTION_MAP_SITE", "PRODUCTION_CONFIG_SITE"):
+            with self.subTest(collides_with=key):
+                values = production_values()
+                values["PRODUCTION_MCP_SITE"] = values[key]
+                errors = validate(values)
+                self.assertTrue(
+                    any("PRODUCTION_MCP_SITE" in error for error in errors),
+                    errors,
+                )

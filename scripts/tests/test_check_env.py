@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,69 @@ from scripts.check_env import add_missing_defaults, keys
 ROOT = Path(__file__).resolve().parents[2]
 
 
+CONTROL_DATABASE_URL = os.environ.get("CONTROL_TEST_DATABASE_URL", "")
+
+requires_control_database = unittest.skipUnless(
+    CONTROL_DATABASE_URL,
+    "set CONTROL_TEST_DATABASE_URL to a scratch PostgreSQL database to run the"
+    " init tests; the administrator credential lives in the control schema, so"
+    " init has nowhere to write without one",
+)
+
+
+def _control_connection():
+    sys.path.insert(0, str(ROOT / "config-ui"))
+    import control_schema
+
+    return control_schema.connect(CONTROL_DATABASE_URL)
+
+
+def reset_control_schema() -> None:
+    """Empty the control schema so each isolated root starts uninitialized."""
+    connection = _control_connection()
+    try:
+        sys.path.insert(0, str(ROOT / "config-ui"))
+        import control_schema
+
+        control_schema.migrate(connection)
+        connection.execute(
+            "TRUNCATE TABLE control.tokens, control.sessions,"
+            " control.device_authorizations, control.admin_credential,"
+            " control.metadata CASCADE"
+        )
+    finally:
+        connection.close()
+
+
+def control_snapshot() -> tuple:
+    """Everything init could have changed, in a comparable form.
+
+    Replaces the byte-for-byte comparison of auth.json these tests used to make.
+    The property is the same -- a refused init changed nothing -- but the
+    credential is no longer a file, so the snapshot is of the rows.
+    """
+    connection = _control_connection()
+    try:
+        return (
+            [dict(r) for r in connection.execute(
+                "SELECT encoded FROM control.admin_credential").fetchall()],
+            [dict(r) for r in connection.execute(
+                "SELECT token_id, name, revoked_at FROM control.tokens"
+                " ORDER BY token_id").fetchall()],
+            [dict(r) for r in connection.execute(
+                "SELECT id_hash, status FROM control.device_authorizations"
+                " ORDER BY id_hash").fetchall()],
+        )
+    finally:
+        connection.close()
+
+
+@requires_control_database
 class CheckEnvironmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        reset_control_schema()
+
     @staticmethod
     def isolated_mapp_root(directory: str) -> Path:
         root = Path(directory)
@@ -24,6 +87,10 @@ class CheckEnvironmentTests(unittest.TestCase):
             "bin/mapp",
             "config-ui/config_admin.py",
             "config-ui/control_plane.py",
+            # control_plane imports this; the list is closed, so a new module
+            # on that import path fails the isolated root with an ImportError
+            # rather than anything that names the real cause.
+            "config-ui/control_schema.py",
             "instance/workspace.seed.json",
         ):
             shutil.copy2(ROOT / relative, root / relative)
@@ -33,6 +100,11 @@ class CheckEnvironmentTests(unittest.TestCase):
     def run_isolated_init(root: Path, *arguments: str) -> subprocess.CompletedProcess:
         process_environment = os.environ.copy()
         process_environment.pop("MAPP_ENV_FILE", None)
+        # init mints the credential in the control schema. Pointing it at the
+        # scratch database keeps this suite offline -- no compose model, no
+        # container -- which is the same seam an external-PostgreSQL deployment
+        # uses, since it has no packaged database to start either.
+        process_environment["MAPP_BOOTSTRAP_DATABASE_URL"] = CONTROL_DATABASE_URL
         return subprocess.run(
             [root / "bin/mapp", "init", *arguments],
             cwd=root,
@@ -46,6 +118,7 @@ class CheckEnvironmentTests(unittest.TestCase):
     def create_isolated_token(root: Path, name: str) -> str:
         process_environment = os.environ.copy()
         process_environment["PYTHONPATH"] = str(root / "config-ui")
+        process_environment["CONTROL_DATABASE_URL"] = CONTROL_DATABASE_URL
         result = subprocess.run(
             [
                 "python3",
@@ -83,11 +156,9 @@ class CheckEnvironmentTests(unittest.TestCase):
             )
             self.assertEqual(1, len(matches), result.stdout)
             self.assertGreaterEqual(len(matches[0]), 12)
-            auth = json.loads(
-                (root / "var/control/auth.json").read_text(encoding="utf-8")
-            )
-            self.assertTrue(auth["adminPassword"].startswith("pbkdf2-sha256$"))
-            self.assertNotIn(matches[0], json.dumps(auth))
+            encoded = control_snapshot()[0][0]["encoded"]
+            self.assertTrue(encoded.startswith("pbkdf2-sha256$"))
+            self.assertNotIn(matches[0], str(control_snapshot()))
 
             assignments = dict(
                 line.split("=", 1)
@@ -102,9 +173,7 @@ class CheckEnvironmentTests(unittest.TestCase):
             root = self.isolated_mapp_root(directory)
             initial = self.run_isolated_init(root)
             self.assertEqual(0, initial.returncode, initial.stderr)
-            original_auth = (root / "var/control/auth.json").read_text(
-                encoding="utf-8"
-            )
+            original_auth = control_snapshot()
             environment = root / ".env"
             environment.write_text(
                 environment.read_text(encoding="utf-8").replace(
@@ -123,11 +192,10 @@ class CheckEnvironmentTests(unittest.TestCase):
                 re.MULTILINE,
             )
             self.assertEqual(1, len(matches), result.stdout)
-            updated_auth = (root / "var/control/auth.json").read_text(
-                encoding="utf-8"
-            )
+            updated_auth = control_snapshot()
             self.assertNotEqual(original_auth, updated_auth)
-            self.assertNotIn(matches[0], updated_auth)
+            # The printed password must exist nowhere at rest.
+            self.assertNotIn(matches[0], str(updated_auth))
             assignments = dict(
                 line.split("=", 1)
                 for line in environment.read_text(encoding="utf-8").splitlines()
@@ -151,11 +219,9 @@ class CheckEnvironmentTests(unittest.TestCase):
                 "authorizations for demo mode.",
                 result.stdout,
             )
-            state = json.loads(
-                (root / "var/control/auth.json").read_text(encoding="utf-8")
-            )
-            token = next(item for item in state["tokens"] if item["id"] == token_id)
-            self.assertIsNotNone(token["revoked"])
+            tokens = control_snapshot()[1]
+            token = next(item for item in tokens if item["token_id"] == token_id)
+            self.assertIsNotNone(token["revoked_at"])
             audit = [
                 json.loads(line)
                 for line in (root / "var/control/audit.jsonl")
@@ -219,7 +285,7 @@ class CheckEnvironmentTests(unittest.TestCase):
         deleted and half-rebuilt.
         """
         script = (ROOT / "bin/mapp").read_text(encoding="utf-8")
-        start = script.index("  reset-data)")
+        start = script.index("  reset-system)")
         reset = script[start : script.index("\n  upgrade-derived)", start)]
 
         build_all = reset.index('build "${runtime_services[@]}"')
@@ -251,8 +317,7 @@ class CheckEnvironmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             before = environment.read_text(encoding="utf-8")
-            auth_path = root / "var/control/auth.json"
-            auth_before = auth_path.read_text(encoding="utf-8")
+            auth_before = control_snapshot()
 
             result = self.run_isolated_init(root, "--demo")
 
@@ -260,13 +325,13 @@ class CheckEnvironmentTests(unittest.TestCase):
             self.assertIn("production", result.stderr)
             # Refused before anything is written, not rolled back after.
             self.assertEqual(before, environment.read_text(encoding="utf-8"))
-            self.assertEqual(auth_before, auth_path.read_text(encoding="utf-8"))
+            self.assertEqual(auth_before, control_snapshot())
             token = next(
                 item
-                for item in json.loads(auth_before)["tokens"]
-                if item["id"] == token_id
+                for item in auth_before[1]
+                if item["token_id"] == token_id
             )
-            self.assertIsNone(token["revoked"])
+            self.assertIsNone(token["revoked_at"])
 
     def test_init_demo_missing_template_preserves_retained_authentication(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -274,8 +339,7 @@ class CheckEnvironmentTests(unittest.TestCase):
             initial = self.run_isolated_init(root)
             self.assertEqual(0, initial.returncode, initial.stderr)
             self.create_isolated_token(root, "retained operator")
-            auth_path = root / "var/control/auth.json"
-            auth_before = auth_path.read_bytes()
+            auth_before = control_snapshot()
             (root / ".env").unlink()
             (root / ".env.example").unlink()
 
@@ -283,7 +347,7 @@ class CheckEnvironmentTests(unittest.TestCase):
 
             self.assertEqual(2, result.returncode, result.stderr)
             self.assertIn("Missing initialization template", result.stderr)
-            self.assertEqual(auth_before, auth_path.read_bytes())
+            self.assertEqual(auth_before, control_snapshot())
 
     def test_init_demo_invalid_template_preserves_retained_authentication(self):
         mutations = (
@@ -326,8 +390,7 @@ class CheckEnvironmentTests(unittest.TestCase):
                 initial = self.run_isolated_init(root)
                 self.assertEqual(0, initial.returncode, initial.stderr)
                 self.create_isolated_token(root, f"{label} retained operator")
-                auth_path = root / "var/control/auth.json"
-                auth_before = auth_path.read_bytes()
+                auth_before = control_snapshot()
                 (root / ".env").unlink()
                 template_path = root / ".env.example"
                 template_path.write_text(
@@ -339,7 +402,7 @@ class CheckEnvironmentTests(unittest.TestCase):
 
                 self.assertEqual(2, result.returncode, result.stderr)
                 self.assertIn(expected_error, result.stderr)
-                self.assertEqual(auth_before, auth_path.read_bytes())
+                self.assertEqual(auth_before, control_snapshot())
 
     def test_every_documented_wrapper_command_exists(self):
         """Copy-pasteable commands must be commands.
@@ -361,7 +424,10 @@ class CheckEnvironmentTests(unittest.TestCase):
             advertised.update(match.group(1).split("|"))
         self.assertIn("verify", advertised, "usage parsing found nothing")
 
-        documents = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md"))
+        # Recursive: docs/adr/ holds decision records, which are exactly the
+        # kind of document that keeps a command name after it is renamed. A
+        # non-recursive glob silently exempted the whole subdirectory.
+        documents = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").rglob("*.md"))
         documents.append(ROOT / "etl/README.md")
         unknown: dict[str, set[str]] = {}
         for document in documents:
@@ -384,7 +450,7 @@ class CheckEnvironmentTests(unittest.TestCase):
             {name: sorted(files) for name, files in unknown.items()},
         )
 
-    def test_reset_data_names_what_it_destroys_before_asking(self):
+    def test_reset_system_names_what_it_destroys_before_asking(self):
         """The warning is where consent is obtained, so it must be true.
 
         It said semantic history was preserved. That was correct while the
@@ -394,7 +460,7 @@ class CheckEnvironmentTests(unittest.TestCase):
         to something other than what happens.
         """
         result = subprocess.run(
-            [ROOT / "bin/mapp", "reset-data"],
+            [ROOT / "bin/mapp", "reset-system"],
             capture_output=True,
             text=True,
         )

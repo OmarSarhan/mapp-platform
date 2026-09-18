@@ -90,6 +90,127 @@ services:
       - backend
       - semantic-control
 
+  mcp-auth:
+    image: mapp-mcp-auth:local
+    build:
+      context: ./mcp-auth
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
+      MCP_RESOURCE: ${MCP_SITE:-http://mcp.localhost}/mcp
+      # What an exchanged token B is for. Must differ from MCP_RESOURCE: equal
+      # values would let a token A be replayed at the configuration API, and
+      # the component refuses to start if they match.
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
+      MCP_AUTH_CONTROL_PORT: 8080
+      MCP_AUTH_SOCKET: /run/mapp-auth/mapp-auth.sock
+      MCP_AUTH_SECURE_COOKIES: ${MCP_AUTH_SECURE_COOKIES:-}
+      # authlib refuses http:// for anything but literal localhost or a
+      # loopback IP, and the development origin is http://mcp.localhost, so
+      # every /oauth call would fail closed without this. The production
+      # overlay clears it, and a test pins that it is cleared.
+      AUTHLIB_INSECURE_TRANSPORT: ${AUTHLIB_INSECURE_TRANSPORT-1}
+      # Its OAuth records live in the control schema. Empty in the base
+      # (external-PostgreSQL) model, where there is no packaged database;
+      # compose.bundled-db.yaml supplies it.
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-}
+    expose:
+      - "8080"
+    volumes:
+      # The only shared mount: the runtime directory holding the edge socket.
+      # No database credentials, workspace, control state or Docker socket.
+      - ./var/mcp-auth:/run/mapp-auth
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      # The internal control link, plus backend to reach the packaged database
+      # where the control schema lives. Deliberately no edge network: the
+      # public surface is reached solely through the Unix socket.
+      - mcp-control
+      - backend
+    # Every credential this component reads or writes lives in the control
+    # schema, so starting before the database is starting unhealthy. The
+    # bundled-db overlay is what supplies `db`; in the external-PostgreSQL
+    # model there is no such service and the health check is the only gate.
+
+  mapp-mcp:
+    image: mapp-mcp:local
+    build:
+      context: ./mapp-mcp
+    restart: unless-stopped
+    init: true
+    user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
+    environment:
+      # The origin it serves, and the issuer it compares. Separate values
+      # because the issuer is never fetched from here: this service sits on an
+      # internal-only network where the public origin does not resolve, so a
+      # runtime that tried to read issuer metadata would hang until its timeout.
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
+      # Every live call goes here instead: the authorization component's control
+      # listener, which is reachable on mcp-control and nowhere else.
+      MCP_AUTH_URL: http://mcp-auth:8080
+      MCP_RUNTIME_SOCKET: /run/mapp-mcp/mapp-mcp.sock
+      # The configuration API, reached over the control link. Used for two
+      # things: its unauthenticated identity document, which is where the
+      # instance the digest binds to comes from, and the request a token B is
+      # spent on.
+      MCP_CONFIG_API_URL: http://config-ui:8080
+      # What a token B is *for*. Must differ from MCP_SITE's resource, or a
+      # token A and a token B would share an audience and either could be
+      # presented where the other belongs.
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
+      # Registered by `./bin/mapp mcp-runtime-register`, which mints it and
+      # stores only its digest. This is the one service that holds the
+      # plaintext, and a test pins that it reaches no other.
+      MAPP_MCP_CLIENT_SECRET: ${MAPP_MCP_CLIENT_SECRET:-}
+      # Quiet by default: the component answers its own errors, and uvicorn's
+      # access log would record every RPC path. Raisable without a rebuild,
+      # because the first thing wanted when this misbehaves is the traceback it
+      # otherwise swallows.
+      MCP_RUNTIME_LOG_LEVEL: ${MCP_RUNTIME_LOG_LEVEL:-warning}
+    volumes:
+      # The only shared mount, and the same shape mcp-auth uses: the runtime
+      # directory holding the edge socket. No database credential, no workspace,
+      # no control state, no Docker socket.
+      - ./var/mapp-mcp:/run/mapp-mcp
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import http.client, os, socket; c = http.client.HTTPConnection('localhost'); c.sock = socket.socket(socket.AF_UNIX); c.sock.settimeout(2); c.sock.connect(os.environ['MCP_RUNTIME_SOCKET']); c.request('GET', '/.well-known/oauth-protected-resource/mcp'); raise SystemExit(0 if c.getresponse().status == 200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks:
+      # mcp-control alone. It needs the authorization component and nothing
+      # else -- no database, because it holds no credential for one and reaches
+      # platform state only through authenticated API calls, and no edge,
+      # because its public surface is the Unix socket Caddy proxies.
+      - mcp-control
+    depends_on:
+      mcp-auth:
+        condition: service_healthy
+        restart: true
+
   config-ui:
     image: mapp-config-ui:local
     build:
@@ -103,6 +224,23 @@ services:
       DERIVED_OWNER_ROLE: ${DERIVED_OWNER_ROLE:-}
       DERIVED_READER_ROLE: ${DERIVED_READER_ROLE:-}
       DERIVED_MAX_BACKGROUND_JOBS: ${DERIVED_MAX_BACKGROUND_JOBS:-2}
+      # Empty in the base (external-PostgreSQL) model, which has no packaged
+      # database and therefore no control schema. compose.bundled-db.yaml
+      # requires it. The store treats an empty value as "unavailable" rather
+      # than falling back to anything.
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:-}
+      # Token-B validation. The audience must be the same expression the
+      # authorization component derives its MCP_CONFIG_API_RESOURCE from, or
+      # the two would disagree about which audience this service accepts and
+      # every exchanged token would be refused here.
+      MCP_AUTH_URL: ${MCP_AUTH_URL:-http://mcp-auth:8080}
+      # Read only to compose the connection details the dashboard hands an
+      # operator for an agent client. Never fetched from here: this service has
+      # no route to the public origin.
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
+      MCP_AUTH_CLIENT_ID: ${MCP_AUTH_CLIENT_ID:-mapp-config-api}
+      MCP_AUTH_CLIENT_SECRET: ${MCP_AUTH_CLIENT_SECRET:-}
       WORKSPACE_PATH: /workspace/workspace.json
       SVG_DIR: /instance-public/svg
       PLUGIN_DIR: /instance-public/plugins
@@ -149,6 +287,10 @@ services:
       - edge
       - automation
       - semantic-control
+      # Reaches the authorization component's internal endpoints. Deliberately
+      # no depends_on: ci.yml asserts config-ui depends only on
+      # semantic-service, and the token-B path fails closed if mcp-auth is down.
+      - mcp-control
     depends_on:
       semantic-service:
         condition: service_healthy
@@ -161,15 +303,18 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-3000}:80"
-      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-3443}:443"
-      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-3443}:443/udp"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-80}:80"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443"
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443/udp"
     environment:
       MAP_SITE: ${MAP_SITE:-http://localhost}
       CONFIG_SITE: ${CONFIG_SITE:-http://config.localhost}
+      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.invalid}
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./var/mcp-auth:/run/mapp-auth
+      - ./var/mapp-mcp:/run/mapp-mcp
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -279,4 +424,7 @@ networks:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_browser-egress
   semantic-control:
     name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_semantic-control
+    internal: true
+  mcp-control:
+    name: ${COMPOSE_PROJECT_NAME:-mapp-explore}_mcp-control
     internal: true

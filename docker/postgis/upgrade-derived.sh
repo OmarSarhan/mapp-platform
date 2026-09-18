@@ -9,6 +9,8 @@ set -eu
 : "${DERIVED_DB_PASSWORD:?DERIVED_DB_PASSWORD is required}"
 : "${FEDERATION_DB_USER:?FEDERATION_DB_USER is required}"
 : "${FEDERATION_DB_PASSWORD:?FEDERATION_DB_PASSWORD is required}"
+: "${CONTROL_DB_USER:?CONTROL_DB_USER is required}"
+: "${CONTROL_DB_PASSWORD:?CONTROL_DB_PASSWORD is required}"
 
 if [ "${FEDERATION_DB_USER}" = "${POSTGRES_USER}" ] \
   || [ "${FEDERATION_DB_USER}" = "${ETL_DB_USER}" ] \
@@ -28,7 +30,9 @@ psql \
   --set derived_db_user="${DERIVED_DB_USER}" \
   --set derived_db_password="${DERIVED_DB_PASSWORD}" \
   --set federation_db_user="${FEDERATION_DB_USER}" \
-  --set federation_db_password="${FEDERATION_DB_PASSWORD}" <<'SQL'
+  --set federation_db_password="${FEDERATION_DB_PASSWORD}" \
+  --set control_db_user="${CONTROL_DB_USER}" \
+  --set control_db_password="${CONTROL_DB_PASSWORD}" <<'SQL'
 BEGIN;
 
 SELECT pg_catalog.set_config(
@@ -203,6 +207,42 @@ WHERE NOT EXISTS (
 \gexec
 
 ALTER ROLE :"federation_db_user" LOGIN PASSWORD :'federation_db_password';
+
+-- Control plane, for volumes created before it existed. This script runs on
+-- every `up`, which is the only reason an existing developer volume ever gets
+-- the role: docker-entrypoint-initdb.d runs once, on a fresh volume only.
+SELECT format(
+  'CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L',
+  :'control_db_user',
+  :'control_db_password'
+)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_roles WHERE rolname = :'control_db_user'
+)
+\gexec
+
+ALTER ROLE :"control_db_user" LOGIN PASSWORD :'control_db_password';
+-- Same limit and the same caveat as docker/postgis/init/10-roles.sh: neither
+-- consumer pools, so this is a ceiling on concurrent operations.
+ALTER ROLE :"control_db_user" CONNECTION LIMIT 8;
+ALTER ROLE :"control_db_user" SET search_path = pg_catalog, control;
+
+SELECT format(
+  'CREATE SCHEMA control AUTHORIZATION %I',
+  :'control_db_user'
+)
+WHERE NOT EXISTS (
+  SELECT 1 FROM pg_namespace WHERE nspname = 'control'
+)
+\gexec
+
+ALTER SCHEMA control OWNER TO :"control_db_user";
+GRANT CONNECT ON DATABASE :"DBNAME" TO :"control_db_user";
+REVOKE CREATE ON DATABASE :"DBNAME" FROM :"control_db_user";
+REVOKE ALL ON SCHEMA control FROM PUBLIC;
+REVOKE ALL ON SCHEMA control FROM :"xyz_db_user", :"derived_db_user", :"federation_db_user";
+REVOKE ALL ON SCHEMA derived_layers FROM :"control_db_user";
+REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw FROM :"control_db_user";
 
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw

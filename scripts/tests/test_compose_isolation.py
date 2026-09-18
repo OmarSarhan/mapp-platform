@@ -33,6 +33,7 @@ def resolved_compose(*overlays: str) -> dict[str, Any]:
         "PRODUCTION_MAP_SITE": "https://maps.company.co.uk",
         "PRODUCTION_CONFIG_SITE": "https://config.company.co.uk",
         "PRODUCTION_CONFIG_ALLOWED_HOSTS": "config.company.co.uk,config-ui",
+        "PRODUCTION_MCP_SITE": "https://mcp.company.co.uk",
         "PRODUCTION_CADDY_EMAIL": "operations@company.co.uk",
     })
     completed = subprocess.run(
@@ -227,6 +228,218 @@ class ComposeIsolationTests(unittest.TestCase):
                     semantic_state,
                     {volume.get("source") for volume in config_volumes},
                 )
+
+    def test_the_authorization_component_is_off_the_public_network(self) -> None:
+        """Its whole public surface is one Unix socket Caddy connects to.
+
+        compose.yaml said so in a comment and then listed `edge` anyway, which
+        put the control listener -- the RFC 8693 exchange, introspection and
+        revocation -- on the same network as every edge service, reachable by
+        DNS name. Nothing constrained membership in either direction: deleting
+        the line changed no test, and neither did adding it.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                services = model["services"]
+                mcp_auth = services["mcp-auth"]
+                self.assertEqual(
+                    {"backend", "mcp-control"}, set(mcp_auth["networks"])
+                )
+                edge_members = {
+                    name
+                    for name, service in services.items()
+                    if "edge" in service.get("networks", {})
+                }
+                self.assertNotIn("mcp-auth", edge_members)
+                # And nothing else joins the control link.
+                control_members = {
+                    name
+                    for name, service in services.items()
+                    if "mcp-control" in service.get("networks", {})
+                }
+                self.assertEqual(
+                    {"config-ui", "mcp-auth", "mapp-mcp"}, control_members
+                )
+
+    def test_the_authorization_component_waits_for_its_database(self) -> None:
+        """Its credentials live in the control schema, so it cannot start first.
+
+        Only the bundled model has a `db` service to depend on; the external
+        model has none, and there the health check is the only gate.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                services = model["services"]
+                if "db" not in services:
+                    self.assertNotIn("db", services["mcp-auth"].get("depends_on", {}))
+                    continue
+                self.assertEqual(
+                    "service_healthy",
+                    services["mcp-auth"]["depends_on"]["db"]["condition"],
+                )
+
+    def test_the_operator_credential_is_never_passed_as_an_environment_value(
+        self,
+    ) -> None:
+        """It is read from control.admin_credential, not injected.
+
+        MCP_AUTH_ADMIN_PASSWORD_HASH was consumed by the consent screen and set
+        by nothing -- not compose, not .env.example, not ./bin/mapp -- so the
+        deployed component could authenticate nobody, and `doctor`'s .env drift
+        check could not report a key that was never documented.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                for name, service in model["services"].items():
+                    self.assertNotIn(
+                        "MCP_AUTH_ADMIN_PASSWORD_HASH",
+                        service.get("environment", {}),
+                        f"{name} still carries the retired credential variable",
+                    )
+
+    def test_production_clears_the_insecure_transport_escape_hatch(self) -> None:
+        """compose.yaml claims a test pins this. This is that test.
+
+        authlib refuses http:// for anything but literal localhost, and the
+        development origin is http://mcp.localhost, so AUTHLIB_INSECURE_TRANSPORT
+        is set in development. Carrying it into production would disable the
+        check that keeps tokens off plaintext transports.
+        """
+        for mode in ("external", "bundled"):
+            environment = self.models[mode]["services"]["mcp-auth"]["environment"]
+            self.assertEqual("1", environment["AUTHLIB_INSECURE_TRANSPORT"], mode)
+        for mode in ("external-production", "bundled-production"):
+            environment = self.models[mode]["services"]["mcp-auth"]["environment"]
+            self.assertIn(
+                environment.get("AUTHLIB_INSECURE_TRANSPORT"),
+                (None, ""),
+                f"{mode} must clear AUTHLIB_INSECURE_TRANSPORT",
+            )
+
+    def test_the_configuration_api_can_reach_the_authorization_component(
+        self,
+    ) -> None:
+        """Both halves of token-B validation, and the audience they share.
+
+        The configuration API authenticates to the control listener as a
+        confidential client and checks the token's audience on every
+        introspection. If the two services resolved MCP_CONFIG_API_RESOURCE
+        differently, every exchanged credential would be refused with nothing
+        to indicate why -- so the two values are asserted equal rather than
+        assumed to come from one expression.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                services = model["services"]
+                config = services["config-ui"]["environment"]
+                component = services["mcp-auth"]["environment"]
+                self.assertEqual(
+                    component["MCP_CONFIG_API_RESOURCE"],
+                    config["MCP_CONFIG_API_RESOURCE"],
+                )
+                # Reached by service name on the control network they share.
+                self.assertEqual(
+                    "http://mcp-auth:8080", config["MCP_AUTH_URL"]
+                )
+                self.assertTrue(config["MCP_AUTH_CLIENT_ID"])
+
+    def test_the_component_client_secret_is_not_shared_more_widely(self) -> None:
+        """Only the configuration API needs it, so only it should have it."""
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                holders = {
+                    name
+                    for name, service in model["services"].items()
+                    if "MCP_AUTH_CLIENT_SECRET" in service.get("environment", {})
+                }
+                self.assertEqual({"config-ui"}, holders)
+
+    def test_the_runtime_client_secret_reaches_only_the_runtime(self) -> None:
+        """One service: the one that presents it.
+
+        An operator registers the MCP runtime's client with
+        `./bin/mapp mcp-runtime-register`, which mints the secret and stores
+        only its digest, so the authorization component never holds the
+        plaintext even though it is the component that verifies it. An earlier
+        version had that component provision the row from its own environment,
+        which put the secret in a second configuration, made rotation a restart
+        of the authorization server, and left the act without an author.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                holders = {
+                    name
+                    for name, service in model["services"].items()
+                    if "MAPP_MCP_CLIENT_SECRET" in service.get("environment", {})
+                }
+                self.assertLessEqual(
+                    holders,
+                    {"mapp-mcp"},
+                    "only the runtime presents this secret; nothing else needs it",
+                )
+
+    def test_the_mcp_origin_reaches_caddy_and_the_component_together(self) -> None:
+        """One MCP_SITE, or the identifiers move without the site serving them.
+
+        The component derives its issuer and resource from MCP_SITE; Caddy
+        serves that origin. Caddy was never given the variable in the base
+        model, so changing it moved the OAuth identifiers and left the site
+        answering on the old hostname.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                services = model["services"]
+                site = services["caddy"]["environment"]["MCP_SITE"]
+                self.assertTrue(site)
+                self.assertEqual(
+                    site, services["mcp-auth"]["environment"]["MCP_ISSUER"]
+                )
+                self.assertEqual(
+                    site + "/mcp",
+                    services["mcp-auth"]["environment"]["MCP_RESOURCE"],
+                )
+
+    def test_the_published_edge_port_matches_the_port_the_sites_carry(self) -> None:
+        """The edge must answer on the port its own origins name.
+
+        Nothing asserted this, and a real defect lived in the gap: HTTP_PORT
+        was 3000 while every site carried no port, so anything following an
+        absolute URL built from an origin arrived at port 80 and found
+        nothing. Browsers never noticed -- the dashboard's links are relative
+        -- and the MCP authorization server's metadata document, which
+        publishes absolute endpoint URLs a client is required to follow, was
+        the first thing on the platform that could not tolerate it.
+
+        Asserted from the resolved model rather than from .env, so it holds
+        for whatever the deployment actually resolves to, and across all four
+        models including the production overlays -- whose sites are https and
+        so name 443. That is only possible because the development ports are
+        the standard ones too; while HTTPS_PORT was 3443 the production models
+        resolved a production overlay against development ports and could not
+        satisfy this, which was itself the same defect one layer down.
+        """
+        for mode, model in self.models.items():
+            with self.subTest(mode=mode):
+                caddy = model["services"]["caddy"]
+                published = {
+                    str(entry["published"]): str(entry["target"])
+                    for entry in caddy.get("ports", [])
+                }
+                self.assertTrue(published, "the edge publishes nothing")
+                for key in ("MAP_SITE", "CONFIG_SITE", "MCP_SITE"):
+                    site = caddy["environment"].get(key)
+                    if not site:
+                        continue
+                    parts = urlsplit(site)
+                    port = parts.port or (443 if parts.scheme == "https" else 80)
+                    self.assertIn(
+                        str(port),
+                        published,
+                        f"{key} is {site}, which names port {port}, but the"
+                        f" edge publishes {sorted(published)}. A client"
+                        " following an absolute URL from this origin would"
+                        " reach nothing.",
+                    )
 
     def test_gemini_credential_is_available_only_to_config_ui(self) -> None:
         for mode, model in self.models.items():

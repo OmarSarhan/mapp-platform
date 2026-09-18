@@ -630,6 +630,27 @@ def _live_visual_input_schema() -> dict[str, Any]:
 
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "catalog.list": {
+        "method": "GET",
+        "pathTemplate": "/api/catalog",
+        # Column names and types, never row values.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "layers.list": {
+        "method": "GET",
+        "pathTemplate": "/api/layers",
+        # Workspace configuration, not layer data: which layers exist, what they
+        # are called and which fields they expose. `layers.values` reads the
+        # data behind one of them and costs `derive` accordingly.
+        "risk": "inspect",
+        "scope": "inspect",
+        "querySchema": {
+            "type": "object",
+            "properties": {"locale": {"type": "string", "minLength": 1}},
+            "additionalProperties": False,
+        },
+    },
     "layers.values": {
         "method": "GET",
         "pathTemplate": "/api/layers/{layerKey}/values",
@@ -1009,6 +1030,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "derived-layers.list": {
+        "method": "GET",
+        "path": "/api/derived-layers",
+        # Which managed relations exist and how they were built. Configuration
+        # and provenance, not the rows -- reading those is `derive`, through
+        # layers.values against a layer that reads the relation.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "derived-layers.map-extent": {
         "method": "GET",
         "path": "/api/derived-layers/map-extent",
@@ -1184,6 +1214,157 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "required": ["confirmed"],
             "properties": {"confirmed": {"const": True}},
+            "additionalProperties": False,
+        },
+    },
+    "sql.test": {
+        "method": "POST",
+        "path": "/api/sql/test",
+        # Tries one expression as a calculated field on an existing layer and
+        # reports its PostgreSQL type and a sample value. It writes nothing:
+        # the transaction is READ ONLY, the statement timeout is 5s, the
+        # search_path is pinned, and the function names are allowlisted and
+        # checked against shadowing. Classified with `layers.values` and
+        # `layers.statistics`, which it matches exactly: a value read from a
+        # configured layer's own relation, costing `derive`. That is a read
+        # class, so the credential is not single-use -- correct here, because
+        # replaying it evaluates the same expression and changes nothing.
+        "risk": "aggregate-data-read",
+        "scope": "derive",
+        "inputSchema": {
+            "type": "object",
+            "required": ["layer", "expression"],
+            "properties": {
+                "layer": {"type": "string", "minLength": 1},
+                "expression": {"type": "string", "minLength": 1},
+                "locale": {"type": "string", "minLength": 1},
+                "field": {"type": "string", "minLength": 1},
+                "type": {"type": "string", "minLength": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "xyz.status": {
+        "method": "GET",
+        "path": "/api/xyz/status",
+        # Whether the tile service picked up the current workspace.
+        # Reading it alters nothing; `xyz.reload` is what costs `reload`.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "operations.show": {
+        "method": "GET",
+        "pathTemplate": "/api/operations/{operationId}",
+        # One asynchronous operation: its kind, status and result.
+        #
+        # `derive` rather than `inspect`, which is not tidiness. The route
+        # itself admits any authenticated credential, and then demands the
+        # scope that the operation's *kind* would have cost to perform --
+        # `visual` for a visual test, `apply` for a proposal apply, `derive`
+        # for derived-layer work. An exchanged credential carries only the one
+        # scope declared here, so declaring `inspect` would make this
+        # unusable for every kind. `derive` is the honest choice: it is
+        # exactly the set of operations an agent could have caused, and the
+        # rest still refuse.
+        "risk": "inspect",
+        "scope": "derive",
+    },
+    "derived-layers.capabilities": {
+        "method": "GET",
+        "path": "/api/derived-layers/capabilities",
+        # What derived-layer work this deployment supports, which is
+        # not uniform across instances.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "sql.capabilities": {
+        "method": "GET",
+        "path": "/api/sql/capabilities",
+        # Which SQL functions an expression may use. Discovery of a
+        # constraint, not permission to run anything.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "capabilities.list": {
+        "method": "GET",
+        "path": "/api/capabilities",
+        # The contract document: every action, its shape and its
+        # cost. Contract discovery, so the platform admits any
+        # authenticated credential; narrowed to `inspect` here.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "schema": {
+        "method": "GET",
+        "path": "/api/schema",
+        # The workspace JSON schema. Needed to author a change
+        # rather than to read one.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "rules": {
+        "method": "GET",
+        "path": "/api/rules",
+        # The authoring rules a candidate workspace must satisfy.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "examples": {
+        "method": "GET",
+        "path": "/api/examples",
+        # Worked examples of valid operations.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "plugins.list": {
+        "method": "GET",
+        "path": "/api/plugins",
+        # Which plugins this instance has configured.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "dependencies.list": {
+        "method": "GET",
+        "path": "/api/dependencies",
+        # Which layers depend on which relations, so a change can be
+        # weighed before it is proposed.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "icons.list": {
+        "method": "GET",
+        "path": "/api/icons",
+        # The icons a layer's styling may reference.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "proposals.show": {
+        "method": "GET",
+        "pathTemplate": "/api/proposals/{proposalId}",
+        # The queue entry in full: its diff, the operations it would run, the
+        # warnings raised against it, and the revision it was cut from. Reading
+        # a proposal is `inspect`; acting on it is not.
+        "risk": "inspect",
+        "scope": "inspect",
+    },
+    "proposals.list": {
+        "method": "GET",
+        "path": "/api/proposals",
+        # Which workspace changes are pending or were applied. Reading the
+        # queue is the GET catch-all's `inspect`; `propose` is what it costs to
+        # add to it.
+        "risk": "inspect",
+        "scope": "inspect",
+        "querySchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_PAGE_LIMIT,
+                },
+                "cursor": {"type": "string"},
+            },
             "additionalProperties": False,
         },
     },

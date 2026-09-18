@@ -22,6 +22,45 @@ first release.
 
 ### Added
 
+- Added `mcp-auth`, an OAuth 2.1 authorization component for the forthcoming
+  MCP server, on a third public origin (`MCP_SITE`, and `PRODUCTION_MCP_SITE`
+  in production, which is now mandatory and validated alongside the other two
+  origins). Caddy publishes exactly four paths on that origin and proxies them
+  over a Unix socket; the exchange, introspection and revocation endpoints sit
+  on a separate internal listener and are not edge-routed. This is a Phase 0
+  feasibility spike: **nothing registers an OAuth client yet**, so a correctly
+  deployed component refuses every authorization request. See
+  [`docs/mcp-authorization.md`](docs/mcp-authorization.md).
+- Consent now creates a grant, and revoking a grant invalidates every
+  credential derived from it immediately -- including an exchanged token
+  already issued and not yet spent, which previously stayed spendable for its
+  full lifetime.
+- The configuration API now validates an exchanged token B, so such a
+  credential authorises one operation on one request rather than a class of
+  effect. It rebuilds the canonical `mapp-jcs-v1` envelope from the request in
+  front of it -- method, operation, path template, typed path parameters,
+  normalized path, ordered query pairs and the exact body -- and spends the
+  token against that digest at the authorization component's new
+  `/internal/oauth/redeem` endpoint; a mutating operation's token is
+  single-use. A token minted for one proposal cannot be applied to another.
+  Requires `MCP_AUTH_CLIENT_SECRET`; blank refuses every exchanged credential.
+- `./bin/mapp` now starts the authorization component, `./bin/mapp verify`
+  probes its origin and confirms the internal endpoints are not edge-reachable,
+  and `./bin/mapp test` runs its suite.
+- Added `./bin/mapp mcp-client-register`, `mcp-client-list` and
+  `mcp-client-disable`. An agent client is registered by an operator and is a
+  public client: the command prints a `client_id` and no secret, because an
+  agent authenticates with PKCE alone. Redirect URIs are validated against what
+  the authorization server will later match exactly — absolute, no fragment, no
+  userinfo, `https` unless loopback — and `full` and `admin` are refused. There
+  is deliberately no registration endpoint: a person decides which agent may
+  ask for consent. Until this existed a correctly deployed component refused
+  every authorization request as an unknown client.
+- A grant may be exchanged for at most 60 token B in a sliding 60-second
+  window, refused with `slow_down`. Every other bound was per credential, so
+  one consent minting them in a loop was the only way to turn a single approval
+  into an unlimited number of consequential effects.
+
 - Added an optional request-time `progress` snapshot to nonterminal
   derived operations. `GET /api/operations/<id>` reports a version-1
   object naming the safe database subphase, a closed activity condition,
@@ -344,6 +383,15 @@ first release.
   recognize them.
 
 ### Changed
+
+- Moved authentication, token and session state out of files under `var/` and
+  into the packaged database's `control` schema. The audit log deliberately
+  remains at `var/control/audit.jsonl`. The administrator credential is now a
+  single row shared by the configuration service and the authorization
+  component's consent screen, read at each sign-in rather than captured at
+  start-up, so a password change needs no restart.
+- The authorization component's health check now reports unhealthy when the
+  control schema is unreachable, instead of answering from the process alone.
 
 - Split managed-derived query failures into malformed, policy-prohibited, and
   over-budget codes with reason-specific remediation, operation-specific

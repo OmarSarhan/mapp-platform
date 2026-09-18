@@ -69,12 +69,14 @@ class CleanupTempTests(unittest.TestCase):
                 state,
                 "2026-08-01T10-00-00-000Z-live-layer-b1c2d3e4",
             )
-            stale_temp = state / "control" / ".auth.json.abcdef1234567890.tmp"
+            # A filename the atomic-write path can still produce: auth.json is
+            # gone, but proposals and operations are still written this way.
+            stale_temp = state / "control" / ".operations.json.abcdef1234567890.tmp"
             stale_temp.write_text("temporary", encoding="utf-8")
             old_time = (NOW - dt.timedelta(days=8)).timestamp()
             os.utime(stale_temp, (old_time, old_time))
-            auth = state / "control" / "auth.json"
-            auth.write_text("{}", encoding="utf-8")
+            kept = state / "control" / "audit.jsonl"
+            kept.write_text("{}\n", encoding="utf-8")
 
             with patch("scripts.cleanup_temp._utc_now", return_value=NOW):
                 result = cleanup(state, confirm=True)
@@ -83,7 +85,7 @@ class CleanupTempTests(unittest.TestCase):
             self.assertFalse(old_run.exists())
             self.assertFalse(stale_temp.exists())
             self.assertTrue(recent_run.exists())
-            self.assertTrue(auth.exists())
+            self.assertTrue(kept.exists())
 
     def test_symlinked_or_unexpected_artifact_trees_are_preserved(self) -> None:
         if not hasattr(os, "symlink"):

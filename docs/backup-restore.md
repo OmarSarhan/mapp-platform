@@ -7,9 +7,9 @@ images and the versioned `instance` directory are not sufficient.
 
 | Data | Location | Reason |
 | --- | --- | --- |
-| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database; the `semantic` catalog schema holding generated and curated profiles, proposals, event receipts, history, and archive tombstones |
+| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database; the `semantic` catalog schema holding generated and curated profiles, proposals, event receipts, history, and archive tombstones; the `control` schema holding the administrator credential, dashboard sessions, CLI token records, device authorizations and the MCP authorization component's OAuth records |
 | Live workspace | `var/workspace` | Current configuration and previous atomic save |
-| Control state | `var/control` | Authentication and device state, token records, audit, proposals, durable operations, artifacts |
+| Control file state | `var/control` | Audit log, proposals, durable operations, artifacts. Authentication, session, token and device-authorization records are **not** here any more; they are in the database's `control` schema, and the audit log is the deliberate exception that stayed a file |
 | Reload state | `var/reload` | Useful for consistent recovery diagnostics; can be regenerated cautiously |
 | Preview scratch state | `var/preview`, `var/preview-reload` | Ephemeral proposal rendering state; recreate it from the restored live workspace rather than treating it as authoritative |
 | Deployment secrets | `.env` and external secret-store records | Database and service credentials |
@@ -52,7 +52,11 @@ while copying `var/workspace` and `var/control`. Stop `config-ui` first so it
 cannot commit another PostgreSQL outbox event.
 
 Take the PostgreSQL dump or coordinated external snapshot during the same
-write-quiesced interval. The derived definition, the semantic outbox, and the
+write-quiesced interval. That dump is now also the only copy of the
+authorization state: an operator who restores `var/control` without a matching
+database restore recovers the audit trail and proposals but no credential to
+sign in with. `var/mcp-auth` holds only a socket and is not a backup input.
+The derived definition, the semantic outbox, and the
 delivered profiles and event receipts now all live in that one database, so a
 single dump is internally consistent across the bridge and the old failure
 mode is gone: a snapshot can no longer claim an event was delivered while a
@@ -77,29 +81,56 @@ not place it in the same unencrypted archive as public release files.
    the external operator restore the target PostGIS database and connection.
 4. Restore `var/workspace` and `var/control`, including durable operation
    records, with the configured host UID/GID and restrictive modes. The
-   semantic catalog needs no separate step; it returned with the database in
-   step 3. Do not restore stale `var/preview` scratch
-   state; leave it absent so initialization seeds it from the restored live
-   workspace.
-5. Restore Caddy data if retaining the existing certificate state is
+   semantic catalog and the control schema — the administrator credential,
+   sessions, CLI tokens, device authorizations and OAuth records — need no
+   separate step; they returned with the database in step 3. That is also why
+   step 5 exists: they returned *as they were*, including credentials revoked
+   since the snapshot was taken. Do not recreate
+   `var/mcp-auth` by hand; the wrapper creates the directory and the
+   authorization component creates the socket. Do not restore stale
+   `var/preview` scratch state; leave it absent so initialization seeds it from
+   the restored live workspace.
+5. Invalidate every credential the restored database brought back:
+
+   ```bash
+   ./bin/mapp advance-recovery-epoch --confirm
+   ```
+
+   A snapshot contains every credential that was valid when it was taken,
+   **including ones revoked since**, so restoring it hands them back. This
+   advances the recovery epoch, which revokes dashboard sessions, CLI API
+   tokens, device authorizations, and MCP grants and their tokens. The
+   administrator credential, registered OAuth clients and the audit log are
+   untouched, and nothing here is unrecoverable — it returns by signing in and
+   consenting again.
+
+   Do this **before** starting the stack. The command needs only the database
+   and deliberately does not start the application, because a pre-restore
+   credential is usable until this has run. Run it without `--confirm` first to
+   see what it would invalidate.
+
+   It refuses if the restored dump predates the migration that added the
+   mechanism; starting the stack once applies the forward ladder, after which
+   it succeeds.
+6. Restore Caddy data if retaining the existing certificate state is
    appropriate, or allow Caddy to obtain new certificates.
-6. Initialize or clear stale live and preview reload coordination
+7. Initialize or clear stale live and preview reload coordination
    deliberately, then start the stack. Startup resumes ordinary pending and
    retrying outbox delivery, but deliberately does not force recovery of a
    retained reset maintenance gate.
-7. If the restored PostgreSQL state contains a gate from an interrupted reset,
-   confirm that no `reset-data` process exists in the restored environment,
-   then run `./bin/mapp recover-reset-data --confirm`. The command assigns new
+8. If the restored PostgreSQL state contains a gate from an interrupted reset,
+   confirm that no `reset-system` process exists in the restored environment,
+   then run `./bin/mapp recover-reset-system --confirm`. The command assigns new
    semantic asset IDs at generation 1 to definitions left in reset archival
    state. Each registration names its validated archived predecessor so
    curated metadata, orphans, visibility, and matching field IDs carry into
    the audited successor without unarchiving or reusing the old tombstone.
-8. Allow the outbox to deliver every retained event before evaluating profile
+9. Allow the outbox to deliver every retained event before evaluating profile
    readiness. Do not clear a restored worker claim manually; its bounded lease
    expires and makes abandoned work eligible again. A restored
    `repair_required` event does not self-requeue; correct its cause and use the
    confirmed administrator retry, which sends the same retained payload.
-9. Verify database health, current workspace revision, authentication, audit
+10. Verify database health, current workspace revision, authentication, audit
    readability, semantic schema/catalog revision, derived-profile readiness,
    XYZ reload fingerprint, public map rendering, and a visual test.
 

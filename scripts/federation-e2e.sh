@@ -198,7 +198,10 @@ cleanup() {
   # covers an interpreter/container interruption between mint and finally and
   # cleans residue from an earlier aborted run. It runs before container
   # teardown while config-ui is still reachable.
-  "${compose[@]}" exec -T config-ui python3 - <<'PY' >/dev/null 2>&1 || true
+  # A credential sweep that fails silently leaves live federation tokens and
+  # still exits 0. It runs in an EXIT trap so it must not abort, but it must
+  # report.
+  if ! "${compose[@]}" exec -T config-ui python3 - <<'PY' >/dev/null 2>&1
 import os
 from pathlib import Path
 from control_plane import ControlStore
@@ -210,6 +213,9 @@ for record in store.list_tokens():
             and not record.get("revoked"):
         store.revoke_token(record["id"])
 PY
+  then
+    printf 'WARNING: could not revoke federation-e2e API tokens; they may still be live. Revoke them with ./bin/mapp revoke-config-tokens.\n' >&2
+  fi
   if [[ "${OWNS_ALIAS}" == "1" ]]; then
     remove_alias_state
   fi
@@ -522,8 +528,8 @@ base = "http://127.0.0.1:8080"
 
 # There is no CLI path for minting a token: POST /api/admin/tokens requires an
 # administrator session, and config_admin.py only offers init/reset/revoke. The
-# store is the supported seam, and it re-reads auth.json on every call, so the
-# running server sees this immediately without a restart.
+# store is the supported seam, and it writes the control schema the running
+# service reads, so the token is visible without a restart.
 store = ControlStore(Path(os.environ["CONTROL_DIR"]))
 expires = (
     dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)

@@ -189,7 +189,15 @@ def docker_checks(environment: Path, values: dict[str, str], live: bool) -> list
 
 def public_checks(values: dict[str, str], live: bool) -> list[Check]:
     results: list[Check] = []
-    for label, key in (("map", "PRODUCTION_MAP_SITE"), ("config", "PRODUCTION_CONFIG_SITE")):
+    # All three published origins. The MCP origin was omitted, so the one
+    # hostname whose service is newest -- and whose Caddy site proxies to a
+    # Unix socket rather than a container port -- had no live DNS or TLS
+    # evidence at all, while acceptance reported green.
+    for label, key in (
+        ("map", "PRODUCTION_MAP_SITE"),
+        ("config", "PRODUCTION_CONFIG_SITE"),
+        ("mcp", "PRODUCTION_MCP_SITE"),
+    ):
         origin = values.get(key, "")
         hostname = urlsplit(origin).hostname
         if not live:

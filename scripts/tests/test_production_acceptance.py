@@ -10,6 +10,7 @@ from scripts.production_acceptance import (
     ROOT,
     compose_command,
     environment_checks,
+    public_checks,
     rehearsal_check,
     write_evidence,
 )
@@ -22,6 +23,7 @@ def valid_environment(path: Path) -> None:
                 "MAPP_ENVIRONMENT=production",
                 "PRODUCTION_MAP_SITE=https://maps.company.co.uk",
                 "PRODUCTION_CONFIG_SITE=https://config.company.co.uk",
+                "PRODUCTION_MCP_SITE=https://mcp.company.co.uk",
                 "PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui",
                 "PRODUCTION_CADDY_EMAIL=operations@company.co.uk",
                 "EDGE_BIND_ADDRESS=0.0.0.0",
@@ -105,3 +107,35 @@ class ProductionAcceptanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishedOriginCoverageTests(unittest.TestCase):
+    """Acceptance must cover every origin the platform publishes.
+
+    It covered two of three. The MCP origin was the newest and the only one
+    whose Caddy site proxies to a Unix socket rather than a container port --
+    so the origin most likely to be misconfigured was the one with no live DNS
+    or TLS evidence, while the report still read green.
+    """
+
+    VALUES = {
+        "PRODUCTION_MAP_SITE": "https://maps.company.co.uk",
+        "PRODUCTION_CONFIG_SITE": "https://config.company.co.uk",
+        "PRODUCTION_MCP_SITE": "https://mcp.company.co.uk",
+    }
+
+    def test_all_three_origins_are_checked(self) -> None:
+        names = {item.id for item in public_checks(self.VALUES, live=False)}
+        for label in ("map", "config", "mcp"):
+            for kind in ("dns", "tls"):
+                with self.subTest(check=f"{kind}.{label}"):
+                    self.assertIn(f"{kind}.{label}", names)
+
+    def test_an_unchecked_origin_is_reported_pending_not_passing(self) -> None:
+        """Without --live these are pending. Pending must never read as pass."""
+        statuses = {
+            item.id: item.status
+            for item in public_checks(self.VALUES, live=False)
+        }
+        self.assertEqual("pending", statuses["dns.mcp"])
+        self.assertEqual("pending", statuses["tls.mcp"])

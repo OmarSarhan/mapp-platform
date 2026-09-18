@@ -76,7 +76,7 @@ class ResetCommandSafetyTests(unittest.TestCase):
 
     def test_host_loss_recovery_is_explicit_and_confirmed(self) -> None:
         self.assertIn(
-            "recover-reset-data --confirm",
+            "recover-reset-system --confirm",
             self.script,
         )
         self.assertIn(
@@ -84,6 +84,124 @@ class ResetCommandSafetyTests(unittest.TestCase):
             "force=True, wait_for_ready=True)",
             self.script,
         )
+
+    def test_schema_rollback_is_destructive_and_never_self_confirms(self) -> None:
+        """The wrapper must not decide the confirmation for the operator.
+
+        migrate-rollback drops tables. Its plan is printed by config_admin,
+        which reads the migration ledger -- so the warning names the versions
+        this database actually has rather than a paragraph that goes stale the
+        first time a migration is added. What the wrapper must get right is
+        narrower and easier to get wrong: forward the operator's arguments
+        verbatim and never inject --confirm.
+        """
+        dispatch = self.script[self.script.index("\n  migrate-rollback)") :]
+        dispatch = dispatch[: dispatch.index("\n    ;;")]
+        self.assertIn(
+            'python config_admin.py migrate-rollback --root /control "${@:2}"',
+            dispatch,
+        )
+        # Executable lines only. The comment above the dispatch explains that
+        # --confirm is never injected, and should not have to avoid naming it.
+        commands = "\n".join(
+            line
+            for line in dispatch.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertNotIn("--confirm", commands)
+
+    def test_schema_rollback_is_advertised_as_destructive(self) -> None:
+        """An operator reading usage should not have to run it to find out."""
+        usage = self.script[self.script.index("usage() {") :]
+        usage = usage[: usage.index("\n}\n")]
+        line = next(
+            item for item in usage.splitlines() if "migrate-rollback" in item
+        )
+        self.assertIn("destructive", line)
+        self.assertIn("--confirm", line)
+
+    def test_epoch_advance_never_self_confirms_and_never_starts_the_app(
+        self,
+    ) -> None:
+        """Two properties, and the second is the one easy to lose.
+
+        The point of the command is to invalidate restored credentials *before*
+        anything can accept one, so it must bring up the database and not the
+        application. --no-deps is what makes that true, and injecting --confirm
+        would take the decision away from the operator.
+        """
+        dispatch = self.script[self.script.index("\n  advance-recovery-epoch)") :]
+        dispatch = dispatch[: dispatch.index("\n    ;;")]
+        commands = "\n".join(
+            line
+            for line in dispatch.splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertIn(
+            'python config_admin.py advance-recovery-epoch --root /control'
+            ' "${@:2}"',
+            commands,
+        )
+        self.assertIn("run --rm --no-deps config-ui", commands)
+        self.assertIn("up --detach --wait db", commands)
+        self.assertNotIn("--confirm", commands)
+
+    def test_epoch_advance_is_advertised_as_destructive(self) -> None:
+        usage = self.script[self.script.index("usage() {") :]
+        usage = usage[: usage.index("\n}\n")]
+        line = next(
+            item for item in usage.splitlines() if "advance-recovery-epoch" in item
+        )
+        self.assertIn("destructive", line)
+        self.assertIn("--confirm", line)
+
+    def test_the_restore_procedure_invalidates_restored_credentials(self) -> None:
+        """The mechanism is only reachable if the procedure says to run it.
+
+        A restore document that recovers credentials without invalidating them
+        is how the hole stays open in practice, whatever the code can do.
+        """
+        document = (ROOT / "docs/backup-restore.md").read_text(encoding="utf-8")
+        self.assertIn("./bin/mapp advance-recovery-epoch --confirm", document)
+        self.assertIn("including ones revoked since", document)
+        # Ordered before the stack starts, or a pre-restore credential is
+        # usable in the window between.
+        self.assertLess(
+            document.index("advance-recovery-epoch"),
+            document.index("Initialize or clear stale live and preview reload"),
+        )
+
+    def test_reset_system_names_every_credential_class_the_volume_holds(
+        self,
+    ) -> None:
+        """The warning is the only thing standing between an operator and an
+        irreversible loss they did not expect.
+
+        It enumerated dashboard authentication, CLI API tokens and device
+        authorizations, and stopped there -- written before the control schema
+        also held registered agent clients and the consents they carry. Both
+        are destroyed with the volume, and neither comes back by signing in:
+        every client has to be registered again and every operator has to
+        consent again.
+
+        The recovery-epoch command already named grants, so for a while the two
+        destructive commands disagreed about what the database contains.
+        """
+        start = self.script.index("  reset-system)")
+        warning = self.script[start : self.script.index("exit 2", start)]
+        for named in (
+            "dashboard authentication",
+            "CLI API token",
+            "device authorization",
+            "MCP agent client",
+            "consent",
+        ):
+            with self.subTest(names=named):
+                self.assertIn(
+                    named,
+                    warning,
+                    f"reset-system destroys {named}s without saying so",
+                )
 
     def test_buildkit_lease_failures_prune_and_retry_once(self) -> None:
         self.assertIn("is_buildkit_lease_failure()", self.script)
@@ -111,10 +229,10 @@ class ResetCommandSafetyTests(unittest.TestCase):
     def test_runtime_start_repairs_stale_edge_port_bindings(self) -> None:
         self.assertIn("clear_edge_environment_overrides", self.script)
         self.assertIn(
-            "EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE CADDY_EMAIL",
+            "EDGE_BIND_ADDRESS HTTP_PORT HTTPS_PORT MAP_SITE CONFIG_SITE MCP_SITE CADDY_EMAIL",
             self.script,
         )
-        self.assertIn("up|serve|config-ui|reset-data|all)", self.script)
+        self.assertIn("up|serve|config-ui|reset-system|all)", self.script)
         self.assertIn("ensure_caddy_bindings()", self.script)
         self.assertIn(
             'config --format json | edge_bindings compose',

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import threading
 import tempfile
@@ -15,6 +16,8 @@ from unittest.mock import ANY, MagicMock, Mock, patch
 import app
 from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
+
+from control_fixture import ControlStoreTestCase
 
 
 class FederationHostDiagnosticRouteTests(unittest.TestCase):
@@ -877,6 +880,133 @@ class FederationAliasReadRouteTests(unittest.TestCase):
         self.assertEqual("federation.registry_unavailable", body["code"])
 
 
+class ExpressionTestResolutionTests(unittest.TestCase):
+    """A trial `fieldfx` entry must reach the evaluation that was told about it.
+
+    effective_locales() deep-copies, so /api/sql/test appended its trial entry
+    to a copy that test_info_expression never saw: it re-derived, found the
+    original entry count, and refused an index that was one past the end. The
+    route failed that way for every layer, which is why the CLI's `sql test`
+    could not work either, and no test covered it.
+    """
+
+    WORKSPACE = {"locale": {"layers": {"Stops": {
+        "table": "public.stops", "dbs": "MAPP",
+        "infoj": [{"field": "name", "type": "text"}],
+    }}}}
+
+    def resolved_locales(self):
+        locale_key, locale = app.select_locale(self.WORKSPACE, None)
+        layer = locale["layers"]["Stops"]
+        layer["infoj"] = list(layer["infoj"]) + [
+            {"field": "trial", "fieldfx": "1 + 1", "type": "integer",
+             "display": True},
+        ]
+        return locale_key, locale
+
+    def test_the_appended_entry_is_found_when_its_mapping_is_passed(self):
+        """It gets as far as needing a database, which is past the index check
+        that used to refuse it."""
+        locale_key, locale = self.resolved_locales()
+
+        with patch.dict(app.DB_CONNECTIONS, {}, clear=True):
+            with self.assertRaises(ValueError) as raised:
+                app.test_info_expression(
+                    self.WORKSPACE, locale_key, "Stops", 1,
+                    locales={locale_key: locale},
+                )
+
+        self.assertIn("connection is configured", str(raised.exception))
+
+    def test_without_the_mapping_the_entry_is_lost(self):
+        """The original behaviour, pinned so the reason for the parameter does
+        not quietly stop being true."""
+        locale_key, locale = self.resolved_locales()
+
+        with self.assertRaises(ValueError) as raised:
+            app.test_info_expression(self.WORKSPACE, locale_key, "Stops", 1)
+
+        self.assertIn("no longer exists", str(raised.exception))
+
+
+class DeclaredPaginationLimitTests(unittest.TestCase):
+    """A published limit the platform then refuses is worse than no limit.
+
+    proposals.list advertised `maximum: 200` in its querySchema while
+    pagination_parameters refuses anything above MAX_PAGE_LIMIT, which is 100.
+    An agent that read the contract and asked for 200 was refused by the
+    platform that published the number -- found by a real client doing exactly
+    that during an acceptance run, not by any test here.
+    """
+
+    #: Actions whose `limit` is bounded by something other than the shared
+    #: pagination limiter, with the value that bounds it. layers.values streams
+    #: a value list rather than a cursor page, and 500 is genuinely accepted.
+    OWN_LIMITER = {"layers.values": 500}
+
+    def test_every_declared_limit_matches_what_the_platform_enforces(self):
+        from control_api import ACTION_SCHEMAS, MAX_PAGE_LIMIT
+
+        for name, spec in ACTION_SCHEMAS.items():
+            for where in ("querySchema", "inputSchema"):
+                limit = (
+                    (spec.get(where) or {}).get("properties", {}).get("limit")
+                )
+                if not isinstance(limit, dict) or "maximum" not in limit:
+                    continue
+                expected = self.OWN_LIMITER.get(name, MAX_PAGE_LIMIT)
+                with self.subTest(action=name, schema=where):
+                    self.assertEqual(
+                        expected,
+                        limit["maximum"],
+                        f"{name} advertises a limit of {limit['maximum']} that"
+                        f" the platform will not accept",
+                    )
+
+
+class ProposalReadRouteTests(unittest.TestCase):
+    """GET /api/proposals/<id> for an unknown id must name the proposal, not
+    the file. The read is a plain `.read_text()`, so a missing record raises an
+    OSError whose text is "[Errno 2] No such file or directory:
+    '/control/proposals/<id>/proposal.json'". Reporting that verbatim hands any
+    caller the platform's internal layout; it reached an MCP credential once
+    this route was allowlisted for exchange."""
+
+    @staticmethod
+    def handler(path):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "admin"
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_an_unknown_proposal_never_reports_a_filesystem_path(self):
+        handler, responses = self.handler("/api/proposals/no-such-proposal")
+
+        handler.do_GET()
+
+        self.assertEqual(1, len(responses))
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("proposal.not_found", body["code"])
+        self.assertEqual("Unknown proposal: no-such-proposal", body["error"])
+        self.assertNotIn("proposal.json", json.dumps(body))
+        self.assertNotIn("Errno", json.dumps(body))
+
+    def test_a_malformed_identifier_keeps_its_own_message(self):
+        """The pattern check raises a ValueError whose text is written here and
+        carries no path, so it is reported rather than replaced."""
+        handler, responses = self.handler("/api/proposals/not a valid id")
+
+        handler.do_GET()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("Invalid proposal ID.", body["error"])
+
+
 class DerivedFailureStateTests(unittest.TestCase):
     def test_exception_reclassification_cannot_downgrade_uncertainty(self):
         failure = RuntimeError("failed")
@@ -1205,7 +1335,7 @@ class JsonResponseTests(unittest.TestCase):
         handler.send_response.assert_called_once_with(HTTPStatus.OK)
 
 
-class TokenAdministrationRouteTests(unittest.TestCase):
+class TokenAdministrationRouteTests(ControlStoreTestCase):
     @staticmethod
     def handler(
         payload: dict,
@@ -3661,8 +3791,9 @@ class CatalogDiscoveryTests(unittest.TestCase):
         self.assertNotIn("JOIN geometry_columns", discovery_query)
 
 
-class DerivedBackgroundOperationTests(unittest.TestCase):
+class DerivedBackgroundOperationTests(ControlStoreTestCase):
     def setUp(self):
+        super().setUp()
         self.semantic = Mock()
         self.semantic.request.return_value = {"assets": []}
         semantic_patcher = patch.object(app, "SEMANTIC", self.semantic)
@@ -6356,7 +6487,7 @@ class SemanticGatewayRouteTests(unittest.TestCase):
         derived = SemanticDerivedIntegrationTests.derived("repair_required")
         derived.repair_semantic_profile.side_effect = (
             app.DerivedLayerMaintenanceError(
-                "Derived-layer changes are paused while reset-data archives "
+                "Derived-layer changes are paused while reset-system archives "
                 "semantic profiles."
             )
         )
@@ -6765,7 +6896,7 @@ class ApplyRouteTests(unittest.TestCase):
         self.assertEqual("indeterminate", responses[0][1]["operation"]["status"])
 
 
-class CandidatePreviewRouteTests(unittest.TestCase):
+class CandidatePreviewRouteTests(ControlStoreTestCase):
     @staticmethod
     def handler(path: str, payload: dict) -> tuple[app.Handler, list]:
         responses = []
@@ -9540,3 +9671,412 @@ class FederationVerifierLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpClientRouteTests(unittest.TestCase):
+    """The dashboard's agent-client surface.
+
+    Registration used to be an operator command only, which meant the person who
+    runs the platform and the person who runs the agent had to be the same
+    person, or had to exchange a client id out of band. These routes are what
+    let an administrator issue one from the dashboard and hand it over.
+
+    They are administrator-session routes, not bearer-token routes, for the same
+    reason token issuance is: deciding which agent may ask for consent is
+    credential administration, and a `full` bearer must not reach it.
+    """
+
+    @staticmethod
+    def handler(path, actor="admin", payload=None):
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: payload or {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_listing_returns_the_clients_and_the_origin_to_connect_to(self):
+        """The origin travels with the list because the dashboard composes a
+        connection snippet from both, and a second source for it would drift."""
+        handler, responses = self.handler("/api/admin/mcp-clients")
+        control = MagicMock()
+        control.list_oauth_clients.return_value = [{"clientId": "mcp-a"}]
+        with patch.object(app, "CONTROL", control), patch.dict(
+            app.os.environ, {"MCP_SITE": "https://mcp.example.test"}, clear=False
+        ):
+            handler.do_GET()
+        self.assertEqual(HTTPStatus.OK, responses[0][0])
+        self.assertEqual([{"clientId": "mcp-a"}], responses[0][1]["clients"])
+        self.assertEqual("https://mcp.example.test/mcp", responses[0][1]["mcpUrl"])
+
+    def test_a_trailing_slash_on_the_origin_does_not_double(self):
+        handler, responses = self.handler("/api/admin/mcp-clients")
+        control = MagicMock()
+        control.list_oauth_clients.return_value = []
+        with patch.object(app, "CONTROL", control), patch.dict(
+            app.os.environ, {"MCP_SITE": "https://mcp.example.test/"}, clear=False
+        ):
+            handler.do_GET()
+        self.assertEqual("https://mcp.example.test/mcp", responses[0][1]["mcpUrl"])
+
+    def test_registration_passes_the_request_through_and_names_the_admin(self):
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={
+                "name": "Claude Code",
+                "redirectUris": ["http://localhost:8484/callback"],
+                "scopes": ["mcp:connect", "inspect"],
+            },
+        )
+        control = MagicMock()
+        control.register_oauth_client.return_value = "mcp-ISSUED"
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertEqual((HTTPStatus.CREATED, {"clientId": "mcp-ISSUED"}), responses[0])
+        control.register_oauth_client.assert_called_once_with(
+            name="Claude Code",
+            redirect_uris=["http://localhost:8484/callback"],
+            scopes=["mcp:connect", "inspect"],
+            # Not the CLI's "local-admin": the audit entry has to say who did it.
+            actor="admin",
+        )
+
+    def test_no_secret_is_ever_returned(self):
+        """A public client has none, and returning a field that looked like one
+        would teach an operator to guard a value that is not a credential."""
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={"name": "n", "redirectUris": ["http://localhost:1/c"], "scopes": ["s"]},
+        )
+        control = MagicMock()
+        control.register_oauth_client.return_value = "mcp-ISSUED"
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertEqual({"clientId"}, set(responses[0][1]))
+
+    def test_an_unsupported_property_is_refused_rather_than_ignored(self):
+        """Silently dropping a field means an operator who asked for something
+        gets a client that does not have it and is told it worked."""
+        handler, responses = self.handler(
+            "/api/admin/mcp-clients",
+            payload={"name": "n", "redirectUris": ["http://localhost:1/c"],
+                     "scopes": ["s"], "clientSecret": "please"},
+        )
+        control = MagicMock()
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertNotEqual(HTTPStatus.CREATED, responses[0][0])
+        self.assertIn("clientSecret", str(responses[0][1]))
+        control.register_oauth_client.assert_not_called()
+
+    def test_disabling_reports_not_found_when_nothing_changed(self):
+        for disabled, expected in ((True, HTTPStatus.OK), (False, HTTPStatus.NOT_FOUND)):
+            with self.subTest(disabled=disabled):
+                handler, responses = self.handler(
+                    "/api/admin/mcp-clients/mcp-abc/disable"
+                )
+                control = MagicMock()
+                control.disable_oauth_client.return_value = disabled
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+                self.assertEqual(expected, responses[0][0])
+                control.disable_oauth_client.assert_called_once_with(
+                    "mcp-abc", actor="admin"
+                )
+
+    def test_every_route_refuses_a_full_bearer(self):
+        """A `full` token is the widest bearer credential the platform issues,
+        and it must still not administer credentials. Checked on each route
+        rather than once, because the guard is written out per route."""
+        cases = (
+            ("/api/admin/mcp-clients", "do_GET", "list_oauth_clients"),
+            ("/api/admin/mcp-clients", "do_POST", "register_oauth_client"),
+            ("/api/admin/mcp-clients/mcp-abc/disable", "do_POST", "disable_oauth_client"),
+        )
+        for path, method, control_method in cases:
+            with self.subTest(path=path, method=method):
+                handler, responses = self.handler(
+                    path,
+                    actor="token:full",
+                    payload={"name": "n", "redirectUris": ["http://localhost:1/c"],
+                             "scopes": ["s"]},
+                )
+                control = MagicMock()
+                with patch.object(app, "CONTROL", control):
+                    getattr(handler, method)()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                getattr(control, control_method).assert_not_called()
+
+
+#: Shaped like a real one. The first version of these tests used "g1", which
+#: routed fine and matched nothing the platform ever mints: grant ids carry a
+#: colon, and the route pattern did not accept one, so every real revocation
+#: answered 404 while the suite passed. Derived from the generator's own form.
+GRANT_ID = "oauth:" + "g-nX6S3bwmAI1n0QjTAq9KAu"
+
+
+class McpGrantRouteTests(unittest.TestCase):
+    """Withdrawing a consent, which is the lever that actually stops an agent.
+
+    Distinct from disabling its client: disabling says the software may no
+    longer ask, revoking withdraws what it was already allowed to do, and a
+    client can stay registered and usable by somebody else.
+    """
+
+    @staticmethod
+    def handler(path, actor="admin", payload=None):
+        responses: list[tuple[HTTPStatus, dict]] = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: actor
+        handler._payload = lambda: payload or {}
+        handler._remote = lambda: "127.0.0.1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler.send_error = lambda status: responses.append((status, {}))
+        return handler, responses
+
+    def test_listing_returns_the_grants(self):
+        handler, responses = self.handler("/api/admin/mcp-grants")
+        control = MagicMock()
+        control.list_oauth_grants.return_value = [{"grantId": "g1"}]
+        with patch.object(app, "CONTROL", control):
+            handler.do_GET()
+        self.assertEqual((HTTPStatus.OK, {"grants": [{"grantId": "g1"}]}), responses[0])
+
+    def test_revoking_reports_not_found_when_nothing_changed(self):
+        """A second revocation changes nothing, and reporting success would
+        tell an operator they withdrew a consent that was already gone."""
+        for revoked, expected in ((True, HTTPStatus.OK), (False, HTTPStatus.NOT_FOUND)):
+            with self.subTest(revoked=revoked):
+                handler, responses = self.handler(f"/api/admin/mcp-grants/{GRANT_ID}/revoke")
+                control = MagicMock()
+                control.revoke_oauth_grant.return_value = revoked
+                with patch.object(app, "CONTROL", control):
+                    handler.do_POST()
+                self.assertEqual(expected, responses[0][0])
+                control.revoke_oauth_grant.assert_called_once_with(
+                    GRANT_ID, reason="", actor="admin"
+                )
+
+    def test_a_reason_is_carried_through(self):
+        handler, responses = self.handler(
+            f"/api/admin/mcp-grants/{GRANT_ID}/revoke", payload={"reason": "laptop lost"}
+        )
+        control = MagicMock()
+        control.revoke_oauth_grant.return_value = True
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        control.revoke_oauth_grant.assert_called_once_with(
+            GRANT_ID, reason="laptop lost", actor="admin"
+        )
+
+    def test_an_unsupported_property_is_refused(self):
+        handler, responses = self.handler(
+            f"/api/admin/mcp-grants/{GRANT_ID}/revoke", payload={"grantId": "somethingelse"}
+        )
+        control = MagicMock()
+        with patch.object(app, "CONTROL", control):
+            handler.do_POST()
+        self.assertNotEqual(HTTPStatus.OK, responses[0][0])
+        control.revoke_oauth_grant.assert_not_called()
+
+    def test_the_route_accepts_ids_shaped_as_the_broker_mints_them(self):
+        """Generated here rather than written out, so the pattern is tested
+        against the real alphabet instead of one example of it.
+
+        The authorization component mints `"oauth:" + secrets.token_urlsafe(18)`
+        (mcp-auth/server.py). token_urlsafe draws from base64url, so a `-` or a
+        `_` appears in most ids and a pattern missing either would fail
+        intermittently -- the worst way for this to be wrong.
+        """
+        import secrets
+
+        for _ in range(200):
+            grant_id = "oauth:" + secrets.token_urlsafe(18)
+            handler, responses = self.handler(
+                f"/api/admin/mcp-grants/{grant_id}/revoke"
+            )
+            control = MagicMock()
+            control.revoke_oauth_grant.return_value = True
+            with patch.object(app, "CONTROL", control):
+                handler.do_POST()
+            self.assertEqual(
+                HTTPStatus.OK,
+                responses[0][0],
+                f"{grant_id} did not route; the pattern rejects part of the alphabet",
+            )
+            control.revoke_oauth_grant.assert_called_once_with(
+                grant_id, reason="", actor="admin"
+            )
+
+    def test_both_routes_refuse_a_full_bearer(self):
+        cases = (
+            ("/api/admin/mcp-grants", "do_GET", "list_oauth_grants"),
+            (f"/api/admin/mcp-grants/{GRANT_ID}/revoke", "do_POST", "revoke_oauth_grant"),
+        )
+        for path, method, control_method in cases:
+            with self.subTest(path=path):
+                handler, responses = self.handler(path, actor="token:full")
+                control = MagicMock()
+                with patch.object(app, "CONTROL", control):
+                    getattr(handler, method)()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                getattr(control, control_method).assert_not_called()
+
+
+class ActorRedactionTests(unittest.TestCase):
+    """What a delegated agent is not told about who did things.
+
+    Several read endpoints attribute records to the credential that created
+    them, written from the authenticated principal on purpose. That is the right
+    answer for an operator and the wrong one for an agent: a scope to read the
+    federated source registry is not a scope to enumerate the operator
+    credentials behind it.
+
+    Enforced at the response layer rather than per consumer, because per
+    consumer had already drifted -- the MCP runtime filtered these fields from
+    its federation tools and passed the identical field through in its
+    derived-layer tool, in the same release.
+    """
+
+    def test_credential_identifiers_are_replaced_wherever_they_appear(self) -> None:
+        payload = {
+            "derivedLayers": [{"name": "x", "createdBy": "token:28fee603566a89e6"}],
+            "aliases": [{"registeredBy": "token:a", "approvedBy": "oauth:g-1"}],
+            "nested": {"deep": [{"someFutureField": "token:b"}]},
+        }
+        redacted = app.redact_actor_credentials(payload)
+        rendered = json.dumps(redacted)
+        self.assertNotIn("token:", rendered)
+        self.assertNotIn("oauth:", rendered)
+        # A placeholder, not a removed key: the agent learns attribution exists.
+        self.assertEqual(app.WITHHELD_ACTOR, redacted["derivedLayers"][0]["createdBy"])
+        self.assertEqual(
+            app.WITHHELD_ACTOR, redacted["nested"]["deep"][0]["someFutureField"]
+        )
+
+    def test_it_matches_on_value_not_on_key_name(self) -> None:
+        """A key-based list is a second thing to keep in step. A field nobody
+        has added yet still carries a credential identifier."""
+        redacted = app.redact_actor_credentials({"anythingAtAll": "token:x"})
+        self.assertEqual(app.WITHHELD_ACTOR, redacted["anythingAtAll"])
+
+    def test_ordinary_values_are_untouched(self) -> None:
+        """Over-redaction would corrupt the answer rather than protect it."""
+        payload = {
+            "name": "census_oa_population_quintiles",
+            "description": "Tokens are discussed here but this is not one.",
+            "count": 6147,
+            "flag": True,
+            "nothing": None,
+            "role": "admin",
+        }
+        self.assertEqual(payload, app.redact_actor_credentials(payload))
+
+    def test_a_dashboard_response_keeps_its_attribution(self) -> None:
+        """An operator at the dashboard is the audience these fields were
+        written for. Redacting for everyone would remove a real feature."""
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/derived-layers"
+        handler.command = "GET"
+        handler._exchanged_token = None
+        handler._exchanged_token_redeemed = False
+        handler._request_id = "r"
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+        handler.wfile = io.BytesIO()
+        handler._json(HTTPStatus.OK, {"createdBy": "token:28fee603566a89e6"})
+        self.assertIn("token:28fee603566a89e6", handler.wfile.getvalue().decode())
+
+    def test_an_exchanged_credential_gets_the_placeholder(self) -> None:
+        """The same response, to an agent."""
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/derived-layers"
+        handler.command = "GET"
+        handler._exchanged_token = "mapp_b_something"
+        handler._exchanged_token_redeemed = True
+        handler._request_id = "r"
+        handler.send_response = lambda *a, **k: None
+        handler.send_header = lambda *a, **k: None
+        handler.end_headers = lambda *a, **k: None
+        handler.wfile = io.BytesIO()
+        handler._json(HTTPStatus.OK, {"createdBy": "token:28fee603566a89e6"})
+        body = handler.wfile.getvalue().decode()
+        self.assertNotIn("28fee603566a89e6", body)
+        self.assertIn(app.WITHHELD_ACTOR, body)
+
+
+class OperationRouteIndexTests(unittest.TestCase):
+    """Every action must be reachable by an exchanged credential.
+
+    The index read only `pathTemplate`, and `ACTION_SCHEMAS` writes `path` for a
+    route with no parameters -- so every fixed-path action was missing from it
+    and answered `auth.operation_unresolved`, which reads like a deliberate
+    refusal rather than a route nobody registered. Found when the first MCP tool
+    pointing at one was driven against the deployed stack.
+    """
+
+    def test_every_action_is_indexed(self) -> None:
+        indexed = {name for names in app.OPERATIONS_BY_ROUTE.values() for name in names}
+        missing = sorted(set(app.ACTION_SCHEMAS) - indexed)
+        self.assertEqual([], missing, f"unreachable by an exchanged credential: {missing}")
+
+    def test_fixed_path_actions_are_indexed_under_their_own_path(self) -> None:
+        """Named explicitly, because "every action is indexed" would also pass
+        if fixed paths were indexed under something wrong."""
+        for name, schema in app.ACTION_SCHEMAS.items():
+            if schema.get("pathTemplate") or not schema.get("path"):
+                continue
+            with self.subTest(action=name):
+                key = (schema["method"], schema["path"])
+                self.assertIn(name, app.OPERATIONS_BY_ROUTE.get(key, ()))
+
+    def test_the_index_is_not_empty(self) -> None:
+        """Otherwise both assertions above pass by finding nothing."""
+        self.assertGreater(len(app.OPERATIONS_BY_ROUTE), 20)
+
+
+class AdminSurfaceGuardTests(unittest.TestCase):
+    """Every administrator read, derived from the source rather than listed.
+
+    The existing table of admin reads is maintained by hand, which is the shape
+    that agrees with the code however wrong both are: a new `/api/admin/` read
+    added without a matching row is unguarded and silently untested. This reads
+    the dispatch itself, so the set under test cannot fall behind it.
+    """
+
+    @staticmethod
+    def admin_read_paths() -> set:
+        import re
+
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        return set(re.findall(r'elif path == "(/api/admin/[a-z-]+)"', source))
+
+    def test_the_surface_is_not_empty(self):
+        """Otherwise the guard below passes by finding nothing to check."""
+        self.assertGreaterEqual(len(self.admin_read_paths()), 4)
+
+    def test_no_administrator_read_answers_a_full_bearer(self):
+        for path in sorted(self.admin_read_paths()):
+            with self.subTest(path=path):
+                responses: list[tuple[HTTPStatus, dict]] = []
+                handler = object.__new__(app.Handler)
+                handler.path = path
+                handler._host_allowed = lambda: True
+                handler._authorized = lambda state_change=False: "token:full"
+                handler._json = lambda status, body: responses.append((status, body))
+                handler.send_error = lambda status: responses.append((status, {}))
+                with patch.object(app, "CONTROL", MagicMock()):
+                    handler.do_GET()
+                self.assertEqual(
+                    HTTPStatus.FORBIDDEN,
+                    responses[0][0],
+                    f"{path} answered a full bearer token",
+                )

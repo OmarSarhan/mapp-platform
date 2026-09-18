@@ -9,7 +9,8 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
 - Live mode uses Caddy-managed HTTPS for all application traffic. Public port
   80 exists only for automatic certificate handling and HTTPS redirects;
   application containers are never published directly.
-- Both public routes send a one-year HSTS policy after HTTPS is established.
+- All three public routes send a one-year HSTS policy after HTTPS is
+  established.
   It intentionally omits `includeSubDomains` and preload until the owner has
   validated every sibling hostname and accepted that broader commitment.
 - Bundled PostgreSQL, XYZ, and the configuration service remain on private
@@ -30,7 +31,17 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
   schema: one role that may only `SELECT` from it and one role that owns it and
   can reach nothing else. **Semantic catalog roles** below states what that
   changed and what it cost.
-- The map and configuration service use separate hostnames.
+- The MCP authorization component is not on the edge network. Caddy reaches it
+  over a Unix socket in `var/mcp-auth` and proxies exactly four public paths to
+  it; everything else on that origin is a 404. Its exchange, introspection and
+  revocation endpoints live on a second listener reachable only on the internal
+  `mcp-control` network, which it shares only with the configuration service,
+  and they are absent from the edge listener's own route table as well as from
+  the Caddy allowlist. It holds one database credential, confined to the
+  `control` schema, and no workspace, artifact or Docker access. See
+  [MCP authorization](mcp-authorization.md).
+- The map, configuration service and MCP authorization component use separate
+  hostnames.
 - The standalone CLI runs on another computer and is untrusted until its
   bearer token is authenticated.
 - `instance` contains reviewed non-secret inputs; `var` contains sensitive
@@ -41,10 +52,17 @@ reporting a suspected vulnerability, see [`../SECURITY.md`](../SECURITY.md).
 XYZ must never receive `var/control`. Its readable inputs are limited to the
 live workspace and explicitly public instance assets. The configuration
 service receives only the writable paths needed for atomic workspace saves,
-control records, artifacts, and reload coordination. The semantic service now
+control records, artifacts, and reload coordination. Authentication state is no
+longer among them: the administrator credential, dashboard sessions, CLI token
+records and device authorizations are rows in the `control` schema of the
+packaged database, reached with a dedicated least-privilege role. The audit log
+is the deliberate exception and remains an append-only file at
+`var/control/audit.jsonl`, alongside the proposal and operation records.
+The semantic service now
 has no writable state at all: the `/state` mount that carried `var/semantic`
 is gone, its container root is read-only, and its only durable state is a
-schema in the packaged database.
+schema in the packaged database. The MCP authorization component has one mount,
+the directory holding its edge socket, and no readable platform state at all.
 
 An installation that predates the move still has `var/semantic/semantic.sqlite3`
 on the host. Nothing reads or writes it any more and nothing removes it, but it
@@ -110,6 +128,13 @@ write anything.
 
 Dashboard sessions use an `HttpOnly`, SameSite cookie and CSRF token.
 Production must enable secure cookies and HTTPS.
+
+The MCP authorization component authenticates its consent screen against the
+same single administrator credential, read live from `control.admin_credential`
+per attempt rather than cached, so a password change needs no restart. It has
+no credential of its own and no password environment variable. Its own session
+cookie is separate, expires absolutely after 30 minutes, and takes `Secure`
+only when `MCP_AUTH_SECURE_COOKIES` is the literal string `true`.
 
 CLI tokens are shown once and stored as hashes by the platform. For device
 authorization, approval stores no usable credential: the raw token is
@@ -366,6 +391,11 @@ widened, and it still has no public route. A future data/function executor must
 be a separate container with its own least-privilege credential: the metadata
 service's two roles are deliberately confined to the `semantic` schema, and
 widening either to reach source data would collapse that separation.
+The MCP authorization component follows the same pattern: read-only root, a
+bounded `tmpfs`, dropped capabilities, `no-new-privileges`, a non-root user,
+and a single mount holding its socket, which is created with mode `0660` under
+the umask rather than widened after bind. It joins `backend` and `mcp-control`
+only.
 Initialize and operate production as a dedicated unprivileged host account.
 Production validation rejects `CONFIG_UID=0` or `CONFIG_GID=0` so a root-run
 initialization cannot silently make the application services run as root.

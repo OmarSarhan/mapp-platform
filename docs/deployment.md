@@ -9,8 +9,8 @@
 - Python 3 and OpenSSL for the wrapper's initialization and validation helpers.
 - Sufficient persistent storage for bundled PostgreSQL when selected, Caddy
   data, audit/proposal records, semantic catalog state, and browser artifacts.
-- Two distinct public DNS hostnames: one for the map and one for the
-  configuration service.
+- Three distinct public DNS hostnames: one for the map, one for the
+  configuration service, and one for the MCP authorization component.
 - Direct public HTTP on TCP port 80 and HTTPS on TCP/UDP port 443 to Caddy.
 - A backup destination outside the deployment host.
 
@@ -76,10 +76,15 @@ changed and verified deliberately.
 
 At minimum, set and review:
 
-- `PRODUCTION_MAP_SITE` and `PRODUCTION_CONFIG_SITE`: distinct public HTTPS
-  origins using DNS hostnames and the standard port 443. IP literals,
-  single-label/reserved names, trailing-dot names, and different ports on one
-  hostname are rejected.
+- `PRODUCTION_MAP_SITE`, `PRODUCTION_CONFIG_SITE` and `PRODUCTION_MCP_SITE`:
+  three distinct public HTTPS origins using DNS hostnames and the standard port
+  443. IP literals, single-label/reserved names, trailing-dot names, and
+  different ports on one hostname are rejected, as is any pair sharing a
+  hostname: Caddy routes the three origins to different backends by hostname,
+  so a collision serves one service's paths from another's site block.
+  `PRODUCTION_MCP_SITE` is the MCP authorization component's origin and is
+  mandatory — the hardening overlay refuses to resolve without it. See
+  [MCP authorization](mcp-authorization.md).
 - `HTTP_PORT=80` and `HTTPS_PORT=443`: required by the direct Caddy topology.
 - `EDGE_BIND_ADDRESS`: a non-loopback host interface, commonly `0.0.0.0`.
 - `PRODUCTION_CADDY_EMAIL`: a monitored, non-placeholder ACME contact.
@@ -185,7 +190,8 @@ also checks the demo content in the source databases that hold it. Complete
 acceptance with layer-specific visual tests for the workspace.
 
 Use `./bin/mapp ps` and `./bin/mapp logs` from the same repository with its
-production `.env` while bringing up the release. Confirm both public hostnames,
+production `.env` while bringing up the release. Confirm all three public
+hostnames, the MCP origin's authorization-server metadata document,
 authenticated dashboard access, semantic status/catalog revision, the current
 workspace revision, XYZ reload health, and a visual test for representative
 point, line, and polygon layers.
@@ -272,7 +278,7 @@ To remove the complete bundled PostgreSQL volume and rebuild it with only the
 configured ETL sources, run:
 
 ```sh
-./bin/mapp reset-data --confirm
+./bin/mapp reset-system --confirm
 ```
 
 This deletes the packaged database and everything in it: derived layers, the
@@ -293,8 +299,8 @@ checks the outbox again; a `repair_required` event or timeout aborts before
 volume deletion.
 
 A handled interruption compensates only the reset operation's own gate. If the
-host or process stops before compensation, confirm that no `reset-data`
-process remains and run `./bin/mapp recover-reset-data --confirm`; ordinary
+host or process stops before compensation, confirm that no `reset-system`
+process remains and run `./bin/mapp recover-reset-system --confirm`; ordinary
 service startup does not force reset recovery. Both commands are unavailable
 in external-database mode and require their explicit `--confirm` guards.
 Source availability can change independently; treat a non-zero ETL exit as a
@@ -340,8 +346,8 @@ normal external-database operation.
 For production, do not rely on the local defaults. Read
 [Deployment](deployment.md), [Security](security.md), and
 [Backup and restore](backup-restore.md) first. The shipped direct
-production topology requires distinct public HTTPS DNS hostnames for map and
-configuration traffic, with Caddy directly bound to ports 80 and 443.
+production topology requires distinct public HTTPS DNS hostnames for map,
+configuration and MCP traffic, with Caddy directly bound to ports 80 and 443.
 
 ---
 
@@ -383,10 +389,17 @@ After the reviewed release is running, execute:
 ./bin/mapp production-acceptance --live --require-complete
 ```
 
-The live run queries both public DNS names, verifies their system-trusted TLS
-chains and hostnames, requests the public endpoints, reads Compose health, and
-attempts to read a supported host firewall (`ufw`, `firewall-cmd`, or `nft`).
-It never changes DNS, certificates, firewall rules, containers, or data.
+The live run queries the map and configuration DNS names, verifies their
+system-trusted TLS chains and hostnames, requests the public endpoints, reads
+Compose health, and attempts to read a supported host firewall (`ufw`,
+`firewall-cmd`, or `nft`). It never changes DNS, certificates, firewall rules,
+containers, or data.
+
+It does not yet cover the MCP origin: its DNS and TLS checks read
+`PRODUCTION_MAP_SITE` and `PRODUCTION_CONFIG_SITE` only, even though the
+production overlay requires the third origin. Confirm that hostname's DNS
+answer, certificate and metadata document separately and record it with the
+release evidence.
 
 A readable host firewall is evidence of observability, not evidence that its
 policy is correct. Review the captured host policy separately and record the
@@ -431,8 +444,9 @@ Each hook must:
 
 The backup hook must create a fresh database-aware backup plus protected,
 coordinated copies of `var/workspace`, `var/control`, Caddy state, and the
-release identity; the semantic catalog is inside the database backup rather
-than beside it. It must verify archive readability, private
+release identity; the semantic catalog and the control schema — the
+administrator credential, sessions, CLI tokens, device authorizations and
+OAuth records — are inside the database backup rather than beside it. It must verify archive readability, private
 permissions, checksums, and the off-host destination.
 
 The restore hook must restore that exact backup into new storage and verify

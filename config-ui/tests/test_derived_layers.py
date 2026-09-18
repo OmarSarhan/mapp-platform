@@ -4712,7 +4712,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         blocked.fetchone.return_value = {"operation": "reset-data"}
         with self.assertRaisesRegex(
             DerivedLayerError,
-            "paused while reset-data",
+            "paused while reset-system",
         ):
             store._ensure_changes_allowed(blocked)
 
@@ -4723,7 +4723,7 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         mutation = self.store_with_cursor(mutation_cursor)
         with self.assertRaisesRegex(
             DerivedLayerError,
-            "paused while reset-data",
+            "paused while reset-system",
         ):
             mutation.create(self.valid(), "token:test")
         mutation_statements = "\n".join(

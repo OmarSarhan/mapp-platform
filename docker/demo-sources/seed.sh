@@ -36,38 +36,11 @@ CENSUS_DB="$(dotenv_value CENSUS_POSTGRES_DB)"
 OPS_DB="$(dotenv_value OPS_POSTGRES_DB)"
 
 workspace_repair_extent() {
-  # Demo source repair must follow the versioned demo workspace, not whichever
-  # mutable workspace happens to be live when the command starts. Otherwise a
-  # custom live extent can produce source geometry that does not cover the map
-  # this same demo run publishes.
-  local workspace="${ROOT_DIR}/docker/demo-sources/workspace-demo.json"
-  if [[ ! -f "${workspace}" ]]; then
-    workspace="${ROOT_DIR}/instance/workspace.seed.json"
-  fi
-  python3 - "${workspace}" <<'PY'
-import json
-import math
-import sys
-
-try:
-    workspace = json.load(open(sys.argv[1], encoding="utf-8"))
-except OSError:
-    raise SystemExit(0)
-extent = ((workspace.get("locale") or {}).get("extent") or {})
-try:
-    west = float(extent["west"])
-    south = float(extent["south"])
-    east = float(extent["east"])
-    north = float(extent["north"])
-except (KeyError, TypeError, ValueError):
-    raise SystemExit(0)
-if (
-    all(math.isfinite(value) for value in (west, south, east, north))
-    and -180 <= west <= east <= 180
-    and -90 <= south <= north <= 90
-):
-    print(f"{west},{south},{east},{north}")
-PY
+  # One definition, in scripts/workspace_repair_extent.py, because verify has
+  # to bound its census validity assertion by the same extent this bounds the
+  # repair by. While the two were separate, verify asserted validity across all
+  # of England and a correct demo run failed on geometry no layer reads.
+  python3 "${ROOT_DIR}/scripts/workspace_repair_extent.py"
 }
 
 # Census metadata travels with the measures: census_variables carries the ONS
@@ -109,12 +82,26 @@ seed_one() {
   "${compose[@]}" exec -T "${service}" psql \
     --set ON_ERROR_STOP=1 --username "${SOURCE_USER}" --dbname "${database}" \
     --set reader_user="${READER_USER}" \
-    --set reader_password="${READER_PASSWORD}" <<'SQL' >/dev/null
+    --set reader_password="${READER_PASSWORD}" \
+    --set source_user="${SOURCE_USER}" \
+    --set source_password="${password}" <<'SQL' >/dev/null
 -- Retained source volumes keep their roles when .env credentials are rotated.
 -- Reconcile the demo-owned read-only login on every load, just as the bundled
 -- database upgrade reconciles its service roles.
 ALTER ROLE :"reader_user" LOGIN PASSWORD :'reader_password';
 ALTER ROLE :"reader_user" CONNECTION LIMIT 64;
+-- And the owner, which POSTGRES_PASSWORD sets only when the data directory is
+-- first created. A retained volume therefore keeps whatever password it was
+-- initialised with, and the load a few lines below connects as this role over
+-- the network -- where pg_hba requires scram, unlike the local socket this
+-- statement arrives on, which is trusted. So the failure is invisible until
+-- the ETL runs, and reads as a plain "password authentication failed" for a
+-- credential that is correct everywhere it is written down.
+--
+-- Reconciling the reader but not the owner was the gap: both are demo-owned
+-- logins into a database MAPP recreates at will, and both have to survive a
+-- rotated .env.
+ALTER ROLE :"source_user" LOGIN PASSWORD :'source_password';
 SQL
 
   "${compose[@]}" exec -T "${service}" psql \

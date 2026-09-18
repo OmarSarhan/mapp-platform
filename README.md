@@ -27,8 +27,8 @@ Docker with Compose, and about 4 GB free. Nothing is installed on the host.
 `demo` takes around fifteen minutes, most of it downloading the England Census
 2021 Output Area dataset. Then open:
 
-- the map — <http://localhost:3000>
-- the dashboard — <http://config.localhost:3000>
+- the map — <http://localhost>
+- the dashboard — <http://config.localhost>
 
 The dashboard password was printed by `init`; `./bin/mapp reset-config-password`
 issues a new one if you have lost it.
@@ -65,7 +65,7 @@ covers preparing the source database itself.
 | `./bin/mapp doctor` | Report `.env` key drift; `--add-missing` fills safe defaults |
 | `./bin/mapp ps`, `logs` | Service state and logs |
 | `./bin/mapp stop`, `down` | Stop, or remove containers and keep the data |
-| `./bin/mapp reset-data --confirm` | Remove the packaged database; read the warning first |
+| `./bin/mapp reset-system --confirm` | Remove the packaged database; read the warning first |
 
 `./bin/mapp` with no arguments lists all of them.
 
@@ -76,11 +76,12 @@ covers preparing the source database itself.
 | `bin/mapp` | The wrapper every operation goes through |
 | `config-ui/` | Configuration dashboard and API |
 | `semantic-service/` | Private semantic catalogue service |
+| `mcp-auth/` | Phase 0 OAuth authorization component for the forthcoming MCP server |
 | `etl/` | Loader used by the demo to populate source databases |
 | `docker/` | Image definitions and database initialisation |
 | `scripts/` | `verify.sh`, acceptance and contract test helpers |
 | `instance/` | Reviewed, versioned inputs — seed workspace, public assets |
-| `var/` | Runtime state: authentication, audit, proposals, artifacts |
+| `var/` | Runtime state: audit, proposals, artifacts, and the authorization component's socket |
 | `docs/` | [Documentation](docs/guide.md) |
 
 `instance/` is checked in and reviewed. `var/` is generated, private, and
@@ -95,6 +96,18 @@ every reference document in the right place.
 If you already know what you are looking for, its
 [reference index](docs/guide.md#10-reference-index) lists all of them with a
 line each.
+
+The platform's own state — the administrator credential, dashboard sessions,
+CLI tokens, device authorizations and the OAuth records of the Phase 0
+[MCP authorization component](docs/mcp-authorization.md) — lives in the
+`control` schema of the packaged database, not in files under `var/`. Its
+design decisions are recorded in
+[ADR 0001](docs/adr/0001-mcp-authorization-and-topology.md), its
+[threat model](docs/mcp-threat-model.md) covers the abuse cases, and the
+[Phase 0 evidence bundle](docs/mcp-phase0-evidence.md) carries the measured
+capacity and the gate status. That component is an unmerged feasibility spike:
+no agent client can be registered yet, so it cannot complete an authorization
+end to end.
 
 ## The remote client
 

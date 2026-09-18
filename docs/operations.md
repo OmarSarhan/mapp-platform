@@ -25,6 +25,14 @@ two credentials of its own: `SEMANTIC_READER_DATABASE_URL` for every catalog
 read and `SEMANTIC_DATABASE_URL` for every catalog write. Both reach only the
 `semantic` schema of that same database, which is where the catalog lives.
 
+The MCP authorization component runs as `mcp-auth` and is required by
+`./bin/mapp verify` like any other runtime service. It publishes no host port:
+Caddy reaches it over a Unix socket for four public paths on the MCP origin,
+and the configuration service reaches its internal endpoints on the
+`mcp-control` network. It is a Phase 0 spike and cannot yet complete an
+authorization, because nothing registers an OAuth client — see
+[MCP authorization](mcp-authorization.md).
+
 Live deployments keep `MAPP_ENVIRONMENT=production` in `.env`. Caddy is their
 only published application endpoint: TCP 80 is redirect/ACME traffic and
 TCP/UDP 443 carries the map, dashboard, API, and remote CLI traffic over HTTPS.
@@ -138,7 +146,7 @@ To rebuild the packaged database from its initialization scripts and leave only
 the configured ETL datasets, use the explicitly destructive command:
 
 ```sh
-./bin/mapp reset-data --confirm
+./bin/mapp reset-system --confirm
 ```
 
 It stops the stack, removes only the named bundled PostgreSQL volume, replaces
@@ -204,10 +212,10 @@ never unarchived or reused.
 
 Configuration-service startup does not force reset recovery. If a process or
 host interruption prevents owned compensation, keep the database volume and
-first confirm that no `reset-data` process remains. Then run:
+first confirm that no `reset-system` process remains. Then run:
 
 ```sh
-./bin/mapp recover-reset-data --confirm
+./bin/mapp recover-reset-system --confirm
 ```
 
 This explicitly force-recovers the retained gate; never run it against an
@@ -543,8 +551,9 @@ production use.
 seven-day cleanup policy. It lists completed browser artifact run directories
 and abandoned atomic-write temporary files, but preserves the live workspace,
 authentication, audit history, proposals, the semantic database and history,
-and reload state. It only ever inspects `var`; the semantic catalog is a
-schema in the packaged database and is out of its reach entirely. Review the
+and reload state. It only ever inspects `var`; the semantic catalog and the
+control schema, which is where authentication state now lives, are schemas in
+the packaged database and are out of its reach entirely. Review the
 JSON candidate list, then run
 `./bin/mapp cleanup-temp --confirm` to remove exactly those disposable paths.
 Unrecognized directories and trees containing symlinks or special files are
@@ -555,6 +564,10 @@ left untouched for manual review.
 - Container logs are operational diagnostics and may include database or
   source errors. Restrict access and avoid pasting them into public issues.
 - `var/control/audit.jsonl` records authentication and configuration events.
+  It is deliberately still a file. When the administrator credential, dashboard
+  sessions, CLI tokens and device authorizations moved into the `control`
+  schema, the audit log, proposals and durable operation records stayed on disk
+  under the existing process lock; only authorization moved.
 - `var/control/proposals` retains complete original and candidate workspaces.
 - `var/control/artifacts` may contain map data visible in screenshots.
 
@@ -576,6 +589,11 @@ The command generates a new password and prints it once. Store it immediately
 in the approved password manager, then sign in to the dashboard again. The
 reset invalidates every existing dashboard session and takes effect without a
 service restart. It does not change or revoke remote CLI bearer tokens.
+
+The credential is a row in the `control` schema, not a file, and it is the same
+credential the MCP authorization component's consent screen checks. That
+component reads it per attempt, so a reset applies there too without a
+restart.
 
 `./bin/mapp init --demo` is a separate disposable-environment transition. On
 an existing instance it validates the demo settings first, then rotates the
@@ -605,8 +623,12 @@ the submitted scopes. Existing token rows expose their exact stored grants
 under **Granted permissions**. **Pending device authorizations** appears only
 while at least one unapproved request is actually pending.
 
-These commands affect configuration-service authentication only. They do not
-change PostgreSQL passwords. Changing `.env` passwords also does not rotate
+These commands affect platform authentication only. They do not change
+PostgreSQL passwords, including the control role's own: rotating
+`CONTROL_DB_PASSWORD` means changing the role in the database and the matching
+value in `.env` in one maintenance window, then recreating both `config-ui` and
+`mcp-auth`, which are the two services holding that connection.
+Changing `.env` passwords also does not rotate
 roles in an existing PostgreSQL volume; perform database password rotation
 explicitly and update dependent services together. That now includes
 `SEMANTIC_DB_PASSWORD` and `SEMANTIC_READER_DB_PASSWORD`: change the role in

@@ -50,12 +50,14 @@ writes or source-schema `CREATE`.
 
 ## Role model
 
-Use two separate login roles when managed derived layers are enabled.
+Use two separate login roles when managed derived layers are enabled, and a
+third when this database also holds the platform's own control plane.
 
 | Role | Application setting | Required access |
 | --- | --- | --- |
 | Runtime reader | `DBS_MAPP` | `CONNECT` but not `TEMPORARY`, `USAGE` on each approved source schema, and `SELECT` on each approved source relation. It also receives `USAGE` on `derived_layers` and `SELECT` on published derived outputs. |
 | Derived owner | `DERIVED_DATABASE_URL` | `CONNECT` but not `TEMPORARY`, read-only access to approved source schemas and relations, and ownership of only the `derived_layers` schema. |
+| Control owner | `CONTROL_DATABASE_URL` | `CONNECT` but not `TEMPORARY`, no `CREATE` on the database, and ownership of only the `control` schema. It reaches no source schema and no other platform schema. Required whenever this database is the deployment's platform database rather than a source; see [Control plane](#control-plane). |
 
 The runtime reader is shared by XYZ and configuration-service catalog and
 validation reads. It must not receive `CREATE`, source DML, truncate, trigger,
@@ -73,8 +75,11 @@ leave `DERIVED_DATABASE_URL` and `DERIVED_READER_ROLE` empty, and skip all
 `derived_layers` statements below.
 
 MAPP attaches read-only databases like this one over `postgres_fdw` from its
-own packaged database, so no federation provisioner is needed here. The two
-roles below are the whole handoff.
+own packaged database, so no federation provisioner is needed here. Those two
+roles are the whole handoff for a database that only supplies spatial data.
+A deployment that runs without the packaged database also needs the control
+owner and its schema, which [Control plane](#control-plane) below covers
+separately.
 
 ## Example provisioning SQL
 
@@ -146,8 +151,63 @@ GRANT SELECT ON TABLE
 
 CREATE SCHEMA derived_layers AUTHORIZATION mapp_derived_owner;
 REVOKE ALL ON SCHEMA derived_layers FROM PUBLIC;
+
 GRANT USAGE ON SCHEMA derived_layers TO mapp_runtime_reader;
 ```
+
+### Control plane
+
+The configuration dashboard keeps its administrator credential, browser
+sessions, API tokens and device authorizations in a `control` schema, together
+with the MCP authorization component's OAuth records. The packaged deployment
+creates this automatically; an external database needs it created once, by a
+superuser, because the owning role deliberately has no `CREATE` on the database
+and so cannot create — or recreate — its own schema.
+
+```sql
+-- Set the password out of band, as for the roles above.
+CREATE ROLE mapp_control
+  LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE mapp_control CONNECTION LIMIT 8;
+ALTER ROLE mapp_control SET search_path = pg_catalog, control;
+
+GRANT CONNECT ON DATABASE maps TO mapp_control;
+REVOKE CREATE ON DATABASE maps FROM mapp_control;
+
+CREATE SCHEMA control AUTHORIZATION mapp_control;
+REVOKE ALL ON SCHEMA control FROM PUBLIC;
+```
+
+`TEMPORARY` needs no separate revoke here: the first block above already
+revoked it from `PUBLIC` on this database, and nothing grants it to this role.
+
+The role needs nothing else: it owns `control` and reaches no other schema, and
+no other role is granted anything on `control`. The tables inside are created
+and migrated by the configuration service on first start; the MCP
+authorization component expects them to exist and does not migrate.
+
+`CONNECTION LIMIT 8` matches the packaged provisioning script and is a ceiling,
+not headroom. Two services share this one role — the configuration service and
+the MCP authorization component — and **neither pools**: each opens a
+connection per operation and closes it, precisely so the limit stays meaningful
+rather than being consumed by held-open connections. Eight is therefore the
+maximum number of concurrent control-plane operations across both services, and
+the ninth fails to connect. Raising it without pooling only moves the number.
+The authorization component serves on an unbounded-thread HTTP server, so a
+burst of authorization requests can reach that ceiling; that is a known Phase 0
+limitation of the component rather than a property of this database.
+
+Set the connection URI alongside the others:
+
+```dotenv
+CONTROL_DATABASE_URL=postgresql://mapp_control:PERCENT_ENCODED_PASSWORD@postgres.example.org:5432/maps?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt
+```
+
+Without it the platform starts and then refuses every login, so `./bin/mapp
+verify` fails closed on a missing value rather than leaving it to be discovered
+at the login prompt. `./bin/mapp init` mints the first administrator password;
+where there is no packaged database to start, point it at the control database
+directly with `MAPP_BOOTSTRAP_DATABASE_URL`.
 
 On PostgreSQL 16 and earlier, omit the two `transaction_timeout` statements;
 that setting was introduced in PostgreSQL 17. Retain the finite statement,
@@ -383,6 +443,26 @@ WHERE rolname IN ('mapp_runtime_reader', 'mapp_derived_owner');
 -- both hardened values must be true
 ```
 
+Where the control plane is provisioned, verify that role too:
+
+```sql
+SELECT has_database_privilege('mapp_control', 'maps', 'CONNECT');
+SELECT has_database_privilege(
+  'mapp_control', 'maps', 'TEMPORARY'
+); -- must be false
+SELECT has_database_privilege(
+  'mapp_control', 'maps', 'CREATE'
+); -- must be false
+
+SELECT nspowner::regrole = 'mapp_control'::regrole
+FROM pg_namespace
+WHERE nspname = 'control'; -- must be true
+
+SELECT has_schema_privilege(
+  'mapp_runtime_reader', 'control', 'USAGE'
+); -- must be false
+```
+
 Also connect as each role and confirm that representative permitted `SELECT`
 queries succeed, source writes and source-schema creation fail, and the runtime
 reader cannot create objects in or inspect the private registry under
@@ -411,10 +491,17 @@ strings.
 - Review access whenever the workspace adds a schema, relation, or extension.
 - Monitor expensive ordinary views and materialized refreshes.
 - Back up the complete `derived_layers` schema, including its private semantic
-  outbox, with the external database. Coordinate that recovery point with the
+  outbox, with the external database. Where this database also holds the
+  `control` schema, back that up with it: it is the only copy of the
+  administrator credential, dashboard sessions, CLI tokens, device
+  authorizations and OAuth records. Coordinate that recovery point with the
   MAPP operator's packaged-database dump, which now holds the `semantic`
   catalog schema, so retained events and delivered semantic profiles can
   reconcile after restore.
-- Rotate both login secrets through the approved deployment procedure.
+- Rotate every login secret provisioned here — the runtime reader, the derived
+  owner, and the control owner where it is present — through the approved
+  deployment procedure. Rotating the control password requires recreating both
+  services that hold it: the configuration service and the MCP authorization
+  component.
 - Re-run permission and visual checks after database migrations, role changes,
   PostGIS upgrades, or restore operations.

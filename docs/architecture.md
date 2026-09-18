@@ -21,16 +21,17 @@ secured independently.
                               │
                               ▼
                        Caddy 80 / 443
-                         │          │
-                  map hostname   config hostname
-                         │          │
-                         ▼          ▼
-                        XYZ     config dashboard/API
-                         │       │       ├── browser runner
-                         └──┬────┘       └── semantic service ──> semantic schema
-                            ▼                                     in that database
-              packaged PostgreSQL/PostGIS
-                            ▲
+                    │          │           │
+             map hostname  config hostname  MCP hostname
+                    │          │           │ (Unix socket)
+                    ▼          ▼           ▼
+                   XYZ    config dashboard/API     mcp-auth
+                    │      │       ├── browser runner   │
+                    │      │       └── semantic service ──> semantic schema
+                    └───┬──┘                             │   in that database
+                        ▼                                │
+              packaged PostgreSQL/PostGIS <──────────────┘
+                            ▲                       control schema
                             │ postgres_fdw, read-only
               source PostgreSQL databases
                          ▲        ▲
@@ -56,6 +57,14 @@ service over a separate internal network shared only with it, and reaches the
 packaged database over the backend network. It has no public route, and its two
 database roles are confined to the `semantic` catalog schema.
 
+The MCP authorization component is the third public hostname and the one
+service Caddy does not reach over a network at all: it joins `backend` and the
+internal `mcp-control` network, deliberately not `edge`, and its public surface
+is a Unix socket in `var/mcp-auth` that Caddy mounts and proxies four paths to.
+`mcp-control` is shared only with the configuration service, which is where its
+internal exchange, introspection and revocation endpoints are reachable and the
+public origin is not. See [MCP authorization](mcp-authorization.md).
+
 ## Components
 
 | Component | Responsibility | Persistent inputs/state |
@@ -67,6 +76,7 @@ database roles are confined to the `semantic` catalog schema.
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
 | Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
 | Semantic service | Durable generated facts, curated annotations, per-asset proposals, history, and archive tombstones | Schema `semantic` in the packaged database, read through a read-only role and written through the role that owns it |
+| MCP authorization component | Phase 0 OAuth 2.1 authorization server for the forthcoming MCP resource server: metadata, authorization code with PKCE, operator consent, token issuance, and an internal token exchange, introspection and revocation surface | Schema `control` in the packaged database; `var/mcp-auth` holds only its edge socket |
 | Browser runner | Authenticated visual validation with bounded map origin and isolated outbound asset access | `var/control/artifacts` |
 | Caddy | TLS, host routing, response headers, upstream file-provider guard | Caddy named volumes |
 | Standalone CLI | Remote inspection, proposals, application and verification | State on the separate client computer |
@@ -86,9 +96,14 @@ The ignored `var` tree contains live state:
 
 - `workspace` is the authoritative workspace and its previous atomic-save
   backup.
-- `control` contains authentication and device-authorization state, sessions,
-  token records, audit entries, proposals, durable operation records, and
-  visual artifacts.
+- `control` contains audit entries, proposals, durable operation records, and
+  visual artifacts. The administrator credential, dashboard sessions, CLI token
+  records and device authorizations are no longer here: they moved into the
+  `control` schema of the packaged database. The audit log at
+  `control/audit.jsonl` is a deliberate exception and stays a file, as do the
+  proposal and operation records, which keep the existing process lock.
+- `mcp-auth` holds nothing but the authorization component's edge socket, which
+  Caddy also mounts. It is recreated on start and is not state to back up.
 - `preview` contains the private candidate workspace used only by
   `xyz-preview`.
 - `semantic` contains the generated and curated semantic catalog, proposal
@@ -147,7 +162,7 @@ generation 1 with the archived asset as a validated predecessor. Curated
 metadata, orphans, and matching field IDs carry into the audited successor; the
 accepted predecessor remains an immutable tombstone. Startup never
 force-recovers a retained gate. After confirming that no reset process remains,
-an operator must use `./bin/mapp recover-reset-data --confirm`. See [Semantic
+an operator must use `./bin/mapp recover-reset-system --confirm`. See [Semantic
 metadata control plane](semantic-layer.md).
 
 ## Configuration flow
@@ -195,6 +210,9 @@ the result to its proposal ID and candidate hash.
   by mapped workspace layers.
 - The bootstrap PostgreSQL role initialises the packaged database and is not
   passed to any application service.
+- `CONTROL_DATABASE_URL` is a separate least-privilege identity, `mapp_control`,
+  which owns the `control` schema and reaches no other. Only the configuration
+  service and the MCP authorization component receive it.
 - In a source database, roles, PostGIS installation, schema privileges, TLS,
   backup and recovery are owned by whoever operates it. MAPP holds one
   read-only credential into it and writes nothing.

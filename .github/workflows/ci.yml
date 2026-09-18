@@ -51,8 +51,69 @@ jobs:
             config-ui/package-lock.json
             browser-runner/package-lock.json
 
+      - name: Prepare the control schema database
+        env:
+          PGPASSWORD: semantic-ci
+        # The control schema is created by a superuser in the packaged image,
+        # never by its owning role, so the fixture assumes it already exists.
+        run: |
+          psql -h 127.0.0.1 -U postgres -d mapp_semantic_test \
+            -v ON_ERROR_STOP=1 -c "CREATE DATABASE mapp_control_test"
+          psql -h 127.0.0.1 -U postgres -d mapp_control_test \
+            -v ON_ERROR_STOP=1 -c "CREATE SCHEMA control"
+
       - name: Test configuration service
-        run: PYTHONPATH=config-ui python -m unittest discover -s config-ui/tests -v
+        env:
+          CONTROL_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
+        # The control schema suite skips without a database, and a silent skip
+        # is exactly the failure this guard exists to catch: the whole point of
+        # those tests is that the SQL meets a real server.
+        run: |
+          set -o pipefail
+          PYTHONPATH=config-ui python -m unittest discover \
+            -s config-ui/tests -v 2>&1 | tee /tmp/config-ui-tests.log
+          if grep -q "skipped=" /tmp/config-ui-tests.log; then
+            echo "::error::configuration service tests skipped; the control schema suite must run against PostgreSQL"
+            exit 1
+          fi
+
+      - name: Test authorization component
+        env:
+          CONTROL_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
+        # Same guard, same reason: the store contract runs against both the
+        # in-memory double and PostgreSQL, and the SQL half is the half that
+        # matters -- it is where the grant is enforced. A silent skip would
+        # report the double's behaviour as the system's.
+        run: |
+          set -o pipefail
+          PYTHONPATH=mcp-auth python -m unittest discover \
+            -s mcp-auth/tests -v 2>&1 | tee /tmp/mcp-auth-tests.log
+          if grep -q "skipped=" /tmp/mcp-auth-tests.log; then
+            echo "::error::authorization tests skipped; the store contract must run against PostgreSQL"
+            exit 1
+          fi
+
+      - name: Test MCP runtime
+        # No database and no network: the era guard, the metadata surface and
+        # the authentication middleware are driven directly over the ASGI
+        # contract, which is where their obligations live. Nothing here is
+        # conditional, so the guard is stricter than the others -- any skip at
+        # all means a test stopped running rather than a dependency being absent.
+        #
+        # The SDK is installed because it is a real dependency of this
+        # component now. The alternative -- injecting a fake runtime into every
+        # test that merely needs an application -- would leave the one path that
+        # actually constructs the SDK untested, which is the path a deployment
+        # takes.
+        run: |
+          set -o pipefail
+          pip install --requirement mapp-mcp/requirements.txt
+          PYTHONPATH=mapp-mcp:mapp-mcp/tests python -m unittest discover \
+            -s mapp-mcp/tests -v 2>&1 | tee /tmp/mapp-mcp-tests.log
+          if grep -q "skipped=" /tmp/mapp-mcp-tests.log; then
+            echo "::error::MCP runtime tests skipped; none of them may be conditional"
+            exit 1
+          fi
 
       - name: Test ETL
         run: PYTHONPATH=etl/src python -m unittest discover -s etl/tests -v
@@ -78,7 +139,19 @@ jobs:
         run: docker build --tag mapp-semantic-service:ci semantic-service
 
       - name: Test deployment helpers
-        run: PYTHONPATH=. python -m unittest discover -s scripts/tests -v
+        env:
+          CONTROL_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
+        # init writes the administrator credential to the control schema, so
+        # these skip without a database -- and a silent skip is the failure the
+        # guard exists to catch.
+        run: |
+          set -o pipefail
+          PYTHONPATH=. python -m unittest discover -s scripts/tests -v 2>&1 \
+            | tee /tmp/scripts-tests.log
+          if grep -q "skipped=" /tmp/scripts-tests.log; then
+            echo "::error::deployment-helper tests skipped; they must run against PostgreSQL"
+            exit 1
+          fi
 
       - name: Test browser egress allowlist
         run: |
@@ -121,6 +194,7 @@ jobs:
           export PRODUCTION_CONFIG_SITE=https://config.company.co.uk
           export PRODUCTION_CONFIG_ALLOWED_HOSTS=config.company.co.uk,config-ui
           export PRODUCTION_CADDY_EMAIL=operations@company.co.uk
+          export PRODUCTION_MCP_SITE=https://mcp.company.co.uk
           export EDGE_BIND_ADDRESS=0.0.0.0
           export HTTP_PORT=80
           export HTTPS_PORT=443

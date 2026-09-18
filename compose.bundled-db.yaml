@@ -28,6 +28,8 @@ services:
       SEMANTIC_DB_PASSWORD: ${SEMANTIC_DB_PASSWORD:?Set SEMANTIC_DB_PASSWORD in .env}
       SEMANTIC_READER_DB_USER: ${SEMANTIC_READER_DB_USER:?Set SEMANTIC_READER_DB_USER in .env}
       SEMANTIC_READER_DB_PASSWORD: ${SEMANTIC_READER_DB_PASSWORD:?Set SEMANTIC_READER_DB_PASSWORD in .env}
+      CONTROL_DB_USER: ${CONTROL_DB_USER:?Set CONTROL_DB_USER in .env}
+      CONTROL_DB_PASSWORD: ${CONTROL_DB_PASSWORD:?Set CONTROL_DB_PASSWORD in .env}
     # Keep the role budgets below 97 ordinary slots. PostgreSQL reserves three
     # of the 100 connections for superusers and no additional reserved roles.
     command:
@@ -81,6 +83,23 @@ services:
       DERIVED_READER_ROLE: ${XYZ_DB_USER:?Set XYZ_DB_USER in .env}
       FEDERATION_DATABASE_URL: ${FEDERATION_DATABASE_URL:?Set FEDERATION_DATABASE_URL in .env}
       FEDERATION_DB_USER: ${FEDERATION_DB_USER:?Set FEDERATION_DB_USER in .env}
+      # The packaged database is the control plane's home. External-PostgreSQL
+      # deployments have no packaged database, so the base model leaves this
+      # empty and the store reports the schema unavailable rather than
+      # appearing to work -- see docs/external-postgresql.md.
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:?Set CONTROL_DATABASE_URL in .env}
+
+  mcp-auth:
+    # Same control schema, same role, same requirement: every credential the
+    # authorization component reads or writes lives there, so starting before
+    # the database is starting unhealthy. It had neither the dependency nor a
+    # health check that touched the store, so it reported healthy while every
+    # OAuth request failed.
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:?Set CONTROL_DATABASE_URL in .env}
 
   etl:
     image: mapp-leeds-etl:local

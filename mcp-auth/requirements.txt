@@ -1,0 +1,3 @@
+# Installed normally: psycopg needs its own dependencies, and its musl wheels
+# exist, which is why config-ui already runs it on alpine.
+psycopg[binary]==3.3.4

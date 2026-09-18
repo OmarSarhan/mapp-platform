@@ -1,4 +1,10 @@
 .env
+# Every .env variant, because the exact-match rule above did not cover a
+# sidecar: an .env.backup-preflight written before a migration was swept into
+# a commit by `git add -A` and had to be amended out. The template is the one
+# file here that is meant to be tracked.
+.env.*
+!.env.example
 backups/
 var/
 node_modules/

@@ -59,6 +59,9 @@ from federation_store import MAX_ALIASES, MAX_GROUPS, FederationAliasStore
 from static_files import safe_static_path
 from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
+import canonical
+import execution_envelope
+from mcp_token_client import McpTokenClient, McpTokenClientError
 from semantic_sources import (
     DEFAULT_ALLOWLIST as DEFAULT_SEMANTIC_SOURCE_ALLOWLIST,
     GENERATION_SAMPLE_MAX_BYTES,
@@ -87,6 +90,7 @@ from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, parse_time
 from control_api import (
+    ACTION_SCHEMAS,
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
     CollectionPaginationError, DATABASE_LAYER_FORMATS, VisualPlanningDatabaseError,
     VisualPlanningNoMatchingFeatures,
@@ -287,6 +291,126 @@ SEMANTIC = (
     )
     else None
 )
+#: The prefix an exchanged token B carries. Discriminating on it inside the
+#: existing Bearer branch is what keeps token-B support out of the request
+#: routers entirely: a token B is a credential, not a route.
+TOKEN_B_PREFIX = "mapp_b_"
+
+#: The audience this service accepts. It must equal the authorization
+#: component's MCP_CONFIG_API_RESOURCE, and the component refuses to start when
+#: that value equals its MCP resource -- which is what keeps a token A from
+#: being spendable here.
+CONFIG_API_RESOURCE = os.environ.get("MCP_CONFIG_API_RESOURCE", "")
+
+try:
+    MCP_TOKENS = (
+        McpTokenClient(
+            os.environ["MCP_AUTH_URL"],
+            os.environ["MCP_AUTH_CLIENT_ID"],
+            os.environ["MCP_AUTH_CLIENT_SECRET"],
+            resource=CONFIG_API_RESOURCE,
+        )
+        if (
+            os.environ.get("MCP_AUTH_URL")
+            and os.environ.get("MCP_AUTH_CLIENT_ID")
+            and os.environ.get("MCP_AUTH_CLIENT_SECRET")
+            and CONFIG_API_RESOURCE
+        )
+        else None
+    )
+except McpTokenClientError:
+    # Misconfigured is not the same as absent, and must not be quieter: an
+    # unset endpoint means the feature is off, whereas a malformed one means
+    # someone tried to turn it on. Both refuse every token B; only one is a
+    # mistake worth surfacing at start-up.
+    MCP_TOKENS = None
+    raise
+
+if MCP_TOKENS is not None:
+    # Provisioned here rather than by a migration: the secret comes from the
+    # deployment, and re-asserting it on every start is what makes rotating it
+    # a matter of changing one environment value and restarting.
+    CONTROL.ensure_oauth_client(
+        os.environ["MCP_AUTH_CLIENT_ID"],
+        os.environ["MCP_AUTH_CLIENT_SECRET"],
+        name="MAPP configuration API",
+        # What this service actually calls, and nothing else. Notably not
+        # "exchange": minting an execution credential is the MCP runtime's job,
+        # and this is the component with the largest attack surface on the
+        # platform. "revoke" is here because withdrawing a consent is an
+        # operator act and this is the operator-facing service.
+        capabilities=("introspect", "redeem", "revoke"),
+    )
+
+#: Resolved from the platform's own action table rather than restated. The
+#: authorization component keeps a deliberate allowlist of what may be
+#: exchanged; this map answers a different question -- "which operation is the
+#: request in front of me" -- and it must be answered from the request, never
+#: from the token, or a token bound to one operation could name itself another.
+#: Two actions can share a method and template -- proposals.visual-test and
+#: proposals.preview-test do, as do the two screenshot actions -- so the value
+#: is every name that claims the route, not the last one to be seen. A dict
+#: keyed this way silently kept one of them, which would have resolved an
+#: ambiguous route to an arbitrary operation. Ambiguity is refused instead.
+#: Actor identifiers as this platform writes them. `admin` and `local-admin`
+#: name a role; these two name a *credential* -- which CLI token, or which MCP
+#: grant, performed an action.
+ACTOR_CREDENTIAL_PREFIXES = ("token:", "oauth:")
+
+#: What an exchanged credential sees in their place. A placeholder rather than a
+#: removed key, so an agent learns the attribution exists and is not for it,
+#: instead of concluding there was none.
+WITHHELD_ACTOR = "[withheld]"
+
+
+def redact_actor_credentials(value):
+    """Replace credential identifiers anywhere in a response body.
+
+    Several read endpoints attribute records to the credential that created
+    them -- `createdBy` on a derived layer, `registeredBy` and `approvedBy` on a
+    federated alias -- and those are written from the authenticated principal on
+    purpose. They are the right answer for an operator at a dashboard, and the
+    wrong one for a delegated agent: a scope to read the source registry is not
+    a scope to enumerate the operator credentials behind it.
+
+    Matched by value rather than by key name. A key-based list is a second thing
+    to keep in step, and it had already drifted before this existed: the MCP
+    runtime filtered these fields out of its federation tools and passed the
+    identical field through in its derived-layer tool, in the same release. A
+    value that begins `token:` or `oauth:` is a credential identifier wherever
+    it appears, including in a field nobody has added yet.
+    """
+    if isinstance(value, dict):
+        return {key: redact_actor_credentials(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_actor_credentials(item) for item in value]
+    if isinstance(value, str) and value.startswith(ACTOR_CREDENTIAL_PREFIXES):
+        return WITHHELD_ACTOR
+    return value
+
+
+def _operations_by_route(schemas):
+    routes: dict[tuple[str, str], tuple[str, ...]] = {}
+    for name, schema in schemas.items():
+        # Either key. `ACTION_SCHEMAS` writes `pathTemplate` when the route
+        # takes parameters and `path` when it does not, and this indexed only
+        # the first -- so every fixed-path action was absent from the index and
+        # could never be resolved for an exchanged credential at all. The route
+        # simply answered `auth.operation_unresolved`, which reads like a
+        # deliberate refusal rather than a route that was never registered.
+        #
+        # A fixed path is a template with no parameters, and the matcher already
+        # treats it as one: `path_parameters` returns {} on an exact match and
+        # refuses a prefix, so nothing about the comparison changes.
+        template = schema.get("pathTemplate") or schema.get("path")
+        if template:
+            key = (schema["method"], template)
+            routes[key] = routes.get(key, ()) + (name,)
+    return routes
+
+
+OPERATIONS_BY_ROUTE = _operations_by_route(ACTION_SCHEMAS)
+
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
 try:
     GEMINI = (
@@ -3303,7 +3427,7 @@ def derived_maintenance_error(
         code="derived_layer.maintenance",
         message=message,
         suggested_action=(
-            "Wait for reset-data maintenance to finish, then retry the same "
+            "Wait for reset-system maintenance to finish, then retry the same "
             "request."
         ),
         operation=operation,
@@ -5696,7 +5820,24 @@ def validate_renderable(data: dict, tables: list[dict]) -> list[dict[str, str]]:
     return errors
 
 
-def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index: int) -> dict:
+def test_info_expression(
+    candidate: dict,
+    locale_key: str,
+    layer_key: str,
+    index: int,
+    *,
+    locales: dict | None = None,
+) -> dict:
+    """Evaluate one `fieldfx` entry against the layer's own relation.
+
+    `locales` exists because effective_locales() deep-copies. A caller that
+    resolves the locale, appends a trial entry to it and then lets this
+    re-derive is mutating a copy this function never sees, so the index it
+    passes names an entry that does not exist -- which is exactly how
+    /api/sql/test failed for every layer. Passing the mapping that was
+    actually mutated is the fix; omitting it keeps the previous behaviour for
+    callers that supply a candidate already containing the entry.
+    """
     structural = validate_workspace(candidate, set(DB_CONNECTIONS))
     expression_errors = [
         error for error in structural
@@ -5704,7 +5845,8 @@ def test_info_expression(candidate: dict, locale_key: str, layer_key: str, index
     ]
     if expression_errors:
         raise ValueError(expression_errors[0]["message"])
-    locale = effective_locales(candidate).get(locale_key)
+    resolved = locales if isinstance(locales, dict) else effective_locales(candidate)
+    locale = resolved.get(locale_key)
     layer = (locale.get("layers") or {}).get(layer_key) if isinstance(locale, dict) else None
     entries = layer.get("infoj") if isinstance(layer, dict) else None
     if not isinstance(entries, list) or not 0 <= index < len(entries):
@@ -6094,6 +6236,16 @@ def start_visual_background(
 class Handler(SimpleHTTPRequestHandler):
     server_version = "MAPPConfig/1.0"
 
+    #: Per-request state, declared on the class so it is always present.
+    #: handle_one_request resets these before each request; the class defaults
+    #: are what make a handler built without going through it -- which is how
+    #: much of this suite constructs one -- behave as though no exchanged
+    #: credential were presented, rather than raising AttributeError inside the
+    #: authorization gate.
+    _raw_body = None
+    _exchanged_token = None
+    _exchanged_token_redeemed = False
+
     def translate_path(self, path):
         candidate = safe_static_path(STATIC_ROOT, path)
         return str(candidate or STATIC_ROOT / ".not-found")
@@ -6101,7 +6253,62 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"{self.client_address[0]} {fmt % args}")
 
+    def handle_one_request(self):
+        # Reset per-request state before anything is parsed. A handler instance
+        # serves every request on its connection, so this state is only
+        # per-request if something makes it so. HTTP/1.0 closes after each
+        # response today, which means one request per instance -- but that is a
+        # property of BaseHTTPRequestHandler's default protocol_version, and a
+        # one-line change to it would silently let a second request inherit a
+        # true _exchanged_token_redeemed and pass the guard in _json without
+        # ever having redeemed anything.
+        self._raw_body = None
+        self._exchanged_token = None
+        self._exchanged_token_redeemed = False
+        return super().handle_one_request()
+
     def _json(self, status, payload, *, headers=None):
+        if (
+            self._exchanged_token is not None
+            and not self._exchanged_token_redeemed
+            and 200 <= int(status) < 300
+        ):
+            # Fail closed. _json answers 239 of this service's call sites,
+            # so putting the check here makes "an exchanged credential never
+            # gets a success it did not redeem for" a property of the response
+            # layer rather than something every handler has to remember.
+            #
+            # It is not literally every response: /api/artifacts/, the SVG
+            # prefix and do_OPTIONS write to wfile directly. None of them is
+            # reachable with an exchanged credential, and the reason is the
+            # binding gate rather than this guard -- no template matches those
+            # paths, so _resolve_operation refuses them before dispatch. That
+            # is what test_raw_response_paths_are_unreachable pins.
+            #
+            # It is a backstop, not the gate: redemption happens in
+            # _authorized before any handler dispatches, because by the time a
+            # response is being written a mutation has already been applied.
+            # If this ever fires, the binding check was skipped somewhere and
+            # the right response is a refusal -- but the effect is already
+            # done, which is why the real gate is upstream.
+            LOGGER.error(
+                "exchanged token reached a success response without redemption:"
+                " %s %s",
+                self.command,
+                urlparse(self.path).path,
+            )
+            status = HTTPStatus.FORBIDDEN
+            payload = {
+                "error": "The credential was not redeemed for this request.",
+                "code": "auth.binding_not_redeemed",
+            }
+        if self._exchanged_token is not None:
+            # Every response to an exchanged credential, for the same reason the
+            # redemption backstop above lives here: a property of the response
+            # layer rather than something each handler has to remember. Agents
+            # reach only allowlisted operations, so this walks a small and known
+            # set of responses rather than arbitrary workspace content.
+            payload = redact_actor_credentials(payload)
         payload = dict(payload)
         meta = payload.get("meta")
         if not isinstance(meta, dict):
@@ -6161,7 +6368,14 @@ class Handler(SimpleHTTPRequestHandler):
             else ""
         )
         if authorization.startswith("Bearer "):
-            token = CONTROL.authenticate_token(authorization[7:], self._remote())
+            presented = authorization[7:]
+            if presented.startswith(TOKEN_B_PREFIX):
+                # An exchanged token is authenticated here and *spent* in
+                # _authorized, after the scope check: redeeming first would
+                # burn a single-use credential on a request that was about to
+                # be refused anyway.
+                return self._actor_from_exchanged_token(presented)
+            token = CONTROL.authenticate_token(presented, self._remote())
             if not token:
                 return None
             actor = f"token:{token['id']}"
@@ -6205,7 +6419,170 @@ class Handler(SimpleHTTPRequestHandler):
                 "grantedScopes": sorted(scopes),
             })
             return None
+        if self._exchanged_token is not None and not self._redeem_exchanged_token():
+            # Last, so an exchanged token is only ever spent on a request that
+            # has already passed authentication and scope. _authorized is the
+            # only caller of _actor and the only gate both routers use, which
+            # is what makes this one line cover every authenticated path.
+            return None
         return actor
+
+    def _actor_from_exchanged_token(self, presented: str):
+        """Authenticate an exchanged token B against the authorization component.
+
+        Authentication only. The operation binding is checked in _authorized
+        once the scope has been accepted.
+
+        Every refusal returns None and says nothing else: this is a bearer
+        credential presented by an agent, and distinguishing "unknown" from
+        "revoked" from "wrong audience" here would rebuild the oracle the
+        component's own inactive response exists to avoid.
+        """
+        if MCP_TOKENS is None:
+            # The feature is not configured, so no token B is valid. Refusing
+            # is the only safe reading: the alternative is a credential that
+            # authorises everything it claims because nothing can check it.
+            return None
+        try:
+            record = MCP_TOKENS.introspect(presented)
+        except McpTokenClientError as exc:
+            # Unreachable or refusing, it is the same answer. Never log the
+            # token; the exception text is already scrubbed of the secret.
+            LOGGER.warning("exchanged token introspection failed: %s", exc)
+            return None
+        if record.get("active") is not True:
+            return None
+        # Audience, checked here as well as by the component. A token A carries
+        # the MCP resource and must never be spendable at the configuration
+        # API; that separation is the reason two audiences exist.
+        if record.get("aud") != CONFIG_API_RESOURCE:
+            LOGGER.warning("exchanged token presented with a foreign audience")
+            return None
+        subject = record.get("sub")
+        if not isinstance(subject, str) or not subject.startswith("oauth:"):
+            # P3 makes the grant the actor, and the audit trail depends on it:
+            # a subject that is not a grant id cannot be resolved back to a
+            # consent, so it is not an actor this service will act for.
+            return None
+        scopes = [item for item in str(record.get("scope") or "").split() if item]
+        self._exchanged_token = presented
+        # No marker key. Two routes spread _authentication directly into a
+        # response body, and nothing reads such a marker: the "oauth:" actor
+        # prefix identifies an exchanged credential, and self._exchanged_token
+        # is the authoritative signal inside the handler.
+        self._authentication = {"actor": subject, "scopes": scopes}
+        return subject
+
+    def _resolve_operation(self, method: str, path: str):
+        """Which allowlisted operation *is* this request, from the request alone.
+
+        Deliberately not taken from the token. If the token named its own
+        operation, a credential bound to one proposal could present itself as
+        the operation for another and the digest comparison would be against
+        the wrong template. The request decides; the token must then match.
+
+        Returns (operation_id, path_template) or None when no template matches
+        or more than one does.
+        """
+        matches = []
+        for (candidate_method, template), names in OPERATIONS_BY_ROUTE.items():
+            if candidate_method != method:
+                continue
+            try:
+                execution_envelope.path_parameters(template, path)
+            except execution_envelope.EnvelopeError:
+                continue
+            matches.extend((name, template) for name in names)
+        if len(matches) != 1:
+            # Ambiguity is refused rather than resolved by precedence. Two
+            # templates matching one path, or one route claimed by two action
+            # ids, means the envelope could be built more than one way and only
+            # one of those is what the broker digested.
+            return None
+        return matches[0]
+
+    def _redeem_exchanged_token(self) -> bool:
+        """Spend the exchanged token against this exact request, or refuse.
+
+        This is the half of the operation binding that lives outside the
+        broker. The broker validated the digest's shape at exchange time and
+        stored it; it never saw this request. Here the canonical envelope is
+        rebuilt from the request actually in front of the handler -- method,
+        operation, template, typed path parameters, normalized path, ordered
+        query pairs and the exact body -- digested, and presented for
+        redemption. A token minted for one proposal cannot be spent on
+        another, and for a mutating operation the spend is single-use.
+        """
+        parsed = urlparse(self.path)
+        method = (self.command or "").upper()
+        resolved = self._resolve_operation(method, parsed.path)
+        if resolved is None:
+            self._json(HTTPStatus.FORBIDDEN, {
+                "error": "This route does not accept an exchanged credential.",
+                "code": "auth.operation_unresolved",
+            })
+            return False
+        operation_id, path_template = resolved
+        try:
+            instance = CONTROL.instance_id()
+        except RuntimeError as exc:
+            # The control plane is not initialized, so there is no instance to
+            # bind a digest to and nothing can be validated. Unavailable is the
+            # honest answer, and refusing is the safe one -- an uncaught raise
+            # here would leave the authorization gate answering 500.
+            LOGGER.error("cannot bind an exchanged credential: %s", exc)
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "Credential validation is unavailable.",
+                "code": "auth.binding_unavailable",
+            })
+            return False
+        try:
+            raw = self._raw_request_body()
+            # Parsed by the canonicalizer, not by the ordinary loader: it
+            # rejects duplicate member names and numbers outside the I-JSON
+            # domain at this trust boundary, before a normal parse can collapse
+            # them. A request whose body cannot be canonicalized cannot be
+            # bound, so it cannot be authorised.
+            body = canonical.loads(raw) if raw else None
+            request_digest = execution_envelope.digest(
+                instance=instance,
+                method=method,
+                operation_id=operation_id,
+                path_template=path_template,
+                path=parsed.path,
+                query=parsed.query,
+                body=body,
+                # Null until the curated manifest and the approval flow supply
+                # them. Passed explicitly because build() requires them: the
+                # day either exists, this call site is where the value has to
+                # arrive, and a default would let it be forgotten silently.
+                resolved_defaults=None,
+                confirmation_fields=None,
+                revision_binding=None,
+            )
+        except (
+            canonical.CanonicalizationError,
+            execution_envelope.EnvelopeError,
+            ValueError,
+        ) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {
+                "error": f"The request cannot be canonicalized: {exc}",
+                "code": "auth.request_not_canonical",
+            })
+            return False
+        try:
+            MCP_TOKENS.redeem(self._exchanged_token, operation_id, request_digest)
+        except McpTokenClientError as exc:
+            LOGGER.warning(
+                "exchanged token redemption refused for %s: %s", operation_id, exc
+            )
+            self._json(HTTPStatus.FORBIDDEN, {
+                "error": "The credential is not valid for this request.",
+                "code": "auth.binding_refused",
+            })
+            return False
+        self._exchanged_token_redeemed = True
+        return True
 
     def _scope_granted(self, actor: str, required_scope: str) -> bool:
         scopes = set((self._authentication or {}).get("scopes") or [])
@@ -6318,6 +6695,14 @@ class Handler(SimpleHTTPRequestHandler):
         )
         if proposal_action and proposal_action.group(1) == "apply":
             return "apply"
+        if path == "/api/sql/test":
+            # Evaluates one read-only scalar expression over a configured
+            # layer's own relation and returns a sample value from it. That is
+            # the authority `derive` already names -- /api/layers/<k>/values
+            # returns values from the same relation -- so it is classified with
+            # it rather than left to the `full` catch-all, which would refuse
+            # every credential that is not an administrator.
+            return "derive"
         if path == "/api/xyz/reload":
             return "reload"
         if path == "/api/derived-layers" or path.startswith("/api/derived-layers/"):
@@ -6446,11 +6831,33 @@ class Handler(SimpleHTTPRequestHandler):
             "code": error.code,
         })
 
+    def _raw_request_body(self) -> bytes:
+        """Read the body once, and serve every later reader from that.
+
+        The binding digest covers the exact body, and the digest is computed in
+        _authorized -- before any handler dispatches, so that a mutating
+        request is refused before it mutates. That means the body is read
+        earlier than it used to be for an exchanged credential, and a socket
+        can only be read once. Caching here keeps _payload's contract
+        unchanged for its eleven callers, including the three unauthenticated
+        routes that reach it before _actor has ever run.
+        """
+        if self._raw_body is None:
+            declared = self.headers.get("Content-Length", "0") or "0"
+            try:
+                size = int(declared)
+            except ValueError:
+                raise ValueError("Content-Length must be an integer.") from None
+            if size < 0 or size > MAX_BODY:
+                raise ValueError("Request body must be between 1 byte and 5 MiB.")
+            self._raw_body = self.rfile.read(size) if size else b""
+        return self._raw_body
+
     def _payload(self):
-        size = int(self.headers.get("Content-Length", "0"))
-        if size <= 0 or size > MAX_BODY:
+        raw = self._raw_request_body()
+        if not raw:
             raise ValueError("Request body must be between 1 byte and 5 MiB.")
-        payload = strict_json_loads(self.rfile.read(size))
+        payload = strict_json_loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("Request body must be a JSON object.")
         return payload
@@ -7395,6 +7802,24 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
             else:
                 self._json(HTTPStatus.OK, {"events": CONTROL.audit_tail()})
+        elif path == "/api/admin/mcp-grants":
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+            else:
+                self._json(HTTPStatus.OK, {"grants": CONTROL.list_oauth_grants()})
+        elif path == "/api/admin/mcp-clients":
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+            else:
+                # The origin is returned with the list so the dashboard can
+                # compose a connection snippet an operator can hand over
+                # verbatim. It is configuration, not a second source of truth:
+                # one deployment value, read in one place.
+                site = os.environ.get("MCP_SITE", "http://mcp.localhost").rstrip("/")
+                self._json(HTTPStatus.OK, {
+                    "clients": CONTROL.list_oauth_clients(),
+                    "mcpUrl": f"{site}/mcp",
+                })
         elif path == "/api/proposals":
             try:
                 query = parse_qs(
@@ -7456,9 +7881,22 @@ class Handler(SimpleHTTPRequestHandler):
                     {"error": str(exc), "code": "pagination.invalid"},
                 )
         elif path.startswith("/api/proposals/"):
+            proposal_id = path.rsplit("/", 1)[1]
             try:
-                self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, path.rsplit("/", 1)[1])})
-            except (FileNotFoundError, ValueError) as exc:
+                self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, proposal_id)})
+            except FileNotFoundError:
+                # Named rather than `str(exc)`: the exception comes from the
+                # filesystem, so its text is "[Errno 2] ... '/control/proposals/
+                # <id>/proposal.json'" and reporting it hands the caller the
+                # platform's internal layout. The identifier is echoed instead,
+                # and only after proposal_read's own pattern check has accepted
+                # it. The other not-found branches here raise with a name and
+                # are unaffected.
+                self._json(HTTPStatus.NOT_FOUND, {
+                    "error": f"Unknown proposal: {proposal_id}",
+                    "code": "proposal.not_found",
+                })
+            except ValueError as exc:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         elif path == "/api/xyz/status":
             self._json(HTTPStatus.OK, reload_status())
@@ -8246,6 +8684,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/visual-test",
             "/api/admin/tokens", "/api/admin/password", "/api/auth/logout",
             "/api/admin/device-authorizations/approve",
+            "/api/admin/mcp-clients",
             "/api/sql/test",
             "/api/derived-layers",
             "/api/derived-layers/plan",
@@ -8263,6 +8702,18 @@ class Handler(SimpleHTTPRequestHandler):
         )
         token_revoke_path = re.fullmatch(
             r"/api/admin/tokens/([A-Za-z0-9._-]+)/revoke",
+            request_path,
+        )
+        mcp_client_disable_path = re.fullmatch(
+            r"/api/admin/mcp-clients/([A-Za-z0-9._-]+)/disable",
+            request_path,
+        )
+        mcp_grant_revoke_path = re.fullmatch(
+            # A colon, because every grant id has one: they are minted as
+            # "oauth:" + token_urlsafe(18) (mcp-auth/server.py), so a pattern
+            # without it matches no real grant at all and answers 404 to every
+            # revocation. The rest is the base64url alphabet.
+            r"/api/admin/mcp-grants/([A-Za-z0-9._:-]+)/revoke",
             request_path,
         )
         proposal_visual_path = re.fullmatch(
@@ -8289,6 +8740,8 @@ class Handler(SimpleHTTPRequestHandler):
             request_path not in allowed
             and not proposal_action_path
             and not token_revoke_path
+            and not mcp_client_disable_path
+            and not mcp_grant_revoke_path
             and not proposal_visual_path
             and not derived_action_path
             and not federation_alias_action_path
@@ -9223,6 +9676,62 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 token_id = token_revoke_path.group(1)
                 self._json(HTTPStatus.OK if CONTROL.revoke_token(token_id) else HTTPStatus.NOT_FOUND, {"revoked": token_id})
+                return
+            if request_path == "/api/admin/mcp-clients":
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                unexpected = sorted(
+                    set(payload) - {"name", "redirectUris", "scopes"}
+                )
+                if unexpected:
+                    raise ValueError(
+                        "Client request contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                client_id = CONTROL.register_oauth_client(
+                    name=payload.get("name", ""),
+                    redirect_uris=payload.get("redirectUris") or [],
+                    scopes=payload.get("scopes") or [],
+                    actor="admin",
+                )
+                # No secret, because a public client has none. The id is not a
+                # credential: it identifies which client is asking, and consent
+                # is what authorizes it. So unlike a CLI token there is nothing
+                # here that has to be shown once and never again.
+                self._json(HTTPStatus.CREATED, {"clientId": client_id})
+                return
+            if mcp_grant_revoke_path:
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                grant_id = mcp_grant_revoke_path.group(1)
+                unexpected = sorted(set(payload) - {"reason"})
+                if unexpected:
+                    raise ValueError(
+                        "Revocation request contains unsupported properties: "
+                        + ", ".join(unexpected)
+                    )
+                revoked = CONTROL.revoke_oauth_grant(
+                    grant_id,
+                    reason=str(payload.get("reason") or ""),
+                    actor="admin",
+                )
+                self._json(
+                    HTTPStatus.OK if revoked else HTTPStatus.NOT_FOUND,
+                    {"revoked": grant_id},
+                )
+                return
+            if mcp_client_disable_path:
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
+                    return
+                client_id = mcp_client_disable_path.group(1)
+                disabled = CONTROL.disable_oauth_client(client_id, actor="admin")
+                self._json(
+                    HTTPStatus.OK if disabled else HTTPStatus.NOT_FOUND,
+                    {"disabled": client_id},
+                )
                 return
             if proposal_visual_path:
                 proposal_id, action = proposal_visual_path.groups()
@@ -10302,6 +10811,10 @@ class Handler(SimpleHTTPRequestHandler):
                     candidate,
                     payload.get("locale"),
                 )
+                # The mapping the trial entry is appended to, so the evaluation
+                # sees it. select_locale returns a member of a deep copy that
+                # is otherwise discarded.
+                locales = {locale_key: locale}
                 layer = (locale.get("layers") or {}).get(payload.get("layer")) if isinstance(locale, dict) else None
                 if not isinstance(layer, dict):
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "Unknown layer."})
@@ -10315,7 +10828,13 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 layer["infoj"] = entries
                 try:
-                    result = test_info_expression(candidate, locale_key, payload["layer"], len(entries) - 1)
+                    result = test_info_expression(
+                        candidate,
+                        locale_key,
+                        payload["layer"],
+                        len(entries) - 1,
+                        locales=locales,
+                    )
                     self._json(HTTPStatus.OK, result)
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Expression test failed.", "errors": annotated([{"path": "fieldfx", "message": str(exc)}])})

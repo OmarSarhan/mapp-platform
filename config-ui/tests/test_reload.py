@@ -14,8 +14,10 @@ from control_api import (
 )
 from control_plane import ControlStore
 
+from control_fixture import ControlStoreTestCase
 
-class ReloadTests(unittest.TestCase):
+
+class ReloadTests(ControlStoreTestCase):
     def test_effective_locale_paths_keep_default_at_locale(self):
         paths = [
             path

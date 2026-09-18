@@ -30,15 +30,23 @@ compose=(
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
+# A credential sweep that fails silently is worse than one that fails: the
+# harness exits 0 having left a live bearer token behind. These run in an EXIT
+# trap, so they must not abort the script -- but they must say so.
+warn_sweep_failed() {
+  printf 'WARNING: %s failed; a demo API token may still be live. Revoke it with ./bin/mapp revoke-config-tokens.\n' "$1" >&2
+}
+
 # The configuration service is reached through Caddy, which routes by host.
 CONFIG_SITE="$(dotenv_value CONFIG_SITE | tr ',' '\n' | head -n 1 | tr -d ' ')"
 CONFIG_HOST="${CONFIG_SITE#*://}"
 HTTP_PORT="$(dotenv_value HTTP_PORT)"
-BASE="http://localhost:${HTTP_PORT:-3000}"
+BASE="http://localhost:${HTTP_PORT:-80}"
 
 # There is no CLI path for minting a token: POST /api/admin/tokens needs an
-# administrator session. The control store is the supported seam and re-reads
-# auth.json on every call, so the running service sees this without a restart.
+# administrator session. The control store is the supported seam, and it writes
+# the control schema the running service reads, so the token is visible without
+# a restart.
 mint_token() {
   "${compose[@]}" exec -T config-ui python - <<'PY'
 import datetime as dt, os, secrets
@@ -78,12 +86,15 @@ PY
 }
 
 revoke_token() {
-  "${compose[@]}" exec -T config-ui python - "$1" <<'PY' >/dev/null 2>&1 || true
+  if ! "${compose[@]}" exec -T config-ui python - "$1" <<'PY' >/dev/null 2>&1
 import os, sys
 from pathlib import Path
 from control_plane import ControlStore
 ControlStore(Path(os.environ["CONTROL_DIR"])).revoke_token(sys.argv[1])
 PY
+  then
+    warn_sweep_failed "revoking the demo token"
+  fi
 }
 
 # Sweep credentials from an earlier interrupted demo as well as the token from
@@ -92,7 +103,7 @@ PY
 # This closes the gap where the container minted a token but the shell died
 # before it captured TOKEN_ID and armed its per-token cleanup.
 revoke_demo_tokens() {
-  "${compose[@]}" exec -T config-ui python - <<'PY' >/dev/null 2>&1 || true
+  if ! "${compose[@]}" exec -T config-ui python - <<'PY' >/dev/null 2>&1
 import os
 from pathlib import Path
 from control_plane import ControlStore
@@ -104,6 +115,9 @@ for record in store.list_tokens():
             and not record.get("revoked"):
         store.revoke_token(record["id"])
 PY
+  then
+    warn_sweep_failed "sweeping earlier demo tokens"
+  fi
 }
 
 api() { # method path [json-body]

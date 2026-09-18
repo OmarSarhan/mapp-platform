@@ -17,6 +17,10 @@ EXPECTED_BASES = {
         "mcr.microsoft.com/playwright:v1.62.1-noble@sha256:"
         "dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e",
     ),
+    "mapp-mcp/Dockerfile": (
+        "python:3.12.13-alpine3.23@sha256:"
+        "601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d",
+    ),
     "docker/caddy/Dockerfile": (
         "golang:1.26.7-alpine3.23@sha256:"
         "b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57",
@@ -44,6 +48,10 @@ EXPECTED_BASES = {
         "8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
         "node:22.23.1-alpine3.23@sha256:"
         "8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
+    ),
+    "mcp-auth/Dockerfile": (
+        "python:3.12.13-alpine3.23@sha256:"
+        "601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d",
     ),
     "etl/Dockerfile": (
         "python:3.12.13-alpine3.23@sha256:"
@@ -152,8 +160,8 @@ class BaseImagePolicyTests(unittest.TestCase):
         self.assertIn("golang.org/x/text@v0.39.0", caddy)
         self.assertIn("google.golang.org/grpc@v1.82.1", caddy)
         self.assertIn("c-ares=1.34.8-r0", caddy)
-        self.assertIn("curl=8.20.0-r0", caddy)
-        self.assertIn("libcurl=8.20.0-r0", caddy)
+        self.assertIn("curl=8.22.0-r0", caddy)
+        self.assertIn("libcurl=8.22.0-r0", caddy)
         self.assertIn(
             "GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513",
             postgis,

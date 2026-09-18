@@ -51,8 +51,10 @@ from control_api import (
 )
 from control_plane import ControlStore
 
+from control_fixture import ControlStoreTestCase
 
-class ControlApiTests(unittest.TestCase):
+
+class ControlApiTests(ControlStoreTestCase):
     def test_contract_advertises_background_job_inspection(self):
         advertised = contract("instance")
         advertised_capabilities = capabilities("instance")

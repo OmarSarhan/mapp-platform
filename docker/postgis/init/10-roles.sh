@@ -58,7 +58,9 @@ psql \
   --set semantic_db_user="${SEMANTIC_DB_USER}" \
   --set semantic_db_password="${SEMANTIC_DB_PASSWORD}" \
   --set semantic_reader_db_user="${SEMANTIC_READER_DB_USER}" \
-  --set semantic_reader_db_password="${SEMANTIC_READER_DB_PASSWORD}" <<'SQL'
+  --set semantic_reader_db_password="${SEMANTIC_READER_DB_PASSWORD}" \
+  --set control_db_user="${CONTROL_DB_USER}" \
+  --set control_db_password="${CONTROL_DB_PASSWORD}" <<'SQL'
 CREATE ROLE :"etl_db_user" LOGIN PASSWORD :'etl_db_password';
 CREATE ROLE :"xyz_db_user" LOGIN PASSWORD :'xyz_db_password';
 CREATE ROLE :"derived_db_user" LOGIN PASSWORD :'derived_db_password';
@@ -71,6 +73,12 @@ CREATE ROLE :"semantic_db_user"
 CREATE ROLE :"semantic_reader_db_user"
   LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   PASSWORD :'semantic_reader_db_password';
+-- Owns the control schema: dashboard authentication, API tokens, device
+-- authorizations and the MCP authorization component's OAuth records. It is
+-- the only identity permitted to write them, and it reaches no other schema.
+CREATE ROLE :"control_db_user"
+  LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'control_db_password';
 
 ALTER ROLE :"etl_db_user" CONNECTION LIMIT 4;
 -- Live and preview XYZ each have an upstream 20-client pool. The configuration
@@ -81,11 +89,21 @@ ALTER ROLE :"derived_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"federation_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"semantic_db_user" CONNECTION LIMIT 4;
 ALTER ROLE :"semantic_reader_db_user" CONNECTION LIMIT 4;
+-- Two consumers share this role: config-ui and the authorization component.
+-- Neither pools -- both open a connection per operation and close it -- so
+-- eight is a ceiling on concurrent control-plane operations, not headroom
+-- above two pools. That is a known Phase 0 limitation: mcp-auth serves on an
+-- unbounded-thread HTTP server, so a burst of authorization requests can
+-- exhaust the budget and the ninth fails to connect. Raising this without
+-- pooling only moves the number; pooling is the actual fix and belongs with
+-- the component, not here.
+ALTER ROLE :"control_db_user" CONNECTION LIMIT 8;
 
 ALTER ROLE :"derived_db_user" SET search_path = pg_catalog, public;
 ALTER ROLE :"federation_db_user" SET search_path = pg_catalog, public;
 ALTER ROLE :"semantic_db_user" SET search_path = pg_catalog, semantic;
 ALTER ROLE :"semantic_reader_db_user" SET search_path = pg_catalog, semantic;
+ALTER ROLE :"control_db_user" SET search_path = pg_catalog, control;
 
 ALTER ROLE :"xyz_db_user" SET work_mem = '8MB';
 ALTER ROLE :"xyz_db_user" SET hash_mem_multiplier = '1';
@@ -147,9 +165,11 @@ GRANT CONNECT ON DATABASE :"DBNAME" TO :"derived_db_user";
 GRANT CONNECT ON DATABASE :"DBNAME" TO :"federation_db_user";
 GRANT CONNECT ON DATABASE :"DBNAME" TO :"semantic_db_user";
 GRANT CONNECT ON DATABASE :"DBNAME" TO :"semantic_reader_db_user";
+GRANT CONNECT ON DATABASE :"DBNAME" TO :"control_db_user";
 REVOKE CREATE ON DATABASE :"DBNAME"
   FROM :"xyz_db_user", :"derived_db_user",
-       :"semantic_db_user", :"semantic_reader_db_user";
+       :"semantic_db_user", :"semantic_reader_db_user",
+       :"control_db_user";
 GRANT CREATE ON DATABASE :"DBNAME" TO :"federation_db_user";
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
@@ -163,7 +183,8 @@ CREATE SCHEMA federation AUTHORIZATION :"federation_db_user";
 REVOKE ALL ON SCHEMA federation FROM PUBLIC;
 REVOKE ALL ON SCHEMA federation
   FROM :"xyz_db_user", :"derived_db_user",
-       :"semantic_db_user", :"semantic_reader_db_user";
+       :"semantic_db_user", :"semantic_reader_db_user",
+       :"control_db_user";
 
 -- Semantic catalogue (semantic-service), replacing the SQLite store. Owned by
 -- the CRUD role, which creates the tables through its own migrations; the
@@ -181,6 +202,18 @@ GRANT SELECT ON ALL TABLES IN SCHEMA semantic TO :"semantic_reader_db_user";
 ALTER DEFAULT PRIVILEGES FOR ROLE :"semantic_db_user" IN SCHEMA semantic
   GRANT SELECT ON TABLES TO :"semantic_reader_db_user";
 
+-- Control plane: dashboard credentials, sessions, API tokens, device
+-- authorizations and OAuth records. Created here as superuser because the
+-- owning role deliberately has no CREATE on the database, so it can never
+-- recreate this schema itself -- which is also why nothing should drop it.
+-- Not workspace-visible and not readable by any other service role.
+CREATE SCHEMA control AUTHORIZATION :"control_db_user";
+REVOKE ALL ON SCHEMA control FROM PUBLIC;
+REVOKE ALL ON SCHEMA control
+  FROM :"xyz_db_user", :"derived_db_user", :"federation_db_user",
+       :"semantic_db_user", :"semantic_reader_db_user";
+REVOKE ALL ON SCHEMA derived_layers, semantic FROM :"control_db_user";
+
 -- Enables cross-database federation testing: one explicit postgres_fdw
 -- source, provisioned on demand by config-ui/federation_store.py's
 -- FederationAliasStore.provision(). Installing the extension and granting
@@ -190,7 +223,8 @@ ALTER DEFAULT PRIVILEGES FOR ROLE :"semantic_db_user" IN SCHEMA semantic
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 REVOKE USAGE ON FOREIGN DATA WRAPPER postgres_fdw
   FROM :"xyz_db_user", :"derived_db_user",
-       :"semantic_db_user", :"semantic_reader_db_user";
+       :"semantic_db_user", :"semantic_reader_db_user",
+       :"control_db_user";
 GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO :"federation_db_user";
 
 SQL

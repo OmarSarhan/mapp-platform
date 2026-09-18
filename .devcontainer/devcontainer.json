@@ -23,13 +23,14 @@
   // HTTP_PORT from .env.example. The map is served here, and the dashboard
   // on the same port under the config.localhost host name -- most browsers
   // resolve any *.localhost name to the loopback address, so both work once
-  // this port is forwarded.
+  // this port is forwarded. 80 rather than a high port because the site names
+  // carry no port, and an absolute URL built from one has to reach the edge.
   "forwardPorts": [
-    3000
+    80
   ],
   "portsAttributes": {
-    "3000": {
-      "label": "MAPP (map, and dashboard at config.localhost:3000)",
+    "80": {
+      "label": "MAPP (map, and dashboard at config.localhost)",
       "onAutoForward": "notify"
     }
   },
@@ -51,6 +52,6 @@
     }
   },
   "postAttachCommand": {
-    "next-steps": "printf '\\nMAPP Platform. To stand up the demo:\\n  ./bin/mapp init --demo\\n  ./bin/mapp all\\n  ./bin/mapp demo\\nThen open http://localhost:3000 and http://config.localhost:3000\\nGuide: docs/guide.md\\n\\n'"
+    "next-steps": "printf '\\nMAPP Platform. To stand up the demo:\\n  ./bin/mapp init --demo\\n  ./bin/mapp all\\n  ./bin/mapp demo\\nThen open http://localhost and http://config.localhost\\nGuide: docs/guide.md\\n\\n'"
   }
 }
