@@ -613,7 +613,17 @@ compose=(
   --file "${ROOT_DIR}/compose.yaml"
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-runtime_services=(db semantic-service mcp-auth mapp-mcp xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+runtime_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+# The MCP surface is opt-in. `MAPP_MCP=1 ./bin/mapp all` starts the
+# authorization broker and the agent runtime; without it neither is built or
+# run, and a deployment that never issues an agent credential does not carry an
+# OAuth server it does not use. Naming a profiled service on the command line
+# would start it regardless of the profile, so the services are added to the
+# list here rather than left in it unconditionally.
+if [[ "${MAPP_MCP:-0}" == "1" ]]; then
+  compose+=(--profile mcp)
+  runtime_services+=(mcp-auth mapp-mcp)
+fi
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
 # an alias using them could be registered, or recreating config-ui silently
 # strips the reference and the periodic verifier withdraws that source. One

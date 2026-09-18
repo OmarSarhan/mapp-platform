@@ -183,6 +183,11 @@ jobs:
           bash -n bin/mapp scripts/verify.sh docker/postgis/healthcheck.sh docker/postgis/init/10-roles.sh
           docker compose --env-file .env.example -f compose.yaml config --quiet
           docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml config --quiet
+          # The MCP surface is behind a profile, so a default render no longer
+          # reaches it and a broken stanza there would pass unnoticed.
+          docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml --profile mcp config --quiet
+          docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml --profile mcp config --format json \
+            | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; assert {"mcp-auth","mapp-mcp"} <= set(services), "the mcp profile no longer brings both halves"'
           CONFIG_UID=1234 CONFIG_GID=2345 \
             docker compose --env-file .env.example -f compose.yaml -f compose.bundled-db.yaml config --format json \
             | python -c 'import json,sys; services=json.load(sys.stdin)["services"]; expected="1234:2345"; assert all(services[name]["user"] == expected for name in ("xyz","config-ui","browser-runner")); assert services["xyz"]["environment"]["DBS_MAPP"] == services["config-ui"]["environment"]["DBS_MAPP"]; assert "db" in services["xyz"]["depends_on"] and "db" in services["config-ui"]["depends_on"]'

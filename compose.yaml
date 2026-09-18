@@ -91,6 +91,11 @@ services:
       - semantic-control
 
   mcp-auth:
+    # Opt-in. `docker compose --profile mcp up` starts the MCP surface; a plain
+    # `up` leaves it dormant, which is what keeps a deployment that does not
+    # want agent access from running an authorization server it never uses.
+    # `./bin/mapp` passes the profile, so the developer path is unchanged.
+    profiles: ["mcp"]
     image: mapp-mcp-auth:local
     build:
       context: ./mcp-auth
@@ -147,6 +152,11 @@ services:
     # model there is no such service and the health check is the only gate.
 
   mapp-mcp:
+    # Opt-in. `docker compose --profile mcp up` starts the MCP surface; a plain
+    # `up` leaves it dormant, which is what keeps a deployment that does not
+    # want agent access from running an authorization server it never uses.
+    # `./bin/mapp` passes the profile, so the developer path is unchanged.
+    profiles: ["mcp"]
     image: mapp-mcp:local
     build:
       context: ./mapp-mcp

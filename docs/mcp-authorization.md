@@ -112,6 +112,27 @@ are written and read by the configuration API and never read outside it.
 This section previously said `mapp-mcp` did not exist, which was true when
 Phase 0 began and stopped being true once the runtime shipped.
 
+## Starting it, or not
+
+The component is opt-in. `mcp-auth` and `mapp-mcp` sit behind a Compose profile
+named `mcp`, so a plain `docker compose up` starts neither, and `./bin/mapp`
+adds them only when `MAPP_MCP=1` is set:
+
+```bash
+MAPP_MCP=1 ./bin/mapp all          # with the agent surface
+./bin/mapp all                     # without it
+docker compose --profile mcp up -d # the same, directly
+```
+
+Naming a profiled service on a compose command line starts it whatever the
+profile says, which is why `bin/mapp` builds its service list conditionally
+rather than leaving both in it.
+
+A deployment that never issues an agent credential therefore does not run an
+authorization server it does not use. Caddy still publishes the MCP origin when
+the services are down, and requests to it fail rather than being refused
+politely; point no DNS at it and nothing reaches it.
+
 ## The third public origin
 
 The platform now publishes three hostnames. `MCP_SITE` is the MCP origin,

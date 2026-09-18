@@ -24,6 +24,8 @@ def resolved_compose(*overlays: str) -> dict[str, Any]:
         str(ROOT / "compose.yaml"),
         "--profile",
         "tools",
+        "--profile",
+        "mcp",
     ]
     for overlay in overlays:
         command.extend(("--file", str(ROOT / overlay)))
@@ -44,6 +46,63 @@ def resolved_compose(*overlays: str) -> dict[str, Any]:
         text=True,
     )
     return json.loads(completed.stdout)
+
+
+class McpOptInTests(unittest.TestCase):
+    """The MCP surface is opt-in, and a plain `up` does not start it.
+
+    Everything else in this file renders the services and asserts how they are
+    isolated once running. This asserts the prior question: that a deployment
+    which never issues an agent credential does not carry an authorization
+    server it does not use.
+    """
+
+    @staticmethod
+    def services(*profiles: str) -> set[str]:
+        command = [
+            "docker", "compose",
+            "--project-directory", str(ROOT),
+            "--env-file", str(ROOT / ".env.example"),
+            "--file", str(ROOT / "compose.yaml"),
+        ]
+        for profile in profiles:
+            command.extend(("--profile", profile))
+        command.append("config")
+        command.append("--services")
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True
+        )
+        return set(completed.stdout.split())
+
+    def test_a_plain_compose_leaves_the_mcp_surface_out(self) -> None:
+        running = self.services()
+        self.assertNotIn("mcp-auth", running)
+        self.assertNotIn("mapp-mcp", running)
+        # The rest of the platform is unaffected: gating the agent surface must
+        # not gate the thing it reads.
+        self.assertIn("config-ui", running)
+        self.assertIn("caddy", running)
+
+    def test_the_profile_brings_both_halves_or_neither(self) -> None:
+        """A broker with no runtime issues credentials for nothing; a runtime
+        with no broker cannot authenticate a caller."""
+        running = self.services("mcp")
+        self.assertIn("mcp-auth", running)
+        self.assertIn("mapp-mcp", running)
+
+    def test_the_launcher_opts_in_only_when_asked(self) -> None:
+        """`bin/mapp` names its services explicitly, and naming a profiled
+        service starts it whatever the profile says -- so the list has to be
+        built conditionally rather than left holding them."""
+        launcher = (ROOT / "bin" / "mapp").read_text()
+        runtime_line = next(
+            line for line in launcher.splitlines()
+            if line.startswith("runtime_services=(")
+        )
+        self.assertNotIn("mcp-auth", runtime_line)
+        self.assertNotIn("mapp-mcp", runtime_line)
+        self.assertIn('if [[ "${MAPP_MCP:-0}" == "1" ]]; then', launcher)
+        self.assertIn("runtime_services+=(mcp-auth mapp-mcp)", launcher)
 
 
 class ComposeIsolationTests(unittest.TestCase):
