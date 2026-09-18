@@ -929,6 +929,41 @@ class ExpressionTestResolutionTests(unittest.TestCase):
         self.assertIn("no longer exists", str(raised.exception))
 
 
+class DeclaredPaginationLimitTests(unittest.TestCase):
+    """A published limit the platform then refuses is worse than no limit.
+
+    proposals.list advertised `maximum: 200` in its querySchema while
+    pagination_parameters refuses anything above MAX_PAGE_LIMIT, which is 100.
+    An agent that read the contract and asked for 200 was refused by the
+    platform that published the number -- found by a real client doing exactly
+    that during an acceptance run, not by any test here.
+    """
+
+    #: Actions whose `limit` is bounded by something other than the shared
+    #: pagination limiter, with the value that bounds it. layers.values streams
+    #: a value list rather than a cursor page, and 500 is genuinely accepted.
+    OWN_LIMITER = {"layers.values": 500}
+
+    def test_every_declared_limit_matches_what_the_platform_enforces(self):
+        from control_api import ACTION_SCHEMAS, MAX_PAGE_LIMIT
+
+        for name, spec in ACTION_SCHEMAS.items():
+            for where in ("querySchema", "inputSchema"):
+                limit = (
+                    (spec.get(where) or {}).get("properties", {}).get("limit")
+                )
+                if not isinstance(limit, dict) or "maximum" not in limit:
+                    continue
+                expected = self.OWN_LIMITER.get(name, MAX_PAGE_LIMIT)
+                with self.subTest(action=name, schema=where):
+                    self.assertEqual(
+                        expected,
+                        limit["maximum"],
+                        f"{name} advertises a limit of {limit['maximum']} that"
+                        f" the platform will not accept",
+                    )
+
+
 class ProposalReadRouteTests(unittest.TestCase):
     """GET /api/proposals/<id> for an unknown id must name the proposal, not
     the file. The read is a plain `.read_text()`, so a missing record raises an

@@ -1651,6 +1651,25 @@ class ContractAndProgressToolTests(ToolTestCase):
             self.tool("capabilities_list", CAPABILITIES)(action="nope")
         self.assertIn("nope", str(raised.exception))
 
+    def test_a_tool_name_finds_the_action_it_calls(self) -> None:
+        """The predictable near miss: the tool is `sql_test` and the action is
+        `sql.test`. A real client passed the former during acceptance, read a
+        refusal that named no alternative, and gave up instead of retrying."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool("capabilities_list", CAPABILITIES)(
+                action="derived_layers_create")
+        self.assertIn("Did you mean 'derived-layers.create'?",
+                      str(raised.exception))
+
+    def test_an_unrelated_name_suggests_nothing(self) -> None:
+        """A suggestion that fires on anything teaches the caller to ignore
+        it."""
+        self.as_caller(caller())
+        with self.assertRaises(ToolError) as raised:
+            self.tool("capabilities_list", CAPABILITIES)(action="nonsense")
+        self.assertNotIn("Did you mean", str(raised.exception))
+
     def test_the_schema_names_its_definitions_rather_than_inlining_them(self) -> None:
         """30 definitions at 34,600 bytes against 838 for the top level."""
         self.as_caller(caller())

@@ -468,6 +468,32 @@ def _refusal_detail(errors):
     return ("\n" + "\n".join(entries)) if entries else ""
 
 
+def _nearest_actions(wanted, actions):
+    """Name the close matches, because the near miss here is predictable.
+
+    An action id and the tool that calls it are spelled differently -- the tool
+    is `sql_test`, the action is `sql.test` -- and a caller holding one reaches
+    for the other. A real client did exactly that during acceptance, read a
+    refusal that named no alternative, and gave up rather than retrying.
+
+    Matched on the identifier with its separators removed, so `sql_test`,
+    `sql.test` and `sqltest` all find each other, which is the whole of the
+    confusion being corrected.
+    """
+    def flatten(value):
+        return str(value).replace("_", "").replace("-", "").replace(".", "").lower()
+
+    target = flatten(wanted)
+    near = sorted({
+        entry.get("id") for entry in actions
+        if isinstance(entry, dict) and entry.get("id")
+        and flatten(entry["id"]) == target
+    })
+    if not near:
+        return ""
+    return " Did you mean " + " or ".join(repr(name) for name in near) + "?"
+
+
 def _without_meta(payload):
     """The response minus its request-correlation envelope.
 
@@ -1250,8 +1276,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 if isinstance(entry, dict) and entry.get("id") == action:
                     return {"action": entry}
             raise ToolError(
-                f"This platform declares no action {action!r}. The actions it"
-                " declares are listed when `action` is omitted."
+                f"This platform declares no action {action!r}."
+                + _nearest_actions(action, actions)
+                + " The actions it declares are listed when `action` is"
+                " omitted."
             )
         return {
             "apiVersion": payload.get("apiVersion"),

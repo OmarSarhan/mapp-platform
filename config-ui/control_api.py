@@ -1358,7 +1358,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "querySchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_PAGE_LIMIT,
+                },
                 "cursor": {"type": "string"},
             },
             "additionalProperties": False,
