@@ -1940,6 +1940,40 @@ class ToolVisibilityTests(ToolTestCase):
             "every @tool registration must pass operation= explicitly",
         )
 
+    def test_each_tool_declares_the_operation_it_actually_spends(self) -> None:
+        """The one drift the wrapper cannot prevent by itself.
+
+        Requiring `operation=` makes a tool declare something; it does not make
+        that something be what the body spends. Declaring a cheaper operation
+        than the tool spends would list it to a grant that cannot call it,
+        which is the behaviour this whole filter removes -- and declaring a
+        dearer one would hide a tool that works. Neither is a way past the
+        scope check, because spend() still reads its own descriptor, so this
+        is a correctness guard rather than a security one.
+        """
+        import re
+
+        source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
+        mismatched = []
+        for block in re.split(r"\n    @tool\(", source)[1:]:
+            name = re.search(r'name="([a-z_]+)"', block)
+            declared = re.search(r"operation=([A-Za-z_]+)", block)
+            spent = re.search(r"spend\(\s*([A-Z_]+)[,)]", block)
+            if not (name and declared):
+                continue
+            spends = spent.group(1) if spent else None
+            if declared.group(1) == "None":
+                if spends:
+                    mismatched.append((name.group(1), "None", spends))
+            elif declared.group(1) != spends:
+                mismatched.append((name.group(1), declared.group(1), spends))
+        self.assertEqual(
+            [],
+            mismatched,
+            "a tool declares one operation and spends another, so it is listed"
+            " under the wrong scopes",
+        )
+
     def test_every_platform_backed_tool_declares_its_scopes(self) -> None:
         """The registration wrapper requires `operation`, so a tool cannot be
         added without one. This pins that describe_instance is the only tool
