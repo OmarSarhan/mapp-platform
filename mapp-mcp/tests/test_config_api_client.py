@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -26,6 +27,9 @@ class Handler(BaseHTTPRequestHandler):
     status = 200
     body: dict = {}
     seen: list = []
+    #: Seconds to stall before answering, so a timeout can be exercised
+    #: against something slow rather than against the loopback.
+    delay = 0.0
 
     def _respond(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -37,6 +41,8 @@ class Handler(BaseHTTPRequestHandler):
             "authorization": self.headers.get("Authorization"),
             "contentType": self.headers.get("Content-Type"),
         })
+        if Handler.delay:
+            time.sleep(Handler.delay)
         encoded = json.dumps(Handler.body).encode()
         self.send_response(Handler.status)
         self.send_header("Content-Type", "application/json")
@@ -69,6 +75,7 @@ class ConfigApiClientTests(unittest.TestCase):
         Handler.status = 200
         Handler.body = {"ok": True}
         Handler.seen = []
+        Handler.delay = 0.0
 
     def test_a_get_sends_no_body_and_no_content_type(self):
         """A GET with a body is a different request from one without, and the
@@ -131,6 +138,43 @@ class ConfigApiClientTests(unittest.TestCase):
             self.client.get(path="/api/thing", query="", token="t")
 
         self.assertEqual([], raised.exception.errors)
+
+    def test_a_refusal_carries_the_parsed_body(self):
+        """Some operations answer a non-2xx with the result. A browser
+        validation that fails its checks returns 422 carrying the artifacts,
+        and that is the reviewer's evidence rather than an error."""
+        Handler.status = 422
+        Handler.body = {"error": "Browser validation did not pass.",
+                        "operation": {"result": {"visual": {"passed": False}}}}
+
+        with self.assertRaises(ConfigApiRefused) as raised:
+            self.client.post(path="/api/x", query="", token="t", body={})
+
+        self.assertEqual(Handler.body, raised.exception.body)
+
+    def test_a_body_that_is_not_an_object_is_not_carried(self):
+        Handler.status = 500
+        Handler.body = ["not", "an", "object"]
+
+        with self.assertRaises(ConfigApiRefused) as raised:
+            self.client.get(path="/api/x", query="", token="t")
+
+        self.assertIsNone(raised.exception.body)
+
+    def test_a_per_call_timeout_overrides_the_default(self):
+        """The default is tuned for a read. A browser render measured 20.8 and
+        24.4 seconds against a 15-second default and failed as "unavailable"
+        while the platform was working, so the slow operations say so."""
+        Handler.delay = 0.5
+        impatient = ConfigApiClient(endpoint=self.client.endpoint, timeout=0.1)
+
+        with self.assertRaises(ConfigApiUnavailable):
+            impatient.get(path="/api/x", query="", token="t")
+
+        # The same client, given room for this one call.
+        self.assertEqual({"ok": True},
+                         impatient.get(path="/api/x", query="", token="t",
+                                       timeout=10))
 
     def test_an_unreachable_endpoint_is_unavailable_not_refused(self):
         client = ConfigApiClient(endpoint="http://127.0.0.1:1", timeout=1)

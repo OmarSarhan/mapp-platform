@@ -284,7 +284,11 @@ class LegacySessionTests(unittest.TestCase):
              # the checks that cost a propose scope nor the creates that spend
              # it are shown to it.
              "proposals_check", "semantic_proposals_check",
-             "proposals_create", "semantic_proposals_create"},
+             "proposals_create", "semantic_proposals_create",
+             # Evidence tools: they render a proposal through a browser, which
+             # costs `visual` and is granted with the authoring preset.
+             "proposals_preview_plan", "proposals_preview_screenshot",
+             "proposals_preview_test"},
             withheld,
         )
 

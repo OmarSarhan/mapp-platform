@@ -77,8 +77,15 @@ class ThreatModelClaimTests(unittest.TestCase):
 
     #: The mutations an operator can currently grant, pinned so that adding
     #: one is a deliberate edit here and not a side effect of allowlisting.
-    #: Both write a proposal record and no workspace.
-    REACHABLE_MUTATIONS = ["proposals.create", "semantic.proposals.create"]
+    #: Each either writes a proposal record or attaches evidence to one; none
+    #: changes what the map serves.
+    REACHABLE_MUTATIONS = [
+        "proposals.create",
+        "semantic.proposals.create",
+        "proposals.preview-plan",
+        "proposals.preview-test",
+        "proposals.preview-screenshot",
+    ]
 
     def test_only_queue_writing_mutations_are_reachable(self) -> None:
         """What an agent can change, and what it still cannot.
@@ -107,17 +114,35 @@ class ThreatModelClaimTests(unittest.TestCase):
 
     def test_no_reachable_mutation_changes_a_workspace(self) -> None:
         """The property the list above rests on, checked rather than asserted
-        in prose: every reachable mutation is a proposal create, whose effect
-        is an entry in a queue. `apply`, `reload` and the derived-layer
-        lifecycle all cost scopes no dashboard option offers.
+        in prose.
+
+        Each reachable mutation is either a proposal create, whose effect is an
+        entry in a queue, or a proposal preview, whose effect is an artifact
+        attached to one. Neither alters what the map serves. `apply`, `reload`
+        and the derived-layer lifecycle all cost scopes no dashboard option
+        offers, which is what keeps that true.
         """
+        allowed_risks = {"propose", "visual"}
         for name in self.REACHABLE_MUTATIONS:
             with self.subTest(operation=name):
                 self.assertTrue(
-                    name.endswith("proposals.create"),
-                    f"{name} is reachable and is not a proposal create",
+                    name.startswith("proposals.")
+                    or name.startswith("semantic.proposals."),
+                    f"{name} is reachable and does not act on a proposal",
                 )
-                self.assertEqual("propose", ACTION_SCHEMAS[name]["risk"])
+                self.assertIn(ACTION_SCHEMAS[name]["risk"], allowed_risks)
+
+    def test_applying_is_not_reachable(self) -> None:
+        """Stated on its own, because it is the line this whole ordering
+        exists to hold: an agent may fill a review queue and illustrate what
+        is in it, and a person still decides whether any of it happens."""
+        start = DASHBOARD.index("export const MCP_SCOPE_OPTIONS=[")
+        offered = set(re.findall(
+            r"\{id:'([^']+)'", DASHBOARD[start : DASHBOARD.index("];", start)]
+        ))
+        for scope in ("apply", "semantic:apply", "reload", "derive:manage"):
+            with self.subTest(scope=scope):
+                self.assertNotIn(scope, offered)
 
     def test_the_default_preset_discloses_only_the_configured_workspace(self) -> None:
         """"`analysis` is the default and excludes both of the scopes that

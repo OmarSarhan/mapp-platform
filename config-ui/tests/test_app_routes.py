@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import math
 import threading
 import tempfile
@@ -962,6 +963,61 @@ class DeclaredPaginationLimitTests(unittest.TestCase):
                         f"{name} advertises a limit of {limit['maximum']} that"
                         f" the platform will not accept",
                     )
+
+
+class RouteUniquenessTests(unittest.TestCase):
+    """One route, one action id.
+
+    `_resolve_operation` refuses ambiguity rather than resolving it by
+    precedence: two action ids claiming one route means the execution envelope
+    could be built more than one way, and only one of those is what the broker
+    digested. So a duplicated id does not produce a wrong answer -- it makes
+    the route unreachable for every exchanged credential, reported as
+    `auth.operation_unresolved`, which reads like a deliberate refusal.
+
+    Three pairs existed until Phase 1 wave 4 and nothing consumed the redundant
+    ids: `visual.screenshot` was byte-identical to `visual.test`, and
+    `proposals.screenshot` and `proposals.visual-test` differed from the
+    `preview-` entries only in two property definitions. They made the
+    screenshot and visual-test routes unreachable to MCP entirely.
+    """
+
+    def test_no_route_is_claimed_by_more_than_one_action(self) -> None:
+        from control_api import ACTION_SCHEMAS
+
+        claimed: dict[tuple[str, str], list[str]] = {}
+        for name, spec in ACTION_SCHEMAS.items():
+            template = spec.get("pathTemplate") or spec.get("path")
+            if template:
+                claimed.setdefault((spec["method"], template), []).append(name)
+        duplicated = {
+            route: names for route, names in claimed.items() if len(names) > 1
+        }
+        self.assertEqual(
+            {},
+            duplicated,
+            "a route claimed by two action ids is unreachable for an exchanged"
+            " credential, because the resolver refuses ambiguity",
+        )
+
+    def test_every_allowlisted_operation_resolves_to_itself(self) -> None:
+        """The property the uniqueness test protects, checked end to end
+        against the resolver the configuration API actually uses."""
+        import sys
+        from pathlib import Path as _Path
+
+        sys.path.insert(0, str(_Path(app.__file__).resolve().parents[1] / "mcp-auth"))
+        import operations as broker_operations
+
+        handler = object.__new__(app.Handler)
+        for name, operation in broker_operations.OPERATIONS.items():
+            concrete = re.sub(r"\{[A-Za-z]+\}", "sample", operation.path_template)
+            with self.subTest(operation=name):
+                resolved = app.Handler._resolve_operation(
+                    handler, operation.method, concrete
+                )
+                self.assertIsNotNone(resolved, f"{name} resolves to nothing")
+                self.assertEqual(name, resolved[0])
 
 
 class DeriveScopeSplitTests(unittest.TestCase):

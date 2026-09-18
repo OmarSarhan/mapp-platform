@@ -291,6 +291,31 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:observe", ),
         mutating=False,
     ),
+    "proposals.preview-plan": Operation(
+        operation_id="proposals.preview-plan",
+        method="POST",
+        path_template="/api/proposals/{proposalId}/visual-plan",
+        required_scopes=("visual",),
+        # Renders a proposed change and attaches the result to the proposal.
+        # It writes an artifact and starts an asynchronous operation, so the
+        # credential is not replayable -- but it applies nothing: the workspace
+        # the map serves is untouched either way.
+        mutating=True,
+    ),
+    "proposals.preview-test": Operation(
+        operation_id="proposals.preview-test",
+        method="POST",
+        path_template="/api/proposals/{proposalId}/visual-test",
+        required_scopes=("visual",),
+        mutating=True,
+    ),
+    "proposals.preview-screenshot": Operation(
+        operation_id="proposals.preview-screenshot",
+        method="POST",
+        path_template="/api/proposals/{proposalId}/screenshot",
+        required_scopes=("visual",),
+        mutating=True,
+    ),
     "proposals.create": Operation(
         operation_id="proposals.create",
         method="POST",

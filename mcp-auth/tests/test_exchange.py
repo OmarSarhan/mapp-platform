@@ -570,9 +570,14 @@ class AllowlistDriftTests(unittest.TestCase):
     NEVER_OFFERED_TO_AGENTS = frozenset({
         "full", "admin", "federation:provision", "federation:register",
         "semantic:apply", "semantic:admin", "semantic:generate",
-        "semantic:data", "apply", "visual",
+        "semantic:data", "apply",
         "reload", "derive:manage",
     })
+    # `visual` was here until Phase 1 wave 4. It renders a proposal through a
+    # real browser and attaches the result as evidence, which is what makes a
+    # proposal reviewable -- without it an agent can propose but cannot show
+    # anybody what the change looks like, and the review step is worse than
+    # not having the agent. It renders; it applies nothing.
     # `propose` and `semantic:propose` were here until Phase 1 wave 2. They
     # authorise adding to a review queue, which writes a proposal record and
     # touches no workspace -- a person still decides whether anything happens.

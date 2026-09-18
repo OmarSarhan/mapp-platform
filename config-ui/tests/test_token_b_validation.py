@@ -228,14 +228,38 @@ class BindingTests(TokenBTestCase):
         self.assertEqual("auth.operation_unresolved", self.responses[0][1]["code"])
 
     def test_an_ambiguous_route_is_refused(self) -> None:
-        """Two action ids claim this method and template.
+        """Two action ids claiming one method and template.
 
         Resolving by precedence would build the envelope one of two ways, and
         only one of them is what the broker digested.
+
+        The ambiguity is constructed rather than borrowed. Three real pairs
+        existed until Phase 1 wave 4 -- and this test used one of them, so it
+        passed for a reason it was not testing: the route it named was
+        genuinely unreachable, which was the defect rather than the control.
+        `RouteUniquenessTests` now asserts no such pair exists, so this has to
+        make its own.
         """
-        handler = self.build(path="/api/proposals/p1/visual-test")
-        self.assertIsNone(handler._authorized(required_scope="apply"))
+        route = ("POST", "/api/proposals/{proposalId}/visual-test")
+        doubled = dict(app.OPERATIONS_BY_ROUTE)
+        doubled[route] = doubled[route] + ("proposals.invented-duplicate",)
+
+        with unittest.mock.patch.object(
+            app, "OPERATIONS_BY_ROUTE", doubled
+        ):
+            handler = self.build(path="/api/proposals/p1/visual-test")
+            self.assertIsNone(handler._authorized(required_scope="apply"))
+
         self.assertEqual("auth.operation_unresolved", self.responses[0][1]["code"])
+
+    def test_the_same_route_resolves_when_only_one_action_claims_it(self) -> None:
+        """The other half: without the invented duplicate the route resolves,
+        so the test above is measuring ambiguity and not a broken path."""
+        handler = self.build(path="/api/proposals/p1/visual-test")
+        resolved = app.Handler._resolve_operation(
+            handler, "POST", "/api/proposals/p1/visual-test"
+        )
+        self.assertEqual("proposals.preview-test", resolved[0])
 
     def test_a_body_with_a_duplicate_member_is_refused(self) -> None:
         """Caught on the raw bytes, before a parser can keep only the last."""

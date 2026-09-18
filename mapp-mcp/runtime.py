@@ -112,6 +112,41 @@ PROPOSALS_LIST = {
     "scopes": ("inspect",),
 }
 
+PROPOSALS_PREVIEW_PLAN = {
+    "operation_id": "proposals.preview-plan",
+    "method": "POST",
+    "path_template": "/api/proposals/{proposalId}/visual-plan",
+    "scopes": ("visual",),
+}
+
+PROPOSALS_PREVIEW_TEST = {
+    "operation_id": "proposals.preview-test",
+    "method": "POST",
+    "path_template": "/api/proposals/{proposalId}/visual-test",
+    "scopes": ("visual",),
+    # 422 carries the outcome, not an error: the checks failed and the
+    # images exist.
+    "result_statuses": (422,),
+    # Measured at 20.8 and 24.4 seconds for one render; the read default of
+    # 15 would report a working platform as unavailable. Under the
+    # credential's 60-second life on purpose.
+    "timeout": 45.0,
+}
+
+PROPOSALS_PREVIEW_SCREENSHOT = {
+    "operation_id": "proposals.preview-screenshot",
+    "method": "POST",
+    "path_template": "/api/proposals/{proposalId}/screenshot",
+    "scopes": ("visual",),
+    # 422 carries the outcome, not an error: the checks failed and the
+    # images exist.
+    "result_statuses": (422,),
+    # Measured at 20.8 and 24.4 seconds for one render; the read default of
+    # 15 would report a working platform as unavailable. Under the
+    # credential's 60-second life on purpose.
+    "timeout": 45.0,
+}
+
 PROPOSALS_CREATE = {
     "operation_id": "proposals.create",
     "method": "POST",
@@ -560,6 +595,58 @@ def _history_entry(entry):
     }
 
 
+def _visual_outcome(payload):
+    """A browser run reduced to what decides whether a change is acceptable.
+
+    The reply is the largest on this surface: 112,998 bytes for one screenshot,
+    of which the pixel comparison is 32,538 and the per-check diagnosis 12,334.
+    None of that is what a person looks at. They look at the images, and at
+    which check failed if one did.
+
+    The artifacts are kept whole -- 650 bytes of paths -- because they are the
+    entire product of the call. Everything else is reduced to the question it
+    answers: did it pass, where did it stop, and which checks did not.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    operation = payload.get("operation")
+    operation = operation if isinstance(operation, dict) else {}
+    result = operation.get("result")
+    result = result if isinstance(result, dict) else {}
+    visual = result.get("visual")
+    visual = visual if isinstance(visual, dict) else {}
+    plan = result.get("plan") or payload.get("plan")
+    plan = plan if isinstance(plan, dict) else {}
+
+    failed = []
+    diagnosis = visual.get("diagnosis")
+    for side in ("original", "candidate"):
+        checks = (diagnosis or {}).get(side) if isinstance(diagnosis, dict) else None
+        checks = (checks or {}).get("checks") if isinstance(checks, dict) else None
+        for check in checks if isinstance(checks, list) else []:
+            if isinstance(check, dict) and not check.get("passed"):
+                failed.append({"side": side, "check": check.get("id"),
+                               "observed": _change_preview(check.get("observed"))})
+
+    detail = {
+        "proposalId": payload.get("proposalId") or result.get("proposalId"),
+        "operationId": operation.get("id") or result.get("operationId"),
+        "status": operation.get("status"),
+        "layer": plan.get("layer"),
+        "layerTitle": plan.get("layerTitle"),
+        "passed": visual.get("passed"),
+        "failedStage": visual.get("failedStage"),
+        "failedChecks": failed,
+        # The point of the call: where the rendered images are.
+        "artifacts": visual.get("artifacts") or {},
+        "warnings": plan.get("warnings") or [],
+    }
+    error = operation.get("error")
+    if isinstance(error, dict):
+        detail["error"] = {"code": error.get("code"),
+                           "message": error.get("message")}
+    return detail
+
+
 def _semantic_change_summary(entry):
     """One semantic diff entry, which is not shaped like a workspace one.
 
@@ -769,13 +856,30 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 "The authorization component is unavailable; try again."
             ) from None
         try:
+            # A descriptor may ask for longer than the read default. Bounded
+            # below the credential's own 60-second life, so a tool that is
+            # going to fail says so before the token it holds expires.
+            deadline = operation.get("timeout")
             if operation["method"] == "GET":
-                return config_api.get(path=path, query=query, token=token_b)
+                return config_api.get(
+                    path=path, query=query, token=token_b, timeout=deadline
+                )
             # The same body object that was digested, not a rebuild of it.
             return config_api.post(
-                path=path, query=query, token=token_b, body=body
+                path=path, query=query, token=token_b, body=body,
+                timeout=deadline,
             )
         except ConfigApiRefused as refusal:
+            # Some operations answer a non-2xx with the result rather than an
+            # error. A browser validation that fails its checks returns 422
+            # carrying the artifacts and the failing checks, which is exactly
+            # what a reviewer needs; reducing it to its message would throw the
+            # evidence away. Declared per operation so this is never a guess
+            # about what a status means.
+            if refusal.status in operation.get("result_statuses", ()) and (
+                refusal.body is not None
+            ):
+                return refusal.body
             # The field-level entries, where the platform sent any. For a
             # validation refusal these are the answer: the top-level message
             # says only that something is wrong, and the entry beneath names
@@ -1077,6 +1181,114 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         if status is not None:
             entries = [entry for entry in entries if entry["status"] == status]
         return {"proposals": entries}
+
+    @tool(
+        operation=PROPOSALS_PREVIEW_PLAN,
+        name="proposals_preview_plan",
+        description=(
+            "What rendering a proposed change would involve: the layer as the"
+            " proposal would leave it, the background layers, the effective"
+            " filter and any warnings. Renders nothing and costs nothing to"
+            " run. Use it before the screenshot to check the right thing"
+            " would be drawn."
+        ),
+    )
+    def proposals_preview_plan(
+        proposal_id: str,
+        layer: str,
+        locale: str | None = None,
+    ) -> dict:
+        """The cheap half of review evidence.
+
+        It answers what *would* be rendered without starting a browser, which
+        makes it the right first call: a plan naming the wrong layer, or
+        warning that the source cannot be rendered faithfully, is worth knowing
+        before spending thirty seconds on a screenshot that will say the same
+        thing less clearly.
+
+        The title it reports is the proposal's, not the workspace's, which is
+        how you can tell it is reading the candidate.
+        """
+        path = PROPOSALS_PREVIEW_PLAN["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        body = {"layer": layer}
+        if locale is not None:
+            body["locale"] = locale
+        payload = _without_meta(
+            spend(PROPOSALS_PREVIEW_PLAN, path=path, body=body)
+        )
+        return payload
+
+    @tool(
+        operation=PROPOSALS_PREVIEW_SCREENSHOT,
+        name="proposals_preview_screenshot",
+        description=(
+            "Render a proposed change through a real browser and attach the"
+            " images to the proposal, so a person can see what it would look"
+            " like before applying it. Returns where the images are, whether"
+            " the checks passed, and which failed. Applies nothing. Takes"
+            " about five seconds."
+        ),
+    )
+    def proposals_preview_screenshot(
+        proposal_id: str,
+        layer: str,
+        hover: bool = False,
+        locale: str | None = None,
+    ) -> dict:
+        """The evidence a reviewer actually looks at.
+
+        Run in the foreground deliberately. The platform will background this
+        and hand back an operation to poll, but `operations_show` costs
+        `derive` while the configuration API demands `visual` to inspect an
+        operation of this kind -- so an agent that backgrounded it could start
+        a screenshot and then not be allowed to read the outcome. Waiting the
+        five seconds avoids inventing a way around that.
+
+        `hover` defaults to False rather than being omitted. The platform's
+        published schema lists it as optional and then refuses the request with
+        "hover must be true or false" if it is absent, which costs a round trip
+        to discover. Supplying a default is the smaller fix; the schema being
+        wrong is recorded rather than worked around silently.
+        """
+        path = PROPOSALS_PREVIEW_SCREENSHOT["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        body = {"layer": layer, "hover": hover}
+        if locale is not None:
+            body["locale"] = locale
+        return _visual_outcome(
+            spend(PROPOSALS_PREVIEW_SCREENSHOT, path=path, body=body)
+        )
+
+    @tool(
+        operation=PROPOSALS_PREVIEW_TEST,
+        name="proposals_preview_test",
+        description=(
+            "Render a proposed change and compare it against the workspace as"
+            " it stands, reporting whether the checks passed and which did"
+            " not. The same evidence as the screenshot, judged rather than"
+            " just captured. Applies nothing."
+        ),
+    )
+    def proposals_preview_test(
+        proposal_id: str,
+        layer: str,
+        hover: bool = False,
+        locale: str | None = None,
+    ) -> dict:
+        """The judged form: the platform decides whether the render is
+        acceptable rather than leaving a person to compare two images."""
+        path = PROPOSALS_PREVIEW_TEST["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        body = {"layer": layer, "hover": hover}
+        if locale is not None:
+            body["locale"] = locale
+        return _visual_outcome(
+            spend(PROPOSALS_PREVIEW_TEST, path=path, body=body)
+        )
 
     @tool(
         operation=PROPOSALS_CREATE,

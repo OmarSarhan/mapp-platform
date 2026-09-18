@@ -2137,7 +2137,7 @@ SEMANTIC_CHECK = {"catalogRevision": 53, "check": {
     "explanation": "probe",
 }, "meta": {"requestId": "r14"}}
 
-AUTHORING = WIDE + " propose semantic:propose"
+AUTHORING = WIDE + " propose semantic:propose visual"
 
 
 class ProposalCheckTests(ToolTestCase):
@@ -2379,6 +2379,242 @@ class ProposalCreateTests(ToolTestCase):
                 self.as_caller(caller(scopes=AUTHORING))
                 detail = self.call(self.tool(payload=payload))
                 self.assertEqual([], detail["changes"])
+
+
+# Cut down from a real screenshot reply of 112,998 bytes: the pixel comparison
+# was 32,538 of it and the per-check diagnosis 12,334, against 650 bytes of
+# artifact paths, which are the only part a person looks at.
+SHOT = {
+    "proposalId": "1789749575-1b410882203d-a080a5",
+    "source": "candidate",
+    "operation": {
+        "id": "c58af381da79db9701a347d285eacf02",
+        "kind": "proposal.screenshot",
+        "status": "failed",
+        "error": {
+            "code": "visual.failed",
+            "message": "Browser validation did not pass.",
+            # 6,174 bytes of per-check detail in the real reply.
+            "diagnosis": {"outcome": "failed", "checks": ["x" * 60]},
+        },
+        "result": {
+            "proposalId": "1789749575-1b410882203d-a080a5",
+            "operationId": "c58af381da79db9701a347d285eacf02",
+            "plan": {
+                "layer": "Bus_Stops",
+                "layerTitle": "Bus Stops (wave 3, proposed by an agent)",
+                "warnings": [
+                    "This layer uses an external or advanced XYZ source, so the visual check uses the configured workspace view."
+                ],
+                "effectiveDataset": {
+                    "layerKey": "Bus_Stops"
+                }
+            },
+            "visual": {
+                "passed": False,
+                "failedStage": "layer-registration",
+                "runId": "2026-09-18T22-09-18-540Z-1789749575-1b410882203d-a080a5-1b410882203d2050-Bus_Stops-08527ed8",
+                "artifacts": {
+                    "beforePage": "2026-09-18T22-09-10-561Z-Bus_Stops-18840fb0/before-page.png",
+                    "beforeMap": "2026-09-18T22-09-10-561Z-Bus_Stops-18840fb0/before-map.png",
+                    "afterPage": "2026-09-18T22-09-18-540Z-1789749575-1b410882203d-a080a5-1b410882203d2050-Bus_Stops-08527ed8/before-page.png",
+                    "afterMap": "2026-09-18T22-09-18-540Z-1789749575-1b410882203d-a080a5-1b410882203d2050-Bus_Stops-08527ed8/before-map.png",
+                    "beforeReport": "2026-09-18T22-09-10-561Z-Bus_Stops-18840fb0/report.json",
+                    "afterReport": "2026-09-18T22-09-18-540Z-1789749575-1b410882203d-a080a5-1b410882203d2050-Bus_Stops-08527ed8/report.json",
+                    "beforeHoverTooltip": None,
+                    "afterHoverTooltip": None
+                },
+                "diagnosis": {
+                    "original": {
+                        "checks": [
+                            {
+                                "id": "visual.http",
+                                "passed": True,
+                                "observed": 200
+                            },
+                            {
+                                "id": "visual.layer_activation",
+                                "passed": False,
+                                "observed": {
+                                    "registered": False,
+                                    "detail": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                                }
+                            }
+                        ]
+                    },
+                    "candidate": {
+                        "checks": [
+                            {
+                                "id": "visual.http",
+                                "passed": True,
+                                "observed": 200
+                            }
+                        ]
+                    }
+                },
+                "comparison": {
+                    "pixels": [
+                        1,
+                        2,
+                        3
+                    ],
+                    "diffRatio": 0.4
+                }
+            }
+        }
+    },
+    "meta": {
+        "requestId": "r17"
+    }
+}
+
+PLAN = {"proposalId": "p-1", "source": "candidate",
+        "plan": {"layer": "Bus_Stops", "layerTitle": "Bus Stops (proposed)",
+                 "warnings": ["external source"]},
+        "meta": {"requestId": "r18"}}
+
+
+class PreviewEvidenceTests(ToolTestCase):
+    """Evidence a person can decide on, without the 113KB it arrives in."""
+
+    def tool(self, name, payload, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_the_plan_reports_the_proposed_title_not_the_live_one(self) -> None:
+        """How you can tell it read the candidate rather than the workspace."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("proposals_preview_plan", PLAN)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertEqual("Bus Stops (proposed)", detail["plan"]["layerTitle"])
+        self.assertNotIn("meta", detail)
+
+    def test_the_artifacts_survive_whole(self) -> None:
+        """They are the product of the call: 650 bytes of paths to the images
+        somebody is going to look at."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("proposals_preview_screenshot", SHOT)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertIn("beforeMap", detail["artifacts"])
+        self.assertIn("afterMap", detail["artifacts"])
+
+    def test_the_pixel_comparison_does_not(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("proposals_preview_screenshot", SHOT)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertNotIn("comparison", json.dumps(detail))
+        self.assertNotIn("diffRatio", json.dumps(detail))
+
+    def test_only_the_failing_checks_are_reported(self) -> None:
+        """Nine checks ran and one failed. Reporting all nine is 12,334 bytes
+        of mostly `passed: true`."""
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("proposals_preview_screenshot", SHOT)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertEqual(
+            [("original", "visual.layer_activation")],
+            [(f["side"], f["check"]) for f in detail["failedChecks"]],
+        )
+        self.assertFalse(detail["passed"])
+        self.assertEqual("layer-registration", detail["failedStage"])
+
+    def test_the_error_is_reported_without_its_diagnosis(self) -> None:
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.tool("proposals_preview_screenshot", SHOT)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertEqual("visual.failed", detail["error"]["code"])
+        self.assertEqual({"code", "message"}, set(detail["error"]))
+        # 6,174 bytes of per-check diagnosis in the real reply.
+        self.assertNotIn("diagnosis", json.dumps(detail))
+
+    def test_hover_is_sent_because_the_platform_requires_it(self) -> None:
+        """The published schema lists it as optional and the platform then
+        refuses with "hover must be true or false"."""
+        api = FakeConfigApi(answer=SHOT)
+        self.as_caller(caller(scopes=AUTHORING))
+        self.build_named("proposals_preview_screenshot", config_api=api)(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertIs(False, api.calls[0]["body"]["hover"])
+        self.assertEqual("POST", api.calls[0]["method"])
+
+    def test_each_preview_costs_the_visual_scope(self) -> None:
+        for name in ("proposals_preview_plan", "proposals_preview_screenshot",
+                     "proposals_preview_test"):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller(scopes=AUTHORING))
+                self.tool(name, SHOT, exchange=exchange)(
+                    proposal_id="p-1", layer="Bus_Stops")
+                self.assertEqual("visual", exchange.calls[0]["scope"])
+
+    def test_a_grant_without_visual_is_refused(self) -> None:
+        self.as_caller(caller(scopes=WIDE + " propose"))
+        with self.assertRaises(ToolError) as raised:
+            self.tool("proposals_preview_screenshot", SHOT)(
+                proposal_id="p-1", layer="Bus_Stops")
+        self.assertIn("visual", str(raised.exception))
+
+    def test_the_proposal_id_is_encoded_into_the_path(self) -> None:
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=AUTHORING))
+        self.tool("proposals_preview_screenshot", SHOT, exchange=exchange)(
+            proposal_id="odd/id", layer="L")
+        self.assertEqual("/api/proposals/odd%2Fid/screenshot",
+                         exchange.calls[0]["path"])
+
+    def test_unexpected_shapes_degrade_rather_than_raising(self) -> None:
+        for payload in ({}, {"operation": None}, {"operation": {"result": "x"}}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller(scopes=AUTHORING))
+                detail = self.tool("proposals_preview_screenshot", payload)(
+                    proposal_id="p", layer="L")
+                self.assertEqual([], detail["failedChecks"])
+                self.assertEqual({}, detail["artifacts"])
+
+    def test_a_failed_render_is_an_answer_not_an_error(self) -> None:
+        """The platform answers 422 with the whole result when the checks
+        fail -- artifacts included. That is the reviewer's evidence: the images
+        exist and something is wrong with them. Reducing it to its message
+        would throw away the only reason the call was made."""
+        class Refusing:
+            def post(self, **kwargs):
+                raise ConfigApiRefused(
+                    "Browser validation did not pass.", status=422,
+                    code="visual.failed", body=SHOT,
+                )
+        self.as_caller(caller(scopes=AUTHORING))
+        detail = self.build_named(
+            "proposals_preview_screenshot", config_api=Refusing())(
+            proposal_id="p-1", layer="Bus_Stops")
+        self.assertIs(False, detail["passed"])
+        self.assertIn("beforeMap", detail["artifacts"])
+
+    def test_another_refusal_status_still_refuses(self) -> None:
+        """Only the declared statuses carry a result. A 403 is a refusal
+        whatever body it happens to have."""
+        class Refusing:
+            def post(self, **kwargs):
+                raise ConfigApiRefused(
+                    "Refused.", status=403, code="auth.scope_required",
+                    body=SHOT,
+                )
+        self.as_caller(caller(scopes=AUTHORING))
+        with self.assertRaises(ToolError):
+            self.build_named(
+                "proposals_preview_screenshot", config_api=Refusing())(
+                proposal_id="p-1", layer="Bus_Stops")
+
+    def test_a_render_is_allowed_longer_than_a_read(self) -> None:
+        """Measured at 20.8 and 24.4 seconds against a 15-second read default,
+        which reported a working platform as unavailable. Bounded under the
+        credential's own 60-second life."""
+        from runtime import PROPOSALS_PREVIEW_SCREENSHOT, PROPOSALS_PREVIEW_TEST
+
+        for descriptor in (PROPOSALS_PREVIEW_SCREENSHOT, PROPOSALS_PREVIEW_TEST):
+            with self.subTest(operation=descriptor["operation_id"]):
+                self.assertGreater(descriptor["timeout"], 25)
+                self.assertLess(descriptor["timeout"], 60)
 
 
 class MetaEnvelopeTests(unittest.TestCase):

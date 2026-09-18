@@ -37,11 +37,16 @@ class ConfigApiRefused(RuntimeError):
     """
 
     def __init__(self, message: str, *, status: int, code: str = "",
-                 errors: Any = None) -> None:
+                 errors: Any = None, body: Any = None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.errors = errors if isinstance(errors, list) else []
+        #: The parsed response, for the operations whose refusal carries one.
+        #: A failed browser validation answers 422 with the whole result --
+        #: artifacts included -- and that is the reviewer's evidence, not an
+        #: error to be reduced to its message.
+        self.body = body if isinstance(body, dict) else None
 
 
 class ConfigApiUnavailable(RuntimeError):
@@ -53,12 +58,14 @@ class ConfigApiClient:
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
 
-    def get(self, *, path: str, query: str, token: str) -> Any:
+    def get(self, *, path: str, query: str, token: str,
+            timeout: float | None = None) -> Any:
         """Exactly the path and query the credential was bound to."""
         return self._send(path=path, query=query, token=token, method="GET",
-                          body=None)
+                          body=None, timeout=timeout)
 
-    def post(self, *, path: str, query: str, token: str, body: Any) -> Any:
+    def post(self, *, path: str, query: str, token: str, body: Any,
+             timeout: float | None = None) -> Any:
         """The same, with the body the credential was bound to.
 
         The digest covers the body as a *parsed value*, canonicalised the same
@@ -69,10 +76,19 @@ class ConfigApiClient:
         disagree, and the disagreement surfaces as a refusal naming no cause.
         """
         return self._send(path=path, query=query, token=token, method="POST",
-                          body=body)
+                          body=body, timeout=timeout)
 
     def _send(self, *, path: str, query: str, token: str, method: str,
-              body: Any) -> Any:
+              body: Any, timeout: float | None = None) -> Any:
+        """`timeout` overrides the instance default for one call.
+
+        The default is tuned for a read. A browser render is not a read: a
+        proposal screenshot measured 20.8 and 24.4 seconds against a 15-second
+        default, so it failed as "the configuration API is unavailable" when
+        the configuration API was working perfectly well. Raising the default
+        would make every read wait that long to notice a dead service, so the
+        operations that need longer say so.
+        """
         url = self.endpoint + path + (f"?{query}" if query else "")
         headers = {
             "Accept": "application/json",
@@ -89,18 +105,27 @@ class ConfigApiClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            deadline = self.timeout if timeout is None else timeout
+            with urllib.request.urlopen(request, timeout=deadline) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             try:
                 detail = json.loads(exc.read().decode("utf-8"))
             except (ValueError, UnicodeDecodeError, OSError):
                 detail = {}
+            if not isinstance(detail, dict):
+                # A JSON array or scalar parses cleanly and then has no `.get`,
+                # so the AttributeError escaped as a crash rather than as the
+                # refusal this is here to raise. Nothing the platform sends
+                # today looks like this; a proxy or gateway in front of it
+                # might.
+                detail = {}
             raise ConfigApiRefused(
                 str(detail.get("error") or f"HTTP {exc.code}"),
                 status=exc.code,
                 code=str(detail.get("code") or ""),
                 errors=detail.get("errors"),
+                body=detail or None,
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise ConfigApiUnavailable(
