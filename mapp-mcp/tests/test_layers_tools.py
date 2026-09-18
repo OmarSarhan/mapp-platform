@@ -29,6 +29,7 @@ from exchange_client import ExchangeRefused  # noqa: E402
 from exchange_client import ExchangeUnavailable  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from protected_resource import ProtectedResource  # noqa: E402
+from runtime import _without_meta  # noqa: E402
 from runtime import build_runtime  # noqa: E402
 
 
@@ -60,6 +61,11 @@ class FakeConfigApi:
 #: `inspect` is in the default because any caller that can *see* a tool holds
 #: it -- it is the listing scope -- so a caller without it is not a realistic
 #: grant. Tests about a missing scope name the narrower set explicitly.
+WIDE = (
+    "mcp:connect inspect derive semantic:inspect federation:observe"
+)
+
+
 def caller(
     scopes="mcp:connect inspect derive semantic:inspect", token="mapp_a_live"
 ):
@@ -1244,6 +1250,224 @@ class ProposalDetailTests(ToolTestCase):
         becomes = self.tool(payload=payload)(proposal_id="p-1")["changes"][0]["becomes"]
         self.assertEqual(20, len(becomes["keys"]))
         self.assertEqual(10, becomes["truncated"])
+
+
+# Every fixture below is cut from a live response captured through
+# config.localhost against the deployed stack, key for key. Composing them here
+# would mean the summarisers agree with an invented shape -- the failure this
+# file has hit more than once.
+STATUS = {
+    "ok": True, "serviceVersion": "0.4.0", "schemaVersion": 3,
+    "catalogRevision": 53,
+    "capabilities": {"catalog": True, "search": True, "proposals": True,
+                     "curatedProposals": True, "derivedProfiles": True,
+                     "generatedEvents": ["created", "updated"],
+                     "pagination": {"maxLimit": 200}},
+    "meta": {"requestId": "503aa83b584c98781c320443fef3719a"},
+}
+PROFILES = {
+    "derivedProfiles": [
+        {"name": "census_oa_country_birth_categories",
+         "relation": "derived_layers.census_oa_country_birth_categories",
+         "kind": "view", "assetId": "440c4b84-4c84-4452-acff-7f4cbb9ca1bd",
+         "generation": 1, "status": "ready", "revision": "46"},
+    ],
+    "catalogRevision": 53, "deliveryBlockers": [], "deliveryBlockersMore": False,
+    "meta": {"requestId": "r1"},
+}
+PROFILE = {
+    "catalogRevision": 53,
+    "derivedProfile": {"name": "census_oa_country_birth_categories",
+                       "relation": "derived_layers.census_oa_country_birth_categories",
+                       "kind": "view", "status": "ready"},
+    "meta": {"requestId": "r2"},
+}
+HISTORY = {
+    "assetId": "440c4b84-4c84-4452-acff-7f4cbb9ca1bd",
+    "catalogRevision": 53,
+    "history": [
+        {"eventId": "ev-1", "changedAt": "2026-09-14T14:27:42.604Z",
+         "changeType": "generated", "version": 1, "generation": 1,
+         "proposalId": None, "catalogRevision": 46,
+         "actor": "[withheld]",
+         # The platform stores a snapshot of the asset at each event; this is
+         # the bulk the summariser exists to drop.
+         "asset": {"createdAt": "2026-09-14T14:27:42.604Z", "curated": {},
+                   "generated": {"binding": {"adapter": "postgresql",
+                                             "relation": "census_oa_country_birth_categories",
+                                             "schema": "derived_layers"},
+                                 "definitionDigest": "5abff3e0" * 8}}},
+    ],
+    "meta": {"requestId": "r3"},
+}
+JOBS = {
+    "backgroundJobs": {"observedAt": "2026-09-18T09:00:00Z", "activeJobs": 0,
+                       "maxActiveJobs": 2, "executingJobs": 0,
+                       "waitingJobs": 0, "activeOperations": []},
+    "meta": {"requestId": "r4"},
+}
+EXTENT = {
+    "spatialScope": {"type": "workspace-map-extent", "locale": "locale",
+                     "crs": "EPSG:4326", "scopeZoom": 10,
+                     "envelopes": [{"west": -1.85, "south": 53.65,
+                                    "east": -1.2, "north": 54.0}],
+                     "selection": "intersects-output-geometry",
+                     "clipsGeometry": False},
+    "meta": {"requestId": "r5"},
+}
+GROUPS = {
+    "groups": [{"name": "census", "description": "Census sources",
+                "createdBy": "[withheld]", "createdAt": "2026-09-01T00:00:00Z",
+                "memberCount": 3}],
+    "meta": {"requestId": "r6"},
+}
+
+
+class InstanceStateToolTests(ToolTestCase):
+    """The reads that say what state the platform is in rather than what it
+    holds: is the semantic service available, is background work running, what
+    ground derived layers are bounded by, and how a meaning got to be what it
+    is."""
+
+    def tool(self, name, payload, exchange=None):
+        return self.build_named(
+            name, exchange=exchange, config_api=FakeConfigApi(answer=payload)
+        )
+
+    def test_the_request_envelope_is_dropped_by_every_new_tool(self) -> None:
+        """`meta.requestId` identifies the HTTP call in the platform's logs and
+        answers nothing an agent asked."""
+        for name, payload, kwargs in (
+            ("semantic_status", STATUS, {}),
+            ("semantic_derived_profiles_list", PROFILES, {}),
+            ("semantic_derived_profiles_show", PROFILE, {"name": "p"}),
+            ("derived_layers_jobs", JOBS, {}),
+            ("derived_layers_map_extent", EXTENT, {}),
+            ("federation_groups", GROUPS, {}),
+        ):
+            with self.subTest(tool=name):
+                self.as_caller(caller(scopes=WIDE))
+                detail = self.tool(name, payload)(**kwargs)
+                self.assertNotIn("meta", detail)
+                self.assertNotIn("requestId", json.dumps(detail))
+
+    def test_status_reports_availability_and_capabilities(self) -> None:
+        """Optional capabilities are why this exists: without it an agent
+        learns search is unavailable by calling it and reading a refusal."""
+        self.as_caller(caller())
+        detail = self.tool("semantic_status", STATUS)()
+        self.assertIs(True, detail["ok"])
+        self.assertIs(True, detail["capabilities"]["search"])
+        self.assertEqual(53, detail["catalogRevision"])
+
+    def test_profiles_carry_the_relation_and_its_asset(self) -> None:
+        """This is the join: derived_layers_list names a relation, the catalog
+        tools describe an asset, and nothing else says they are the same."""
+        self.as_caller(caller())
+        entry = self.tool("semantic_derived_profiles_list", PROFILES)()["derivedProfiles"][0]
+        self.assertEqual("derived_layers.census_oa_country_birth_categories",
+                         entry["relation"])
+        self.assertEqual("440c4b84-4c84-4452-acff-7f4cbb9ca1bd", entry["assetId"])
+
+    def test_history_keeps_the_change_and_drops_the_asset_snapshot(self) -> None:
+        """Each stored event embeds the asset as it then was, so a history
+        costs the full record once per event; the current one is one call
+        away via semantic_catalog_show."""
+        self.as_caller(caller())
+        detail = self.tool("semantic_catalog_history", HISTORY)(asset_id="a-1")
+        entry = detail["history"][0]
+        self.assertEqual("generated", entry["changeType"])
+        self.assertEqual("ev-1", entry["eventId"])
+        self.assertNotIn("asset", entry)
+        self.assertNotIn("definitionDigest", json.dumps(detail))
+        self.assertEqual("440c4b84-4c84-4452-acff-7f4cbb9ca1bd", detail["assetId"])
+
+    def test_history_keeps_the_actor_the_platform_already_withheld(self) -> None:
+        """Dropping it here would hide that the platform redacts it, and the
+        decision belongs at the configuration API, not in each tool."""
+        self.as_caller(caller())
+        detail = self.tool("semantic_catalog_history", HISTORY)(asset_id="a-1")
+        self.assertEqual("[withheld]", detail["history"][0]["actor"])
+
+    def test_jobs_report_the_queue_and_its_ceiling(self) -> None:
+        """Refresh is asynchronous; without the queue an agent cannot tell a
+        slow job from one that never started."""
+        self.as_caller(caller())
+        jobs = self.tool("derived_layers_jobs", JOBS)()["backgroundJobs"]
+        self.assertEqual(0, jobs["executingJobs"])
+        self.assertEqual(2, jobs["maxActiveJobs"])
+
+    def test_map_extent_reports_the_envelope_and_its_crs(self) -> None:
+        """A derived layer missing data outside a region is usually bounded
+        rather than broken, and that is invisible from the layer."""
+        self.as_caller(caller())
+        scope = self.tool("derived_layers_map_extent", EXTENT)()["spatialScope"]
+        self.assertEqual("EPSG:4326", scope["crs"])
+        self.assertEqual(-1.85, scope["envelopes"][0]["west"])
+
+    def test_groups_report_membership_counts(self) -> None:
+        self.as_caller(caller(scopes=WIDE))
+        group = self.tool("federation_groups", GROUPS)()["groups"][0]
+        self.assertEqual("census", group["name"])
+        self.assertEqual(3, group["memberCount"])
+
+    def test_each_tool_costs_exactly_its_declared_scope(self) -> None:
+        """A read tool that asked for more than it needs makes looking
+        indistinguishable from acting."""
+        for name, payload, kwargs, scope in (
+            ("semantic_status", STATUS, {}, "semantic:inspect"),
+            ("semantic_derived_profiles_list", PROFILES, {}, "semantic:inspect"),
+            ("semantic_derived_profiles_show", PROFILE, {"name": "p"}, "semantic:inspect"),
+            ("semantic_catalog_history", HISTORY, {"asset_id": "a"}, "semantic:inspect"),
+            ("derived_layers_jobs", JOBS, {}, "inspect"),
+            ("derived_layers_map_extent", EXTENT, {}, "inspect"),
+            ("federation_groups", GROUPS, {}, "federation:observe"),
+        ):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller(scopes=WIDE))
+                self.tool(name, payload, exchange=exchange)(**kwargs)
+                self.assertEqual(scope, exchange.calls[0]["scope"])
+
+    def test_federation_groups_is_refused_without_the_observe_scope(self) -> None:
+        """It names the third-party sources an operator grouped, so it sits
+        behind the same scope as the alias list rather than plain inspect."""
+        self.as_caller(caller(scopes="mcp:connect inspect semantic:inspect"))
+        with self.assertRaises(ToolError) as raised:
+            self.tool("federation_groups", GROUPS)()
+        self.assertIn("federation:observe", str(raised.exception))
+
+    def test_the_identifier_is_encoded_into_the_path(self) -> None:
+        for name, kwargs, expected in (
+            ("semantic_derived_profiles_show", {"name": "odd/name"},
+             "/api/semantic/derived-profiles/odd%2Fname"),
+            ("semantic_catalog_history", {"asset_id": "odd/id"},
+             "/api/semantic/catalog/objects/odd%2Fid/history"),
+        ):
+            with self.subTest(tool=name):
+                exchange = FakeExchange()
+                self.as_caller(caller())
+                self.tool(name, PROFILE if "profiles" in name else HISTORY,
+                          exchange=exchange)(**kwargs)
+                self.assertEqual(expected, exchange.calls[0]["path"])
+
+    def test_an_unexpected_shape_degrades_rather_than_raising(self) -> None:
+        for payload in ({}, {"history": None}, {"history": "x"}):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                detail = self.tool("semantic_catalog_history", payload)(asset_id="a")
+                self.assertEqual([], detail["history"])
+
+    def test_a_response_that_is_not_an_object_degrades_to_an_empty_one(self) -> None:
+        """Unguarded this raises AttributeError, which the SDK reports as
+        "Error executing tool" with a traceback rather than as a refusal."""
+        for payload in ([], "x", 3):
+            with self.subTest(payload=payload):
+                self.as_caller(caller())
+                self.assertEqual({}, self.tool("semantic_status", payload)())
+        # A JSON `null` body reaches the helper as None, which the config-api
+        # fake cannot express -- it reads a None answer as "use the default".
+        self.assertEqual({}, _without_meta(None))
 
 
 class LimitQueryTests(unittest.TestCase):

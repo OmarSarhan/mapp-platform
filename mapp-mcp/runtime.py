@@ -137,6 +137,55 @@ SEMANTIC_PROPOSALS_SHOW = {
     "scopes": ("semantic:inspect",),
 }
 
+SEMANTIC_STATUS = {
+    "operation_id": "semantic.status",
+    "method": "GET",
+    "path_template": "/api/semantic/status",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_DERIVED_PROFILES_LIST = {
+    "operation_id": "semantic.derived-profiles.list",
+    "method": "GET",
+    "path_template": "/api/semantic/derived-profiles",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_DERIVED_PROFILES_SHOW = {
+    "operation_id": "semantic.derived-profiles.show",
+    "method": "GET",
+    "path_template": "/api/semantic/derived-profiles/{name}",
+    "scopes": ("semantic:inspect",),
+}
+
+SEMANTIC_CATALOG_HISTORY = {
+    "operation_id": "semantic.catalog.history",
+    "method": "GET",
+    "path_template": "/api/semantic/catalog/objects/{assetId}/history",
+    "scopes": ("semantic:inspect",),
+}
+
+DERIVED_LAYERS_JOBS = {
+    "operation_id": "derived-layers.background-jobs",
+    "method": "GET",
+    "path_template": "/api/derived-layers/background-jobs",
+    "scopes": ("inspect",),
+}
+
+DERIVED_LAYERS_MAP_EXTENT = {
+    "operation_id": "derived-layers.map-extent",
+    "method": "GET",
+    "path_template": "/api/derived-layers/map-extent",
+    "scopes": ("inspect",),
+}
+
+FEDERATION_GROUPS = {
+    "operation_id": "federation.groups.list",
+    "method": "GET",
+    "path_template": "/api/federation/groups",
+    "scopes": ("federation:observe",),
+}
+
 SEMANTIC_CATALOG_LIST = {
     "operation_id": "semantic.catalog.export",
     "method": "GET",
@@ -302,6 +351,42 @@ def _change_summary(entry):
         "path": entry.get("path"),
         "was": _change_preview(entry.get("old")),
         "becomes": _change_preview(entry.get("value")),
+    }
+
+
+def _without_meta(payload):
+    """The response minus its request-correlation envelope.
+
+    Every configuration API response carries `meta.requestId`. It identifies
+    the HTTP call in the platform's own logs and answers nothing an agent
+    asked, so it is dropped rather than spent in a conversation.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    return {key: value for key, value in payload.items() if key != "meta"}
+
+
+def _history_entry(entry):
+    """One recorded change to a catalogued asset, without the asset.
+
+    Each stored event embeds a full snapshot of the asset as it then was, so
+    the history of a single asset reaches 4,925 bytes over a handful of events
+    and grows with every one. What a reader wants from a history is the shape
+    of the change -- when, what kind, which version, and the proposal that
+    carried it -- and `semantic_catalog_show` already returns the asset as it
+    now stands. `actor` is kept: the configuration API withholds credential
+    identifiers from an exchanged credential before this sees them, which is
+    where that decision belongs.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    return {
+        "eventId": entry.get("eventId"),
+        "changedAt": entry.get("changedAt"),
+        "changeType": entry.get("changeType"),
+        "version": entry.get("version"),
+        "generation": entry.get("generation"),
+        "proposalId": entry.get("proposalId"),
+        "catalogRevision": entry.get("catalogRevision"),
+        "actor": entry.get("actor"),
     }
 
 
@@ -856,6 +941,162 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "{proposalId}", quote(proposal_id, safe="")
         )
         return spend(SEMANTIC_PROPOSALS_SHOW, path=path)
+
+    @server.tool(
+        name="semantic_status",
+        description=(
+            "Whether the semantic service is reachable and what it supports on"
+            " this instance: search, proposals, generation, derived profiles,"
+            " and the catalogue revision its answers are cut from. Use this"
+            " when a semantic tool behaves unexpectedly, to tell a disabled"
+            " capability from a failure."
+        ),
+    )
+    def semantic_status() -> dict:
+        """Which of the semantic tools are worth calling at all.
+
+        Several semantic capabilities are optional per instance. Without this,
+        an agent learns that search is unavailable by calling it and reading a
+        refusal, which is indistinguishable from a transient fault.
+        """
+        return _without_meta(
+            spend(SEMANTIC_STATUS, path=SEMANTIC_STATUS["path_template"])
+        )
+
+    @server.tool(
+        name="semantic_derived_profiles_list",
+        description=(
+            "Derived profiles: the managed relations the semantic service"
+            " models, with the catalogued asset each corresponds to and"
+            " whether it is ready. Use a name here with"
+            " semantic_derived_profiles_show."
+        ),
+    )
+    def semantic_derived_profiles_list() -> dict:
+        """The join between a derived relation and its catalogued meaning.
+
+        `derived_layers_list` says a relation exists and `semantic_catalog_*`
+        says what an asset means; this is what says the two are the same thing,
+        by carrying both the relation name and its assetId.
+        """
+        return _without_meta(
+            spend(
+                SEMANTIC_DERIVED_PROFILES_LIST,
+                path=SEMANTIC_DERIVED_PROFILES_LIST["path_template"],
+            )
+        )
+
+    @server.tool(
+        name="semantic_derived_profiles_show",
+        description=(
+            "One derived profile by name: its relation, kind, catalogued"
+            " assetId, generation and readiness. Takes a name from"
+            " semantic_derived_profiles_list."
+        ),
+    )
+    def semantic_derived_profiles_show(name: str) -> dict:
+        """One profile, for when the list has already narrowed the question."""
+        path = SEMANTIC_DERIVED_PROFILES_SHOW["path_template"].replace(
+            "{name}", quote(name, safe="")
+        )
+        return _without_meta(spend(SEMANTIC_DERIVED_PROFILES_SHOW, path=path))
+
+    @server.tool(
+        name="semantic_catalog_history",
+        description=(
+            "How a catalogued asset's meaning changed over time: each event"
+            " with its kind, version, when it happened and the proposal that"
+            " carried it. The asset as it now stands comes from"
+            " semantic_catalog_show. Takes an assetId."
+        ),
+    )
+    def semantic_catalog_history(asset_id: str) -> dict:
+        """Why a definition says what it says, which the asset cannot.
+
+        `semantic_catalog_show` returns the current meaning. This answers when
+        it became that and what carried the change -- the question asked when a
+        definition looks wrong and somebody needs to know whether it was always
+        so.
+
+        The stored events embed a snapshot of the asset at each point. Those
+        are dropped: an asset's history would otherwise cost its full record
+        once per event, and the current record is one tool call away.
+        """
+        path = SEMANTIC_CATALOG_HISTORY["path_template"].replace(
+            "{assetId}", quote(asset_id, safe="")
+        )
+        payload = spend(SEMANTIC_CATALOG_HISTORY, path=path)
+        history = payload.get("history")
+        return {
+            "assetId": payload.get("assetId"),
+            "catalogRevision": payload.get("catalogRevision"),
+            "history": [
+                _history_entry(entry)
+                for entry in (history if isinstance(history, list) else [])
+            ],
+        }
+
+    @server.tool(
+        name="derived_layers_jobs",
+        description=(
+            "Background job capacity for derived layers: how many are"
+            " executing, waiting, and the ceiling. Use this to tell work still"
+            " running from work that never started."
+        ),
+    )
+    def derived_layers_jobs() -> dict:
+        """Whether the platform is busy, which nothing else here reports.
+
+        Refreshing or replacing a derived layer is asynchronous. An agent that
+        cannot see the queue has no way to distinguish a slow job from a lost
+        one, and the read costs nothing beyond `inspect`.
+        """
+        return _without_meta(
+            spend(DERIVED_LAYERS_JOBS, path=DERIVED_LAYERS_JOBS["path_template"])
+        )
+
+    @server.tool(
+        name="derived_layers_map_extent",
+        description=(
+            "The spatial extent derived-layer work is bounded by: the"
+            " configured envelopes, their CRS, the source view and how"
+            " geometry at the boundary is selected."
+        ),
+    )
+    def derived_layers_map_extent() -> dict:
+        """Why a derived layer covers the ground it does.
+
+        A derived relation is built against the locale's configured extent, so
+        a layer that appears to be missing data outside a region is usually
+        correct and bounded rather than broken. That is not visible from the
+        layer itself.
+        """
+        return _without_meta(
+            spend(
+                DERIVED_LAYERS_MAP_EXTENT,
+                path=DERIVED_LAYERS_MAP_EXTENT["path_template"],
+            )
+        )
+
+    @server.tool(
+        name="federation_groups",
+        description=(
+            "Federation group labels and how many live sources carry each."
+            " Groups are metadata an operator applies; they grant no access."
+            " Needs federation:observe."
+        ),
+    )
+    def federation_groups() -> dict:
+        """The labels sources are organised by, which the alias list implies.
+
+        Membership is a label and never a permission -- cross-source querying
+        already works between any two provisioned sources. Said here because an
+        agent reading group names would otherwise reasonably infer a boundary
+        that does not exist.
+        """
+        return _without_meta(
+            spend(FEDERATION_GROUPS, path=FEDERATION_GROUPS["path_template"])
+        )
 
     @server.tool(
         name="semantic_catalog_list",
