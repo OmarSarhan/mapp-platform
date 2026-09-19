@@ -2528,15 +2528,34 @@ class PreviewEvidenceTests(ToolTestCase):
         # 6,174 bytes of per-check diagnosis in the real reply.
         self.assertNotIn("diagnosis", json.dumps(detail))
 
-    def test_hover_is_sent_because_the_platform_requires_it(self) -> None:
-        """The published schema lists it as optional and the platform then
-        refuses with "hover must be true or false"."""
+    def test_hover_is_sent_as_false_because_nothing_else_completes(self) -> None:
+        """Measured on one proposal: hover=false renders in 14.4 seconds,
+        hover=true in 97.1, and omitting it in 100 to 166. A token B lives 60,
+        so false is the only value that finishes before the credential
+        authorising the request expires."""
         api = FakeConfigApi(answer=SHOT)
         self.as_caller(caller(scopes=AUTHORING))
         self.build_named("proposals_preview_screenshot", config_api=api)(
             proposal_id="p-1", layer="Bus_Stops")
         self.assertIs(False, api.calls[0]["body"]["hover"])
         self.assertEqual("POST", api.calls[0]["method"])
+
+    def test_asking_for_hover_is_refused_before_it_is_attempted(self) -> None:
+        """Rather than spending a minute and reporting the platform as
+        unavailable, which is both slow and untrue. The refusal names the
+        measurement and the surface that can do it."""
+        for name in ("proposals_preview_screenshot", "proposals_preview_test"):
+            with self.subTest(tool=name):
+                api = FakeConfigApi(answer=SHOT)
+                self.as_caller(caller(scopes=AUTHORING))
+                with self.assertRaises(ToolError) as raised:
+                    self.build_named(name, config_api=api)(
+                        proposal_id="p-1", layer="Bus_Stops", hover=True)
+                message = str(raised.exception)
+                self.assertIn("60", message)
+                self.assertIn("dashboard", message)
+                # Refused here, so nothing was spent reaching the platform.
+                self.assertEqual([], api.calls)
 
     def test_each_preview_costs_the_visual_scope(self) -> None:
         for name in ("proposals_preview_plan", "proposals_preview_screenshot",

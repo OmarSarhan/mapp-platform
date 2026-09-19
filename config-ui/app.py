@@ -9974,7 +9974,15 @@ class Handler(SimpleHTTPRequestHandler):
                     candidate_render_plan.pop("interaction", None)
                 render_payload = dict(payload)
                 render_payload["viewMode"] = view_mode
-                render_payload["hover"] = hover_request
+                # Only when one was asked for. `requested_hover` reports an
+                # absent hover as None, and this payload is validated again
+                # further down -- where a present `hover` of None is not a
+                # boolean and is refused. Writing the key unconditionally
+                # turned "the caller omitted hover", which is allowed, into
+                # "hover must be true or false", raised mid-render as a
+                # non-terminal result rather than as a rejected request.
+                if hover_request is not None:
+                    render_payload["hover"] = hover_request
                 render_payload["expectedHoverText"] = hover_expectations
                 if action == "screenshot":
                     render_payload.setdefault(

@@ -1246,12 +1246,36 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         a screenshot and then not be allowed to read the outcome. Waiting the
         five seconds avoids inventing a way around that.
 
-        `hover` defaults to False rather than being omitted. The platform's
-        published schema lists it as optional and then refuses the request with
-        "hover must be true or false" if it is absent, which costs a round trip
-        to discover. Supplying a default is the smaller fix; the schema being
-        wrong is recorded rather than worked around silently.
+        `hover` defaults to False and True is refused, which is a limit of
+        this surface rather than of the platform.
+
+        Measured against one proposal: `hover=false` renders in 14.4 seconds,
+        `hover=true` in 97.1, and omitting it entirely in 100 to 166 -- the
+        hover path drives real pointer interaction and waits on tooltips. A
+        token B lives sixty seconds, so a hover render cannot finish before the
+        credential authorising it expires. Attempting one spends a minute and
+        returns "the configuration API is unavailable", which is both slow and
+        untrue.
+
+        So it is refused up front, with the alternative named. The dashboard
+        and the CLI hold a session rather than a request-bound credential and
+        can wait as long as it takes.
+
+        Omitting `hover` would be the honest default and is not available for
+        the same reason: the platform reads an absent hover as "decide for
+        yourself", and what it decides costs more than the credential has. A
+        separate configuration-API bug made an absent hover fail outright
+        rather than merely slowly; that is fixed, and this limit is what
+        remains.
         """
+        if hover:
+            raise ToolError(
+                "A hover render takes about 97 seconds and the credential"
+                " authorising this request lives 60, so it cannot complete"
+                " here. Run it from the dashboard or the CLI, which hold a"
+                " session rather than a per-request credential. Without hover"
+                " this returns in about 15 seconds."
+            )
         path = PROPOSALS_PREVIEW_SCREENSHOT["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
@@ -1279,7 +1303,19 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         locale: str | None = None,
     ) -> dict:
         """The judged form: the platform decides whether the render is
-        acceptable rather than leaving a person to compare two images."""
+        acceptable rather than leaving a person to compare two images.
+
+        The same hover limit applies and for the same measured reason; see
+        `proposals_preview_screenshot`.
+        """
+        if hover:
+            raise ToolError(
+                "A hover render takes about 97 seconds and the credential"
+                " authorising this request lives 60, so it cannot complete"
+                " here. Run it from the dashboard or the CLI, which hold a"
+                " session rather than a per-request credential. Without hover"
+                " this returns in about 15 seconds."
+            )
         path = PROPOSALS_PREVIEW_TEST["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )

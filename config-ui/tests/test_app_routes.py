@@ -965,6 +965,59 @@ class DeclaredPaginationLimitTests(unittest.TestCase):
                     )
 
 
+class AbsentHoverTests(unittest.TestCase):
+    """An omitted `hover` must stay omitted.
+
+    `requested_hover` reports an absent hover as None, which is legal -- the
+    published input schema lists the field as optional. The preview path then
+    copied the request, wrote that None into it under the `hover` key, and
+    handed the copy to a stage that validates the same way. On the second pass
+    the key exists and None is not a boolean, so a request that omitted an
+    optional field failed with "hover must be true or false" -- and failed
+    mid-render, as `visual.preview_interrupted`, rather than as a rejected
+    request. Reaching it took a real screenshot through MCP.
+    """
+
+    def test_an_absent_hover_survives_a_second_validation(self):
+        """The round trip the preview path performs, in miniature."""
+        payload = {"layer": "Stops"}
+        carried = dict(payload)
+        hover = app.requested_hover(payload)
+        self.assertIsNone(hover)
+        if hover is not None:
+            carried["hover"] = hover
+
+        self.assertNotIn("hover", carried)
+        self.assertIsNone(app.requested_hover(carried))
+
+    def test_a_requested_hover_is_carried(self):
+        for value in (True, False):
+            with self.subTest(hover=value):
+                payload = {"layer": "Stops", "hover": value}
+                self.assertIs(value, app.requested_hover(payload))
+
+    def test_a_non_boolean_hover_is_still_refused(self):
+        """The check the fix must not weaken: an explicit non-boolean is a
+        malformed request and stays one."""
+        for value in ("true", 1, [], None):
+            with self.subTest(hover=value):
+                with self.assertRaises(ValueError):
+                    app.requested_hover({"layer": "Stops", "hover": value})
+
+    def test_the_preview_path_does_not_write_an_absent_hover(self):
+        """Read from the source, because the defect was one assignment and the
+        behaviour it broke needs a browser to reach."""
+        source = (
+            Path(app.__file__).resolve().parent / "app.py"
+        ).read_text()
+        self.assertIn(
+            "if hover_request is not None:\n"
+            "                    render_payload[\"hover\"] = hover_request",
+            source,
+            "an absent hover is being written into the render payload again",
+        )
+
+
 class RouteUniquenessTests(unittest.TestCase):
     """One route, one action id.
 

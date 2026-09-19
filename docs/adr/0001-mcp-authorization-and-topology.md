@@ -364,6 +364,22 @@ asynchronous operation, so a blanket strip would remove the handle a mutating
 tool needs to follow its own work. The filter is therefore on the read path and
 not inside `spend`.
 
+**The credential's lifetime bounds what this surface can offer.** A token B
+lives sixty seconds, and that is not only a replay bound -- it decides which
+platform operations a tool can expose at all. Measured on one proposal
+screenshot: 14.4 seconds without hover, 97.1 with it, and 100 to 166 when
+hover is left for the platform to decide. The hover forms cannot finish before
+the credential authorising them expires, so `proposals_preview_screenshot`
+refuses them up front and names the dashboard, which holds a session rather
+than a per-request credential.
+
+This is the second place where the per-request credential and the platform
+disagree about what a request is, after `operations.show` and the scope its
+route derives from the resource being read. Phase 1 should expect more: any
+operation whose work is measured in minutes is outside what a request-bound
+credential can authorise, and the answer is either a longer-lived binding for
+that class or an honest refusal. Refusal is what Phase 1 does.
+
 ## Consequences
 
 **The three-place routing problem does not apply.** Token B is a credential, not
