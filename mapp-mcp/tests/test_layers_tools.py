@@ -1065,15 +1065,19 @@ class ProposalQueueTests(ToolTestCase):
         self,
     ) -> None:
         """The explanation is why a proposal exists and is what a person reads
-        first. The hashes and fingerprints answer nothing an agent can act on."""
+        first. The hashes and fingerprints answer nothing an agent can act on;
+        the base revision does, so it stays."""
         self.as_caller(caller())
         entry = self.tool("proposals_list")()["proposals"][0]
         self.assertEqual("p-1", entry["proposalId"])
         self.assertEqual("applied", entry["status"])
         self.assertTrue(entry["explanation"].startswith("y"))
-        for dropped in ("candidateHash", "originalRevision",
-                        "pluginCatalogueFingerprint"):
+        for dropped in ("candidateHash", "pluginCatalogueFingerprint"):
             self.assertNotIn(dropped, entry)
+        # `originalRevision` was dropped here as integrity material and is
+        # back: it is what separates a proposal that can still be applied from
+        # one that cannot, which is not nothing an agent can act on.
+        self.assertEqual("rev", entry["originalRevision"])
 
     def test_a_long_explanation_is_truncated(self) -> None:
         self.as_caller(caller())
@@ -2669,6 +2673,105 @@ class PreviewEvidenceTests(ToolTestCase):
             with self.subTest(operation=descriptor["operation_id"]):
                 self.assertGreater(descriptor["timeout"], 25)
                 self.assertLess(descriptor["timeout"], 60)
+
+
+QUEUE_WITH_REVISION = {
+    "revision": "current-rev",
+    "proposals": [
+        {"id": "p-live", "status": "pending", "created": "2026-09-18T00:00:00Z",
+         "originalRevision": "current-rev", "explanation": "still applies"},
+        {"id": "p-dead", "status": "pending", "created": "2026-07-29T09:22:39Z",
+         "originalRevision": "long-gone", "explanation": "cut from a revision"
+                                                         " the workspace left"},
+        {"id": "p-done", "status": "applied", "created": "2026-08-01T00:00:00Z",
+         "originalRevision": "long-gone", "explanation": "already applied"},
+        # Age and revision disagree here on purpose: the oldest entry in the
+        # queue, still applicable because the workspace never moved past it.
+        # Without this case an "expire after N days" rule would pass the same
+        # tests as the rule that is actually wanted.
+        {"id": "p-ancient", "status": "pending", "created": "2026-01-04T00:00:00Z",
+         "originalRevision": "current-rev", "explanation": "old and still fine"},
+    ],
+}
+
+
+class ApplicabilityTests(ToolTestCase):
+    """Whether a pending proposal can still be applied.
+
+    Derived, never stored. `apply_proposal_and_reload` refuses when the
+    workspace has left the revision a proposal was cut from, so this restates
+    a rule the platform already enforces rather than inventing a second one
+    that could disagree with it. On the dev instance 16 of 19 pending
+    proposals were in that state, reported as `pending` -- true of the status
+    and false of what it implied.
+    """
+
+    def tool(self, name="proposals_list", payload=QUEUE_WITH_REVISION):
+        return self.build_named(name, config_api=FakeConfigApi(answer=payload))
+
+    def test_a_pending_proposal_on_the_current_revision_is_applicable(self) -> None:
+        self.as_caller(caller())
+        entries = {e["proposalId"]: e for e in self.tool()()["proposals"]}
+        self.assertEqual("applicable", entries["p-live"]["applicability"])
+
+    def test_a_pending_proposal_on_an_old_revision_is_superseded(self) -> None:
+        """Not expired by a clock: this one is the oldest and the judgement
+        has nothing to do with its age."""
+        self.as_caller(caller())
+        entries = {e["proposalId"]: e for e in self.tool()()["proposals"]}
+        self.assertEqual("superseded", entries["p-dead"]["applicability"])
+
+    def test_age_does_not_decide_it(self) -> None:
+        """The oldest proposal in the queue is applicable and a newer one is
+        superseded. A rule keyed on the clock would get both wrong, which is
+        the whole argument against expiring proposals on a timer."""
+        self.as_caller(caller())
+        entries = {e["proposalId"]: e for e in self.tool()()["proposals"]}
+        self.assertLess(entries["p-ancient"]["created"],
+                        entries["p-dead"]["created"])
+        self.assertEqual("applicable", entries["p-ancient"]["applicability"])
+        self.assertEqual("superseded", entries["p-dead"]["applicability"])
+
+    def test_a_proposal_that_is_not_pending_is_not_judged(self) -> None:
+        """Applicability is a question about the queue. An applied proposal
+        already happened and a declined one never will."""
+        self.as_caller(caller())
+        entries = {e["proposalId"]: e for e in self.tool()()["proposals"]}
+        self.assertNotIn("applicability", entries["p-done"])
+
+    def test_the_counts_say_how_much_of_the_queue_is_live(self) -> None:
+        """The number that matters: this instance reported 19 pending and 3
+        that could be applied."""
+        self.as_caller(caller())
+        detail = self.tool()()
+        self.assertEqual(2, detail["pendingApplicable"])
+        self.assertEqual(1, detail["pendingSuperseded"])
+        self.assertEqual("current-rev", detail["revision"])
+
+    def test_an_unknown_current_revision_is_not_a_judgement(self) -> None:
+        """The platform reports the revision best-effort, because listing
+        proposals must not fail when the workspace is unreadable. Absent means
+        "could not say", which is not the same as "does not match"."""
+        payload = dict(QUEUE_WITH_REVISION)
+        payload.pop("revision")
+        self.as_caller(caller())
+        detail = self.tool(payload=payload)()
+        for entry in detail["proposals"]:
+            self.assertNotIn("applicability", entry)
+        self.assertEqual(0, detail["pendingSuperseded"])
+
+    def test_showing_one_proposal_judges_it_too(self) -> None:
+        self.as_caller(caller())
+        detail = self.build_named(
+            "proposals_show",
+            config_api=FakeConfigApi(answer={
+                "revision": "current-rev",
+                "proposal": {"id": "p-live", "status": "pending",
+                             "originalRevision": "long-gone", "diff": []},
+            }))(proposal_id="p-live")
+        self.assertEqual("superseded", detail["applicability"])
+        self.assertEqual("current-rev", detail["currentRevision"])
+        self.assertEqual("long-gone", detail["originalRevision"])
 
 
 class MetaEnvelopeTests(unittest.TestCase):

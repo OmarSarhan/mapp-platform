@@ -965,6 +965,51 @@ class DeclaredPaginationLimitTests(unittest.TestCase):
                     )
 
 
+class ProposalRevisionReportingTests(unittest.TestCase):
+    """The queue reports what its entries can be measured against.
+
+    A proposal is applied only while the workspace is still on the revision it
+    was cut from. Each entry already carried `originalRevision`; nothing
+    carried the current one, so a caller could see that a proposal was pending
+    and not whether pending meant anything. On the dev instance that was 16 of
+    19 entries.
+    """
+
+    @staticmethod
+    def handler(path):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = path
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "admin"
+        handler._json = lambda status, body: responses.append((status, body))
+        return handler, responses
+
+    def test_the_list_reports_the_current_revision(self):
+        handler, responses = self.handler("/api/proposals")
+
+        with patch.object(app, "read_workspace",
+                          lambda *a, **k: ({}, {}, "rev-current")):
+            handler.do_GET()
+
+        self.assertEqual("rev-current", responses[-1][1]["revision"])
+
+    def test_an_unreadable_workspace_does_not_stop_the_listing(self):
+        """Exactly when somebody wants to see what is queued."""
+        handler, responses = self.handler("/api/proposals")
+
+        def explode(*a, **k):
+            raise OSError("no workspace")
+
+        with patch.object(app, "read_workspace", explode):
+            handler.do_GET()
+
+        status, body = responses[-1]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertIn("proposals", body)
+        self.assertNotIn("revision", body)
+
+
 class AbsentHoverTests(unittest.TestCase):
     """An omitted `hover` must stay omitted.
 

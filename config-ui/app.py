@@ -389,6 +389,18 @@ def redact_actor_credentials(value):
     return value
 
 
+def _current_revision_or_none():
+    """The workspace revision, or None when it cannot be read.
+
+    Reading a proposal must not fail because the workspace is unreadable; that
+    is precisely when somebody wants to see what is queued.
+    """
+    try:
+        return read_workspace()[2]
+    except (OSError, ValueError):
+        return None
+
+
 def _operations_by_route(schemas):
     routes: dict[tuple[str, str], tuple[str, ...]] = {}
     for name, schema in schemas.items():
@@ -7880,6 +7892,25 @@ class Handler(SimpleHTTPRequestHandler):
                     payload,
                     paginated=bool(query),
                 )
+                # The revision the workspace is on now, alongside the
+                # revision each proposal was cut from. A proposal can be
+                # applied only while those match --
+                # apply_proposal_and_reload refuses otherwise -- so
+                # without this a caller can see that a proposal is
+                # pending and cannot see whether pending means anything.
+                # Read here rather than fetched separately, so both
+                # revisions come from one moment rather than two calls
+                # that can disagree.
+                #
+                # Best effort. Listing proposals must not start failing
+                # because the workspace is missing or unreadable -- that is
+                # exactly when somebody wants to see what is queued. Absent
+                # means "could not say", which a caller can distinguish from
+                # a revision that does not match.
+                try:
+                    payload["revision"] = read_workspace()[2]
+                except (OSError, ValueError):
+                    pass
                 self._json(HTTPStatus.OK, payload)
             except CollectionPaginationError as exc:
                 self._collection_pagination_error(exc)
@@ -7891,7 +7922,11 @@ class Handler(SimpleHTTPRequestHandler):
         elif path.startswith("/api/proposals/"):
             proposal_id = path.rsplit("/", 1)[1]
             try:
-                self._json(HTTPStatus.OK, {"proposal": proposal_read(CONTROL, proposal_id)})
+                self._json(HTTPStatus.OK, {
+                    "proposal": proposal_read(CONTROL, proposal_id),
+                    # As above, and best effort for the same reason.
+                    "revision": _current_revision_or_none(),
+                })
             except FileNotFoundError:
                 # Named rather than `str(exc)`: the exception comes from the
                 # filesystem, so its text is "[Errno 2] ... '/control/proposals/

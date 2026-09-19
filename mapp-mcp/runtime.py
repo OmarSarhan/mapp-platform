@@ -462,13 +462,41 @@ def _alias_detail(alias):
     return detail
 
 
+def _applicability(proposal, revision):
+    """Whether a pending proposal can still be applied.
+
+    Derived, never stored. A proposal is applied only while the workspace is
+    on the revision it was cut from -- `apply_proposal_and_reload` refuses
+    otherwise -- so this restates a rule the platform already enforces instead
+    of inventing a second one that could disagree with it.
+
+    Not a clock. A proposal does not rot with age: one cut two months ago
+    against the current revision applies cleanly, and one cut five minutes ago
+    against a superseded revision does not. On this instance 16 of 19 pending
+    proposals were already in the second state, reported as `pending`, which
+    was true of their status and false of what it implied.
+
+    `None` when the current revision is unknown, which is different from
+    knowing the two differ.
+    """
+    if proposal.get("status") != "pending":
+        return None
+    if not revision or not proposal.get("originalRevision"):
+        return None
+    return "applicable" if proposal["originalRevision"] == revision else "superseded"
+
+
 def _proposal_summary(proposal):
     """One queue entry: what changed, when, and whether it landed.
 
     The explanation is why a proposal exists and is the only field a person
-    reads first, so it survives; `candidateHash`, `originalRevision` and the
-    plugin fingerprint are integrity material that answer nothing an agent can
-    act on. `actor` is not dropped here -- the configuration API withholds
+    reads first, so it survives. `candidateHash` and the plugin fingerprint are
+    integrity material that answer nothing an agent can act on.
+
+    `originalRevision` was dropped here on that same reasoning and has been put
+    back, because the reasoning was wrong: it is the field that separates a
+    proposal which can still be applied from one that cannot, and without it a
+    caller reading the queue has no way to tell. `actor` is not dropped here -- the configuration API withholds
     credential identifiers from an exchanged credential before this sees them,
     which is where that decision belongs.
     """
@@ -478,6 +506,7 @@ def _proposal_summary(proposal):
         "proposalId": proposal.get("id"),
         "status": proposal.get("status"),
         "created": proposal.get("created"),
+        "originalRevision": proposal.get("originalRevision"),
         "explanation": (explanation[:200] + "…")
         if isinstance(explanation, str) and len(explanation) > 200
         else explanation,
@@ -1189,14 +1218,30 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             path=PROPOSALS_LIST["path_template"],
             query=limit_query(limit=limit),
         )
+        revision = payload.get("revision")
         proposals = payload.get("proposals")
-        entries = [
-            _proposal_summary(proposal)
-            for proposal in (proposals if isinstance(proposals, list) else [])
-        ]
+        entries = []
+        for proposal in (proposals if isinstance(proposals, list) else []):
+            proposal = proposal if isinstance(proposal, dict) else {}
+            entry = _proposal_summary(proposal)
+            applicable = _applicability(proposal, revision)
+            if applicable is not None:
+                entry["applicability"] = applicable
+            entries.append(entry)
         if status is not None:
             entries = [entry for entry in entries if entry["status"] == status]
-        return {"proposals": entries}
+        return {
+            "revision": revision,
+            "proposals": entries,
+            # Counted here because the difference is the point: this instance
+            # reported 19 pending, of which 3 could actually be applied.
+            "pendingApplicable": sum(
+                1 for e in entries if e.get("applicability") == "applicable"
+            ),
+            "pendingSuperseded": sum(
+                1 for e in entries if e.get("applicability") == "superseded"
+            ),
+        }
 
     @tool(
         operation=PROPOSALS_PREVIEW_PLAN,
@@ -1618,7 +1663,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         # The list truncates the explanation at 200 characters because a queue
         # is scanned; this is the read where the whole reason is the point.
         detail["explanation"] = proposal.get("explanation")
-        detail["originalRevision"] = proposal.get("originalRevision")
+        detail["currentRevision"] = payload.get("revision")
+        applicable = _applicability(proposal, payload.get("revision"))
+        if applicable is not None:
+            detail["applicability"] = applicable
         detail["operationCount"] = len(
             operations if isinstance(operations, list) else []
         )
