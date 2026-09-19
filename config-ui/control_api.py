@@ -1531,6 +1531,8 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "viewport": {
                     "type": "object",
+                # As applied by the screenshot path itself.
+                "default": {"width": 1080, "height": 1080},
                     "properties": {
                         "width": {
                             "type": "integer",
@@ -1545,7 +1547,11 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                     },
                     "additionalProperties": False,
                 },
-                "deviceScaleFactor": {"type": "number", "minimum": 1, "maximum": 3},
+                "deviceScaleFactor": {
+                "type": "number", "minimum": 1, "maximum": 3,
+                # What the handler applies when the caller says nothing.
+                "default": 1,
+            },
                 "panel": {
                     "type": "string",
                     "enum": ["filtering", "styling"],

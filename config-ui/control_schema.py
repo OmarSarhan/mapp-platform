@@ -487,6 +487,9 @@ def _migration_4(connection: psycopg.Connection) -> None:
 TABLES_IN_DELETE_ORDER = (
     # References nothing, so it goes first and stays independent of the rest.
     "audit_event",
+    # Also references nothing by foreign key: an approval names its grant and
+    # client as text, because it must survive being read after either is gone.
+    "approvals",
     "oauth_refresh_tokens",
     "oauth_refresh_families",
     "oauth_authorization_codes",
@@ -529,6 +532,10 @@ EPOCH_REVOKED_TABLES = (
     # revoking it kills every token in it, and the tokens are worth keeping
     # as replay evidence rather than sweeping.
     "oauth_refresh_families",
+    # An approved receipt that has not been spent is authority, so a restore
+    # must reach it. Revoked rather than deleted, because the row also records
+    # what a person allowed and why.
+    "approvals",
 )
 
 #: Sessions, one-shot codes and in-flight authorizations. Nothing here is worth
@@ -825,6 +832,102 @@ def _rollback_8(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_9(connection: psycopg.Connection) -> None:
+    """A decision a person made about one request, and the receipt that spends it.
+
+    One table rather than two. The specification names an approval intent and a
+    receipt separately because a standing window can decide an intent without
+    prompting anybody, but both describe the same thing at different moments:
+    what was asked, who allowed it, and whether it has been spent. Splitting
+    them would put the execution digest in two places, and the digest is the
+    binding -- two copies of a binding is one chance for them to differ.
+
+    `request_digest` is what makes this a decision about *one request* rather
+    than a permission. It is the same canonical digest a token B is bound to,
+    so an approval cannot be carried to a different path, body or revision than
+    the one an operator saw.
+
+    `receipt_hash` holds the sha256 of a value returned once and never stored,
+    exactly as every other credential here is held. The row is the record; the
+    receipt is the secret that spends it.
+
+    One-shot, and enforced by the same idiom as the device grant above: the
+    conditional UPDATE ... RETURNING *is* the read, and a consumed row is kept
+    so that a replay is detectably a replay rather than a miss.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+        CREATE TABLE {schema}.approvals (
+            id_hash        text        PRIMARY KEY,
+            grant_id       text        NOT NULL,
+            client_id      text        NOT NULL,
+            instance       text        NOT NULL,
+            operation_id   text        NOT NULL,
+            tool           text        NOT NULL,
+            -- The canonical execution digest. What was approved, exactly.
+            request_digest text        NOT NULL,
+            risk           text        NOT NULL,
+            scopes         text[]      NOT NULL,
+            -- What the person was shown when they decided. Kept so an approval
+            -- can be audited against the thing that justified it rather than
+            -- against a reconstruction.
+            packet         jsonb       NOT NULL,
+            created_at     timestamptz NOT NULL,
+            expires_at     timestamptz NOT NULL,
+            status         text        NOT NULL
+                             CHECK (status IN
+                                    ('pending','approved','declined','consumed')),
+            decided_at     timestamptz,
+            -- The operator identity that decided, or the window that stood in
+            -- for one. Never the agent.
+            decided_by     text,
+            receipt_hash   text,
+            consumed_at    timestamptz,
+            -- A restore must invalidate an approval that was decided before
+            -- the snapshot and not yet spent, on the same basis as any other
+            -- credential. Revoked rather than deleted: the row is the record
+            -- of what an operator allowed, and losing that to a restore would
+            -- lose the audit along with the authority.
+            revoked_at     timestamptz,
+            revoked_reason text,
+            -- Defaulted by the function, not by zero: migration 5 rewrote the
+            -- earlier tables to stamp themselves, and a table created after it
+            -- has to do the same or a restore cannot invalidate what it holds.
+            recovery_epoch bigint      NOT NULL
+                             DEFAULT {schema}.current_recovery_epoch(),
+            CONSTRAINT approval_decided_at_matches_status
+                CHECK ((status IN ('approved','declined','consumed'))
+                       = (decided_at IS NOT NULL)),
+            CONSTRAINT approval_consumed_at_matches_status
+                CHECK ((status = 'consumed') = (consumed_at IS NOT NULL)),
+            -- An approved row must be spendable and a pending one must not be.
+            CONSTRAINT approval_receipt_matches_status
+                CHECK ((status IN ('approved','consumed'))
+                       = (receipt_hash IS NOT NULL))
+        );
+
+        -- The lookup the configuration API makes when a receipt arrives: by
+        -- the secret it was given, and only while the row can still be spent.
+        CREATE UNIQUE INDEX approval_receipt_idx
+            ON {schema}.approvals (receipt_hash)
+            WHERE receipt_hash IS NOT NULL;
+
+        -- Revoking a grant must reach every approval made under it.
+        CREATE INDEX approval_grant_idx ON {schema}.approvals (grant_id);
+        """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_9(connection: psycopg.Connection) -> None:
+    connection.execute(
+        sql.SQL("DROP TABLE IF EXISTS {schema}.approvals").format(
+            schema=sql.Identifier(SCHEMA)
+        )
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -834,6 +937,7 @@ MIGRATIONS = {
     6: _migration_6,
     7: _migration_7,
     8: _migration_8,
+    9: _migration_9,
 }
 
 
@@ -870,6 +974,9 @@ DESTRUCTIVE_ROLLBACKS = {
     8: "which control-listener operations each confidential client may ask"
        " for. After this rollback the listener authenticates its callers and"
        " then permits all of them everything, as it did before migration 8",
+    9: "every approval: the record of what an operator allowed, the digest"
+       " it was bound to, and whether it was spent. A restored snapshot"
+       " must not re-arm a receipt that was consumed after it was taken",
 }
 
 
@@ -1011,6 +1118,7 @@ ROLLBACKS = {
     6: _rollback_6,
     7: _rollback_7,
     8: _rollback_8,
+    9: _rollback_9,
 }
 
 

@@ -151,13 +151,20 @@ class ControlApiTests(ControlStoreTestCase):
             actions["proposals.check"]["inputSchema"]["required"],
         )
         self.assertEqual("apply", actions["proposals.apply"]["risk"])
+        # The `preview-` ids, which are the ones the CLI vocabulary names.
+        # `proposals.visual-test` and `proposals.screenshot` were separate
+        # action ids for these same two routes until Phase 1 wave 4, and a
+        # route claimed by two ids cannot be resolved for an exchanged
+        # credential at all -- the resolver refuses ambiguity rather than
+        # picking one. The operation kinds are unchanged, so what this asserts
+        # about the contract is the same thing it always asserted.
         self.assertEqual(
             "proposal.visual-test",
-            actions["proposals.visual-test"]["operationKind"],
+            actions["proposals.preview-test"]["operationKind"],
         )
         self.assertEqual(
             "proposal.screenshot",
-            actions["proposals.screenshot"]["operationKind"],
+            actions["proposals.preview-screenshot"]["operationKind"],
         )
         progress = contract("instance")["capabilities"]["operations"][
             "progress"
@@ -203,7 +210,12 @@ class ControlApiTests(ControlStoreTestCase):
             },
             provision_schema["properties"]["expectedObservationId"],
         )
-        screenshot_properties = actions["proposals.screenshot"]["inputSchema"][
+        # Same route as above, under the id the CLI vocabulary names. The
+        # defaults asserted below were declared only on the removed sibling
+        # until this was caught: deduplicating the two ids in Phase 1 wave 4
+        # dropped them, so the contract stopped documenting what the handler
+        # applies. They are back on the surviving entry.
+        screenshot_properties = actions["proposals.preview-screenshot"]["inputSchema"][
             "properties"
         ]
         self.assertEqual(2560, screenshot_properties["viewport"]["properties"][
@@ -350,8 +362,13 @@ class ControlApiTests(ControlStoreTestCase):
             "/api/derived-layers/plan",
             generic_plan["path"],
         )
+        # `derive:manage`, not `derive`, since Phase 1 wave 1. Planning a
+        # derived layer is part of the managed-relation lifecycle; `derive`
+        # now means reading aggregate values and nothing more, because it sits
+        # in the dashboard's default read-only preset and a scope offered for
+        # reading must not authorise a write.
         self.assertEqual(
-            ["derive", "semantic:inspect"],
+            ["derive:manage", "semantic:inspect"],
             generic_plan["requiredScopes"],
         )
         self.assertNotIn(
@@ -473,12 +490,13 @@ class ControlApiTests(ControlStoreTestCase):
                 {"type": "boolean"},
                 action["inputSchema"]["properties"]["background"],
             )
+        # The lifecycle scope since Phase 1 wave 1; see the note above.
         self.assertEqual(
-            ["derive", "semantic:inspect"],
+            ["derive:manage", "semantic:inspect"],
             actions["derived-layers.create"]["requiredScopes"],
         )
         self.assertEqual(
-            ["derive", "semantic:inspect"],
+            ["derive:manage", "semantic:inspect"],
             actions["derived-layers.replace"]["requiredScopes"],
         )
         statistics = actions["layers.statistics"]
@@ -486,6 +504,9 @@ class ControlApiTests(ControlStoreTestCase):
             "/api/layers/{layerKey}/statistics",
             statistics["pathTemplate"],
         )
+        # A read, so it keeps plain `derive`. This is the half of the wave 1
+        # split that had to stay put: reading aggregate values is what `derive`
+        # means now, and only the lifecycle moved.
         self.assertEqual(
             ["derive", "semantic:inspect"],
             statistics["requiredScopes"],
@@ -504,7 +525,7 @@ class ControlApiTests(ControlStoreTestCase):
             recipe["path"],
         )
         self.assertEqual(
-            ["derive", "semantic:inspect"],
+            ["derive:manage", "semantic:inspect"],
             recipe["requiredScopes"],
         )
         self.assertEqual(
@@ -548,7 +569,10 @@ class ControlApiTests(ControlStoreTestCase):
             },
         )
         self.assertEqual("meta", payload["responseEnvelope"]["metadataField"])
-        for action_id in ("visual.plan", "visual.test", "visual.screenshot"):
+        # `visual.screenshot` was a byte-identical duplicate of `visual.test`
+        # on the same route, removed in Phase 1 wave 4 because a route claimed
+        # by two ids cannot be resolved for an exchanged credential at all.
+        for action_id in ("visual.plan", "visual.test"):
             self.assertIn(
                 "expectedInfoPanelText",
                 actions[action_id]["inputSchema"]["properties"],
