@@ -2373,6 +2373,41 @@ class ProposalCreateTests(ToolTestCase):
         self.assertEqual("sp-9", detail["proposalId"])
         self.assertEqual({"exists": False}, detail["changes"][0]["was"])
 
+    def test_a_fingerprint_mismatch_explains_the_asymmetry(self) -> None:
+        """Measured on the deployed stack: a semantic create is refused when
+        the explanation differs from the one its check was given, while the
+        workspace create accepts it. The platform's message names neither the
+        cause nor the difference, so the tool does."""
+        class Refusing:
+            def post(self, **kwargs):
+                raise ConfigApiRefused(
+                    "Proposal fingerprint does not match the checked"
+                    " operation.",
+                    status=409, code="semantic.fingerprint_mismatch",
+                )
+        self.as_caller(caller(scopes=AUTHORING))
+        with self.assertRaises(ToolError) as raised:
+            self.build_named(
+                "semantic_proposals_create", config_api=Refusing())(
+                asset_id="a", base_version=1, operations=[], fingerprint="f")
+        message = str(raised.exception)
+        self.assertIn("same one", message)
+        self.assertIn("explanation", message)
+
+    def test_a_hint_is_only_added_for_the_code_it_names(self) -> None:
+        """A hint that fires on every refusal teaches the caller to skip the
+        end of the message."""
+        class Refusing:
+            def post(self, **kwargs):
+                raise ConfigApiRefused("Refused.", status=403,
+                                       code="auth.scope_required")
+        self.as_caller(caller(scopes=AUTHORING))
+        with self.assertRaises(ToolError) as raised:
+            self.build_named(
+                "semantic_proposals_create", config_api=Refusing())(
+                asset_id="a", base_version=1, operations=[], fingerprint="f")
+        self.assertNotIn("explanation", str(raised.exception))
+
     def test_unexpected_shapes_degrade_rather_than_raising(self) -> None:
         for payload in ({}, {"proposal": None}, {"proposal": {"diff": "x"}}):
             with self.subTest(payload=payload):

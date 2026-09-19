@@ -159,6 +159,20 @@ SEMANTIC_PROPOSALS_CREATE = {
     "method": "POST",
     "path_template": "/api/semantic/proposals",
     "scopes": ("semantic:propose",),
+    # The two fingerprints do not bind the same thing, and the platform's
+    # refusal does not say which. Measured: a semantic create is refused when
+    # the explanation differs from the one the check was given, while the
+    # workspace create accepts it. An agent that learns one rule is caught by
+    # the other, so the refusal explains itself.
+    "refusal_hints": {
+        "semantic.fingerprint_mismatch": (
+            "The semantic fingerprint covers the explanation as well as the"
+            " operations, so semantic_proposals_check and"
+            " semantic_proposals_create must be given the same one. The"
+            " workspace pair does not bind the explanation, which is why this"
+            " is easy to miss."
+        ),
+    },
 }
 
 PROPOSALS_CHECK = {
@@ -884,10 +898,12 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             # validation refusal these are the answer: the top-level message
             # says only that something is wrong, and the entry beneath names
             # the field and what the database said about it.
+            hint = (operation.get("refusal_hints") or {}).get(refusal.code)
             raise ToolError(
                 f"The platform refused this request: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
                 + _refusal_detail(refusal.errors)
+                + (f" {hint}" if hint else "")
             ) from None
         except ConfigApiUnavailable:
             raise ToolError(
