@@ -58,14 +58,21 @@ class ConfigApiClient:
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
 
+    #: Where an approval receipt travels. Its own header rather than the body,
+    #: because the body is digested and the receipt is bound to that digest --
+    #: putting it inside would make the request's identity depend on the
+    #: permission to make it. The name must match the configuration API's
+    #: APPROVAL_RECEIPT_HEADER; ReceiptHeaderTests compares the two.
+    APPROVAL_RECEIPT_HEADER = "X-MAPP-Approval-Receipt"
+
     def get(self, *, path: str, query: str, token: str,
-            timeout: float | None = None) -> Any:
+            timeout: float | None = None, receipt: str | None = None) -> Any:
         """Exactly the path and query the credential was bound to."""
         return self._send(path=path, query=query, token=token, method="GET",
-                          body=None, timeout=timeout)
+                          body=None, timeout=timeout, receipt=receipt)
 
     def post(self, *, path: str, query: str, token: str, body: Any,
-             timeout: float | None = None) -> Any:
+             timeout: float | None = None, receipt: str | None = None) -> Any:
         """The same, with the body the credential was bound to.
 
         The digest covers the body as a *parsed value*, canonicalised the same
@@ -76,10 +83,11 @@ class ConfigApiClient:
         disagree, and the disagreement surfaces as a refusal naming no cause.
         """
         return self._send(path=path, query=query, token=token, method="POST",
-                          body=body, timeout=timeout)
+                          body=body, timeout=timeout, receipt=receipt)
 
     def _send(self, *, path: str, query: str, token: str, method: str,
-              body: Any, timeout: float | None = None) -> Any:
+              body: Any, timeout: float | None = None,
+              receipt: str | None = None) -> Any:
         """`timeout` overrides the instance default for one call.
 
         The default is tuned for a read. A browser render is not a read: a
@@ -94,6 +102,8 @@ class ConfigApiClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
         }
+        if receipt is not None:
+            headers[self.APPROVAL_RECEIPT_HEADER] = receipt
         data = None
         if body is not None:
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")

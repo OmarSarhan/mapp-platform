@@ -116,25 +116,30 @@ class ExchangeClient:
 
     # -- the exchange ----------------------------------------------------
 
-    def exchange(
+    def request_digest(
         self,
         *,
-        subject_token: str,
         operation_id: str,
         method: str,
         path_template: str,
         path: str,
         query: str,
         body: Any,
-        scope: str,
     ) -> str:
-        """Mint a token B bound to exactly this request, or raise.
+        """The canonical digest of one request, as the platform will recompute it.
 
-        Every member the configuration API will recompute is supplied here, in
-        the same shapes: the raw path and query strings rather than anything
+        Extracted from `exchange` because an approval is bound to this value
+        and so is the credential that spends it. Two computations of the same
+        digest is one chance for them to differ, and the difference would
+        surface as a person approving a request whose receipt then buys
+        nothing -- a refusal naming no cause, at the most expensive possible
+        moment.
+
+        Every member the configuration API will recompute is supplied in the
+        same shapes: the raw path and query strings rather than anything
         reassembled, because those two are digested byte for byte.
         """
-        digest = execution_envelope.digest(
+        return execution_envelope.digest(
             instance=self.instance_id(),
             method=method,
             operation_id=operation_id,
@@ -149,6 +154,28 @@ class ExchangeClient:
             resolved_defaults=None,
             confirmation_fields=None,
             revision_binding=None,
+        )
+
+    def exchange(
+        self,
+        *,
+        subject_token: str,
+        operation_id: str,
+        method: str,
+        path_template: str,
+        path: str,
+        query: str,
+        body: Any,
+        scope: str,
+    ) -> str:
+        """Mint a token B bound to exactly this request, or raise."""
+        digest = self.request_digest(
+            operation_id=operation_id,
+            method=method,
+            path_template=path_template,
+            path=path,
+            query=query,
+            body=body,
         )
         context = json.dumps(
             {

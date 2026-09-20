@@ -24,9 +24,12 @@ check would find nothing to check with.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
+
+import anyio
 
 import era_guard
 from authentication import CURRENT_CALLER
@@ -43,6 +46,8 @@ from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel
+from pydantic import Field
 
 #: Advertised to clients as the server's identity. Not a version of the
 #: platform: it is the version of this protocol surface, and it moves when the
@@ -195,6 +200,106 @@ PROPOSALS_SHOW = {
     "path_template": "/api/proposals/{proposalId}",
     "scopes": ("inspect",),
 }
+
+#: Asking a person, and collecting the answer. Neither is a tool: an agent
+#: cannot request its own approval as an action the model chooses to take, and
+#: cannot claim a receipt on its own initiative. They are the two halves of
+#: `approval_gate`, which the tools that need permission call, so the only way
+#: to reach them is to be performing the operation they authorise.
+APPROVALS_CREATE = {
+    "operation_id": "approvals.create",
+    "method": "POST",
+    "path_template": "/api/approvals",
+    # The listing scope. Asking for permission is not exercising it, and a
+    # caller that can see a tool can ask to use it -- the gate is the receipt.
+    "scopes": ("inspect",),
+}
+
+APPROVALS_CLAIM = {
+    "operation_id": "approvals.claim",
+    "method": "POST",
+    "path_template": "/api/approvals/claim",
+    "scopes": ("inspect",),
+}
+
+APPROVALS_CONFIRM = {
+    "operation_id": "approvals.confirm",
+    "method": "POST",
+    "path_template": "/api/approvals/confirm",
+    "scopes": ("inspect",),
+}
+
+#: How long a tool call will wait for somebody to decide in a browser, and how
+#: often it asks. A call that waits forever is worse than one that refuses:
+#: the client shows it as running for the life of the session, and the person
+#: has no way to tell a slow decision from a broken server. Two minutes is
+#: long enough to read a diff and a screenshot; past that the request is still
+#: pending and the refusal says where to find it.
+APPROVAL_WAIT_SECONDS = 120
+APPROVAL_POLL_SECONDS = 2
+
+#: Said the same way wherever a person says no, so a declined approval reads
+#: as a decision rather than as a failure the agent should work around.
+_APPROVAL_DECLINED = (
+    "You declined this change, so nothing was done."
+)
+
+
+class _ApprovalConfirmation(BaseModel):
+    """What a form-mode client asks the person.
+
+    One boolean and nothing else. The elicitation spec admits only primitive
+    types, and more importantly the decision is yes or no: a free-text field
+    here would be a place for the model's framing to reach the person's
+    answer.
+    """
+
+    approve: bool = Field(
+        description="Approve this change? It cannot be undone automatically.",
+    )
+
+
+def _elicitation_modes(ctx) -> frozenset:
+    """Which elicitation modes this client declared, measured not assumed.
+
+    Measured against the three shipped clients on 2026-09-18: Codex CLI
+    0.155.0 declares `{form, url}`, Claude Code 2.1.276 declares `{}`, and
+    Gemini CLI 0.58.0 declares no elicitation at all.
+
+    An empty `elicitation` object means form. The capability predates the
+    mode split, when form was the only mode there was, so a client declaring
+    the bare object is declaring the original one -- reading it as "no modes"
+    would send the largest of the three clients down the dashboard path for
+    no reason.
+    """
+    capabilities = getattr(getattr(ctx, "session", None), "client_capabilities", None)
+    elicitation = getattr(capabilities, "elicitation", None)
+    if elicitation is None:
+        return frozenset()
+    modes = set()
+    if getattr(elicitation, "url", None) is not None:
+        modes.add("url")
+    if getattr(elicitation, "form", None) is not None:
+        modes.add("form")
+    return frozenset(modes or {"form"})
+
+
+def _approval_message(operation_id: str, packet: dict) -> str:
+    """What the person is asked, composed from the packet rather than freely.
+
+    The summary comes from the tool that built the packet, not from the model
+    reasoning about how to phrase a request for permission. An agent that
+    could write this string could write a persuasive one.
+    """
+    summary = (packet or {}).get("summary")
+    count = (packet or {}).get("changeCount")
+    detail = f" {summary}" if isinstance(summary, str) and summary else ""
+    scale = (
+        f" It changes {count} thing{'' if count == 1 else 's'}."
+        if isinstance(count, int) and count > 0
+        else ""
+    )
+    return f"MAPP wants to run {operation_id}.{detail}{scale}"
 
 SEMANTIC_PROPOSALS_LIST = {
     "operation_id": "semantic.proposals.list",
@@ -838,7 +943,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "runtime": f"{RUNTIME_NAME}/{RUNTIME_VERSION}",
         }
 
-    def spend(operation, *, path, query="", body=None):
+    def spend(operation, *, path, query="", body=None, receipt=None):
         """Obtain one request-bound credential and spend it. The whole path.
 
         Every tool that touches the platform goes through here, so the scope
@@ -905,12 +1010,13 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             deadline = operation.get("timeout")
             if operation["method"] == "GET":
                 return config_api.get(
-                    path=path, query=query, token=token_b, timeout=deadline
+                    path=path, query=query, token=token_b, timeout=deadline,
+                    receipt=receipt,
                 )
             # The same body object that was digested, not a rebuild of it.
             return config_api.post(
                 path=path, query=query, token=token_b, body=body,
-                timeout=deadline,
+                timeout=deadline, receipt=receipt,
             )
         except ConfigApiRefused as refusal:
             # Some operations answer a non-2xx with the result rather than an
@@ -938,6 +1044,182 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             raise ToolError(
                 "The configuration API is unavailable; try again."
             ) from None
+
+    async def approval_gate(
+        ctx, operation, *, path, query="", body=None, tool_name, packet,
+    ):
+        """Get a person's permission for one exact request, or refuse.
+
+        Returns a receipt the caller passes to `spend` for the *same* request.
+        The receipt is bound to the canonical digest of that request, so the
+        thing approved and the thing done cannot differ: a receipt minted for
+        one apply buys nothing against another.
+
+        The person answering is the person driving this session, not an
+        operator at a separate dashboard. Routing an agent's mutation through
+        a different surface makes the loop unusable in a chat, which is the
+        context this component exists for.
+
+        **The model cannot answer on its own behalf.** Nothing here is a tool,
+        so the model cannot invoke it; the prompt is rendered by the *client*
+        and answered by a person; and an `ElicitResult` is a transport message
+        the model has no way to fabricate, exactly as it cannot fabricate a
+        tool result it did not receive. A confirmation merely returned to the
+        agent and echoed back would satisfy none of that, and is the obvious
+        wrong design here.
+        """
+        caller = CURRENT_CALLER.get()
+        digest = exchange.request_digest(
+            operation_id=operation["operation_id"],
+            method=operation["method"],
+            path_template=operation["path_template"],
+            path=path,
+            query=query,
+            body=body,
+        )
+        created = spend(
+            APPROVALS_CREATE,
+            path=APPROVALS_CREATE["path_template"],
+            body={
+                "operationId": operation["operation_id"],
+                "requestDigest": digest,
+                "tool": tool_name,
+                "clientId": getattr(caller, "client_id", "") or "",
+                "packet": packet,
+            },
+        )
+        handle = created.get("handle")
+        approval_url = created.get("approvalUrl") or ""
+        if not handle:
+            raise ToolError(
+                "The platform accepted the approval request but named no"
+                " handle, so there is nothing to wait on."
+            )
+
+        message = _approval_message(operation["operation_id"], packet)
+        modes = _elicitation_modes(ctx)
+        if "url" in modes:
+            # The best version: the decision is made in a browser session the
+            # agent does not control, looking at the rendered evidence rather
+            # than at a summary the model composed.
+            outcome = await ctx.elicit_url(
+                message=message + " Open the approval page to see the change"
+                                  " and decide.",
+                url=approval_url,
+                elicitation_id=digest,
+            )
+            if outcome.action != "accept":
+                raise ToolError(_APPROVAL_DECLINED)
+            receipt = await _await_decision(ctx, handle, approval_url)
+            # Tells the client the out-of-band step is over, so it can stop
+            # showing the person a link to a page that no longer needs them.
+            with contextlib.suppress(Exception):
+                await ctx.session.send_elicit_complete(digest)
+            return receipt
+
+        if "form" in modes:
+            outcome = await ctx.elicit(message, _ApprovalConfirmation)
+            accepted = (
+                outcome.action == "accept"
+                and getattr(outcome.data, "approve", False) is True
+            )
+            # Recorded either way. A decline is a decision a person made and
+            # belongs in the audit trail; leaving the row pending would also
+            # leave it decidable by somebody else afterwards.
+            spend(
+                APPROVALS_CONFIRM,
+                path=APPROVALS_CONFIRM["path_template"],
+                body={"handle": handle, "accepted": accepted},
+            )
+            if not accepted:
+                raise ToolError(_APPROVAL_DECLINED)
+            return _claim(handle)
+
+        # Neither mode: the client cannot ask anybody anything, so the
+        # dashboard is the only surface left. Refused rather than left
+        # hanging, because a tool call that waits on a page nobody has been
+        # told to open is indistinguishable from one that is broken.
+        raise ToolError(
+            "This client cannot ask you to approve anything, so the decision"
+            f" has to be made in the dashboard: {approval_url}"
+            " Approve it there, then ask me to try again."
+        )
+
+    def _claim(handle):
+        """Collect the receipt a decision produced, once.
+
+        The platform mints it on the first claim and never again, so this is
+        called exactly once per decision and its result is not re-fetchable.
+        """
+        claimed = spend(
+            APPROVALS_CLAIM,
+            path=APPROVALS_CLAIM["path_template"],
+            body={"handle": handle},
+        )
+        status = claimed.get("status")
+        receipt = claimed.get("receipt")
+        if status == "declined":
+            raise ToolError(_APPROVAL_DECLINED)
+        if status == "expired":
+            raise ToolError(
+                "The approval request expired before it was decided. Ask me"
+                " to try again if you still want this change."
+            )
+        if not receipt:
+            raise ToolError(
+                "The approval was recorded but no receipt came back, so this"
+                " request cannot proceed. Ask me to try again."
+            )
+        return receipt
+
+    async def _await_decision(ctx, handle, approval_url):
+        """Poll until the person in the browser has decided.
+
+        Bounded, because a tool call that never returns is worse than one that
+        refuses: the client shows it as running for as long as the session
+        lives. On timeout the request is still pending and still decidable --
+        the person is told where, rather than told it failed.
+        """
+        deadline = APPROVAL_WAIT_SECONDS
+        while True:
+            # Asked before waiting, not after. Somebody who decided while the
+            # client was still rendering the prompt has already answered, and
+            # sleeping first would cost every such approval a poll interval
+            # for nothing.
+            claimed = spend(
+                APPROVALS_CLAIM,
+                path=APPROVALS_CLAIM["path_template"],
+                body={"handle": handle},
+            )
+            status = claimed.get("status")
+            if status != "pending":
+                if status == "declined":
+                    raise ToolError(_APPROVAL_DECLINED)
+                if status == "expired":
+                    raise ToolError(
+                        "The approval request expired before it was decided."
+                        " Ask me to try again if you still want this change."
+                    )
+                receipt = claimed.get("receipt")
+                if not receipt:
+                    # The platform mints a receipt once. A second claim of an
+                    # approved request answers without one, so this is what a
+                    # lost first answer looks like -- not a refusal, and not
+                    # something a retry of this call can recover.
+                    raise ToolError(
+                        "The approval was recorded but no receipt came back,"
+                        " so this request cannot proceed. Ask me to try again."
+                    )
+                return receipt
+            if deadline <= 0:
+                break
+            await anyio.sleep(min(APPROVAL_POLL_SECONDS, deadline))
+            deadline -= APPROVAL_POLL_SECONDS
+        raise ToolError(
+            "Nobody decided within the time this call can wait. The request"
+            f" is still waiting at {approval_url} -- approve it there, then"
+            " ask me to try again."
+        )
 
     @tool(
         operation=LAYERS_LIST,
@@ -2485,6 +2767,11 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     # Exposed so tests can derive what a given grant should see from the same
     # values the filter uses, rather than restating a list that drifts.
     server.tool_scopes = tool_scopes
+    # Exposed for the same reason and no other: the gate is deliberately not a
+    # tool -- nothing the model can invoke reaches it -- so a test has no way
+    # in through the tool surface. Wave 6's first mutating tool is what calls
+    # it in earnest; until then this is how its behaviour is pinned.
+    server.approval_gate = approval_gate
 
     return server
 

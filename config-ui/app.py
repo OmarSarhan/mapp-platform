@@ -102,6 +102,7 @@ from control_api import (
     pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
     reload_status, reload_timeout, request_reload, visual_hover_plan,
+    requires_approval,
     schema as contract_schema, select_locale, visual_plan,
     strict_json_loads, wait_reload, workspace_fingerprint, workspace_hash,
     workspace_map_extent,
@@ -295,6 +296,13 @@ SEMANTIC = (
 #: existing Bearer branch is what keeps token-B support out of the request
 #: routers entirely: a token B is a credential, not a route.
 TOKEN_B_PREFIX = "mapp_b_"
+
+#: Where an approval receipt travels. Its own header rather than the body,
+#: because the body is digested and the digest is what the approval is bound
+#: to -- carrying the receipt inside it would make the request's own identity
+#: depend on the permission to make it. Not a tool argument either: nothing
+#: approval-shaped is ever something the model composes.
+APPROVAL_RECEIPT_HEADER = "X-MAPP-Approval-Receipt"
 
 #: The audience this service accepts. It must equal the authorization
 #: component's MCP_CONFIG_API_RESOURCE, and the component refuses to start when
@@ -6535,6 +6543,18 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return False
         operation_id, path_template = resolved
+        receipt = self.headers.get(APPROVAL_RECEIPT_HEADER)
+        needs_approval = requires_approval(operation_id)
+        if needs_approval and not receipt:
+            # Checked before the credential is redeemed rather than after. The
+            # redemption is single-use for exactly these operations, so doing
+            # it the other way round would burn a token B over a missing
+            # header and make the caller re-exchange to retry.
+            self._json(HTTPStatus.FORBIDDEN, {
+                "error": "This operation requires an approved request.",
+                "code": "approval.required",
+            })
+            return False
         try:
             instance = CONTROL.instance_id()
         except RuntimeError as exc:
@@ -6593,6 +6613,27 @@ class Handler(SimpleHTTPRequestHandler):
                 "code": "auth.binding_refused",
             })
             return False
+        if needs_approval:
+            # Against the same digest, computed once above. The receipt is
+            # bound to the request a person saw described, so a receipt minted
+            # for one apply cannot be spent on another -- and the binding is
+            # in the UPDATE's predicate, so the read and the spend cannot
+            # disagree under concurrency.
+            if CONTROL.redeem_receipt(
+                receipt, request_digest=request_digest
+            ) is None:
+                CONTROL.audit(
+                    "approval.receipt_refused",
+                    actor=str(self._authentication.get("sub") or "unknown")
+                    if self._authentication else "unknown",
+                    remote=self._remote(),
+                    details={"operationId": operation_id},
+                )
+                self._json(HTTPStatus.FORBIDDEN, {
+                    "error": "No approval covers this request.",
+                    "code": "approval.receipt_invalid",
+                })
+                return False
         self._exchanged_token_redeemed = True
         return True
 
@@ -8768,6 +8809,7 @@ class Handler(SimpleHTTPRequestHandler):
             # given one. Deciding is not here: it is a parameterised path,
             # matched below, and operator-only.
             "/api/approvals", "/api/approvals/claim",
+            "/api/approvals/confirm",
             "/api/workspace", "/api/validate", "/api/expression-test", "/api/mutate",
             "/api/proposals", "/api/proposals/check", "/api/xyz/reload", "/api/visual-plan",
             "/api/visual-test",
@@ -10979,8 +11021,49 @@ class Handler(SimpleHTTPRequestHandler):
                     # Where a person goes to decide. An operator session is
                     # required there, which is the whole point: an approval
                     # names somebody the platform authenticated.
-                    "approvalUrl": f"{CONFIG_SITE}/#approvals",
+                    #
+                    # Deep-linked to this one request, because URL elicitation
+                    # sends the person straight here and a list would make them
+                    # find the row the agent means. The reference authorises
+                    # nothing on its own -- deciding still needs the session.
+                    "approvalUrl":
+                        f"{CONFIG_SITE}/#approvals/{created['reference']}",
                 })
+                return
+            if request_path == "/api/approvals/confirm":
+                # The decision, when it was made in an MCP client rather than
+                # at the dashboard. The handle is the proof of standing: it was
+                # returned once, to whoever created the request, so a caller
+                # confirming one is the caller that asked for it.
+                handle = payload.get("handle")
+                accepted = payload.get("accepted")
+                if not isinstance(handle, str) or not handle:
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "handle is required.",
+                        "code": "approval.handle_missing",
+                    })
+                    return
+                if not isinstance(accepted, bool):
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "accepted must be true or false.",
+                        "code": "approval.decision_invalid",
+                    })
+                    return
+                if not CONTROL.confirm_approval(
+                    handle,
+                    approved=accepted,
+                    # Named so the audit can tell the two assurances apart. An
+                    # operator read the dashboard; this person answered a
+                    # prompt their client rendered. Both are people, and they
+                    # are not the same evidence.
+                    decided_by=f"session:{actor}",
+                ):
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "This approval can no longer be decided.",
+                        "code": "approval.not_decidable",
+                    })
+                    return
+                self._json(HTTPStatus.OK, {"decided": accepted})
                 return
             if request_path == "/api/approvals/claim":
                 # The receipt, once and only once a person has approved. The

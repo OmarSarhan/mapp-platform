@@ -75,6 +75,72 @@ class ThreatModelClaimTests(unittest.TestCase):
                         f"{name} reaches the administrative surface {path}",
                     )
 
+    def test_the_two_approval_windows_are_what_the_document_says(self) -> None:
+        """Defends: "fifteen minutes to decide ... and five minutes to claim
+        and spend".
+
+        Two numbers in prose, describing two predicates in SQL. Prose is where
+        a reader learns how long an approval lives, so a change to either
+        constant that leaves the document alone teaches the wrong thing to
+        everybody who reads it instead of the code.
+        """
+        from control_plane import ControlStore
+
+        self.assertIn("fifteen minutes to decide", THREAT_MODEL)
+        self.assertIn("five minutes to claim and spend", THREAT_MODEL)
+        self.assertEqual(
+            15, ControlStore.APPROVAL_LIFETIME.total_seconds() / 60
+        )
+        self.assertEqual(
+            5, ControlStore.RECEIPT_LIFETIME.total_seconds() / 60
+        )
+        self.assertLess(
+            ControlStore.RECEIPT_LIFETIME,
+            ControlStore.APPROVAL_LIFETIME,
+            "the spend window must be the tighter of the two",
+        )
+
+    def test_every_apply_class_operation_requires_approval(self) -> None:
+        """Defends: "a grant with `apply` no longer authorises every apply for
+        its lifetime".
+
+        The claim is about the allowlist, not about one operation, so it is
+        checked across the allowlist. An operation that mutates a workspace and
+        does not require approval is the sentence becoming false.
+        """
+        from control_api import requires_approval
+
+        unguarded = sorted(
+            name for name, operation in operations.OPERATIONS.items()
+            if operation.mutating
+            and not requires_approval(name)
+            and ACTION_SCHEMAS[name]["risk"] not in {"propose", "visual"}
+        )
+        self.assertEqual(
+            [], unguarded,
+            "these mutate and ask nobody, and are not the deliberate"
+            " propose/visual exemptions",
+        )
+
+    def test_the_measured_client_capabilities_are_the_ones_recorded(
+        self,
+    ) -> None:
+        """Defends the capability table's three rows.
+
+        They were measured on one date against three versions. Nothing in the
+        code can re-measure them, so what is pinned is that the document still
+        names the date and the versions it claims to have measured -- a table
+        silently updated to a newer client is a measurement nobody made.
+        """
+        for claim in (
+            "2026-09-18",
+            "Codex CLI 0.155.0",
+            "Claude Code 2.1.276",
+            "Gemini CLI 0.58.0",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, THREAT_MODEL)
+
     #: The mutations an operator can currently grant, pinned so that adding
     #: one is a deliberate edit here and not a side effect of allowlisting.
     #: Each either writes a proposal record or attaches evidence to one; none

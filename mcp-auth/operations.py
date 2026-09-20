@@ -350,6 +350,19 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("inspect",),
         mutating=False,
     ),
+    "approvals.confirm": Operation(
+        operation_id="approvals.confirm",
+        method="POST",
+        path_template="/api/approvals/confirm",
+        required_scopes=("inspect",),
+        # Relays a decision a person made in their MCP client, for the clients
+        # that can elicit a form but cannot send anybody to a browser. Costs
+        # `inspect` because the authority is the person's, not the grant's --
+        # what the grant buys is the ability to *ask*. The platform cannot
+        # verify the elicitation any more than the broker can verify a request
+        # digest; see the threat model's division of trust.
+        mutating=False,
+    ),
     "proposals.check": Operation(
         operation_id="proposals.check",
         method="POST",

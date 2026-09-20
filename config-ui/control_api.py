@@ -1392,6 +1392,31 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "approvals.confirm": {
+        "method": "POST",
+        "path": "/api/approvals/confirm",
+        # The decision itself, made by the person driving an MCP session and
+        # relayed by the server that elicited it. `inspect` for the same
+        # reason `approvals.create` is: the grant buys the ability to ask, and
+        # the answer comes from a prompt the *client* rendered and a person
+        # answered. A model cannot fabricate an elicitation result any more
+        # than it can fabricate a tool result it did not receive.
+        #
+        # Recorded with a `session:` decider so the audit distinguishes it
+        # from an operator who looked at the dashboard. They are different
+        # assurances and should not read the same afterwards.
+        "risk": "inspect",
+        "scope": "inspect",
+        "inputSchema": {
+            "type": "object",
+            "required": ["handle", "accepted"],
+            "properties": {
+                "handle": {"type": "string", "minLength": 1},
+                "accepted": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
     "approvals.claim": {
         "method": "POST",
         "path": "/api/approvals/claim",
@@ -1878,6 +1903,48 @@ ACTION_SCHEMAS["derived-layers.plan"]["inputSchema"]["properties"].pop(
 ACTION_SCHEMAS["derived-layers.plan"]["inputSchema"]["properties"].pop(
     "planFingerprint"
 )
+
+
+#: Risk classes that do *not* need a person to have agreed before the effect
+#: happens. Everything else does.
+#:
+#: Stated as the exemption rather than the requirement, so the default for a
+#: risk class nobody has considered is to require approval. The inverse list
+#: would mean a new action class silently arrives unguarded, which is the one
+#: direction of this mistake that cannot be noticed by using the system.
+#:
+#: The three read classes are exempt because they change nothing. `propose`
+#: and `visual` are exempt deliberately and that is the substance of Phase 1
+#: waves 3 and 4: proposing adds to a review queue that a person already has
+#: to work through, and rendering evidence is what makes that queue reviewable.
+#: Requiring an approval to ask for approval would make the loop unusable and
+#: buy nothing, because the proposal applies nothing on its own.
+NO_APPROVAL_RISKS = frozenset({
+    "aggregate-data-read",
+    "inspect",
+    "read",
+    "propose",
+    "visual",
+    "database-plan",
+    "semantic-source",
+})
+
+
+def requires_approval(operation_id: str) -> bool:
+    """Whether this operation may only proceed behind a spent approval receipt.
+
+    Derived from the action's own risk class rather than declared a second
+    time. A separate flag would be a fourth place to keep in step with the
+    three that already exist, and the one most likely to be forgotten: the
+    failure is invisible until an agent applies something nobody agreed to.
+
+    An operation the platform does not define requires approval, because a
+    caller naming one is already outside the contract.
+    """
+    action = ACTION_SCHEMAS.get(operation_id)
+    if action is None:
+        return True
+    return action.get("risk") not in NO_APPROVAL_RISKS
 
 
 def contract(instance_id: str) -> dict[str, Any]:

@@ -176,10 +176,70 @@ Redirect URIs are matched exactly. No prefix or wildcard matching, ever: a prefi
 test would admit `<registered>.attacker.example/steal`, which is a working open
 redirect that delivers authorization codes.
 
-**Residual:** P8's approval receipts and the review-packet flow are Phase 1.
-Phase 0 has consent, not per-effect approval, so a grant with `apply` authorises
-any `apply` operation the allowlist permits for its lifetime — the *token* is
-request-bound, the *grant* is not.
+Phase 1 wave 5 adds per-effect approval on top of that, so a grant with `apply`
+no longer authorises every apply for its lifetime. The configuration API refuses
+an operation that requires approval unless the request also carries a receipt
+that spends against the same canonical digest the credential was bound to, and
+the requirement is derived from the action's own risk class rather than declared
+a fourth time. What "requires approval" means is stated as an exemption list, so
+a risk class nobody has classified requires approval rather than silently
+arriving unguarded.
+
+The receipt cannot reach the model. It is minted by the platform for the holder
+of a handle, returned inside the MCP server process, and put in a header by the
+HTTP client; no tool takes it as an argument and no tool result contains it. The
+person deciding never holds it either — they see a *reference*, which names the
+row and spends nothing — so there is no route by which a decision made in a
+browser travels back through the agent.
+
+**Three ways a person is asked, chosen by what the client declared at
+`initialize` rather than by preference.** Measured against the shipped clients
+on 2026-09-18: Codex CLI 0.155.0 declares `{form, url}`, Claude Code 2.1.276
+declares `{}`, Gemini CLI 0.58.0 declares none. URL mode is preferred wherever
+offered, because the decision is then made in a browser session the agent does
+not control, looking at the rendered evidence rather than at a summary. A client
+that can elicit neither is refused with the dashboard address rather than left
+waiting on a page nobody has been told to open.
+
+**The model cannot answer on its own behalf.** The prompt is rendered by the
+*client* and answered by a person; an `ElicitResult` is a transport message the
+model has no way to fabricate, exactly as it cannot fabricate a tool result it
+did not receive; and none of the three approval operations is a tool, so nothing
+the model can invoke reaches them. Two tests pin the last part — one reads the
+registered tools and their declared operations out of the source, and one asserts
+the gate operations are absent from the scope table the listing filter reads.
+The prompt text is composed from the packet the tool built, not by the model, so
+an agent cannot phrase its own request for permission persuasively.
+
+**Division of trust, stated because it cannot be verified away.** For form-mode
+clients the MCP server relays the person's answer to the platform through
+`approvals.confirm`, and the platform cannot verify that an elicitation
+happened any more than the broker can verify a request digest it never saw. A
+compromised MCP server could therefore approve its own requests. That is the
+same trust already placed in it to make the platform call at all, and it is
+bounded by the exchange living on the control listener only — an external holder
+of a token A cannot mint a token B, so this is not a route that opens to a
+network attacker. The audit distinguishes the two assurances: a dashboard
+decision records the operator, a relayed one records `session:<grant>`.
+
+**A receipt is not a standing authorisation.** The decision window and the spend
+window are separate and both bounded — fifteen minutes to decide, measured from
+the request, and five minutes to claim and spend, measured from `decided_at`
+rather than stored. Without the second bound an agent could hold an approved
+receipt and spend it at a moment the person was not expecting, which is the
+thing the mechanism exists to prevent. Revoking the grant reaches approved and
+unspent approvals in the same transaction.
+
+**Residual:** approval is a *confirmation* control, not a segregation-of-duties
+control. The person approving in an MCP session is the same person who asked for
+the change. It defends against an agent doing something the person did not
+intend; it does not defend against a person doing something they should not. That
+is the right trade for a single-operator system and is stated here rather than
+left to be inferred — P20 already records that separation of duty is not
+enforceable with one shared administrator identity.
+
+**Residual:** P8's time-boxed standing windows are still Phase 1 wave 8. Today
+every gated effect asks.
 
 ### Credential administration from a browser session
 
@@ -300,8 +360,15 @@ can currently express which action classes a standing window may cover. Phase 0
 prompts for consent per authorization request, which is the safe end of the
 trade-off and also the one most likely to train an operator to click through.
 
-Nothing here mitigates it. Recorded so the Phase 1 design does not treat it as
-solved.
+Wave 5 makes this worse before wave 8 makes it better, and that is worth saying
+plainly: every gated effect now asks, so the number of prompts an operator sees
+goes up. What is done about it is small and deliberate — approving takes two
+clicks in the dashboard and names the operation, declining takes one, and a
+request that carries no packet says so rather than looking routine, because
+approving a bare operation name is how the habit forms. None of that is a
+control. P8's standing windows and their seven bounds remain the answer, and
+O19 still records that neither the capabilities response nor the manifest can
+express which action classes such a window may cover.
 
 ### Disclosure through a read grant
 
@@ -455,6 +522,9 @@ Stated plainly, because a threat model that implies otherwise is misleading:
   credential and all grant state are readable there.
 - **A compromised broker.** It can mint a token B for any allowlisted operation
   within a grant's scopes and fabricate the matching digest.
+- **A compromised MCP server.** It can relay a form-mode approval that nobody
+  gave, because the platform cannot see the elicitation. Bounded by the exchange
+  being reachable only on the control listener; see *Approval forgery*.
 - **A malicious operator.** P20 records that separation of duty is not
   enforceable with a single shared administrator identity, so it is not claimed.
 - **Traffic interception inside the deployment.** The control listener is plain

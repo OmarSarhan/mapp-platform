@@ -23,6 +23,7 @@ import json
 import sys
 import threading
 import unittest
+import re
 import unittest.mock
 import urllib.parse
 from http import HTTPStatus
@@ -78,13 +79,21 @@ class TokenBTestCase(unittest.TestCase):
         token="mapp_b_credential",
         tokens=None,
         resource=CONFIG_RESOURCE,
+        receipt="receipt-value",
+        receipt_spends=True,
     ):
+        """The default path is `proposals.apply`, which requires approval, so
+        the default carries a receipt that spends. Tests about the receipt
+        itself pass `receipt=None` or `receipt_spends=False`; everything else
+        is about the credential and should not have to care."""
         handler = object.__new__(app.Handler)
         handler.path = path
         handler.command = method
         handler.headers = HTTPMessage()
         if token is not None:
             handler.headers["Authorization"] = f"Bearer {token}"
+        if receipt is not None:
+            handler.headers[app.APPROVAL_RECEIPT_HEADER] = receipt
         handler.headers["Content-Length"] = str(len(body))
         handler.rfile = io.BytesIO(body)
         handler._remote = lambda: "127.0.0.1"
@@ -96,7 +105,22 @@ class TokenBTestCase(unittest.TestCase):
             (int(status), payload)
         )
         self.tokens = tokens if tokens is not None else StubTokens()
+        self.redeemed_receipts: list = []
+
+        def redeem_receipt(value, *, request_digest):
+            self.redeemed_receipts.append((value, request_digest))
+            return (
+                {"operation_id": "proposals.apply", "grant_id": GRANT,
+                 "client_id": "mcp-1", "decided_by": "admin",
+                 "request_digest": request_digest}
+                if receipt_spends else None
+            )
+
         self._patches = [
+            unittest.mock.patch.object(
+                app.CONTROL, "redeem_receipt", redeem_receipt
+            ),
+            unittest.mock.patch.object(app.CONTROL, "audit", lambda *a, **k: None),
             unittest.mock.patch.object(app, "MCP_TOKENS", self.tokens),
             unittest.mock.patch.object(app, "CONFIG_API_RESOURCE", resource),
             unittest.mock.patch.object(
@@ -346,6 +370,136 @@ class OrderingTests(TokenBTestCase):
         self.assertEqual(GRANT, handler._authorized(required_scope="apply"))
         self.assertEqual({"approved": True}, handler._payload())
         self.assertEqual({"approved": True}, handler._payload())
+
+
+class ApprovalReceiptTests(TokenBTestCase):
+    """A consequential operation needs a person to have agreed to it.
+
+    The credential proves an operator consented to the *grant*; the receipt
+    proves somebody agreed to *this request*. They are different consents and
+    the platform requires both, because a grant is issued once and a request
+    happens whenever the agent decides it should.
+    """
+
+    def test_an_apply_without_a_receipt_is_refused(self) -> None:
+        handler = self.build(receipt=None)
+        self.assertIsNone(handler._authorized(required_scope="apply"))
+        status, payload = self.responses[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("approval.required", payload["code"])
+
+    def test_a_missing_receipt_does_not_burn_the_credential(self) -> None:
+        """Checked before the credential is spent. The redemption is
+        single-use for exactly these operations, so refusing afterwards would
+        make a forgotten header cost an exchange."""
+        handler = self.build(receipt=None)
+        handler._authorized(required_scope="apply")
+        self.assertEqual([], self.tokens.redeemed)
+
+    def test_a_receipt_that_does_not_cover_the_request_is_refused(self) -> None:
+        handler = self.build(receipt_spends=False)
+        self.assertIsNone(handler._authorized(required_scope="apply"))
+        status, payload = self.responses[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("approval.receipt_invalid", payload["code"])
+
+    def test_the_receipt_is_spent_against_the_bound_digest(self) -> None:
+        """The same value the credential was bound to, so the thing approved
+        and the thing done cannot differ."""
+        handler = self.build()
+        handler._authorized(required_scope="apply")
+        self.assertEqual(1, len(self.redeemed_receipts))
+        value, digest = self.redeemed_receipts[0]
+        self.assertEqual("receipt-value", value)
+        self.assertEqual(self.tokens.redeemed[0][2], digest)
+
+    def test_a_read_needs_no_receipt(self) -> None:
+        """Requiring one everywhere would make every read need a person."""
+        handler = self.build(
+            method="GET", path="/api/layers", body=b"", receipt=None,
+            tokens=StubTokens(record={
+                "active": True, "scope": "inspect", "sub": GRANT,
+                "aud": CONFIG_RESOURCE, "client_id": "mcp-1",
+            }),
+        )
+        self.assertEqual(
+            GRANT,
+            handler._authorized(required_scope="inspect"),
+        )
+        self.assertEqual([], self.redeemed_receipts)
+
+    def test_proposing_needs_no_receipt(self) -> None:
+        """Deliberate, and the substance of waves 3 and 4: a proposal adds to
+        a review queue a person already works through and applies nothing."""
+        handler = self.build(
+            path="/api/proposals",
+            body=b'{"revision":"r1","operations":[]}',
+            receipt=None,
+            tokens=StubTokens(record={
+                "active": True, "scope": "propose", "sub": GRANT,
+                "aud": CONFIG_RESOURCE, "client_id": "mcp-1",
+            }),
+        )
+        self.assertEqual(
+            GRANT, handler._authorized(required_scope="propose")
+        )
+        self.assertEqual([], self.redeemed_receipts)
+
+    def test_the_requirement_is_derived_from_the_platforms_risk_class(
+        self,
+    ) -> None:
+        """Not a second list to keep in step with the three that exist. The
+        exemption is what is stated, so an action class nobody has considered
+        requires approval rather than silently arriving unguarded."""
+        import control_api
+
+        self.assertTrue(control_api.requires_approval("proposals.apply"))
+        self.assertTrue(control_api.requires_approval("semantic.proposals.apply"))
+        self.assertTrue(control_api.requires_approval("derived-layers.refresh"))
+        self.assertFalse(control_api.requires_approval("proposals.create"))
+        self.assertFalse(control_api.requires_approval("layers.list"))
+        self.assertTrue(
+            control_api.requires_approval("nothing.the.platform.defines"),
+            "an unknown operation must not be exempt",
+        )
+
+    def test_every_action_the_platform_defines_is_classified(self) -> None:
+        """A risk class arriving without a decision about it should show up
+        here rather than as an unguarded mutation."""
+        import control_api
+
+        classified = control_api.NO_APPROVAL_RISKS
+        unknown = {
+            action["risk"] for action in control_api.ACTION_SCHEMAS.values()
+        } - classified
+        self.assertTrue(
+            unknown,
+            "if nothing requires approval this test is measuring nothing",
+        )
+        for risk in unknown:
+            with self.subTest(risk=risk):
+                self.assertNotIn(risk, classified)
+
+
+class ReceiptHeaderTests(unittest.TestCase):
+    """The two ends must name the header identically.
+
+    One is in this repository's configuration API and the other in its MCP
+    server, in different modules that never import each other. A rename on one
+    side would make every approval refuse with `approval.required`, which
+    reads exactly like nobody having approved anything.
+    """
+
+    def test_the_client_and_the_platform_agree(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "mapp-mcp" / "config_api_client.py"
+        ).read_text(encoding="utf-8")
+        declared = re.search(
+            r'APPROVAL_RECEIPT_HEADER = "([^"]+)"', source
+        )
+        self.assertIsNotNone(declared, "the client declares no receipt header")
+        self.assertEqual(app.APPROVAL_RECEIPT_HEADER, declared.group(1))
 
 
 class RouteGateAlignmentTests(unittest.TestCase):

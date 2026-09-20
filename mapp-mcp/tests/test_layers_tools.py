@@ -2082,6 +2082,13 @@ class ToolVisibilityTests(ToolTestCase):
         source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
         mismatched = []
         for block in re.split(r"\n    @tool\(", source)[1:]:
+            # Cut the block at the tool's own function, so a helper defined
+            # between two registrations is not read as part of the earlier
+            # one. Without this the gate's `spend(APPROVALS_CREATE, ...)` was
+            # attributed to describe_instance, which spends nothing.
+            siblings = list(re.finditer(r"\n    (?:async )?def ", block))
+            if len(siblings) > 1:
+                block = block[: siblings[1].start()]
             name = re.search(r'name="([a-z_]+)"', block)
             declared = re.search(r"operation=([A-Za-z_]+)", block)
             spent = re.search(r"spend\(\s*([A-Z_]+)[,)]", block)

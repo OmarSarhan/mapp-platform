@@ -1246,6 +1246,18 @@ class ControlStore:
     #: that has since changed is not a decision about this request.
     APPROVAL_LIFETIME = dt.timedelta(minutes=15)
 
+    #: How long a decision stays spendable, measured from when it was made.
+    #:
+    #: Separate from APPROVAL_LIFETIME, and derived from `decided_at` rather
+    #: than stored, so a person who takes fourteen minutes to decide does not
+    #: leave the agent one minute to act. Without it a receipt is a standing
+    #: authorisation: an agent could hold an approved one and spend it at a
+    #: moment the person is not expecting, which is precisely the thing this
+    #: mechanism exists to prevent. The agent polls for the decision, so it
+    #: claims and spends within seconds of one being made; five minutes is
+    #: slack, not a working window.
+    RECEIPT_LIFETIME = dt.timedelta(minutes=5)
+
     def create_approval(
         self,
         *,
@@ -1328,6 +1340,19 @@ class ControlStore:
         detail["expired"] = detail["expires_at"] <= now()
         return detail
 
+    def confirm_approval(
+        self, handle: str, *, approved: bool, decided_by: str
+    ) -> bool:
+        """The same decision, named by the handle its requester holds.
+
+        The hashing stays here for the reason `read_approval` keeps it here:
+        a caller that has to hash before calling is a caller that can hash
+        differently, and the reference is what every predicate matches on.
+        """
+        return self.decide_approval(
+            token_hash(handle), approved=approved, decided_by=decided_by
+        )
+
     def decide_approval(
         self, reference: str, *, approved: bool, decided_by: str
     ) -> bool:
@@ -1405,8 +1430,10 @@ class ControlStore:
                 "UPDATE control.approvals"
                 "   SET receipt_hash = %s"
                 " WHERE id_hash = %s AND status = 'approved'"
-                "   AND receipt_hash IS NULL AND revoked_at IS NULL",
-                (token_hash(receipt), token_hash(handle)),
+                "   AND receipt_hash IS NULL AND revoked_at IS NULL"
+                "   AND decided_at > %s",
+                (token_hash(receipt), token_hash(handle),
+                 now() - self.RECEIPT_LIFETIME),
             )
         return receipt if row.rowcount else None
 
@@ -1430,9 +1457,11 @@ class ControlStore:
                 "   SET status = 'consumed', consumed_at = %s"
                 " WHERE receipt_hash = %s AND status = 'approved'"
                 "   AND request_digest = %s AND revoked_at IS NULL"
+                "   AND decided_at > %s"
                 " RETURNING operation_id, grant_id, client_id, decided_by,"
                 "           request_digest",
-                (now(), token_hash(receipt), request_digest),
+                (now(), token_hash(receipt), request_digest,
+                 now() - self.RECEIPT_LIFETIME),
             ).fetchone()
         if row is None:
             return None

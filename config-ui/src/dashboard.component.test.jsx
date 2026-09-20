@@ -17,6 +17,7 @@ import {
   MCP_SCOPE_OPTIONS,
   Approvals,
   ApprovalDetail,
+  referencedApproval,
   McpGrants,
   Security,
   TOKEN_ACCESS_PRESETS,
@@ -2435,6 +2436,30 @@ describe('Agent approvals', () => {
     const bare = {...WAITING, packet: {}};
     render(<ApprovalDetail approval={bare} busy={false} decide={vi.fn()}/>);
     expect(screen.getByText(/deciding on less than you should be/)).toBeTruthy();
+  });
+
+  test('a link opens the request it names', () => {
+    // URL elicitation sends the person straight here. Landing on the list and
+    // making them find the row the agent means defeats the point of the mode.
+    render(<Approvals approvals={[WAITING]} busy={false} decide={vi.fn()}
+                      reload={vi.fn()} hash={`#approvals/${'a'.repeat(64)}`}/>);
+    expect(screen.getByRole('heading', {name: 'proposals.apply'})).toBeTruthy();
+  });
+
+  test('a link to something else selects nothing', () => {
+    render(<Approvals approvals={[WAITING]} busy={false} decide={vi.fn()}
+                      reload={vi.fn()} hash="#approvals"/>);
+    expect(screen.queryByRole('heading', {name: 'proposals.apply'})).toBeNull();
+    expect(screen.getByText(/Choose a request/)).toBeTruthy();
+  });
+
+  test('only a well-formed reference is read out of the fragment', () => {
+    expect(referencedApproval(`#approvals/${'a'.repeat(64)}`)).toBe('a'.repeat(64));
+    expect(referencedApproval('#approvals/short')).toBeNull();
+    expect(referencedApproval('#approvals/' + 'A'.repeat(64))).toBeNull();
+    expect(referencedApproval('#other/' + 'a'.repeat(64))).toBeNull();
+    expect(referencedApproval('')).toBeNull();
+    expect(referencedApproval(undefined)).toBeNull();
   });
 
   test('an empty queue offers to look again', () => {

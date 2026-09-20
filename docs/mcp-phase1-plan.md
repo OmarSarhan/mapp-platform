@@ -202,6 +202,39 @@ person did not intend; it does not defend against a person doing something they
 should not. That is the right trade for this system and should be stated in the
 threat model rather than left to be inferred.
 
+**Built.** What landed, and the two places it differs from the plan above:
+
+- The requirement is **derived from the action's own risk class**, not declared
+  a fourth time. `control_api.requires_approval` states the *exemption* set, so
+  a risk class nobody has classified requires approval rather than arriving
+  unguarded. Four allowlisted operations require one today: `proposals.apply`,
+  `semantic.proposals.apply`, `derived-layers.refresh` and
+  `federation.aliases.observe`.
+- Enforcement is at `_redeem_exchanged_token`, the one boundary every exchanged
+  credential already passes, against the digest computed there. A missing
+  receipt is refused *before* the credential is spent, so a forgotten header
+  does not also cost an exchange.
+- Form mode needed a fourth approvals operation the plan did not name.
+  `approvals.confirm` relays a decision a person made in their MCP client,
+  because the dashboard decide route requires an operator session an MCP caller
+  does not have. It records `session:<grant>` as the decider so the audit can
+  tell the two assurances apart. The platform cannot verify the elicitation;
+  that division of trust is in the threat model.
+- The receipt is bounded twice, not once. `RECEIPT_LIFETIME` is derived from
+  `decided_at` rather than stored, so somebody who takes fourteen minutes to
+  decide does not leave the agent one minute to act — and an approved receipt
+  is not a standing authorisation.
+
+**Not demonstrated end to end, and this is the honest gap.** Wave 5 builds the
+gate; no tool calls it yet, because the tools that need it are wave 6. The gate
+is exercised directly by 28 tests and the enforcement by the configuration API's
+own suite, but "a real client drove a real approval to a real effect" is wave
+6's first acceptance run, not this one. A guard is in place for that join:
+`GatedToolTests` fails if a tool spends an operation that requires approval
+without going through `approval_gate`, which is vacuous today and deliberate —
+the plan calls wave 6 "mostly the join", and a join is what gets made in one
+place and forgotten in the second.
+
 ## Wave 6 — apply
 
 **Build:** `proposals_apply` and `semantic_proposals_apply` behind a receipt,

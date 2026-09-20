@@ -177,6 +177,106 @@ class ApprovalTests(ControlStoreTestCase):
                                                decided_by="admin"))
         self.assertTrue(store.read_approval(handle)["expired"])
 
+    def age_decision(self, store, seconds):
+        """Push the decision back in time, leaving everything else alone."""
+        with store._db() as connection:
+            connection.execute(
+                "UPDATE control.approvals SET decided_at = %s",
+                (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=seconds),),
+            )
+
+    def test_a_stale_decision_mints_nothing(self) -> None:
+        """Without this a receipt is a standing authorisation: an agent could
+        hold an approved one and spend it at a moment the person is not
+        expecting, which is the thing the mechanism exists to prevent."""
+        store = self.store()
+        created = self.request(store)
+        store.decide_approval(created["reference"], approved=True,
+                              decided_by="admin")
+        self.age_decision(
+            store, store.RECEIPT_LIFETIME.total_seconds() + 1
+        )
+        self.assertIsNone(store.claim_receipt(created["handle"]))
+
+    def test_a_receipt_claimed_in_time_cannot_be_held(self) -> None:
+        """The bound is on the spend as well as the claim. Claiming early and
+        spending late would otherwise buy back the standing authorisation."""
+        store = self.store()
+        created = self.request(store)
+        store.decide_approval(created["reference"], approved=True,
+                              decided_by="admin")
+        receipt = store.claim_receipt(created["handle"])
+        self.assertIsNotNone(receipt)
+        self.age_decision(
+            store, store.RECEIPT_LIFETIME.total_seconds() + 1
+        )
+        self.assertIsNone(store.redeem_receipt(receipt, request_digest=DIGEST))
+
+    def test_the_spend_window_runs_from_the_decision_not_the_request(
+        self,
+    ) -> None:
+        """Measured from `decided_at`, so somebody who takes fourteen minutes
+        to decide does not leave the agent one minute to act."""
+        store = self.store()
+        created = self.request(store)
+        with store._db() as connection:
+            connection.execute(
+                "UPDATE control.approvals SET created_at = %s",
+                (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=14),),
+            )
+        store.decide_approval(created["reference"], approved=True,
+                              decided_by="admin")
+        receipt = store.claim_receipt(created["handle"])
+        self.assertIsNotNone(receipt)
+        self.assertIsNotNone(
+            store.redeem_receipt(receipt, request_digest=DIGEST)
+        )
+
+    def test_confirming_by_handle_decides_the_same_row(self) -> None:
+        """The MCP path names the row by the handle its requester holds; the
+        dashboard names it by the reference. One row, two names."""
+        store = self.store()
+        created = self.request(store)
+        self.assertTrue(store.confirm_approval(
+            created["handle"], approved=True, decided_by="session:oauth:g",
+        ))
+        record = store.read_approval(created["handle"])
+        self.assertEqual("approved", record["status"])
+        self.assertEqual("session:oauth:g", record["decided_by"])
+
+    def test_a_session_decision_is_distinguishable_from_an_operators(
+        self,
+    ) -> None:
+        """Different assurances: an operator read the dashboard, this person
+        answered a prompt their client rendered. They must not read the same
+        afterwards."""
+        store = self.store()
+        confirmed = self.request(store)
+        store.confirm_approval(confirmed["handle"], approved=True,
+                               decided_by="session:oauth:g")
+        decided = self.request(store, request_digest=OTHER_DIGEST)
+        store.decide_approval(decided["reference"], approved=True,
+                              decided_by="admin")
+        self.assertTrue(
+            store.read_approval(confirmed["handle"])["decided_by"]
+            .startswith("session:")
+        )
+        self.assertEqual(
+            "admin", store.read_approval(decided["handle"])["decided_by"]
+        )
+
+    def test_a_confirmed_decline_cannot_be_reversed_by_the_dashboard(
+        self,
+    ) -> None:
+        store = self.store()
+        created = self.request(store)
+        store.confirm_approval(created["handle"], approved=False,
+                               decided_by="session:oauth:g")
+        self.assertFalse(store.decide_approval(
+            created["reference"], approved=True, decided_by="admin",
+        ))
+        self.assertIsNone(store.claim_receipt(created["handle"]))
+
     def test_revoking_the_grant_kills_an_unspent_receipt(self) -> None:
         """The case that matters: a receipt outlives the decision that
         produced it for as long as nobody spends it."""

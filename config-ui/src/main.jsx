@@ -644,8 +644,22 @@ export function ApprovalDetail({approval,busy,decide}){
  </div>;
 }
 
-export function Approvals({approvals,busy,decide,reload}){
- const [selected,setSelected]=useState(null);
+//: The fragment an approvalUrl carries, so URL elicitation opens the request
+//: the agent is waiting on rather than the list. Read once per render from
+//: location rather than held in state: arriving at the page and clicking a
+//: second link should both select, and a stale copy would make the second do
+//: nothing.
+export function referencedApproval(hash){
+ const match=/^#approvals\/([0-9a-f]{64})$/.exec(hash||'');
+ return match?match[1]:null;
+}
+
+export function Approvals({approvals,busy,decide,reload,hash}){
+ const linked=referencedApproval(hash);
+ const [selected,setSelected]=useState(linked);
+ // A link that arrives after mount still selects; a person's later click wins
+ // over it, because clicking sets selected and the link has not changed.
+ useEffect(()=>{if(linked)setSelected(linked)},[linked]);
  const chosen=approvals.find(item=>item.reference===selected)||null;
  return <><h3>Approvals {approvals.length>0&&<span className="approval-count">{approvals.length}</span>}</h3>
   <p className="muted">An agent has asked to do something consequential and is waiting. Each request names one operation and is bound to one exact request — approving it authorises that and nothing else, once. Requests lapse after fifteen minutes.</p>
@@ -698,7 +712,7 @@ function ApiToken({token,busy,revoke}){
  const full=TOKEN_ACCESS_PRESETS.find(option=>option.id===FULL_TOKEN_PRESET_ID),granted=token.scopes.map(id=>({id,scope:TOKEN_SCOPE_OPTIONS.find(option=>option.id===id)||(id==='full'?full:null)}));
  return <div className="token-row permission-row"><div className="permission-info"><strong>{token.name}</strong><small>{token.id} · expires {token.expires||'never'} · last used {token.lastUsed||'never'}{token.revoked?' · revoked':''}</small><details className="permission-details"><summary>Granted permission{granted.length===1?'':'s'} ({granted.length})</summary><p className="muted">This token carries the exact stored permission set below.</p><div className="token-scope-grid">{granted.map(({id,scope})=><label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unknown token permission'}</strong><small>{id} · {scope?.help||'This dashboard does not recognize this stored permission.'}</small></span></label>)}</div></details></div>{!token.revoked&&<button disabled={busy} className="danger" onClick={()=>revoke(token.id)}>Revoke</button>}</div>;
 }
-export function Security({close}){
+export function Security({close,hash}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
  const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
@@ -741,12 +755,12 @@ export function Security({close}){
   {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button type="button" aria-label={copied?'API token copied to clipboard':'Copy API token'} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>{copied?'Copied':'Copy'}</button></div>}
   <h3>CLI tokens</h3>
   {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
-  <Approvals approvals={approvals} busy={busy} decide={decideApproval} reload={()=>load().catch(reason=>setError(reason.message))}/>
+  <Approvals approvals={approvals} busy={busy} decide={decideApproval} reload={()=>load().catch(reason=>setError(reason.message))} hash={hash}/>
   <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
   <McpGrants grants={grants} busy={busy} revoke={revokeGrant}/>
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
  </section></div>;
 }
-export function Root(){const [authenticated,setAuthenticated]=useState(null),[identity,setIdentity]=useState(null),[security,setSecurity]=useState(false),[derived,setDerived]=useState(null),[semantic,setSemantic]=useState(false),[federation,setFederation]=useState(false);const requireLogin=()=>{setAuthenticated(false);setIdentity(null);setSecurity(false);setDerived(null);setSemantic(false);setFederation(false)};const check=()=>api('/api/auth/me').then(result=>{setIdentity(result);setAuthenticated(true)}).catch(()=>requireLogin());useEffect(()=>{window.addEventListener(AUTH_REQUIRED_EVENT,requireLogin);check();return()=>window.removeEventListener(AUTH_REQUIRED_EVENT,requireLogin)},[]);const logout=async()=>{try{await api('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}finally{clearAuthentication();requireLogin()}};if(authenticated===null)return <p className="loading">Checking access…</p>;if(!authenticated)return <Login onLogin={check}/>;return <><Dashboard onLogout={logout} openSecurity={()=>setSecurity(true)} openDerivedLayers={choice=>setDerived(choice||{})} openSemantic={()=>setSemantic(true)} openFederation={()=>setFederation(true)}/>{security&&<Security close={()=>setSecurity(false)}/>} {derived&&<DerivedLayers initialName={derived.name} initialAction={derived.action} close={()=>setDerived(null)}/>} {semantic&&<SemanticCatalog api={api} identity={identity} close={()=>setSemantic(false)}/>} {federation&&<FederatedSources api={api} close={()=>setFederation(false)}/>}</>}
+export function Root(){const [authenticated,setAuthenticated]=useState(null),[identity,setIdentity]=useState(null),[security,setSecurity]=useState(false),[hash,setHash]=useState(()=>window.location.hash),[derived,setDerived]=useState(null),[semantic,setSemantic]=useState(false),[federation,setFederation]=useState(false);const requireLogin=()=>{setAuthenticated(false);setIdentity(null);setSecurity(false);setDerived(null);setSemantic(false);setFederation(false)};const check=()=>api('/api/auth/me').then(result=>{setIdentity(result);setAuthenticated(true)}).catch(()=>requireLogin());useEffect(()=>{window.addEventListener(AUTH_REQUIRED_EVENT,requireLogin);check();return()=>window.removeEventListener(AUTH_REQUIRED_EVENT,requireLogin)},[]);useEffect(()=>{const onHash=()=>setHash(window.location.hash);window.addEventListener('hashchange',onHash);return()=>window.removeEventListener('hashchange',onHash)},[]);useEffect(()=>{if(referencedApproval(hash))setSecurity(true)},[hash]);const logout=async()=>{try{await api('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})}finally{clearAuthentication();requireLogin()}};if(authenticated===null)return <p className="loading">Checking access…</p>;if(!authenticated)return <Login onLogin={check}/>;return <><Dashboard onLogout={logout} openSecurity={()=>setSecurity(true)} openDerivedLayers={choice=>setDerived(choice||{})} openSemantic={()=>setSemantic(true)} openFederation={()=>setFederation(true)}/>{security&&<Security close={()=>setSecurity(false)} hash={hash}/>} {derived&&<DerivedLayers initialName={derived.name} initialAction={derived.action} close={()=>setDerived(null)}/>} {semantic&&<SemanticCatalog api={api} identity={identity} close={()=>setSemantic(false)}/>} {federation&&<FederatedSources api={api} close={()=>setFederation(false)}/>}</>}
 const rootElement=document.getElementById('root');
 if(rootElement)createRoot(rootElement).render(<Root/>);
