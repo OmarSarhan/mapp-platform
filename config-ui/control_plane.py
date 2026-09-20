@@ -1319,7 +1319,7 @@ class ControlStore:
 
     def decide_approval(
         self, handle: str, *, approved: bool, decided_by: str
-    ) -> str | None:
+    ) -> bool:
         """Record a person's decision, and mint the receipt if it was yes.
 
         One conditional statement, so two operators deciding at once cannot
@@ -1327,34 +1327,54 @@ class ControlStore:
         the predicate requires `pending`, which an approved or declined row is
         no longer.
 
-        Returns the receipt on approval -- once, never stored -- and None when
-        the row was already decided, expired or revoked.
+        Records the decision and nothing else. It does not mint the receipt,
+        because the person deciding does so in a browser and is not the party
+        that will spend it -- a secret handed to them would have to travel back
+        through the agent to be useful, which is the one route it must not
+        take. `claim_receipt` mints it for the holder of the handle instead.
         """
-        receipt = secrets.token_urlsafe(32) if approved else None
         with self._db() as connection:
             self._require_initialized(connection)
             row = connection.execute(
                 "UPDATE control.approvals"
-                "   SET status = %s, decided_at = %s, decided_by = %s,"
-                "       receipt_hash = %s"
+                "   SET status = %s, decided_at = %s, decided_by = %s"
                 " WHERE id_hash = %s AND status = 'pending'"
                 "   AND expires_at > %s AND revoked_at IS NULL"
                 " RETURNING operation_id, grant_id",
                 (
                     "approved" if approved else "declined",
-                    now(), decided_by,
-                    token_hash(receipt) if receipt else None,
-                    token_hash(handle), now(),
+                    now(), decided_by, token_hash(handle), now(),
                 ),
             ).fetchone()
         if row is None:
-            return None
+            return False
         self.audit(
             "approval.approved" if approved else "approval.declined",
             actor=decided_by,
             details={"operation": row["operation_id"], "grant": row["grant_id"]},
         )
-        return receipt
+        return True
+
+    def claim_receipt(self, handle: str) -> str | None:
+        """Mint the receipt for the holder of the handle, once.
+
+        Gated on a decision having been made: the predicate requires
+        `approved`, which only a person can produce. Gated on there being no
+        receipt yet, so a second claim returns nothing rather than a second
+        spendable secret -- the handle holder gets one, and if it is lost the
+        approval has to be asked for again.
+        """
+        receipt = secrets.token_urlsafe(32)
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.approvals"
+                "   SET receipt_hash = %s"
+                " WHERE id_hash = %s AND status = 'approved'"
+                "   AND receipt_hash IS NULL AND revoked_at IS NULL",
+                (token_hash(receipt), token_hash(handle)),
+            )
+        return receipt if row.rowcount else None
 
     def redeem_receipt(self, receipt: str, *, request_digest: str) -> dict | None:
         """Spend a receipt against the one request it was issued for.

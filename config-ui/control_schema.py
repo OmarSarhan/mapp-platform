@@ -901,10 +901,17 @@ def _migration_9(connection: psycopg.Connection) -> None:
                        = (decided_at IS NOT NULL)),
             CONSTRAINT approval_consumed_at_matches_status
                 CHECK ((status = 'consumed') = (consumed_at IS NOT NULL)),
-            -- An approved row must be spendable and a pending one must not be.
-            CONSTRAINT approval_receipt_matches_status
-                CHECK ((status IN ('approved','consumed'))
-                       = (receipt_hash IS NOT NULL))
+            -- A receipt exists only once it has been claimed, and a row that
+            -- has been spent must have had one. The gap between `approved` and
+            -- a claimed receipt is deliberate: the person who decides does so
+            -- in a browser and never holds the secret, so the component that
+            -- will spend it mints it on claim rather than being handed one it
+            -- cannot be given.
+            CONSTRAINT approval_receipt_requires_a_decision
+                CHECK (receipt_hash IS NULL
+                       OR status IN ('approved', 'consumed')),
+            CONSTRAINT approval_consumed_implies_receipt
+                CHECK (status <> 'consumed' OR receipt_hash IS NOT NULL)
         );
 
         -- The lookup the configuration API makes when a receipt arrives: by

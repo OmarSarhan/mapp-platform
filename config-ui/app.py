@@ -10864,6 +10864,74 @@ class Handler(SimpleHTTPRequestHandler):
                         "operation": operation,
                     })
                 return
+            if request_path == "/api/approvals":
+                # Asking is not doing. This writes a row whose status is
+                # `pending` and returns a handle that names it; nothing is
+                # authorised until a person decides, and the decision is made
+                # in an authenticated operator session rather than here.
+                digest = payload.get("requestDigest")
+                operation_id = payload.get("operationId")
+                if not isinstance(digest, str) or len(digest) != 64:
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "requestDigest must be a sha256 hex digest.",
+                        "code": "approval.digest_invalid",
+                    })
+                    return
+                if operation_id not in ACTION_SCHEMAS:
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "Unknown operation.",
+                        "code": "approval.operation_unknown",
+                    })
+                    return
+                action = ACTION_SCHEMAS[operation_id]
+                handle = CONTROL.create_approval(
+                    grant_id=str(actor),
+                    client_id=str(payload.get("clientId") or ""),
+                    instance=CONFIG_SITE,
+                    operation_id=operation_id,
+                    tool=str(payload.get("tool") or ""),
+                    request_digest=digest,
+                    risk=action["risk"],
+                    scopes=[action["scope"]],
+                    packet=payload.get("packet")
+                    if isinstance(payload.get("packet"), dict) else {},
+                )
+                self._json(HTTPStatus.OK, {
+                    "handle": handle,
+                    # Where a person goes to decide. An operator session is
+                    # required there, which is the whole point: an approval
+                    # names somebody the platform authenticated.
+                    "approvalUrl": f"{CONFIG_SITE}/#approvals",
+                })
+                return
+            if request_path == "/api/approvals/claim":
+                # The receipt, once and only once a person has approved. The
+                # handle is what proves this caller is the one that asked.
+                handle = payload.get("handle")
+                if not isinstance(handle, str) or not handle:
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "handle is required.",
+                        "code": "approval.handle_missing",
+                    })
+                    return
+                record = CONTROL.read_approval(handle)
+                if record is None:
+                    self._json(HTTPStatus.NOT_FOUND, {
+                        "error": "No such approval.",
+                        "code": "approval.unknown",
+                    })
+                    return
+                if record["status"] == "pending":
+                    self._json(HTTPStatus.OK, {
+                        "status": "expired" if record["expired"] else "pending",
+                    })
+                    return
+                self._json(HTTPStatus.OK, {
+                    "status": record["status"],
+                    # Minted when the person decided; handed over once, here.
+                    "receipt": CONTROL.claim_receipt(handle),
+                })
+                return
             if request_path == "/api/sql/test":
                 _, candidate, _ = read_workspace()
                 locale_key, locale = select_locale(

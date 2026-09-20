@@ -1368,6 +1368,45 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
     },
+    "approvals.create": {
+        "method": "POST",
+        "path": "/api/approvals",
+        # Asking is not doing. This writes a row whose status is `pending` and
+        # returns a handle naming it; the decision is made elsewhere, by a
+        # person the platform has authenticated. `inspect` because an agent
+        # that can see a tool can ask for permission to use it -- the gate is
+        # the receipt, not the request for one.
+        "risk": "inspect",
+        "scope": "inspect",
+        "inputSchema": {
+            "type": "object",
+            "required": ["operationId", "requestDigest"],
+            "properties": {
+                "operationId": {"type": "string", "minLength": 1},
+                "requestDigest": {"type": "string", "minLength": 64,
+                                  "maxLength": 64},
+                "tool": {"type": "string"},
+                "clientId": {"type": "string"},
+                "packet": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "approvals.claim": {
+        "method": "POST",
+        "path": "/api/approvals/claim",
+        # Returns the receipt once a person has approved, to whoever holds the
+        # handle. Not a decision and not authority by itself: an unapproved
+        # handle claims nothing.
+        "risk": "inspect",
+        "scope": "inspect",
+        "inputSchema": {
+            "type": "object",
+            "required": ["handle"],
+            "properties": {"handle": {"type": "string", "minLength": 1}},
+            "additionalProperties": False,
+        },
+    },
     "proposals.check": {
         "method": "POST",
         "path": "/api/proposals/check",

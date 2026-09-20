@@ -33,7 +33,7 @@ component and the configuration API's validation of the credential it issues.
 | Control schema | 15 tables, 8 migrations, owned by `mapp_control` |
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker, the configuration API and the MCP runtime — three copies, cross-checked |
 | Credential administration | Dashboard: agent-client issuance and consent inspection and revocation, both audited, administrator-session only |
-| Operation allowlist | 45 of the platform's 66 actions |
+| Operation allowlist | 47 of the platform's 68 actions |
 | Scope vocabulary | 13 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
 
 Public paths on the MCP origin: `/.well-known/oauth-authorization-server`,

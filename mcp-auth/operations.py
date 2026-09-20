@@ -333,6 +333,23 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("semantic:propose",),
         mutating=True,
     ),
+    "approvals.create": Operation(
+        operation_id="approvals.create",
+        method="POST",
+        path_template="/api/approvals",
+        required_scopes=("inspect",),
+        # Writes a pending row and authorises nothing. Not single-use: asking
+        # twice produces two requests for permission, which is untidy rather
+        # than dangerous, and both still need a person.
+        mutating=False,
+    ),
+    "approvals.claim": Operation(
+        operation_id="approvals.claim",
+        method="POST",
+        path_template="/api/approvals/claim",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
     "proposals.check": Operation(
         operation_id="proposals.check",
         method="POST",

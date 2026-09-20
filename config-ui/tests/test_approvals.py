@@ -65,8 +65,9 @@ class ApprovalTests(ControlStoreTestCase):
     def test_approval_mints_a_receipt_that_spends_once(self) -> None:
         store = self.store()
         handle = self.request(store)
-        receipt = store.decide_approval(handle, approved=True,
-                                        decided_by="admin")
+        self.assertTrue(store.decide_approval(handle, approved=True,
+                                              decided_by="admin"))
+        receipt = store.claim_receipt(handle)
         self.assertIsNotNone(receipt)
 
         spent = store.redeem_receipt(receipt, request_digest=DIGEST)
@@ -81,7 +82,8 @@ class ApprovalTests(ControlStoreTestCase):
         that never existed."""
         store = self.store()
         handle = self.request(store)
-        receipt = store.decide_approval(handle, approved=True, decided_by="a")
+        store.decide_approval(handle, approved=True, decided_by="a")
+        receipt = store.claim_receipt(handle)
         store.redeem_receipt(receipt, request_digest=DIGEST)
         self.assertEqual("consumed", store.read_approval(handle)["status"])
 
@@ -90,8 +92,9 @@ class ApprovalTests(ControlStoreTestCase):
         carried to a different path, body or revision than the one a person saw
         does not match the row that would otherwise be spent."""
         store = self.store()
-        receipt = store.decide_approval(
-            self.request(store), approved=True, decided_by="admin")
+        handle = self.request(store)
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        receipt = store.claim_receipt(handle)
         self.assertIsNone(
             store.redeem_receipt(receipt, request_digest=OTHER_DIGEST))
         # And is still spendable for the request it was actually issued for.
@@ -100,21 +103,23 @@ class ApprovalTests(ControlStoreTestCase):
     def test_a_decline_mints_nothing(self) -> None:
         store = self.store()
         handle = self.request(store)
-        self.assertIsNone(store.decide_approval(handle, approved=False,
-                                                decided_by="admin"))
+        self.assertTrue(store.decide_approval(handle, approved=False,
+                                              decided_by="admin"))
         self.assertEqual("declined", store.read_approval(handle)["status"])
+        # Nothing to claim: a decline mints no secret at all.
+        self.assertIsNone(store.claim_receipt(handle))
 
     def test_a_decision_cannot_be_changed(self) -> None:
         """The predicate requires `pending`, which a decided row is not. Two
         operators deciding at once cannot both believe they did it."""
         store = self.store()
         handle = self.request(store)
-        self.assertIsNotNone(store.decide_approval(handle, approved=True,
-                                                   decided_by="first"))
-        self.assertIsNone(store.decide_approval(handle, approved=False,
-                                                decided_by="second"))
-        self.assertIsNone(store.decide_approval(handle, approved=True,
-                                                decided_by="third"))
+        self.assertTrue(store.decide_approval(handle, approved=True,
+                                              decided_by="first"))
+        self.assertFalse(store.decide_approval(handle, approved=False,
+                                               decided_by="second"))
+        self.assertFalse(store.decide_approval(handle, approved=True,
+                                               decided_by="third"))
         self.assertEqual("first", store.read_approval(handle)["decided_by"])
 
     def test_an_expired_request_cannot_be_decided(self) -> None:
@@ -127,16 +132,17 @@ class ApprovalTests(ControlStoreTestCase):
                 "UPDATE control.approvals SET expires_at = %s",
                 (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1),),
             )
-        self.assertIsNone(store.decide_approval(handle, approved=True,
-                                                decided_by="admin"))
+        self.assertFalse(store.decide_approval(handle, approved=True,
+                                               decided_by="admin"))
         self.assertTrue(store.read_approval(handle)["expired"])
 
     def test_revoking_the_grant_kills_an_unspent_receipt(self) -> None:
         """The case that matters: a receipt outlives the decision that
         produced it for as long as nobody spends it."""
         store = self.store()
-        receipt = store.decide_approval(
-            self.request(store), approved=True, decided_by="admin")
+        handle = self.request(store)
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        receipt = store.claim_receipt(handle)
         self.assertEqual(1, store.revoke_approvals_for_grant(
             "oauth:grant-1", "operator revoked the grant"))
         self.assertIsNone(store.redeem_receipt(receipt, request_digest=DIGEST))
@@ -164,8 +170,9 @@ class ApprovalTests(ControlStoreTestCase):
                 " VALUES (%s, %s, %s, %s, now())",
                 ("oauth:grant-1", "mcp-1", "operator", ["apply"]),
             )
-        receipt = store.decide_approval(
-            self.request(store), approved=True, decided_by="admin")
+        handle = self.request(store)
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        receipt = store.claim_receipt(handle)
 
         self.assertTrue(store.revoke_oauth_grant(
             "oauth:grant-1", reason="operator withdrew consent"))
@@ -174,16 +181,43 @@ class ApprovalTests(ControlStoreTestCase):
 
     def test_revocation_leaves_another_grants_approvals_alone(self) -> None:
         store = self.store()
-        mine = store.decide_approval(
-            self.request(store), approved=True, decided_by="admin")
+        handle = self.request(store)
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        mine = store.claim_receipt(handle)
         store.revoke_approvals_for_grant("oauth:someone-else", "unrelated")
         self.assertIsNotNone(store.redeem_receipt(mine, request_digest=DIGEST))
+
+    def test_a_receipt_is_minted_once_and_only_after_a_decision(self) -> None:
+        """Deciding and minting are separate on purpose. The person who
+        approves does so in a browser and is not the party that will spend it;
+        a secret handed to them would have to travel back through the agent to
+        be useful, which is the one route it must not take. So the holder of
+        the handle mints it, and only once a decision exists."""
+        store = self.store()
+        handle = self.request(store)
+
+        # Nothing to claim before a person has decided.
+        self.assertIsNone(store.claim_receipt(handle))
+
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        first = store.claim_receipt(handle)
+        self.assertIsNotNone(first)
+
+        # And never a second spendable secret for the same decision.
+        self.assertIsNone(store.claim_receipt(handle))
+
+    def test_a_revoked_approval_mints_nothing(self) -> None:
+        store = self.store()
+        handle = self.request(store)
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        store.revoke_approvals_for_grant("oauth:grant-1", "withdrawn")
+        self.assertIsNone(store.claim_receipt(handle))
 
     def test_the_handle_and_the_receipt_are_stored_only_as_hashes(self) -> None:
         store = self.store()
         handle = self.request(store)
-        receipt = store.decide_approval(handle, approved=True,
-                                        decided_by="admin")
+        store.decide_approval(handle, approved=True, decided_by="admin")
+        receipt = store.claim_receipt(handle)
         with store._db() as connection:
             row = connection.execute(
                 "SELECT id_hash, receipt_hash FROM control.approvals"
