@@ -7840,12 +7840,23 @@ class Handler(SimpleHTTPRequestHandler):
                     "clients": CONTROL.list_oauth_clients(),
                     "mcpUrl": f"{site}/mcp",
                 })
-        elif path == "/api/approvals/pending":
-            # Operator-only. An agent asks for approval and claims a receipt;
+        elif path == "/api/admin/approvals":
+            # Operator-only, and under /api/admin like every other operator
+            # surface, so the intent is legible from the path. An agent asks
+            # for approval and claims a receipt;
             # it must never be able to see what else is waiting, nor to decide
             # anything. This route is not in ACTION_SCHEMAS, so no exchanged
             # credential resolves it -- the binding gate refuses before scope
             # is even considered.
+            if actor != "admin":
+                # Every other administrator read refuses a bearer token here,
+                # and a pending approval names what an agent is trying to do --
+                # which a CLI credential has no business reading. Caught by
+                # AdminSurfaceGuardTests, which derives the administrator reads
+                # from the dispatch rather than listing them.
+                self._json(HTTPStatus.FORBIDDEN,
+                           {"error": "Administrator session required."})
+                return
             self._json(HTTPStatus.OK, {
                 "approvals": [
                     {
@@ -8815,7 +8826,7 @@ class Handler(SimpleHTTPRequestHandler):
             request_path,
         )
         approval_decide_path = re.fullmatch(
-            r"/api/approvals/[0-9a-f]{64}/decide", request_path
+            r"/api/admin/approvals/[0-9a-f]{64}/decide", request_path
         )
         if (
             request_path not in allowed
@@ -10896,7 +10907,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                 return
             decide = re.fullmatch(
-                r"/api/approvals/([0-9a-f]{64})/decide", request_path
+                r"/api/admin/approvals/([0-9a-f]{64})/decide", request_path
             )
             if decide:
                 # Operator-only, and the only place a decision is made. Not in

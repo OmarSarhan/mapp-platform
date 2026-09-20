@@ -15,6 +15,8 @@ import {
   Root,
   MCP_CLIENT_PRESETS,
   MCP_SCOPE_OPTIONS,
+  Approvals,
+  ApprovalDetail,
   McpGrants,
   Security,
   TOKEN_ACCESS_PRESETS,
@@ -65,6 +67,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         return response({token: 'mapp_copy_me', record: {id: 'token-copy'}}, 201);
       }
@@ -111,6 +116,9 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -248,6 +256,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (path === '/api/admin/tokens') return response({tokens});
       if (path === '/api/admin/device-authorizations') {
         return response({authorizations: []});
@@ -302,6 +313,9 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -361,6 +375,9 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -452,6 +469,9 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (
         options.method === 'POST'
         && path === '/api/admin/device-authorizations/approve'
@@ -527,6 +547,9 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (path === '/api/admin/tokens') {
         return response({tokens: []});
@@ -806,6 +829,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [{...materialized, kind: listKind}]});
       }
@@ -879,6 +905,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -933,6 +962,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -980,6 +1012,9 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1043,6 +1078,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
       }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -1094,6 +1132,9 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1153,6 +1194,9 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/mcp-grants' && options.method !== 'POST') {
         return response({grants: []});
+      }
+      if (path === '/api/admin/approvals' && options.method !== 'POST') {
+        return response({approvals: []});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [materialized]});
@@ -2083,6 +2127,7 @@ describe('MCP agent client administration', () => {
     }
     if (path.startsWith('/api/admin/mcp-clients/')) return response({disabled: true});
     if (path === '/api/admin/mcp-grants') return response({grants: []});
+    if (path === '/api/admin/approvals') return response({approvals: []});
     if (path === '/api/admin/tokens') return response({tokens: []});
     if (path === '/api/admin/device-authorizations') return response({authorizations: []});
     if (path === '/api/admin/audit') return response({events: []});
@@ -2294,5 +2339,108 @@ describe('MCP consent administration', () => {
   test('nothing is offered while a request is in flight', () => {
     render(<McpGrants grants={[GRANT]} busy={true} revoke={vi.fn()}/>);
     expect(screen.getByRole('button', {name: /^Revoke consent/}).disabled).toBe(true);
+  });
+});
+
+
+const WAITING = {
+  reference: 'a'.repeat(64),
+  operation: 'proposals.apply',
+  tool: 'proposals_apply',
+  client: 'mcp-1',
+  requestedBy: 'oauth:grant-1',
+  scopes: ['apply'],
+  risk: 'high',
+  expires: '2026-09-20T10:15:00Z',
+  packet: {
+    summary: 'Rename the passport layer folder.',
+    changeCount: 112,
+    changes: [
+      {op: 'replace', path: '/locale/layers/Passport_UK/group',
+       was: 'EuropeanResidents', becomes: 'European Passports'},
+    ],
+    evidence: {
+      passed: false,
+      failedStage: 'layer-registration',
+      failedChecks: [{side: 'original', check: 'visual.layer_activation'}],
+      artifacts: {beforeMap: 'run/before-map.png', afterMap: 'run/after-map.png'},
+    },
+  },
+};
+
+describe('Agent approvals', () => {
+  test('nothing is decided from the list alone', () => {
+    // A row names an operation. Approving on that much is how approval
+    // fatigue starts, and the threat model already carries it unmitigated.
+    render(<Approvals approvals={[WAITING]} busy={false} decide={vi.fn()} reload={vi.fn()}/>);
+    expect(screen.getByText('proposals.apply')).toBeTruthy();
+    expect(screen.queryByText(/^Approve/)).toBeNull();
+  });
+
+  test('choosing a request shows what it would do', () => {
+    render(<Approvals approvals={[WAITING]} busy={false} decide={vi.fn()} reload={vi.fn()}/>);
+    fireEvent.click(screen.getByLabelText('Review proposals.apply'));
+    // The summary appears twice on purpose -- once as the row's label, once in
+    // the detail -- so this reads the detail rather than the page.
+    const detail = screen
+      .getByRole('heading', {name: 'proposals.apply'})
+      .closest('.approval-detail');
+    expect(within(detail).getByText('Rename the passport layer folder.')).toBeTruthy();
+    expect(within(detail).getByText('/locale/layers/Passport_UK/group')).toBeTruthy();
+    expect(
+      within(detail).getByText((_, node) =>
+        node?.textContent === 'Showing 1 of 112. The rest are in the proposal.')
+    ).toBeTruthy();
+  });
+
+  test('the evidence is shown, including that it failed', () => {
+    render(<ApprovalDetail approval={WAITING} busy={false} decide={vi.fn()}/>);
+    expect(screen.getByText(/Visual check failed at layer-registration/)).toBeTruthy();
+    expect(screen.getByText('visual.layer_activation')).toBeTruthy();
+    expect(screen.getByText('beforeMap')).toBeTruthy();
+  });
+
+  test('an artifact link points at the route that serves it', () => {
+    // Asserting only the link text is what let the panel ship pointing at
+    // /instance/artifacts/, which no handler answers. The values the packet
+    // carries are relative paths under the artifact root, and app.py serves
+    // that root at /api/artifacts/.
+    render(<ApprovalDetail approval={WAITING} busy={false} decide={vi.fn()}/>);
+    expect(screen.getByText('beforeMap').getAttribute('href'))
+      .toBe('/api/artifacts/run/before-map.png');
+  });
+
+  test('the risk band is shown, since it is why a decision is needed', () => {
+    render(<ApprovalDetail approval={WAITING} busy={false} decide={vi.fn()}/>);
+    expect(screen.getByText('Risk: high')).toBeTruthy();
+  });
+
+  test('approving takes two deliberate clicks, declining one', () => {
+    // Declining is safe and should be quick. Approving is the consequential
+    // direction, so it names the operation before it happens.
+    const decide = vi.fn();
+    render(<ApprovalDetail approval={WAITING} busy={false} decide={decide}/>);
+
+    fireEvent.click(screen.getByText('Approve…'));
+    expect(decide).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText('Yes — approve proposals.apply'));
+    expect(decide).toHaveBeenCalledWith('a'.repeat(64), true);
+
+    fireEvent.click(screen.getByText('Decline'));
+    expect(decide).toHaveBeenCalledWith('a'.repeat(64), false);
+  });
+
+  test('a request with no packet says so rather than looking routine', () => {
+    const bare = {...WAITING, packet: {}};
+    render(<ApprovalDetail approval={bare} busy={false} decide={vi.fn()}/>);
+    expect(screen.getByText(/deciding on less than you should be/)).toBeTruthy();
+  });
+
+  test('an empty queue offers to look again', () => {
+    const reload = vi.fn();
+    render(<Approvals approvals={[]} busy={false} decide={vi.fn()} reload={reload}/>);
+    fireEvent.click(screen.getByText('Check again'));
+    expect(reload).toHaveBeenCalled();
   });
 });

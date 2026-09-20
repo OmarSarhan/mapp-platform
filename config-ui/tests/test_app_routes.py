@@ -977,8 +977,8 @@ class ApprovalRouteTests(unittest.TestCase):
     """
 
     OPERATOR_ONLY = (
-        ("GET", "/api/approvals/pending"),
-        ("POST", "/api/approvals/" + "a" * 64 + "/decide"),
+        ("GET", "/api/admin/approvals"),
+        ("POST", "/api/admin/approvals/" + "a" * 64 + "/decide"),
     )
 
     def test_the_operator_routes_are_not_allowlisted_operations(self) -> None:
@@ -1008,7 +1008,7 @@ class ApprovalRouteTests(unittest.TestCase):
         it does arrive."""
         responses = []
         handler = object.__new__(app.Handler)
-        handler.path = "/api/approvals/" + "a" * 64 + "/decide"
+        handler.path = "/api/admin/approvals/" + "a" * 64 + "/decide"
         handler._host_allowed = lambda: True
         handler._authorized = lambda state_change=False: "token:someone"
         handler._json = lambda status, body: responses.append((status, body))

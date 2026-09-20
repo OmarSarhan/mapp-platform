@@ -556,8 +556,8 @@ export const MCP_SCOPE_OPTIONS=[
  {id:'derive',label:'Read derived layers',help:'Needed by layer_values to aggregate over a managed derived relation.'},
  {id:'semantic:inspect',label:'Read semantic catalog',help:'Needed by the semantic tools, and by layer_values to resolve the field it aggregates over.'},
  {id:'federation:observe',label:'Read federated sources',help:'Needed by federation_list, federation_show and federation_groups. Reveals which third-party databases this instance reads; it cannot expose or withdraw one, which is federation:provision.'},
- {id:'propose',label:'Propose workspace changes',help:'Needed by proposals_check and, later, proposals_create. Adds to the review queue; it applies nothing, and a person still decides. Not in the analysis presets: reading an instance and proposing to it are separate things to grant.'},
- {id:'semantic:propose',label:'Propose semantic changes',help:'The same for curated meaning: needed by semantic_proposals_check. Proposes, never applies.'},
+ {id:'propose',label:'Agent may propose workspace changes',help:'Needed by proposals_check and proposals_create. Adds to the review queue; it applies nothing, and a person still decides. Not in the analysis presets: reading an instance and proposing to it are separate things to grant.'},
+ {id:'semantic:propose',label:'Agent may propose semantic changes',help:'The same for curated meaning: needed by semantic_proposals_check. Proposes, never applies.'},
  {id:'visual',label:'Render review evidence',help:'Needed by the proposal preview tools. Renders a proposed change through a real browser and attaches the result to the proposal, so a person can see what it would look like before applying it. Renders only; it applies nothing.'},
  {id:'semantic:source',label:'Read source relations',help:'Needed by semantic_source_relations. Lists the tables and views available to model, including ones no layer uses -- the database inventory rather than the configured workspace. Reads no rows from them. Left out of the presets so it is granted deliberately.'},
 ];
@@ -609,6 +609,62 @@ export function McpGrants({grants,busy,revoke}){
  </>;
 }
 
+export function ApprovalChange({change}){
+ const show=value=>{
+  if(value===null||value===undefined)return <em>nothing</em>;
+  if(typeof value==='object')return <span className="muted">{value.type==='list'?`list of ${value.items}`:`object · ${(value.keys||[]).join(', ')}`}</span>;
+  return <code>{String(value)}</code>;
+ };
+ return <li><code>{change.op}</code> <code>{change.path}</code><div className="approval-change">{show(change.was)} → {show(change.becomes)}</div></li>;
+}
+
+export function ApprovalDetail({approval,busy,decide}){
+ const packet=approval.packet||{};
+ const changes=Array.isArray(packet.changes)?packet.changes:[];
+ const evidence=packet.evidence||null;
+ const [confirming,setConfirming]=useState(false);
+ return <div className="approval-detail">
+  <h4>{approval.operation}</h4>
+  <p className="muted">Asked by <strong>{approval.tool||'an agent'}</strong> using client <code>{approval.client}</code>. Costs <code>{(approval.scopes||[]).join(' ')}</code>. Expires {approval.expires}.</p>
+  {approval.risk&&<p className={`approval-risk approval-risk-${approval.risk}`}>Risk: {approval.risk}</p>}
+  {packet.summary&&<p className="approval-summary">{packet.summary}</p>}
+  {changes.length>0&&<><h5>Changes ({packet.changeCount??changes.length})</h5><ul className="approval-changes">{changes.map((change,index)=><ApprovalChange key={index} change={change}/>)}</ul>{packet.changeCount>changes.length&&<p className="muted">Showing {changes.length} of {packet.changeCount}. The rest are in the proposal.</p>}</>}
+  {evidence&&<><h5>Evidence</h5>
+   <p className={evidence.passed?'approval-evidence-pass':'approval-evidence-fail'}>Visual check {evidence.passed?'passed':`failed at ${evidence.failedStage||'an unnamed stage'}`}.</p>
+   {Array.isArray(evidence.failedChecks)&&evidence.failedChecks.length>0&&<ul className="approval-changes">{evidence.failedChecks.map((check,index)=><li key={index}><code>{check.check}</code> <span className="muted">({check.side})</span></li>)}</ul>}
+   {evidence.artifacts&&<div className="approval-artifacts">{Object.entries(evidence.artifacts).map(([name,href])=><a key={name} href={`/api/artifacts/${href}`} target="_blank" rel="noreferrer">{name}</a>)}</div>}
+  </>}
+  {!changes.length&&!evidence&&<p className="muted">This request carried no summary. Approving it grants the operation named above and nothing else, but you are deciding on less than you should be — ask the agent to include a packet.</p>}
+  <div className="approval-actions">
+   <button className="danger" disabled={busy} onClick={()=>decide(approval.reference,false)}>Decline</button>
+   {confirming
+    ?<button disabled={busy} onClick={()=>decide(approval.reference,true)}>{busy?'Approving…':`Yes — approve ${approval.operation}`}</button>
+    :<button disabled={busy} onClick={()=>setConfirming(true)}>Approve…</button>}
+  </div>
+ </div>;
+}
+
+export function Approvals({approvals,busy,decide,reload}){
+ const [selected,setSelected]=useState(null);
+ const chosen=approvals.find(item=>item.reference===selected)||null;
+ return <><h3>Approvals {approvals.length>0&&<span className="approval-count">{approvals.length}</span>}</h3>
+  <p className="muted">An agent has asked to do something consequential and is waiting. Each request names one operation and is bound to one exact request — approving it authorises that and nothing else, once. Requests lapse after fifteen minutes.</p>
+  {approvals.length===0&&<p className="muted">Nothing is waiting. <button type="button" className="link-button" onClick={reload}>Check again</button></p>}
+  {approvals.length>0&&<div className="approval-layout">
+   <ul className="approval-list">{approvals.map(item=><li key={item.reference}>
+    <button type="button" aria-label={`Review ${item.operation}`} aria-pressed={item.reference===selected} className={`approval-row${item.reference===selected?' selected':''}`} onClick={()=>setSelected(item.reference)}>
+     <strong>{item.operation}</strong>
+     <small>{(item.packet||{}).summary||item.tool||'no summary'}</small>
+     <small className="muted">expires {item.expires}</small>
+    </button>
+   </li>)}</ul>
+   {chosen
+    ?<ApprovalDetail approval={chosen} busy={busy} decide={decide}/>
+    :<p className="muted approval-detail">Choose a request to see what it would do.</p>}
+  </div>}
+ </>;
+}
+
 export function McpClients({clients,mcpUrl,busy,register,disable}){
  const [name,setName]=useState('Claude Code'),[preset,setPreset]=useState(MCP_CLIENT_PRESETS[0].id),[scopes,setScopes]=useState(MCP_CLIENT_PRESETS[0].scopes),[issued,setIssued]=useState(null);
  const choosePreset=id=>{const selected=MCP_CLIENT_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -644,9 +700,9 @@ function ApiToken({token,busy,revoke}){
 }
 export function Security({close}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
- const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a,c,g]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants)};
+ const load=async()=>{const [t,d,a,c,g,p]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals)};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -657,6 +713,7 @@ export function Security({close}){
  const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load();return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
+ const decideApproval=async(reference,approved)=>{setBusy(true);setError('');try{await api(`/api/admin/approvals/${reference}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revokeGrant=async grantId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-grants/${grantId}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const presetHelp=TOKEN_ACCESS_PRESETS.find(item=>item.id===preset)?.help||'Custom least-privilege scope selection.';
@@ -684,6 +741,7 @@ export function Security({close}){
   {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button type="button" aria-label={copied?'API token copied to clipboard':'Copy API token'} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>{copied?'Copied':'Copy'}</button></div>}
   <h3>CLI tokens</h3>
   {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
+  <Approvals approvals={approvals} busy={busy} decide={decideApproval} reload={()=>load().catch(reason=>setError(reason.message))}/>
   <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
   <McpGrants grants={grants} busy={busy} revoke={revokeGrant}/>
   <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')}</pre>
