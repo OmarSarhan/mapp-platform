@@ -823,12 +823,24 @@ class ControlStore:
                 (reason or None, grant_id),
             ).fetchone()
             families = 0
+            approvals = 0
             if row is not None:
                 families = connection.execute(
                     "UPDATE control.oauth_refresh_families"
                     "   SET revoked_at = now(), revoked_reason = %s"
                     " WHERE grant_id = %s AND revoked_at IS NULL",
                     (reason or None, grant_id),
+                ).rowcount
+                # In this transaction rather than after it. An approved receipt
+                # that has not been spent is authority the grant produced, and
+                # a revocation that reached the grant but not the receipt would
+                # leave the one credential most worth revoking behind.
+                approvals = connection.execute(
+                    "UPDATE control.approvals"
+                    "   SET revoked_at = now(), revoked_reason = %s"
+                    " WHERE grant_id = %s AND revoked_at IS NULL"
+                    "   AND status IN ('pending', 'approved')",
+                    ((reason or "grant revoked")[:200], grant_id),
                 ).rowcount
         if row is None:
             return False
@@ -840,6 +852,7 @@ class ControlStore:
                 "clientId": row["client_id"],
                 "reason": reason or "unspecified",
                 "refreshFamiliesRevoked": families,
+                "approvalsRevoked": approvals,
             },
         )
         return True
@@ -1226,6 +1239,176 @@ class ControlStore:
             }
             for row in rows
         ]
+
+    #: How long a person has to decide before an approval stops being one.
+    #: Short, because the digest it carries binds a request whose revision and
+    #: workspace can move underneath it, and a decision made about a workspace
+    #: that has since changed is not a decision about this request.
+    APPROVAL_LIFETIME = dt.timedelta(minutes=15)
+
+    def create_approval(
+        self,
+        *,
+        grant_id: str,
+        client_id: str,
+        instance: str,
+        operation_id: str,
+        tool: str,
+        request_digest: str,
+        risk: str,
+        scopes: list[str],
+        packet: dict,
+    ) -> str:
+        """Record what is being asked, and return the handle that names it.
+
+        The handle is returned once and stored only as a hash, like every other
+        credential here. It is not authority: it names a row whose status is
+        `pending`, and nothing can be spent until a person decides.
+        """
+        handle = secrets.token_urlsafe(32)
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute(
+                "INSERT INTO control.approvals"
+                " (id_hash, grant_id, client_id, instance, operation_id, tool,"
+                "  request_digest, risk, scopes, packet, created_at,"
+                "  expires_at, status)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
+                "         'pending')",
+                (
+                    token_hash(handle), grant_id, client_id, instance,
+                    operation_id, tool, request_digest, risk, list(scopes),
+                    json.dumps(packet), now(), now() + self.APPROVAL_LIFETIME,
+                ),
+            )
+        self.audit(
+            "approval.requested",
+            actor=grant_id,
+            details={
+                "operation": operation_id,
+                "tool": tool,
+                "client": client_id,
+                # Never the handle, and never the packet: one is a credential
+                # and the other can carry workspace content.
+                "digest": request_digest,
+            },
+        )
+        return handle
+
+    def read_approval(self, handle: str) -> dict | None:
+        """What a person is being asked to decide, by the handle naming it.
+
+        A plain read, unlike the redemption below, because showing somebody a
+        request is not spending it.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "SELECT grant_id, client_id, instance, operation_id, tool,"
+                "       request_digest, risk, scopes, packet, status,"
+                "       created_at, expires_at, decided_at, decided_by"
+                "  FROM control.approvals"
+                " WHERE id_hash = %s AND revoked_at IS NULL",
+                (token_hash(handle),),
+            ).fetchone()
+        if row is None:
+            return None
+        detail = dict(row)
+        detail["expired"] = detail["expires_at"] <= now()
+        return detail
+
+    def decide_approval(
+        self, handle: str, *, approved: bool, decided_by: str
+    ) -> str | None:
+        """Record a person's decision, and mint the receipt if it was yes.
+
+        One conditional statement, so two operators deciding at once cannot
+        both believe they did it, and a decision cannot be changed afterwards:
+        the predicate requires `pending`, which an approved or declined row is
+        no longer.
+
+        Returns the receipt on approval -- once, never stored -- and None when
+        the row was already decided, expired or revoked.
+        """
+        receipt = secrets.token_urlsafe(32) if approved else None
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.approvals"
+                "   SET status = %s, decided_at = %s, decided_by = %s,"
+                "       receipt_hash = %s"
+                " WHERE id_hash = %s AND status = 'pending'"
+                "   AND expires_at > %s AND revoked_at IS NULL"
+                " RETURNING operation_id, grant_id",
+                (
+                    "approved" if approved else "declined",
+                    now(), decided_by,
+                    token_hash(receipt) if receipt else None,
+                    token_hash(handle), now(),
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        self.audit(
+            "approval.approved" if approved else "approval.declined",
+            actor=decided_by,
+            details={"operation": row["operation_id"], "grant": row["grant_id"]},
+        )
+        return receipt
+
+    def redeem_receipt(self, receipt: str, *, request_digest: str) -> dict | None:
+        """Spend a receipt against the one request it was issued for.
+
+        The conditional UPDATE is the read. A receipt that was already spent
+        does not match `status = 'approved'`, so a replay is a miss rather than
+        a second effect, and the consumed row is kept so the replay is
+        detectable rather than merely unsuccessful.
+
+        The digest is part of the predicate, not checked afterwards. An
+        approval carried to a different path, body or revision than the one a
+        person saw does not match the row and is refused by the same statement
+        that would otherwise spend it.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.approvals"
+                "   SET status = 'consumed', consumed_at = %s"
+                " WHERE receipt_hash = %s AND status = 'approved'"
+                "   AND request_digest = %s AND revoked_at IS NULL"
+                " RETURNING operation_id, grant_id, client_id, decided_by,"
+                "           request_digest",
+                (now(), token_hash(receipt), request_digest),
+            ).fetchone()
+        if row is None:
+            return None
+        self.audit(
+            "approval.consumed",
+            actor=row["grant_id"],
+            details={
+                "operation": row["operation_id"],
+                "approvedBy": row["decided_by"],
+            },
+        )
+        return dict(row)
+
+    def revoke_approvals_for_grant(self, grant_id: str, reason: str) -> int:
+        """Revoking a grant reaches every approval made under it.
+
+        Including one already approved and not yet spent, which is the case
+        that matters: a receipt outlives the decision that produced it by as
+        long as nobody spends it.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            result = connection.execute(
+                "UPDATE control.approvals"
+                "   SET revoked_at = %s, revoked_reason = %s"
+                " WHERE grant_id = %s AND revoked_at IS NULL"
+                "   AND status IN ('pending', 'approved')",
+                (now(), reason[:200], grant_id),
+            )
+        return result.rowcount
 
     def approve_device_authorization(self, user_code: str) -> bool:
         """Approve a pending request, in one conditional statement.
