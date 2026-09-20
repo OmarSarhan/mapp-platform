@@ -288,7 +288,12 @@ class LegacySessionTests(unittest.TestCase):
              # Evidence tools: they render a proposal through a browser, which
              # costs `visual` and is granted with the authoring preset.
              "proposals_preview_plan", "proposals_preview_screenshot",
-             "proposals_preview_test"},
+             "proposals_preview_test",
+             # The irreversible half, added in wave 6. An analysis grant
+             # reads; these write the workspace, write curated meaning and
+             # tell the tile service to serve the result, and each costs a
+             # scope an operator grants on purpose.
+             "proposals_apply", "semantic_proposals_apply", "xyz_reload"},
             withheld,
         )
 

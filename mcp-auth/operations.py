@@ -416,6 +416,19 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("apply",),
         mutating=True,
     ),
+    "xyz.reload": Operation(
+        operation_id="xyz.reload",
+        method="POST",
+        path_template="/api/xyz/reload",
+        required_scopes=("reload",),
+        # Tells the tile service to pick up the workspace on disk. It changes
+        # no data and applies nothing -- it makes an already-applied change
+        # visible. Allowlisted for the case `proposals.apply` cannot cover: an
+        # apply that committed and then answered 504 because the reload was
+        # not observed, where re-requesting one is the recovery and the only
+        # alternative is an operator at a terminal.
+        mutating=True,
+    ),
     "semantic.proposals.apply": Operation(
         operation_id="semantic.proposals.apply",
         method="POST",

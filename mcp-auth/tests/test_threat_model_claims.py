@@ -143,9 +143,13 @@ class ThreatModelClaimTests(unittest.TestCase):
 
     #: The mutations an operator can currently grant, pinned so that adding
     #: one is a deliberate edit here and not a side effect of allowlisting.
-    #: Each either writes a proposal record or attaches evidence to one; none
-    #: changes what the map serves.
-    REACHABLE_MUTATIONS = [
+    #: Split at Phase 1 wave 6, because the two halves now rest on different
+    #: controls and collapsing them would hide which one is load-bearing.
+    #:
+    #: Unattended: an agent holding the scope does these without asking. Each
+    #: writes a proposal record or attaches evidence to one; none changes what
+    #: the map serves.
+    UNATTENDED_MUTATIONS = [
         "proposals.create",
         "semantic.proposals.create",
         "proposals.preview-plan",
@@ -153,21 +157,22 @@ class ThreatModelClaimTests(unittest.TestCase):
         "proposals.preview-screenshot",
     ]
 
-    def test_only_queue_writing_mutations_are_reachable(self) -> None:
-        """What an agent can change, and what it still cannot.
+    #: Attended: the scope is necessary and not sufficient. Each requires an
+    #: approval receipt bound to that exact request, so holding the grant buys
+    #: the ability to *ask*.
+    ATTENDED_MUTATIONS = [
+        "proposals.apply",
+        "semantic.proposals.apply",
+        "xyz.reload",
+    ]
 
-        Until Phase 1 wave 3 this list was empty and the assertion said so.
-        Allowlisting the two creates is the point at which an agent can write
-        durable state, and the property that replaces "nothing" is narrower
-        than it looks: both write a proposal record and neither touches a
-        workspace. What they produce is an entry in a review queue that a
-        person must still decide on, and `proposals_show` has been readable
-        since Phase 0, so the thing an agent creates is the thing a human
-        reads before anything happens.
+    def test_the_reachable_mutations_are_the_two_pinned_lists(self) -> None:
+        """What an agent can change, and under what condition.
 
-        Applying is not on this list and is a different scope. If
-        `proposals.apply` ever appears here, the review step has become
-        optional and this test is where that shows.
+        Until Phase 1 wave 3 this list was empty. Wave 3 allowlisted the two
+        creates; wave 6 made the applies grantable. Adding to either list
+        should be a deliberate edit here rather than a side effect of
+        allowlisting an operation or offering a scope.
         """
         start = DASHBOARD.index("export const MCP_SCOPE_OPTIONS=[")
         block = DASHBOARD[start : DASHBOARD.index("];", start)]
@@ -176,20 +181,24 @@ class ThreatModelClaimTests(unittest.TestCase):
             name for name, op in operations.OPERATIONS.items()
             if op.mutating and set(op.required_scopes) <= offered
         )
-        self.assertEqual(sorted(self.REACHABLE_MUTATIONS), reachable)
+        self.assertEqual(
+            sorted(self.UNATTENDED_MUTATIONS + self.ATTENDED_MUTATIONS),
+            reachable,
+        )
 
-    def test_no_reachable_mutation_changes_a_workspace(self) -> None:
-        """The property the list above rests on, checked rather than asserted
-        in prose.
+    def test_no_unattended_mutation_changes_a_workspace(self) -> None:
+        """The property the first list rests on, checked rather than asserted.
 
-        Each reachable mutation is either a proposal create, whose effect is an
-        entry in a queue, or a proposal preview, whose effect is an artifact
-        attached to one. Neither alters what the map serves. `apply`, `reload`
-        and the derived-layer lifecycle all cost scopes no dashboard option
-        offers, which is what keeps that true.
+        Each is either a proposal create, whose effect is an entry in a queue,
+        or a proposal preview, whose effect is an artifact attached to one.
+        Neither alters what the map serves. Since wave 6 that is no longer
+        kept true by the scopes being unofferable -- it is kept true by these
+        being the only mutations that ask nobody.
         """
+        from control_api import requires_approval
+
         allowed_risks = {"propose", "visual"}
-        for name in self.REACHABLE_MUTATIONS:
+        for name in self.UNATTENDED_MUTATIONS:
             with self.subTest(operation=name):
                 self.assertTrue(
                     name.startswith("proposals.")
@@ -197,18 +206,52 @@ class ThreatModelClaimTests(unittest.TestCase):
                     f"{name} is reachable and does not act on a proposal",
                 )
                 self.assertIn(ACTION_SCHEMAS[name]["risk"], allowed_risks)
+                self.assertFalse(requires_approval(name))
 
-    def test_applying_is_not_reachable(self) -> None:
-        """Stated on its own, because it is the line this whole ordering
-        exists to hold: an agent may fill a review queue and illustrate what
-        is in it, and a person still decides whether any of it happens."""
+    def test_every_attended_mutation_actually_asks(self) -> None:
+        """The property the second list rests on. A name added there without
+        the receipt requirement would be an unattended mutation described as
+        an attended one, which is the worst way for this document to be
+        wrong."""
+        from control_api import requires_approval
+
+        for name in self.ATTENDED_MUTATIONS:
+            with self.subTest(operation=name):
+                self.assertIn(name, operations.OPERATIONS)
+                self.assertTrue(requires_approval(name))
+
+    def test_applying_is_reachable_only_behind_a_person(self) -> None:
+        """Defends: "a person still decides whether any of it happens".
+
+        Until Phase 1 wave 6 this held because `apply` could not be granted at
+        all, and the test said so. That is no longer the control -- the three
+        scopes are offered now -- so what it checks is the control that
+        replaced it: every operation those scopes buy requires an approval
+        receipt, which only a person can produce. If an apply-class operation
+        ever becomes exempt, the sentence stops being true and this is where
+        it shows.
+
+        `derive:manage` is still unofferable and is checked separately, since
+        wave 7 has not happened.
+        """
+        from control_api import requires_approval
+
         start = DASHBOARD.index("export const MCP_SCOPE_OPTIONS=[")
         offered = set(re.findall(
             r"\{id:'([^']+)'", DASHBOARD[start : DASHBOARD.index("];", start)]
         ))
-        for scope in ("apply", "semantic:apply", "reload", "derive:manage"):
+        self.assertNotIn("derive:manage", offered)
+        for scope in ("apply", "semantic:apply", "reload"):
             with self.subTest(scope=scope):
-                self.assertNotIn(scope, offered)
+                self.assertIn(
+                    scope, offered, "wave 6 made this grantable"
+                )
+                for name, operation in operations.OPERATIONS.items():
+                    if scope in operation.required_scopes:
+                        self.assertTrue(
+                            requires_approval(name),
+                            f"{name} costs {scope} and asks nobody",
+                        )
 
     def test_the_default_preset_discloses_only_the_configured_workspace(self) -> None:
         """"`analysis` is the default and excludes both of the scopes that

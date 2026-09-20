@@ -569,10 +569,28 @@ class AllowlistDriftTests(unittest.TestCase):
     #: that can serve a third-party database; the rest mutate.
     NEVER_OFFERED_TO_AGENTS = frozenset({
         "full", "admin", "federation:provision", "federation:register",
-        "semantic:apply", "semantic:admin", "semantic:generate",
-        "semantic:data", "apply",
-        "reload", "derive:manage",
+        "semantic:admin", "semantic:generate",
+        "semantic:data",
+        "derive:manage",
     })
+    # `apply`, `semantic:apply` and `reload` were here until Phase 1 wave 6,
+    # and lifting them is that wave's substantive decision rather than a
+    # consequence of it. They authorise the irreversible half of the loop: a
+    # workspace write, a curated-meaning write, and telling the tile service
+    # to serve the result. Nothing about them got safer -- what changed is
+    # that wave 5 put a person in front of each one. Their risk classes are
+    # outside `NO_APPROVAL_RISKS`, so the configuration API refuses every one
+    # of them without a receipt bound to that exact request, and the receipt
+    # can only come from a prompt a client rendered and a person answered.
+    # Without that gate these pins would still be the only control and would
+    # still belong here.
+    #
+    # `reload` is the mildest of the three and is allowlisted for the
+    # narrowest reason: an apply that commits and then answers 504 because the
+    # reload was not observed leaves a workspace on disk that the tile service
+    # has not picked up, and re-requesting a reload is the recovery. It writes
+    # nothing. It still asks a person, which is what stops a repeated reload
+    # being a way to spend the tile service's time.
     # `visual` was here until Phase 1 wave 4. It renders a proposal through a
     # real browser and attaches the result as evidence, which is what makes a
     # proposal reviewable -- without it an agent can propose but cannot show
@@ -626,14 +644,24 @@ class AllowlistDriftTests(unittest.TestCase):
             " will not issue",
         )
 
-    def test_the_dashboard_offers_every_scope_an_allowlisted_read_needs(self) -> None:
+    def test_the_dashboard_offers_every_scope_an_allowlisted_operation_needs(
+        self,
+    ) -> None:
         """The direction that actually bit. A tool can be correct, allowlisted
-        and enforced, and still unusable because no operator can grant it."""
+        and enforced, and still unusable because no operator can grant it.
+
+        Covered reads only until Phase 1 wave 6, which is when the first
+        mutations became grantable and the gap stopped being theoretical --
+        `apply` was allowlisted from Phase 0 and no dashboard option granted
+        it. What is exempt is what is deliberately pinned, so a scope is either
+        offerable or on the pin list, and never neither.
+        """
         needed = set()
         for operation in operations.OPERATIONS.values():
-            if not operation.mutating:
-                needed.update(operation.required_scopes)
-        missing = needed - self.dashboard_scope_options()
+            needed.update(operation.required_scopes)
+        missing = (
+            needed - self.NEVER_OFFERED_TO_AGENTS - self.dashboard_scope_options()
+        )
         self.assertEqual(
             set(),
             missing,

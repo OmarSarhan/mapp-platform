@@ -26,6 +26,8 @@ from runtime import APPROVALS_CLAIM  # noqa: E402
 from runtime import APPROVALS_CONFIRM  # noqa: E402
 from runtime import APPROVALS_CREATE  # noqa: E402
 from runtime import PROPOSALS_SHOW  # noqa: E402
+from runtime import PROPOSALS_APPLY  # noqa: E402
+from runtime import XYZ_RELOAD  # noqa: E402
 from runtime import _approval_message  # noqa: E402
 from runtime import _elicitation_modes  # noqa: E402
 from runtime import build_runtime  # noqa: E402
@@ -439,6 +441,304 @@ class CapabilityTests(unittest.TestCase):
             session = None
 
         self.assertEqual(frozenset(), _elicitation_modes(Bare()))
+
+
+class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
+    """The tools that change what the map serves.
+
+    Driven through the registered functions with the platform stubbed, because
+    what is this tool's own judgement is: what it shows the person before
+    asking, what it refuses before asking anybody, and how it reports an apply
+    that committed while the reload did not.
+    """
+
+    PROPOSAL = {
+        "proposal": {
+            "id": "p-1",
+            "status": "pending",
+            "explanation": "Rename the passport layer folder.",
+            "originalRevision": "r-1",
+            "diff": [
+                {"op": "replace", "path": "/locale/layers/A/group",
+                 "old": "Old", "value": "New"},
+                {"op": "replace", "path": "/locale/layers/B/group",
+                 "old": "Old", "value": "New"},
+            ],
+            "warnings": [{"ruleId": "layer.group", "message": "check me"}],
+        },
+        "revision": "r-1",
+    }
+
+    APPLIED = {
+        "proposal": {"id": "p-1", "status": "applied",
+                     "appliedRevision": "r-2"},
+        "reload": {"status": {"completed": True}},
+        "operation": {"id": "op-9"},
+    }
+
+    class Api:
+        def __init__(self, outer, *, applied=None, proposal=None) -> None:
+            self.outer = outer
+            self.applied = applied if applied is not None else outer.APPLIED
+            self.proposal = proposal if proposal is not None else outer.PROPOSAL
+            self.calls = []
+
+        def get(self, **kwargs):
+            self.calls.append({"method": "GET", **kwargs})
+            if "/proposals/" in kwargs["path"]:
+                return self.proposal
+            if kwargs["path"].startswith("/api/operations/"):
+                return {"operation": {"result": {"visual": {
+                    "diagnosis": {"candidate": {"checks": [
+                        {"id": "visual.layer_activation", "passed": False},
+                    ]}},
+                    "artifacts": {"afterMap": "run/after.png"},
+                }}}}
+            return {}
+
+        def post(self, **kwargs):
+            self.calls.append({"method": "POST", **kwargs})
+            path = kwargs["path"]
+            if path == APPROVALS_CREATE["path_template"]:
+                return {"handle": HANDLE, "reference": "a" * 64,
+                        "approvalUrl": APPROVAL_URL}
+            if path == APPROVALS_CLAIM["path_template"]:
+                return {"status": "approved", "receipt": RECEIPT}
+            if path == APPROVALS_CONFIRM["path_template"]:
+                return {"decided": True}
+            return self.applied
+
+        def posted_to(self, path):
+            return [c for c in self.calls
+                    if c["method"] == "POST" and c["path"] == path]
+
+    #: What the `authoring-apply` preset grants, so these exercise the grant
+    #: an operator can actually issue rather than an invented one.
+    APPLYING = ("mcp:connect inspect derive semantic:inspect propose"
+                " semantic:propose visual apply semantic:apply reload")
+
+    def build(self, name, api, scopes=None):
+        server = build_runtime(
+            resource=ProtectedResource(
+                origin="http://mcp.localhost", issuer="http://mcp.localhost"
+            ),
+            exchange=FakeExchange(),
+            config_api=api,
+        )
+        token = CURRENT_CALLER.set(Authenticated(
+            {"sub": "oauth:grant",
+             "scope": scopes or self.APPLYING,
+             "aud": "http://mcp.localhost/mcp"},
+            "mapp_a_live",
+        ))
+        self.addCleanup(CURRENT_CALLER.reset, token)
+        return server._tool_manager._tools[name].fn
+
+    def agreeing(self):
+        return FakeContext(
+            elicitation=Capability(form={}),
+            form=Answer("accept", Confirmation(True)),
+        )
+
+    async def test_the_person_is_shown_the_diff_not_the_arguments(self) -> None:
+        """A summary assembled from what the model passed in would let the
+        agent describe its own change."""
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual("Rename the passport layer folder.", packet["summary"])
+        self.assertEqual(2, packet["changeCount"])
+        self.assertEqual(
+            ["/locale/layers/A/group", "/locale/layers/B/group"],
+            [change["path"] for change in packet["changes"]],
+        )
+        self.assertEqual("r-1", packet["originalRevision"])
+
+    async def test_warnings_reach_the_person_deciding(self) -> None:
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual(
+            [{"ruleId": "layer.group", "message": "check me"}],
+            packet["warnings"],
+        )
+
+    async def test_evidence_is_read_from_the_platform_not_taken_on_trust(
+        self,
+    ) -> None:
+        """The agent names which run to show; what that run found comes from
+        the platform, so an agent cannot report a pass that did not happen."""
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1", "op-7")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertFalse(packet["evidence"]["passed"])
+        self.assertEqual(
+            {"afterMap": "run/after.png"}, packet["evidence"]["artifacts"]
+        )
+
+    async def test_evidence_that_cannot_be_read_says_so_rather_than_vanishing(
+        self,
+    ) -> None:
+        """Reading an operation costs `derive`, which a hand-picked grant may
+        not carry. Refusing the apply over its illustration would refuse the
+        wrong thing; dropping it quietly would let the person believe no
+        render was asked for."""
+        api = self.Api(self)
+        apply = self.build(
+            "proposals_apply", api, scopes="mcp:connect inspect apply",
+        )
+        await apply(self.agreeing(), "p-1", "op-7")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual("op-7", packet["evidence"]["operationId"])
+        self.assertIn("derive", packet["evidence"]["unavailable"])
+        self.assertNotIn("passed", packet["evidence"])
+
+    async def test_no_evidence_is_asked_for_when_none_is_named(self) -> None:
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        self.assertEqual(
+            [], [c for c in api.calls if "/api/operations/" in c["path"]]
+        )
+
+    async def test_a_proposal_that_is_not_pending_is_refused_before_asking(
+        self,
+    ) -> None:
+        """A person asked to approve an applied proposal would be agreeing to
+        nothing, and the platform would refuse afterwards anyway -- with a
+        prompt already spent."""
+        api = self.Api(self, proposal={
+            "proposal": {"id": "p-1", "status": "applied"}, "revision": "r-2",
+        })
+        apply = self.build("proposals_apply", api)
+        ctx = self.agreeing()
+        with self.assertRaises(ToolError) as raised:
+            await apply(ctx, "p-1")
+        self.assertIn("applied", str(raised.exception))
+        self.assertEqual([], ctx.asked)
+        self.assertEqual(
+            [], api.posted_to(APPROVALS_CREATE["path_template"])
+        )
+
+    async def test_declining_applies_nothing(self) -> None:
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        ctx = FakeContext(
+            elicitation=Capability(form={}), form=Answer("decline"),
+        )
+        with self.assertRaises(ToolError):
+            await apply(ctx, "p-1")
+        self.assertEqual(
+            [], api.posted_to("/api/proposals/p-1/apply"),
+            "a declined apply must not reach the platform",
+        )
+
+    async def test_the_request_approved_is_the_request_made(self) -> None:
+        """One body object, digested for the approval and sent with the
+        credential, so the two cannot describe different requests."""
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        applied = api.posted_to("/api/proposals/p-1/apply")
+        self.assertEqual(1, len(applied))
+        self.assertEqual({"approved": True}, applied[0]["body"])
+        self.assertEqual(RECEIPT, applied[0]["receipt"])
+
+    async def test_a_successful_apply_reports_what_happened(self) -> None:
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        result = await apply(self.agreeing(), "p-1")
+        self.assertTrue(result["applied"])
+        self.assertTrue(result["mapReloaded"])
+        self.assertEqual("r-2", result["appliedRevision"])
+        self.assertEqual("op-9", result["operationId"])
+        self.assertNotIn("note", result)
+
+    async def test_a_committed_apply_whose_reload_lagged_says_do_not_retry(
+        self,
+    ) -> None:
+        """Two facts with different consequences. Collapsing them into one
+        boolean invites a second apply of a change that already happened."""
+        api = self.Api(self, applied={
+            "proposal": {"id": "p-1", "status": "applied",
+                         "appliedRevision": "r-2"},
+            "reload": {"status": {"completed": False},
+                       "error": "Reload coordination failed: TimeoutError"},
+            "operation": {"id": "op-9"},
+        })
+        apply = self.build("proposals_apply", api)
+        result = await apply(self.agreeing(), "p-1")
+        self.assertTrue(result["applied"])
+        self.assertFalse(result["mapReloaded"])
+        self.assertIn("Do not apply again", result["note"])
+        self.assertIn("xyz_reload", result["note"])
+        self.assertIn("TimeoutError", result["reloadError"])
+
+    async def test_the_504_carrying_the_result_is_not_read_as_a_refusal(
+        self,
+    ) -> None:
+        """The platform answers 504 with the whole result when the workspace
+        was written and the reload was not observed. Reducing that to a
+        refusal would tell an agent to retry a change that happened."""
+        self.assertIn(504, PROPOSALS_APPLY["result_statuses"])
+        self.assertIn(504, XYZ_RELOAD["result_statuses"])
+
+    async def test_a_semantic_apply_shows_its_own_changes(self) -> None:
+        api = self.Api(self, proposal={
+            "proposal": {"id": "s-1", "explanation": "Rename a measure.",
+                         "changes": [{"op": "replace", "path": "/a"}]},
+        })
+        apply = self.build("semantic_proposals_apply", api)
+        await apply(self.agreeing(), "s-1")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual("Rename a measure.", packet["summary"])
+        self.assertEqual(1, packet["changeCount"])
+        self.assertEqual(
+            {"confirmed": True},
+            api.posted_to("/api/semantic/proposals/s-1/apply")[0]["body"],
+        )
+
+    async def test_a_reload_asks_before_it_reloads(self) -> None:
+        api = self.Api(self, applied={"reload": {"status": {"completed": True}}})
+        reload = self.build("xyz_reload", api)
+        ctx = self.agreeing()
+        await reload(ctx)
+        self.assertEqual(1, len(ctx.asked))
+        self.assertEqual(
+            {"confirmed": True}, api.posted_to("/api/xyz/reload")[0]["body"]
+        )
+        self.assertEqual(RECEIPT, api.posted_to("/api/xyz/reload")[0]["receipt"])
+
+    async def test_a_proposal_id_is_encoded_into_the_path(self) -> None:
+        api = self.Api(self)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p/1")
+        self.assertTrue(
+            any(c["path"] == "/api/proposals/p%2F1/apply"
+                for c in api.calls),
+            [c["path"] for c in api.calls],
+        )
+
+    async def test_the_change_window_is_bounded(self) -> None:
+        """A person is deciding, not auditing. The panel says how many were
+        left out and the proposal holds them all."""
+        api = self.Api(self, proposal={
+            "proposal": {
+                "id": "p-1", "status": "pending", "explanation": "Many.",
+                "originalRevision": "r-1",
+                "diff": [{"op": "replace", "path": f"/a/{n}"}
+                         for n in range(50)],
+            },
+            "revision": "r-1",
+        })
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual(50, packet["changeCount"])
+        self.assertEqual(20, len(packet["changes"]))
 
 
 class GatedToolTests(unittest.TestCase):

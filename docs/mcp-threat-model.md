@@ -435,6 +435,26 @@ saves, no credential administration, no token issuance or revocation, and no
 dashboard or audit administration exposed; every consequential operation
 requiring a fresh token B bound to one request.
 
+**What changed at Phase 1 wave 6.** `apply`, `semantic:apply` and `reload`
+became grantable, so a hostile client holding them can reach operations that
+write the workspace, write curated meaning and tell the tile service to serve
+the result. Until wave 6 those scopes were unofferable and that unofferability
+*was* the control. It no longer is, and the control that replaced it is wave
+5's receipt: every one of those operations is refused by the configuration API
+without a receipt bound to that exact request, and a receipt exists only
+because a person answered a prompt their own client rendered. So a hostile
+client's reach into the irreversible half is exactly "it can ask", and what it
+can do unattended is unchanged — the proposal creates and the previews, none of
+which alter what the map serves.
+
+The honest residual is that asking is itself an attack surface. A hostile
+client can ask repeatedly, and it composes the *operation* even though it does
+not compose the prompt: the summary the person reads is read back from the
+platform's own record of the proposal, not from the tool's arguments, so the
+description cannot be made to disagree with the change. What it can do is
+choose a moment, and phrase nothing. That is approval fatigue, which is
+recorded above as having no control until wave 8.
+
 What it gets is disclosure, at the speed of a script. The surface is 37 reads,
 so a hostile client holding an ordinary analysis grant can enumerate the whole
 workspace description in a few dozen calls — every layer and the relation it

@@ -246,6 +246,39 @@ single-use. `operations_show` follows the asynchronous half, and `xyz_status`
 already answers whether the tile service picked the change up — the two tools
 that looked like completeness in Phase 0 turn out to close this loop.
 
+**Built.** `proposals_apply`, `semantic_proposals_apply` and `xyz_reload`, all
+through wave 5's gate. What the plan did not say, and what this wave actually
+turned on:
+
+- **Three pins came off `NEVER_OFFERED_TO_AGENTS`**: `apply`, `semantic:apply`
+  and `reload`. That is the substance of the wave rather than a consequence of
+  it. Until now "a person still decides" held because those scopes could not be
+  granted at all; now it holds because every operation they buy is refused
+  without a receipt. The threat model says so in those terms, and the claim
+  tests were rewritten to check the new control rather than the old one.
+- **The dashboard had to grow three options and a preset.** A scope the broker
+  will issue and no operator can grant makes a correct tool unusable — the
+  failure the drift guard was written for. That guard covered reads only,
+  because until now only reads were offerable; it now covers every allowlisted
+  operation except what is deliberately pinned, and `authoring-apply` is the
+  preset an operator actually clicks.
+- **`xyz.reload` was not allowlisted and had to be**, for a narrower reason
+  than the plan implies. `proposals.apply` already reloads. The case reload
+  exists for is an apply that commits and then answers 504 because the reload
+  was not observed — which is why `_applied` reports the write and the reload
+  as two facts and tells the agent not to apply again.
+- **Evidence had to be threaded, not assumed.** Visual results live on
+  operations, not on the proposal record, so `proposals_apply` takes an
+  `evidence_operation_id` and reads the outcome from the platform. Reading an
+  operation costs `derive`, which every preset but `discovery` carries and a
+  hand-picked grant may not; a grant without it gets a packet saying evidence
+  was asked for and could not be read, rather than a failed apply or a silent
+  omission.
+
+**The join wave 5 could not demonstrate is now made**, and `GatedToolTests` is
+no longer vacuous: it checks three real tools and fails if any of them stops
+calling the gate.
+
 ## Wave 7 — the derived-layer lifecycle
 
 **Build:** `derived_layers_create`, `_replace`, `_refresh`, `_drop` under wave

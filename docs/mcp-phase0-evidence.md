@@ -29,21 +29,27 @@ component and the configuration API's validation of the credential it issues.
 | --- | --- |
 | Edge listener | 6 method/path routes across the 4 public paths Caddy publishes, over an `AF_UNIX` socket |
 | Control listener | `/healthz`, `/internal/oauth/exchange`, `/internal/oauth/introspect`, `/internal/oauth/revoke`, `/internal/oauth/redeem` — `mcp-control` network only |
-| MCP runtime | `mapp-mcp`: the official Python SDK behind a protocol-era guard, 44 tools of which 5 write, RFC 9728 metadata, token-A authentication per call, `tools/list` filtered to what the grant can call |
+| MCP runtime | `mapp-mcp`: the official Python SDK behind a protocol-era guard, 47 tools of which 8 write, RFC 9728 metadata, token-A authentication per call, `tools/list` filtered to what the grant can call |
 | Control schema | 15 tables, 8 migrations, owned by `mapp_control` |
 | Canonicalization | `mapp-jcs-v1`, vendored independently into the broker, the configuration API and the MCP runtime — three copies, cross-checked |
 | Credential administration | Dashboard: agent-client issuance and consent inspection and revocation, both audited, administrator-session only |
-| Operation allowlist | 48 of the platform's 69 actions |
-| Scope vocabulary | 13 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
+| Operation allowlist | 49 of the platform's 69 actions |
+| Scope vocabulary | 14 accepted, derived from the allowlist plus the MCP scopes; 2 advertised in metadata |
 
 Public paths on the MCP origin: `/.well-known/oauth-authorization-server`,
 `/oauth/authorize`, `/oauth/token`, `/oauth/login`. Everything else 404s.
 
-Accepted scopes: `apply`, `derive`, `federation:provision`, `inspect`,
-`mcp:connect`, `propose`, `semantic:apply`, `semantic:inspect`, `visual`.
-Derived from the operation table rather than restated, after the two disagreed
-and four of the five allowlisted operations turned out to require scopes the
-issuer refused to issue.
+Accepted scopes: `apply`, `derive`, `derive:manage`, `federation:observe`,
+`federation:provision`, `inspect`, `mcp:connect`, `propose`, `reload`,
+`semantic:apply`, `semantic:inspect`, `semantic:propose`, `semantic:source`,
+`visual`. Derived from the operation table rather than restated, after the two
+disagreed and four of the five allowlisted operations turned out to require
+scopes the issuer refused to issue.
+
+Accepted is not the same as offerable. `derive:manage`, `federation:provision`,
+`federation:register`, `semantic:admin`, `semantic:generate`, `semantic:data`,
+`full` and `admin` are pinned out of the dashboard, so no operator can grant
+them to an agent whatever the issuer would mint.
 
 ## Test evidence
 

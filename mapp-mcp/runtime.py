@@ -44,6 +44,7 @@ from config_api_client import semantic_search_query
 from exchange_client import ExchangeRefused
 from exchange_client import ExchangeUnavailable
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
@@ -327,6 +328,55 @@ OPERATIONS_SHOW = {
     "method": "GET",
     "path_template": "/api/operations/{operationId}",
     "scopes": ("derive",),
+}
+
+#: The irreversible half of the loop. Each requires an approval receipt, which
+#: the configuration API enforces from the action's risk class -- these
+#: descriptors could not opt out of it if they tried.
+PROPOSALS_APPLY = {
+    "operation_id": "proposals.apply",
+    "method": "POST",
+    "path_template": "/api/proposals/{proposalId}/apply",
+    "scopes": ("apply",),
+    # Applying writes the workspace and then waits on the tile service, whose
+    # own wait is 30 seconds. The read default of 15 would report a working
+    # apply as an unavailable configuration API, which is the failure the
+    # screenshot operations already taught this surface once.
+    "timeout": 60.0,
+    # Applied, but the reload was not observed. The platform answers 504 with
+    # the whole result -- the proposal is committed and the body says so --
+    # and reducing that to "the platform refused this request" would tell an
+    # agent to retry a change that already happened.
+    "result_statuses": (504,),
+    "refusal_hints": {
+        "proposal.revision": (
+            "The workspace moved since this proposal was made. Nothing was"
+            " applied. Compose the change again from the current revision."
+        ),
+        "proposal.validation": (
+            "The proposal no longer passes validation against the current"
+            " workspace. Nothing was applied."
+        ),
+    },
+}
+
+SEMANTIC_PROPOSALS_APPLY = {
+    "operation_id": "semantic.proposals.apply",
+    "method": "POST",
+    "path_template": "/api/semantic/proposals/{proposalId}/apply",
+    "scopes": ("semantic:apply",),
+    "timeout": 45.0,
+}
+
+XYZ_RELOAD = {
+    "operation_id": "xyz.reload",
+    "method": "POST",
+    "path_template": "/api/xyz/reload",
+    "scopes": ("reload",),
+    "timeout": 60.0,
+    # The same distinction as apply: a reload that was requested and not
+    # observed completing is a result, not a refusal.
+    "result_statuses": (504,),
 }
 
 DERIVED_LAYERS_CAPABILITIES = {
@@ -2008,6 +2058,246 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "{proposalId}", quote(proposal_id, safe="")
         )
         return _without_meta(spend(SEMANTIC_PROPOSALS_SHOW, path=path))
+
+    @tool(
+        operation=PROPOSALS_APPLY,
+        name="proposals_apply",
+        description=(
+            "Apply a queued proposal: write its change to the workspace and"
+            " reload the map. Asks you to approve first, showing what it would"
+            " change, and does nothing until you agree. Takes a proposalId"
+            " from proposals_list. Pass evidence_operation_id -- the operation a"
+            " proposals_preview_* run returned -- to put the rendered evidence"
+            " in front of the person deciding. This is not reversible by an"
+            " undo; recovering means proposing the inverse change."
+        ),
+    )
+    async def proposals_apply(
+        ctx: Context, proposal_id: str, evidence_operation_id: str | None = None
+    ) -> dict:
+        """The first tool that changes what the map serves.
+
+        Everything before this either read the instance or added to a queue a
+        person works through. This empties that queue, so the question it has
+        to answer is not "may this grant apply" -- an operator settled that --
+        but "does the person here, now, want this particular change".
+
+        The packet is read before asking, not composed from the arguments.
+        What a person is shown has to come from the proposal the platform
+        holds; a summary assembled from what the model passed in would let the
+        agent describe its own change.
+        """
+        proposal = _apply_packet(proposal_id, evidence_operation_id)
+        target = PROPOSALS_APPLY["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        # Built once and passed to both. The digest the approval binds and the
+        # digest the credential binds are computed from this same object, so
+        # they cannot describe different requests.
+        body = {"approved": True}
+        receipt = await approval_gate(
+            ctx, PROPOSALS_APPLY, path=target, body=body,
+            tool_name="proposals_apply", packet=proposal,
+        )
+        return _applied(spend(
+            PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
+        ))
+
+    @tool(
+        operation=SEMANTIC_PROPOSALS_APPLY,
+        name="semantic_proposals_apply",
+        description=(
+            "Apply a queued semantic proposal, writing the proposed meaning"
+            " into the catalog. Asks you to approve first. Takes a proposalId"
+            " from semantic_proposals_list."
+        ),
+    )
+    async def semantic_proposals_apply(ctx: Context, proposal_id: str) -> dict:
+        """The same decision for curated meaning.
+
+        Separate from the workspace apply and separately scoped, because they
+        change different things and an operator should be able to hand over
+        one without the other.
+        """
+        packet = _semantic_apply_packet(proposal_id)
+        target = SEMANTIC_PROPOSALS_APPLY["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        body = {"confirmed": True}
+        receipt = await approval_gate(
+            ctx, SEMANTIC_PROPOSALS_APPLY, path=target, body=body,
+            tool_name="semantic_proposals_apply", packet=packet,
+        )
+        return _without_meta(spend(
+            SEMANTIC_PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
+        ))
+
+    @tool(
+        operation=XYZ_RELOAD,
+        name="xyz_reload",
+        description=(
+            "Ask the tile service to pick up the workspace already on disk."
+            " Writes nothing and applies nothing. Use this when an apply"
+            " committed but reported that the reload was not observed --"
+            " xyz_status says whether that is the case. Asks you to approve"
+            " first."
+        ),
+    )
+    async def xyz_reload(ctx: Context) -> dict:
+        """Recovery, not part of the ordinary loop.
+
+        `proposals_apply` already reloads; this exists for the case it cannot
+        cover, where the apply committed and the reload did not complete
+        within the wait. Without it the only way out is an operator at a
+        terminal, which is exactly the situation an agent is supposed to make
+        rarer.
+
+        It still asks a person. A reload writes nothing, so the reason is not
+        the change -- it is that an unattended reload is the one operation on
+        this surface an agent could usefully repeat, and the tile service
+        would be the thing paying for it.
+        """
+        body = {"confirmed": True}
+        receipt = await approval_gate(
+            ctx, XYZ_RELOAD, path=XYZ_RELOAD["path_template"], body=body,
+            tool_name="xyz_reload",
+            packet={"summary": "Reload the map from the workspace on disk."},
+        )
+        return _without_meta(spend(
+            XYZ_RELOAD, path=XYZ_RELOAD["path_template"], body=body,
+            receipt=receipt,
+        ))
+
+    def _apply_packet(proposal_id, evidence_operation_id):
+        """What the person deciding is shown, read from the platform.
+
+        `proposals_show` is the same read a reviewer would do, so this is the
+        diff the dashboard would show them and not a second description of it.
+        A proposal that cannot be read cannot be approved: asking somebody to
+        agree to a change nobody can describe is worse than refusing.
+        """
+        target = PROPOSALS_SHOW["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        payload = spend(PROPOSALS_SHOW, path=target)
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        diff = proposal.get("diff")
+        diff = diff if isinstance(diff, list) else []
+        status = proposal.get("status")
+        if status != "pending":
+            # Refused before anybody is asked. A person asked to approve an
+            # applied proposal would be agreeing to nothing, and the platform
+            # would refuse afterwards anyway -- with a prompt already spent.
+            raise ToolError(
+                f"This proposal is {status}, so there is nothing to apply."
+                " proposals_list shows which are still pending."
+            )
+        applicable = _applicability(proposal, payload.get("revision"))
+        packet = {
+            "summary": proposal.get("explanation")
+            or f"Apply proposal {proposal_id}.",
+            "changeCount": len(diff),
+            # A window, not the diff. The whole thing can be hundreds of
+            # entries and the person is deciding, not auditing -- the panel
+            # says how many were left out and the proposal holds them all.
+            "changes": [_change_summary(entry) for entry in diff[:20]],
+            "proposalId": proposal.get("id"),
+            "originalRevision": proposal.get("originalRevision"),
+            "currentRevision": payload.get("revision"),
+        }
+        if applicable is not None:
+            packet["applicability"] = applicable
+        warnings = proposal.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            packet["warnings"] = warnings
+        if evidence_operation_id is not None:
+            packet["evidence"] = _apply_evidence(evidence_operation_id)
+        return packet
+
+    def _apply_evidence(operation_id):
+        """The rendered result of a preview run, for the person deciding.
+
+        Read here rather than taken as an argument. The agent names which run
+        to show; what that run found comes from the platform, so an agent
+        cannot report a pass that did not happen.
+
+        A failure here does not fail the apply. Reading an operation costs
+        `derive`, which every preset but `discovery` carries and a hand-picked
+        grant may not, and an apply that refuses because its *illustration*
+        could not be fetched would be refusing the wrong thing. What is not
+        done is dropping it quietly: the packet says evidence was asked for
+        and why it is missing, so the person decides knowing there is a render
+        they are not looking at.
+        """
+        target = OPERATIONS_SHOW["path_template"].replace(
+            "{operationId}", quote(operation_id, safe="")
+        )
+        try:
+            return _visual_outcome(spend(OPERATIONS_SHOW, path=target))
+        except ToolError as refusal:
+            return {
+                "operationId": operation_id,
+                "unavailable": str(refusal),
+            }
+
+    def _semantic_apply_packet(proposal_id):
+        """The semantic counterpart, read the same way and for the reason."""
+        target = SEMANTIC_PROPOSALS_SHOW["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        payload = _without_meta(spend(SEMANTIC_PROPOSALS_SHOW, path=target))
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else payload
+        changes = proposal.get("changes")
+        changes = changes if isinstance(changes, list) else []
+        return {
+            "summary": proposal.get("explanation")
+            or proposal.get("rationale")
+            or f"Apply semantic proposal {proposal_id}.",
+            "changeCount": len(changes),
+            "changes": [_change_summary(entry) for entry in changes[:20]],
+            "proposalId": proposal.get("id") or proposal_id,
+        }
+
+    def _applied(payload):
+        """What happened, separating the write from the tile service.
+
+        The platform answers 504 with the whole result when the workspace was
+        written and the reload was not observed completing. That is two facts
+        and they have different consequences: the change is live in the
+        configuration either way, and whether the map serves it yet is what
+        xyz_status answers and xyz_reload can retry. Reporting one boolean
+        would collapse them and invite a second apply of a change that already
+        happened.
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        reload_result = payload.get("reload")
+        reload_result = reload_result if isinstance(reload_result, dict) else {}
+        status = reload_result.get("status")
+        status = status if isinstance(status, dict) else {}
+        completed = bool(status.get("completed"))
+        applied = {
+            "applied": proposal.get("status") == "applied",
+            "proposalId": proposal.get("id"),
+            "appliedRevision": proposal.get("appliedRevision"),
+            "mapReloaded": completed,
+        }
+        if not completed:
+            applied["note"] = (
+                "The change is applied and the workspace is updated. The tile"
+                " service was asked to reload and had not confirmed it within"
+                " the wait. Do not apply again -- check xyz_status, and use"
+                " xyz_reload if it is still serving the old workspace."
+            )
+            if reload_result.get("error"):
+                applied["reloadError"] = reload_result["error"]
+        operation = payload.get("operation")
+        if isinstance(operation, dict) and operation.get("id"):
+            applied["operationId"] = operation["id"]
+        return applied
 
     @tool(
         operation=XYZ_STATUS,
