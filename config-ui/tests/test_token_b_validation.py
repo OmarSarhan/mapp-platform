@@ -481,6 +481,77 @@ class ApprovalReceiptTests(TokenBTestCase):
                 self.assertNotIn(risk, classified)
 
 
+class RequestDigestShapeTests(unittest.TestCase):
+    """One digest, produced in one place, accepted and matched in others.
+
+    `execution_envelope.digest` produces it, the broker binds a token to it,
+    `POST /api/approvals` records what an approval covers, and
+    `redeem_receipt` matches the receipt against it. Four places, and only the
+    first decides the shape.
+
+    Wave 5 shipped with the approval route demanding a bare 64-character
+    sha256 -- the digest without its scheme -- so every approval an agent
+    asked for was refused `approval.digest_invalid` and the gate could never
+    run. Nothing caught it: the store tests used a bare 64-character fixture,
+    which agreed with the route, and the handler tests supplied the scope and
+    the digest by hand. It took driving a real client.
+    """
+
+    def real_digest(self):
+        return execution_envelope.digest(
+            instance=INSTANCE,
+            method="POST",
+            operation_id="proposals.apply",
+            path_template="/api/proposals/{proposalId}/apply",
+            path="/api/proposals/p1/apply",
+            query="",
+            body={"approved": True},
+            resolved_defaults=None,
+            confirmation_fields=None,
+            revision_binding=None,
+        )
+
+    def test_the_route_accepts_what_the_envelope_produces(self) -> None:
+        self.assertIsNotNone(
+            app.REQUEST_DIGEST.fullmatch(self.real_digest()),
+            "the approval route would refuse a digest the platform itself"
+            " computed",
+        )
+
+    def test_the_declared_schema_accepts_it_too(self) -> None:
+        """The handler and the published contract must agree, or a client
+        built from the schema sends what the handler rejects."""
+        from control_api import ACTION_SCHEMAS
+
+        pattern = (ACTION_SCHEMAS["approvals.create"]["inputSchema"]
+                   ["properties"]["requestDigest"]["pattern"])
+        self.assertIsNotNone(re.fullmatch(pattern, self.real_digest()))
+
+    def test_the_broker_binds_the_same_shape(self) -> None:
+        """The token and the approval must be about the same string, or a
+        receipt could never match the request it was minted for."""
+        sys.path.insert(
+            0, str(Path(__file__).resolve().parents[2] / "mcp-auth")
+        )
+        import exchange as broker_exchange
+
+        self.assertIsNotNone(
+            broker_exchange.DIGEST_PATTERN.fullmatch(self.real_digest())
+        )
+
+    def test_a_bare_sha256_is_refused(self) -> None:
+        """The exact wrong value that shipped. A digest without its scheme
+        cannot be told apart from one computed under a different scheme, which
+        is the whole reason the prefix exists."""
+        self.assertIsNone(app.REQUEST_DIGEST.fullmatch("a" * 64))
+
+    def test_an_empty_digest_is_refused(self) -> None:
+        """The scheme alone matches a prefix test and binds to nothing."""
+        self.assertIsNone(
+            app.REQUEST_DIGEST.fullmatch(f"{canonical.SCHEME}:")
+        )
+
+
 class ReceiptHeaderTests(unittest.TestCase):
     """The two ends must name the header identically.
 
@@ -520,19 +591,43 @@ class RouteGateAlignmentTests(unittest.TestCase):
     exactly why the allowlist mints both scopes for it.
     """
 
-    #: One concrete path per allowlisted operation. Concrete on purpose: the
-    #: router matches paths, not templates, so a template would not exercise it.
-    PATHS = {
-        "layers.values": ("GET", "/api/layers/roads/values"),
-        "derived-layers.refresh": ("POST", "/api/derived-layers/d1/refresh"),
-        "federation.aliases.observe": (
-            "POST", "/api/federation/aliases/a1/observe",
-        ),
-        "proposals.apply": ("POST", "/api/proposals/p1/apply"),
-        "semantic.proposals.apply": (
-            "POST", "/api/semantic/proposals/p1/apply",
-        ),
+    #: Placeholders that need a value the router will actually match. Every
+    #: other `{segment}` takes the generic one below.
+    SEGMENTS = {
+        "alias": "a1",
+        "name": "d1",
+        "layerKey": "roads",
+        "operationId": "op1",
+        "proposalId": "p1",
     }
+
+    @classmethod
+    def paths(cls):
+        """One concrete path per allowlisted operation, derived from the
+        allowlist rather than listed.
+
+        Concrete on purpose: the router matches paths, not templates, so a
+        template would not exercise it. Derived on purpose, and that is the
+        correction -- this was a hand-written table of five operations, and
+        wave 5 added three the table did not know about. All three fell
+        through to the `full` catch-all, so the entire approval flow was
+        unreachable in a real deployment while this test passed. A list of
+        what to check is a list somebody has to remember to extend.
+        """
+        sys.path.insert(
+            0, str(Path(__file__).resolve().parents[2] / "mcp-auth")
+        )
+        import operations as broker
+
+        found = {}
+        for name, operation in broker.OPERATIONS.items():
+            path = re.sub(
+                r"\{([A-Za-z]+)\}",
+                lambda match: cls.SEGMENTS.get(match.group(1), "x1"),
+                operation.path_template,
+            )
+            found[name] = (operation.method, path)
+        return found
 
     def exchanged_scopes(self, name):
         from control_api import ACTION_SCHEMAS
@@ -540,10 +635,35 @@ class RouteGateAlignmentTests(unittest.TestCase):
         schema = ACTION_SCHEMAS[name]
         return set(schema.get("requiredScopes") or [schema["scope"]])
 
+    #: Allowlisted operations the router deliberately does not scope-gate,
+    #: because something narrower than a route rule does it instead. Pinned
+    #: rather than inferred from a None, so adding one is a decision: a route
+    #: that silently stops being gated looks exactly like a route that was
+    #: never meant to be.
+    #:
+    #: The two capabilities reads answer contract discovery and expose no
+    #: workspace state; what refuses an exchanged credential there is the
+    #: binding gate, since a token B authorises one allowlisted operation and
+    #: a route no operation names matches no template. `operations.show` is
+    #: gated per record inside the handler, from the kind of work the
+    #: operation describes, which a path rule cannot see.
+    UNGATED_BY_ROUTE = {
+        "capabilities.list",
+        "derived-layers.capabilities",
+        "operations.show",
+    }
+
     def test_the_router_demands_a_scope_the_exchange_grants(self) -> None:
-        for name, (method, path) in self.PATHS.items():
-            with self.subTest(operation=name):
+        for name, (method, path) in self.paths().items():
+            with self.subTest(operation=name, path=path):
                 gate = app.Handler._required_scope(path, method)
+                if name in self.UNGATED_BY_ROUTE:
+                    self.assertIsNone(
+                        gate,
+                        "this is pinned as gated elsewhere; if the router now"
+                        " gates it, drop it from UNGATED_BY_ROUTE",
+                    )
+                    continue
                 self.assertIsNotNone(
                     gate, "an allowlisted operation must be scope-gated"
                 )
@@ -551,16 +671,19 @@ class RouteGateAlignmentTests(unittest.TestCase):
 
     def test_no_allowlisted_route_falls_through_to_full(self) -> None:
         """`full` is on the broker's deny-list, so that would be unreachable."""
-        for name, (method, path) in self.PATHS.items():
-            with self.subTest(operation=name):
+        for name, (method, path) in self.paths().items():
+            with self.subTest(operation=name, path=path):
                 self.assertNotEqual(
-                    "full", app.Handler._required_scope(path, method)
+                    "full", app.Handler._required_scope(path, method),
+                    "this operation is allowlisted and unreachable:"
+                    " the exchange mints a credential the router then"
+                    " refuses for want of a scope nobody can ask for",
                 )
 
     def test_each_path_resolves_to_the_operation_it_belongs_to(self) -> None:
         handler = object.__new__(app.Handler)
-        for name, (method, path) in self.PATHS.items():
-            with self.subTest(operation=name):
+        for name, (method, path) in self.paths().items():
+            with self.subTest(operation=name, path=path):
                 resolved = app.Handler._resolve_operation(handler, method, path)
                 self.assertIsNotNone(resolved, f"{name} does not resolve")
                 self.assertEqual(name, resolved[0])

@@ -192,20 +192,55 @@ person deciding never holds it either — they see a *reference*, which names th
 row and spends nothing — so there is no route by which a decision made in a
 browser travels back through the agent.
 
-**Three ways a person is asked, chosen by what the client declared at
-`initialize` rather than by preference.** Measured against the shipped clients
-on 2026-09-18: Codex CLI 0.155.0 declares `{form, url}`, Claude Code 2.1.276
-declares `{}`, Gemini CLI 0.58.0 declares none. URL mode is preferred wherever
-offered, because the decision is then made in a browser session the agent does
-not control, looking at the rendered evidence rather than at a summary. A client
-that can elicit neither is refused with the dashboard address rather than left
-waiting on a page nobody has been told to open.
+**In this deployment a person is always asked in the dashboard, and that is a
+measurement rather than a preference.** The design has three paths — URL
+elicitation, form elicitation, and the dashboard — chosen by what the client
+declared. Driving the deployed stack with a real client on 2026-09-20 showed
+that neither elicitation path can run here, for two different reasons:
 
-**The model cannot answer on its own behalf.** The prompt is rendered by the
-*client* and answered by a person; an `ElicitResult` is a transport message the
-model has no way to fabricate, exactly as it cannot fabricate a tool result it
-did not receive; and none of the three approval operations is a tool, so nothing
-the model can invoke reaches them. Two tests pin the last part — one reads the
+- The modern era (2026-07-28) declares capabilities on every request, but the
+  SDK serves it through a dispatch context that refuses server-initiated
+  requests outright.
+- The handshake era (2025-11-25) has the request's own stream, but
+  `stateless_http=True` means no session is kept, so capabilities declared at
+  `initialize` are gone by the time a tool runs. Forcing the capability on and
+  retrying produced, verbatim: *"Cannot send 'elicitation/create': this
+  transport context has no back-channel for server-initiated requests."*
+
+What the shipped clients declare was measured separately, on 2026-09-18, and
+is kept because it decides which path would be taken if the transport ever
+carried one — today it decides nothing:
+
+| Client | Declares | Path it would take |
+| --- | --- | --- |
+| Codex CLI 0.155.0 | `elicitation: {form, url}` | URL |
+| Claude Code 2.1.276 | `elicitation: {}` | Form |
+| Gemini CLI 0.58.0 | none | Dashboard |
+
+`stateless_http` is not incidental: `era_guard` obligation 4 is that no
+`Mcp-Session-Id` is ever minted, and this is how that is kept. Enabling
+elicitation means trading that away, which is a decision for whoever owns the
+transport rather than a defect to fix quietly.
+
+**The security consequence is favourable, and the usability consequence is
+not.** The plan called URL elicitation the best of the three because the
+decision is made in a browser session the agent does not control, looking at
+the rendered evidence rather than a summary. The dashboard path has exactly
+that property — it *is* that property, without the client's cooperation. What
+is lost is convenience: approving takes two tool calls rather than one, with a
+person visiting a page in between. The measured client capabilities are
+recorded above because they decide which path would be taken if the transport
+ever carried one; today they decide nothing.
+
+**The model cannot answer on its own behalf.** On the path that actually runs
+the answer is given in an authenticated dashboard session the agent has no
+credential for, and what the agent holds afterwards is a receipt the platform
+minted, bound to one digest. Where elicitation is available the same holds by a
+different route: the prompt is rendered by the *client* and answered by a
+person, and an `ElicitResult` is a transport message the model has no way to
+fabricate, exactly as it cannot fabricate a tool result it did not receive. In
+neither case is any of the four approval operations a tool, so nothing the
+model can invoke reaches them. Two tests pin the last part — one reads the
 registered tools and their declared operations out of the source, and one asserts
 the gate operations are absent from the scope table the listing filter reads.
 The prompt text is composed from the packet the tool built, not by the model, so

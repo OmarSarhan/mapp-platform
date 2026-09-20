@@ -16,11 +16,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from control_fixture import ControlStoreTestCase  # noqa: E402
+import canonical  # noqa: E402
 from control_plane import ControlStore  # noqa: E402
 
 
-DIGEST = "a" * 64
-OTHER_DIGEST = "b" * 64
+#: Real digests, in the form execution_envelope.digest actually produces.
+#: These were bare 64-character strings, and agreeing with the route's own
+#: wrong assumption is how the approval gate shipped unreachable: every
+#: request an agent made was refused `approval.digest_invalid`, and nothing
+#: here could see it because nothing here went through the route.
+DIGEST = f"{canonical.SCHEME}:{'a' * 64}"
+OTHER_DIGEST = f"{canonical.SCHEME}:{'b' * 64}"
 
 
 class ApprovalTests(ControlStoreTestCase):

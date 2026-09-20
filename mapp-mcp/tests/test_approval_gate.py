@@ -359,6 +359,185 @@ class NoElicitationTests(GateTestCase):
         self.assertEqual([], ctx.asked)
 
 
+class TwoCallFlowTests(GateTestCase):
+    """The path every shipped client actually takes.
+
+    No client can be elicited on this transport, so the working flow is: ask,
+    tell the person where, and pick up their answer on the next call. Which
+    means the second call must find the *first* approval. Asking again would
+    create a second pending row, the person would have approved the first, and
+    the loop could never complete however patient either of them was.
+    """
+
+    def build_gate(self, api):
+        server = build_runtime(
+            resource=ProtectedResource(
+                origin="http://mcp.localhost", issuer="http://mcp.localhost"
+            ),
+            exchange=FakeExchange(),
+            config_api=api,
+        )
+        return server.approval_gate
+
+    async def ask(self, gate, ctx, *, grant="oauth:grant"):
+        token = CURRENT_CALLER.set(Authenticated(
+            {"sub": grant, "scope": "mcp:connect inspect apply",
+             "aud": "http://mcp.localhost/mcp"},
+            "mapp_a_live",
+        ))
+        try:
+            return await gate(
+                ctx, PROPOSALS_SHOW, path="/api/proposals/p-1",
+                tool_name="proposals_apply", packet=PACKET,
+            )
+        finally:
+            CURRENT_CALLER.reset(token)
+
+    def mute(self):
+        return FakeContext(elicitation=None)
+
+    async def test_the_first_call_asks_and_says_where(self) -> None:
+        api = FakeConfigApi(statuses=[{"status": "pending"}])
+        gate = self.build_gate(api)
+        with self.assertRaises(ToolError) as raised:
+            await self.ask(gate, self.mute())
+        self.assertIn(APPROVAL_URL, str(raised.exception))
+        self.assertIn("Rename the passport layer folder.",
+                      str(raised.exception))
+        self.assertEqual(
+            1, len(api.posted_to(APPROVALS_CREATE["path_template"]))
+        )
+
+    async def test_the_second_call_collects_the_answer(self) -> None:
+        # Only the second call claims: the first has nothing to collect.
+        api = FakeConfigApi(statuses=[{"status": "approved",
+                                       "receipt": RECEIPT}])
+        gate = self.build_gate(api)
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute())
+        self.assertEqual(RECEIPT, await self.ask(gate, self.mute()))
+        self.assertEqual(
+            1, len(api.posted_to(APPROVALS_CREATE["path_template"])),
+            "the second call must not ask for a second approval",
+        )
+
+    async def test_a_third_call_asks_afresh_once_the_answer_is_spent(
+        self,
+    ) -> None:
+        """The receipt is minted once, so holding the handle after spending it
+        would make every later attempt fail on a used approval."""
+        api = FakeConfigApi(statuses=[{"status": "approved",
+                                       "receipt": RECEIPT}])
+        gate = self.build_gate(api)
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute())
+        await self.ask(gate, self.mute())
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute())
+        self.assertEqual(
+            2, len(api.posted_to(APPROVALS_CREATE["path_template"]))
+        )
+
+    async def test_one_grants_approval_is_not_another_grants(self) -> None:
+        """Keyed by the grant the approval was asked under. A shared key would
+        hand one consent's answer to a different consent."""
+        api = FakeConfigApi(statuses=[{"status": "pending"}])
+        gate = self.build_gate(api)
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute(), grant="oauth:one")
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute(), grant="oauth:two")
+        self.assertEqual(
+            2, len(api.posted_to(APPROVALS_CREATE["path_template"])),
+            "a second grant must ask for its own approval",
+        )
+
+    async def test_a_decline_made_in_the_dashboard_ends_it(self) -> None:
+        api = FakeConfigApi(statuses=[{"status": "declined",
+                                       "receipt": None}])
+        gate = self.build_gate(api)
+        with self.assertRaises(ToolError):
+            await self.ask(gate, self.mute())
+        with self.assertRaises(ToolError) as raised:
+            await self.ask(gate, self.mute())
+        self.assertIn("declined", str(raised.exception))
+
+    async def test_what_is_remembered_is_bounded(self) -> None:
+        """An agent decides how often to ask, so this is the one structure
+        here that grows on its say-so."""
+        import runtime
+
+        api = FakeConfigApi(statuses=[{"status": "pending"}])
+        server = build_runtime(
+            resource=ProtectedResource(
+                origin="http://mcp.localhost", issuer="http://mcp.localhost"
+            ),
+            exchange=FakeExchange(),
+            config_api=api,
+        )
+        original = runtime.APPROVAL_MEMORY_LIMIT
+        runtime.APPROVAL_MEMORY_LIMIT = 3
+        self.addCleanup(
+            setattr, runtime, "APPROVAL_MEMORY_LIMIT", original
+        )
+        for index in range(6):
+            with self.assertRaises(ToolError):
+                token = CURRENT_CALLER.set(Authenticated(
+                    {"sub": f"oauth:{index}", "scope": "mcp:connect inspect",
+                     "aud": "http://mcp.localhost/mcp"},
+                    "mapp_a_live",
+                ))
+                try:
+                    await server.approval_gate(
+                        self.mute(), PROPOSALS_SHOW,
+                        path="/api/proposals/p-1",
+                        tool_name="proposals_apply", packet=PACKET,
+                    )
+                finally:
+                    CURRENT_CALLER.reset(token)
+        self.assertEqual(3, len(server.remembered_approvals))
+
+
+class TransportCannotElicitTests(unittest.TestCase):
+    """Measured on 2026-09-20 against the deployed stack, and pinned here.
+
+    Neither served era can carry a server-initiated request, so neither
+    elicitation path can run in this deployment:
+
+    - The modern era (2026-07-28) declares capabilities per request, and the
+      SDK serves it through a dispatch context whose name is the answer --
+      `_NoServerRequestsDispatchContext`.
+    - The handshake era (2025-11-25) has the request's own stream, but
+      `stateless_http=True` means no session is kept, so capabilities declared
+      at `initialize` are gone by the time a tool runs. Forcing the capability
+      on and retrying produced, verbatim: "Cannot send 'elicitation/create':
+      this transport context has no back-channel for server-initiated
+      requests."
+
+    `stateless_http` is not incidental -- era_guard obligation 4 is that no
+    `Mcp-Session-Id` is ever minted, and this is how that is kept. Enabling
+    elicitation means trading that away, which is a decision for whoever owns
+    the transport rather than a fix.
+
+    This pins the *reason*, so the day the obligation or the SDK changes, the
+    claim is re-examined rather than silently left wrong in the documentation.
+    """
+
+    def test_the_runtime_is_stateless(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
+        self.assertIn("stateless_http=True", source)
+
+    def test_the_guard_forbids_minting_a_session(self) -> None:
+        guard = (Path(__file__).resolve().parents[1] / "era_guard.py").read_text()
+        self.assertIn("Never mint or echo", guard)
+
+    def test_the_dashboard_path_is_documented_as_the_working_one(self) -> None:
+        """If someone removes this comment because elicitation "works", the
+        measurement above should be redone rather than assumed."""
+        source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
+        self.assertIn("no back-channel for server-initiated", source)
+
+
 class BindingTests(GateTestCase):
     async def test_the_approval_is_bound_to_the_request_it_is_for(self) -> None:
         """The digest is what the platform matches on when the receipt is

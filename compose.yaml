@@ -248,6 +248,12 @@ services:
       # operator for an agent client. Never fetched from here: this service has
       # no route to the public origin.
       MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      # Where an operator reaches this dashboard. Used to compose the approval
+      # link an agent hands a person, which has to be an address in *their*
+      # browser -- the internal service name this container answers on is not
+      # one. Same reason as MCP_SITE above: read to compose a URL, never
+      # fetched from here.
+      CONFIG_SITE: ${CONFIG_SITE:-http://config.localhost}
       MCP_CONFIG_API_RESOURCE: ${CONFIG_SITE:-http://config.localhost}/api
       MCP_AUTH_CLIENT_ID: ${MCP_AUTH_CLIENT_ID:-mapp-config-api}
       MCP_AUTH_CLIENT_SECRET: ${MCP_AUTH_CLIENT_SECRET:-}

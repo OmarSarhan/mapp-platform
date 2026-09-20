@@ -239,6 +239,11 @@ APPROVALS_CONFIRM = {
 APPROVAL_WAIT_SECONDS = 120
 APPROVAL_POLL_SECONDS = 2
 
+#: How many outstanding asks one runtime keeps track of. An agent decides how
+#: often to ask, so this is bounded rather than trusted; well above any real
+#: session and far below anything that matters for memory.
+APPROVAL_MEMORY_LIMIT = 256
+
 #: Said the same way wherever a person says no, so a declined approval reads
 #: as a decision rather than as a failure the agent should work around.
 _APPROVAL_DECLINED = (
@@ -1127,24 +1132,48 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             query=query,
             body=body,
         )
-        created = spend(
-            APPROVALS_CREATE,
-            path=APPROVALS_CREATE["path_template"],
-            body={
-                "operationId": operation["operation_id"],
-                "requestDigest": digest,
-                "tool": tool_name,
-                "clientId": getattr(caller, "client_id", "") or "",
-                "packet": packet,
-            },
-        )
-        handle = created.get("handle")
-        approval_url = created.get("approvalUrl") or ""
-        if not handle:
-            raise ToolError(
-                "The platform accepted the approval request but named no"
-                " handle, so there is nothing to wait on."
+        # An approval already asked for, for this exact request, by this
+        # grant. Without this a second attempt creates a second pending row:
+        # the person approves the first, the agent waits on the second, and
+        # the loop cannot complete however patient either of them is. It is
+        # the difference between a two-call flow and no flow at all.
+        #
+        # Held here rather than looked up, because the handle is the secret
+        # that claims the receipt and the platform keeps only its hash --
+        # there is nothing to look it up by. Held *here* rather than passed
+        # back through the agent for the reason nothing approval-shaped is
+        # ever a tool argument: the model never sees it and cannot supply it.
+        remembered = _remembered_approval(caller, digest)
+        if remembered is not None:
+            handle, approval_url = remembered
+            # Asked already. The only question left is whether it has been
+            # answered, so ask that before asking the person anything again --
+            # a second prompt for a decision already made is how a two-call
+            # flow turns into an endless one.
+            settled = _settled_decision(handle)
+            if settled is not None:
+                _forget_approval(caller, digest)
+                return settled
+        else:
+            created = spend(
+                APPROVALS_CREATE,
+                path=APPROVALS_CREATE["path_template"],
+                body={
+                    "operationId": operation["operation_id"],
+                    "requestDigest": digest,
+                    "tool": tool_name,
+                    "clientId": getattr(caller, "client_id", "") or "",
+                    "packet": packet,
+                },
             )
+            handle = created.get("handle")
+            approval_url = created.get("approvalUrl") or ""
+            if not handle:
+                raise ToolError(
+                    "The platform accepted the approval request but named no"
+                    " handle, so there is nothing to wait on."
+                )
+            _remember_approval(caller, digest, handle, approval_url)
 
         message = _approval_message(operation["operation_id"], packet)
         modes = _elicitation_modes(ctx)
@@ -1161,6 +1190,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             if outcome.action != "accept":
                 raise ToolError(_APPROVAL_DECLINED)
             receipt = await _await_decision(ctx, handle, approval_url)
+            _forget_approval(caller, digest)
             # Tells the client the out-of-band step is over, so it can stop
             # showing the person a link to a page that no longer needs them.
             with contextlib.suppress(Exception):
@@ -1181,19 +1211,91 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 path=APPROVALS_CONFIRM["path_template"],
                 body={"handle": handle, "accepted": accepted},
             )
+            _forget_approval(caller, digest)
             if not accepted:
                 raise ToolError(_APPROVAL_DECLINED)
             return _claim(handle)
 
-        # Neither mode: the client cannot ask anybody anything, so the
-        # dashboard is the only surface left. Refused rather than left
-        # hanging, because a tool call that waits on a page nobody has been
-        # told to open is indistinguishable from one that is broken.
+        # Neither mode. Today that is *every* client, because the transport
+        # this runtime serves has no back-channel for server-initiated
+        # requests -- measured, not assumed, and pinned by
+        # TransportCannotElicitTests. So this is the working path rather than
+        # the fallback, and it is a two-call flow: the first call asks and
+        # says where, the second spends the answer.
+        #
+        # Refused rather than left hanging, because nothing has told the
+        # person to open the page -- the refusal is what the agent repeats to
+        # them, and it carries the summary so they know what they are being
+        # asked to allow before they follow a link.
+        summary = (packet or {}).get("summary")
         raise ToolError(
-            "This client cannot ask you to approve anything, so the decision"
-            f" has to be made in the dashboard: {approval_url}"
-            " Approve it there, then ask me to try again."
+            f"This needs your approval before it can happen.{
+                ' ' + summary if summary else ''
+            } Approve it here: {approval_url}"
+            " -- then ask me to try again and I will pick up your decision."
         )
+
+    #: Approvals this process has asked for and not yet spent, keyed by the
+    #: grant and the exact request. Small and short-lived: an entry is dropped
+    #: the moment the decision is collected, and an approval the platform will
+    #: no longer honour is dropped on the next attempt at it. Lost on restart,
+    #: which costs a person one extra "ask me again" and no authority -- the
+    #: row is still there, still pending, and still theirs to decline.
+    remembered_approvals: dict = {}
+
+    def _approval_key(caller, digest):
+        # The grant, not the client and not the token: an approval belongs to
+        # the consent it was asked under. Keyed by it so two grants asking for
+        # the identical request never share one person's answer -- which is
+        # what a key of "" for everybody would have meant.
+        return (getattr(caller, "grant_id", None) or "", digest)
+
+    def _remembered_approval(caller, digest):
+        return remembered_approvals.get(_approval_key(caller, digest))
+
+    def _remember_approval(caller, digest, handle, approval_url):
+        if len(remembered_approvals) >= APPROVAL_MEMORY_LIMIT:
+            # Bounded, because an agent can ask as often as it likes and this
+            # is the one structure here that grows on its say-so. Oldest out:
+            # dict order is insertion order, and the oldest ask is the one
+            # closest to expiring anyway.
+            remembered_approvals.pop(next(iter(remembered_approvals)), None)
+        remembered_approvals[_approval_key(caller, digest)] = (
+            handle, approval_url,
+        )
+
+    def _forget_approval(caller, digest):
+        remembered_approvals.pop(_approval_key(caller, digest), None)
+
+    def _settled_decision(handle):
+        """The receipt, if somebody has now decided. None while they have not.
+
+        Distinguishes "not answered yet" from every other outcome, because
+        only the first should send the person back to the page. A declined or
+        expired request is finished and says so.
+        """
+        claimed = spend(
+            APPROVALS_CLAIM,
+            path=APPROVALS_CLAIM["path_template"],
+            body={"handle": handle},
+        )
+        status = claimed.get("status")
+        if status == "pending":
+            return None
+        if status == "declined":
+            raise ToolError(_APPROVAL_DECLINED)
+        if status == "expired":
+            raise ToolError(
+                "The approval request expired before it was decided. Ask me"
+                " to try again if you still want this change."
+            )
+        receipt = claimed.get("receipt")
+        if not receipt:
+            raise ToolError(
+                "The approval was recorded but no receipt came back, so this"
+                " request cannot proceed. Ask me to try again."
+            )
+        return receipt
 
     def _claim(handle):
         """Collect the receipt a decision produced, once.
@@ -3062,6 +3164,9 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     # in through the tool surface. Wave 6's first mutating tool is what calls
     # it in earnest; until then this is how its behaviour is pinned.
     server.approval_gate = approval_gate
+    # Exposed so a test can assert the bound holds, rather than assert that
+    # the code that enforces it exists.
+    server.remembered_approvals = remembered_approvals
 
     return server
 

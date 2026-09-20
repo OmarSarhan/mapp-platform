@@ -304,6 +304,18 @@ TOKEN_B_PREFIX = "mapp_b_"
 #: approval-shaped is ever something the model composes.
 APPROVAL_RECEIPT_HEADER = "X-MAPP-Approval-Receipt"
 
+#: What an approval may be bound to. Derived from the canonicalization scheme
+#: rather than written out, so the three places that produce, transport and
+#: match a digest cannot disagree about its shape.
+REQUEST_DIGEST = re.compile(re.escape(canonical.SCHEME) + r":[0-9a-f]{64}")
+
+#: Where an operator reaches this dashboard, for the approval link an agent
+#: hands a person. Read the way MCP_SITE is, because it is the same kind of
+#: value: one deployment setting, composed into a URL, never fetched.
+CONFIG_SITE = os.environ.get(
+    "CONFIG_SITE", "http://config.localhost"
+).rstrip("/")
+
 #: The audience this service accepts. It must equal the authorization
 #: component's MCP_CONFIG_API_RESOURCE, and the component refuses to start when
 #: that value equals its MCP resource -- which is what keeps a token A from
@@ -6662,6 +6674,24 @@ class Handler(SimpleHTTPRequestHandler):
             # workspace state. Any authenticated narrow-scope token may read
             # them before invoking its domain-specific API.
             return None
+        if path in {
+            "/api/approvals",
+            "/api/approvals/claim",
+            "/api/approvals/confirm",
+        }:
+            # Asking for permission, collecting the answer, and relaying a
+            # decision a person made in an MCP client. `inspect` because the
+            # authority is the person's and not the grant's -- what the grant
+            # buys is the ability to ask, and the gate is the receipt.
+            #
+            # Classified here because the catch-all below demands `full`,
+            # which the broker never issues to an agent. Wave 5 shipped
+            # without these three lines and the entire approval flow was
+            # unreachable: every intent was refused `auth.scope_required`
+            # before any person could be asked. Found by driving a real
+            # client, because nothing that supplied the scope by hand could
+            # see it.
+            return "inspect"
         if path.startswith("/api/semantic/"):
             if method == "GET":
                 return "semantic:inspect"
@@ -10990,9 +11020,16 @@ class Handler(SimpleHTTPRequestHandler):
                 # in an authenticated operator session rather than here.
                 digest = payload.get("requestDigest")
                 operation_id = payload.get("operationId")
-                if not isinstance(digest, str) or len(digest) != 64:
+                # The same form the credential is bound to and the receipt is
+                # later matched against: scheme-prefixed, as
+                # execution_envelope.digest produces it. A bare sha256 was
+                # accepted here once, which refused every real request.
+                if not isinstance(digest, str) or not REQUEST_DIGEST.fullmatch(
+                    digest
+                ):
                     self._json(HTTPStatus.BAD_REQUEST, {
-                        "error": "requestDigest must be a sha256 hex digest.",
+                        "error": "requestDigest must be a canonical"
+                                 f" {canonical.SCHEME} digest.",
                         "code": "approval.digest_invalid",
                     })
                     return
@@ -11006,7 +11043,11 @@ class Handler(SimpleHTTPRequestHandler):
                 created = CONTROL.create_approval(
                     grant_id=str(actor),
                     client_id=str(payload.get("clientId") or ""),
-                    instance=CONFIG_SITE,
+                    # The instance the approval is about, which is the same
+                    # identity the digest binds to. This was the dashboard
+                    # origin, which is where a person goes rather than what
+                    # they are deciding about.
+                    instance=CONTROL.instance_id(),
                     operation_id=operation_id,
                     tool=str(payload.get("tool") or ""),
                     request_digest=digest,

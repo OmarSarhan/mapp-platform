@@ -225,7 +225,51 @@ threat model rather than left to be inferred.
   decide does not leave the agent one minute to act — and an approved receipt
   is not a standing authorisation.
 
-**Not demonstrated end to end, and this is the honest gap.** Wave 5 builds the
+**Corrected 2026-09-20, after a real client was driven through the whole
+loop.** Four defects had shipped, every suite green, and all four were the same
+kind: nothing executed the route.
+
+- **The three approvals routes were not in `_required_scope`**, so they fell
+  through to the `full` catch-all the broker never issues. The entire gate was
+  unreachable — every intent refused `auth.scope_required`. The guard that
+  should have caught this, `RouteGateAlignmentTests`, checked a hand-written
+  table of five operations; it now derives one concrete path per allowlisted
+  operation, so a new one is covered the day it is added.
+- **`approvals.create` demanded a bare 64-character sha256**, while every
+  digest in the system is scheme-prefixed and the receipt is matched against
+  the prefixed form. No approval could ever have matched. The store tests used
+  a bare fixture and agreed with it.
+- **The handler referred to an undefined `CONFIG_SITE`**, and recorded the
+  dashboard origin as the approval's `instance`.
+- **A retry created a second pending approval**, so the person approved the
+  first and the agent waited on the second. Even the dashboard path could not
+  complete. The runtime now remembers the handle for one grant and one digest,
+  which is also why the handle never has to travel through the model.
+
+**And elicitation cannot run here at all.** Measured, not inferred: neither
+served era carries a server-initiated request. That makes the dashboard the
+working path rather than the fallback, so it is now a deliberate two-call flow
+— ask and say where, then pick up the answer — instead of a refusal telling
+somebody to try again. The threat model records the measurement and the reason,
+which is `era_guard`'s obligation never to mint a session identifier.
+
+**Proved end to end on 2026-09-20** against the deployed stack with a real
+OAuth client: authorize with PKCE → consent → token A → `tools/list` → ask →
+an operator approves in the dashboard → the receipt is claimed and spent → the
+tile service reloads, generation 66 applied. A third call is refused, because
+the approval was single-use.
+
+**Not proved: a workspace write.** This instance carries a pre-existing
+validation failure (`locale.layers.Bus_Stops.tables.15`) that refuses every
+candidate, so `proposals_apply` reached the platform with a valid receipt and
+was then refused on that rule. Authorisation was proved; the write was not.
+
+**Worth knowing:** a receipt is spent at the authorisation boundary, so a
+request the platform then refuses on a business rule has still consumed its
+approval. Safe, and the same semantics as the single-use credential, but it
+means a person re-approves after a refusal.
+
+**Superseded — the original note, kept for the reasoning:** Wave 5 builds the
 gate; no tool calls it yet, because the tools that need it are wave 6. The gate
 is exercised directly by 28 tests and the enforcement by the configuration API's
 own suite, but "a real client drove a real approval to a real effect" is wave

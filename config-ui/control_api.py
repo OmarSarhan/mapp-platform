@@ -10,6 +10,8 @@ import json
 import math
 import os
 import re
+
+import canonical
 import secrets
 import tempfile
 import threading
@@ -1383,8 +1385,18 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["operationId", "requestDigest"],
             "properties": {
                 "operationId": {"type": "string", "minLength": 1},
-                "requestDigest": {"type": "string", "minLength": 64,
-                                  "maxLength": 64},
+                # The canonical digest, scheme-prefixed, exactly as the
+                # broker's DIGEST_PATTERN matches it and as
+                # execution_envelope.digest produces it. This said 64
+                # characters once, which is the sha256 without its scheme --
+                # so every approval an agent asked for was refused
+                # `approval.digest_invalid`, and the whole gate was
+                # unreachable. The store tests used a bare 64-character
+                # fixture and agreed with it.
+                "requestDigest": {
+                    "type": "string",
+                    "pattern": f"^{re.escape(canonical.SCHEME)}:[0-9a-f]{{64}}$",
+                },
                 "tool": {"type": "string"},
                 "clientId": {"type": "string"},
                 "packet": {"type": "object"},

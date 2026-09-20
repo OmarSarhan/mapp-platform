@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import app
+import execution_envelope
+import unittest.mock
 from control_plane import ControlStore, TOKEN_SCOPES
 from semantic_sources import parse_exclusions
 
@@ -1032,6 +1034,107 @@ class ApprovalRouteTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertIn(action, ACTION_SCHEMAS)
                 self.assertEqual("inspect", ACTION_SCHEMAS[action]["scope"])
+
+
+class ApprovalCreateRouteTests(unittest.TestCase):
+    """Run the handler body, rather than reason about it.
+
+    Three separate defects shipped in this one handler and every suite stayed
+    green, because nothing executed it: the digest check demanded a bare
+    sha256 the platform never produces, the response referred to an undefined
+    `CONFIG_SITE`, and the row recorded the dashboard origin as the instance.
+    All three are the same mistake -- a route nothing calls is a route nobody
+    has run -- and all three are the kind that a real client finds in one
+    call.
+    """
+
+    def drive(self, payload):
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/approvals"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "oauth:grant-1"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler._payload = lambda: payload
+        handler._remote = lambda: "127.0.0.1"
+        handler.client_address = ("127.0.0.1", 0)
+        handler.do_POST()
+        return responses[-1]
+
+    def real_digest(self):
+        """What the platform itself computes for one request, so the route is
+        offered the value it will actually be sent."""
+        return execution_envelope.digest(
+            instance="instance-under-test",
+            method="POST",
+            operation_id="proposals.apply",
+            path_template="/api/proposals/{proposalId}/apply",
+            path="/api/proposals/p1/apply",
+            query="",
+            body={"approved": True},
+            resolved_defaults=None,
+            confirmation_fields=None,
+            revision_binding=None,
+        )
+
+    def test_a_real_request_produces_a_handle_and_a_link(self) -> None:
+        created = []
+        with unittest.mock.patch.object(
+            app.CONTROL, "create_approval",
+            lambda **kwargs: created.append(kwargs) or {
+                "handle": "h", "reference": "a" * 64},
+        ), unittest.mock.patch.object(
+            app.CONTROL, "instance_id", lambda: "instance-under-test"
+        ):
+            status, body = self.drive({
+                "operationId": "proposals.apply",
+                "requestDigest": self.real_digest(),
+                "tool": "proposals_apply",
+                "clientId": "mcp-1",
+                "packet": {"summary": "Rename a layer."},
+            })
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual("h", body["handle"])
+        self.assertEqual(
+            f"{app.CONFIG_SITE}/#approvals/{'a' * 64}", body["approvalUrl"]
+        )
+
+    def test_the_row_records_the_instance_not_the_dashboard(self) -> None:
+        """`instance` says what the approval is about. The dashboard origin is
+        where a person goes, which is a different question and already
+        answered by approvalUrl."""
+        created = []
+        with unittest.mock.patch.object(
+            app.CONTROL, "create_approval",
+            lambda **kwargs: created.append(kwargs) or {
+                "handle": "h", "reference": "a" * 64},
+        ), unittest.mock.patch.object(
+            app.CONTROL, "instance_id", lambda: "instance-under-test"
+        ):
+            self.drive({
+                "operationId": "proposals.apply",
+                "requestDigest": self.real_digest(),
+            })
+        self.assertEqual("instance-under-test", created[0]["instance"])
+        self.assertEqual("oauth:grant-1", created[0]["grant_id"])
+        self.assertEqual("apply", created[0]["risk"])
+        self.assertEqual(["apply"], created[0]["scopes"])
+
+    def test_a_bare_sha256_is_refused(self) -> None:
+        """The exact value that shipped as the only accepted one."""
+        status, body = self.drive({
+            "operationId": "proposals.apply", "requestDigest": "a" * 64,
+        })
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("approval.digest_invalid", body["code"])
+
+    def test_an_unknown_operation_is_refused(self) -> None:
+        status, body = self.drive({
+            "operationId": "nothing.defined",
+            "requestDigest": self.real_digest(),
+        })
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("approval.operation_unknown", body["code"])
 
 
 class ProposalRevisionReportingTests(unittest.TestCase):
