@@ -88,7 +88,7 @@ from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
 from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
-from control_plane import ControlStore, parse_time
+from control_plane import ControlStore, iso, parse_time
 from control_api import (
     ACTION_SCHEMAS,
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
@@ -7840,6 +7840,29 @@ class Handler(SimpleHTTPRequestHandler):
                     "clients": CONTROL.list_oauth_clients(),
                     "mcpUrl": f"{site}/mcp",
                 })
+        elif path == "/api/approvals/pending":
+            # Operator-only. An agent asks for approval and claims a receipt;
+            # it must never be able to see what else is waiting, nor to decide
+            # anything. This route is not in ACTION_SCHEMAS, so no exchanged
+            # credential resolves it -- the binding gate refuses before scope
+            # is even considered.
+            self._json(HTTPStatus.OK, {
+                "approvals": [
+                    {
+                        "reference": row["reference"],
+                        "operation": row["operation_id"],
+                        "tool": row["tool"],
+                        "risk": row["risk"],
+                        "scopes": row["scopes"],
+                        "client": row["client_id"],
+                        "requestedBy": row["grant_id"],
+                        "packet": row["packet"],
+                        "created": iso(row["created_at"]),
+                        "expires": iso(row["expires_at"]),
+                    }
+                    for row in CONTROL.list_pending_approvals()
+                ],
+            })
         elif path == "/api/proposals":
             try:
                 query = parse_qs(
@@ -8730,6 +8753,10 @@ class Handler(SimpleHTTPRequestHandler):
                 self._semantic_error(exc)
             return
         allowed = {
+            # Asking for approval, and claiming the receipt once a person has
+            # given one. Deciding is not here: it is a parameterised path,
+            # matched below, and operator-only.
+            "/api/approvals", "/api/approvals/claim",
             "/api/workspace", "/api/validate", "/api/expression-test", "/api/mutate",
             "/api/proposals", "/api/proposals/check", "/api/xyz/reload", "/api/visual-plan",
             "/api/visual-test",
@@ -8787,8 +8814,12 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/federation/groups/([A-Za-z][A-Za-z0-9_]{0,55})/delete",
             request_path,
         )
+        approval_decide_path = re.fullmatch(
+            r"/api/approvals/[0-9a-f]{64}/decide", request_path
+        )
         if (
             request_path not in allowed
+            and not approval_decide_path
             and not proposal_action_path
             and not token_revoke_path
             and not mcp_client_disable_path
@@ -10864,6 +10895,41 @@ class Handler(SimpleHTTPRequestHandler):
                         "operation": operation,
                     })
                 return
+            decide = re.fullmatch(
+                r"/api/approvals/([0-9a-f]{64})/decide", request_path
+            )
+            if decide:
+                # Operator-only, and the only place a decision is made. Not in
+                # ACTION_SCHEMAS, so no exchanged credential resolves it: the
+                # binding gate refuses before scope is considered. An agent can
+                # ask for approval and claim a receipt; it can never grant one.
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN, {
+                        "error": "Only an administrator session may decide an"
+                                 " approval.",
+                        "code": "approval.operator_required",
+                    })
+                    return
+                approved = payload.get("approved")
+                if not isinstance(approved, bool):
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": "approved must be true or false.",
+                        "code": "approval.decision_invalid",
+                    })
+                    return
+                if not CONTROL.decide_approval(
+                    decide.group(1), approved=approved, decided_by=str(actor)
+                ):
+                    # Already decided, expired or revoked. Reported as a
+                    # conflict rather than a 404: the row exists and somebody
+                    # looking at a stale panel deserves to know which.
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "This approval can no longer be decided.",
+                        "code": "approval.not_decidable",
+                    })
+                    return
+                self._json(HTTPStatus.OK, {"decided": approved})
+                return
             if request_path == "/api/approvals":
                 # Asking is not doing. This writes a row whose status is
                 # `pending` and returns a handle that names it; nothing is
@@ -10884,7 +10950,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 action = ACTION_SCHEMAS[operation_id]
-                handle = CONTROL.create_approval(
+                created = CONTROL.create_approval(
                     grant_id=str(actor),
                     client_id=str(payload.get("clientId") or ""),
                     instance=CONFIG_SITE,
@@ -10897,7 +10963,8 @@ class Handler(SimpleHTTPRequestHandler):
                     if isinstance(payload.get("packet"), dict) else {},
                 )
                 self._json(HTTPStatus.OK, {
-                    "handle": handle,
+                    "handle": created["handle"],
+                    "reference": created["reference"],
                     # Where a person goes to decide. An operator session is
                     # required there, which is the whole point: an approval
                     # names somebody the platform authenticated.

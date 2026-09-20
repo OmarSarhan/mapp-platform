@@ -1266,6 +1266,12 @@ class ControlStore:
         `pending`, and nothing can be spent until a person decides.
         """
         handle = secrets.token_urlsafe(32)
+        # Two names for one row, for two parties who must not share a secret.
+        # The asker holds `handle` and can claim a receipt with it; the person
+        # deciding sees `reference`, which is the handle's digest -- enough to
+        # name the row, useless for spending it. The decider never holds
+        # anything that could be carried back through the agent.
+        reference = token_hash(handle)
         with self._db() as connection:
             self._require_initialized(connection)
             connection.execute(
@@ -1276,7 +1282,7 @@ class ControlStore:
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
                 "         'pending')",
                 (
-                    token_hash(handle), grant_id, client_id, instance,
+                    reference, grant_id, client_id, instance,
                     operation_id, tool, request_digest, risk, list(scopes),
                     json.dumps(packet), now(), now() + self.APPROVAL_LIFETIME,
                 ),
@@ -1293,7 +1299,7 @@ class ControlStore:
                 "digest": request_digest,
             },
         )
-        return handle
+        return {"handle": handle, "reference": reference}
 
     def read_approval(self, handle: str) -> dict | None:
         """What a person is being asked to decide, by the handle naming it.
@@ -1301,15 +1307,20 @@ class ControlStore:
         A plain read, unlike the redemption below, because showing somebody a
         request is not spending it.
         """
+        return self.read_approval_by_reference(token_hash(handle))
+
+    def read_approval_by_reference(self, reference: str) -> dict | None:
+        """The same read, by the name the person deciding was given."""
         with self._db() as connection:
             self._require_initialized(connection)
             row = connection.execute(
-                "SELECT grant_id, client_id, instance, operation_id, tool,"
-                "       request_digest, risk, scopes, packet, status,"
-                "       created_at, expires_at, decided_at, decided_by"
+                "SELECT id_hash AS reference, grant_id, client_id, instance,"
+                "       operation_id, tool, request_digest, risk, scopes,"
+                "       packet, status, created_at, expires_at, decided_at,"
+                "       decided_by"
                 "  FROM control.approvals"
                 " WHERE id_hash = %s AND revoked_at IS NULL",
-                (token_hash(handle),),
+                (reference,),
             ).fetchone()
         if row is None:
             return None
@@ -1318,7 +1329,7 @@ class ControlStore:
         return detail
 
     def decide_approval(
-        self, handle: str, *, approved: bool, decided_by: str
+        self, reference: str, *, approved: bool, decided_by: str
     ) -> bool:
         """Record a person's decision, and mint the receipt if it was yes.
 
@@ -1343,7 +1354,7 @@ class ControlStore:
                 " RETURNING operation_id, grant_id",
                 (
                     "approved" if approved else "declined",
-                    now(), decided_by, token_hash(handle), now(),
+                    now(), decided_by, reference, now(),
                 ),
             ).fetchone()
         if row is None:
@@ -1354,6 +1365,29 @@ class ControlStore:
             details={"operation": row["operation_id"], "grant": row["grant_id"]},
         )
         return True
+
+    def list_pending_approvals(self) -> list[dict]:
+        """What is waiting for a person, newest first.
+
+        Only what is still decidable: a decided or revoked row is history, and
+        an expired one cannot be approved however it looks in a list. The
+        packet travels with each row because the panel shows the request in
+        full without a second call, and because a list that only names an
+        operation asks somebody to approve a word.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT id_hash AS reference, grant_id, client_id,"
+                "       operation_id, tool, risk, scopes, packet,"
+                "       created_at, expires_at"
+                "  FROM control.approvals"
+                " WHERE status = 'pending' AND revoked_at IS NULL"
+                "   AND expires_at > %s"
+                " ORDER BY created_at DESC",
+                (now(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def claim_receipt(self, handle: str) -> str | None:
         """Mint the receipt for the holder of the handle, once.

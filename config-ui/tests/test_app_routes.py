@@ -965,6 +965,75 @@ class DeclaredPaginationLimitTests(unittest.TestCase):
                     )
 
 
+class ApprovalRouteTests(unittest.TestCase):
+    """An agent may ask for permission. It may never grant itself any.
+
+    The split is the whole point of the wave: approvals.create and
+    approvals.claim are allowlisted operations an exchanged credential can
+    reach, while listing what is pending and deciding it are operator routes
+    that no credential resolves. That is not enforced by a scope check -- it is
+    enforced by those two paths being absent from ACTION_SCHEMAS, so the
+    binding gate refuses before scope is ever considered.
+    """
+
+    OPERATOR_ONLY = (
+        ("GET", "/api/approvals/pending"),
+        ("POST", "/api/approvals/" + "a" * 64 + "/decide"),
+    )
+
+    def test_the_operator_routes_are_not_allowlisted_operations(self) -> None:
+        from control_api import ACTION_SCHEMAS
+
+        declared = {
+            (spec["method"], spec.get("pathTemplate") or spec.get("path"))
+            for spec in ACTION_SCHEMAS.values()
+        }
+        for method, path in self.OPERATOR_ONLY:
+            with self.subTest(route=path):
+                self.assertNotIn((method, path), declared)
+
+    def test_no_exchanged_credential_resolves_them(self) -> None:
+        """Through the resolver the configuration API actually uses, rather
+        than by reading the table twice."""
+        handler = object.__new__(app.Handler)
+        for method, path in self.OPERATOR_ONLY:
+            with self.subTest(route=path):
+                self.assertIsNone(
+                    app.Handler._resolve_operation(handler, method, path)
+                )
+
+    def test_deciding_demands_an_administrator_session(self) -> None:
+        """Belt as well as braces. The route is unreachable for an exchanged
+        credential, and refuses anything that is not an administrator even if
+        it does arrive."""
+        responses = []
+        handler = object.__new__(app.Handler)
+        handler.path = "/api/approvals/" + "a" * 64 + "/decide"
+        handler._host_allowed = lambda: True
+        handler._authorized = lambda state_change=False: "token:someone"
+        handler._json = lambda status, body: responses.append((status, body))
+        handler._payload = lambda: {"approved": True}
+        handler._remote = lambda: "127.0.0.1"
+        # do_POST logs, and the logger reads the peer off the handler.
+        handler.client_address = ("127.0.0.1", 0)
+
+        handler.do_POST()
+
+        status, body = responses[-1]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("approval.operator_required", body["code"])
+
+    def test_asking_for_approval_is_allowlisted(self) -> None:
+        """The other half: an agent must be able to ask, or nothing can ever
+        be approved."""
+        from control_api import ACTION_SCHEMAS
+
+        for action in ("approvals.create", "approvals.claim"):
+            with self.subTest(action=action):
+                self.assertIn(action, ACTION_SCHEMAS)
+                self.assertEqual("inspect", ACTION_SCHEMAS[action]["scope"])
+
+
 class ProposalRevisionReportingTests(unittest.TestCase):
     """The queue reports what its entries can be measured against.
 

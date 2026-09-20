@@ -49,23 +49,54 @@ class ApprovalTests(ControlStoreTestCase):
     def test_a_new_request_is_pending_and_spends_nothing(self) -> None:
         """The handle names a row; it is not authority."""
         store = self.store()
-        handle = self.request(store)
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
         record = store.read_approval(handle)
         self.assertEqual("pending", record["status"])
         self.assertIsNone(record["decided_at"])
         self.assertIsNone(store.redeem_receipt(handle, request_digest=DIGEST))
 
+    def test_the_decider_never_holds_the_spendable_secret(self) -> None:
+        """Two names for one row. The asker holds the handle and can claim a
+        receipt with it; the person deciding sees only the reference, which
+        names the row and spends nothing. Nothing the decider is given could
+        be carried back through the agent and used."""
+        store = self.store()
+        created = self.request(store)
+        self.assertNotEqual(created["handle"], created["reference"])
+        store.decide_approval(created["reference"], approved=True,
+                              decided_by="admin")
+        # The reference is not a handle: it claims nothing.
+        self.assertIsNone(store.claim_receipt(created["reference"]))
+        self.assertIsNotNone(store.claim_receipt(created["handle"]))
+
+    def test_the_pending_list_shows_only_what_can_still_be_decided(self) -> None:
+        store = self.store()
+        live = self.request(store)
+        decided = self.request(store)
+        store.decide_approval(decided["reference"], approved=True,
+                              decided_by="admin")
+        pending = store.list_pending_approvals()
+        self.assertEqual([live["reference"]],
+                         [row["reference"] for row in pending])
+        # The packet travels with the row, so a panel shows the request rather
+        # than asking somebody to approve a word.
+        self.assertEqual("Rename Bus Stops", pending[0]["packet"]["summary"])
+
     def test_the_packet_is_kept_so_a_decision_can_be_audited(self) -> None:
         """What the person was shown, not a reconstruction of it."""
         store = self.store()
-        record = store.read_approval(self.request(store))
+        record = store.read_approval(self.request(store)["handle"])
         self.assertEqual({"summary": "Rename Bus Stops", "changes": 1},
                          record["packet"])
 
     def test_approval_mints_a_receipt_that_spends_once(self) -> None:
         store = self.store()
-        handle = self.request(store)
-        self.assertTrue(store.decide_approval(handle, approved=True,
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        self.assertTrue(store.decide_approval(reference, approved=True,
                                               decided_by="admin"))
         receipt = store.claim_receipt(handle)
         self.assertIsNotNone(receipt)
@@ -81,8 +112,10 @@ class ApprovalTests(ControlStoreTestCase):
         """Deleting it would make a replay indistinguishable from a receipt
         that never existed."""
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="a")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="a")
         receipt = store.claim_receipt(handle)
         store.redeem_receipt(receipt, request_digest=DIGEST)
         self.assertEqual("consumed", store.read_approval(handle)["status"])
@@ -92,8 +125,10 @@ class ApprovalTests(ControlStoreTestCase):
         carried to a different path, body or revision than the one a person saw
         does not match the row that would otherwise be spent."""
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         receipt = store.claim_receipt(handle)
         self.assertIsNone(
             store.redeem_receipt(receipt, request_digest=OTHER_DIGEST))
@@ -102,8 +137,10 @@ class ApprovalTests(ControlStoreTestCase):
 
     def test_a_decline_mints_nothing(self) -> None:
         store = self.store()
-        handle = self.request(store)
-        self.assertTrue(store.decide_approval(handle, approved=False,
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        self.assertTrue(store.decide_approval(reference, approved=False,
                                               decided_by="admin"))
         self.assertEqual("declined", store.read_approval(handle)["status"])
         # Nothing to claim: a decline mints no secret at all.
@@ -113,12 +150,14 @@ class ApprovalTests(ControlStoreTestCase):
         """The predicate requires `pending`, which a decided row is not. Two
         operators deciding at once cannot both believe they did it."""
         store = self.store()
-        handle = self.request(store)
-        self.assertTrue(store.decide_approval(handle, approved=True,
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        self.assertTrue(store.decide_approval(reference, approved=True,
                                               decided_by="first"))
-        self.assertFalse(store.decide_approval(handle, approved=False,
+        self.assertFalse(store.decide_approval(reference, approved=False,
                                                decided_by="second"))
-        self.assertFalse(store.decide_approval(handle, approved=True,
+        self.assertFalse(store.decide_approval(reference, approved=True,
                                                decided_by="third"))
         self.assertEqual("first", store.read_approval(handle)["decided_by"])
 
@@ -126,13 +165,15 @@ class ApprovalTests(ControlStoreTestCase):
         """A decision made about a workspace that has since changed is not a
         decision about this request."""
         store = self.store()
-        handle = self.request(store)
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
         with store._db() as connection:
             connection.execute(
                 "UPDATE control.approvals SET expires_at = %s",
                 (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1),),
             )
-        self.assertFalse(store.decide_approval(handle, approved=True,
+        self.assertFalse(store.decide_approval(reference, approved=True,
                                                decided_by="admin"))
         self.assertTrue(store.read_approval(handle)["expired"])
 
@@ -140,8 +181,10 @@ class ApprovalTests(ControlStoreTestCase):
         """The case that matters: a receipt outlives the decision that
         produced it for as long as nobody spends it."""
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         receipt = store.claim_receipt(handle)
         self.assertEqual(1, store.revoke_approvals_for_grant(
             "oauth:grant-1", "operator revoked the grant"))
@@ -170,8 +213,10 @@ class ApprovalTests(ControlStoreTestCase):
                 " VALUES (%s, %s, %s, %s, now())",
                 ("oauth:grant-1", "mcp-1", "operator", ["apply"]),
             )
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         receipt = store.claim_receipt(handle)
 
         self.assertTrue(store.revoke_oauth_grant(
@@ -181,8 +226,10 @@ class ApprovalTests(ControlStoreTestCase):
 
     def test_revocation_leaves_another_grants_approvals_alone(self) -> None:
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         mine = store.claim_receipt(handle)
         store.revoke_approvals_for_grant("oauth:someone-else", "unrelated")
         self.assertIsNotNone(store.redeem_receipt(mine, request_digest=DIGEST))
@@ -194,12 +241,14 @@ class ApprovalTests(ControlStoreTestCase):
         be useful, which is the one route it must not take. So the holder of
         the handle mints it, and only once a decision exists."""
         store = self.store()
-        handle = self.request(store)
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
 
         # Nothing to claim before a person has decided.
         self.assertIsNone(store.claim_receipt(handle))
 
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        store.decide_approval(reference, approved=True, decided_by="admin")
         first = store.claim_receipt(handle)
         self.assertIsNotNone(first)
 
@@ -208,15 +257,19 @@ class ApprovalTests(ControlStoreTestCase):
 
     def test_a_revoked_approval_mints_nothing(self) -> None:
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         store.revoke_approvals_for_grant("oauth:grant-1", "withdrawn")
         self.assertIsNone(store.claim_receipt(handle))
 
     def test_the_handle_and_the_receipt_are_stored_only_as_hashes(self) -> None:
         store = self.store()
-        handle = self.request(store)
-        store.decide_approval(handle, approved=True, decided_by="admin")
+        created = self.request(store)
+        handle = created["handle"]
+        reference = created["reference"]
+        store.decide_approval(reference, approved=True, decided_by="admin")
         receipt = store.claim_receipt(handle)
         with store._db() as connection:
             row = connection.execute(
