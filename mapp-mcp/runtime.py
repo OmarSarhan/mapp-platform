@@ -25,6 +25,7 @@ check would find nothing to check with.
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
@@ -991,6 +992,84 @@ def _layer_summary(key, layer):
         "table": table if isinstance(table, str) else None,
         "displayFields": display,
     }
+
+
+#: Where the guidance documents live, beside the runtime that serves them.
+GUIDANCE_DIR = Path(__file__).resolve().parent / "guidance"
+
+#: What an agent is told about *using* this surface, as MCP resources rather
+#: than tools.
+#:
+#: A resource is the right primitive for guidance: a client can read it without
+#: invoking anything, attach it to context on its own initiative, and it costs
+#: no scope and has no side effect. A tool would make reading the instructions
+#: an action with a result to interpret.
+#:
+#: Unfiltered by scope, deliberately. These describe how to use tools the
+#: caller can already see; they carry no instance data, name no credential and
+#: disclose nothing about the deployment. Withholding them from a narrow grant
+#: would make that agent worse at the job without making anything safer.
+#:
+#: Adapted from `mapp-config-cli/docs/agent-workflow.md` rather than vendored
+#: from it. The judgement in that document is hard-won and mostly
+#: surface-agnostic, but its invocations are not: an agent here has no
+#: `config-cli`, and "use config-cli as the only write interface" is false for
+#: it. `test_guidance.py` pins the source's digest, so a change there surfaces
+#: as a prompt to re-read rather than as silent divergence.
+GUIDANCE = (
+    {
+        "path": "workflow.md",
+        "uri": "mapp://guidance/workflow",
+        "name": "Changing a MAPP workspace",
+        "description": (
+            "The order the platform expects -- establish the target, inspect,"
+            " check, propose, show evidence, apply, verify -- and the"
+            " safeguards that are not negotiable. Read before proposing or"
+            " applying anything."
+        ),
+    },
+    {
+        "path": "styling.md",
+        "uri": "mapp://guidance/styling",
+        "name": "Mapping a styling request onto workspace properties",
+        "description": (
+            "Which property actually carries a colour, per geometry and symbol"
+            " type; why style states are independent; and how to choose and"
+            " audit breaks for a graduated metric layer."
+        ),
+    },
+    {
+        "path": "derived-layers.md",
+        "uri": "mapp://guidance/derived-layers",
+        "name": "Managed derived relations",
+        "description": (
+            "Views against materialized relations, identifier rules, why a"
+            " plan comes before a create, how spatial scope is fixed, and what"
+            " guards a drop. Needed by anything holding derive:manage."
+        ),
+    },
+)
+
+
+def _serve_guidance(server, document):
+    """Register one guidance document as a readable resource.
+
+    Read from disk per request rather than at import: the files are small, the
+    read is local, and a runtime that cached them would serve a stale document
+    after an image rebuild that changed one.
+    """
+    path = GUIDANCE_DIR / document["path"]
+
+    @server.resource(
+        document["uri"],
+        name=document["name"],
+        description=document["description"],
+        mime_type="text/markdown",
+    )
+    def read() -> str:
+        return path.read_text(encoding="utf-8")
+
+    return read
 
 
 def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
@@ -3545,6 +3624,9 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 query=layer_values_query(field=field, locale=locale, limit=limit),
             )
         )
+
+    for document in GUIDANCE:
+        _serve_guidance(server, document)
 
     registered = server.list_tools
 

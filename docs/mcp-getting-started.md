@@ -291,6 +291,31 @@ credentials those sources need.
 
 ---
 
+## What the agent is told
+
+Alongside the tools, the server publishes three **MCP resources** — documents
+an assistant can read without calling anything:
+
+| Resource | Covers |
+| --- | --- |
+| `mapp://guidance/workflow` | The order the platform expects, and the safeguards that are not negotiable |
+| `mapp://guidance/styling` | Which property actually carries a colour, and how to choose graduated breaks |
+| `mapp://guidance/derived-layers` | Views against materialized relations, naming, spatial scope, and what guards a drop |
+
+These exist because most of what makes a change *good* here cannot be inferred
+from a tool schema. That a `circle` point takes its colour from
+`strokeColor` and a `dot` from `fillColor`, that a value displaying as `0.0%`
+is not zero, that a replace quietly changes the numbers every dependent layer
+returns — an assistant that does not know these produces changes that apply
+cleanly and are wrong.
+
+They are adapted from the CLI's agent workflow rather than copied from it: the
+judgement carries across, the invocations do not. Nothing in them is
+instance-specific, so every connected assistant can read them whatever its
+scopes.
+
+---
+
 ## Where to read further
 
 - [`mcp-authorization.md`](mcp-authorization.md) — how the credentials work,
