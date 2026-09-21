@@ -144,18 +144,24 @@ the same rules as `PRODUCTION_MAP_SITE` and `PRODUCTION_CONFIG_SITE`, enforced
 by `scripts/validate_production_env.py` and by `compose.production.yaml`, which
 fails the deploy outright when the value is unset.
 
-Caddy publishes exactly four paths on that origin:
+Caddy publishes these paths on that origin:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/.well-known/oauth-authorization-server` | RFC 8414 metadata |
+| `GET` | `/.well-known/oauth-protected-resource` | RFC 9728 metadata, which the `401` points a client at |
 | `GET`, `POST` | `/oauth/authorize` | Authorization request and the consent screen |
 | `GET`, `POST` | `/oauth/login` | Operator sign-in for the consent screen |
 | `POST` | `/oauth/token` | Authorization-code redemption |
+| `POST` | `/mcp` | The MCP resource itself, served by `mapp-mcp` |
 
-Everything else on the origin is a 404 served by Caddy itself. The MCP resource
-itself — `${MCP_SITE}/mcp`, the audience token A is issued for — is not
-published at all: it arrives with `mapp-mcp` in a later phase.
+Everything else on the origin is a 404 served by Caddy itself.
+
+This said the resource "is not published at all: it arrives with `mapp-mcp` in
+a later phase", which was true while the runtime did not exist and stopped
+being true when it shipped. `/mcp` answers now: unauthenticated it is a `401`
+carrying `WWW-Authenticate: Bearer resource_metadata="…"`, which is the first
+step of the discovery a client walks without being configured to.
 
 The metadata document advertises the authorization and token endpoints, `code`,
 `authorization_code` and `refresh_token`, PKCE `S256`, the two client
