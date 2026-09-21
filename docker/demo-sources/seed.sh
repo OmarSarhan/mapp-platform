@@ -121,7 +121,12 @@ SQL
   if [[ -n "${MAPP_CENSUS_REPAIR_EXTENT:-}" ]]; then
     extra_env+=(-e "MAPP_CENSUS_REPAIR_EXTENT=${MAPP_CENSUS_REPAIR_EXTENT}")
   fi
-  "${compose[@]}" run --rm --build --no-deps \
+  # No --build: the image is built once before the first source is seeded.
+  # BuildKit cannot render progress into a redirected stdout while stderr is
+  # still a terminal, and dies with "failed to get console: provided file is
+  # not a console" -- on an interactive shell only, so it is invisible here
+  # and in CI. The same mistake, in the same shape, as `./bin/mapp init`.
+  "${compose[@]}" run --rm --no-deps \
     -e "DATABASE_URL=postgresql://${SOURCE_USER}:${password}@${service}:5432/${database}?sslmode=require" \
     "${extra_env[@]}" \
     etl ${etl_command} >/dev/null
@@ -206,6 +211,13 @@ COUNT_SQL
 )"
   printf '  %s: %s\n' "${service}" "${counts}"
 }
+
+# Built once, here, rather than by the first `run` that needs it: a `run
+# --build` whose stdout is redirected cannot render its progress and fails on
+# an interactive terminal. Building outside every redirection also puts the
+# progress where the operator can see it, and reports a build failure as one.
+printf 'Building the ETL image.\n'
+"${compose[@]}" build etl
 
 # The sample layers use the ETL default entrypoint and its layers.json; the
 # census dataset has its own module and config.

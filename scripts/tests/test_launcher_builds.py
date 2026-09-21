@@ -25,6 +25,19 @@ LAUNCHER = ROOT / "bin" / "mapp"
 COMPOSE = ROOT / "compose.yaml"
 
 
+def launcher_scripts():
+    """Every shell script in this repository that drives compose.
+
+    Globbed rather than listed: the console bug shipped a second time in
+    `docker/demo-sources/seed.sh` because the guard read `bin/mapp` alone, and
+    a hand-maintained list would have had the same gap.
+    """
+    scripts = [LAUNCHER]
+    for pattern in ("scripts/*.sh", "docker/*/*.sh"):
+        scripts.extend(sorted(ROOT.glob(pattern)))
+    return [path for path in scripts if "compose" in path.read_text()]
+
+
 def locally_built_services():
     """Services compose builds here rather than pulling, read from the file."""
     text = COMPOSE.read_text()
@@ -95,16 +108,46 @@ class LauncherBuildTests(unittest.TestCase):
         )
 
     def test_a_captured_run_does_not_build_inside_the_capture(self) -> None:
-        """`--build` on a run whose stdout is captured fails from a terminal:
-        BuildKit cannot render progress into a pipe and dies with "failed to
-        get console: provided file is not a console". It is invisible in CI and
-        in any non-interactive shell, which is where this was tested."""
-        text = LAUNCHER.read_text()
+        """`--build` on a run whose stdout does not reach the terminal fails
+        from a terminal: BuildKit cannot render progress into a pipe while
+        stderr is still a console, and dies with "failed to get console:
+        provided file is not a console". It is invisible in CI and in any
+        non-interactive shell, which is where this gets tested.
+
+        Two shapes, both real. `bin/mapp init` captured the run to read a
+        password out of it; `docker/demo-sources/seed.sh` redirected it to
+        /dev/null. The first was fixed and the second shipped, because this
+        test matched only command substitution and read only `bin/mapp`.
+        """
         offending = []
-        for match in re.finditer(r'="\$\((?:[^()]|\([^()]*\))*\)"', text, re.S):
-            if "--build" in match.group(0) and " run " in match.group(0):
-                line = text[: match.start()].count("\n") + 1
-                offending.append(line)
+        for path in launcher_scripts():
+            text = path.read_text()
+            for match in re.finditer(r'="\$\((?:[^()]|\([^()]*\))*\)"', text, re.S):
+                if "2>&1" in match.group(0):
+                    continue
+                if "--build" in match.group(0) and " run " in match.group(0):
+                    line = text[: match.start()].count("\n") + 1
+                    offending.append(f"{path.name}:{line} (captured)")
+            # The second shape: a run whose stdout is sent elsewhere. The
+            # command spans lines, so the redirection is looked for in the
+            # whole continued statement rather than on the `run` line.
+            for match in re.finditer(
+                r'^[^\n#]*\srun\s(?:[^\n]*\\\n)*[^\n]*$', text, re.M
+            ):
+                statement = match.group(0)
+                if "--build" not in statement:
+                    continue
+                # Only when stderr still reaches the terminal. That is the
+                # configuration both real failures had, and it is the one
+                # that makes BuildKit choose a console renderer for a stream
+                # that is not one. `>/dev/null 2>&1` and `2>&1 | tee` send
+                # both streams away, leave no console to detect, and are
+                # exercised constantly by `./bin/mapp test` without failing.
+                if "2>&1" in statement or re.search(r'2>\s*\S', statement):
+                    continue
+                if re.search(r'>\s*(/dev/null|&?\d|"?\$)', statement) or "| " in statement:
+                    line = text[: match.start()].count("\n") + 1
+                    offending.append(f"{path.name}:{line} (redirected)")
         self.assertEqual(
             [], offending,
             "these capture a compose `run --build`, so the build renders into"
