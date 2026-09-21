@@ -142,7 +142,12 @@ class ResetCommandSafetyTests(unittest.TestCase):
             ' "${@:2}"',
             commands,
         )
-        self.assertIn("run --rm --no-deps config-ui", commands)
+        # The property is `--no-deps` on a one-off run, not the exact flag
+        # string: `--build` was added to every compose `run` so a fresh clone
+        # builds the image instead of trying to pull it, and matching the
+        # literal made this fail for a change that does not touch what it
+        # guards.
+        self.assertRegex(commands, r"run --rm (?:--build )?--no-deps config-ui")
         self.assertIn("up --detach --wait db", commands)
         self.assertNotIn("--confirm", commands)
 
