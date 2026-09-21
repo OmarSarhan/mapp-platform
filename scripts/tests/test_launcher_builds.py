@@ -107,3 +107,96 @@ class LauncherBuildTests(unittest.TestCase):
             "these capture a compose `run --build`, so the build renders into"
             " a pipe and fails on an interactive terminal",
         )
+
+
+def compose_services(path: Path):
+    """Every service in a compose file, with its image and whether it builds.
+
+    Deliberately a parser rather than `docker compose config`: this has to run
+    without Docker, without `.env`, and over the overlays individually.
+    """
+    text = path.read_text()
+    start = re.search(r"^services:\n", text, re.M)
+    if not start:
+        return
+    body = text[start.end() :]
+    end = re.search(r"^[a-zA-Z]", body, re.M)
+    if end:
+        body = body[: end.start()]
+    blocks = list(re.finditer(r"^  ([a-z][a-z0-9-]*):\s*$", body, re.M))
+    for index, match in enumerate(blocks):
+        stop = blocks[index + 1].start() if index + 1 < len(blocks) else len(body)
+        block = body[match.end() : stop]
+        image = re.search(r"^    image:\s*(\S+)", block, re.M)
+        yield (
+            match.group(1),
+            image.group(1) if image else None,
+            bool(re.search(r"^    build:", block, re.M)),
+        )
+
+
+def repository(image: str) -> str:
+    """The repository part of an image reference, with `${VAR:-default}`
+    resolved to its default -- the value a developer with no override gets,
+    and the only one this repository can make promises about."""
+    resolved = re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", r"\1", image)
+    return resolved.split("@")[0].rsplit(":", 1)[0] if ":" in resolved.split("@")[0] \
+        else resolved.split("@")[0]
+
+
+class ComposeImageOriginTests(unittest.TestCase):
+    """A service that names an image this repository builds must build it.
+
+    Compose resolves an `image:` with no `build:` by pulling. Our images are
+    published nowhere, so such a service works only on a machine that happens
+    to hold the tag already -- which every development machine does, because
+    some *other* service built it. `xyz-preview` shipped that way: it reuses
+    `xyz`'s image by tag, so a fresh machine running `./bin/mapp all` got
+
+        Image mapp-xyz:v4.23.4-a6f03c0 Error pull access denied for mapp-xyz
+
+    while the same command on a warm machine printed `Built` and passed.
+
+    An image whose repository has no `/` is one of ours: a bare name resolves
+    to Docker Hub's `library/` namespace, where none of these exist. Anything
+    with a registry or namespace (`postgis/postgis`) is genuinely pullable.
+    """
+
+    def test_no_service_pulls_an_image_this_repository_builds(self) -> None:
+        offending = []
+        for path in sorted(ROOT.glob("compose*.yaml")):
+            for name, image, builds in compose_services(path):
+                if image is None or builds:
+                    continue
+                if "/" in repository(image):
+                    continue
+                offending.append(f"{path.name}: {name} -> {image}")
+        self.assertEqual(
+            [], offending,
+            "these services name an image built by this repository and"
+            " published nowhere, without a build section, so compose pulls"
+            " them and they fail on a fresh machine. Give the service the"
+            " same build as whichever service builds that tag.",
+        )
+
+    def test_the_parser_sees_the_services_it_is_guarding(self) -> None:
+        """A parser that silently matched nothing would pass forever."""
+        base = dict(
+            (name, (image, builds))
+            for name, image, builds in compose_services(COMPOSE)
+        )
+        self.assertIn("xyz-preview", base)
+        self.assertIn("caddy", base)
+        self.assertNotIn("backend", base, "networks are not services")
+        self.assertEqual("mapp-caddy", repository(base["caddy"][0]))
+        self.assertEqual(
+            "postgis/postgis",
+            repository(
+                "postgis/postgis:17-3.5-alpine@sha256:"
+                + "978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568"
+            ),
+        )
+        self.assertEqual(
+            "mapp-postgis-h3",
+            repository("${POSTGIS_IMAGE:-mapp-postgis-h3:17-3.5-4.2.3}"),
+        )

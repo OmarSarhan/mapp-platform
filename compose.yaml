@@ -3,7 +3,7 @@ name: ${COMPOSE_PROJECT_NAME:-mapp-explore}
 services:
   xyz:
     image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
-    build:
+    build: &xyz-build
       context: ./docker/xyz
       dockerfile: Dockerfile
       args:
@@ -39,6 +39,13 @@ services:
 
   xyz-preview:
     image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
+    # The same build as xyz, by anchor, so the two cannot drift. Not
+    # redundant: without a build section compose resolves this image by
+    # *pulling* it, and mapp-xyz is published nowhere. On a machine that had
+    # already built xyz the pull is skipped and everything works, which is why
+    # this survived until somebody ran it on a fresh one. The second build is
+    # a cache hit.
+    build: *xyz-build
     restart: unless-stopped
     init: true
     user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
