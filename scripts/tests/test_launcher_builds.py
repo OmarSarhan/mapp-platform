@@ -80,7 +80,10 @@ class LauncherBuildTests(unittest.TestCase):
         name so a refactor that moves it still has to keep this true."""
         text = LAUNCHER.read_text()
         start = text.index("init_compose=(")
-        block = text[start : start + 2500]
+        # Bounded by the function, not by a character count. A fixed window
+        # silently stopped covering the run line the first time this function
+        # grew.
+        block = text[start : text.index("\ninit_env() {", start)]
         run_line = re.search(r'\$\{init_compose\[@\]\}" run [^\n]*', block)
         self.assertIsNotNone(run_line, "init no longer runs a one-off container")
         # Either spelling, so long as the image exists before it is run. init
@@ -247,3 +250,62 @@ class StateDirectoryTests(unittest.TestCase):
             " by init_state, so Docker creates them as root and the next"
             " ./bin/mapp command refuses to run",
         )
+
+
+class BuildVisibilityTests(unittest.TestCase):
+    """A compose call that can build must not have its stderr discarded.
+
+    BuildKit writes progress to stderr, so `2>&1` to /dev/null on a command
+    that may build turns a multi-minute compile into silence. `./bin/mapp
+    init` did exactly that: it folded the database build into a silenced
+    `up --detach --wait db`, and on a fresh machine that compiles PostGIS and
+    H3 from source. The first ten minutes of the first command a new user runs
+    printed nothing, with no way to tell a long build from a hang.
+
+    Discarding stdout alone is fine and several commands do it deliberately --
+    that suppresses compose's container chatter and leaves the build visible.
+    """
+
+    #: `up` builds a service whose image is missing unless told not to.
+    CAN_BUILD = (" up ", " build ")
+
+    def test_no_build_has_its_progress_discarded(self) -> None:
+        offending = []
+        for number, line in enumerate(LAUNCHER.read_text().splitlines(), start=1):
+            if "compose[@]}\"" not in line:
+                continue
+            if not any(token in line for token in self.CAN_BUILD):
+                continue
+            if "--no-build" in line:
+                continue
+            if "2>&1" in line and "/dev/null" in line:
+                offending.append(f"{number}: {line.strip()}")
+        self.assertEqual(
+            [], offending,
+            "these compose commands can build and send stderr to /dev/null,"
+            " where BuildKit writes its progress. Build as a separate visible"
+            " step and leave the silenced command unable to build.",
+        )
+
+    def test_init_says_what_it_is_doing_before_each_slow_step(self) -> None:
+        """The database build, the configuration build and the credential are
+        three distinct waits. Naming them is what makes the silence between
+        them legible as progress rather than as a hang."""
+        text = LAUNCHER.read_text()
+        start = text.index("bootstrap_admin_credential() {")
+        block = text[start : text.index("\ninit_env() {", start)]
+        # Announcements only. Every one of these phrases also appears in the
+        # matching failure message, so a test that searched the whole function
+        # passed with the announcements deleted -- which is how the first
+        # version of this test behaved when it was mutated.
+        announcements = "\n".join(
+            line for line in block.splitlines()
+            if "printf " in line and ">&2" not in line
+        )
+        for expected in ("packaged database image", "configuration service image",
+                         "administrator credential"):
+            with self.subTest(step=expected):
+                self.assertIn(
+                    expected, announcements,
+                    "init no longer announces this step before waiting on it",
+                )

@@ -450,7 +450,20 @@ bootstrap_admin_credential() {
     --file "${ROOT_DIR}/compose.yaml"
     --file "${ROOT_DIR}/compose.bundled-db.yaml"
   )
-  if ! "${init_compose[@]}" up --detach --wait db >/dev/null 2>&1; then
+  # Built as its own visible step, for the same reason the configuration
+  # image below is, plus one more: on a fresh machine this compiles PostGIS
+  # and H3 from source. Folded into the `up` and silenced, it was ten minutes
+  # in which init printed nothing at all and gave an operator no way to tell a
+  # long build from a hang.
+  printf 'Building the packaged database image. The first run compiles PostGIS and H3 from source and usually takes several minutes.\n'
+  if ! "${init_compose[@]}" build db; then
+    printf 'Could not build the packaged database image.\n' >&2
+    exit 1
+  fi
+  printf 'Starting the database and waiting for it to accept connections.\n'
+  # --no-build: the image was just built as a visible step, so this waits and
+  # nothing more. That is what makes discarding its output safe.
+  if ! "${init_compose[@]}" up --detach --no-build --wait db >/dev/null 2>&1; then
     printf 'Could not start the packaged database to initialize authentication.\n' >&2
     exit 1
   fi
@@ -477,10 +490,12 @@ bootstrap_admin_credential() {
   # belongs and leaves the capture wrapping nothing but the password. It also
   # means a build failure is reported as a build failure rather than as an
   # unreadable password.
+  printf 'Building the configuration service image.\n'
   if ! "${init_compose[@]}" build config-ui; then
     printf 'Could not build the configuration service image.\n' >&2
     exit 1
   fi
+  printf 'Creating the configuration administrator credential.\n'
   if ! admin_output="$(printf '%s\n' "${admin_password}" \
     | "${init_compose[@]}" run --rm --no-deps -T config-ui \
         python config_admin.py "${admin_command}" \

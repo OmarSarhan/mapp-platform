@@ -295,6 +295,21 @@ for service in xyz xyz-preview config-ui; do
       printf '%s is not running with the DBS_MAPP value resolved from the current environment.\n' \
         "${service}" >&2
     fi
+    # Say what differs. Without this the operator is told two values
+    # disagree and never which two, so the only way to act on it is to guess
+    # -- and the advice to force-recreate is wrong whenever the container is
+    # the correct one and the resolution moved. The password is the one part
+    # that cannot be shown; every other component is where a mismatch shows
+    # up, so mask only that.
+    mask_dsn() { sed -E 's#://([^:/@]*):[^@]*@#://\1:***@#g'; }
+    printf '  running  (%s): %s\n' "${service}" \
+      "$(printf %s "${running_dbs}" | mask_dsn)" >&2
+    printf '  resolved (compose config): %s\n' \
+      "$(printf %s "${resolved_dbs}" | mask_dsn)" >&2
+    if [[ "$(printf %s "${running_dbs}" | mask_dsn)" \
+          == "$(printf %s "${resolved_dbs}" | mask_dsn)" ]]; then
+      printf '  The two differ only in the password.\n' >&2
+    fi
     printf 'Run ./bin/mapp up --force-recreate to replace the stale containers, then run ./bin/mapp verify again.\n' >&2
     exit 1
   fi
