@@ -456,13 +456,25 @@ bootstrap_admin_credential() {
   # --no-deps because the database is already up and nothing else is needed;
   # without the explicit `up` above this would run with no database at all.
   #
-  # --build because `run` does not build and `up` does. On a machine where the
-  # image already exists the difference is invisible, which is why this was
-  # only ever hit on a genuinely fresh clone: compose read `mapp-config-ui:local`
-  # as a registry reference and answered "pull access denied for
-  # mapp-config-ui", about an image this repository builds from source.
+  # Built as its own step, not with `run --build`, and the difference is the
+  # whole point. `run` does not build while `up` does, so a fresh clone used to
+  # fail with "pull access denied for mapp-config-ui" -- compose reading an
+  # image this repository builds as a registry reference. Passing --build fixed
+  # that and broke something else: this run's stdout is captured to read the
+  # password out of it, and BuildKit rendering progress into a captured pipe
+  # from an interactive terminal dies with "failed to get console: provided
+  # file is not a console".
+  #
+  # Building first puts the progress on the operator's terminal where it
+  # belongs and leaves the capture wrapping nothing but the password. It also
+  # means a build failure is reported as a build failure rather than as an
+  # unreadable password.
+  if ! "${init_compose[@]}" build config-ui; then
+    printf 'Could not build the configuration service image.\n' >&2
+    exit 1
+  fi
   if ! admin_output="$(printf '%s\n' "${admin_password}" \
-    | "${init_compose[@]}" run --rm --build --no-deps -T config-ui \
+    | "${init_compose[@]}" run --rm --no-deps -T config-ui \
         python config_admin.py "${admin_command}" \
           --root /control \
           --password-stdin)"; then

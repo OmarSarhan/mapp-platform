@@ -56,8 +56,19 @@ class LauncherBuildTests(unittest.TestCase):
             if "docker run" in line:
                 # Not compose: a plain container with an explicit image.
                 continue
-            if "--build" not in line:
-                missing.append(f"{line_number}: {line.strip()}")
+            if "--build" in line:
+                continue
+            # Or the image was built as its own step just before. That is the
+            # right shape wherever the run's stdout is captured: BuildKit
+            # rendering progress into a captured pipe from an interactive
+            # terminal fails with "failed to get console", so the build has to
+            # happen outside the capture.
+            preceding = "\n".join(
+                text.splitlines()[max(0, line_number - 12) : line_number]
+            )
+            if re.search(r'\}" build [a-z]', preceding):
+                continue
+            missing.append(f"{line_number}: {line.strip()}")
         self.assertEqual(
             [], missing,
             "these compose `run` invocations do not build, so they pull an"
@@ -72,4 +83,27 @@ class LauncherBuildTests(unittest.TestCase):
         block = text[start : start + 2500]
         run_line = re.search(r'\$\{init_compose\[@\]\}" run [^\n]*', block)
         self.assertIsNotNone(run_line, "init no longer runs a one-off container")
-        self.assertIn("--build", run_line.group(0))
+        # Either spelling, so long as the image exists before it is run. init
+        # builds as its own step because its run's stdout is captured.
+        self.assertTrue(
+            "--build" in run_line.group(0)
+            or re.search(r'\$\{init_compose\[@\]\}" build config-ui', block),
+            "init runs config-ui without ensuring the image is built",
+        )
+
+    def test_a_captured_run_does_not_build_inside_the_capture(self) -> None:
+        """`--build` on a run whose stdout is captured fails from a terminal:
+        BuildKit cannot render progress into a pipe and dies with "failed to
+        get console: provided file is not a console". It is invisible in CI and
+        in any non-interactive shell, which is where this was tested."""
+        text = LAUNCHER.read_text()
+        offending = []
+        for match in re.finditer(r'="\$\((?:[^()]|\([^()]*\))*\)"', text, re.S):
+            if "--build" in match.group(0) and " run " in match.group(0):
+                line = text[: match.start()].count("\n") + 1
+                offending.append(line)
+        self.assertEqual(
+            [], offending,
+            "these capture a compose `run --build`, so the build renders into"
+            " a pipe and fails on an interactive terminal",
+        )
