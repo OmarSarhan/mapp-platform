@@ -16,6 +16,16 @@
   advancing past Phase 0 into Phase 1 design. Merge approved **on the condition
   that the MCP feature stays off `main`** — see the merge note in the evidence
   bundle.
+- **That condition no longer holds, and the record should say so rather than
+  read as though it does.** Phase 1 was built and merged to `main` on the
+  owner's instruction, waves 1 to 8, and is pushed. This record has not been
+  re-accepted for what Phase 1 added — per-action approval receipts, MCP
+  elicitation, the derived-layer lifecycle, standing approval windows, and the
+  withdrawal of `era_guard`'s obligation never to mint a session identifier,
+  which was traded for in-session approval. Those decisions are recorded in
+  [`mcp-phase1-plan.md`](../mcp-phase1-plan.md) and the threat model; what is
+  missing is an owner acceptance covering them, which a second ADR should
+  carry rather than an amendment to one already accepted.
 - **Scope:** the authorization design for `mapp-mcp`, its deployment topology,
   and the state it owns
 - **Supersedes:** nothing. First ADR in this repository.

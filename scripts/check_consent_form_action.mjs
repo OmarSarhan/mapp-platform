@@ -1,5 +1,15 @@
-// O20: does `form-action 'self'` on the consent page block the consent POST's
-// 302 to the client's registered redirect_uri, which is a different origin?
+// Regression check on the consent page's `form-action` policy.
+//
+// Not an open question: it was settled in three engines and the answer was
+// that `'self'` alone does NOT survive the cross-origin redirect -- Firefox
+// follows it, Chromium and WebKit block it, and all three deliver the POST
+// first, so a block leaves the operator having consented and the platform
+// holding a live grant nobody can use. `pages.content_security_policy`
+// therefore names the client's registered redirect origin alongside `'self'`.
+//
+// What this script checks is that the shipped policy still works: drive the
+// real consent flow and see whether the callback is reached. A regression
+// here means somebody narrowed the directive back to `'self'`.
 //
 // Run it:
 //
@@ -17,8 +27,8 @@
 // *.localhost to loopback themselves and ignore /etc/hosts and any
 // --add-host, so the server has to *be* on that loopback.
 //
-// Result on 2026-09-21: chromium and firefox both followed the redirect and
-// reported no violation. webkit could not launch in mapp-browser-runner:local
+// Result on 2026-09-21: chromium and firefox both followed the redirect under
+// the shipped policy. webkit could not launch in mapp-browser-runner:local
 // -- the image lacks its system libraries and carries no package manager to
 // add them -- so Safari's engine is untested and that is why this script is
 // kept rather than deleted after one use.
