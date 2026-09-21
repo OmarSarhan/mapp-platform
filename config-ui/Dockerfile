@@ -23,7 +23,18 @@ COPY --from=web /web/dist ./static
 
 USER nobody
 EXPOSE 8080
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=6 \
+# The start period must outlast whatever startup does before it serves, and
+# what it does is wait up to FEDERATION_VERIFY_STARTUP_GRACE_SECONDS (60) for
+# the first federation pass. At --start-period=5s the budget was 5 + 6x10 = 65
+# seconds, so a deployment that actually used that grace -- a cold start with
+# two federated sources, or one unreachable alias at 5s per connect -- was
+# marked unhealthy a few seconds before it began serving. Everything with
+# `depends_on: service_healthy` then refused to start, and the reported cause
+# was "dependency failed to start" rather than anything about federation.
+#
+# 90s leaves a clear margin over the 60s grace. If that constant moves, this
+# must move with it; test_startup_budget.py fails when it does not.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=90s --retries=6 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
 
 CMD ["python", "app.py"]

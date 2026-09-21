@@ -67,7 +67,15 @@ compose=(
   --file "${ROOT_DIR}/compose.yaml"
 )
 compose+=(--file "${ROOT_DIR}/compose.bundled-db.yaml")
-required_services=(db semantic-service mcp-auth xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+required_services=(db semantic-service xyz xyz-preview config-ui browser-runner egress-proxy caddy)
+# The MCP surface is opt-in and `bin/mapp` starts it only under MAPP_MCP=1, so
+# requiring it unconditionally made the documented default -- a plain
+# `./bin/mapp all` -- fail every time, at the last step, with
+# "mcp-auth health is missing after waiting". Required when it is asked for,
+# and not otherwise.
+if [[ "${MAPP_MCP:-0}" == "1" ]]; then
+  required_services+=(mcp-auth mapp-mcp)
+fi
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
 # an alias using them could be registered, or recreating config-ui silently
 # strips the reference and the periodic verifier withdraws that source. One
@@ -3005,6 +3013,13 @@ probe_endpoint "The configuration service public identity" config_headers \
 # unauthenticated, it is served by the component rather than by Caddy, and it
 # fails if the socket is missing, if the component cannot reach the control
 # schema, or if the issuer is misconfigured.
+#
+# Only when the surface was asked for. `bin/mapp` starts the component under
+# MAPP_MCP=1 and not otherwise, so probing unconditionally made a plain
+# `./bin/mapp all` fail on a 502 from a service nobody asked to run -- the
+# same mistake as requiring it in `required_services`, in a second place, and
+# the fix for the first uncovered the second.
+if [[ "${MAPP_MCP:-0}" == "1" ]]; then
 probe_endpoint "The MCP authorization server metadata" mcp_headers \
   "${mcp_url}/.well-known/oauth-authorization-server"
 # Fetching that document is not enough, and believing it was is what let a real
@@ -3040,6 +3055,9 @@ if [[ "${advertised_port}" != "${expected_edge_port}" ]]; then
 fi
 printf 'The MCP authorization endpoint it advertises is on the published edge port (%s).\n' \
   "${advertised_port}"
+else
+  printf 'The MCP surface is off (MAPP_MCP is unset), so its origin was not probed.\n'
+fi
 # And the control endpoints must not be reachable from the edge. The component
 # owns that as a property of its route tables; the Caddy allowlist is the
 # second, independent control. Both are asserted here because this is the only
