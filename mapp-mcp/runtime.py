@@ -373,6 +373,65 @@ SEMANTIC_PROPOSALS_APPLY = {
     "timeout": 45.0,
 }
 
+#: The derived-layer lifecycle. These act on the database directly: no
+#: proposal, no review queue, no diff to read first. That is why the plan put
+#: them after approval was real rather than alongside the rest.
+DERIVED_LAYERS_PLAN = {
+    "operation_id": "derived-layers.plan",
+    "method": "POST",
+    "path_template": "/api/derived-layers/plan",
+    "scopes": ("derive:manage", "semantic:inspect"),
+    # Probing runs real database work against the sources a definition names.
+    "timeout": 60.0,
+}
+
+DERIVED_LAYERS_CREATE = {
+    "operation_id": "derived-layers.create",
+    "method": "POST",
+    "path_template": "/api/derived-layers",
+    "scopes": ("derive:manage", "semantic:inspect"),
+    "timeout": 120.0,
+    "refusal_hints": {
+        "derived_layer.plan_stale": (
+            "The plan this was built from no longer describes what would"
+            " happen. Run derived_layers_plan again and use the new"
+            " planFingerprint."
+        ),
+    },
+}
+
+DERIVED_LAYERS_REPLACE = {
+    "operation_id": "derived-layers.replace",
+    "method": "POST",
+    "path_template": "/api/derived-layers/{name}/replace",
+    "scopes": ("derive:manage", "semantic:inspect"),
+    "timeout": 120.0,
+}
+
+DERIVED_LAYERS_DROP = {
+    "operation_id": "derived-layers.drop",
+    "method": "POST",
+    "path_template": "/api/derived-layers/{name}/drop",
+    "scopes": ("derive:manage",),
+    "timeout": 60.0,
+    "refusal_hints": {
+        "derived_layer.in_use": (
+            "Something still reads this relation. Remove those layers first --"
+            " each removal is its own proposal and its own approval."
+        ),
+    },
+}
+
+DERIVED_LAYERS_REFRESH = {
+    "operation_id": "derived-layers.refresh",
+    "method": "POST",
+    "path_template": "/api/derived-layers/{name}/refresh",
+    "scopes": ("derive:manage",),
+    # Recomputing a materialised relation is the longest-running thing on this
+    # surface, and `background` exists precisely because it can exceed a wait.
+    "timeout": 120.0,
+}
+
 XYZ_RELOAD = {
     "operation_id": "xyz.reload",
     "method": "POST",
@@ -1568,6 +1627,355 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             f"No derived layer {name!r} on this instance."
             + (f" Managed relations: {', '.join(sorted(known))}." if known else "")
         )
+
+    @tool(
+        operation=DERIVED_LAYERS_PLAN,
+        name="derived_layers_plan",
+        description=(
+            "What creating a derived relation would do, without creating it:"
+            " the probes the platform runs against the sources, the shape it"
+            " would produce, and a planFingerprint. Pass that fingerprint to"
+            " derived_layers_create and the create is refused if anything"
+            " moved in between. Creates nothing and asks nobody."
+        ),
+    )
+    def derived_layers_plan(
+        name: str,
+        query: str,
+        sources: list[str],
+        id_column: str,
+        geometry_column: str,
+        kind: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """The dry run, and the reason `create` is not the first step.
+
+        `proposals_check` is the same idea for the workspace: find out what
+        would happen while nothing has happened yet. It matters more here,
+        because a derived layer leaves no proposal for a person to read -- the
+        plan is the only description of the change that exists before the
+        change does.
+        """
+        return _without_meta(spend(
+            DERIVED_LAYERS_PLAN,
+            path=DERIVED_LAYERS_PLAN["path_template"],
+            body=_derived_definition(
+                name=name, query=query, sources=sources,
+                id_column=id_column, geometry_column=geometry_column,
+                kind=kind, description=description,
+            ),
+        ))
+
+    @tool(
+        operation=DERIVED_LAYERS_CREATE,
+        name="derived_layers_create",
+        description=(
+            "Create a managed derived relation. Asks you to approve first,"
+            " showing the plan. Pass plan_fingerprint from"
+            " derived_layers_plan so the create is refused if the sources"
+            " moved since you looked. This writes to the database directly --"
+            " there is no proposal and no review queue."
+        ),
+    )
+    async def derived_layers_create(
+        ctx: Context,
+        name: str,
+        query: str,
+        sources: list[str],
+        id_column: str,
+        geometry_column: str,
+        kind: str | None = None,
+        description: str | None = None,
+        plan_fingerprint: str | None = None,
+        background: bool | None = None,
+    ) -> dict:
+        """The first tool that creates a database object.
+
+        Everything wave 6 applies was proposed, reviewed and readable first.
+        This is not: the relation appears because an agent asked for it and a
+        person agreed. So the packet carries the definition itself -- the
+        query, the sources, the columns -- because there is nothing else for
+        the person to read.
+        """
+        body = _derived_definition(
+            name=name, query=query, sources=sources,
+            id_column=id_column, geometry_column=geometry_column,
+            kind=kind, description=description,
+        )
+        if plan_fingerprint is not None:
+            body["planFingerprint"] = plan_fingerprint
+        if background is not None:
+            body["background"] = background
+        packet = {
+            "summary": f"Create the derived relation {name}.",
+            "changeCount": 1,
+            "changes": [{"op": "create", "path": f"derived_layers.{name}",
+                         "was": None, "becomes": _change_preview(query)}],
+            "definition": {
+                "name": name, "kind": kind or "view", "sources": sources,
+                "idColumn": id_column, "geometryColumn": geometry_column,
+            },
+            "planned": plan_fingerprint is not None,
+        }
+        receipt = await approval_gate(
+            ctx, DERIVED_LAYERS_CREATE,
+            path=DERIVED_LAYERS_CREATE["path_template"], body=body,
+            tool_name="derived_layers_create", packet=packet,
+        )
+        return _without_meta(spend(
+            DERIVED_LAYERS_CREATE,
+            path=DERIVED_LAYERS_CREATE["path_template"],
+            body=body, receipt=receipt,
+        ))
+
+    @tool(
+        operation=DERIVED_LAYERS_REPLACE,
+        name="derived_layers_replace",
+        description=(
+            "Replace an existing derived relation's definition. Asks you to"
+            " approve first, showing what it is today and what it would"
+            " become. Anything reading the relation sees the new definition"
+            " once this completes."
+        ),
+    )
+    async def derived_layers_replace(
+        ctx: Context,
+        name: str,
+        query: str,
+        sources: list[str],
+        id_column: str,
+        geometry_column: str,
+        kind: str | None = None,
+        description: str | None = None,
+        background: bool | None = None,
+    ) -> dict:
+        """Replacing is the quiet one, and the packet is why.
+
+        A drop announces itself: the platform refuses it while anything reads
+        the relation. A replace does not -- every layer reading it keeps
+        working and starts returning different numbers. So the packet carries
+        the current definition beside the proposed one, and the dependents,
+        because "what reads this" is the question a person should be asked
+        here and is not asked by the operation itself.
+        """
+        current = _derived_entry(name)
+        body = _derived_definition(
+            name=name, query=query, sources=sources,
+            id_column=id_column, geometry_column=geometry_column,
+            kind=kind or current.get("kind"), description=description,
+        )
+        body["confirmed"] = True
+        if background is not None:
+            body["background"] = background
+        dependents = _derived_dependents(name)
+        packet = {
+            "summary": f"Replace the definition of {name}.",
+            "changeCount": 1,
+            "changes": [{
+                "op": "replace", "path": f"derived_layers.{name}",
+                "was": _change_preview(current.get("query")),
+                "becomes": _change_preview(query),
+            }],
+            "dependents": dependents,
+            "note": (
+                "Everything listed under dependents keeps working and starts"
+                " returning different numbers."
+                if dependents["workspaceLayers"] or dependents["derivedLayers"]
+                else "Nothing else reads this relation."
+            ),
+        }
+        target = DERIVED_LAYERS_REPLACE["path_template"].replace(
+            "{name}", quote(name, safe="")
+        )
+        receipt = await approval_gate(
+            ctx, DERIVED_LAYERS_REPLACE, path=target, body=body,
+            tool_name="derived_layers_replace", packet=packet,
+        )
+        return _without_meta(spend(
+            DERIVED_LAYERS_REPLACE, path=target, body=body, receipt=receipt,
+        ))
+
+    @tool(
+        operation=DERIVED_LAYERS_REFRESH,
+        name="derived_layers_refresh",
+        description=(
+            "Recompute a materialised derived relation from its sources. The"
+            " definition does not change; the numbers do. Asks you to approve"
+            " first. Pass background=true for a long one and follow it with"
+            " operations_show."
+        ),
+    )
+    async def derived_layers_refresh(
+        ctx: Context, name: str, background: bool | None = None,
+    ) -> dict:
+        """The mildest of the four, and still asked about.
+
+        It changes no definition and drops nothing -- it recomputes. What makes
+        it worth a person's attention is cost: a refresh reads every source row
+        again, and an agent that could fire it unattended would be a way to
+        spend the database's time.
+        """
+        current = _derived_entry(name)
+        body = {"confirmed": True}
+        if background is not None:
+            body["background"] = background
+        target = DERIVED_LAYERS_REFRESH["path_template"].replace(
+            "{name}", quote(name, safe="")
+        )
+        receipt = await approval_gate(
+            ctx, DERIVED_LAYERS_REFRESH, path=target, body=body,
+            tool_name="derived_layers_refresh",
+            packet={
+                "summary": f"Recompute {name} from its sources.",
+                "changeCount": 1,
+                "changes": [{"op": "refresh",
+                             "path": f"derived_layers.{name}",
+                             "was": current.get("refreshedAt"),
+                             "becomes": "recomputed now"}],
+                "sources": current.get("sources") or [],
+            },
+        )
+        return _without_meta(spend(
+            DERIVED_LAYERS_REFRESH, path=target, body=body, receipt=receipt,
+        ))
+
+    @tool(
+        operation=DERIVED_LAYERS_DROP,
+        name="derived_layers_drop",
+        description=(
+            "Permanently remove a managed derived relation, named exactly."
+            " Refused outright while any layer or other derived relation"
+            " still reads it -- remove those first. Asks you to approve, and"
+            " the approval names what would break. This cannot be undone:"
+            " recovering means rebuilding the relation."
+        ),
+    )
+    async def derived_layers_drop(ctx: Context, name: str) -> dict:
+        """The first genuinely destructive tool on this surface.
+
+        Four things hold it, and none of them is that the scope is hard to
+        get. The relation is named exactly, never matched by pattern or
+        inferred from what was discussed. The dependents are read *before*
+        anybody is asked, so a drop that the platform would refuse is refused
+        here instead of costing somebody a prompt. What would break travels in
+        the approval, so the person sees the consequence and not just the
+        verb. And the receipt is single-use and bound to this one relation.
+
+        The platform refuses an in-use drop on its own; this does not rely on
+        that, and the platform does not rely on this. Both, on purpose.
+        """
+        current = _derived_entry(name)
+        dependents = _derived_dependents(name)
+        blocking = dependents["workspaceLayers"] + dependents["derivedLayers"]
+        if blocking:
+            # Refused before asking. The platform would refuse this too, and
+            # a person prompted to approve something that cannot happen has
+            # been asked to spend attention on nothing.
+            raise ToolError(
+                f"{name} cannot be dropped: "
+                + ", ".join(sorted(blocking))
+                + " still read it. Remove those first -- each removal is its"
+                " own proposal and its own approval."
+            )
+        body = {"confirmed": True}
+        target = DERIVED_LAYERS_DROP["path_template"].replace(
+            "{name}", quote(name, safe="")
+        )
+        receipt = await approval_gate(
+            ctx, DERIVED_LAYERS_DROP, path=target, body=body,
+            tool_name="derived_layers_drop",
+            packet={
+                "summary": f"Permanently remove the derived relation {name}."
+                           " This cannot be undone.",
+                "changeCount": 1,
+                "changes": [{"op": "remove",
+                             "path": f"derived_layers.{name}",
+                             "was": _change_preview(current.get("query")),
+                             "becomes": None}],
+                "kind": current.get("kind"),
+                "sources": current.get("sources") or [],
+                # Empty by the time anybody sees this -- a non-empty list was
+                # refused above. Carried anyway, so the person reading the
+                # approval can see the question was asked.
+                "dependents": dependents,
+            },
+        )
+        return _without_meta(spend(
+            DERIVED_LAYERS_DROP, path=target, body=body, receipt=receipt,
+        ))
+
+    def _derived_definition(
+        *, name, query, sources, id_column, geometry_column, kind, description,
+    ):
+        """The definition body, built once and in one order.
+
+        `kind` defaults to a view because that is the cheap, always-correct
+        choice: a view costs nothing to create and recomputes on read. A
+        materialised relation is faster and stale until refreshed, which is a
+        decision somebody should make rather than inherit from a default.
+        """
+        body = {
+            "name": name,
+            "kind": kind or "view",
+            "query": query,
+            "sources": list(sources),
+            "idColumn": id_column,
+            "geometryColumn": geometry_column,
+        }
+        if description is not None:
+            body["description"] = description
+        return body
+
+    def _derived_entry(name):
+        """The relation as it stands, so a change can be described against it.
+
+        Read rather than assumed. A packet that described the proposed state
+        alone would ask somebody to approve a change without showing them what
+        is being changed.
+        """
+        payload = spend(
+            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
+        )
+        entries = payload.get("derivedLayers")
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and entry.get("name") == name:
+                return entry
+        known = sorted(
+            entry.get("name") for entry in entries
+            if isinstance(entry, dict) and entry.get("name")
+        ) if isinstance(entries, list) else []
+        raise ToolError(
+            f"No derived layer {name!r} on this instance."
+            + (f" Managed relations: {', '.join(known)}." if known else "")
+        )
+
+    def _derived_dependents(name):
+        """What else reads this relation, from the platform's own graph.
+
+        `dependencies.list` is the read the dashboard uses to decide whether a
+        delete is blocked, so this asks the same question of the same answer
+        rather than inferring it from the workspace.
+        """
+        payload = spend(
+            DEPENDENCIES_LIST, path=DEPENDENCIES_LIST["path_template"]
+        )
+        rows = payload.get("dependencies")
+        relation = f"derived_layers.{name}"
+        workspace_layers: list = []
+        derived_layers: list = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("relation") != relation:
+                continue
+            for found in row.get("workspaceLayers") or []:
+                if found not in workspace_layers:
+                    workspace_layers.append(found)
+            for found in row.get("derivedLayers") or []:
+                if found not in derived_layers:
+                    derived_layers.append(found)
+        return {
+            "workspaceLayers": sorted(workspace_layers),
+            "derivedLayers": sorted(derived_layers),
+        }
 
     @tool(
         operation=FEDERATION_LIST,

@@ -293,7 +293,13 @@ class LegacySessionTests(unittest.TestCase):
              # reads; these write the workspace, write curated meaning and
              # tell the tile service to serve the result, and each costs a
              # scope an operator grants on purpose.
-             "proposals_apply", "semantic_proposals_apply", "xyz_reload"},
+             "proposals_apply", "semantic_proposals_apply", "xyz_reload",
+             # The derived-layer lifecycle, added in wave 7. These act on the
+             # database with no proposal behind them, which is why they cost
+             # the widest scope an operator can grant.
+             "derived_layers_plan", "derived_layers_create",
+             "derived_layers_replace", "derived_layers_refresh",
+             "derived_layers_drop"},
             withheld,
         )
 

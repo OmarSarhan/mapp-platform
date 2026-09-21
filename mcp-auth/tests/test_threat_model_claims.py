@@ -110,11 +110,15 @@ class ThreatModelClaimTests(unittest.TestCase):
         """
         from control_api import requires_approval
 
+        from control_api import NO_APPROVAL_RISKS
+
+        # The exemptions are read from the platform rather than restated. A
+        # restated pair went stale the moment wave 7 allowlisted a dry run.
         unguarded = sorted(
             name for name, operation in operations.OPERATIONS.items()
             if operation.mutating
             and not requires_approval(name)
-            and ACTION_SCHEMAS[name]["risk"] not in {"propose", "visual"}
+            and ACTION_SCHEMAS[name]["risk"] not in NO_APPROVAL_RISKS
         )
         self.assertEqual(
             [], unguarded,
@@ -155,6 +159,9 @@ class ThreatModelClaimTests(unittest.TestCase):
         "proposals.preview-plan",
         "proposals.preview-test",
         "proposals.preview-screenshot",
+        # A dry run, single-use only so a probe cannot be replayed. It writes
+        # nothing, which is why it is here rather than below.
+        "derived-layers.plan",
     ]
 
     #: Attended: the scope is necessary and not sufficient. Each requires an
@@ -164,6 +171,10 @@ class ThreatModelClaimTests(unittest.TestCase):
         "proposals.apply",
         "semantic.proposals.apply",
         "xyz.reload",
+        "derived-layers.create",
+        "derived-layers.replace",
+        "derived-layers.refresh",
+        "derived-layers.drop",
     ]
 
     def test_the_reachable_mutations_are_the_two_pinned_lists(self) -> None:
@@ -200,6 +211,15 @@ class ThreatModelClaimTests(unittest.TestCase):
         allowed_risks = {"propose", "visual"}
         for name in self.UNATTENDED_MUTATIONS:
             with self.subTest(operation=name):
+                if name == "derived-layers.plan":
+                    # The one entry that does not act on a proposal. It is a
+                    # probe: it reports what a definition would do and creates
+                    # nothing, which is the same claim by a different route.
+                    self.assertEqual(
+                        "database-plan", ACTION_SCHEMAS[name]["risk"]
+                    )
+                    self.assertFalse(requires_approval(name))
+                    continue
                 self.assertTrue(
                     name.startswith("proposals.")
                     or name.startswith("semantic.proposals."),
@@ -231,8 +251,9 @@ class ThreatModelClaimTests(unittest.TestCase):
         ever becomes exempt, the sentence stops being true and this is where
         it shows.
 
-        `derive:manage` is still unofferable and is checked separately, since
-        wave 7 has not happened.
+        `derive:manage` joined them at wave 7, which is the last pin to come
+        off. Nothing that mutates is held by unofferability any more -- every
+        one of them is held by the receipt.
         """
         from control_api import requires_approval
 
@@ -240,18 +261,27 @@ class ThreatModelClaimTests(unittest.TestCase):
         offered = set(re.findall(
             r"\{id:'([^']+)'", DASHBOARD[start : DASHBOARD.index("];", start)]
         ))
-        self.assertNotIn("derive:manage", offered)
-        for scope in ("apply", "semantic:apply", "reload"):
+        for scope in ("apply", "semantic:apply", "reload", "derive:manage"):
             with self.subTest(scope=scope):
                 self.assertIn(
                     scope, offered, "wave 6 made this grantable"
                 )
+                from control_api import NO_APPROVAL_RISKS
+
                 for name, operation in operations.OPERATIONS.items():
-                    if scope in operation.required_scopes:
-                        self.assertTrue(
-                            requires_approval(name),
-                            f"{name} costs {scope} and asks nobody",
-                        )
+                    if scope not in operation.required_scopes:
+                        continue
+                    if ACTION_SCHEMAS[name]["risk"] in NO_APPROVAL_RISKS:
+                        # A class the platform exempts on purpose. The same
+                        # scope buys `derived-layers.plan`, a probe that
+                        # reports what a definition would do and creates
+                        # nothing -- it is single-use so it cannot be
+                        # replayed, but there is nothing to approve.
+                        continue
+                    self.assertTrue(
+                        requires_approval(name),
+                        f"{name} costs {scope} and asks nobody",
+                    )
 
     def test_the_default_preset_discloses_only_the_configured_workspace(self) -> None:
         """"`analysis` is the default and excludes both of the scopes that

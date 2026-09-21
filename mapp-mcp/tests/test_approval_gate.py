@@ -920,6 +920,249 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(20, len(packet["changes"]))
 
 
+class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """The derived-layer lifecycle, where the guards are the wave.
+
+    These act on the database directly: no proposal, no queue, no diff to read
+    first. So what a person is shown has to be assembled by the tool, and the
+    one destructive tool has to refuse before it asks rather than after.
+    """
+
+    ENTRY = {
+        "name": "census_h3", "kind": "materialized",
+        "query": "SELECT 1", "sources": ["source_census.oa"],
+        "refreshedAt": "2026-09-01T00:00:00Z",
+    }
+
+    class Api:
+        def __init__(self, outer, *, dependents=None) -> None:
+            self.outer = outer
+            self.dependents = dependents or []
+            self.calls = []
+
+        def get(self, **kwargs):
+            self.calls.append({"method": "GET", **kwargs})
+            if kwargs["path"] == "/api/derived-layers":
+                return {"derivedLayers": [self.outer.ENTRY]}
+            if kwargs["path"] == "/api/dependencies":
+                return {"dependencies": self.dependents}
+            return {}
+
+        def post(self, **kwargs):
+            self.calls.append({"method": "POST", **kwargs})
+            path = kwargs["path"]
+            if path == APPROVALS_CREATE["path_template"]:
+                return {"handle": HANDLE, "reference": "a" * 64,
+                        "approvalUrl": APPROVAL_URL}
+            if path == APPROVALS_CLAIM["path_template"]:
+                return {"status": "approved", "receipt": RECEIPT}
+            if path == APPROVALS_CONFIRM["path_template"]:
+                return {"decided": True}
+            return {"derivedLayer": {"name": "census_h3"}}
+
+        def posted_to(self, path):
+            return [c for c in self.calls
+                    if c["method"] == "POST" and c["path"] == path]
+
+        def packet(self):
+            return self.posted_to(
+                APPROVALS_CREATE["path_template"]
+            )[0]["body"]["packet"]
+
+    def build(self, name, api):
+        server = build_runtime(
+            resource=ProtectedResource(
+                origin="http://mcp.localhost", issuer="http://mcp.localhost"
+            ),
+            exchange=FakeExchange(),
+            config_api=api,
+        )
+        token = CURRENT_CALLER.set(Authenticated(
+            {"sub": "oauth:grant",
+             "scope": "mcp:connect inspect derive semantic:inspect"
+                      " derive:manage",
+             "aud": "http://mcp.localhost/mcp"},
+            "mapp_a_live",
+        ))
+        self.addCleanup(CURRENT_CALLER.reset, token)
+        return server._tool_manager._tools[name].fn
+
+    def agreeing(self):
+        return FakeContext(
+            elicitation=Capability(form={}),
+            form=Answer("accept", Confirmation(True)),
+        )
+
+    def reading(self, *, workspace=(), derived=()):
+        return [{"alias": "MAPP", "relation": "derived_layers.census_h3",
+                 "workspaceLayers": list(workspace),
+                 "derivedLayers": list(derived)}]
+
+    async def test_a_drop_with_dependents_is_refused_before_anybody_is_asked(
+        self,
+    ) -> None:
+        """A person prompted to approve something that cannot happen has been
+        asked to spend attention on nothing."""
+        api = self.Api(self, dependents=self.reading(
+            workspace=["locale:Census_OA_Population"]))
+        drop = self.build("derived_layers_drop", api)
+        ctx = self.agreeing()
+        with self.assertRaises(ToolError) as raised:
+            await drop(ctx, "census_h3")
+        self.assertIn("locale:Census_OA_Population", str(raised.exception))
+        self.assertEqual([], ctx.asked)
+        self.assertEqual(
+            [], api.posted_to(APPROVALS_CREATE["path_template"]),
+            "a refused drop must not ask for an approval",
+        )
+
+    async def test_another_derived_layer_blocks_a_drop_too(self) -> None:
+        api = self.Api(self, dependents=self.reading(derived=["other_h3"]))
+        drop = self.build("derived_layers_drop", api)
+        with self.assertRaises(ToolError) as raised:
+            await drop(self.agreeing(), "census_h3")
+        self.assertIn("other_h3", str(raised.exception))
+
+    async def test_a_clean_drop_asks_and_names_what_it_removes(self) -> None:
+        api = self.Api(self, dependents=self.reading())
+        drop = self.build("derived_layers_drop", api)
+        self.assertIsNotNone(await drop(self.agreeing(), "census_h3"))
+        packet = api.packet()
+        self.assertIn("cannot be undone", packet["summary"])
+        self.assertIn("census_h3", packet["summary"])
+        self.assertEqual("remove", packet["changes"][0]["op"])
+        self.assertIsNone(packet["changes"][0]["becomes"])
+        self.assertEqual({"workspaceLayers": [], "derivedLayers": []},
+                         packet["dependents"])
+
+    async def test_the_drop_is_bound_to_the_relation_named(self) -> None:
+        api = self.Api(self, dependents=self.reading())
+        drop = self.build("derived_layers_drop", api)
+        await drop(self.agreeing(), "census_h3")
+        dropped = api.posted_to("/api/derived-layers/census_h3/drop")
+        self.assertEqual(1, len(dropped))
+        self.assertEqual({"confirmed": True}, dropped[0]["body"])
+        self.assertEqual(RECEIPT, dropped[0]["receipt"])
+
+    async def test_a_name_is_encoded_never_interpreted(self) -> None:
+        """Named exactly. No pattern, and nothing the path could reinterpret."""
+        api = self.Api(self, dependents=self.reading())
+        api.get = lambda **kw: (
+            {"derivedLayers": [{**self.ENTRY, "name": "a/b"}]}
+            if kw["path"] == "/api/derived-layers"
+            else {"dependencies": []}
+        )
+        drop = self.build("derived_layers_drop", api)
+        await drop(self.agreeing(), "a/b")
+        self.assertTrue(
+            any(c["path"] == "/api/derived-layers/a%2Fb/drop"
+                for c in api.calls),
+            [c["path"] for c in api.calls],
+        )
+
+    async def test_dropping_something_that_is_not_there_says_what_is(
+        self,
+    ) -> None:
+        api = self.Api(self, dependents=self.reading())
+        drop = self.build("derived_layers_drop", api)
+        with self.assertRaises(ToolError) as raised:
+            await drop(self.agreeing(), "no_such_thing")
+        self.assertIn("census_h3", str(raised.exception))
+
+    async def test_a_replace_shows_what_it_is_today(self) -> None:
+        """A replace is the quiet one: everything reading the relation keeps
+        working and starts returning different numbers."""
+        api = self.Api(self, dependents=self.reading(
+            workspace=["locale:Census_OA_Population"]))
+        replace = self.build("derived_layers_replace", api)
+        await replace(
+            self.agreeing(), "census_h3", "SELECT 2",
+            ["source_census.oa"], "oa_id", "geom_3857",
+        )
+        packet = api.packet()
+        self.assertEqual("replace", packet["changes"][0]["op"])
+        self.assertEqual("SELECT 1", packet["changes"][0]["was"])
+        self.assertEqual("SELECT 2", packet["changes"][0]["becomes"])
+        self.assertEqual(["locale:Census_OA_Population"],
+                         packet["dependents"]["workspaceLayers"])
+        self.assertIn("different numbers", packet["note"])
+
+    async def test_a_replace_with_no_dependents_says_so(self) -> None:
+        api = self.Api(self, dependents=self.reading())
+        replace = self.build("derived_layers_replace", api)
+        await replace(
+            self.agreeing(), "census_h3", "SELECT 2",
+            ["source_census.oa"], "oa_id", "geom_3857",
+        )
+        self.assertIn("Nothing else reads", api.packet()["note"])
+
+    async def test_a_create_carries_the_definition_it_would_write(
+        self,
+    ) -> None:
+        """There is no proposal to read, so the definition is the only
+        description of the change that exists."""
+        api = self.Api(self)
+        create = self.build("derived_layers_create", api)
+        await create(
+            self.agreeing(), "new_h3", "SELECT 1", ["source_census.oa"],
+            "oa_id", "geom_3857",
+        )
+        packet = api.packet()
+        self.assertEqual("create", packet["changes"][0]["op"])
+        self.assertEqual(["source_census.oa"],
+                         packet["definition"]["sources"])
+        self.assertEqual("view", packet["definition"]["kind"])
+        self.assertFalse(packet["planned"])
+
+    async def test_a_plan_fingerprint_is_carried_and_noted(self) -> None:
+        api = self.Api(self)
+        create = self.build("derived_layers_create", api)
+        await create(
+            self.agreeing(), "new_h3", "SELECT 1", ["source_census.oa"],
+            "oa_id", "geom_3857", plan_fingerprint="sha256:" + "f" * 64,
+        )
+        self.assertTrue(api.packet()["planned"])
+        created = api.posted_to("/api/derived-layers")[0]["body"]
+        self.assertEqual("sha256:" + "f" * 64, created["planFingerprint"])
+
+    async def test_planning_asks_nobody_and_writes_nothing(self) -> None:
+        """The dry run. If this ever needs approval, the parallel with
+        proposals_check has been broken."""
+        api = self.Api(self)
+        plan = self.build("derived_layers_plan", api)
+        plan("new_h3", "SELECT 1", ["source_census.oa"], "oa_id", "geom_3857")
+        self.assertEqual(
+            [], api.posted_to(APPROVALS_CREATE["path_template"])
+        )
+        self.assertEqual(
+            1, len(api.posted_to("/api/derived-layers/plan"))
+        )
+
+    async def test_a_refresh_asks_and_names_the_sources(self) -> None:
+        api = self.Api(self)
+        refresh = self.build("derived_layers_refresh", api)
+        await refresh(self.agreeing(), "census_h3")
+        packet = api.packet()
+        self.assertEqual("refresh", packet["changes"][0]["op"])
+        self.assertEqual(["source_census.oa"], packet["sources"])
+        self.assertEqual(
+            {"confirmed": True},
+            api.posted_to("/api/derived-layers/census_h3/refresh")[0]["body"],
+        )
+
+    async def test_declining_a_drop_removes_nothing(self) -> None:
+        api = self.Api(self, dependents=self.reading())
+        drop = self.build("derived_layers_drop", api)
+        ctx = FakeContext(
+            elicitation=Capability(form={}), form=Answer("decline"),
+        )
+        with self.assertRaises(ToolError):
+            await drop(ctx, "census_h3")
+        self.assertEqual(
+            [], api.posted_to("/api/derived-layers/census_h3/drop")
+        )
+
+
 class GatedToolTests(unittest.TestCase):
     """A tool whose operation needs permission must ask for it.
 

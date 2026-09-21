@@ -353,6 +353,45 @@ not a caveat on it:
 The asymmetry is deliberate: creating is cheap to undo and dropping is not, so
 they sit behind the same scope but not behind the same amount of ceremony.
 
+**Built.** `derived_layers_plan`, `_create`, `_replace`, `_refresh` and
+`_drop`. Five rather than the four planned: `plan` is the dry run, standing in
+the same relation to `create` that `proposals_check` stands in to
+`proposals_create`, and it matters more here — a derived layer leaves no
+proposal, so the plan is the only description of the change that exists before
+the change does. It is single-use anyway, because probing runs real database
+work and a replayable credential for it is a way to spend that work twice.
+
+`derive:manage` came off `NEVER_OFFERED_TO_AGENTS`, the last pin to go.
+Nothing that mutates is held by unofferability any more; every one of them is
+held by the receipt.
+
+**The drop guards, which are the wave:**
+
+- **Named exactly**, and the name is percent-encoded into the path, never
+  interpreted. No pattern, no "the one I just made".
+- **Dependents read before anybody is asked.** The platform refuses an in-use
+  drop on its own; the tool does not rely on that and the platform does not
+  rely on the tool. What the tool adds is that nobody is prompted to approve
+  something that cannot happen.
+- **What would break travels in the approval**, so the person sees the
+  consequence and not just the verb. On a clean drop the list is empty and is
+  carried anyway, so the approval shows the question was asked.
+- **A receipt per drop**, single-use and bound to that one relation.
+
+**`replace` turned out to need the same care, which the plan did not say.** A
+drop announces itself — the platform refuses it while anything reads the
+relation. A replace does not: every layer reading it keeps working and starts
+returning different numbers. So its packet carries the current definition
+beside the proposed one and the dependent list, because "what reads this" is
+the question a person should be asked there and the operation does not ask it.
+
+Two guards fired during the build and were right both times: the allowlist
+drift test caught that `plan`, `create` and `replace` also need
+`semantic:inspect` — the handler resolves semantic sources before probing, so
+a credential minted for `derive:manage` alone is refused — and the risk-class
+test caught an attempt to mark the dry run non-mutating without reclassifying
+`database-plan`.
+
 ## Wave 8 — standing approval windows (P8)
 
 **Build:** time-boxed windows binding grant, client, instance and one action

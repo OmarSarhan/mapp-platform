@@ -571,8 +571,21 @@ class AllowlistDriftTests(unittest.TestCase):
         "full", "admin", "federation:provision", "federation:register",
         "semantic:admin", "semantic:generate",
         "semantic:data",
-        "derive:manage",
     })
+    # `derive:manage` was here until Phase 1 wave 7, and it is the last and
+    # sharpest of the pins to come off. It authorises creating, replacing,
+    # refreshing and dropping a managed relation -- acts that leave no
+    # proposal, no review queue and no diff to read beforehand, which is
+    # exactly why the plan put them after approval was real rather than
+    # alongside the rest.
+    #
+    # `drop` is the first genuinely destructive tool on the surface. What
+    # holds it is four things and not the pin: the relation is named exactly
+    # and never matched by pattern; the platform refuses to drop a relation
+    # anything still reads, by name rather than by warning; the tool reads the
+    # dependents *before* asking, so nobody is prompted to approve a drop that
+    # would be refused; and the approval carries what would break, so the
+    # person sees the consequence and not just the verb.
     # `apply`, `semantic:apply` and `reload` were here until Phase 1 wave 6,
     # and lifting them is that wave's substantive decision rather than a
     # consequence of it. They authorise the irreversible half of the loop: a

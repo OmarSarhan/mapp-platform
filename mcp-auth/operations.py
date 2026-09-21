@@ -130,11 +130,66 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:observe",),
         mutating=False,
     ),
+    "derived-layers.plan": Operation(
+        operation_id="derived-layers.plan",
+        method="POST",
+        path_template="/api/derived-layers/plan",
+        # Two scopes, because the handler resolves semantic sources
+        # before it probes anything and imposes its own gate on
+        # them. A credential minted for the first alone is refused
+        # by the platform for want of the second.
+        required_scopes=("derive:manage", "semantic:inspect"),
+        # A dry run: it probes the definition, returns what would happen and
+        # a fingerprint, and creates nothing -- the same relationship
+        # `proposals.check` has to `proposals.create`. Its risk class keeps it
+        # out of the approval set for that reason: there is nothing to approve
+        # because nothing happens.
+        #
+        # Single-use anyway. `database-plan` is not a read risk and is not
+        # being reclassified as one to save an exchange: probing runs real
+        # database work, and a replayable credential for it is a way to spend
+        # that work twice. The cost of the conservative choice is one exchange
+        # per plan, which is nothing.
+        mutating=True,
+    ),
     "derived-layers.refresh": Operation(
         operation_id="derived-layers.refresh",
         method="POST",
         path_template="/api/derived-layers/{name}/refresh",
         required_scopes=("derive:manage",),
+        mutating=True,
+    ),
+    "derived-layers.create": Operation(
+        operation_id="derived-layers.create",
+        method="POST",
+        path_template="/api/derived-layers",
+        # Two scopes, because the handler resolves semantic sources
+        # before it probes anything and imposes its own gate on
+        # them. A credential minted for the first alone is refused
+        # by the platform for want of the second.
+        required_scopes=("derive:manage", "semantic:inspect"),
+        mutating=True,
+    ),
+    "derived-layers.replace": Operation(
+        operation_id="derived-layers.replace",
+        method="POST",
+        path_template="/api/derived-layers/{name}/replace",
+        # Two scopes, because the handler resolves semantic sources
+        # before it probes anything and imposes its own gate on
+        # them. A credential minted for the first alone is refused
+        # by the platform for want of the second.
+        required_scopes=("derive:manage", "semantic:inspect"),
+        mutating=True,
+    ),
+    "derived-layers.drop": Operation(
+        operation_id="derived-layers.drop",
+        method="POST",
+        path_template="/api/derived-layers/{name}/drop",
+        required_scopes=("derive:manage",),
+        # The first genuinely destructive operation on this surface. Nothing
+        # about the exchange treats it specially -- what guards it is the
+        # approval, the platform's own refusal to drop a relation in use, and
+        # the tool showing what would break before anybody is asked.
         mutating=True,
     ),
     "federation.aliases.observe": Operation(

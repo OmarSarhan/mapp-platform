@@ -470,6 +470,23 @@ saves, no credential administration, no token issuance or revocation, and no
 dashboard or audit administration exposed; every consequential operation
 requiring a fresh token B bound to one request.
 
+**What changed at Phase 1 wave 7.** `derive:manage` became grantable, which
+puts DDL on the surface: a hostile client holding it can create, replace,
+refresh and drop managed relations. This is the widest thing an operator can
+hand over and the preset says so. Three things bound it. Every one of those
+operations requires a receipt, so the reach is again "it can ask". A drop is
+refused outright while any layer or other derived relation still reads the
+relation — by the platform, and separately by the tool before it asks. And a
+replace, which is the one that does *not* announce itself, carries the current
+definition and the dependent list into the approval, so the person is shown
+that layers will keep working and start returning different numbers.
+
+The residual worth naming: `refresh` is the cheapest of the four to ask for
+and the most expensive to serve, since it reads every source row again. It
+asks a person every time, which is what stops it being a way to spend the
+database's time unattended — and is another reason wave 8's standing windows
+should not cover it casually.
+
 **What changed at Phase 1 wave 6.** `apply`, `semantic:apply` and `reload`
 became grantable, so a hostile client holding them can reach operations that
 write the workspace, write curated meaning and tell the tile service to serve
