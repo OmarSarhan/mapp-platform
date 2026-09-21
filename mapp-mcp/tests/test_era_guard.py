@@ -425,22 +425,36 @@ class HandshakeAdmissionTests(unittest.TestCase):
 
 
 class SessionHeaderTests(unittest.TestCase):
-    def test_a_session_id_from_the_runtime_is_stripped(self) -> None:
-        """The second control, and the one that survives an SDK bump.
+    """The inverse of what this asserted until Phase 1 wave 7.
 
-        The guard already refuses the requests that would create a session, so
-        nothing downstream should mint one. This is what catches it if something
-        downstream starts doing so anyway.
-        """
+    It read: a session identifier the runtime emits is stripped, on the RPC
+    path and on pass-through paths alike. That was `era_guard` obligation 4,
+    and it was traded for in-session approval -- the server cannot ask a
+    client anything without a back-channel, and there is no back-channel
+    without a session.
+
+    Kept as its inverse rather than deleted, because the obligation is the
+    kind of thing somebody will later assume is still in force. What must not
+    change is that the *era* controls are untouched: an unserved revision is
+    still refused, and the tests above still say so.
+    """
+
+    def test_a_session_id_from_the_runtime_reaches_the_client(self) -> None:
+        """Stripping it left a client holding a session the server had been
+        told to forget, which is why enabling sessions meant removing this."""
         app, _, _ = guarded(session_id="legacy-session-1")
         response = call(app, headers=MODERN, body=b"{}")
         self.assertEqual(200, response.status)
-        self.assertNotIn("mcp-session-id", response.headers)
+        self.assertEqual(
+            "legacy-session-1", response.headers.get("mcp-session-id")
+        )
 
-    def test_it_is_stripped_on_pass_through_paths_too(self) -> None:
+    def test_it_reaches_the_client_on_pass_through_paths_too(self) -> None:
         app, _, _ = guarded(session_id="legacy-session-2")
         response = call(app, method="GET", path="/elsewhere")
-        self.assertNotIn("mcp-session-id", response.headers)
+        self.assertEqual(
+            "legacy-session-2", response.headers.get("mcp-session-id")
+        )
 
 
 class BodyHandlingTests(unittest.TestCase):

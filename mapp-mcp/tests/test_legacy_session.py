@@ -34,6 +34,10 @@ from asgi_harness import StubIntrospection, active  # noqa: E402
 from protected_resource import ProtectedResource  # noqa: E402
 from runtime import build_runtime_app  # noqa: E402
 
+#: Distinguishable from `None`, which is a real choice: send no session
+#: identifier at all, as the handshake must.
+_UNSET = object()
+
 TOKEN = "mapp_a_session"
 ORIGIN = "http://mcp.localhost"
 SCOPES = "mcp:connect inspect derive semantic:inspect"
@@ -49,6 +53,17 @@ class FakeExchange:
         self.calls.append(kwargs)
         return "mapp_b_minted"
 
+    def request_digest(self, **kwargs):
+        """The approval gate digests before it exchanges.
+
+        Absent once, and the omission was invisible: a gated tool crashed
+        before any elicitation was sent, and a cross-session test that asked
+        "did the call complete" saw both its cases complete identically on the
+        crash. A fake missing a method the real one has does not fail loudly;
+        it makes the test measure something else.
+        """
+        return "mapp-jcs-v1:" + "d" * 64
+
 
 class FakeConfigApi:
     def __init__(self) -> None:
@@ -58,21 +73,61 @@ class FakeConfigApi:
         self.calls.append(kwargs)
         return {"total": 2, "values": [{"value": "a", "count": 2}]}
 
+    def post(self, **kwargs):
+        """Enough of the approval routes for a gated tool to reach its prompt.
+
+        `approvals.create` hands back a handle, and a claim reports a decision
+        already made -- so what these tests exercise is the elicitation and its
+        routing, not the platform's half, which `test_approvals.py` drives
+        against a real database.
+        """
+        self.calls.append(kwargs)
+        if kwargs["path"] == "/api/approvals":
+            return {"handle": "h", "reference": "a" * 64,
+                    "approvalUrl": "http://config.localhost/#approvals/"
+                                   + "a" * 64}
+        if kwargs["path"] == "/api/approvals/claim":
+            return {"status": "approved", "receipt": "receipt-value"}
+        if kwargs["path"] == "/api/approvals/confirm":
+            return {"decided": True}
+        return {"status": {"completed": True}}
+
 
 class Session:
-    """Requests sharing one lifespan, as a connected client's would."""
+    """Requests sharing one lifespan, as a connected client's would.
+
+    It also carries the session identifier back, which a real client does and
+    this did not have to until Phase 1 wave 7 -- the server minted none, so
+    there was nothing to carry. With sessions on, a client that does not
+    return it is answered "Missing session ID" on everything after the
+    handshake, which is exactly what a client that forgot would see.
+    """
 
     def __init__(self, app) -> None:
         self._app = app
         self.session_ids = []
+        self.session = None
 
-    async def request(self, body, *, version=None, token=TOKEN, method_header=None):
+    async def request(self, body, *, version=None, token=TOKEN, method_header=None,
+                      session=_UNSET, on_frame=None):
+        """`session` overrides what is sent, so a test can present another
+        client's identifier or none at all.
+
+        `on_frame` is called with each SSE payload as it arrives rather than
+        after the response completes, which is the only way to see a request
+        the *server* sends mid-call -- an elicitation is delivered on the
+        stream of the call that triggered it, and a test that waits for the
+        call to finish waits for the thing it is trying to answer.
+        """
         raw = json.dumps(body).encode()
         headers = [
             (b"content-type", b"application/json"),
             (b"accept", b"application/json, text/event-stream"),
             (b"host", b"mcp.localhost"),
         ]
+        carried = self.session if session is _UNSET else session
+        if carried is not None:
+            headers.append((b"mcp-session-id", carried.encode()))
         if version is not None:
             headers.append((b"mcp-protocol-version", version.encode()))
         if method_header is not None:
@@ -95,6 +150,13 @@ class Session:
 
         async def send(message):
             messages.append(message)
+            if on_frame is None or message["type"] != "http.response.body":
+                return
+            for line in message.get("body", b"").decode(
+                "utf-8", "replace"
+            ).splitlines():
+                if line.startswith("data: "):
+                    on_frame(json.loads(line[6:]))
 
         await asyncio.wait_for(self._app(scope, receive, send), timeout=20)
         start = next(m for m in messages if m["type"] == "http.response.start")
@@ -102,7 +164,10 @@ class Session:
             name.decode("latin-1").lower(): value.decode("latin-1")
             for name, value in start.get("headers", [])
         }
-        self.session_ids.append(headers_out.get("mcp-session-id"))
+        minted = headers_out.get("mcp-session-id")
+        self.session_ids.append(minted)
+        if minted and self.session is None:
+            self.session = minted
         body_out = b"".join(
             m.get("body", b"") for m in messages if m["type"] == "http.response.body"
         )
@@ -242,19 +307,25 @@ class LegacySessionTests(unittest.TestCase):
         result = rpc_result(transcript["initialize"][2])["result"]
         self.assertEqual(era_guard.HANDSHAKE_VERSIONS[-1], result["protocolVersion"])
 
-    def test_no_session_identifier_is_ever_minted(self) -> None:
-        """The obligation that serving this era was most likely to cost.
+    def test_a_session_identifier_is_minted_and_kept(self) -> None:
+        """The inverse of what this asserted until Phase 1 wave 7.
 
-        The legacy transport is session-based, so admitting it could have meant
-        admitting `Mcp-Session-Id` -- which the guard strips, leaving a client
-        holding a session the server had been told to forget. It does not,
-        because the runtime is stateless; this is what says so on the wire.
+        It read: no session identifier is ever minted. That was `era_guard`
+        obligation 4, and it was traded for in-session approval -- a server
+        cannot ask a client anything without a back-channel, and there is no
+        back-channel without a session. The obligation never enforced the era
+        decision; obligations 1 to 3 do that and are untouched.
+
+        Kept as its inverse rather than deleted, because the day somebody
+        wonders why this server holds sessions, a test named for it is where
+        the answer should be.
         """
         transcript, _, _ = self.drive()
+        minted = [value for value in transcript["session_ids"] if value]
+        self.assertTrue(minted, "the handshake minted no session identifier")
         self.assertEqual(
-            [None, None, None, None],
-            transcript["session_ids"],
-            "a session identifier crossed the boundary",
+            1, len(set(minted)),
+            "one session per client, not one per request",
         )
 
     def test_the_listed_tools_are_the_ones_this_grant_can_call(self) -> None:
@@ -442,7 +513,25 @@ class ToolFailureVisibilityTests(unittest.TestCase):
 
         async def session():
             async with runtime.router.lifespan_context(runtime):
-                return await Session(app).request(
+                client = Session(app)
+                version = era_guard.HANDSHAKE_VERSIONS[-1]
+                # The handshake first. It was not needed while the runtime was
+                # stateless; with sessions on, a `tools/call` that opens no
+                # session is answered "Missing session ID" and never reaches a
+                # tool -- which would make this assert the wrong refusal.
+                await client.request({
+                    "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": {
+                        "protocolVersion": version,
+                        "capabilities": {},
+                        "clientInfo": {"name": "probe", "version": "1"},
+                    },
+                })
+                await client.request(
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    version=version,
+                )
+                return await client.request(
                     {
                         "jsonrpc": "2.0",
                         "id": 2,
@@ -452,7 +541,7 @@ class ToolFailureVisibilityTests(unittest.TestCase):
                             "arguments": {"layer_key": "L", "field": "f"},
                         },
                     },
-                    version=era_guard.HANDSHAKE_VERSIONS[-1],
+                    version=version,
                 )
 
         status, _, body = run(session())
@@ -539,3 +628,151 @@ class ModernSessionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrossSessionElicitationTests(unittest.TestCase):
+    """One session must not be able to answer another's approval prompt.
+
+    This is the property the whole approval mechanism rests on, and the one
+    thing holding sessions could plausibly have broken. An agent that could
+    answer a prompt meant for somebody else would be approving mutations
+    nobody asked it about.
+
+    Measured against the deployed stack before the change landed: a second
+    session presenting a valid token and the right request id was acked `202`
+    by the transport and never routed, leaving the first call waiting. This
+    pins it in process, with a positive control beside it -- a negative result
+    from a harness that cannot detect success would prove nothing at all.
+    """
+
+    def run_case(self, *, answer_on_victim):
+        """Drive one eliciting call and answer it from one session or another.
+
+        Returns whether the victim's call completed. The two cases differ in
+        exactly one thing: which session posts the answer.
+        """
+        app, runtime, _, _ = composed(scopes=SCOPES + " reload")
+        outcome = {}
+
+        async def case():
+            async with runtime.router.lifespan_context(runtime):
+                victim, attacker = Session(app), Session(app)
+                V = era_guard.HANDSHAKE_VERSIONS[-1]
+                for client in (victim, attacker):
+                    await client.request({
+                        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                        "params": {
+                            "protocolVersion": V,
+                            # Declaring form elicitation is what makes the
+                            # runtime ask rather than send them to a dashboard.
+                            "capabilities": {"elicitation": {"form": {}}},
+                            "clientInfo": {"name": "probe", "version": "1"},
+                        },
+                    })
+                    await client.request(
+                        {"jsonrpc": "2.0",
+                         "method": "notifications/initialized"},
+                        version=V,
+                    )
+                victim_session = next(
+                    value for value in victim.session_ids if value
+                )
+                attacker_session = next(
+                    value for value in attacker.session_ids if value
+                )
+                self.assertNotEqual(victim_session, attacker_session)
+
+                asked = asyncio.Event()
+                prompt: list = []
+                seen: list = []
+
+                def watch_frames(payload):
+                    if payload.get("method") == "elicitation/create":
+                        prompt.append(payload)
+                        asked.set()
+
+                async def watch():
+                    """The victim's call, with its stream read as it arrives."""
+                    seen.append(await victim.request(
+                        {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                         "params": {"name": "xyz_reload", "arguments": {}}},
+                        version=V,
+                        on_frame=watch_frames,
+                    ))
+
+                call = asyncio.create_task(watch())
+                # The elicitation is sent while the call is in flight, so the
+                # answer has to be posted from outside it -- and its id is
+                # read off the wire rather than guessed, because a guess that
+                # is wrong looks exactly like a routing refusal.
+                await asyncio.wait_for(asked.wait(), timeout=10)
+                answerer = victim if answer_on_victim else attacker
+                await answerer.request(
+                    {"jsonrpc": "2.0", "id": prompt[0]["id"],
+                     "result": {"action": "decline"}},
+                    version=V,
+                )
+                try:
+                    await asyncio.wait_for(call, timeout=5)
+                    outcome["answered"] = True
+                    outcome["text"] = self.text_of(seen[0][2] if seen else "")
+                except asyncio.TimeoutError:
+                    # Still waiting on a prompt nobody it trusts has answered.
+                    call.cancel()
+                    outcome["answered"] = False
+                    outcome["text"] = ""
+
+        run(case())
+        return outcome
+
+    @staticmethod
+    def text_of(body):
+        """The tool's own answer, found by its id.
+
+        Not the first frame on the stream: the elicitation travels there too,
+        and reading that one yields an empty string, which is
+        indistinguishable from a call that was never answered.
+        """
+        for line in body.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = json.loads(line[6:])
+            if payload.get("id") != 7:
+                continue
+            result = payload.get("result") or {}
+            return " ".join(
+                part.get("text", "") for part in result.get("content", [])
+            )
+        return ""
+
+    def test_the_right_session_can_answer(self) -> None:
+        """The positive control, and it earned its place.
+
+        Without it this pair passed while proving nothing: the fake exchange
+        was missing the method the gate calls first, so the tool crashed before
+        any prompt was sent and *both* cases "completed" -- identically, on the
+        crash. What distinguishes them has to be the decision reaching the
+        call, so that is what is asserted rather than the call merely ending.
+        """
+        outcome = self.run_case(answer_on_victim=True)
+        self.assertTrue(
+            outcome["answered"],
+            "the session that was asked could not answer its own prompt, so"
+            " this harness proves nothing about the test below",
+        )
+        self.assertIn(
+            "declined", outcome["text"],
+            "the call ended without the answer reaching it:"
+            f" {outcome['text'][:160]}",
+        )
+
+    def test_another_session_cannot(self) -> None:
+        """The property the approval mechanism rests on. An agent that could
+        answer a prompt meant for somebody else would be approving mutations
+        nobody asked it about."""
+        outcome = self.run_case(answer_on_victim=False)
+        self.assertFalse(
+            outcome["answered"],
+            "a second session answered a prompt meant for the first:"
+            f" {outcome['text'][:160]}",
+        )

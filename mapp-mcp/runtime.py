@@ -3607,22 +3607,32 @@ def build_runtime_app(*, resource, exchange=None, config_api=None):
     host = urlsplit(resource.origin).hostname or "localhost"
     return server.streamable_http_app(
         streamable_http_path=RPC_PATH,
-        # No session state. Under the handshake era the SDK would otherwise
-        # mint and require `Mcp-Session-Id`, which the guard strips -- the
-        # client would send back a session the server had been told to forget,
-        # and every request after initialize would be refused.
+        # Session state, which this server refused until Phase 1 wave 7.
         #
-        # Measured, not assumed: with this on, a full legacy session --
-        # initialize, notifications/initialized, tools/list, tools/call --
-        # completes and no session identifier is ever emitted. That is what
-        # lets the legacy era be served without giving up the no-session
-        # obligation.
+        # The reversal buys exactly one thing, and it is the thing the owner
+        # asked for: a person approves a mutation in the session they are
+        # working in, rather than at a dashboard over two tool calls. Without
+        # a session there is no back-channel, and without a back-channel the
+        # server cannot ask a client anything -- measured on 2026-09-20, where
+        # forcing the elicitation capability on produced "Cannot send
+        # 'elicitation/create': this transport context has no back-channel for
+        # server-initiated requests".
         #
-        # This is a consequence of the era decision, not the control that
-        # enforces it. The specification is explicit that enabling it "is not
-        # accepted as evidence that the legacy era is disabled"; the guard is
-        # the evidence, and it is asserted on the wire.
-        stateless_http=True,
+        # What it costs is `era_guard`'s obligation 4, and it is worth being
+        # exact about what that obligation was. It never enforced the era
+        # decision -- the guard does that, on the wire, and still does. What
+        # it bought was a smaller surface: no server-side state keyed by an
+        # identifier a client presents. That is given up knowingly.
+        #
+        # What did not change, checked rather than assumed. Authentication is
+        # per request from the bearer token, so a session identifier alone
+        # authorises nothing. And one session cannot answer another's
+        # elicitation: a second session presenting a valid token and the right
+        # request id is acked by the transport and never routed, leaving the
+        # first call waiting. `CrossSessionElicitationTests` pins that, with a
+        # positive control beside it -- a negative result from a harness that
+        # cannot detect success would prove nothing.
+        stateless_http=False,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             # Both spellings: a client may or may not carry the port, and an

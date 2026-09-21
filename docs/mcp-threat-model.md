@@ -192,11 +192,14 @@ person deciding never holds it either — they see a *reference*, which names th
 row and spends nothing — so there is no route by which a decision made in a
 browser travels back through the agent.
 
-**In this deployment a person is always asked in the dashboard, and that is a
-measurement rather than a preference.** The design has three paths — URL
-elicitation, form elicitation, and the dashboard — chosen by what the client
-declared. Driving the deployed stack with a real client on 2026-09-20 showed
-that neither elicitation path can run here, for two different reasons:
+**A person is asked in the session they are working in, and the server holds a
+session so that it can ask.** Three paths — URL elicitation, form elicitation,
+and the dashboard — chosen by what the client declared.
+
+This was not free, and the cost is recorded here rather than in a commit
+message. Driving the deployed stack on 2026-09-20 showed that under the
+original transport arrangement *neither* elicitation path could run, for two
+different reasons:
 
 - The modern era (2026-07-28) declares capabilities on every request, but the
   SDK serves it through a dispatch context that refuses server-initiated
@@ -217,20 +220,33 @@ carried one — today it decides nothing:
 | Claude Code 2.1.276 | `elicitation: {}` | Form |
 | Gemini CLI 0.58.0 | none | Dashboard |
 
-`stateless_http` is not incidental: `era_guard` obligation 4 is that no
-`Mcp-Session-Id` is ever minted, and this is how that is kept. Enabling
-elicitation means trading that away, which is a decision for whoever owns the
-transport rather than a defect to fix quietly.
+**`stateless_http` was turned off at wave 7, and `era_guard` obligation 4 —
+never mint or echo `Mcp-Session-Id` — was withdrawn with it.** That is the
+trade, made deliberately: without a session there is no back-channel, and
+without a back-channel approval happens at a separate dashboard over two tool
+calls, which is the arrangement this design ruled out.
 
-**The security consequence is favourable, and the usability consequence is
-not.** The plan called URL elicitation the best of the three because the
-decision is made in a browser session the agent does not control, looking at
-the rendered evidence rather than a summary. The dashboard path has exactly
-that property — it *is* that property, without the client's cooperation. What
-is lost is convenience: approving takes two tool calls rather than one, with a
-person visiting a page in between. The measured client capabilities are
-recorded above because they decide which path would be taken if the transport
-ever carried one; today they decide nothing.
+**What that obligation was actually worth, because it is easily overread.** It
+never enforced the era decision. `era_guard` does that on the wire, holding
+the served set to `SERVED_VERSIONS`, and it still does — an unserved revision
+is still refused and `initialize` is still admitted only as the handshake era.
+What the obligation bought was a smaller surface: no server-side state keyed
+by an identifier a client presents. That is what was given up.
+
+**What replaced it, checked rather than reasoned about.** A session identifier
+authorises nothing: authentication is per request from the bearer token, so a
+stolen identifier without a token A reaches nothing. And one session cannot
+answer another's elicitation — probed against the deployed stack, where a
+second session presenting a valid token and the correct request id was acked
+`202` by the transport and never routed, leaving the first call waiting; and
+pinned in process by `CrossSessionElicitationTests`, which carries a positive
+control because the first version of that test passed while proving nothing.
+An agent cannot approve a mutation it was not asked about.
+
+**The dashboard path remains** for a client that declares no elicitation
+capability — Gemini CLI 0.58.0, measured 2026-09-18 — as a two-call flow, and
+its code and tests stay. What changed is that clients which can be asked now
+are.
 
 **The model cannot answer on its own behalf.** On the path that actually runs
 the answer is given in an authenticated dashboard session the agent has no

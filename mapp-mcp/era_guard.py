@@ -27,11 +27,32 @@ Five obligations, each separately testable:
    offers in the body is one of :data:`HANDSHAKE_VERSIONS`. Under the modern
    revision ``initialize`` is not a method at all and is refused as one. That
    forces the guard to decode the body before dispatch.
-4. Never mint or echo ``Mcp-Session-Id``. Serving the handshake era does not
-   relax this: with ``stateless_http`` the SDK completes a full legacy session
-   -- initialize, notification, list, call -- and mints no session identifier,
-   so the obligation survives the era being admitted rather than being traded
-   away for it.
+4. **Withdrawn at Phase 1 wave 7, deliberately.** This read: never mint or echo
+   ``Mcp-Session-Id``. The guard enforced it by stripping the header from every
+   response, and ``stateless_http`` meant nothing downstream produced one.
+
+   It was traded for in-session approval. A person approving a mutation in the
+   session they are working in needs the server to be able to ask them, a server
+   can only ask over a back-channel, and there is no back-channel without a
+   session -- measured, not assumed: forcing the elicitation capability on under
+   ``stateless_http`` produced "Cannot send 'elicitation/create': this transport
+   context has no back-channel for server-initiated requests". The alternative
+   was approval at a separate dashboard over two tool calls, which the owner
+   ruled out twice.
+
+   What this obligation was actually worth is worth stating, because it is
+   easily overread. **It never enforced the era decision.** Obligations 1 to 3
+   do that, on the wire, and are untouched -- an unserved revision is still
+   refused, and ``initialize`` is still admitted only as the handshake era.
+   What it bought was a smaller surface: no server-side state keyed by an
+   identifier a client presents. That is the thing given up.
+
+   What holds instead, checked rather than reasoned about: a session identifier
+   authorises nothing, because authentication is per request from the bearer
+   token; and one session cannot answer another's elicitation, because a
+   response is routed to the stream that asked rather than to the session that
+   sent it. ``CrossSessionElicitationTests`` pins the second with a positive
+   control beside it.
 5. Admit a header-less request to the handshake era, never the modern one. The
    ``initialize`` that opens a handshake cannot carry the header, because it is
    what decides the revision; and a client may omit it afterwards too -- Gemini
@@ -76,7 +97,6 @@ HANDSHAKE_VERSIONS = ("2025-06-18", "2025-11-25")
 SERVED_VERSIONS = (*HANDSHAKE_VERSIONS, MODERN_VERSION)
 
 VERSION_HEADER = b"mcp-protocol-version"
-SESSION_HEADER = b"mcp-session-id"
 
 #: JSON-RPC codes. The first two are the JSON-RPC standard ones. The third is
 #: the code the MCP ecosystem uses -- it is ``mcp_types.UNSUPPORTED_PROTOCOL_-
@@ -133,7 +153,7 @@ class ProtocolEraGuard:
         # business: the metadata GET is unauthenticated and read-only, and
         # DELETE on the RPC path is the inner app's 405 to give.
         if scope.get("path") != self._rpc_path or scope.get("method") != "POST":
-            await self._app(scope, receive, self._strip_session(send))
+            await self._app(scope, receive, send)
             return
 
         headers = _headers(scope)
@@ -228,29 +248,7 @@ class ProtocolEraGuard:
                 supported=list(SERVED_VERSIONS),
             )
             return
-        await self._app(scope, replay, self._strip_session(send))
-
-    @staticmethod
-    def _strip_session(send):
-        """Remove ``Mcp-Session-Id`` from anything the inner app emits.
-
-        The guard refuses the requests that would create a session, so in
-        principle nothing downstream can mint one. This is the second control:
-        an SDK bump that started emitting the header would otherwise reintroduce
-        the legacy era through a response nobody was looking at.
-        """
-
-        async def guarded(message):
-            if message.get("type") == "http.response.start":
-                message = dict(message)
-                message["headers"] = [
-                    (name, value)
-                    for name, value in message.get("headers", [])
-                    if name.lower() != SESSION_HEADER
-                ]
-            await send(message)
-
-        return guarded
+        await self._app(scope, replay, send)
 
 
 class _Sentinel:

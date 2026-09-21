@@ -246,12 +246,20 @@ kind: nothing executed the route.
   complete. The runtime now remembers the handle for one grant and one digest,
   which is also why the handle never has to travel through the model.
 
-**And elicitation cannot run here at all.** Measured, not inferred: neither
-served era carries a server-initiated request. That makes the dashboard the
-working path rather than the fallback, so it is now a deliberate two-call flow
-— ask and say where, then pick up the answer — instead of a refusal telling
-somebody to try again. The threat model records the measurement and the reason,
-which is `era_guard`'s obligation never to mint a session identifier.
+**Elicitation could not run at all, and now can.** Measured, not inferred:
+under `stateless_http` neither served era carried a server-initiated request.
+That made the dashboard the working path rather than the fallback, so it became
+a deliberate two-call flow — ask and say where, then pick up the answer — and
+that flow remains for clients which declare no elicitation capability.
+
+At **wave 7** the owner restated decision 4 after being shown it was
+unreachable, and sessions were enabled to honour it: `stateless_http=False`,
+and `era_guard` no longer strips `Mcp-Session-Id`. Obligation 4 was withdrawn
+with it, deliberately and in the guard's own docstring. It never enforced the
+era decision — obligations 1 to 3 do that and are untouched — so what was given
+up is a smaller surface, not a control on which revisions are served. A person
+now approves in one tool call, in the session they are working in, which is
+what decision 4 asked for.
 
 **Proved end to end on 2026-09-20** against the deployed stack with a real
 OAuth client: authorize with PKCE → consent → token A → `tools/list` → ask →
@@ -259,10 +267,32 @@ an operator approves in the dashboard → the receipt is claimed and spent → t
 tile service reloads, generation 66 applied. A third call is refused, because
 the approval was single-use.
 
-**Not proved: a workspace write.** This instance carries a pre-existing
-validation failure (`locale.layers.Bus_Stops.tables.15`) that refuses every
-candidate, so `proposals_apply` reached the platform with a valid receipt and
-was then refused on that rule. Authorisation was proved; the write was not.
+**Proved on 2026-09-21, including the write.** A real OAuth client ran
+`proposals_check` → `proposals_create` → `proposals_apply`, approved the apply
+*in the session* on the one elicitation, and the workspace changed: `applied:
+true`, `mapReloaded: true`, a new revision, and the layer's name was what the
+proposal said. The loop was then run in reverse to restore it, which proved it
+twice.
+
+**A correction to the earlier account.** The validation failure that blocked
+this — `locale.layers.Bus_Stops.tables.15: Table is not selectable through the
+configured read-only connection` — was reported here as pre-existing. It was
+not: it was caused by redeploying `config-ui` with a hand-written `docker
+compose` invocation that omitted `compose.federated-demo.yaml`, which is the
+overlay carrying the `FEDERATION_DBS_*` credentials. Without them federation
+verification cannot reach a source, and the platform then *withdraws consumer
+access on purpose* — `mark_unverifiable`, "consumer access withdrawn until a
+pass completes". So the missing grant was the platform enforcing a policy, not
+a permission somebody forgot, and granting it by hand was undone by the next
+verification pass. Deploying through the overlays `./bin/mapp` composes
+restored both aliases to `active` and the grants with them, with nothing
+granted by hand.
+
+The lesson is the deployment command, not the platform: `MAPP_DEMO_SOURCES` in
+`.env` selects two further overlays, and `bin/mapp` assembles them. A bare
+`docker compose --file compose.yaml --file compose.bundled-db.yaml` is not the
+deployed configuration, and the way it fails is a confusing error about a table
+rather than anything naming credentials.
 
 **Worth knowing:** a receipt is spent at the authorisation boundary, so a
 request the platform then refuses on a business rule has still consumed its
@@ -423,6 +453,12 @@ above rather than only here.
    operator at a separate dashboard. This is the decision the rest of wave 5
    hangs from, and the reason elicitation capability was measured before the
    design was written rather than after.
+
+   *Reported unreachable on 2026-09-20 and restated by the owner the same day.*
+   The transport could not carry a server-initiated request, so approval had
+   fallen back to a dashboard over two calls. Honoured at wave 7 by enabling
+   sessions, at the cost of `era_guard` obligation 4. The decision stands as
+   written; what changed is the transport under it.
 5. **An agent may drop a derived layer**, guarded by exact naming, a
    dependency check that refuses rather than warns, the dependent list carried
    into the approval, and a single-use receipt.

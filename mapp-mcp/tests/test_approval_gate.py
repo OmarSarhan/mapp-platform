@@ -498,44 +498,47 @@ class TwoCallFlowTests(GateTestCase):
         self.assertEqual(3, len(server.remembered_approvals))
 
 
-class TransportCannotElicitTests(unittest.TestCase):
-    """Measured on 2026-09-20 against the deployed stack, and pinned here.
+class ElicitationRequiresASessionTests(unittest.TestCase):
+    """Why this server holds sessions, pinned where somebody will look.
 
-    Neither served era can carry a server-initiated request, so neither
-    elicitation path can run in this deployment:
+    Until Phase 1 wave 7 the runtime was stateless and `era_guard` obligation
+    4 forbade minting a session identifier. Under that arrangement elicitation
+    could not run at all: neither served era carried a server-initiated
+    request. Forcing the capability on and retrying produced, verbatim,
+    "Cannot send 'elicitation/create': this transport context has no
+    back-channel for server-initiated requests" -- so every approval went to a
+    dashboard, over two tool calls.
 
-    - The modern era (2026-07-28) declares capabilities per request, and the
-      SDK serves it through a dispatch context whose name is the answer --
-      `_NoServerRequestsDispatchContext`.
-    - The handshake era (2025-11-25) has the request's own stream, but
-      `stateless_http=True` means no session is kept, so capabilities declared
-      at `initialize` are gone by the time a tool runs. Forcing the capability
-      on and retrying produced, verbatim: "Cannot send 'elicitation/create':
-      this transport context has no back-channel for server-initiated
-      requests."
+    Sessions were enabled to close that, which cost the obligation. These pin
+    the two halves of the trade, because both are the kind of thing a later
+    change would undo without noticing: turning `stateless_http` back on to
+    "reduce state" would silently return every approval to the dashboard, and
+    reinstating the strip would leave clients holding a session the server had
+    been told to forget.
 
-    `stateless_http` is not incidental -- era_guard obligation 4 is that no
-    `Mcp-Session-Id` is ever minted, and this is how that is kept. Enabling
-    elicitation means trading that away, which is a decision for whoever owns
-    the transport rather than a fix.
-
-    This pins the *reason*, so the day the obligation or the SDK changes, the
-    claim is re-examined rather than silently left wrong in the documentation.
+    What the obligation was worth is the part most easily overread: it never
+    enforced the era decision. `test_era_guard` still holds the served set,
+    and `CrossSessionElicitationTests` holds the property that actually
+    matters here -- one session cannot answer another's prompt.
     """
 
-    def test_the_runtime_is_stateless(self) -> None:
+    def test_the_runtime_keeps_sessions(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
-        self.assertIn("stateless_http=True", source)
+        self.assertIn("stateless_http=False", source)
 
-    def test_the_guard_forbids_minting_a_session(self) -> None:
+    def test_the_guard_no_longer_strips_the_session_header(self) -> None:
+        """A strip with sessions on is worse than either arrangement alone:
+        the server issues an identifier and then removes it from the response,
+        so every request after the handshake is refused."""
         guard = (Path(__file__).resolve().parents[1] / "era_guard.py").read_text()
-        self.assertIn("Never mint or echo", guard)
+        self.assertNotIn("_strip_session", guard)
 
-    def test_the_dashboard_path_is_documented_as_the_working_one(self) -> None:
-        """If someone removes this comment because elicitation "works", the
-        measurement above should be redone rather than assumed."""
-        source = (Path(__file__).resolve().parents[1] / "runtime.py").read_text()
-        self.assertIn("no back-channel for server-initiated", source)
+    def test_the_trade_is_recorded_where_the_obligation_was(self) -> None:
+        """The obligation is stated in the guard's own docstring, which is
+        where somebody checks what this server promises."""
+        guard = (Path(__file__).resolve().parents[1] / "era_guard.py").read_text()
+        self.assertIn("Withdrawn at Phase 1 wave 7", guard)
+        self.assertIn("no back-channel for server-initiated", guard)
 
 
 class BindingTests(GateTestCase):
