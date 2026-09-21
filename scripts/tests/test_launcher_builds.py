@@ -200,3 +200,50 @@ class ComposeImageOriginTests(unittest.TestCase):
             "mapp-postgis-h3",
             repository("${POSTGIS_IMAGE:-mapp-postgis-h3:17-3.5-4.2.3}"),
         )
+
+
+class StateDirectoryTests(unittest.TestCase):
+    """Every `./var` bind mount must be a directory the launcher creates.
+
+    Docker creates a missing bind-mount source itself, as root. The launcher
+    then refuses to run, because it checks that writable state is owned by
+    CONFIG_UID -- correctly, but the message names a directory the user never
+    made and cannot explain.
+
+    `./var/mapp-mcp` shipped that way. It is mounted by `caddy`, which starts
+    whether or not the MCP surface is enabled, so `./bin/mapp all` created it
+    as root on every fresh machine and the next command -- `./bin/mapp demo`
+    -- died with an ownership error naming a path nothing had written to.
+    `all` itself passed, because the check runs before the `up` that creates
+    the directory.
+
+    Derived from the compose files rather than listed: the failure mode is
+    adding a mount and forgetting the directory, so a list maintained by hand
+    would be wrong in exactly the case that matters.
+    """
+
+    def test_every_var_mount_is_created_by_the_launcher(self) -> None:
+        mounted = set()
+        for path in sorted(ROOT.glob("compose*.yaml")):
+            mounted.update(re.findall(r"\./var/([a-z0-9-]+)", path.read_text()))
+        self.assertTrue(mounted, "no ./var bind mounts found; parser is wrong")
+
+        launcher = LAUNCHER.read_text()
+        # The directories init_state actually makes, resolved through the
+        # variables it makes them under.
+        block = re.search(r"\n  mkdir -p \\\n(.*?)\n  chmod", launcher, re.S)
+        self.assertIsNotNone(block, "init_state no longer creates directories")
+        variables = dict(
+            re.findall(r'^([A-Z_]+)="\$\{STATE_DIR\}/([a-z0-9-]+)"', launcher, re.M)
+        )
+        created = {
+            variables[name]
+            for name in re.findall(r"\$\{([A-Z_]+)\}", block.group(1))
+            if name in variables
+        }
+        self.assertEqual(
+            set(), mounted - created,
+            "these directories are bind-mounted from compose but not created"
+            " by init_state, so Docker creates them as root and the next"
+            " ./bin/mapp command refuses to run",
+        )

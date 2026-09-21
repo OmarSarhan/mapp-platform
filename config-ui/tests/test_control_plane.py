@@ -13,6 +13,7 @@ from control_fixture import (
     DATABASE_URL,
     ControlStoreTestCase,
     control_rows,
+    reset_control_schema,
 )
 from control_plane import (
     DEVICE_SCOPES,
@@ -618,3 +619,117 @@ class ControlPlaneTests(ControlStoreTestCase):
                 "service-recovery", recovered["error"]["failurePhase"],
             )
             self.assertIsNone(recovered["result"])
+
+
+class InitializationCompletenessTests(ControlStoreTestCase):
+    """Every path that can create the administrator credential must finish.
+
+    Being initialized means two things in two tables: a credential in
+    `control.admin_credential` and an identity in `control.metadata`.
+    `_require_initialized` asks only about the first, so a path that writes
+    the credential and not the identity produces a platform that authenticates
+    correctly and cannot say who it is.
+
+    `reset_password` was such a path, and it is the one `./bin/mapp init
+    --demo` takes -- the demo flag dispatches to `reset-demo`, not `init`. On a
+    fresh machine that left no instance_id, `instance_id()` raised inside
+    `do_GET`, the public identity route closed the connection without a
+    response, and the `./bin/mapp all` that followed failed its verification
+    with a bare 502 naming nothing. `./bin/mapp init` on its own was fine,
+    which is why it survived: the demo path is the documented one and the
+    tested one was the other.
+
+    Derived from the source rather than listed, so a third credential-writing
+    method is covered the day somebody writes it.
+    """
+
+    #: Long enough for require_password, and not a credential anywhere.
+    PASSWORD = "initialization-completeness-probe"
+
+    def credential_writers(self) -> list[str]:
+        import inspect
+
+        import control_plane
+
+        writers = []
+        for name, member in inspect.getmembers(
+            control_plane.ControlStore, inspect.isfunction
+        ):
+            if name.startswith("_"):
+                continue
+            if "INSERT INTO control.admin_credential" in inspect.getsource(member):
+                writers.append(name)
+        return writers
+
+    def test_the_derivation_finds_the_writers_it_is_guarding(self) -> None:
+        """A derivation that matched nothing would pass forever."""
+        found = self.credential_writers()
+        self.assertIn("initialize", found)
+        self.assertIn("reset_password", found)
+
+    def test_every_credential_writer_leaves_an_instance_identity(self) -> None:
+        for name in self.credential_writers():
+            with self.subTest(method=name):
+                reset_control_schema()
+                with tempfile.TemporaryDirectory() as directory:
+                    store = ControlStore(Path(directory))
+                    getattr(store, name)(self.PASSWORD)
+                    self.assertEqual(
+                        1, len(control_rows("admin_credential")),
+                        f"{name} did not write a credential; this test's call"
+                        " convention no longer fits it",
+                    )
+                    # The assertion that matters: not the row, the question the
+                    # platform actually asks on its public identity route.
+                    self.assertRegex(store.instance_id(), r"^[0-9a-f]{32}$")
+
+    def test_a_password_reset_keeps_the_identity_it_already_had(self) -> None:
+        """An operator rotating a credential has not adopted a new instance.
+        Every agent grant, CLI token and federation registration is scoped to
+        this identity, so changing it would silently orphan all of them."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = ControlStore(Path(directory))
+            store.initialize(self.PASSWORD)
+            original = store.instance_id()
+            store.reset_password(self.PASSWORD + "-rotated")
+            self.assertEqual(original, store.instance_id())
+
+
+class HalfInitializedRepairTests(ControlStoreTestCase):
+    """A control plane can already be half-initialized, and saying so is not
+    enough: `instance_id()` tells the operator to run `./bin/mapp init`, so
+    that command has to be the one that repairs it."""
+
+    PASSWORD = "half-initialized-repair-probe"
+
+    def half_initialized_store(self, directory: str):
+        """A credential with no identity -- what a demo init used to leave."""
+        import control_schema
+
+        store = ControlStore(Path(directory))
+        store.initialize(self.PASSWORD)
+        connection = control_schema.connect(DATABASE_URL)
+        try:
+            connection.execute(
+                "DELETE FROM control.metadata WHERE key = 'instance_id'"
+            )
+        finally:
+            connection.close()
+        return store
+
+    def test_the_half_state_is_reachable_and_broken(self) -> None:
+        """Otherwise the repair test could pass against a state that cannot
+        occur."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.half_initialized_store(directory)
+            with self.assertRaises(RuntimeError):
+                store.instance_id()
+
+    def test_init_repairs_a_credential_with_no_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.half_initialized_store(directory)
+            self.assertFalse(
+                store.initialize(self.PASSWORD),
+                "the credential already existed, so this is not a first init",
+            )
+            self.assertRegex(store.instance_id(), r"^[0-9a-f]{32}$")

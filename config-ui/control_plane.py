@@ -349,13 +349,17 @@ class ControlStore:
                 " RETURNING encoded",
                 (password_hash(password),),
             ).fetchone()
-            if row is None:
-                return False
+            # Ahead of the early return, not after it. An instance that
+            # already has a credential can still be missing its identity, and
+            # this is precisely the command the error for that state tells the
+            # operator to run -- so it has to be the command that fixes it.
             connection.execute(
                 "INSERT INTO control.metadata(key, value) VALUES('instance_id', %s)"
                 " ON CONFLICT (key) DO NOTHING",
                 (instance_id or secrets.token_hex(16),),
             )
+            if row is None:
+                return False
         self.audit("auth.initialized", actor="local-admin")
         return True
 
@@ -2154,6 +2158,21 @@ class ControlStore:
                     " ON CONFLICT (id) DO UPDATE SET"
                     "   encoded = EXCLUDED.encoded, updated_at = now()",
                     (password_hash(password),),
+                )
+                # Being initialized means both a credential and an instance
+                # identity, and this is a path that can create the credential
+                # from nothing: `./bin/mapp init --demo` reaches reset-demo,
+                # not init. Without this the platform came up with a working
+                # password and no instance_id, so `instance_id()` raised, the
+                # public identity route closed the connection and every
+                # `./bin/mapp all` after a demo init failed verification with
+                # an unexplained 502. DO NOTHING because an existing instance
+                # keeps its identity across a password reset -- the operator
+                # rotated a credential, they did not adopt a new instance.
+                connection.execute(
+                    "INSERT INTO control.metadata(key, value)"
+                    " VALUES('instance_id', %s) ON CONFLICT (key) DO NOTHING",
+                    (secrets.token_hex(16),),
                 )
                 connection.execute("DELETE FROM control.sessions")
                 revoked_devices = 0
