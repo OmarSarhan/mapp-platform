@@ -33,7 +33,14 @@ AUDIT_READ_BYTES = 2 * 1024 * 1024
 AUDIT_RECORD_MAX_BYTES = 64 * 1024
 FAILED_TOKEN_AUDIT_INTERVAL = 60
 DEVICE_SCOPES = {
+    # `derive:manage` is separate from `derive` and both are issuable. Phase 1
+    # wave 1 split them and gave the derived-layer write routes the narrower
+    # one, but left this vocabulary alone -- so no CLI token could be issued
+    # with it, and every `derived-layers` write refused with
+    # `auth.scope_required` for anyone not carrying `full`. That included
+    # `./bin/mapp demo`, which is where it surfaced.
     "inspect", "propose", "visual", "apply", "reload", "derive",
+    "derive:manage",
     "semantic:inspect", "semantic:source", "semantic:generate",
     "semantic:data", "semantic:propose", "semantic:apply", "semantic:admin",
     "federation:register", "federation:provision", "federation:observe",

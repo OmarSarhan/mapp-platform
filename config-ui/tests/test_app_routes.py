@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import sys
 import math
 import threading
 import tempfile
@@ -10464,3 +10465,88 @@ class AdminSurfaceGuardTests(unittest.TestCase):
                     responses[0][0],
                     f"{path} answered a full bearer token",
                 )
+
+
+class RouteScopeIssuabilityTests(unittest.TestCase):
+    """Every scope a route demands must be one a credential can carry.
+
+    Phase 1 wave 1 split `derive` into `derive` and `derive:manage` and gave
+    the derived-layer write routes the narrower one. It did not add
+    `derive:manage` to the CLI token vocabulary, so no token could be issued
+    with it and every one of those routes refused `auth.scope_required` unless
+    the caller held `full`. `./bin/mapp demo` is where that surfaced, months
+    later, when the whole platform was rebuilt from cold -- it creates derived
+    layers with a deliberately narrow token and could not.
+
+    The shape of the mistake is what this guards: a route's required scope and
+    the set of issuable scopes are maintained in different files, and nothing
+    compared them. Derived on both sides rather than listed, so a scope
+    introduced tomorrow is checked tomorrow.
+    """
+
+    #: One concrete path per scope-gated route family. Concrete because
+    #: `_required_scope` matches paths, not templates.
+    PATHS = (
+        ("POST", "/api/derived-layers"),
+        ("POST", "/api/derived-layers/d1/replace"),
+        ("POST", "/api/derived-layers/d1/refresh"),
+        ("POST", "/api/derived-layers/d1/drop"),
+        ("POST", "/api/derived-layers/plan"),
+        ("GET", "/api/layers"),
+        ("GET", "/api/catalog"),
+        ("GET", "/api/layers/roads/values"),
+        ("POST", "/api/proposals"),
+        ("POST", "/api/proposals/check"),
+        ("POST", "/api/proposals/p1/apply"),
+        ("POST", "/api/xyz/reload"),
+        ("POST", "/api/sql/test"),
+        ("POST", "/api/approvals"),
+        ("POST", "/api/semantic/proposals/p1/apply"),
+        ("POST", "/api/federation/aliases/a1/observe"),
+    )
+
+    def test_every_demanded_scope_can_be_issued_to_something(self) -> None:
+        """`full` does not count. It satisfies every route check, so a scope
+        reachable only through it is one narrow credentials cannot use --
+        which is exactly the state this was in."""
+        from control_plane import TOKEN_SCOPES
+
+        # The CLI token vocabulary alone, and not a union with the broker's.
+        # The first version of this test took that union and the regression
+        # survived its own mutation: the broker *can* issue `derive:manage`,
+        # so the union looked complete while no CLI token could carry it --
+        # which is precisely the state that broke the demo. A8 and P7 make CLI
+        # parity a rule, so every scope a route demands must be issuable to a
+        # token.
+        issuable = set(TOKEN_SCOPES) - {"full"}
+        unissuable = {}
+        for method, path in self.PATHS:
+            required = app.Handler._required_scope(path, method)
+            if required in (None, "full"):
+                # None is a deliberate discovery route; "full" is the
+                # catch-all that refuses an unclassified path by construction.
+                continue
+            if required not in issuable:
+                unissuable[f"{method} {path}"] = required
+        self.assertEqual(
+            {}, unissuable,
+            "these routes demand a scope no credential can carry, so they are"
+            " reachable only with `full`, so no CLI token and no narrow"
+            " credential can use them",
+        )
+
+    def test_the_dashboard_offers_every_issuable_token_scope(self) -> None:
+        """A scope the store will issue and the dashboard does not list is one
+        an operator can only reach by hand."""
+        from control_plane import TOKEN_SCOPES
+
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "main.jsx"
+        ).read_text()
+        start = source.index("export const TOKEN_SCOPE_OPTIONS=")
+        offered = set(re.findall(
+            r"\{id:'([^']+)'", source[start : source.index("];", start)]
+        ))
+        # `full` is issuable and deliberately not an ordinary option: the
+        # dashboard offers it through its own preset rather than as a tick box.
+        self.assertEqual(set(), (set(TOKEN_SCOPES) - {"full"}) - offered)

@@ -70,6 +70,9 @@ token, record = store.create_token(
         "apply",
         "reload",
         "derive",
+        # The demo creates derived layers, which has needed the narrower scope
+        # since wave 1 split it out of `derive`.
+        "derive:manage",
         "semantic:inspect",
         "semantic:source",
         "semantic:generate",
