@@ -1,13 +1,21 @@
 # MCP authorization component
 
 The `mcp-auth` service is the platform-hosted OAuth 2.1 authorization server
-for the forthcoming MCP resource server. It issues the credentials an MCP
-client and the internal token broker will use; it serves no MCP tools itself.
+for the MCP resource server. It issues the credentials the MCP client and the
+internal token broker use; it serves no MCP tools itself — `mapp-mcp` does
+that, and answers `/mcp` on the same origin.
 
-**This is Phase 0 of an unmerged feasibility spike.** It is deployed by the
-normal Compose model and covered by its own suite, but it has not been run in
-production. Read every "designed" statement here as designed-but-unproven
-unless it names a test or a check that runs.
+**Merged, and Phase 1 is complete.** This began as an unmerged Phase 0
+feasibility spike and that header stood for longer than it was true. The whole
+loop has been driven against the deployed stack by a real OAuth client:
+authorize with PKCE, consent, connect, read the workspace, propose a change,
+approve it in the session, and see the workspace change. It has still not been
+run in production, so read a production claim as designed-but-unproven unless
+it names a check that runs.
+
+New to this? Start with
+[`mcp-getting-started.md`](mcp-getting-started.md), which is the operator
+walkthrough. This page is the reference behind it.
 
 ## Registering an agent client
 
@@ -157,11 +165,12 @@ Caddy publishes these paths on that origin:
 
 Everything else on the origin is a 404 served by Caddy itself.
 
-This said the resource "is not published at all: it arrives with `mapp-mcp` in
-a later phase", which was true while the runtime did not exist and stopped
-being true when it shipped. `/mcp` answers now: unauthenticated it is a `401`
-carrying `WWW-Authenticate: Bearer resource_metadata="…"`, which is the first
-step of the discovery a client walks without being configured to.
+This table once described the MCP resource as unpublished, pending a later
+phase. It was true while the runtime did not exist and false from the day it
+shipped, and nobody noticed because nothing compared the sentence to the
+server. `/mcp` answers now: unauthenticated it is a `401` carrying
+`WWW-Authenticate: Bearer resource_metadata="…"`, which is the first step of
+the discovery a client walks without being configured to.
 
 The metadata document advertises the authorization and token endpoints, `code`,
 `authorization_code` and `refresh_token`, PKCE `S256`, the two client
@@ -475,6 +484,120 @@ The guard is a backstop in any case: by the time a response is written a
 mutation has already been applied, which is why redemption happens in
 `_authorized` before any handler dispatches.
 
+## Per-action approval
+
+A grant says what an agent may ever do. It does not say that any particular
+thing should happen now, and the gap between those is where this sits.
+
+Phase 1 closed it. An operation whose risk class is consequential is refused by
+the configuration API unless the request also carries an **approval receipt**
+bound to the same canonical execution digest the credential is bound to. The
+requirement is *derived* from the action's own risk class rather than declared
+again — `control_api.requires_approval` states the exemptions, so a risk class
+nobody has classified requires approval rather than arriving unguarded.
+
+The receipt is a credential like every other here: minted by the platform,
+returned once, stored only as a hash, single-use, and spent atomically with the
+effect. Three properties make it an approval of a *request* rather than a
+permission:
+
+- **Bound to one digest.** A receipt minted for one apply buys nothing against
+  another. The digest covers the operation, path, query and body, so a changed
+  argument or a moved revision is a different request.
+- **Spent once**, and the consumed row is kept, so a replay is detectably a
+  replay rather than a miss.
+- **Bounded twice.** Fifteen minutes to decide, measured from the request; five
+  minutes to claim and spend, measured from the decision. The second bound is
+  derived from `decided_at` rather than stored, and without it an approved
+  receipt would be a standing authorisation an agent could spend at a moment
+  nobody expected.
+
+Revoking the grant revokes its approvals in the same transaction.
+
+### Who is asked, and where
+
+The person driving the MCP session, in that session. `mapp-mcp` creates the
+intent, then asks through **MCP elicitation**: the client renders the prompt
+and a person answers it. The model cannot fabricate an `ElicitResult` any more
+than it can fabricate a tool result it did not receive, and none of the four
+approval operations is a tool, so nothing the model can invoke reaches them.
+The prompt text is composed from the platform's own record of the change, not
+by the agent.
+
+A client that declares no elicitation capability gets a two-call flow instead:
+the tool refuses with a link to the dashboard, a person decides there, and the
+next call collects the answer. The runtime remembers the handle for one grant
+and one digest so the second call finds the first approval rather than opening
+a second.
+
+**This is why the server keeps sessions.** A server can only ask over a
+back-channel and there is no back-channel without one, so `stateless_http` is
+off and `era_guard`'s obligation never to mint `Mcp-Session-Id` was withdrawn
+to buy it. That obligation never enforced the era decision — the guard still
+holds the served revision set on the wire — and what it bought was a smaller
+surface. Two properties replace it, both checked rather than assumed: a session
+identifier authorises nothing, because authentication stays per request from
+the bearer token; and one session cannot answer another's elicitation, because
+a response is routed to the stream that asked rather than to the session that
+sent it.
+
+### Standing approvals
+
+An operator can decide once for a **class** of action instead of once per
+action, from **Security → Standing approvals**. A window substitutes the
+decider and nothing else: the intent still carries the full digest, is still
+decided into an ordinary single-use receipt, and is still spent atomically. So
+a window authorises a class and never a specific replayable request, and every
+per-action invalidation applies unchanged inside a live one.
+
+Seven bounds:
+
+| Bound | Value |
+| --- | --- |
+| Lifetime | at most 60 minutes |
+| Consumptions | at most 20, decremented in the statement that matches the window |
+| Covers | exactly one action class, one grant, one client, one instance |
+| May cover | `apply`, `reload`, `database-definition`, `database-refresh` only |
+| Never covers | semantic administration and federation mutation, as whole classes |
+| Opened by | a CSRF-protected POST from an administrator session authenticated within 15 minutes |
+| Closed by | the dashboard, the grant's revocation, or a recovery-epoch advance |
+
+The action classes a window may cover are an *allowlist*, the opposite
+direction from the approval exemptions, because here the safe default is that
+no window may decide. `federation:retire` is why the unit is an action class
+and not a scope: it is not a scope at all, since the platform's retire action
+runs under `federation:provision`.
+
+Recency is checked at creation and deliberately not at consumption — checking
+again would make the 60-minute bound dead letter, since nothing would be
+approvable after the first 15 minutes. The timestamp is
+`control.sessions.created_at`, written when the password verifies and never
+refreshed, which closes O8 without a new column or a step-up endpoint. Its
+visible consequence: an administrator whose session is older than that must
+sign in again to open a window.
+
+Each consumption is audited individually against the window that authorised it,
+carrying its identifier, creator, expiry and how much was left.
+
+### What requires approval
+
+Derived from the risk class, so this table is a consequence rather than a
+second list. `derive:manage` names the managed-relation lifecycle, which acts
+on the database directly with no proposal behind it.
+
+| Requires approval | Does not |
+| --- | --- |
+| `proposals.apply`, `semantic.proposals.apply` | `proposals.create`, `semantic.proposals.create` |
+| `xyz.reload` | `proposals.preview-*` |
+| `derived-layers.create`, `.replace`, `.refresh`, `.drop` | `derived-layers.plan` |
+
+`derived-layers.drop` is the one genuinely destructive tool. It is guarded four
+ways: the relation is named exactly and percent-encoded into the path; the
+platform refuses the drop while anything still reads it, and the tool reads the
+dependents before asking so nobody is prompted for a drop that cannot happen;
+what would break travels in the approval; and the receipt is single-use and
+bound to that one relation.
+
 ## Sign-in and consent
 
 The consent and login pages are two plain HTML forms with no JavaScript and no
@@ -671,8 +794,8 @@ sign-in is what makes P19's 90-day floor and purge-under-pressure required.
 
 Phase 0 stops deliberately short in several places:
 
-- the operation allowlist covers 38 of the platform's 69 actions, all but four
-  of them reads, and adding one is a deliberate act in three places;
+- the operation allowlist covers 53 of the platform's 69 actions, and adding
+  one is a deliberate act in three places. It was 38 when Phase 0 closed;
 - a refused authorization is not recorded in the audit trail. A failed operator
   sign-in is (`auth.login_failed`), as are the client and grant lifecycle
   events, but the one an unauthenticated caller can provoke most cheaply is
