@@ -1232,6 +1232,18 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                     "The platform accepted the approval request but named no"
                     " handle, so there is nothing to wait on."
                 )
+            if created.get("decided"):
+                # A standing window decided it on arrival. Nothing here is
+                # skipped except the question: the intent carried the same
+                # canonical digest, the receipt is the same single-use
+                # receipt bound to it, and it is spent atomically with the
+                # effect exactly as an interactively approved one is. What a
+                # window substitutes is the decider.
+                #
+                # Not remembered either, because there is nothing to come back
+                # for -- the two-call flow exists to carry a handle across a
+                # decision somebody has yet to make.
+                return _claim(handle)
             _remember_approval(caller, digest, handle, approval_url)
 
         message = _approval_message(operation["operation_id"], packet)

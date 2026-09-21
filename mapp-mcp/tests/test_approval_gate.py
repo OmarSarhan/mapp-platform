@@ -359,6 +359,96 @@ class NoElicitationTests(GateTestCase):
         self.assertEqual([], ctx.asked)
 
 
+class StandingWindowTests(GateTestCase):
+    """P8 from this side: when a window decided it, nobody is asked.
+
+    The runtime does not know what a window is and should not. It creates the
+    same intent it always creates; the platform either decides it or does not,
+    and the one bit that comes back says which. Everything a test here pins is
+    about not asking -- because the failure that matters is a tool that
+    prompts anyway, which would make the feature pointless, or one that
+    proceeds without a receipt, which would make it dangerous.
+    """
+
+    def decided_api(self, **over):
+        api = FakeConfigApi()
+        original = api.post
+
+        def post(**kwargs):
+            answer = original(**kwargs)
+            if kwargs["path"] == APPROVALS_CREATE["path_template"]:
+                return {**answer, "decided": True, "window": "w" * 32, **over}
+            return answer
+
+        api.post = post
+        return api
+
+    async def test_nobody_is_asked(self) -> None:
+        api = self.decided_api()
+        ctx = FakeContext(
+            elicitation=Capability(form={}),
+            form=Answer("accept", Confirmation(True)),
+        )
+        self.assertEqual(RECEIPT, await self.gate(ctx, config_api=api))
+        self.assertEqual(
+            [], ctx.asked,
+            "a window decided this; prompting anyway defeats the point",
+        )
+
+    async def test_a_client_that_cannot_elicit_is_not_sent_anywhere(
+        self,
+    ) -> None:
+        """The dashboard path is for a decision nobody has made. This one has
+        been made, so a refusal naming a page would be wrong twice."""
+        api = self.decided_api()
+        self.assertEqual(
+            RECEIPT,
+            await self.gate(FakeContext(elicitation=None), config_api=api),
+        )
+
+    async def test_the_receipt_is_still_claimed_and_spent(self) -> None:
+        """A window substitutes the decider, never the receipt."""
+        api = self.decided_api()
+        await self.gate(FakeContext(elicitation=None), config_api=api)
+        self.assertEqual(
+            1, len(api.posted_to(APPROVALS_CLAIM["path_template"])),
+            "an auto-decided approval must still claim its receipt",
+        )
+
+    async def test_a_decision_that_produced_no_receipt_does_not_proceed(
+        self,
+    ) -> None:
+        """Fail closed. "Decided" without a spendable receipt is not
+        permission, and proceeding on it would be acting unapproved."""
+        api = FakeConfigApi(statuses=[{"status": "approved", "receipt": None}])
+        original = api.post
+
+        def post(**kwargs):
+            answer = original(**kwargs)
+            if kwargs["path"] == APPROVALS_CREATE["path_template"]:
+                return {**answer, "decided": True}
+            return answer
+
+        api.post = post
+        with self.assertRaises(ToolError) as raised:
+            await self.gate(FakeContext(elicitation=None), config_api=api)
+        self.assertIn("no receipt", str(raised.exception))
+
+    async def test_an_undecided_intent_still_asks(self) -> None:
+        """The flag is read, not assumed. Without this the test above would
+        pass on a gate that never asked anybody at all."""
+        # The default fake reports no `decided`, and answers the later claim
+        # with an approved receipt so the form path runs to completion -- what
+        # is asserted is that somebody was asked, not what they said.
+        api = FakeConfigApi()
+        ctx = FakeContext(
+            elicitation=Capability(form={}),
+            form=Answer("accept", Confirmation(True)),
+        )
+        self.assertEqual(RECEIPT, await self.gate(ctx, config_api=api))
+        self.assertEqual(1, len(ctx.asked))
+
+
 class TwoCallFlowTests(GateTestCase):
     """The path every shipped client actually takes.
 

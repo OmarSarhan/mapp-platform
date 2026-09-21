@@ -18,6 +18,7 @@ import {
   Approvals,
   ApprovalDetail,
   referencedApproval,
+  ApprovalWindows,
   McpGrants,
   Security,
   TOKEN_ACCESS_PRESETS,
@@ -71,6 +72,10 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         return response({token: 'mapp_copy_me', record: {id: 'token-copy'}}, 201);
       }
@@ -120,6 +125,10 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -260,6 +269,10 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (path === '/api/admin/tokens') return response({tokens});
       if (path === '/api/admin/device-authorizations') {
         return response({authorizations: []});
@@ -317,6 +330,10 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -379,6 +396,10 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (options.method === 'POST' && path === '/api/admin/tokens') {
         created.push(JSON.parse(options.body));
@@ -473,6 +494,10 @@ describe('Scoped token administration', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (
         options.method === 'POST'
         && path === '/api/admin/device-authorizations/approve'
@@ -551,6 +576,10 @@ describe('Scoped token administration', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (path === '/api/admin/tokens') {
         return response({tokens: []});
@@ -833,6 +862,10 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [{...materialized, kind: listKind}]});
       }
@@ -909,6 +942,10 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -966,6 +1003,10 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -1016,6 +1057,10 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1082,6 +1127,10 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
       }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
+      }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
       }
@@ -1136,6 +1185,10 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: []});
@@ -1198,6 +1251,10 @@ describe('Dashboard managed save lifecycle', () => {
       }
       if (path === '/api/admin/approvals' && options.method !== 'POST') {
         return response({approvals: []});
+      }
+      if (path === '/api/admin/approval-windows' && options.method !== 'POST') {
+        return response({windows: [], actionClasses: ['apply'],
+                         maxMinutes: 60, maxConsumptions: 20});
       }
       if (path === '/api/derived-layers' && !options.method) {
         return response({derivedLayers: [materialized]});
@@ -2129,6 +2186,7 @@ describe('MCP agent client administration', () => {
     if (path.startsWith('/api/admin/mcp-clients/')) return response({disabled: true});
     if (path === '/api/admin/mcp-grants') return response({grants: []});
     if (path === '/api/admin/approvals') return response({approvals: []});
+    if (path === '/api/admin/approval-windows') return response({windows: [], actionClasses: ['apply'], maxMinutes: 60, maxConsumptions: 20});
     if (path === '/api/admin/tokens') return response({tokens: []});
     if (path === '/api/admin/device-authorizations') return response({authorizations: []});
     if (path === '/api/admin/audit') return response({events: []});
@@ -2368,6 +2426,76 @@ const WAITING = {
     },
   },
 };
+
+describe('Standing approvals', () => {
+  const POLICY = {actionClasses: ['apply', 'reload'], maxMinutes: 60,
+                  maxConsumptions: 20};
+  const GRANTS = [{grantId: 'oauth:g1', clientId: 'mcp-1',
+                   clientName: 'Claude Code'}];
+  const LIVE = {
+    id: 'w'.repeat(32), actionClass: 'apply', clientId: 'mcp-1',
+    consumed: 2, maxConsumptions: 5, live: true,
+    expires: '2026-09-21T10:00:00Z', revoked: null,
+  };
+
+  test('it says plainly that this answers on your behalf', () => {
+    // The one control here that acts without a person present. A panel that
+    // described it as a convenience would be describing the wrong thing.
+    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
+                            busy={false} open={vi.fn()} revoke={vi.fn()}/>);
+    expect(screen.getByText(/answers for you/)).toBeTruthy();
+    expect(screen.getByText(/never covers semantic or federation/)).toBeTruthy();
+  });
+
+  test('it offers only the classes the platform allows', () => {
+    // Read from the response, never restated here: a list typed into the
+    // dashboard is a second policy that drifts from the first.
+    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
+                            busy={false} open={vi.fn()} revoke={vi.fn()}/>);
+    const options = screen.getAllByRole('option').map(node => node.value);
+    expect(options).toContain('apply');
+    expect(options).toContain('reload');
+    expect(options).not.toContain('semantic-apply');
+  });
+
+  test('it cannot be opened without naming both what and who', () => {
+    const open = vi.fn();
+    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
+                            busy={false} open={open} revoke={vi.fn()}/>);
+    expect(screen.getByText('Open standing approval').disabled).toBe(true);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  test('opening one carries the bounds the operator chose', () => {
+    const open = vi.fn();
+    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
+                            busy={false} open={open} revoke={vi.fn()}/>);
+    const [agent, covers] = screen.getAllByRole('combobox');
+    fireEvent.change(agent, {target: {value: 'oauth:g1'}});
+    fireEvent.change(covers, {target: {value: 'apply'}});
+    fireEvent.click(screen.getByText('Open standing approval'));
+    expect(open).toHaveBeenCalledWith({
+      grantId: 'oauth:g1', clientId: 'mcp-1', actionClass: 'apply',
+      minutes: 15, maxConsumptions: 5,
+    });
+  });
+
+  test('a live window shows what it has spent and can be closed now', () => {
+    const revoke = vi.fn();
+    render(<ApprovalWindows windows={[LIVE]} policy={POLICY} grants={GRANTS}
+                            busy={false} open={vi.fn()} revoke={revoke}/>);
+    expect(screen.getByText(/2 of 5 used/)).toBeTruthy();
+    fireEvent.click(screen.getByText('Close now'));
+    expect(revoke).toHaveBeenCalledWith('w'.repeat(32));
+  });
+
+  test('a closed window cannot be closed again', () => {
+    render(<ApprovalWindows windows={[{...LIVE, live: false, revoked: 'x'}]}
+                            policy={POLICY} grants={GRANTS} busy={false}
+                            open={vi.fn()} revoke={vi.fn()}/>);
+    expect(screen.queryByText('Close now')).toBeNull();
+  });
+});
 
 describe('Agent approvals', () => {
   test('nothing is decided from the list alone', () => {

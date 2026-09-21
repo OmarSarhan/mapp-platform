@@ -88,7 +88,7 @@ from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
 from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
-from control_plane import ControlStore, iso, parse_time
+from control_plane import ControlStore, WINDOWABLE_ACTION_CLASSES, iso, parse_time
 from control_api import (
     ACTION_SCHEMAS,
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
@@ -7911,6 +7911,41 @@ class Handler(SimpleHTTPRequestHandler):
                     "clients": CONTROL.list_oauth_clients(),
                     "mcpUrl": f"{site}/mcp",
                 })
+        elif path == "/api/admin/approval-windows":
+            # Operator-only, like every other administrator read. A window is
+            # the most consequential thing on this surface -- it answers on
+            # somebody's behalf -- so who has one open is not a question a
+            # credential gets to ask.
+            if actor != "admin":
+                self._json(HTTPStatus.FORBIDDEN,
+                           {"error": "Administrator session required."})
+                return
+            self._json(HTTPStatus.OK, {
+                "windows": [
+                    {
+                        "id": row["id"],
+                        "grantId": row["grant_id"],
+                        "clientId": row["client_id"],
+                        "actionClass": row["action_class"],
+                        "createdBy": row["created_by"],
+                        "created": iso(row["created_at"]),
+                        "expires": iso(row["expires_at"]),
+                        "consumed": row["consumed"],
+                        "maxConsumptions": row["max_consumptions"],
+                        "live": row["live"],
+                        "revoked": iso(row["revoked_at"])
+                        if row["revoked_at"] else None,
+                    }
+                    for row in CONTROL.list_approval_windows()
+                ],
+                # Offered so the dashboard need not restate the policy, and
+                # cannot drift from it.
+                "actionClasses": sorted(WINDOWABLE_ACTION_CLASSES),
+                "maxMinutes": int(
+                    ControlStore.WINDOW_MAX_LIFETIME.total_seconds() // 60
+                ),
+                "maxConsumptions": ControlStore.WINDOW_MAX_CONSUMPTIONS,
+            })
         elif path == "/api/admin/approvals":
             # Operator-only, and under /api/admin like every other operator
             # surface, so the intent is legible from the path. An agent asks
@@ -8869,6 +8904,10 @@ class Handler(SimpleHTTPRequestHandler):
             r"/api/admin/mcp-clients/([A-Za-z0-9._-]+)/disable",
             request_path,
         )
+        approval_window_revoke_path = re.fullmatch(
+            r"/api/admin/approval-windows/([0-9a-f]{32})/revoke",
+            request_path,
+        )
         mcp_grant_revoke_path = re.fullmatch(
             # A colon, because every grant id has one: they are minted as
             # "oauth:" + token_urlsafe(18) (mcp-auth/server.py), so a pattern
@@ -8900,8 +8939,13 @@ class Handler(SimpleHTTPRequestHandler):
         approval_decide_path = re.fullmatch(
             r"/api/admin/approvals/[0-9a-f]{64}/decide", request_path
         )
+        approval_window_path = re.fullmatch(
+            r"/api/admin/approval-windows(?:/[0-9a-f]{32}/revoke)?",
+            request_path,
+        )
         if (
             request_path not in allowed
+            and not approval_window_path
             and not approval_decide_path
             and not proposal_action_path
             and not token_revoke_path
@@ -9885,6 +9929,62 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(
                     HTTPStatus.OK if revoked else HTTPStatus.NOT_FOUND,
                     {"revoked": grant_id},
+                )
+                return
+            if request_path == "/api/admin/approval-windows":
+                # Opened only from an administrator browser session, and only
+                # a recent one. The session check above already required CSRF
+                # for a state change, which is the other half of P8's "created
+                # only by a CSRF-protected POST" -- an agent holding a
+                # credential cannot arm the thing that decides for it.
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN,
+                               {"error": "Administrator session required."})
+                    return
+                authenticated_at = CONTROL.session_authenticated_at(
+                    self._cookies().get("mapp_session")
+                )
+                if authenticated_at is None:
+                    self._json(HTTPStatus.FORBIDDEN, {
+                        "error": "This session cannot open a standing"
+                                 " approval.",
+                        "code": "window.session_unknown",
+                    })
+                    return
+                try:
+                    opened = CONTROL.open_approval_window(
+                        grant_id=str(payload.get("grantId") or ""),
+                        client_id=str(payload.get("clientId") or ""),
+                        instance=CONTROL.instance_id(),
+                        action_class=str(payload.get("actionClass") or ""),
+                        created_by="admin",
+                        session_created_at=authenticated_at,
+                        minutes=int(payload.get("minutes") or 0),
+                        max_consumptions=int(
+                            payload.get("maxConsumptions") or 0
+                        ),
+                    )
+                except (ValueError, TypeError) as exc:
+                    # The refusal names the bound that was met. An operator
+                    # told only "no" while arming this will try another number.
+                    self._json(HTTPStatus.BAD_REQUEST, {
+                        "error": str(exc), "code": "window.refused",
+                    })
+                    return
+                self._json(HTTPStatus.OK, opened)
+                return
+            if approval_window_revoke_path:
+                if actor != "admin":
+                    self._json(HTTPStatus.FORBIDDEN,
+                               {"error": "Administrator session required."})
+                    return
+                window_id = approval_window_revoke_path.group(1)
+                closed = CONTROL.revoke_approval_window(
+                    window_id, str(payload.get("reason") or "closed by operator")
+                )
+                self._json(
+                    HTTPStatus.OK if closed else HTTPStatus.NOT_FOUND,
+                    {"revoked": window_id},
                 )
                 return
             if mcp_client_disable_path:
@@ -11059,6 +11159,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {
                     "handle": created["handle"],
                     "reference": created["reference"],
+                    # Whether a standing window already decided this. The
+                    # caller asks nobody when it did: P8's "because the
+                    # decision is automatic, the tool returns its ordinary
+                    # result rather than approval_required".
+                    "decided": created["decided"],
+                    "window": created["window"],
                     # Where a person goes to decide. An operator session is
                     # required there, which is the whole point: an approval
                     # names somebody the platform authenticated.

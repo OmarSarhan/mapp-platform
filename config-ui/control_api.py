@@ -1942,6 +1942,21 @@ NO_APPROVAL_RISKS = frozenset({
 })
 
 
+from control_plane import WINDOWABLE_ACTION_CLASSES  # noqa: E402
+
+
+def windowable(operation_id: str) -> bool:
+    """Whether a standing window could ever decide this operation.
+
+    Necessary and not sufficient: a window must also exist, be unexpired,
+    unrevoked, unexhausted and bound to this grant, client and instance.
+    """
+    action = ACTION_SCHEMAS.get(operation_id)
+    if action is None:
+        return False
+    return action.get("risk") in WINDOWABLE_ACTION_CLASSES
+
+
 def requires_approval(operation_id: str) -> bool:
     """Whether this operation may only proceed behind a spent approval receipt.
 

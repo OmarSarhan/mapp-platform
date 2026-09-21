@@ -411,7 +411,62 @@ can currently express which action classes a standing window may cover. Phase 0
 prompts for consent per authorization request, which is the safe end of the
 trade-off and also the one most likely to train an operator to click through.
 
-Wave 5 makes this worse before wave 8 makes it better, and that is worth saying
+**Wave 8 is the answer, and it is a trade rather than a fix.** A standing
+approval window lets an operator decide once for a class of action instead of
+once per action, bounded by a clock *and* a count. What it removes is the
+prompt; what it adds is a period in which an agent acts on a decision nobody is
+present for. That is the honest shape of it: fatigue is reduced by accepting a
+bounded amount of unattended action, not by making the attended path cheaper.
+
+Seven bounds hold it, and each is a way it could otherwise authorise more than
+somebody meant:
+
+- **One action class, never a set**, and never a scope — a window binds what an
+  action *is*. `federation:retire` is the reason: it is not a scope at all,
+  since the platform's retire action runs under `federation:provision`.
+- **Only the workspace-mutation classes.** `apply`, `reload`,
+  `database-definition` and `database-refresh`, stated as an allowlist so a
+  class nobody has considered is un-windowable by default. Semantic
+  administration and federation mutation are excluded in full, as classes, and
+  always ask.
+- **Bound to one grant, one client and one instance.** A window is not a
+  policy; it is an arrangement with one agent.
+- **Sixty minutes at most, and twenty consumptions at most**, decremented in
+  the same statement that matches the window, so two intents arriving together
+  cannot both spend the last one. Time alone is not a bound: at the
+  specification's measured rates an hour would auto-approve roughly three
+  hundred mutations.
+- **Opened only from a recently authenticated administrator browser session**,
+  CSRF-protected, and never by a credential. An agent cannot arm the thing that
+  decides for it. Recency is checked at creation and deliberately not at
+  consumption — checking again would make the sixty-minute bound dead letter.
+- **Revocable immediately**, and revoked with its grant in the same
+  transaction. An unspent receipt authorises one request; a live window keeps
+  deciding, which is the stronger reason to reach it.
+- **Invalidated by a recovery-epoch advance**, so a restored snapshot cannot
+  re-arm a window that was closed after it was taken.
+
+**What a window does not change is the whole of the rest.** It substitutes the
+decider and nothing else: the intent still carries the full canonical execution
+digest, the receipt is still single-use and still bound to that one digest, and
+it is still spent atomically with the effect. So a window authorises a *class*
+of action and never a specific replayable request — a changed argument,
+revision or fingerprint is a different digest and therefore a different intent,
+decided on its own merits or not at all. Preflight is not skipped either: an
+action needing a current revision or check fingerprint must still supply one.
+
+Each consumption is audited individually against the window that authorised it,
+carrying the window's identifier, its creator, its expiry and how much of it
+was left — because the question asked afterwards is which standing approval
+answered, and a record naming only the operator cannot say.
+
+**Residual:** during a live window, an agent's request is authorised by a
+decision made earlier about a class. That is exactly what was asked for, and
+the bounds are what make it a window rather than a grant. The one thing worth
+watching is `database-refresh`, which is the cheapest to ask for and the most
+expensive to serve.
+
+Wave 5 made this worse before wave 8 made it better, and that is worth saying
 plainly: every gated effect now asks, so the number of prompts an operator sees
 goes up. What is done about it is small and deliberate — approving takes two
 clicks in the dashboard and names the operation, declining takes one, and a

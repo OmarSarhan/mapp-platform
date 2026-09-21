@@ -1081,8 +1081,13 @@ class ApprovalCreateRouteTests(unittest.TestCase):
         created = []
         with unittest.mock.patch.object(
             app.CONTROL, "create_approval",
+            # The full shape the real method returns. A stub that lags the
+            # method it stands in for is how a route ends up reading a key
+            # nothing provides -- `decided` arrived with P8's windows, and a
+            # stub missing it turns a passing test into a 500.
             lambda **kwargs: created.append(kwargs) or {
-                "handle": "h", "reference": "a" * 64},
+                "handle": "h", "reference": "a" * 64,
+                "decided": False, "window": None},
         ), unittest.mock.patch.object(
             app.CONTROL, "instance_id", lambda: "instance-under-test"
         ):
@@ -1106,8 +1111,13 @@ class ApprovalCreateRouteTests(unittest.TestCase):
         created = []
         with unittest.mock.patch.object(
             app.CONTROL, "create_approval",
+            # The full shape the real method returns. A stub that lags the
+            # method it stands in for is how a route ends up reading a key
+            # nothing provides -- `decided` arrived with P8's windows, and a
+            # stub missing it turns a passing test into a 500.
             lambda **kwargs: created.append(kwargs) or {
-                "handle": "h", "reference": "a" * 64},
+                "handle": "h", "reference": "a" * 64,
+                "decided": False, "window": None},
         ), unittest.mock.patch.object(
             app.CONTROL, "instance_id", lambda: "instance-under-test"
         ):

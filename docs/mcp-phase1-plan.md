@@ -437,6 +437,37 @@ naming scopes, because a window binds action classes.
 be built before the receipt exists, and it should not be built before there is
 operational experience of how often per-action approval actually bites.
 
+**Built.** The record, the four bounds a CHECK can hold, the three it cannot,
+the dashboard surface, and the substitution in `create_approval`.
+
+**The unit is the risk class, derived not invented.** `ACTION_SCHEMAS[op]["risk"]`
+is already how the approval requirement itself is derived, so a window binds
+the same thing. `WINDOWABLE_ACTION_CLASSES` is an *allowlist* — the opposite
+direction from `NO_APPROVAL_RISKS` — because here the safe default is that no
+window may decide, so a class nobody has considered is un-windowable rather
+than silently covered.
+
+**O8 is answered without a new column.** "What timestamp establishes recent
+authentication" is `control.sessions.created_at`, which is written when the
+password verifies and never refreshed, so it is an authentication time rather
+than an activity time. It has a visible consequence, stated rather than
+designed around: an administrator whose session is older than fifteen minutes
+must sign in again to open a window. That is the right friction for arming
+auto-approval.
+
+**The substitution is one place and one bit.** `create_approval` spends a
+window *before* the insert — a window found and not spent would be a race that
+approved more than it authorised — and the row is inserted `approved` with the
+window creator as its decider. The route reports `decided`, and `approval_gate`
+claims the receipt and returns instead of asking. The runtime does not know
+what a window is, and should not.
+
+**Watch, and it came up during the build:** two stubs lagged the methods they
+stood in for — a `create_approval` fake missing the new key, and earlier a
+`FakeExchange` missing `request_digest`. The second made a cross-session test
+pass while proving nothing. A fake missing a method the real one has does not
+fail loudly; it makes the test measure something else.
+
 ---
 
 ## Decisions taken

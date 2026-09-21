@@ -660,6 +660,29 @@ export function referencedApproval(hash){
  return match?match[1]:null;
 }
 
+export function ApprovalWindows({windows,policy,grants,busy,open,revoke}){
+ const live=windows.filter(item=>item.live);
+ const [grant,setGrant]=useState(''),[actionClass,setActionClass]=useState(''),[minutes,setMinutes]=useState('15'),[count,setCount]=useState('5');
+ const classes=policy.actionClasses||[];
+ const choosable=grants.filter(item=>!item.revoked);
+ return <><h3>Standing approvals {live.length>0&&<span className="approval-count">{live.length}</span>}</h3>
+  <p className="muted">A standing approval answers for you. While one is open, the agent it names can perform one kind of action without asking each time -- bounded by a clock and by a count, whichever runs out first. It never covers semantic or federation changes: those always ask. Opening one borrows your authority, so you must have signed in recently.</p>
+  {choosable.length===0&&<p className="muted">No agent consent to open one against.</p>}
+  {choosable.length>0&&<div className="window-open">
+   <label>Agent<select value={grant} onChange={event=>setGrant(event.target.value)}><option value="">Choose a consent…</option>{choosable.map(item=><option key={item.grantId} value={item.grantId}>{item.clientName||item.clientId} — {item.grantId}</option>)}</select></label>
+   <label>May do<select value={actionClass} onChange={event=>setActionClass(event.target.value)}><option value="">Choose what it covers…</option>{classes.map(name=><option key={name} value={name}>{name}</option>)}</select></label>
+   <label>For<input type="number" min="1" max={policy.maxMinutes||60} value={minutes} onChange={event=>setMinutes(event.target.value)}/> minutes</label>
+   <label>Up to<input type="number" min="1" max={policy.maxConsumptions||20} value={count} onChange={event=>setCount(event.target.value)}/> actions</label>
+   <button disabled={busy||!grant||!actionClass} onClick={()=>open({grantId:grant,clientId:(choosable.find(item=>item.grantId===grant)||{}).clientId,actionClass,minutes:Number(minutes),maxConsumptions:Number(count)})}>Open standing approval</button>
+  </div>}
+  {windows.length>0&&<ul className="window-list">{windows.map(item=><li key={item.id} className={item.live?'window-live':'window-closed'}>
+   <strong>{item.actionClass}</strong> <span className="muted">for {item.clientId}</span>
+   <small>{item.consumed} of {item.maxConsumptions} used · {item.live?`open until ${item.expires}`:(item.revoked?'closed':'finished')}</small>
+   {item.live&&<button className="danger" disabled={busy} onClick={()=>revoke(item.id)}>Close now</button>}
+  </li>)}</ul>}
+ </>;
+}
+
 export function Approvals({approvals,busy,decide,reload,hash}){
  const linked=referencedApproval(hash);
  const [selected,setSelected]=useState(linked);
@@ -720,9 +743,9 @@ function ApiToken({token,busy,revoke}){
 }
 export function Security({close,hash}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
- const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[windows,setWindows]=useState([]),[windowPolicy,setWindowPolicy]=useState({}),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a,c,g,p]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals)};
+ const load=async()=>{const [t,d,a,c,g,p,w]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals'),api('/api/admin/approval-windows')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals);setWindows(w.windows||[]);setWindowPolicy({actionClasses:w.actionClasses,maxMinutes:w.maxMinutes,maxConsumptions:w.maxConsumptions})};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -733,6 +756,8 @@ export function Security({close,hash}){
  const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load();return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
+ const openWindow=async request=>{setBusy(true);setError('');try{await api('/api/admin/approval-windows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const revokeWindow=async id=>{setBusy(true);setError('');try{await api(`/api/admin/approval-windows/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const decideApproval=async(reference,approved)=>{setBusy(true);setError('');try{await api(`/api/admin/approvals/${reference}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const revokeGrant=async grantId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-grants/${grantId}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
@@ -761,6 +786,7 @@ export function Security({close,hash}){
   {revealed&&<div className="token-reveal"><strong>Copy now — this token is shown once.</strong><code>{revealed}</code><button type="button" aria-label={copied?'API token copied to clipboard':'Copy API token'} aria-live="polite" aria-pressed={copied} className={`copy-token ${copied?'copied':''}`} onClick={copyRevealed}>{copied?'Copied':'Copy'}</button></div>}
   <h3>CLI tokens</h3>
   {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
+  <ApprovalWindows windows={windows} policy={windowPolicy} grants={grants} busy={busy} open={openWindow} revoke={revokeWindow}/>
   <Approvals approvals={approvals} busy={busy} decide={decideApproval} reload={()=>load().catch(reason=>setError(reason.message))} hash={hash}/>
   <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
   <McpGrants grants={grants} busy={busy} revoke={revokeGrant}/>

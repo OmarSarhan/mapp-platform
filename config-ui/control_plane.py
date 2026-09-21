@@ -157,6 +157,31 @@ def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+#: Risk classes a standing approval window may cover, and the only ones.
+#:
+#: An allowlist rather than an exemption list, which is the opposite direction
+#: from NO_APPROVAL_RISKS above and deliberately so. There, the safe default is
+#: "requires approval", so what is written down is the exemption. Here the safe
+#: default is "no window may decide this", so what is written down is the
+#: permission -- a risk class nobody has considered cannot be auto-approved.
+#:
+#: These four are the specification's *Workspace mutation* permission class:
+#: apply, reload and the managed-relation lifecycle. What is deliberately
+#: absent is broader than a list of scopes, because the specification excludes
+#: whole classes: *Semantic administration* (`semantic-apply`,
+#: `semantic-archive`, `semantic-repair`) and *Federation mutation*
+#: (`federation-register`, `federation-provision`, `federation-observe`) each
+#: require a per-action decision, always. `federation:retire` is the reason
+#: the unit is an action class and not a scope -- it is not a scope at all,
+#: since the platform's retire action runs under `federation:provision`.
+WINDOWABLE_ACTION_CLASSES = frozenset({
+    "apply",
+    "reload",
+    "database-definition",
+    "database-refresh",
+})
+
+
 class ControlStore:
     def __init__(self, root: Path):
         self.root = root
@@ -824,6 +849,7 @@ class ControlStore:
             ).fetchone()
             families = 0
             approvals = 0
+            windows = 0
             if row is not None:
                 families = connection.execute(
                     "UPDATE control.oauth_refresh_families"
@@ -842,6 +868,16 @@ class ControlStore:
                     "   AND status IN ('pending', 'approved')",
                     ((reason or "grant revoked")[:200], grant_id),
                 ).rowcount
+                # And in the same transaction again, for a stronger reason. An
+                # unspent receipt authorises one request; a live window keeps
+                # deciding, so a revocation that left one standing would let a
+                # revoked grant go on auto-approving until the clock ran out.
+                windows = connection.execute(
+                    "UPDATE control.approval_windows"
+                    "   SET revoked_at = now(), revoked_reason = %s"
+                    " WHERE grant_id = %s AND revoked_at IS NULL",
+                    ((reason or "grant revoked")[:200], grant_id),
+                ).rowcount
         if row is None:
             return False
         self.audit(
@@ -853,6 +889,7 @@ class ControlStore:
                 "reason": reason or "unspecified",
                 "refreshFamiliesRevoked": families,
                 "approvalsRevoked": approvals,
+                "windowsRevoked": windows,
             },
         )
         return True
@@ -1037,6 +1074,30 @@ class ControlStore:
                 [current, *values],
             ).fetchone()
             return row is not None
+
+    def session_authenticated_at(self, session: str | None):
+        """When this session's password was verified, or None.
+
+        `created_at` and not `last_used_at`: the first is written once, when
+        `login` verifies the password, and the second is refreshed on every
+        request. Opening a standing approval needs the authentication time, so
+        reading the activity time would let a session kept warm by ordinary
+        browsing arm an auto-approving window hours after anybody proved who
+        they were.
+
+        This answers O8 -- "what timestamp establishes recent authentication"
+        -- from the record that already exists, rather than by adding a
+        re-authentication field or a step-up endpoint.
+        """
+        if not session:
+            return None
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "SELECT created_at FROM control.sessions WHERE session_hash = %s",
+                (token_hash(session),),
+            ).fetchone()
+        return row["created_at"] if row is not None else None
 
     def logout(self, session: str | None) -> None:
         if not session:
@@ -1258,6 +1319,204 @@ class ControlStore:
     #: slack, not a working window.
     RECEIPT_LIFETIME = dt.timedelta(minutes=5)
 
+    # -- standing approval windows (P8) ---------------------------------
+
+    #: How long a window may stand, and how much it may authorise while it
+    #: does. Time alone is not a bound: at the specification's measured rates
+    #: a sixty-minute window would auto-approve roughly three hundred
+    #: mutations, so the count is what actually limits one and the clock is
+    #: the outer edge.
+    WINDOW_MAX_LIFETIME = dt.timedelta(minutes=60)
+    WINDOW_MAX_CONSUMPTIONS = 20
+
+    #: How recently the administrator opening a window must have proved who
+    #: they are. Checked at creation and deliberately not at consumption --
+    #: checking again would make the sixty-minute bound dead letter, since
+    #: nothing would be approvable after the first fifteen minutes.
+    #:
+    #: The timestamp is `control.sessions.created_at`, which is written when
+    #: the password verifies and never refreshed, so it is the authentication
+    #: time rather than an activity time. That answers O8 without a new column
+    #: or a step-up endpoint, and it has a visible consequence worth stating:
+    #: an administrator whose session is older than this must sign in again to
+    #: open a window. That is the right friction for arming auto-approval.
+    WINDOW_RECENCY = dt.timedelta(minutes=15)
+
+    def open_approval_window(
+        self,
+        *,
+        grant_id: str,
+        client_id: str,
+        instance: str,
+        action_class: str,
+        created_by: str,
+        session_created_at: dt.datetime,
+        minutes: int,
+        max_consumptions: int,
+    ) -> dict:
+        """Arm a window, or refuse and say which bound was exceeded.
+
+        Every refusal names the bound rather than returning a bare failure: an
+        operator who is told "no" while arming an auto-approving control should
+        learn which limit they met, or they will simply try a different number.
+        """
+        if action_class not in WINDOWABLE_ACTION_CLASSES:
+            raise ValueError(
+                f"No standing approval may cover {action_class!r}."
+            )
+        if minutes <= 0 or dt.timedelta(minutes=minutes) > self.WINDOW_MAX_LIFETIME:
+            raise ValueError(
+                "A window lasts between one minute and"
+                f" {int(self.WINDOW_MAX_LIFETIME.total_seconds() // 60)}."
+            )
+        if max_consumptions <= 0 or max_consumptions > self.WINDOW_MAX_CONSUMPTIONS:
+            raise ValueError(
+                "A window authorises between one and"
+                f" {self.WINDOW_MAX_CONSUMPTIONS} actions."
+            )
+        current = now()
+        if session_created_at < current - self.WINDOW_RECENCY:
+            raise ValueError(
+                "Sign in again before opening a standing approval: it borrows"
+                " your authority, so the platform requires a recent"
+                " authentication rather than a long-lived session."
+            )
+        window_id = secrets.token_hex(16)
+        with self._db() as connection:
+            self._require_initialized(connection)
+            connection.execute(
+                "INSERT INTO control.approval_windows"
+                " (id, grant_id, client_id, instance, action_class,"
+                "  created_by, creator_auth_time, created_at, expires_at,"
+                "  max_consumptions)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (window_id, grant_id, client_id, instance, action_class,
+                 created_by, session_created_at, current,
+                 current + dt.timedelta(minutes=minutes), max_consumptions),
+            )
+        self.audit(
+            "approval.window_opened",
+            actor=created_by,
+            details={
+                "window": window_id, "grant": grant_id, "client": client_id,
+                "actionClass": action_class, "minutes": minutes,
+                "maxConsumptions": max_consumptions,
+            },
+        )
+        return {
+            "id": window_id,
+            "expiresAt": iso(current + dt.timedelta(minutes=minutes)),
+        }
+
+    def consume_approval_window(
+        self, *, grant_id: str, client_id: str, instance: str,
+        action_class: str,
+    ) -> dict | None:
+        """Spend one of a window's consumptions, or return None.
+
+        The conditional UPDATE is the read, for the reason every one-shot here
+        works that way: two intents arriving together must not both see the
+        last consumption free. The count is incremented in the predicate's own
+        statement, so a window with one left decides exactly one of them.
+
+        Expiry, revocation and exhaustion are all in the predicate rather than
+        checked afterwards, so there is no moment between deciding a window is
+        usable and using it.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.approval_windows"
+                "   SET consumed = consumed + 1"
+                " WHERE id = ("
+                "         SELECT id FROM control.approval_windows"
+                "          WHERE grant_id = %s AND client_id = %s"
+                "            AND instance = %s AND action_class = %s"
+                "            AND revoked_at IS NULL AND expires_at > %s"
+                "            AND consumed < max_consumptions"
+                # Oldest first, so a window is used up and closed rather than
+                # several being held part-spent.
+                "          ORDER BY created_at"
+                "          FOR UPDATE SKIP LOCKED"
+                "          LIMIT 1)"
+                " RETURNING id, created_by, creator_auth_time, expires_at,"
+                "           consumed, max_consumptions",
+                (grant_id, client_id, instance, action_class, now()),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_approval_windows(self) -> list[dict]:
+        """What is standing open, newest first.
+
+        Expired and exhausted windows are included rather than filtered: an
+        operator asking what has been armed is owed the ones that have just
+        closed too, because "it was open until a minute ago" is the answer to
+        most questions about an approval nobody remembers giving.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            rows = connection.execute(
+                "SELECT id, grant_id, client_id, instance, action_class,"
+                "       created_by, creator_auth_time, created_at, expires_at,"
+                "       max_consumptions, consumed, revoked_at, revoked_reason"
+                "  FROM control.approval_windows"
+                " WHERE created_at > %s"
+                " ORDER BY created_at DESC",
+                (now() - dt.timedelta(days=1),),
+            ).fetchall()
+        current = now()
+        return [
+            {
+                **dict(row),
+                "live": (
+                    row["revoked_at"] is None
+                    and row["expires_at"] > current
+                    and row["consumed"] < row["max_consumptions"]
+                ),
+            }
+            for row in rows
+        ]
+
+    def revoke_approval_window(self, window_id: str, reason: str) -> bool:
+        """Close a window now. The conditional UPDATE is the read again, so
+        two operators closing the same one cannot both believe they did."""
+        with self._db() as connection:
+            self._require_initialized(connection)
+            row = connection.execute(
+                "UPDATE control.approval_windows"
+                "   SET revoked_at = %s, revoked_reason = %s"
+                " WHERE id = %s AND revoked_at IS NULL"
+                " RETURNING created_by, action_class",
+                (now(), reason[:200], window_id),
+            ).fetchone()
+        if row is None:
+            return False
+        self.audit(
+            "approval.window_revoked",
+            actor="admin",
+            details={"window": window_id, "actionClass": row["action_class"],
+                     "reason": reason[:200]},
+        )
+        return True
+
+    def revoke_approval_windows_for_grant(
+        self, grant_id: str, reason: str
+    ) -> int:
+        """Revoking a grant closes every window opened under it.
+
+        A window outlives nothing: it is authority to decide on behalf of a
+        grant, so a grant that no longer exists cannot have one standing.
+        """
+        with self._db() as connection:
+            self._require_initialized(connection)
+            result = connection.execute(
+                "UPDATE control.approval_windows"
+                "   SET revoked_at = %s, revoked_reason = %s"
+                " WHERE grant_id = %s AND revoked_at IS NULL",
+                (now(), reason[:200], grant_id),
+            )
+        return result.rowcount
+
     def create_approval(
         self,
         *,
@@ -1284,19 +1543,39 @@ class ControlStore:
         # name the row, useless for spending it. The decider never holds
         # anything that could be carried back through the agent.
         reference = token_hash(handle)
+        # A standing window substitutes the decider and nothing else. The row
+        # below is the same row, carrying the same execution digest, decided
+        # into the same single-use receipt -- what a window removes is the
+        # human round trip. It is spent *before* the insert so that an intent
+        # is never recorded as auto-decided on a consumption that was not
+        # actually taken; a window found and not spent would be a race that
+        # approved more than it authorised.
+        window = None
+        if risk in WINDOWABLE_ACTION_CLASSES:
+            window = self.consume_approval_window(
+                grant_id=grant_id, client_id=client_id, instance=instance,
+                action_class=risk,
+            )
         with self._db() as connection:
             self._require_initialized(connection)
             connection.execute(
                 "INSERT INTO control.approvals"
                 " (id_hash, grant_id, client_id, instance, operation_id, tool,"
                 "  request_digest, risk, scopes, packet, created_at,"
-                "  expires_at, status)"
+                "  expires_at, status, decided_at, decided_by,"
+                "  decided_by_window)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-                "         'pending')",
+                "         %s, %s, %s, %s)",
                 (
                     reference, grant_id, client_id, instance,
                     operation_id, tool, request_digest, risk, list(scopes),
                     json.dumps(packet), now(), now() + self.APPROVAL_LIFETIME,
+                    "pending" if window is None else "approved",
+                    None if window is None else now(),
+                    # The approval inherits the window creator's identity, so
+                    # the audit names a person rather than a mechanism.
+                    None if window is None else window["created_by"],
+                    None if window is None else window["id"],
                 ),
             )
         self.audit(
@@ -1311,7 +1590,35 @@ class ControlStore:
                 "digest": request_digest,
             },
         )
-        return {"handle": handle, "reference": reference}
+        if window is not None:
+            # Audited individually against the window that authorised it, not
+            # merely as a decision: the question a reader asks afterwards is
+            # which standing approval answered for them and how much of it was
+            # left, and a record naming only the operator cannot say.
+            self.audit(
+                "approval.window_consumed",
+                actor=window["created_by"],
+                details={
+                    "window": window["id"],
+                    "operation": operation_id,
+                    "tool": tool,
+                    "grant": grant_id,
+                    "digest": request_digest,
+                    "consumed": window["consumed"],
+                    "maxConsumptions": window["max_consumptions"],
+                    "windowExpires": iso(window["expires_at"]),
+                    "creatorAuthenticatedAt": iso(window["creator_auth_time"]),
+                },
+            )
+        return {
+            "handle": handle,
+            "reference": reference,
+            # The caller needs to know whether to ask anybody. A tool whose
+            # intent was decided on arrival returns its ordinary result rather
+            # than reporting that approval is required.
+            "decided": window is not None,
+            "window": None if window is None else window["id"],
+        }
 
     def read_approval(self, handle: str) -> dict | None:
         """What a person is being asked to decide, by the handle naming it.

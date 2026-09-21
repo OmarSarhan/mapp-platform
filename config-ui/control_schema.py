@@ -489,7 +489,9 @@ TABLES_IN_DELETE_ORDER = (
     "audit_event",
     # Also references nothing by foreign key: an approval names its grant and
     # client as text, because it must survive being read after either is gone.
+    # It does reference a window, so it goes before them.
     "approvals",
+    "approval_windows",
     "oauth_refresh_tokens",
     "oauth_refresh_families",
     "oauth_authorization_codes",
@@ -536,6 +538,10 @@ EPOCH_REVOKED_TABLES = (
     # must reach it. Revoked rather than deleted, because the row also records
     # what a person allowed and why.
     "approvals",
+    # A live window is authority that decides on somebody's behalf, which is
+    # the most a restored snapshot could re-arm: not one permitted request but
+    # a standing answer to a class of them.
+    "approval_windows",
 )
 
 #: Sessions, one-shot codes and in-flight authorizations. Nothing here is worth
@@ -927,6 +933,115 @@ def _migration_9(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_10(connection: psycopg.Connection) -> None:
+    """A standing approval window: the same receipt, decided without prompting.
+
+    P8's mechanics, and the sentence that governs the whole design is "a window
+    substitutes the decider, never the receipt". Nothing downstream changes: an
+    intent is still created carrying the full canonical execution digest, still
+    decided into an ordinary single-use receipt, still spent atomically with
+    the effect. What a window removes is the human round trip, and nothing
+    else.
+
+    So a window authorises a *class* of action and never a specific replayable
+    request. Every per-action invalidation still applies inside a live window:
+    a changed argument, revision or fingerprint produces a different digest and
+    therefore a different intent, which the window decides on its own merits or
+    not at all.
+
+    The columns are the seven bounds, made structural where a CHECK can hold
+    them and enforced in `control_plane` where they cannot:
+
+    - `grant_id`, `client_id`, `instance`, `action_class` -- exactly what it
+      covers. One action class, never a set: a window that covered several
+      would be a second permission system growing beside the scopes.
+    - `created_by` and `creator_auth_time` -- whose authority this borrows.
+      An auto-decided approval inherits them as its deciding operator, so the
+      audit names a person rather than a mechanism.
+    - `expires_at`, bounded to 60 minutes ahead at creation.
+    - `max_consumptions` and `consumed`, with the CHECK that keeps the second
+      inside the first. Time alone is not a bound: at the specification's
+      measured rates a 60-minute window would authorise roughly 300
+      auto-approved mutations.
+    - `revoked_at`, so the dashboard can close one immediately.
+    - `recovery_epoch`, so a restore cannot re-arm a window that was revoked
+      after the snapshot was taken -- the same basis as receipts and claims.
+
+    Recency is checked at creation and deliberately not at consumption. The
+    administrator must have authenticated within fifteen minutes to open one;
+    checking again at consumption would make the sixty-minute bound dead
+    letter, since nothing would be approvable after the first fifteen.
+    """
+    connection.execute(
+        sql.SQL(
+            """
+        CREATE TABLE {schema}.approval_windows (
+            id             text        PRIMARY KEY,
+            grant_id       text        NOT NULL,
+            client_id      text        NOT NULL,
+            instance       text        NOT NULL,
+            -- Exactly one, and never a scope name. `federation:retire` is not
+            -- a scope at all, and a window binds what an action *is* rather
+            -- than what buys it.
+            action_class   text        NOT NULL,
+            created_by     text        NOT NULL,
+            -- When the creator last proved who they were, carried onto every
+            -- approval this window decides.
+            creator_auth_time timestamptz NOT NULL,
+            created_at     timestamptz NOT NULL,
+            expires_at     timestamptz NOT NULL,
+            max_consumptions int       NOT NULL,
+            consumed       int         NOT NULL DEFAULT 0,
+            revoked_at     timestamptz,
+            revoked_reason text,
+            recovery_epoch bigint      NOT NULL
+                DEFAULT {schema}.current_recovery_epoch(),
+            CONSTRAINT window_consumptions_are_positive
+                CHECK (max_consumptions > 0),
+            -- The count is a bound, not a counter. Exceeding it is not a state
+            -- the table will hold, whatever the code that decrements believes.
+            CONSTRAINT window_consumed_within_its_bound
+                CHECK (consumed >= 0 AND consumed <= max_consumptions),
+            CONSTRAINT window_expires_after_it_is_created
+                CHECK (expires_at > created_at),
+            CONSTRAINT window_revoked_reason_needs_a_revocation
+                CHECK (revoked_reason IS NULL OR revoked_at IS NOT NULL)
+        );
+
+        -- The match a consumption makes: everything a window binds, and only
+        -- while it can still authorise anything.
+        CREATE INDEX approval_window_match_idx
+            ON {schema}.approval_windows
+               (grant_id, client_id, instance, action_class, expires_at)
+            WHERE revoked_at IS NULL;
+
+        -- Revoking a grant must reach every window opened under it.
+        CREATE INDEX approval_window_grant_idx
+            ON {schema}.approval_windows (grant_id);
+
+        -- Which window decided an approval, so a consumption can be audited
+        -- against the authority it borrowed rather than only against the
+        -- person who opened it. Nullable because an interactively decided
+        -- approval borrowed nothing.
+        ALTER TABLE {schema}.approvals
+            ADD COLUMN decided_by_window text
+                REFERENCES {schema}.approval_windows (id) ON DELETE SET NULL;
+        """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
+def _rollback_10(connection: psycopg.Connection) -> None:
+    connection.execute(
+        sql.SQL(
+            """
+        ALTER TABLE {schema}.approvals DROP COLUMN IF EXISTS decided_by_window;
+        DROP TABLE IF EXISTS {schema}.approval_windows;
+        """
+        ).format(schema=sql.Identifier(SCHEMA))
+    )
+
+
 def _rollback_9(connection: psycopg.Connection) -> None:
     connection.execute(
         sql.SQL("DROP TABLE IF EXISTS {schema}.approvals").format(
@@ -945,6 +1060,7 @@ MIGRATIONS = {
     7: _migration_7,
     8: _migration_8,
     9: _migration_9,
+    10: _migration_10,
 }
 
 
@@ -984,6 +1100,11 @@ DESTRUCTIVE_ROLLBACKS = {
     9: "every approval: the record of what an operator allowed, the digest"
        " it was bound to, and whether it was spent. A restored snapshot"
        " must not re-arm a receipt that was consumed after it was taken",
+    10: "every standing approval window, and the record of which window"
+        " decided an approval. The approvals themselves survive; what is lost"
+        " is whether a person was prompted for each one or an open window"
+        " answered on their behalf, which is the difference the audit exists"
+        " to show",
 }
 
 
@@ -1126,6 +1247,7 @@ ROLLBACKS = {
     7: _rollback_7,
     8: _rollback_8,
     9: _rollback_9,
+    10: _rollback_10,
 }
 
 
