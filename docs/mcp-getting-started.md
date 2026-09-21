@@ -53,9 +53,20 @@ not run an OAuth server it has no use for.
 MAPP_MCP=1 ./bin/mapp all
 ```
 
-> **`MAPP_MCP` goes on the command line, not in `.env`.** It is read as a shell
-> variable. `MAPP_DEMO_SOURCES`, which looks like the same kind of setting, *is*
-> read from `.env`. Putting `MAPP_MCP=1` in `.env` silently starts nothing.
+Or set it once for the deployment, in `.env`:
+
+```
+MAPP_MCP=1
+```
+
+An `.env` created before this key existed will not have it. `./bin/mapp
+doctor` reports it as missing and `./bin/mapp doctor --add-missing` adds it,
+commented default and all, without touching anything else.
+
+> The shell takes precedence over `.env`, so `MAPP_MCP=1 ./bin/mapp all` turns
+> the surface on for one command whatever `.env` says. Whichever you use, it
+> has to be visible to every command that should see these services — `verify`,
+> `ps` and `down` included — which is the reason to prefer `.env`.
 
 Two services appear: `mcp-auth` (the authorization server) and `mapp-mcp` (the
 tools). Check they are healthy:

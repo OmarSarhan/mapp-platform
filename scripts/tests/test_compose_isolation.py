@@ -101,7 +101,7 @@ class McpOptInTests(unittest.TestCase):
         )
         self.assertNotIn("mcp-auth", runtime_line)
         self.assertNotIn("mapp-mcp", runtime_line)
-        self.assertIn('if [[ "${MAPP_MCP:-0}" == "1" ]]; then', launcher)
+        self.assertIn('if [[ "${mcp_surface}" == "1" ]]; then', launcher)
         self.assertIn("runtime_services+=(mcp-auth mapp-mcp)", launcher)
 
 

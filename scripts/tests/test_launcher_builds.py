@@ -309,3 +309,58 @@ class BuildVisibilityTests(unittest.TestCase):
                     expected, announcements,
                     "init no longer announces this step before waiting on it",
                 )
+
+
+class McpSurfaceSwitchTests(unittest.TestCase):
+    """`bin/mapp` and `verify.sh` must decide the MCP surface the same way.
+
+    One starts the services and the other probes them, so a disagreement means
+    either services nobody verifies or a verification of services nobody
+    started. Both halves of that have already shipped: `verify.sh` once
+    required mcp-auth unconditionally, so a plain `./bin/mapp all` could never
+    pass, and fixing it uncovered the identical bug in the metadata probe.
+
+    The resolution reads the shell first and `.env` second, so the surface can
+    be turned on for one command or set once for the deployment.
+    """
+
+    RESOLUTION = '"${MAPP_MCP:-$(dotenv_value MAPP_MCP)}"'
+    VERIFY = ROOT / "scripts" / "verify.sh"
+
+    def test_both_resolve_the_switch_identically(self) -> None:
+        for path in (LAUNCHER, self.VERIFY):
+            with self.subTest(file=path.name):
+                self.assertIn(
+                    self.RESOLUTION, path.read_text(),
+                    "this file no longer resolves MAPP_MCP the same way as the"
+                    " other, so the two can disagree about whether the agent"
+                    " surface is running",
+                )
+
+    def test_neither_reads_the_shell_alone(self) -> None:
+        """The old spelling. It ignored `.env` entirely, which made MAPP_MCP
+        the odd one out beside MAPP_DEMO_SOURCES and meant setting it in
+        `.env` silently started nothing."""
+        for path in (LAUNCHER, self.VERIFY):
+            with self.subTest(file=path.name):
+                self.assertNotIn('"${MAPP_MCP:-0}"', path.read_text())
+
+    def test_the_switch_is_in_the_env_template(self) -> None:
+        """Otherwise it is only discoverable by reading the launcher."""
+        keys = {
+            line.split("=", 1)[0]
+            for line in (ROOT / ".env.example").read_text().splitlines()
+            if "=" in line and not line.startswith("#")
+        }
+        self.assertIn("MAPP_MCP", keys)
+
+    def test_verify_resolves_it_once(self) -> None:
+        """Two independent resolutions in one file is the same drift risk in
+        miniature, and that is how the probe came to disagree with the
+        required-services list."""
+        text = self.VERIFY.read_text()
+        self.assertEqual(
+            1, text.count(self.RESOLUTION),
+            "verify.sh resolves MAPP_MCP more than once; resolve it into"
+            " mcp_surface and use that",
+        )

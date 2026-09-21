@@ -661,7 +661,12 @@ runtime_services=(db semantic-service xyz xyz-preview config-ui browser-runner e
 # OAuth server it does not use. Naming a profiled service on the command line
 # would start it regardless of the profile, so the services are added to the
 # list here rather than left in it unconditionally.
-if [[ "${MAPP_MCP:-0}" == "1" ]]; then
+# Read from the shell first and .env second, so it can be turned on for one
+# command or set once for the deployment. It used to be shell-only, which made
+# it the odd one out beside MAPP_DEMO_SOURCES and meant `MAPP_MCP=1` in .env
+# silently started nothing.
+mcp_surface="${MAPP_MCP:-$(dotenv_value MAPP_MCP)}"
+if [[ "${mcp_surface}" == "1" ]]; then
   compose+=(--profile mcp)
   runtime_services+=(mcp-auth mapp-mcp)
 fi

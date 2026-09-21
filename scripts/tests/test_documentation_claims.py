@@ -256,16 +256,20 @@ class GuideClaimTests(unittest.TestCase):
             self.assertNotIn(excluded, WINDOWABLE_ACTION_CLASSES)
         self.assertIn("Never semantic or federation changes", self.text)
 
-    def test_the_opt_in_variable_is_described_as_the_shell_reads_it(
+    def test_the_opt_in_variable_is_described_as_the_code_reads_it(
         self,
     ) -> None:
-        """`MAPP_MCP` is a shell variable and `MAPP_DEMO_SOURCES` is read from
-        .env. They look alike, and putting the first in .env starts nothing --
-        which is why the guide warns about it."""
+        """`MAPP_MCP` reads the shell first and `.env` second, so the guide has
+        to offer both and say which wins. It was shell-only, and the guide
+        warned that putting it in `.env` started nothing -- a warning that
+        becomes a false claim the moment the launcher stops being shell-only,
+        which is why this is pinned against the launcher rather than alone."""
         launcher = (ROOT / "bin" / "mapp").read_text()
-        self.assertIn('"${MAPP_MCP:-0}" == "1"', launcher)
+        self.assertIn('"${MAPP_MCP:-$(dotenv_value MAPP_MCP)}"', launcher)
         self.assertIn('dotenv_value MAPP_DEMO_SOURCES', launcher)
-        self.assertIn("goes on the command line, not in `.env`", self.text)
+        self.assertIn("MAPP_MCP=1 ./bin/mapp all", self.text)
+        self.assertIn("takes precedence over `.env`", self.text)
+        self.assertNotIn("not in `.env`", self.text)
 
     def test_the_commands_it_prints_exist(self) -> None:
         launcher = (ROOT / "bin" / "mapp").read_text()

@@ -73,7 +73,12 @@ required_services=(db semantic-service xyz xyz-preview config-ui browser-runner 
 # `./bin/mapp all` -- fail every time, at the last step, with
 # "mcp-auth health is missing after waiting". Required when it is asked for,
 # and not otherwise.
-if [[ "${MAPP_MCP:-0}" == "1" ]]; then
+# Resolved once and used everywhere below. Shell first, .env second, matching
+# bin/mapp exactly: if the two disagree about whether the surface is on, one
+# starts services the other refuses to probe -- which has already happened
+# twice, in this list and in the metadata probe.
+mcp_surface="${MAPP_MCP:-$(dotenv_value MAPP_MCP)}"
+if [[ "${mcp_surface}" == "1" ]]; then
   required_services+=(mcp-auth mapp-mcp)
 fi
 # An overlay that carries FEDERATION_DBS_<REF> entries must be applied whenever
@@ -3034,7 +3039,7 @@ probe_endpoint "The configuration service public identity" config_headers \
 # `./bin/mapp all` fail on a 502 from a service nobody asked to run -- the
 # same mistake as requiring it in `required_services`, in a second place, and
 # the fix for the first uncovered the second.
-if [[ "${MAPP_MCP:-0}" == "1" ]]; then
+if [[ "${mcp_surface}" == "1" ]]; then
 probe_endpoint "The MCP authorization server metadata" mcp_headers \
   "${mcp_url}/.well-known/oauth-authorization-server"
 # Fetching that document is not enough, and believing it was is what let a real
@@ -3071,7 +3076,7 @@ fi
 printf 'The MCP authorization endpoint it advertises is on the published edge port (%s).\n' \
   "${advertised_port}"
 else
-  printf 'The MCP surface is off (MAPP_MCP is unset), so its origin was not probed.\n'
+  printf 'The MCP surface is off, so its origin was not probed. Set MAPP_MCP=1 in .env, or run MAPP_MCP=1 ./bin/mapp all for one command.\n'
 fi
 # And the control endpoints must not be reachable from the edge. The component
 # owns that as a property of its route tables; the Caddy allowlist is the
