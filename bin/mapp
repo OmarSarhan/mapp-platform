@@ -388,7 +388,7 @@ ensure_runtime_client_registered() {
     return 0
   fi
   if ! printf '%s\n' "${secret}" \
-    | "${compose[@]}" run --rm --no-deps -T config-ui \
+    | "${compose[@]}" run --rm --build --no-deps -T config-ui \
         python config_admin.py mcp-runtime-register \
           --root /control --secret-stdin >/dev/null 2>&1; then
     printf 'Could not register the MCP runtime client; MCP calls will be refused.\n' >&2
@@ -455,8 +455,14 @@ bootstrap_admin_credential() {
   admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
   # --no-deps because the database is already up and nothing else is needed;
   # without the explicit `up` above this would run with no database at all.
+  #
+  # --build because `run` does not build and `up` does. On a machine where the
+  # image already exists the difference is invisible, which is why this was
+  # only ever hit on a genuinely fresh clone: compose read `mapp-config-ui:local`
+  # as a registry reference and answered "pull access denied for
+  # mapp-config-ui", about an image this repository builds from source.
   if ! admin_output="$(printf '%s\n' "${admin_password}" \
-    | "${init_compose[@]}" run --rm --no-deps -T config-ui \
+    | "${init_compose[@]}" run --rm --build --no-deps -T config-ui \
         python config_admin.py "${admin_command}" \
           --root /control \
           --password-stdin)"; then
@@ -965,7 +971,7 @@ case "${1:-}" in
         --set ON_ERROR_STOP=1 --command "CREATE SCHEMA control"' >/dev/null
     control_test_url="postgresql://$(dotenv_value POSTGRES_USER):$(dotenv_value POSTGRES_PASSWORD)@db:5432/mapp_control_test?sslmode=disable"
     config_ui_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --no-deps \
+    if ! "${compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
       --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
@@ -989,7 +995,7 @@ case "${1:-}" in
     # statements, so a run without a database reports the double's behaviour
     # as the system's. This suite ran in no target at all until now.
     mcp_auth_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --no-deps \
+    if ! "${compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
       --env PYTHONDONTWRITEBYTECODE=1 \
@@ -1014,7 +1020,7 @@ case "${1:-}" in
     # rendered page. The skip guard applies for the same reason as the others:
     # a suite that quietly stops running is worse than one that fails.
     mapp_mcp_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --no-deps \
+    if ! "${compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app:/workspace/mapp-mcp/tests \
       --env PYTHONDONTWRITEBYTECODE=1 \
@@ -1044,7 +1050,7 @@ case "${1:-}" in
         --set ON_ERROR_STOP=1 \
         --command "DROP DATABASE IF EXISTS mapp_semantic_test" \
         --command "CREATE DATABASE mapp_semantic_test"' >/dev/null
-    "${compose[@]}" run --rm --no-deps \
+    "${compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}/semantic-service:/workspace:ro" \
       --workdir /workspace \
       --env PYTHONDONTWRITEBYTECODE=1 \
@@ -1125,12 +1131,12 @@ case "${1:-}" in
     # alone used to be enough when it was a file; on its own it would now fail
     # with no database at all.
     "${compose[@]}" up --detach --wait db >/dev/null
-    "${compose[@]}" run --rm --no-deps config-ui \
+    "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py reset-password --root /control
     ;;
   revoke-config-tokens)
     "${compose[@]}" up --detach --wait db >/dev/null
-    "${compose[@]}" run --rm --no-deps config-ui \
+    "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py revoke-tokens --root /control
     ;;
   advance-recovery-epoch)
@@ -1144,7 +1150,7 @@ case "${1:-}" in
     # application, because the whole point is to invalidate the credentials
     # before anything can accept one.
     "${compose[@]}" up --detach --wait db >/dev/null
-    "${compose[@]}" run --rm --no-deps config-ui \
+    "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py advance-recovery-epoch --root /control "${@:2}"
     ;;
   migrate-rollback)
@@ -1154,7 +1160,7 @@ case "${1:-}" in
     # time a migration is added. Arguments are forwarded verbatim -- --confirm
     # is never injected, so the unconfirmed path is the default.
     "${compose[@]}" up --detach --wait db >/dev/null
-    "${compose[@]}" run --rm --no-deps config-ui \
+    "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py migrate-rollback --root /control "${@:2}"
     ;;
   mcp-client-register|mcp-client-list|mcp-client-disable|mcp-runtime-register)
@@ -1166,7 +1172,7 @@ case "${1:-}" in
     # so there is nothing to print once and nothing to store on the operator's
     # machine. Arguments are forwarded so --redirect-uri and --scope can repeat.
     "${compose[@]}" up --detach --wait db >/dev/null
-    "${compose[@]}" run --rm --no-deps config-ui \
+    "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py "$1" --root /control "${@:2}"
     ;;
   stop)
