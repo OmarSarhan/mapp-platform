@@ -102,6 +102,36 @@ class HttpOriginTests(unittest.TestCase):
             " listens on whatever port MCP_SITE names",
         )
 
+    def test_every_development_origin_port_is_forwarded(self) -> None:
+        """A devcontainer only reaches a port it forwards.
+
+        The MCP origin moved onto its own port and nothing forwarded it, so
+        from outside the container the metadata document advertised endpoints
+        that resolved to nothing -- after sign-in and consent had already
+        succeeded. Derived from the origins rather than from the published
+        ports, because 443 is published and deliberately unused in
+        development, and demanding it would be wrong.
+        """
+        import json
+
+        template = (ROOT / ".env.example").read_text()
+        ports = set()
+        for key in ("MAP_SITE", "CONFIG_SITE", "MCP_SITE"):
+            origin = re.search(rf"^{key}=(\S+)", template, re.M).group(1)
+            authority = origin.split("//", 1)[1].split("/")[0]
+            _, _, port = authority.rpartition(":")
+            ports.add(int(port) if port.isdigit() else 80)
+
+        raw = (ROOT / ".devcontainer/devcontainer.json").read_text()
+        config = json.loads(re.sub(r"(?m)^\s*//.*$", "", raw))
+        forwarded = set(config.get("forwardPorts", []))
+        self.assertEqual(
+            set(), ports - forwarded,
+            "these ports are named by a development origin but not forwarded"
+            " by the devcontainer, so nothing outside the container can reach"
+            " them",
+        )
+
     def test_the_two_defaults_agree(self) -> None:
         """The Caddyfile default is what a deployment with no MCP_SITE gets,
         and .env.example is what every `./bin/mapp init` writes. If they

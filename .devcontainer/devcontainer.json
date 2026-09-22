@@ -26,11 +26,22 @@
   // this port is forwarded. 80 rather than a high port because the site names
   // carry no port, and an absolute URL built from one has to reach the edge.
   "forwardPorts": [
-    80
+    80,
+    8181
   ],
   "portsAttributes": {
     "80": {
       "label": "MAPP (map, and dashboard at config.localhost)",
+      "onAutoForward": "notify"
+    },
+    // The MCP origin, on its own port because an MCP client will not send
+    // credentials to an http token endpoint on anything but a literal
+    // localhost, 127.0.0.1 or ::1. Forwarded separately from 80 for the same
+    // reason it is published separately: a client outside the container
+    // follows the absolute URLs in the metadata document, and an unforwarded
+    // port means it reaches nothing after consent has already succeeded.
+    "8181": {
+      "label": "MAPP MCP (agent surface)",
       "onAutoForward": "notify"
     }
   },
