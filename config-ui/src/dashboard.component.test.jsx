@@ -88,6 +88,7 @@ describe('Scoped token administration', () => {
     }));
 
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
     fireEvent.click(await screen.findByRole('button', {
       name: 'Create scoped CLI token',
     }));
@@ -147,6 +148,7 @@ describe('Scoped token administration', () => {
     }));
 
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
     const access = await screen.findByLabelText('Token access level');
     const cliAccess = screen.getByRole('heading', {name: 'CLI access'})
       .closest('.security-section');
@@ -287,6 +289,7 @@ describe('Scoped token administration', () => {
     }));
 
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
     expect(await screen.findByText('Narrow operator')).toBeTruthy();
     expect(screen.queryByRole('heading', {
       name: 'Pending device authorizations',
@@ -360,6 +363,7 @@ describe('Scoped token administration', () => {
     }));
 
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
     const access = await screen.findByLabelText('Token access level');
     const create = screen.getByRole('button', {
       name: 'Create scoped CLI token',
@@ -423,6 +427,7 @@ describe('Scoped token administration', () => {
     }));
 
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
     const access = await screen.findByLabelText('Token access level');
     const cliAccess = screen.getByRole('heading', {name: 'CLI access'})
       .closest('.security-section');
@@ -2205,6 +2210,43 @@ describe('MCP agent client administration', () => {
     throw new Error(`Unexpected request: ${options.method || 'GET'} ${path}`);
   });
 
+  test('security navigation shows only the selected section and preserves client setup', async () => {
+    vi.stubGlobal('fetch', clientsMock());
+    const view = render(<Security close={() => {}}/>);
+    expect(screen.getByRole('heading', {name: 'Requests and approvals'})).toBeTruthy();
+    expect(screen.queryByRole('heading', {name: 'Agent access'})).toBeNull();
+    expect(screen.queryByRole('button', {name: 'Create scoped CLI token'})).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
+    expect(screen.queryByRole('heading', {name: 'Requests and approvals'})).toBeNull();
+    fireEvent.change(screen.getByRole('textbox', {name: 'MCP client name'}), {target: {value: 'My assistant'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Register MCP client'}));
+    await screen.findByText('Project .mcp.json');
+    fireEvent.click(screen.getByRole('button', {name: 'Codex', exact: true}));
+
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
+    expect(screen.getByRole('button', {name: 'Create scoped CLI token'})).toBeTruthy();
+    expect(screen.queryByRole('button', {name: 'Register MCP client'})).toBeNull();
+    fireEvent.change(screen.getByRole('textbox', {name: 'Token name'}), {target: {value: 'My CLI'}});
+
+    fireEvent.click(screen.getByRole('button', {name: 'Audit trail', exact: true}));
+    expect(screen.getByRole('heading', {name: 'Recent audit events'})).toBeTruthy();
+    expect(screen.queryByRole('heading', {name: 'CLI access'})).toBeNull();
+    expect(screen.getByRole('button', {name: 'Audit trail', exact: true}).getAttribute('aria-current')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
+    expect(screen.getByRole('textbox', {name: 'MCP client name'}).value).toBe('My assistant');
+    expect(screen.getByRole('button', {name: 'Codex', exact: true}).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('button', {name: 'Copy MCP client configuration'})).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'CLI access', exact: true}));
+    expect(screen.getByRole('textbox', {name: 'Token name'}).value).toBe('My CLI');
+
+    view.rerender(<Security close={() => {}} hash={`#approvals/${'a'.repeat(64)}`}/>);
+    expect(screen.getByRole('heading', {name: 'Requests and approvals'})).toBeTruthy();
+    expect(screen.queryByRole('heading', {name: 'CLI access'})).toBeNull();
+    expect(screen.getByRole('button', {name: 'Requests', exact: true}).getAttribute('aria-current')).toBe('true');
+  });
+
   test('the default preset is exactly what the shipped tools need', () => {
     // Not a style choice. A client registered without `derive` and
     // `semantic:inspect` connects, lists both tools and is refused on the first
@@ -2292,6 +2334,7 @@ describe('MCP agent client administration', () => {
     const fetchMock = clientsMock();
     vi.stubGlobal('fetch', fetchMock);
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
 
     fireEvent.click(await screen.findByRole('button', {name: 'Register MCP client'}));
 
@@ -2319,6 +2362,7 @@ describe('MCP agent client administration', () => {
     // treating it as one teaches an operator to guard the wrong thing.
     vi.stubGlobal('fetch', clientsMock());
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
     fireEvent.click(await screen.findByRole('button', {name: 'Register MCP client'}));
     await screen.findByText('Project .mcp.json');
     // The CLI-token panel says "Copy now - this token is shown once." Nothing
@@ -2326,6 +2370,37 @@ describe('MCP agent client administration', () => {
     expect(screen.queryByText(/shown once/i)).toBeNull();
     expect(screen.getByText(/no secret to copy/i)).toBeTruthy();
     expect(screen.queryByRole('button', {name: /Copy API token/})).toBeNull();
+  });
+
+  test('switching assistants copies the matching config and retains the issued client and permissions', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('navigator', {...navigator, clipboard: {writeText}});
+    vi.stubGlobal('fetch', clientsMock());
+    render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
+    fireEvent.click(await screen.findByRole('button', {name: 'Register MCP client'}));
+    await screen.findByText('Project .mcp.json');
+    fireEvent.click(screen.getByRole('button', {name: 'Codex', exact: true}));
+    expect(screen.getByRole('button', {name: 'Codex', exact: true}).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByText('Project .mcp.json')).toBeNull();
+    const block = screen.getByText('Project .codex/config.toml').closest('.mcp-copy-block');
+    const toml = block.querySelector('pre').textContent;
+    expect(toml).toContain('[mcp_servers.mapp]');
+    expect(toml).toContain('url = "http://mcp.localhost/mcp"');
+    expect(toml).toContain('scopes = ["mcp:connect","inspect","derive","semantic:inspect"]');
+    expect(toml).toContain('[mcp_servers.mapp.oauth]');
+    expect(toml).toContain('client_id = "mcp-NEWLYISSUED"');
+    expect(toml).toContain(`callback_url = "${mcpRedirectUris()[1]}"`);
+    expect(toml).toContain('callback_port = 8484');
+    fireEvent.click(screen.getByRole('button', {name: 'Copy MCP client configuration', exact: true}));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(toml));
+    expect(screen.getByText('codex mcp login mapp --scopes mcp:connect,inspect,derive,semantic:inspect')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'Claude', exact: true}));
+    expect(screen.queryByText('Project .codex/config.toml')).toBeNull();
+    const json = screen.getByText('Project .mcp.json').closest('.mcp-copy-block').querySelector('pre').textContent;
+    expect(JSON.parse(json).mcpServers.mapp.oauth.clientId).toBe('mcp-NEWLYISSUED');
+    fireEvent.click(screen.getByRole('button', {name: 'Copy MCP client configuration', exact: true}));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(json));
   });
 
   test('an existing agent client can be withdrawn', async () => {
@@ -2337,6 +2412,7 @@ describe('MCP agent client administration', () => {
     }]);
     vi.stubGlobal('fetch', fetchMock);
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
 
     fireEvent.click(await screen.findByRole('button', {name: 'Disable Someone’s laptop'}));
     await waitFor(() => expect(fetchMock.mock.calls.some(
@@ -2354,6 +2430,7 @@ describe('MCP agent client administration', () => {
       created: '2026-09-01T00:00:00Z', disabled: null,
     }]));
     render(<Security close={() => {}}/>);
+    fireEvent.click(screen.getByRole('button', {name: 'Agent access', exact: true}));
     await screen.findByText('MCP agent clients');
     expect(screen.queryByRole('button', {name: /Disable MAPP configuration API/})).toBeNull();
     expect(screen.getByText('No agent clients registered.')).toBeTruthy();
@@ -2440,72 +2517,55 @@ const WAITING = {
 };
 
 describe('Standing approvals', () => {
-  const POLICY = {actionClasses: ['apply', 'reload'], maxMinutes: 60,
-                  maxConsumptions: 20};
-  const GRANTS = [{grantId: 'oauth:g1', clientId: 'mcp-1',
-                   clientName: 'Claude Code'}];
-  const LIVE = {
-    id: 'w'.repeat(32), actionClass: 'apply', clientId: 'mcp-1',
-    consumed: 2, maxConsumptions: 5, live: true,
-    expires: '2026-09-21T10:00:00Z', revoked: null,
-  };
+  const CLIENTS = [{clientId: 'mcp-1', name: 'Claude Code', confidential: false}];
+  const LIVE = {id: 'w'.repeat(32), clientId: 'mcp-1', consumed: 25, live: true};
 
-  test('it says plainly that this answers on your behalf', () => {
-    // The one control here that acts without a person present. A panel that
-    // described it as a convenience would be describing the wrong thing.
-    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
-                            busy={false} open={vi.fn()} revoke={vi.fn()}/>);
-    expect(screen.getByText(/answers for you/)).toBeTruthy();
-    expect(screen.getByText(/never covers semantic or federation/)).toBeTruthy();
-  });
-
-  test('it offers only the classes the platform allows', () => {
-    // Read from the response, never restated here: a list typed into the
-    // dashboard is a second policy that drifts from the first.
-    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
-                            busy={false} open={vi.fn()} revoke={vi.fn()}/>);
-    const options = screen.getAllByRole('option').map(node => node.value);
-    expect(options).toContain('apply');
-    expect(options).toContain('reload');
-    expect(options).not.toContain('semantic-apply');
-  });
-
-  test('it cannot be opened without naming both what and who', () => {
-    const open = vi.fn();
-    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
-                            busy={false} open={open} revoke={vi.fn()}/>);
-    expect(screen.getByText('Open standing approval').disabled).toBe(true);
-    expect(open).not.toHaveBeenCalled();
-  });
-
-  test('opening one carries the bounds the operator chose', () => {
-    const open = vi.fn();
-    render(<ApprovalWindows windows={[]} policy={POLICY} grants={GRANTS}
-                            busy={false} open={open} revoke={vi.fn()}/>);
-    const [agent, covers] = screen.getAllByRole('combobox');
-    fireEvent.change(agent, {target: {value: 'oauth:g1'}});
-    fireEvent.change(covers, {target: {value: 'apply'}});
-    fireEvent.click(screen.getByText('Open standing approval'));
-    expect(open).toHaveBeenCalledWith({
-      grantId: 'oauth:g1', clientId: 'mcp-1', actionClass: 'apply',
-      minutes: 15, maxConsumptions: 5,
-    });
-  });
-
-  test('a live window shows what it has spent and can be closed now', () => {
-    const revoke = vi.fn();
-    render(<ApprovalWindows windows={[LIVE]} policy={POLICY} grants={GRANTS}
-                            busy={false} open={vi.fn()} revoke={revoke}/>);
-    expect(screen.getByText(/2 of 5 used/)).toBeTruthy();
-    fireEvent.click(screen.getByText('Close now'));
-    expect(revoke).toHaveBeenCalledWith('w'.repeat(32));
-  });
-
-  test('a closed window cannot be closed again', () => {
-    render(<ApprovalWindows windows={[{...LIVE, live: false, revoked: 'x'}]}
-                            policy={POLICY} grants={GRANTS} busy={false}
+  test('one client switch replaces the class, timer, and count controls', () => {
+    render(<ApprovalWindows windows={[]} clients={CLIENTS} busy={false}
                             open={vi.fn()} revoke={vi.fn()}/>);
-    expect(screen.queryByText('Close now')).toBeNull();
+    expect(screen.getByRole('switch', {name: 'Automatic approval for Claude Code'}).getAttribute('aria-checked')).toBe('false');
+    expect(screen.queryAllByRole('combobox')).toHaveLength(0);
+    expect(screen.queryAllByRole('spinbutton')).toHaveLength(0);
+    expect(screen.getByText(/any action its current permissions allow/)).toBeTruthy();
+    expect(screen.getByText(/no time or action limit/)).toBeTruthy();
+  });
+
+  test('enabling is bound only to the chosen client', () => {
+    const open = vi.fn();
+    render(<ApprovalWindows windows={[]} clients={CLIENTS} busy={false}
+                            open={open} revoke={vi.fn()}/>);
+    fireEvent.click(screen.getByRole('switch'));
+    expect(open).toHaveBeenCalledWith({clientId: 'mcp-1'});
+  });
+
+  test('turning off revokes the current approval', () => {
+    const revoke = vi.fn();
+    render(<ApprovalWindows windows={[LIVE]} clients={CLIENTS} busy={false}
+                            open={vi.fn()} revoke={revoke}/>);
+    expect(screen.getByRole('switch').getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByText(/25 actions approved/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('switch'));
+    expect(revoke).toHaveBeenCalledWith(LIVE.id);
+  });
+
+  test('closed approvals do not turn the switch on', () => {
+    render(<ApprovalWindows windows={[{...LIVE, live: false}]} clients={CLIENTS}
+                            busy={false} open={vi.fn()} revoke={vi.fn()}/>);
+    expect(screen.getByRole('switch').getAttribute('aria-checked')).toBe('false');
+  });
+
+  test('service clients and disabled clients cannot be enabled', () => {
+    render(<ApprovalWindows windows={[]} clients={[
+      {...CLIENTS[0], confidential: true},
+      {...CLIENTS[0], clientId: 'disabled', disabled: 'today'},
+    ]} busy={false} open={vi.fn()} revoke={vi.fn()}/>);
+    expect(screen.queryByRole('switch')).toBeNull();
+  });
+
+  test('a pending change disables the switch', () => {
+    render(<ApprovalWindows windows={[]} clients={CLIENTS} busy
+                            open={vi.fn()} revoke={vi.fn()}/>);
+    expect(screen.getByRole('switch').disabled).toBe(true);
   });
 });
 

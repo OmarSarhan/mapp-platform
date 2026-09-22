@@ -981,8 +981,35 @@ class ApprovalRouteTests(unittest.TestCase):
 
     OPERATOR_ONLY = (
         ("GET", "/api/admin/approvals"),
+        ("GET", "/api/admin/approval-windows"),
+        ("POST", "/api/admin/approval-windows"),
+        ("POST", "/api/admin/approval-windows/" + "a" * 32 + "/revoke"),
         ("POST", "/api/admin/approvals/" + "a" * 64 + "/decide"),
     )
+
+    def test_client_approval_creation_accepts_only_client_id(self):
+        import datetime as dt
+        for payload, expected in (({"clientId": "mcp-test"}, HTTPStatus.OK),
+                                  ({"clientId": "mcp-test", "minutes": 60}, HTTPStatus.BAD_REQUEST),
+                                  ({"clientId": 123}, HTTPStatus.BAD_REQUEST)):
+            responses = []
+            handler = object.__new__(app.Handler)
+            handler.path = "/api/admin/approval-windows"
+            handler._host_allowed = lambda: True
+            handler._authorized = lambda state_change=False: "admin"
+            handler._json = lambda status, body: responses.append((status, body))
+            handler._payload = lambda: dict(payload)
+            handler._cookies = lambda: {"mapp_session": "session"}
+            handler._remote = lambda: "127.0.0.1"
+            handler.client_address = ("127.0.0.1", 0)
+            with patch.object(app.CONTROL, "session_authenticated_at", return_value=dt.datetime.now(dt.UTC)), patch.object(app.CONTROL, "instance_id", return_value="instance"), patch.object(app.CONTROL, "open_approval_window", return_value={"id": "a"*32, "enabled": True}) as opened:
+                handler.do_POST()
+                self.assertEqual(expected, responses[-1][0])
+                if expected == HTTPStatus.OK:
+                    self.assertEqual("mcp-test", opened.call_args.kwargs["client_id"])
+                    self.assertNotIn("grant_id", opened.call_args.kwargs)
+                else:
+                    opened.assert_not_called()
 
     def test_the_operator_routes_are_not_allowlisted_operations(self) -> None:
         from control_api import ACTION_SCHEMAS

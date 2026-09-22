@@ -1031,6 +1031,55 @@ def _migration_10(connection: psycopg.Connection) -> None:
     )
 
 
+def _migration_11(connection: psycopg.Connection) -> None:
+    """Client approvals replace bounded windows without expanding old authority."""
+    connection.execute(sql.SQL("""
+        UPDATE {schema}.approval_windows
+           SET revoked_at = now(), revoked_reason = 'replaced by client approvals'
+         WHERE revoked_at IS NULL;
+        UPDATE {schema}.approvals
+           SET revoked_at = now(), revoked_reason = 'replaced by client approvals'
+         WHERE decided_by_window IS NOT NULL AND revoked_at IS NULL
+           AND status IN ('pending', 'approved');
+        ALTER TABLE {schema}.approval_windows
+            ADD COLUMN client_bound boolean NOT NULL DEFAULT false,
+            ALTER COLUMN grant_id DROP NOT NULL,
+            ALTER COLUMN action_class DROP NOT NULL,
+            ALTER COLUMN expires_at DROP NOT NULL,
+            ALTER COLUMN max_consumptions DROP NOT NULL,
+            ALTER COLUMN consumed TYPE bigint,
+            ADD CONSTRAINT window_scope_shape CHECK (
+                (client_bound AND grant_id IS NULL AND action_class IS NULL
+                 AND expires_at IS NULL AND max_consumptions IS NULL)
+                OR (NOT client_bound AND grant_id IS NOT NULL
+                    AND action_class IS NOT NULL AND expires_at IS NOT NULL
+                    AND max_consumptions IS NOT NULL));
+        CREATE UNIQUE INDEX approval_window_client_live_idx
+            ON {schema}.approval_windows (client_id, instance)
+            WHERE client_bound AND revoked_at IS NULL;
+    """).format(schema=sql.Identifier(SCHEMA)))
+
+
+def _rollback_11(connection: psycopg.Connection) -> None:
+    connection.execute(sql.SQL("""
+        UPDATE {schema}.approvals
+           SET revoked_at = now(), revoked_reason = 'client approvals rolled back'
+         WHERE decided_by_window IN
+               (SELECT id FROM {schema}.approval_windows WHERE client_bound)
+           AND revoked_at IS NULL AND status IN ('pending', 'approved');
+        DELETE FROM {schema}.approval_windows WHERE client_bound;
+        DROP INDEX {schema}.approval_window_client_live_idx;
+        ALTER TABLE {schema}.approval_windows
+            DROP CONSTRAINT window_scope_shape,
+            DROP COLUMN client_bound,
+            ALTER COLUMN grant_id SET NOT NULL,
+            ALTER COLUMN action_class SET NOT NULL,
+            ALTER COLUMN expires_at SET NOT NULL,
+            ALTER COLUMN max_consumptions SET NOT NULL,
+            ALTER COLUMN consumed TYPE int;
+    """).format(schema=sql.Identifier(SCHEMA)))
+
+
 def _rollback_10(connection: psycopg.Connection) -> None:
     connection.execute(
         sql.SQL(
@@ -1061,6 +1110,7 @@ MIGRATIONS = {
     8: _migration_8,
     9: _migration_9,
     10: _migration_10,
+    11: _migration_11,
 }
 
 
@@ -1077,6 +1127,8 @@ class IrreversibleMigration(RuntimeError):
 #: removes carried no state the platform could not rebuild. Nothing about a
 #: credential is ever reconstructible, so anything holding one is lossy.
 DESTRUCTIVE_ROLLBACKS = {
+    11: "client standing approvals and their receipt associations; unspent"
+        " automatic receipts are revoked before removal",
     1: "every platform credential: the administrator password, CLI tokens,"
        " sessions and device authorizations",
     2: "every OAuth record: clients, authorization codes, tokens, pending"
@@ -1248,6 +1300,7 @@ ROLLBACKS = {
     8: _rollback_8,
     9: _rollback_9,
     10: _rollback_10,
+    11: _rollback_11,
 }
 
 

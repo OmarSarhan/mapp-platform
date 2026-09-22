@@ -5,6 +5,29 @@ the separately released `mapp-config-cli`. The platform is authoritative for
 workspace structure, rules, validation, revision handling, proposals, reloads,
 and visual evidence.
 
+## MCP client standing approvals
+
+These dashboard-only routes require an administrator session; POST requests
+also require CSRF protection. They are not MCP operations or agent scopes.
+
+- `GET /api/admin/approval-windows` returns `policy: "client-until-revoked"`
+  and `windows`. Each entry contains `id`, `clientId`, `clientName`,
+  `createdBy`, `created`, `consumed` (audit count), `live`, and `revoked`.
+  All enabled entries are included even when older than one day; closed
+  entries are included for one day.
+- `POST /api/admin/approval-windows` accepts only `{ "clientId": "mcp-..." }`.
+  It enables approval for that public, enabled MCP client on this instance,
+  returning `{ "id": "...", "enabled": true }`. Repeating it while enabled
+  returns the same ID. Enabling requires authentication within 15 minutes.
+- `POST /api/admin/approval-windows/{id}/revoke` turns it off and invalidates
+  its unused automatic approval receipts. It accepts an optional `reason`.
+
+There is no expiry, action limit, grant selector or action-class selector.
+Old `grantId`, `actionClass`, `minutes`, and `maxConsumptions` request fields
+are rejected rather than ignored. Migration 11 closes existing bounded
+windows; it does not silently expand them. Every action remains subject to
+its current client/grant scopes, normal validation and a single-use receipt.
+
 ## Discovery and versioning
 
 `GET /api/public/identity` is public and returns the instance identifier,

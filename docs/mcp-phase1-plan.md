@@ -424,6 +424,9 @@ test caught an attempt to mark the dry run non-mutating without reclassifying
 
 ## Wave 8 — standing approval windows (P8)
 
+The bounded-window policy below is historical. Client-bound approvals that stay
+enabled until turned off supersede it; see [the current contract](mcp-authorization.md#standing-approvals).
+
 **Build:** time-boxed windows binding grant, client, instance and one action
 class, capped at 60 minutes and a consumption count, decremented atomically,
 revocable from the dashboard, invalidated by grant revocation and by a

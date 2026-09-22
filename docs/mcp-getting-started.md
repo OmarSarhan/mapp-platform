@@ -94,9 +94,11 @@ different port is a different origin as far as a browser is concerned.
 An agent is a **public client**: it proves itself with PKCE and holds no
 secret, so there is nothing to copy down and nothing to keep safe.
 
-The easiest route is the dashboard — **Security → MCP clients** — which offers
-the permission presets described below and hands you a ready configuration to
-paste. From a terminal:
+The easiest route is the dashboard — **Access & audit → Agent access → MCP
+agent clients**. Register a client, then choose **Claude** or **Codex** above
+the configuration to copy the appropriate format and command. Use a separate
+registration for each assistant when you want independent consent, revocation,
+and standing-approval switches. From a terminal:
 
 ```bash
 ./bin/mapp mcp-client-register --name "Claude Code" \
@@ -115,6 +117,10 @@ It prints a client ID like `mcp-NgbtAji4QKqEGrLa`.
 ---
 
 ## Step 3 — point the assistant at it
+
+Use the client ID and MCP URL from your dashboard in the examples below.
+
+### Claude Code
 
 ```bash
 claude mcp add --transport http \
@@ -148,6 +154,65 @@ Or as a project `.mcp.json`:
 > ephemeral one, and a port nobody can predict cannot be registered in advance.
 > Exact matching and dynamic ports are mutually exclusive. `8484` is what the
 > dashboard uses.
+
+Open `/mcp` in Claude Code, select `mapp`, and authenticate. Approve the project
+server if Claude asks. See [Claude Code's MCP setup guide](https://code.claude.com/docs/en/mcp)
+for configuration scopes and the browser sign-in flow.
+
+### Codex CLI
+
+Choose **Codex** in the dashboard and merge its TOML into
+`~/.codex/config.toml`, or `.codex/config.toml` in a trusted project. Keep any
+existing settings and add only one `mapp` entry. The configuration uses the
+[documented Codex OAuth fields](https://developers.openai.com/codex/config-reference):
+
+```toml
+[mcp_servers.mapp]
+url = "http://localhost:8181/mcp"
+scopes = ["mcp:connect", "inspect", "derive", "semantic:inspect"]
+
+[mcp_servers.mapp.oauth]
+client_id = "mcp-NgbtAji4QKqEGrLa"
+callback_url = "http://127.0.0.1:8484/callback"
+callback_port = 8484
+```
+
+Set both the callback URL and listener port to match the registered URI. MAPP
+advertises issuer identification, which lets Codex reuse this fixed callback.
+Use a current Codex release supporting these OAuth settings; a generated
+callback suffix or random port will not match MAPP's registration.
+[Codex callback rules](https://developers.openai.com/codex/mcp).
+
+After saving, run this from the configured project:
+
+```sh
+codex mcp login mapp --scopes mcp:connect,inspect,derive,semantic:inspect
+codex mcp list
+```
+
+The dashboard generates the scope list for your chosen permissions. Pass that
+list explicitly: MAPP's discovery metadata advertises only bootstrap scopes,
+which are insufficient for analysis tools. Complete browser consent, restart
+your Codex session, then use `/mcp` to inspect the connection.
+[Codex login command](https://developers.openai.com/codex/cli/reference).
+
+### Codex extension for VS Code
+
+Install the OpenAI Codex extension and sign in to Codex. Use the same **Codex**
+TOML above: the CLI and extension share configuration on the same host. This
+configuration belongs in `.codex/config.toml` or `~/.codex/config.toml`, not
+VS Code's `.vscode/mcp.json`.
+
+Run the generated `codex mcp login mapp --scopes ...` command in the same
+environment as the extension, so it uses the same configuration and credential
+store. In the Codex gear menu, open **MCP servers**, then **Restart extension**
+after saving. Confirm `mapp` is enabled and connected.
+[Codex IDE MCP setup](https://developers.openai.com/codex/mcp).
+
+For WSL, SSH, or a dev container, `localhost` means the environment running
+Codex. Use a reachable MCP URL and forward callback port `8484` from the browser
+machine to that environment. Complete one assistant's login at a time so both
+clients do not compete for the callback port.
 
 ---
 
@@ -249,27 +314,26 @@ permission is single-use and bound to that one relation.
 
 ## Standing approvals
 
-If approving every action becomes tiresome, you can decide once for a **class**
-of action instead. In **Security → Standing approvals**, pick an agent, pick
-what it covers, and set two limits.
+In **Security → Standing approvals**, turn on automatic approval for an MCP
+client. It can then perform any action its current permissions allow,
+including semantic administration and federation changes, until you turn it
+off. There is no time or action limit and no action-class selector.
 
-While one is open the agent stops asking for that class. It is bounded by:
+The approval is bound to that registered client and this platform instance.
+It applies across the client's consents, while every request must still have
+a live consent and sufficient scopes. Revoking a consent stops its credentials;
+a different valid consent for the same client can still use the standing
+approval. Disabling the client turns its standing approval off.
 
-- **At most 60 minutes**, and **at most 20 actions** — whichever runs out
-  first. Time alone would not be a bound.
-- **One class of action, one agent, one instance.** Not a general permission.
-- **Never semantic or federation changes.** Those always ask, whatever is open.
-- **Recent sign-in.** If you signed in more than 15 minutes ago you must sign
-  in again to open one. It borrows your authority, so the platform wants to
-  know it is you.
+If you signed in more than 15 minutes ago, sign in again to enable it. Only an
+administrator browser session can change the switch; an agent cannot enable
+its own approval. Turning it off also invalidates unused automatic approval
+receipts. A recovery-epoch advance turns it off after a restore.
 
-Close one at any time from the same panel. Revoking the agent's consent closes
-its windows in the same breath.
-
-What a standing approval does **not** change: every action still produces the
-same single-use, request-bound permission, and still records what happened.
-It replaces *who decides*, not *what is decided*. Each use is recorded against
-the window that authorised it, with how much of it was left.
+Every action still uses a single-use, request-bound receipt, passes the usual
+revision, validation and resource checks, and is audited against the client
+approval that allowed it. Existing bounded approval windows are closed during
+the upgrade; enable the new switch deliberately for each client you trust.
 
 ---
 

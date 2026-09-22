@@ -544,41 +544,31 @@ sent it.
 
 ### Standing approvals
 
-An operator can decide once for a **class** of action instead of once per
-action, from **Security → Standing approvals**. A window substitutes the
-decider and nothing else: the intent still carries the full digest, is still
-decided into an ordinary single-use receipt, and is still spent atomically. So
-a window authorises a class and never a specific replayable request, and every
-per-action invalidation applies unchanged inside a live one.
+**Security → Standing approvals** provides one switch per registered MCP
+agent client. An enabled approval covers every action the client's current
+permissions allow, including semantic administration and federation mutation.
+It remains enabled until turned off, with no expiry or action-count limit.
+The binding is the client and instance, so a new consent for the same client
+uses the same switch. The grant and registered client must both still allow
+the action; revoked consents and disabled clients cannot use it.
 
-Seven bounds:
+Enabling requires a CSRF-protected administrator session authenticated within
+15 minutes. Agents cannot change this setting. Disabling the client or
+advancing the recovery epoch closes its standing approval. Revoking a single
+consent invalidates that consent's credentials without changing the client's
+switch for other valid consents.
 
-| Bound | Value |
-| --- | --- |
-| Lifetime | at most 60 minutes |
-| Consumptions | at most 20, decremented in the statement that matches the window |
-| Covers | exactly one action class, one grant, one client, one instance |
-| May cover | `apply`, `reload`, `database-definition`, `database-refresh` only |
-| Never covers | semantic administration and federation mutation, as whole classes |
-| Opened by | a CSRF-protected POST from an administrator session authenticated within 15 minutes |
-| Closed by | the dashboard, the grant's revocation, or a recovery-epoch advance |
+Matching the client approval and creating its request-bound decision occur in
+one database transaction. Turning the switch off waits for any matching
+transaction, then invalidates unused automatic receipts in the same
+transaction as revocation. Requests already executing can finish. Each use
+is counted for audit, with no quota, and names the approving administrator,
+client, grant, operation and request digest. Single-use receipts, scopes,
+revision checks, validation and resource guards remain required.
 
-The action classes a window may cover are an *allowlist*, the opposite
-direction from the approval exemptions, because here the safe default is that
-no window may decide. `federation:retire` is why the unit is an action class
-and not a scope: it is not a scope at all, since the platform's retire action
-runs under `federation:provision`.
-
-Recency is checked at creation and deliberately not at consumption — checking
-again would make the 60-minute bound dead letter, since nothing would be
-approvable after the first 15 minutes. The timestamp is
-`control.sessions.created_at`, written when the password verifies and never
-refreshed, which closes O8 without a new column or a step-up endpoint. Its
-visible consequence: an administrator whose session is older than that must
-sign in again to open a window.
-
-Each consumption is audited individually against the window that authorised it,
-carrying its identifier, creator, expiry and how much was left.
+Control migration 11 closes existing limited windows without broadening their
+authority. Their records remain available for audit. The administrator enables
+the new client switches explicitly after upgrading.
 
 ### What requires approval
 

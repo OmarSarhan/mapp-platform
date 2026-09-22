@@ -73,6 +73,32 @@ class LadderTests(unittest.TestCase):
     def test_the_ladder_applies_every_migration_from_nothing(self) -> None:
         self.assertEqual(sorted(cs.MIGRATIONS), cs.migrate(self.connection))
 
+    def test_client_approval_migration_closes_and_preserves_old_windows(self):
+        cs.migrate(self.connection)
+        cs.rollback(self.connection, 10, accept_data_loss=True)
+        self.connection.execute(
+            "INSERT INTO control.approval_windows"
+            " (id, grant_id, client_id, instance, action_class, created_by,"
+            " creator_auth_time, created_at, expires_at, max_consumptions)"
+            " VALUES ('old', 'grant', 'client', 'instance', 'apply', 'admin',"
+            " now(), now(), now() + interval '1 hour', 5)"
+        )
+        self.assertEqual([11], cs.migrate(self.connection))
+        row = self.connection.execute("SELECT * FROM control.approval_windows WHERE id = 'old'").fetchone()
+        self.assertIsNotNone(row["revoked_at"])
+        self.assertFalse(row["client_bound"])
+        self.assertEqual("apply", row["action_class"])
+        self.assertEqual(5, row["max_consumptions"])
+        self.connection.execute(
+            "INSERT INTO control.approval_windows"
+            " (id, client_id, instance, client_bound, created_by, creator_auth_time, created_at)"
+            " VALUES ('new', 'client', 'instance', true, 'admin', now(), now())"
+        )
+        cs.rollback(self.connection, 10, accept_data_loss=True)
+        rows = self.connection.execute("SELECT id FROM control.approval_windows").fetchall()
+        self.assertEqual([{"id": "old"}], rows)
+        self.assertEqual([11], cs.migrate(self.connection))
+
     def test_the_ladder_is_idempotent(self) -> None:
         cs.migrate(self.connection)
         self.assertEqual([], cs.migrate(self.connection))

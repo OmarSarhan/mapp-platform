@@ -292,6 +292,28 @@ function Preview({layer,table}) { const normal=layer.style?.default||{},highligh
 function SearchField({label,value,onChange,placeholder}){
  return <label className="search-field"><span className="sr-only">{label}</span><Search size={16} aria-hidden="true"/><input aria-label={label} type="search" placeholder={placeholder} value={value} onChange={onChange}/></label>;
 }
+function PrimaryNavigation({children}){
+ const ref=useRef(null);
+ useEffect(()=>{
+  const nav=ref.current;
+  let active=true;
+  const fit=()=>{
+   if(!active)return;
+   // Measure the full labels even when the previous layout hid them, so
+   // expanding the available space restores them without a resize loop.
+   nav.classList.remove('icons-only');
+   const overflow=nav.scrollWidth>nav.clientWidth||[...nav.children].some(button=>button.scrollWidth>button.clientWidth);
+   nav.classList.toggle('icons-only',overflow);
+  };
+  const observer=typeof ResizeObserver==='undefined'?null:new ResizeObserver(fit);
+  observer?.observe(nav);
+  fit();
+  document.fonts?.ready.then(fit);
+  return()=>{active=false;observer?.disconnect()};
+ },[]);
+ return <nav ref={ref} className="primary-nav" aria-label="Platform areas">{children}</nav>;
+}
+
 export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null}){
  const [ws,setWs]=useState(null),[rev,setRev]=useState(),[catalog,setCatalog]=useState([]),[databases,setDatabases]=useState([]),[icons,setIcons]=useState([]),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[derivedUpdate,setDerivedUpdate]=useState(null);
  const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving';
@@ -323,14 +345,15 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
     <span className="brand-mark" aria-hidden="true">M</span>
     <span><strong>MAPP</strong><small>Platform console</small></span>
    </button>
-   <nav className="primary-nav" aria-label="Platform areas">
-    <button className="active" aria-current="page" disabled={busy} onClick={()=>{setSelected();setSidebarMode('layers')}}><Layers3 size={17} aria-hidden="true"/><span>Workspace</span></button>
-    <button disabled={busy} onClick={()=>openDerivedLayers?.({})}><Waypoints size={17} aria-hidden="true"/><span>Derived layers</span></button>
-    <button disabled={busy} onClick={openSemantic}><Database size={17} aria-hidden="true"/><span>Semantic catalog</span></button>
-    <button disabled={busy} onClick={openFederation}><Database size={17} aria-hidden="true"/><span>Federated sources</span></button>
-    <button disabled={busy} onClick={openSecurity}><ShieldCheck size={17} aria-hidden="true"/><span>Access &amp; audit</span></button>
-   </nav>
+   <PrimaryNavigation>
+    <button className="active" aria-current="page" aria-label="Workspace" title="Workspace" disabled={busy} onClick={()=>{setSelected();setSidebarMode('layers')}}><Layers3 size={17} aria-hidden="true"/><span>Workspace</span></button>
+    <button aria-label="Derived layers" title="Derived layers" disabled={busy} onClick={()=>openDerivedLayers?.({})}><Waypoints size={17} aria-hidden="true"/><span>Derived layers</span></button>
+    <button aria-label="Semantic catalog" title="Semantic catalog" disabled={busy} onClick={openSemantic}><Database size={17} aria-hidden="true"/><span>Semantic catalog</span></button>
+    <button aria-label="Federated sources" title="Federated sources" disabled={busy} onClick={openFederation}><Database size={17} aria-hidden="true"/><span>Federated sources</span></button>
+    <button aria-label="Access & audit" title="Access & audit" disabled={busy} onClick={openSecurity}><ShieldCheck size={17} aria-hidden="true"/><span>Access &amp; audit</span></button>
+   </PrimaryNavigation>
    <div className="account-actions">
+    <button type="button" className="header-reload" aria-label="Reload config" title="Reload saved configuration" disabled={busy} onClick={()=>load()}><RefreshCw size={17} aria-hidden="true"/><span>{activity==='loading'?'Reloading…':'Reload config'}</span></button>
     <span className={`save-state ${dirty?'dirty':'saved'}`}><span aria-hidden="true"></span>{activityText}</span>
     <button disabled={busy} className="icon-button inverse" aria-label="Logout" title="Logout" onClick={onLogout}><LogOut size={18} aria-hidden="true"/></button>
    </div>
@@ -645,6 +668,24 @@ export function mcpClientConfig({mcpUrl,clientId,scopes,port=MCP_CALLBACK_PORT,n
 export const mcpClientCommand=({mcpUrl,clientId,port=MCP_CALLBACK_PORT,name='mapp'})=>
  `claude mcp add --transport http --client-id ${clientId} --callback-port ${port} ${name} ${mcpUrl}`;
 
+export function mcpCodexConfig({mcpUrl,clientId,scopes,port=MCP_CALLBACK_PORT}){
+ return `[mcp_servers.mapp]\nurl = ${JSON.stringify(mcpUrl)}\nscopes = ${JSON.stringify(scopes)}\n\n[mcp_servers.mapp.oauth]\nclient_id = ${JSON.stringify(clientId)}\ncallback_url = "http://127.0.0.1:${port}/callback"\ncallback_port = ${port}`;
+}
+
+function McpClientSetup({mcpUrl,clientId,scopes}){
+ const [format,setFormat]=useState('claude');
+ const codex=format==='codex',config={mcpUrl,clientId,scopes};
+ return <>
+  <div className="mcp-format-selector" role="group" aria-label="MCP configuration format">
+   <button type="button" aria-pressed={!codex} onClick={()=>setFormat('claude')}>Claude</button>
+   <button type="button" aria-pressed={codex} onClick={()=>setFormat('codex')}>Codex</button>
+  </div>
+  <p className="muted">{codex?'Merge this into .codex/config.toml in a trusted project, or ~/.codex/config.toml for all projects. Codex CLI and the Codex VS Code extension share this configuration. Then run the login command in the same environment as Codex.':'Merge this into your project’s .mcp.json for Claude Code, or use the command below. Open /mcp in Claude Code to sign in.'}</p>
+  <CopyBlock key={`${format}-config`} label={codex?'Project .codex/config.toml':'Project .mcp.json'} ariaLabel="MCP client configuration" value={codex?mcpCodexConfig(config):mcpClientConfig(config)}/>
+  <CopyBlock key={`${format}-command`} label={codex?'After saving, sign in':'Or one command'} ariaLabel="MCP client command" value={codex?`codex mcp login mapp --scopes ${scopes.join(',')}`:mcpClientCommand(config)}/>
+ </>;
+}
+
 function CopyBlock({label,value,ariaLabel}){
  const [copied,setCopied]=useState(false),timer=useRef(null);
  useEffect(()=>()=>clearTimeout(timer.current),[]);
@@ -716,26 +757,19 @@ export function referencedApproval(hash){
  return match?match[1]:null;
 }
 
-export function ApprovalWindows({windows,policy,grants,busy,open,revoke}){
+export function ApprovalWindows({windows,clients,busy,open,revoke}){
+ const agents=clients.filter(client=>!client.confidential&&!client.disabled);
  const live=windows.filter(item=>item.live);
- const [grant,setGrant]=useState(''),[actionClass,setActionClass]=useState(''),[minutes,setMinutes]=useState('15'),[count,setCount]=useState('5');
- const classes=policy.actionClasses||[];
- const choosable=grants.filter(item=>!item.revoked);
  return <><h3>Standing approvals {live.length>0&&<span className="approval-count">{live.length}</span>}</h3>
-  <p className="muted">A standing approval answers for you. While one is open, the agent it names can perform one kind of action without asking each time -- bounded by a clock and by a count, whichever runs out first. It never covers semantic or federation changes: those always ask. Opening one borrows your authority, so you must have signed in recently.</p>
-  {choosable.length===0&&<p className="muted">No agent consent to open one against.</p>}
-  {choosable.length>0&&<div className="window-open">
-   <label>Agent<select value={grant} onChange={event=>setGrant(event.target.value)}><option value="">Choose a consent…</option>{choosable.map(item=><option key={item.grantId} value={item.grantId}>{item.clientName||item.clientId} — {item.grantId}</option>)}</select></label>
-   <label>May do<select value={actionClass} onChange={event=>setActionClass(event.target.value)}><option value="">Choose what it covers…</option>{classes.map(name=><option key={name} value={name}>{name}</option>)}</select></label>
-   <label>For<input type="number" min="1" max={policy.maxMinutes||60} value={minutes} onChange={event=>setMinutes(event.target.value)}/> minutes</label>
-   <label>Up to<input type="number" min="1" max={policy.maxConsumptions||20} value={count} onChange={event=>setCount(event.target.value)}/> actions</label>
-   <button disabled={busy||!grant||!actionClass} onClick={()=>open({grantId:grant,clientId:(choosable.find(item=>item.grantId===grant)||{}).clientId,actionClass,minutes:Number(minutes),maxConsumptions:Number(count)})}>Open standing approval</button>
-  </div>}
-  {windows.length>0&&<ul className="window-list">{windows.map(item=><li key={item.id} className={item.live?'window-live':'window-closed'}>
-   <strong>{item.actionClass}</strong> <span className="muted">for {item.clientId}</span>
-   <small>{item.consumed} of {item.maxConsumptions} used · {item.live?`open until ${item.expires}`:(item.revoked?'closed':'finished')}</small>
-   {item.live&&<button className="danger" disabled={busy} onClick={()=>revoke(item.id)}>Close now</button>}
-  </li>)}</ul>}
+  <p className="muted">Turn on automatic approval for an MCP client to let it perform any action its current permissions allow, including semantic and federation changes. It stays on until you turn it off, with no time or action limit. Enabling requires a sign-in within the last 15 minutes.</p>
+  {agents.length===0&&<p className="muted">Register an MCP agent client to enable standing approval.</p>}
+  {agents.map(client=>{
+   const approval=live.find(item=>item.clientId===client.clientId);
+   return <div className="token-row permission-row" key={client.clientId}>
+    <div className="permission-info"><strong>{client.name}</strong><small>{client.clientId} · {approval?`On · ${approval.consumed} actions approved`:'Off · asks before each action requiring approval'}</small></div>
+    <button type="button" role="switch" aria-checked={Boolean(approval)} aria-label={`Automatic approval for ${client.name}`} disabled={busy} onClick={()=>approval?revoke(approval.id):open({clientId:client.clientId})}>{approval?'Turn off':'Turn on'}</button>
+   </div>;
+  })}
  </>;
 }
 
@@ -781,7 +815,7 @@ export function McpClients({clients,mcpUrl,busy,register,disable}){
    <p className="muted">Callback: {mcpRedirectUris().join(' and ')} — both spellings, because redirect URIs are matched byte for byte.</p>
    <button disabled={busy||!name.trim()||scopes.length===0} onClick={create}>{busy?'Registering…':'Register MCP client'}</button>
   </div>
-  {issued&&<div className="mcp-issued"><p><strong>Registered {issued.clientId}.</strong> There is no secret to copy: an agent is a public client and proves itself with PKCE. Send the person either of these.</p><CopyBlock label="Project .mcp.json" ariaLabel="MCP client configuration" value={mcpClientConfig({mcpUrl,clientId:issued.clientId,scopes:issued.scopes})}/><CopyBlock label="Or one command" ariaLabel="MCP client command" value={mcpClientCommand({mcpUrl,clientId:issued.clientId})}/></div>}
+  {issued&&<div className="mcp-issued"><p><strong>Registered {issued.clientId}.</strong> There is no secret to copy: an agent is a public client and proves itself with PKCE. Choose the assistant to see its setup.</p><McpClientSetup mcpUrl={mcpUrl} clientId={issued.clientId} scopes={issued.scopes}/></div>}
   {agents.map(client=><McpClient key={client.clientId} client={client} busy={busy} disable={disable}/>)}
   {agents.length===0&&<p className="muted">No agent clients registered.</p>}
  </>;
@@ -798,10 +832,14 @@ function ApiToken({token,busy,revoke}){
  return <div className="token-row permission-row"><div className="permission-info"><strong>{token.name}</strong><small>{token.id} · expires {token.expires||'never'} · last used {token.lastUsed||'never'}{token.revoked?' · revoked':''}</small><details className="permission-details"><summary>Granted permission{granted.length===1?'':'s'} ({granted.length})</summary><p className="muted">This token carries the exact stored permission set below.</p><div className="token-scope-grid">{granted.map(({id,scope})=><label className={`token-scope${scope?'':' unsupported'}`} key={id}><input type="checkbox" checked disabled/><span><strong>{scope?.label||'Unknown token permission'}</strong><small>{id} · {scope?.help||'This dashboard does not recognize this stored permission.'}</small></span></label>)}</div></details></div>{!token.revoked&&<button disabled={busy} className="danger" onClick={()=>revoke(token.id)}>Revoke</button>}</div>;
 }
 export function Security({close,hash}){
+ const [section,setSection]=useState('requests');
+ const contentRef=useRef(null);
+ useEffect(()=>{if(referencedApproval(hash))setSection('requests')},[hash]);
+ useEffect(()=>{if(contentRef.current)contentRef.current.scrollTop=0},[section]);
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
- const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[windows,setWindows]=useState([]),[windowPolicy,setWindowPolicy]=useState({}),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[windows,setWindows]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a,c,g,p,w]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals'),api('/api/admin/approval-windows')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals);setWindows(w.windows||[]);setWindowPolicy({actionClasses:w.actionClasses,maxMinutes:w.maxMinutes,maxConsumptions:w.maxConsumptions})};
+ const load=async()=>{const [t,d,a,c,g,p,w]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals'),api('/api/admin/approval-windows')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals);setWindows(w.windows||[])};
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
@@ -821,30 +859,30 @@ export function Security({close,hash}){
  const visibleScopes=scopes.includes('full')?ALL_NARROW_TOKEN_SCOPES:scopes;
  const selectedScopesLabel=scopes.includes('full')?'full (all bearer-token workspace and semantic scopes)':(scopes.join(', ')||'none');
  const pendingDevices=devices.filter(device=>device.status==='pending');
- const jumpTo=id=>document.getElementById(id)?.scrollIntoView({block:'start',behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
+ const sectionButton=id=>({'aria-label':{requests:'Requests',agents:'Agent access',cli:'CLI access',audit:'Audit trail'}[id],'aria-controls':`security-${id}`,'aria-current':section===id?'true':undefined,className:section===id?'active':undefined,onClick:()=>setSection(id)});
  return <div className="modal-backdrop"><section className="panel security-panel access-panel" role="dialog" aria-modal="true" aria-labelledby="access-title">
   <div className="form-head security-header"><div><span className="eyebrow">Administration</span><h2 id="access-title">Access and audit</h2><p>Review agent requests, manage credentials, and follow the authorization trail.</p></div><button autoFocus className="icon-button" aria-label="Close" title="Close" onClick={close}><X size={19} aria-hidden="true"/></button></div>
   {error&&<div className="expression-result error">{error}</div>}
   <div className="security-layout">
    <nav className="security-nav" aria-label="Access and audit sections">
-    <button onClick={()=>jumpTo('security-requests')}><ShieldCheck size={18} aria-hidden="true"/><span>Requests<small>{approvals.length+pendingDevices.length} waiting</small></span>{approvals.length+pendingDevices.length>0&&<strong>{approvals.length+pendingDevices.length}</strong>}</button>
-    <button onClick={()=>jumpTo('security-agents')}><Bot size={18} aria-hidden="true"/><span>Agent access<small>{clients.filter(client=>!client.confidential&&!client.disabled).length} clients · {grants.filter(grant=>!grant.revoked).length} consents</small></span></button>
-    <button onClick={()=>jumpTo('security-cli')}><KeyRound size={18} aria-hidden="true"/><span>CLI access<small>{tokens.filter(token=>!token.revoked).length} active tokens</small></span></button>
-    <button onClick={()=>jumpTo('security-audit')}><FileClock size={18} aria-hidden="true"/><span>Audit trail<small>{audit.length} recent events</small></span></button>
+    <button {...sectionButton('requests')}><ShieldCheck size={18} aria-hidden="true"/><span>Requests<small>{approvals.length+pendingDevices.length} waiting</small></span>{approvals.length+pendingDevices.length>0&&<strong>{approvals.length+pendingDevices.length}</strong>}</button>
+    <button {...sectionButton('agents')}><Bot size={18} aria-hidden="true"/><span>Agent access<small>{clients.filter(client=>!client.confidential&&!client.disabled).length} clients · {grants.filter(grant=>!grant.revoked).length} consents</small></span></button>
+    <button {...sectionButton('cli')}><KeyRound size={18} aria-hidden="true"/><span>CLI access<small>{tokens.filter(token=>!token.revoked).length} active tokens</small></span></button>
+    <button {...sectionButton('audit')}><FileClock size={18} aria-hidden="true"/><span>Audit trail<small>{audit.length} recent events</small></span></button>
    </nav>
-   <div className="security-content">
-    <section id="security-requests" className="security-section">
-     <div className="security-section-head"><span className="section-index">01</span><div><h2>Requests and approvals</h2><p>Time-bound decisions that need an administrator.</p></div></div>
+   <div ref={contentRef} className="security-content">
+    <section id="security-requests" className="security-section" hidden={section!=='requests'}>
+     <div className="security-section-head"><span className="section-index">01</span><div><h2>Requests and approvals</h2><p>Review individual requests or enable automatic approval for a client.</p></div></div>
      {pendingDevices.length>0&&<><h3>Pending device authorizations</h3>{pendingDevices.map(device=><DeviceAuthorization key={device.userCode} device={device} busy={busy} approve={approve}/>)}</>}
      <Approvals approvals={approvals} busy={busy} decide={decideApproval} reload={()=>load().catch(reason=>setError(reason.message))} hash={hash}/>
-     <ApprovalWindows windows={windows} policy={windowPolicy} grants={grants} busy={busy} open={openWindow} revoke={revokeWindow}/>
+     <ApprovalWindows windows={windows} clients={clients} busy={busy} open={openWindow} revoke={revokeWindow}/>
     </section>
-    <section id="security-agents" className="security-section">
+    <section id="security-agents" className="security-section" hidden={section!=='agents'}>
      <div className="security-section-head"><span className="section-index">02</span><div><h2>Agent access</h2><p>Registration permits an OAuth request; consent decides what the agent may do.</p></div></div>
      <McpClients clients={clients} mcpUrl={mcpUrl} busy={busy} register={registerClient} disable={disableClient}/>
      <McpGrants grants={grants} busy={busy} revoke={revokeGrant}/>
     </section>
-    <section id="security-cli" className="security-section">
+    <section id="security-cli" className="security-section" hidden={section!=='cli'}>
      <div className="security-section-head"><span className="section-index">03</span><div><h2>CLI access</h2><p>Issue revocable bearer tokens with explicit scope and lifetime.</p></div></div>
      <h3>Provision CLI token</h3>
      <div className="token-provision">
@@ -862,7 +900,7 @@ export function Security({close,hash}){
      {tokens.map(token=><ApiToken key={token.id} token={token} busy={busy} revoke={revoke}/>)}
      {tokens.length===0&&<p className="muted">No CLI tokens have been issued.</p>}
     </section>
-    <section id="security-audit" className="security-section">
+    <section id="security-audit" className="security-section" hidden={section!=='audit'}>
      <div className="security-section-head"><span className="section-index">04</span><div><h2>Audit trail</h2><p>Most recent administrative events, newest first.</p></div></div>
      <h3>Recent audit events</h3><pre className="audit-log">{audit.slice(-40).reverse().map(event=>`${event.time} ${event.event} ${event.actor}`).join('\n')||'No audit events yet.'}</pre>
     </section>

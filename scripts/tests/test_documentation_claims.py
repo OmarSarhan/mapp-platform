@@ -189,16 +189,10 @@ class GuideClaimTests(unittest.TestCase):
                     rows[label],
                 )
 
-    def test_the_window_bounds_are_the_enforced_ones(self) -> None:
+    def test_client_approval_policy_and_sign_in_recency_are_documented(self) -> None:
         from control_plane import ControlStore
-
-        self.assertIn(
-            f"At most {int(ControlStore.WINDOW_MAX_LIFETIME.total_seconds() // 60)}"
-            " minutes", self.text,
-        )
-        self.assertIn(
-            f"at most {ControlStore.WINDOW_MAX_CONSUMPTIONS} actions", self.text
-        )
+        self.assertIn("no time or action limit", self.text)
+        self.assertIn("until you turn it", self.text)
         self.assertIn(
             f"more than {int(ControlStore.WINDOW_RECENCY.total_seconds() // 60)}"
             " minutes ago", self.text,
@@ -249,12 +243,11 @@ class GuideClaimTests(unittest.TestCase):
             with self.subTest(scope=scope):
                 self.assertIn(f"`{scope}`", self.text)
 
-    def test_the_windowable_exclusion_is_stated(self) -> None:
-        from control_plane import WINDOWABLE_ACTION_CLASSES
-
-        for excluded in ("semantic-apply", "federation-provision"):
-            self.assertNotIn(excluded, WINDOWABLE_ACTION_CLASSES)
-        self.assertIn("Never semantic or federation changes", self.text)
+    def test_semantic_and_federation_actions_are_covered(self) -> None:
+        from control_api import windowable
+        self.assertTrue(windowable("semantic.proposals.apply"))
+        self.assertTrue(windowable("federation.aliases.provision"))
+        self.assertIn("including semantic administration and federation changes", self.text)
 
     def test_the_opt_in_variable_is_described_as_the_code_reads_it(
         self,
@@ -310,14 +303,9 @@ class ReferenceClaimTests(unittest.TestCase):
         self.assertIn("| `POST` | `/mcp` |", self.text)
         self.assertNotIn("is not published at all", self.text)
 
-    def test_the_window_bounds_agree_with_the_guide(self) -> None:
-        from control_plane import ControlStore
-
-        self.assertIn(
-            str(int(ControlStore.WINDOW_MAX_LIFETIME.total_seconds() // 60)),
-            self.text,
-        )
-        self.assertIn(str(ControlStore.WINDOW_MAX_CONSUMPTIONS), self.text)
+    def test_client_approval_policy_agrees_with_the_guide(self) -> None:
+        self.assertIn("no expiry or action-count limit", self.text)
+        self.assertIn("client and instance", self.text)
 
 
 if __name__ == "__main__":

@@ -272,11 +272,12 @@ the premise rather than assuming it. mapp-mcp treats a lost response as unknown
 and re-reads state; it must never re-send a consequential effect. Phase 1 owes
 the unambiguous proposal state that makes that decidable.
 
-**O19 is resolved as "the flag is required."** Without a per-action eligibility
-flag, adding an action to the manifest could silently fall inside an existing
-standing-approval window, so a new high-risk action would inherit an approval
-nobody gave it. The flag makes a window fail closed on anything it does not
-name. Publication lands in Contract 1.7.
+**O19's original per-action eligibility flag is superseded.** Standing
+approvals now bind to an MCP client and instance and remain enabled until
+turned off. They cover every action allowed by the client's current scopes;
+there is no separate action-class eligibility policy. Control migration 11
+closes old limited windows without expanding them. The current behavior is
+specified in [Standing approvals](../mcp-authorization.md#standing-approvals).
 
 **Contract 1.7 stays closed until after Phase 0**, by decision. Only
 `mcp:connect` is a genuinely new scope — `apply`, `derive`,

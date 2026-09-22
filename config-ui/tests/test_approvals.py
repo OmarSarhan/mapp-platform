@@ -388,290 +388,188 @@ class ApprovalTests(ControlStoreTestCase):
 
 
 class ApprovalWindowTests(ControlStoreTestCase):
-    """P8's standing windows: the same receipt, decided without prompting.
+    """Client-bound approval, durable until explicitly turned off."""
 
-    The governing sentence is "a window substitutes the decider, never the
-    receipt", so most of what matters here is what does *not* change -- the
-    digest binding, the single use, the atomic spend. What is new is the
-    seven bounds, and each one is a way this could authorise more than
-    somebody meant.
-    """
-
-    def store(self) -> ControlStore:
+    def store(self):
         directory = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, directory, True)
         store = ControlStore(Path(directory))
         store.initialize("correct horse battery staple")
+        self.client_id = store.register_oauth_client(
+            name="Agent", redirect_uris=["http://localhost:8484/callback"],
+            scopes=["mcp:connect", "apply", "reload", "semantic:apply",
+                    "federation:provision", "derive:manage"],
+        )
+        self.add_grant(store, "oauth:grant-1")
         return store
 
+    def add_grant(self, store, grant_id):
+        with store._db() as connection:
+            connection.execute(
+                "INSERT INTO control.oauth_grants (grant_id, client_id, subject, scopes)"
+                " SELECT %s, client_id, 'admin', scopes FROM control.oauth_clients"
+                " WHERE client_id = %s", (grant_id, self.client_id),
+            )
+
     def window(self, store, **over):
-        fields = {
-            "grant_id": "oauth:grant-1",
-            "client_id": "mcp-1",
-            "instance": "instance-under-test",
-            "action_class": "apply",
-            "created_by": "admin",
-            "session_created_at": dt.datetime.now(dt.UTC),
-            "minutes": 30,
-            "max_consumptions": 3,
-        }
+        fields = dict(client_id=self.client_id, instance="instance-under-test",
+                      created_by="admin", session_created_at=dt.datetime.now(dt.UTC))
         fields.update(over)
         return store.open_approval_window(**fields)
 
     def request(self, store, **over):
-        fields = {
-            "grant_id": "oauth:grant-1",
-            "client_id": "mcp-1",
-            "instance": "instance-under-test",
-            "operation_id": "proposals.apply",
-            "tool": "proposals_apply",
-            "request_digest": DIGEST,
-            "risk": "apply",
-            "scopes": ["apply"],
-            "packet": {"summary": "Rename a layer"},
-        }
+        fields = dict(grant_id="oauth:grant-1", client_id=self.client_id,
+                      instance="instance-under-test", operation_id="proposals.apply",
+                      tool="proposals_apply", request_digest=DIGEST, risk="apply",
+                      scopes=["apply"], packet={"summary": "Rename a layer"})
         fields.update(over)
         return store.create_approval(**fields)
 
-    # -- what a window may cover --------------------------------------------
-
-    def test_a_window_cannot_cover_semantic_administration(self) -> None:
-        """Excluded as a class, not as a scope. Every action class in it needs
-        a per-action decision, always."""
+    def test_every_permitted_action_class_can_be_approved(self):
         store = self.store()
-        with self.assertRaises(ValueError):
-            self.window(store, action_class="semantic-apply")
+        self.window(store)
+        for risk, scope in (("apply", "apply"), ("reload", "reload"),
+                            ("database-definition", "derive:manage"),
+                            ("semantic-apply", "semantic:apply"),
+                            ("federation-provision", "federation:provision")):
+            with self.subTest(risk=risk):
+                self.assertTrue(self.request(store, risk=risk, scopes=[scope])["decided"])
 
-    def test_a_window_cannot_cover_federation_mutation(self) -> None:
+    def test_stays_enabled_beyond_old_time_and_count_limits(self):
         store = self.store()
-        for action_class in ("federation-provision", "federation-register",
-                             "federation-observe"):
-            with self.subTest(action_class=action_class):
-                with self.assertRaises(ValueError):
-                    self.window(store, action_class=action_class)
-
-    def test_a_window_cannot_cover_a_class_nobody_has_considered(self) -> None:
-        """The allowlist is the opposite direction from the approval exemption
-        list, so a new action class is un-windowable by default."""
-        store = self.store()
-        with self.assertRaises(ValueError):
-            self.window(store, action_class="something-invented")
-
-    # -- the bounds ---------------------------------------------------------
-
-    def test_a_window_cannot_outlast_an_hour(self) -> None:
-        store = self.store()
-        with self.assertRaises(ValueError):
-            self.window(store, minutes=61)
-
-    def test_a_window_cannot_authorise_more_than_the_cap(self) -> None:
-        """Time alone is not a bound: at the specification's rates an hour
-        would auto-approve roughly three hundred mutations."""
-        store = self.store()
-        with self.assertRaises(ValueError):
-            self.window(store, max_consumptions=21)
-
-    def test_a_stale_session_cannot_open_one(self) -> None:
-        """Recency is checked here and nowhere else. A window borrows the
-        creator's authority, so the platform wants a recent authentication
-        rather than a long-lived session."""
-        store = self.store()
-        stale = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=16)
-        with self.assertRaises(ValueError) as raised:
-            self.window(store, session_created_at=stale)
-        self.assertIn("Sign in again", str(raised.exception))
-
-    def test_recency_is_not_rechecked_at_consumption(self) -> None:
-        """Deliberate, and the reason is arithmetic: re-checking would make
-        the sixty-minute bound dead letter, since nothing would be approvable
-        after the first fifteen."""
-        store = self.store()
-        self.window(store, minutes=60)
+        self.window(store)
         with store._db() as connection:
-            connection.execute(
-                "UPDATE control.approval_windows SET creator_auth_time = %s,"
-                " created_at = %s",
-                (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=50),
-                 dt.datetime.now(dt.UTC) - dt.timedelta(minutes=50)),
-            )
-        self.assertTrue(self.request(store)["decided"])
+            connection.execute("UPDATE control.approval_windows SET created_at = now() - interval '30 days', creator_auth_time = now() - interval '30 days', consumed = 200")
+        for _ in range(3):
+            self.assertTrue(self.request(store)["decided"])
+        row, = store.list_approval_windows()
+        self.assertTrue(row["live"])
+        self.assertEqual(203, row["consumed"])
+        self.assertIsNone(row["expires_at"])
+        self.assertIsNone(row["max_consumptions"])
 
-    # -- consumption --------------------------------------------------------
+    def test_new_consent_for_same_client_uses_existing_approval(self):
+        store = self.store()
+        self.window(store)
+        self.add_grant(store, "oauth:new-consent")
+        store.revoke_oauth_grant("oauth:grant-1")
+        self.assertFalse(self.request(store)["decided"])
+        self.assertTrue(self.request(store, grant_id="oauth:new-consent")["decided"])
 
-    def test_an_intent_inside_a_window_is_decided_on_arrival(self) -> None:
+    def test_other_clients_instances_and_forged_grants_are_not_approved(self):
+        store = self.store()
+        self.window(store)
+        for overrides in ({"client_id": "another-client"},
+                          {"instance": "another-instance"},
+                          {"grant_id": "oauth:missing"}):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self.request(store, **overrides)["decided"])
+
+    def test_client_and_grant_scopes_still_limit_access(self):
+        store = self.store()
+        self.window(store)
+        self.assertFalse(self.request(store, scopes=["semantic:admin"])["decided"])
+        with store._db() as connection:
+            connection.execute("UPDATE control.oauth_grants SET scopes = '{reload}'")
+        self.assertFalse(self.request(store)["decided"])
+        with store._db() as connection:
+            connection.execute("UPDATE control.oauth_grants SET scopes = '{apply}'")
+            connection.execute("UPDATE control.oauth_clients SET scopes = '{reload}' WHERE client_id = %s", (self.client_id,))
+        self.assertFalse(self.request(store)["decided"])
+
+    def test_enable_requires_enabled_agent_client_and_recent_session(self):
+        store = self.store()
+        with self.assertRaises(ValueError):
+            self.window(store, client_id="missing")
+        with self.assertRaises(ValueError):
+            self.window(store, session_created_at=dt.datetime.now(dt.UTC)-dt.timedelta(minutes=16))
+        with store._db() as connection:
+            connection.execute("UPDATE control.oauth_clients SET token_endpoint_auth_method = 'client_secret_post' WHERE client_id = %s", (self.client_id,))
+        with self.assertRaises(ValueError):
+            self.window(store)
+        with store._db() as connection:
+            connection.execute("UPDATE control.oauth_clients SET token_endpoint_auth_method = 'none' WHERE client_id = %s", (self.client_id,))
+        store.disable_oauth_client(self.client_id)
+        with self.assertRaises(ValueError):
+            self.window(store)
+
+    def test_enable_is_idempotent_and_parallel_requests_all_use_it(self):
+        from concurrent.futures import ThreadPoolExecutor
+        store = self.store()
+        first = self.window(store)
+        self.assertEqual(first, self.window(store))
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: self.request(store), range(8)))
+        self.assertTrue(all(result["decided"] for result in results))
+        row, = store.list_approval_windows()
+        self.assertEqual(8, row["consumed"])
+
+    def test_turn_off_revokes_unclaimed_and_claimed_receipts(self):
         store = self.store()
         opened = self.window(store)
-        created = self.request(store)
-        self.assertTrue(created["decided"])
-        self.assertEqual(opened["id"], created["window"])
-        record = store.read_approval(created["handle"])
-        self.assertEqual("approved", record["status"])
-        self.assertEqual("admin", record["decided_by"])
+        unclaimed = self.request(store)
+        claimed = self.request(store)
+        receipt = store.claim_receipt(claimed["handle"])
+        self.assertTrue(store.revoke_approval_window(opened["id"], "off"))
+        self.assertFalse(store.revoke_approval_window(opened["id"], "again"))
+        self.assertIsNone(store.claim_receipt(unclaimed["handle"]))
+        self.assertIsNone(store.redeem_receipt(receipt, request_digest=DIGEST))
+        self.assertFalse(self.request(store)["decided"])
+        self.assertFalse(store.list_approval_windows()[0]["live"])
+        self.assertNotEqual(opened["id"], self.window(store)["id"])
 
-    def test_the_receipt_is_the_ordinary_one(self) -> None:
-        """Everything downstream is unchanged: single use, bound to that one
-        digest, spent atomically with the effect."""
+    def test_disable_client_turns_off_approval_and_receipts(self):
         store = self.store()
         self.window(store)
-        created = self.request(store)
-        receipt = store.claim_receipt(created["handle"])
-        self.assertIsNotNone(receipt)
-        self.assertIsNotNone(
-            store.redeem_receipt(receipt, request_digest=DIGEST)
-        )
-        self.assertIsNone(
-            store.redeem_receipt(receipt, request_digest=DIGEST),
-            "an auto-decided receipt must still spend exactly once",
-        )
+        requested = self.request(store)
+        receipt = store.claim_receipt(requested["handle"])
+        store.disable_oauth_client(self.client_id)
+        self.assertFalse(self.request(store)["decided"])
+        self.assertFalse(store.list_approval_windows()[0]["live"])
+        self.assertIsNone(store.redeem_receipt(receipt, request_digest=DIGEST))
 
-    def test_a_window_authorises_a_class_never_a_request(self) -> None:
-        """The per-action invalidation set applies unchanged inside a live
-        window: a different digest is a different intent."""
+    def test_request_binding_single_use_and_audit_remain(self):
         store = self.store()
-        self.window(store)
-        created = self.request(store)
-        receipt = store.claim_receipt(created["handle"])
-        self.assertIsNone(
-            store.redeem_receipt(receipt, request_digest=OTHER_DIGEST),
-            "a window must not make a receipt portable between requests",
-        )
+        opened = self.window(store)
+        requested = self.request(store)
+        self.assertEqual(opened["id"], requested["window"])
+        receipt = store.claim_receipt(requested["handle"])
+        self.assertIsNone(store.redeem_receipt(receipt, request_digest=OTHER_DIGEST))
+        self.assertIsNotNone(store.redeem_receipt(receipt, request_digest=DIGEST))
+        self.assertIsNone(store.redeem_receipt(receipt, request_digest=DIGEST))
+        events = [e for e in store.audit_tail() if e["event"] == "approval.window_consumed"]
+        self.assertEqual(opened["id"], events[0]["details"]["window"])
 
-    def test_consumptions_are_counted_and_the_window_closes(self) -> None:
-        store = self.store()
-        self.window(store, max_consumptions=2)
-        for index in range(2):
-            with self.subTest(consumption=index):
-                self.assertTrue(self.request(store)["decided"])
-        self.assertFalse(
-            self.request(store)["decided"],
-            "an exhausted window must stop deciding even with time left",
-        )
-
-    def test_an_exhausted_window_is_no_longer_live(self) -> None:
-        store = self.store()
-        self.window(store, max_consumptions=1)
-        self.request(store)
-        entry = store.list_approval_windows()[0]
-        self.assertFalse(entry["live"])
-        self.assertEqual(entry["consumed"], entry["max_consumptions"])
-
-    def test_simultaneous_intents_cannot_overspend_the_last_consumption(
-        self,
-    ) -> None:
-        """The predicate and the decrement are one statement, so two intents
-        arriving together cannot both see the last consumption free."""
+    def test_turn_off_waits_for_inflight_approval_and_revokes_it(self):
         import threading
-
-        store = self.store()
-        self.window(store, max_consumptions=1)
-        decided, barrier = [], threading.Barrier(4)
-
-        def ask():
-            barrier.wait()
-            decided.append(self.request(store)["decided"])
-
-        threads = [threading.Thread(target=ask) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        self.assertEqual(1, decided.count(True), decided)
-
-    # -- what closes one ----------------------------------------------------
-
-    def test_an_expired_window_decides_nothing(self) -> None:
-        store = self.store()
-        self.window(store)
-        # Both timestamps, because the row carries a CHECK that an expiry is
-        # after its creation -- an expired window is one created earlier, not
-        # one whose expiry was moved into the past.
-        with store._db() as connection:
-            connection.execute(
-                "UPDATE control.approval_windows"
-                "   SET created_at = %s, expires_at = %s",
-                (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=31),
-                 dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)),
-            )
-        self.assertFalse(self.request(store)["decided"])
-
-    def test_a_revoked_window_decides_nothing(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
         store = self.store()
         opened = self.window(store)
-        self.assertTrue(store.revoke_approval_window(opened["id"], "changed my mind"))
-        self.assertFalse(self.request(store)["decided"])
+        matched, release = threading.Event(), threading.Event()
+        original = store.consume_approval_window
+        def held(*args, **kwargs):
+            result = original(*args, **kwargs)
+            matched.set()
+            self.assertTrue(release.wait(5))
+            return result
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with patch.object(store, "consume_approval_window", side_effect=held):
+                creation = executor.submit(self.request, store)
+                self.assertTrue(matched.wait(5))
+                closing = executor.submit(store.revoke_approval_window, opened["id"], "off")
+                release.set()
+                requested = creation.result(timeout=5)
+                self.assertTrue(closing.result(timeout=5))
+        self.assertIsNone(store.claim_receipt(requested["handle"]))
 
-    def test_revoking_twice_reports_who_did_it(self) -> None:
-        store = self.store()
-        opened = self.window(store)
-        self.assertTrue(store.revoke_approval_window(opened["id"], "first"))
-        self.assertFalse(store.revoke_approval_window(opened["id"], "second"))
-
-    def test_revoking_the_grant_closes_its_windows(self) -> None:
-        """A window is authority to decide on a grant's behalf, so a grant
-        that no longer exists cannot have one standing."""
-        store = self.store()
-        store.register_oauth_client(
-            name="agent", redirect_uris=["http://127.0.0.1:9/cb"],
-            scopes=["mcp:connect", "apply"],
-        )
-        self.window(store, grant_id="oauth:grant-9")
-        self.assertEqual(
-            1,
-            store.revoke_approval_windows_for_grant("oauth:grant-9", "revoked"),
-        )
-        self.assertFalse(
-            self.request(store, grant_id="oauth:grant-9")["decided"]
-        )
-
-    # -- what it is bound to ------------------------------------------------
-
-    def test_a_window_does_not_reach_another_grant(self) -> None:
+    def test_recovery_epoch_turns_off_client_approval(self):
         store = self.store()
         self.window(store)
-        self.assertFalse(
-            self.request(store, grant_id="oauth:someone-else")["decided"]
-        )
+        store.advance_recovery_epoch()
+        self.assertFalse(store.list_approval_windows()[0]["live"])
 
-    def test_a_window_does_not_reach_another_client(self) -> None:
-        store = self.store()
-        self.window(store)
-        self.assertFalse(self.request(store, client_id="mcp-2")["decided"])
-
-    def test_a_window_does_not_reach_another_instance(self) -> None:
-        store = self.store()
-        self.window(store)
-        self.assertFalse(
-            self.request(store, instance="somewhere-else")["decided"]
-        )
-
-    def test_a_window_does_not_reach_another_action_class(self) -> None:
-        """One class, never a set. A window covering several would be a second
-        permission system growing beside the scopes."""
-        store = self.store()
-        self.window(store, action_class="apply")
-        self.assertFalse(
-            self.request(
-                store, risk="database-definition",
-                operation_id="derived-layers.drop", tool="derived_layers_drop",
-                request_digest=OTHER_DIGEST,
-            )["decided"]
-        )
-
-    def test_an_unwindowable_intent_is_never_auto_decided(self) -> None:
-        """Even with a window open for something else, and even if one somehow
-        existed for this class."""
-        store = self.store()
-        self.window(store)
-        self.assertFalse(
-            self.request(
-                store, risk="semantic-apply",
-                operation_id="semantic.proposals.apply",
-                tool="semantic_proposals_apply",
-                request_digest=OTHER_DIGEST,
-            )["decided"]
-        )
-
-    def test_an_interactive_approval_still_has_no_window(self) -> None:
+    def test_without_standing_approval_request_still_waits_for_operator(self):
         store = self.store()
         created = self.request(store)
         self.assertFalse(created["decided"])

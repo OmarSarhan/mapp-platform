@@ -173,6 +173,28 @@ than repaired. It will not silently plan for a different live map extent or
 overwrite an unrelated derived definition that happens to use one of the four
 demo names; restore the packaged scope or resolve that name collision first.
 
+### Connect Claude or Codex
+
+Open **Access & audit → Agent access** in the configuration dashboard and
+register an MCP agent client with the permissions it needs. The **Claude** /
+**Codex** buttons show the configuration for that assistant:
+
+- **Claude Code:** merge the Claude configuration into the project's
+  `.mcp.json`, or run the displayed `claude mcp add` command. Open `/mcp` in
+  Claude Code and authenticate.
+- **Codex CLI:** merge the Codex configuration into `.codex/config.toml` in a
+  trusted project, or `~/.codex/config.toml` for all projects. Run the displayed
+  `codex mcp login mapp --scopes ...` command and complete browser consent.
+- **Codex in VS Code:** use the same Codex TOML and login command in the
+  extension's environment. Restart the Codex extension and check `mapp` under
+  its **MCP servers** settings.
+
+The [assistant setup guide](mcp-getting-started.md#step-3--point-the-assistant-at-it)
+has complete examples, callback settings, and remote-development instructions,
+with links to the official Claude and Codex documentation. Once connected, ask
+the assistant to list the workspace layers. To approve its permitted actions
+automatically, turn on that client's **Standing approvals** switch.
+
 ## 3. The mental model
 
 ### Two kinds of database
@@ -461,6 +483,7 @@ Read: [`security.md`](security.md)
 | [`backup-restore.md`](backup-restore.md) | What to back up and how to restore it |
 | [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation, XYZ framework policy |
 | [`mcp-authorization.md`](mcp-authorization.md) | The Phase 0 MCP authorization component: its origin, endpoints, state and limits |
+| [`mcp-getting-started.md`](mcp-getting-started.md) | Connect Claude Code, Codex CLI, or the Codex VS Code extension, then choose permissions and approvals |
 | [`adr/0001-mcp-authorization-and-topology.md`](adr/0001-mcp-authorization-and-topology.md) | The authorization ADR: what the decisions became when they were built, and what Phase 0 changed |
 | [`mcp-threat-model.md`](mcp-threat-model.md) | Assets, trust boundaries and the eight abuse cases, with what is and is not mitigated |
 | [`mcp-phase0-evidence.md`](mcp-phase0-evidence.md) | Phase 0 evidence: measured capacity, gate status and the go/no-go recommendation |

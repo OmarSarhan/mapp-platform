@@ -289,7 +289,7 @@ is the right trade for a single-operator system and is stated here rather than
 left to be inferred — P20 already records that separation of duty is not
 enforceable with one shared administrator identity.
 
-**Residual:** P8's time-boxed standing windows are still Phase 1 wave 8. Today
+**Residual:** Client standing approvals may decide requests automatically. Without one,
 every gated effect asks.
 
 ### Credential administration from a browser session
@@ -405,76 +405,41 @@ released, but it is a ceiling and not headroom.
 
 ### Approval fatigue
 
-**No control.** P8's time-boxed standing approval and its seven bounds are
-Phase 1, and O19 records that neither the capabilities response nor the manifest
-can currently express which action classes a standing window may cover. Phase 0
-prompts for consent per authorization request, which is the safe end of the
-trade-off and also the one most likely to train an operator to click through.
+An administrator can enable a client standing approval to allow unattended
+operations within that client's current permissions. This is bound to one
+registered MCP client and one platform instance. It has no time or action
+limit and stays enabled until turned off. It covers semantic administration
+and federation mutation as well as workspace and derived-layer changes.
 
-**Wave 8 is the answer, and it is a trade rather than a fix.** A standing
-approval window lets an operator decide once for a class of action instead of
-once per action, bounded by a clock *and* a count. What it removes is the
-prompt; what it adds is a period in which an agent acts on a decision nobody is
-present for. That is the honest shape of it: fatigue is reduced by accepting a
-bounded amount of unattended action, not by making the attended path cheaper.
+The following controls remain:
 
-Seven bounds hold it, and each is a way it could otherwise authorise more than
-somebody meant:
+- Enabling requires a CSRF-protected administrator session authenticated
+  within 15 minutes. No agent credential can enable its own approval.
+- Every match resolves a live grant for the same client and checks the grant's
+  and client's current scopes. A forged client identifier, revoked grant,
+  disabled client or another instance cannot use it.
+- The match and decision share a transaction. Turning off the approval also
+  revokes its unspent receipts, including a decision being inserted when the
+  operator turned it off. Concurrent uses serialize without losing approvals.
+- Disabling the client closes its switch. Revoking a consent stops that
+  consent's credentials; another valid consent for the same client may still
+  use the client approval. Recovery-epoch advance closes all client approvals.
+- A standing approval substitutes the decider, never the receipt. Every action
+  still carries the canonical request digest and a single-use receipt; changed
+  arguments, revisions and fingerprints still require a new bound request.
+  Preflight, SQL guards, execution limits and rate limits still apply.
+- Each use records the client approval, operator, grant, operation, digest and
+  cumulative use count. The count is an audit measure, not a quota.
 
-- **One action class, never a set**, and never a scope — a window binds what an
-  action *is*. `federation:retire` is the reason: it is not a scope at all,
-  since the platform's retire action runs under `federation:provision`.
-- **Only the workspace-mutation classes.** `apply`, `reload`,
-  `database-definition` and `database-refresh`, stated as an allowlist so a
-  class nobody has considered is un-windowable by default. Semantic
-  administration and federation mutation are excluded in full, as classes, and
-  always ask.
-- **Bound to one grant, one client and one instance.** A window is not a
-  policy; it is an arrangement with one agent.
-- **Sixty minutes at most, and twenty consumptions at most**, decremented in
-  the same statement that matches the window, so two intents arriving together
-  cannot both spend the last one. Time alone is not a bound: at the
-  specification's measured rates an hour would auto-approve roughly three
-  hundred mutations.
-- **Opened only from a recently authenticated administrator browser session**,
-  CSRF-protected, and never by a credential. An agent cannot arm the thing that
-  decides for it. Recency is checked at creation and deliberately not at
-  consumption — checking again would make the sixty-minute bound dead letter.
-- **Revocable immediately**, and revoked with its grant in the same
-  transaction. An unspent receipt authorises one request; a live window keeps
-  deciding, which is the stronger reason to reach it.
-- **Invalidated by a recovery-epoch advance**, so a restored snapshot cannot
-  re-arm a window that was closed after it was taken.
+Migration 11 closes all old time- and count-limited windows and their unused
+receipts. It preserves their history and never converts a narrow permission
+into a client-wide approval automatically.
 
-**What a window does not change is the whole of the rest.** It substitutes the
-decider and nothing else: the intent still carries the full canonical execution
-digest, the receipt is still single-use and still bound to that one digest, and
-it is still spent atomically with the effect. So a window authorises a *class*
-of action and never a specific replayable request — a changed argument,
-revision or fingerprint is a different digest and therefore a different intent,
-decided on its own merits or not at all. Preflight is not skipped either: an
-action needing a current revision or check fingerprint must still supply one.
-
-Each consumption is audited individually against the window that authorised it,
-carrying the window's identifier, its creator, its expiry and how much of it
-was left — because the question asked afterwards is which standing approval
-answered, and a record naming only the operator cannot say.
-
-**Residual:** during a live window, an agent's request is authorised by a
-decision made earlier about a class. That is exactly what was asked for, and
-the bounds are what make it a window rather than a grant. The one thing worth
-watching is `database-refresh`, which is the cheapest to ask for and the most
-expensive to serve.
-
-Wave 5 made this worse before wave 8 made it better, and that is worth saying
-plainly: every gated effect now asks, so the number of prompts an operator sees
-goes up. What is done about it is small and deliberate — approving takes two
-clicks in the dashboard and names the operation, declining takes one, and a
-request that carries no packet says so rather than looking routine, because
-approving a bare operation name is how the habit forms. None of that is a
-control. P8's standing windows and their seven bounds remain the answer, and
-O19 still records that neither the capabilities response nor the manifest can
-express which action classes such a window may cover.
+**Residual:** an enabled client may perform any permitted action without a
+person reviewing that action. There is no automatic time or count cutoff.
+Operators control this exposure with client scopes and the off switch.
+Turning off cannot undo an effect already executed or cancel work already
+admitted for execution. Database resource ceilings remain necessary.
 
 ### Disclosure through a read grant
 
@@ -554,9 +519,9 @@ that layers will keep working and start returning different numbers.
 
 The residual worth naming: `refresh` is the cheapest of the four to ask for
 and the most expensive to serve, since it reads every source row again. It
-asks a person every time, which is what stops it being a way to spend the
-database's time unattended — and is another reason wave 8's standing windows
-should not cover it casually.
+requires a receipt for every request, which can be decided by a client standing
+approval. Resource ceilings and admission limits therefore remain necessary
+even when an administrator has enabled unattended work.
 
 **What changed at Phase 1 wave 6.** `apply`, `semantic:apply` and `reload`
 became grantable, so a hostile client holding them can reach operations that

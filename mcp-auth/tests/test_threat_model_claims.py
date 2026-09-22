@@ -75,29 +75,13 @@ class ThreatModelClaimTests(unittest.TestCase):
                         f"{name} reaches the administrative surface {path}",
                     )
 
-    def test_a_standing_window_covers_only_workspace_mutation(self) -> None:
-        """Defends: "Semantic administration and federation mutation are
-        excluded in full, as classes, and always ask."
-
-        The exclusion is the whole reason a window is acceptable, and it is
-        one frozenset away from not being true. Checked against the allowlist
-        rather than against its own restatement, and from the other direction
-        too: every allowlisted operation whose risk a window may cover must be
-        one of the four named classes.
-        """
-        from control_plane import WINDOWABLE_ACTION_CLASSES
-
-        self.assertEqual(
-            {"apply", "reload", "database-definition", "database-refresh"},
-            set(WINDOWABLE_ACTION_CLASSES),
-        )
-        for excluded in (
-            "semantic-apply", "semantic-archive", "semantic-repair",
-            "federation-observe", "federation-provision",
-            "federation-register",
-        ):
-            with self.subTest(action_class=excluded):
-                self.assertNotIn(excluded, WINDOWABLE_ACTION_CLASSES)
+    def test_standing_approval_covers_all_gated_operations(self) -> None:
+        from control_api import ACTION_SCHEMAS, requires_approval, windowable
+        for operation in ACTION_SCHEMAS:
+            self.assertEqual(requires_approval(operation), windowable(operation))
+        self.assertFalse(windowable("unknown.operation"))
+        self.assertIn("no time or action", THREAT_MODEL)
+        self.assertIn("one platform instance", THREAT_MODEL)
 
     def test_no_windowable_operation_escapes_the_receipt(self) -> None:
         """Defends: "a window substitutes the decider, never the receipt."
@@ -113,21 +97,11 @@ class ThreatModelClaimTests(unittest.TestCase):
                 with self.subTest(operation=name):
                     self.assertTrue(requires_approval(name))
 
-    def test_the_window_bounds_are_what_the_document_says(self) -> None:
-        """Defends: "Sixty minutes at most, and twenty consumptions at most",
-        and the fifteen-minute recency. Three numbers in prose describing
-        three constants."""
+    def test_client_approval_retains_recent_administrator_authentication(self) -> None:
         from control_plane import ControlStore
-
-        self.assertIn("Sixty minutes at most", THREAT_MODEL)
-        self.assertIn("twenty consumptions at most", THREAT_MODEL)
-        self.assertEqual(
-            60, ControlStore.WINDOW_MAX_LIFETIME.total_seconds() / 60
-        )
-        self.assertEqual(20, ControlStore.WINDOW_MAX_CONSUMPTIONS)
-        self.assertEqual(
-            15, ControlStore.WINDOW_RECENCY.total_seconds() / 60
-        )
+        self.assertIn("within 15 minutes", THREAT_MODEL)
+        self.assertEqual(15, ControlStore.WINDOW_RECENCY.total_seconds() / 60)
+        self.assertIn("stays enabled until turned off", THREAT_MODEL)
 
     def test_the_two_approval_windows_are_what_the_document_says(self) -> None:
         """Defends: "fifteen minutes to decide ... and five minutes to claim

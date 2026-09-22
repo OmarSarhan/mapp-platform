@@ -88,7 +88,7 @@ from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
 from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
-from control_plane import ControlStore, WINDOWABLE_ACTION_CLASSES, iso, parse_time
+from control_plane import ControlStore, iso, parse_time
 from control_api import (
     ACTION_SCHEMAS,
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
@@ -7924,27 +7924,18 @@ class Handler(SimpleHTTPRequestHandler):
                 "windows": [
                     {
                         "id": row["id"],
-                        "grantId": row["grant_id"],
                         "clientId": row["client_id"],
-                        "actionClass": row["action_class"],
+                        "clientName": row["client_name"] or row["client_id"],
                         "createdBy": row["created_by"],
                         "created": iso(row["created_at"]),
-                        "expires": iso(row["expires_at"]),
                         "consumed": row["consumed"],
-                        "maxConsumptions": row["max_consumptions"],
                         "live": row["live"],
                         "revoked": iso(row["revoked_at"])
                         if row["revoked_at"] else None,
                     }
                     for row in CONTROL.list_approval_windows()
                 ],
-                # Offered so the dashboard need not restate the policy, and
-                # cannot drift from it.
-                "actionClasses": sorted(WINDOWABLE_ACTION_CLASSES),
-                "maxMinutes": int(
-                    ControlStore.WINDOW_MAX_LIFETIME.total_seconds() // 60
-                ),
-                "maxConsumptions": ControlStore.WINDOW_MAX_CONSUMPTIONS,
+                "policy": "client-until-revoked",
             })
         elif path == "/api/admin/approvals":
             # Operator-only, and under /api/admin like every other operator
@@ -9934,9 +9925,8 @@ class Handler(SimpleHTTPRequestHandler):
             if request_path == "/api/admin/approval-windows":
                 # Opened only from an administrator browser session, and only
                 # a recent one. The session check above already required CSRF
-                # for a state change, which is the other half of P8's "created
-                # only by a CSRF-protected POST" -- an agent holding a
-                # credential cannot arm the thing that decides for it.
+                # for a state change. An agent credential cannot enable its
+                # own automatic approvals.
                 if actor != "admin":
                     self._json(HTTPStatus.FORBIDDEN,
                                {"error": "Administrator session required."})
@@ -9952,21 +9942,20 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 try:
+                    unexpected = sorted(set(payload) - {"clientId"})
+                    if unexpected:
+                        raise ValueError("Unsupported standing approval properties: "
+                                         + ", ".join(unexpected))
+                    if not isinstance(payload.get("clientId"), str):
+                        raise ValueError("clientId must name an MCP agent client.")
                     opened = CONTROL.open_approval_window(
-                        grant_id=str(payload.get("grantId") or ""),
-                        client_id=str(payload.get("clientId") or ""),
+                        client_id=payload["clientId"],
                         instance=CONTROL.instance_id(),
-                        action_class=str(payload.get("actionClass") or ""),
                         created_by="admin",
                         session_created_at=authenticated_at,
-                        minutes=int(payload.get("minutes") or 0),
-                        max_consumptions=int(
-                            payload.get("maxConsumptions") or 0
-                        ),
                     )
                 except (ValueError, TypeError) as exc:
-                    # The refusal names the bound that was met. An operator
-                    # told only "no" while arming this will try another number.
+                    # Explain which client or session requirement failed.
                     self._json(HTTPStatus.BAD_REQUEST, {
                         "error": str(exc), "code": "window.refused",
                     })
