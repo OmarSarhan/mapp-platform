@@ -43,15 +43,12 @@ export function savedWorkspaceFromError(error) {
   };
 }
 
-export function confirmedWorkspaceReload(payload) {
-  const fingerprint = payload?.fingerprint;
-  const reload = payload?.reload;
+export function confirmedXyzReload(reload) {
+  const fingerprint = reload?.expectedWorkspaceFingerprint;
   const status = reload?.status;
   return (
-    payload?.saved === true
-    && typeof fingerprint === 'string'
+    typeof fingerprint === 'string'
     && /^[0-9a-f]{64}$/.test(fingerprint)
-    && reload?.expectedWorkspaceFingerprint === fingerprint
     && Number.isInteger(reload?.requestedGeneration)
     && reload.requestedGeneration >= 0
     && status?.completed === true
@@ -59,6 +56,14 @@ export function confirmedWorkspaceReload(payload) {
     && Number.isInteger(status.appliedGeneration)
     && status.appliedGeneration >= reload.requestedGeneration
     && status.workspaceFingerprint === fingerprint
+  );
+}
+
+export function confirmedWorkspaceReload(payload) {
+  return (
+    payload?.saved === true
+    && payload.fingerprint === payload.reload?.expectedWorkspaceFingerprint
+    && confirmedXyzReload(payload.reload)
   );
 }
 

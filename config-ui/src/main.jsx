@@ -24,6 +24,7 @@ import {
   ApiError,
   activeLocale,
   confirmedWorkspaceReload,
+  confirmedXyzReload,
   renderedLocales,
   requestJson,
   savedWorkspaceFromError,
@@ -316,7 +317,7 @@ function PrimaryNavigation({children}){
 
 export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null}){
  const [ws,setWs]=useState(null),[rev,setRev]=useState(),[catalog,setCatalog]=useState([]),[databases,setDatabases]=useState([]),[icons,setIcons]=useState([]),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[derivedUpdate,setDerivedUpdate]=useState(null);
- const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving';
+ const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving',reloading=activity==='reloading';
  const beginActivity=next=>{if(activityRef.current)return false;activityRef.current=next;setActivity(next);return true};
  const endActivity=completed=>{if(activityRef.current!==completed)return;activityRef.current=null;setActivity(null)};
  const localeOptions=renderedLocales(ws),fallbackLocale=activeLocale(ws),localeKey=localeOptions.some(([key])=>key===selectedLocale)?selectedLocale:fallbackLocale.key,loc=localeOptions.find(([key])=>key===localeKey)?.[1],layers=loc?.layers||{},namedReadOnly=localeKey!=='locale';
@@ -335,9 +336,23 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
  const renameLayer=displayName=>{const occupied=new Set([...(Object.keys(ws.locale?.layers||{})),...Object.values(ws.locales||{}).flatMap(locale=>Object.keys(locale.layers||{}))]);occupied.delete(selected);const nextKey=uniqueLayerKey(displayName,occupied,selected);if(nextKey===selected)return;mutateWorkspace(next=>{for(const locale of [next.locale,...Object.values(next.locales||{})]){if(!locale?.layers||!Object.hasOwn(locale.layers,selected))continue;locale.layers[nextKey]=locale.layers[selected];delete locale.layers[selected]}});setSelected(nextKey)};
  const validate=async()=>{if(!beginActivity('validating'))return;setErrors([]);setStatus({kind:'pending',message:'Validating workspace…'});try{const x=await api('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:ws})});setErrors([]);setStatus({kind:'success',message:x.message||'Configuration is valid.'})}catch(e){const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus({kind:'error',message:'Configuration is not valid.',errors:next})}finally{endActivity('validating')}};
  const save=async()=>{if(!beginActivity('saving'))return;setErrors([]);setStatus(workspaceSaveStatus('restarting'));try{const x=await api('/api/workspace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:ws,revision:rev})});if(!confirmedWorkspaceReload(x))throw new ApiError('Workspace save returned without fingerprint-matched XYZ readiness.',{status:502,payload:x});setWs(x.workspace);setRev(x.revision);setDirty(false);setErrors([]);setStatus(workspaceSaveStatus('ready'))}catch(e){const saved=savedWorkspaceFromError(e);if(saved){setWs(saved.workspace);setRev(saved.revision);setDirty(saved.dirty)}const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus(workspaceSaveStatus(workspaceSaveFailurePhase(e),next))}finally{endActivity('saving')}};
+ const reloadXyz=async()=>{
+  if(!beginActivity('reloading'))return;
+  setErrors([]);
+  setStatus({kind:'pending',message:'Reloading XYZ from the saved workspace…'});
+  try{
+   const result=await api('/api/xyz/reload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
+   if(!confirmedXyzReload(result))throw new ApiError('Reload returned without confirmed readiness for the saved workspace.',{status:502,payload:result});
+   setStatus({kind:'success',message:'XYZ reloaded and is ready for connections with the saved workspace.'});
+  }catch(error){
+   const next=error.details||[{path:'XYZ',message:error.payload?.operation?.error?.message||error.message}];
+   setErrors(next);
+   setStatus({kind:'error',message:'XYZ readiness could not be confirmed.',errors:next});
+  }finally{endActivity('reloading')}
+ };
  const addTable=t=>{if(namedReadOnly)return;const guessed=generatedLayer(t),geom=guessed.geom,id=guessed.id;if(!geom||!id)return;const kind=geometryKind({geom:geom.name},t),normal=kind==='point'?{icon:{type:'dot',fillColor:'#176b4d',scale:1}}:kind==='line'?{strokeColor:'#176b4d',strokeOpacity:1,strokeWidth:2}:{fillColor:'#176b4d',fillOpacity:.3,strokeColor:'#0f5138',strokeOpacity:1,strokeWidth:2},name=title(t.table),key=uniqueLayerKey(name,new Set(Object.keys(layers)));mutateLayers((x,l)=>l.layers[key]={name,display:true,format:'mvt',dbs:t.dbs,table:`${t.schema}.${t.table}`,geom:geom.name,srid:String(geom.srid),qID:id.name,_dashboard:{generated:{geom:true,qID:true,geometryInfo:true,pinInfo:true}},infoj:[...standardInfoEntries(geom.name),...t.columns.filter(c=>!c.geometryType).slice(0,8).map(c=>({type:/int/.test(c.type)?'integer':/numeric|double|real/.test(c.type)?'numeric':/bool/.test(c.type)?'boolean':'text',title:title(c.name),field:c.name,inline:true,display:true}))],style:{default:normal,highlight:kind==='point'?{highlightScale:1.4}:{strokeColor:'#e9b949',strokeWidth:3}}});setSelected(key);setSidebarMode('layers');setSidebarOpen(false)};
  if(!ws)return <div className="loading-shell" aria-live="polite" aria-atomic="true">{status?.kind==='error'?<div className="initial-load-error"><strong>{status.message}</strong>{status.errors?.length>0&&<ul>{status.errors.map((error,index)=><li key={index}>{error.path}: {error.message}</li>)}</ul>}<button disabled={busy} onClick={()=>load(true)}>Retry</button></div>:<p>Loading workspace…</p>}</div>;
- const layer=layers[selected],activityText=activity==='loading'?'Refreshing workspace…':activity==='validating'?'Validating…':saving?'Restarting XYZ…':dirty?'Unsaved changes':'Saved';
+ const layer=layers[selected],activityText=activity==='loading'?'Refreshing workspace…':activity==='validating'?'Validating…':saving?'Restarting XYZ…':reloading?'Reloading XYZ…':dirty?'Unsaved changes':'Saved';
  return <div className="app-shell">
   <a className="skip-link" href="#editor">Skip to workspace editor</a>
   <header className="app-header">
@@ -390,6 +405,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
       <DerivedLayerHeaderMenu disabled={busy} openDerivedLayers={openDerivedLayers}/>
       <button disabled={busy} className="icon-button" aria-label="Reload editor" title="Reload editor" onClick={()=>load()}><RefreshCw size={18} aria-hidden="true"/></button>
       <button disabled={busy} className="validate-button" onClick={validate}><CheckCircle2 size={17} aria-hidden="true"/>{activity==='validating'?'Validating…':'Validate'}</button>
+      <button type="button" disabled={busy} className="reload-xyz-button" title="Reload XYZ using the saved workspace. Unsaved editor changes stay in the editor." onClick={reloadXyz}><RefreshCw size={17} aria-hidden="true"/>{reloading?'Reloading XYZ…':'Reload XYZ'}</button>
       <button disabled={!dirty||busy} className="save-button" onClick={save}><Save size={17} aria-hidden="true"/>{saving?'Restarting XYZ…':'Save & reload XYZ'}</button>
      </div>
     </div>

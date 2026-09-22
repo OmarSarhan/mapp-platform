@@ -414,6 +414,12 @@ confirmed. The XYZ supervisor restarts only its child application process and
 records the applied generation, workspace fingerprint, start time, and health
 in `var/reload`.
 
+The dashboard's **Reload XYZ** button reloads the saved workspace through the
+same authenticated API and reports confirmed readiness or an error. It is
+available even when there are no edits to save. Unsaved editor changes remain
+in the editor; use **Save & reload XYZ** to publish them. While a reload is
+running, the dashboard prevents overlapping workspace actions.
+
 Use `./bin/mapp reload-xyz` only for an intentional local operator-requested
 reload. It fingerprints the current workspace, requests a generation, and
 waits for the supervisor to report TCP readiness with that fingerprint. This

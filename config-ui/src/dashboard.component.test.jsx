@@ -2166,6 +2166,144 @@ describe('Dashboard managed save lifecycle', () => {
   });
 });
 
+describe('Dashboard standalone XYZ reload', () => {
+  const reloadReady = () => ({
+    expectedWorkspaceFingerprint: 'a'.repeat(64),
+    requestedGeneration: 7,
+    status: {
+      appliedGeneration: 7,
+      workspaceFingerprint: 'a'.repeat(64),
+      healthy: true,
+      completed: true,
+    },
+  });
+
+  function fetchWithReload(reloadRequest, saveRequest = () => successfulSave(workspace)) {
+    const fallback = standardFetch(saveRequest);
+    return vi.fn((path, options = {}) => (
+      path === '/api/xyz/reload'
+        ? reloadRequest(options)
+        : fallback(path, options)
+    ));
+  }
+
+  test('reloads the saved workspace from a clean editor without saving or applying', async () => {
+    const fetchMock = fetchWithReload(() => response(reloadReady()));
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    await screen.findByDisplayValue('demo');
+    expect(screen.getByRole('button', {name: 'Save & reload XYZ'}).disabled).toBe(true);
+    const reload = screen.getByRole('button', {name: 'Reload XYZ'});
+    expect(reload.disabled).toBe(false);
+    fireEvent.click(reload);
+
+    await screen.findByText(
+      'XYZ reloaded and is ready for connections with the saved workspace.',
+    );
+    const writes = fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST');
+    expect(writes).toHaveLength(1);
+    expect(writes[0][0]).toBe('/api/xyz/reload');
+    expect(JSON.parse(writes[0][1].body)).toEqual({confirmed: true});
+    expect(screen.getByDisplayValue('demo')).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Save & reload XYZ'}).disabled).toBe(true);
+  });
+
+  test('serializes a pending reload and preserves dirty edits and their revision', async () => {
+    let finishReload;
+    const pendingReload = new Promise(resolve => { finishReload = resolve; });
+    const fetchMock = fetchWithReload(
+      () => pendingReload,
+      () => successfulSave({...workspace, key: 'changed'}),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const {container} = render(<Dashboard openSecurity={() => {}}/>);
+
+    const key = await screen.findByDisplayValue('demo');
+    fireEvent.change(key, {target: {value: 'changed'}});
+    const reload = screen.getByRole('button', {name: 'Reload XYZ'});
+    fireEvent.click(reload);
+    fireEvent.click(reload);
+
+    await screen.findByText('Reloading XYZ from the saved workspace…');
+    expect(reload.textContent).toContain('Reloading XYZ…');
+    expect(reload.disabled).toBe(true);
+    const save = screen.getByRole('button', {name: 'Save & reload XYZ'});
+    const validate = screen.getByRole('button', {name: 'Validate'});
+    expect(save.disabled).toBe(true);
+    expect(validate.disabled).toBe(true);
+    fireEvent.click(save);
+    fireEvent.click(validate);
+    expect(container.querySelector('main').hasAttribute('inert')).toBe(true);
+    expect(fetchMock.mock.calls.filter(([path]) => path === '/api/xyz/reload')).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1);
+
+    fireEvent.change(key, {target: {value: 'late edit'}});
+    finishReload(response(reloadReady()));
+    await screen.findByText(
+      'XYZ reloaded and is ready for connections with the saved workspace.',
+    );
+    expect(screen.getByDisplayValue('changed')).toBeTruthy();
+    expect(screen.getByText('Unsaved changes')).toBeTruthy();
+    expect(container.querySelector('main').hasAttribute('inert')).toBe(false);
+    expect(screen.getByRole('button', {name: 'Save & reload XYZ'}).disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', {name: 'Save & reload XYZ'}));
+    await screen.findByText(
+      'Workspace saved. XYZ restarted and is ready for connections with this workspace.',
+    );
+    const saved = fetchMock.mock.calls.find(([path, options]) => (
+      path === '/api/workspace' && options?.method === 'POST'
+    ));
+    expect(JSON.parse(saved[1].body)).toMatchObject({
+      workspace: {key: 'changed'},
+      revision: 'rev-1',
+    });
+  });
+
+  test('reports an unconfirmed timeout with its operation diagnostic and retains edits', async () => {
+    vi.stubGlobal('fetch', fetchWithReload(() => response({
+      ...reloadReady(),
+      status: {completed: false, healthy: false},
+      operation: {
+        status: 'indeterminate',
+        error: {
+          code: 'xyz.reload_timeout',
+          message: 'Reload completion was not observed before timeout.',
+        },
+      },
+    }, 504)));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.change(await screen.findByDisplayValue('demo'), {target: {value: 'changed'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Reload XYZ'}));
+
+    await screen.findByText('XYZ readiness could not be confirmed.');
+    expect(screen.getByText(/Reload completion was not observed before timeout\./)).toBeTruthy();
+    expect(screen.queryByText(
+      'XYZ reloaded and is ready for connections with the saved workspace.',
+    )).toBeNull();
+    expect(screen.getByDisplayValue('changed')).toBeTruthy();
+    expect(screen.getByText('Unsaved changes')).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Reload XYZ'}).disabled).toBe(false);
+  });
+
+  test('rejects a successful HTTP response for a different workspace fingerprint', async () => {
+    const mismatched = reloadReady();
+    mismatched.status.workspaceFingerprint = 'b'.repeat(64);
+    vi.stubGlobal('fetch', fetchWithReload(() => response(mismatched)));
+    render(<Dashboard openSecurity={() => {}}/>);
+
+    fireEvent.click(await screen.findByRole('button', {name: 'Reload XYZ'}));
+
+    await screen.findByText('XYZ readiness could not be confirmed.');
+    expect(screen.queryByText(
+      'XYZ reloaded and is ready for connections with the saved workspace.',
+    )).toBeNull();
+    expect(screen.getByRole('button', {name: 'Reload XYZ'}).disabled).toBe(false);
+  });
+});
+
 describe('Dashboard authentication lifecycle', () => {
   test('returns to sign-in when an authenticated API request receives 401', async () => {
     sessionStorage.setItem('mapp-csrf', 'expired-csrf');
