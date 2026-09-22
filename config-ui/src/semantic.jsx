@@ -787,17 +787,17 @@ export function SemanticCatalog({api, close, identity}) {
   };
 
   return <div className="modal-backdrop">
-    <section className="panel security-panel semantic-panel">
+    <section className="panel security-panel semantic-panel" role="dialog" aria-modal="true" aria-labelledby="semantic-title">
       <div className="form-head">
         <div>
-          <h2>Semantic catalog</h2>
+          <h2 id="semantic-title">Semantic catalog</h2>
           <p>Choose a profile, generate a reviewed draft, then create a proposal.</p>
         </div>
         <div className="semantic-actions">
           <button className="icon" disabled={generationRunning} onClick={switchMode}>
             {advanced ? 'Guided mode' : 'Advanced mode'}
           </button>
-          <button disabled={generationRunning} onClick={close}>Close</button>
+          <button autoFocus disabled={generationRunning} onClick={close}>Close</button>
         </div>
       </div>
       {advanced && service && <details className="semantic-catalog-info">

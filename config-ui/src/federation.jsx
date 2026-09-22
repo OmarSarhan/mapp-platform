@@ -330,10 +330,10 @@ export function FederatedSources({api, close}) {
     && selected.lastObservationId !== undefined;
 
   return <div className="modal-backdrop">
-    <section className="panel security-panel federation-panel">
+    <section className="panel security-panel federation-panel" role="dialog" aria-modal="true" aria-labelledby="federation-title">
       <div className="form-head">
         <div>
-          <h2>Federated sources</h2>
+          <h2 id="federation-title">Federated sources</h2>
           <p>
             Register records intent, observe probes the source live, and provision is
             the only step that deliberately serves its data.
@@ -344,7 +344,7 @@ export function FederatedSources({api, close}) {
             derived owner, and a clean one restores them.
           </p>
         </div>
-        <button disabled={busy} onClick={close}>Close</button>
+        <button autoFocus disabled={busy} onClick={close}>Close</button>
       </div>
       {error && <div className="expression-result error">{error}</div>}
       {notice && <div className="expression-result success">{notice}</div>}

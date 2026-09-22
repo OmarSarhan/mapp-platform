@@ -148,9 +148,13 @@ describe('Scoped token administration', () => {
 
     render(<Security close={() => {}}/>);
     const access = await screen.findByLabelText('Token access level');
+    const cliAccess = screen.getByRole('heading', {name: 'CLI access'})
+      .closest('.security-section');
     expect(access.value).toBe('full');
     for (const scope of TOKEN_SCOPE_OPTIONS) {
-      expect(screen.getByRole('checkbox', {name: new RegExp(scope.label)}).checked)
+      expect(within(cliAccess).getByRole('checkbox', {
+        name: new RegExp(scope.label),
+      }).checked)
         .toBe(true);
     }
     expect(screen.getByText(
@@ -225,6 +229,7 @@ describe('Scoped token administration', () => {
       'apply',
       'reload',
       'derive',
+      'derive:manage',
       'semantic:inspect',
       'semantic:source',
       'semantic:generate',
@@ -419,13 +424,15 @@ describe('Scoped token administration', () => {
 
     render(<Security close={() => {}}/>);
     const access = await screen.findByLabelText('Token access level');
+    const cliAccess = screen.getByRole('heading', {name: 'CLI access'})
+      .closest('.security-section');
     const create = screen.getByRole('button', {name: 'Create scoped CLI token'});
     expect(access.value).toBe('full');
     expect(screen.getByText(
       'Selected scopes: full (all bearer-token workspace and semantic scopes)',
     )).toBeTruthy();
 
-    const semanticInspect = screen.getByRole('checkbox', {
+    const semanticInspect = within(cliAccess).getByRole('checkbox', {
       name: /Inspect semantic catalog/,
     });
     fireEvent.click(semanticInspect);
@@ -442,14 +449,18 @@ describe('Scoped token administration', () => {
 
     fireEvent.click(semanticInspect);
     for (const scope of TOKEN_SCOPE_OPTIONS) {
-      expect(screen.getByRole('checkbox', {name: new RegExp(scope.label)}).checked)
+      expect(within(cliAccess).getByRole('checkbox', {
+        name: new RegExp(scope.label),
+      }).checked)
         .toBe(true);
     }
     expect(screen.getAllByText(/semantic:inspect/).length).toBeGreaterThan(1);
     expect(create.disabled).toBe(false);
 
     for (const scope of TOKEN_SCOPE_OPTIONS) {
-      const checkbox = screen.getByRole('checkbox', {name: new RegExp(scope.label)});
+      const checkbox = within(cliAccess).getByRole('checkbox', {
+        name: new RegExp(scope.label),
+      });
       if (checkbox.checked) fireEvent.click(checkbox);
     }
     expect(screen.getByText('Selected scopes: none')).toBeTruthy();
@@ -689,6 +700,7 @@ describe('Dashboard managed save lifecycle', () => {
     }));
     render(<Dashboard openSecurity={() => {}}/>);
 
+    fireEvent.click(await screen.findByRole('button', {name: 'Source catalog'}));
     const catalogRow = await screen.findByRole('button', {name: /leeds\.bus_stops/});
     fireEvent.click(catalogRow);
 
@@ -2077,7 +2089,7 @@ describe('Dashboard managed save lifecycle', () => {
     expect(screen.getByRole('button', {name: 'Validate'}).disabled).toBe(true);
     expect(screen.getByRole('button', {name: 'Reload editor'}).disabled).toBe(true);
     expect(screen.getByRole('button', {name: 'Access & audit'}).disabled).toBe(true);
-    expect(container.querySelector('header select').disabled).toBe(true);
+    expect(container.querySelector('.workspace-commandbar select').disabled).toBe(true);
 
     fireEvent.change(keyInput, {target: {value: 'late edit'}});
     resolveSave(successfulSave({...workspace, key: 'changed'}));

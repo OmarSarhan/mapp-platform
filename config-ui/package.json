@@ -8,6 +8,7 @@
     "test": "node --test src/api.test.js && vitest run"
   },
   "dependencies": {
+    "lucide-react": "^1.47.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "vite": "8.2.1"
