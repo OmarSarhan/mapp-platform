@@ -157,6 +157,34 @@ class EnvelopeTests(AgreementTestCase):
 
     NULLS = dict(resolved_defaults=None, confirmation_fields=None, revision_binding=None)
 
+    def test_draft_cleanup_authority_and_generation_change_the_bound_digest(self) -> None:
+        create = dict(
+            instance="instance-1", method="POST", operation_id="derived-layers.create",
+            path_template="/api/derived-layers", path="/api/derived-layers", query="",
+        )
+        digests = []
+        for body in (
+            {"name": "preview_metric"},
+            {"name": "preview_metric", "draft": {"expiresInHours": 24, "cleanupApproved": True}},
+            {"name": "preview_metric", "draft": {"expiresInHours": 48, "cleanupApproved": True}},
+        ):
+            ours = envelope.build(**create, body=body, **self.NULLS)
+            theirs = self.api_envelope.build(**create, body=body, **self.NULLS)
+            self.assertEqual(ours, theirs)
+            digests.append(canonical.digest(ours))
+        self.assertEqual(3, len(set(digests)))
+
+        propose = dict(create, operation_id="proposals.create",
+                       path_template="/api/proposals", path="/api/proposals")
+        digests = []
+        for generation in (1, 2):
+            body = {"draftRelations": [{"name": "preview_metric", "generation": generation,
+                                        "assetId": "440c4b84-4c84-4452-acff-7f4cbb9ca1bd"}]}
+            ours = envelope.build(**propose, body=body, **self.NULLS)
+            self.assertEqual(ours, self.api_envelope.build(**propose, body=body, **self.NULLS))
+            digests.append(canonical.digest(ours))
+        self.assertNotEqual(*digests)
+
     def test_both_copies_build_the_same_envelope(self) -> None:
         for index, case in enumerate(self.CASES):
             with self.subTest(index=index):

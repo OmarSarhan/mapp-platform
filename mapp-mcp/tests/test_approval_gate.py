@@ -759,7 +759,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append({"method": "GET", **kwargs})
             if "/proposals/" in kwargs["path"]:
                 return self.proposal
-            if kwargs["path"].startswith("/api/operations/"):
+            if kwargs["path"].startswith("/api/visual-operations/"):
                 return {"operation": {"result": {"visual": {
                     "diagnosis": {"candidate": {"checks": [
                         {"id": "visual.layer_activation", "passed": False},
@@ -837,6 +837,18 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             packet["warnings"],
         )
 
+    async def test_apply_approval_discloses_permanent_draft_promotion(self) -> None:
+        binding = [{"name": "preview_metric", "assetId": "asset-id", "generation": 1}]
+        proposal = {**self.PROPOSAL, "proposal": {
+            **self.PROPOSAL["proposal"], "draftRelations": binding,
+        }}
+        api = self.Api(self, proposal=proposal)
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1")
+        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
+        self.assertEqual(binding, packet["draftRelations"])
+        self.assertIn("permanently", packet["note"])
+
     async def test_evidence_is_read_from_the_platform_not_taken_on_trust(
         self,
     ) -> None:
@@ -854,7 +866,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_evidence_that_cannot_be_read_says_so_rather_than_vanishing(
         self,
     ) -> None:
-        """Reading an operation costs `derive`, which a hand-picked grant may
+        """Reading visual evidence costs `visual`, which a hand-picked grant may
         not carry. Refusing the apply over its illustration would refuse the
         wrong thing; dropping it quietly would let the person believe no
         render was asked for."""
@@ -865,7 +877,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
         self.assertEqual("op-7", packet["evidence"]["operationId"])
-        self.assertIn("derive", packet["evidence"]["unavailable"])
+        self.assertIn("visual", packet["evidence"]["unavailable"])
         self.assertNotIn("passed", packet["evidence"])
 
     async def test_no_evidence_is_asked_for_when_none_is_named(self) -> None:
@@ -873,7 +885,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         apply = self.build("proposals_apply", api)
         await apply(self.agreeing(), "p-1")
         self.assertEqual(
-            [], [c for c in api.calls if "/api/operations/" in c["path"]]
+            [], [c for c in api.calls if "/api/visual-operations/" in c["path"]]
         )
 
     async def test_a_proposal_that_is_not_pending_is_refused_before_asking(
@@ -1206,6 +1218,11 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                          packet["definition"]["sources"])
         self.assertEqual("view", packet["definition"]["kind"])
         self.assertFalse(packet["planned"])
+        self.assertIn("persistent database relation", packet["summary"])
+        self.assertIn("never applied", packet["summary"])
+        self.assertIn("persistent database relation", packet["note"])
+        self.assertIn("never applied", packet["note"])
+        self.assertIn("separate approval", packet["note"])
 
     async def test_a_plan_fingerprint_is_carried_and_noted(self) -> None:
         api = self.Api(self)

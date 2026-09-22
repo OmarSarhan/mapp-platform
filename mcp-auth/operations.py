@@ -114,6 +114,13 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("inspect",),
         mutating=False,
     ),
+    "derived-layers.drafts": Operation(
+        operation_id="derived-layers.drafts",
+        method="GET",
+        path_template="/api/derived-layers/drafts",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
     "federation.aliases.list": Operation(
         operation_id="federation.aliases.list",
         method="GET",
@@ -225,6 +232,13 @@ OPERATIONS: dict[str, Operation] = {
         method="GET",
         path_template="/api/operations/{operationId}",
         required_scopes=("derive",),
+        mutating=False,
+    ),
+    "visual.operations.show": Operation(
+        operation_id="visual.operations.show",
+        method="GET",
+        path_template="/api/visual-operations/{operationId}",
+        required_scopes=("visual",),
         mutating=False,
     ),
     "derived-layers.capabilities": Operation(
@@ -346,6 +360,13 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("federation:observe", ),
         mutating=False,
     ),
+    "visual.artifacts.image": Operation(
+        operation_id="visual.artifacts.image",
+        method="GET",
+        path_template="/api/visual-artifacts/{runId}/{filename}",
+        required_scopes=("visual",),
+        mutating=False,
+    ),
     "proposals.preview-plan": Operation(
         operation_id="proposals.preview-plan",
         method="POST",
@@ -379,6 +400,13 @@ OPERATIONS: dict[str, Operation] = {
         # Writes a proposal record and no workspace. Single-use anyway: the
         # risk class is `propose`, which is not a read class, and a replayed
         # create would add a second identical entry to somebody's queue.
+        mutating=True,
+    ),
+    "proposals.decline": Operation(
+        operation_id="proposals.decline",
+        method="POST",
+        path_template="/api/proposals/{proposalId}/decline",
+        required_scopes=("propose",),
         mutating=True,
     ),
     "semantic.proposals.create": Operation(

@@ -45,6 +45,55 @@ Catalog discovery reads geometry type and SRID directly from PostgreSQL
 relation attributes so ordinary tables, views, and materialized views are
 reported consistently.
 
+`POST /api/derived-layers/plan` leaves no persistent relation; its
+catalog-validation view is rolled back before returning. It reports planner
+estimates, not an executed output distribution or a rendered screenshot.
+Rendering still requires separately approved database creation. A request to
+preview before making changes is not permission to create a relation.
+
+Create and plan accept the optional closed object
+`"draft": {"expiresInHours": 24, "cleanupApproved": true}`. Retention must be an
+integer from 1 to 168 hours. This explicitly opts into a disposable relation
+whose creation approval also authorizes later automatic cleanup. The policy is
+part of the plan fingerprint and approval request digest. Omission preserves
+the permanent lifecycle; existing relations are not retroactively enrolled.
+
+After creation, bind the exact `{name, assetId, generation}` identity through
+`draftRelations` in both workspace proposal check and create. The candidate must
+reference the draft, and the bindings are included in the check fingerprint.
+Applying the owning proposal retains the relation permanently. Declining the
+proposal schedules cleanup; abandoned or unbound drafts become eligible at the
+approved expiry. Merely being pending is not a cleanup trigger before expiry.
+
+Cleanup runs in the background, defers while previews run, and rechecks the
+live workspace, other pending proposals, managed and PostgreSQL dependencies,
+and the exact relation identity and generation before deleting. It never uses
+`CASCADE`. Blocked or failed cleanup remains inspectable and can be retried;
+successful cleanup uses the existing semantic archive lifecycle. The read-only
+`GET /api/derived-layers/drafts` route (`inspect`) reports draft ownership,
+retention, and cleanup outcomes. MCP exposes this as `derived_layers_drafts`,
+creation retention as `draft_expires_in_hours`, and bindings as `draft_relations`.
+MCP `proposals_decline` records a final proposal rejection through
+`POST /api/proposals/{proposalId}/decline`. Refusing an apply approval alone
+leaves the proposal pending; cleanup then waits for final rejection or the
+approved expiry. Neither a decline response nor queueing proves deletion has
+finished: inspect the draft lifecycle status for its result and blockers.
+
+Disposable drafts are persistent database state with an approved cleanup
+policy, not non-mutating query-backed rendering. They retain source-profile
+authority, SQL/H3/plan and storage guards, database resource limits, and separate
+workspace publication approval. A transaction-local view cannot supply XYZ's
+separate database connections. Relations created without draft policy continue
+to require a separate confirmed dependency-checked drop, even when a workspace
+proposal is rejected.
+
+Active drafts cannot be replaced or refreshed. Publish first or create a new
+draft and obtain its own approval. The capability
+`definitionPlanning.draftLifecycle` advertises this restriction and retention
+policy separately from the unsupported non-mutating rendering capability.
+See [disposable relation cleanup](derived-draft-cleanup.md) for the deletion
+boundary, operational blast radius, and rollout and recovery considerations.
+
 Every successful managed create also stores a generated semantic-profile event
 as a matter of course. The relation definition, stable semantic asset ID,
 generation, and event are committed together in PostgreSQL; delivery to the

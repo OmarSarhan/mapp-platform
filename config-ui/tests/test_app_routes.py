@@ -2890,6 +2890,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         recipe = capabilities["recipes"]["areaWeightedH3"]
         self.assertFalse(recipe["available"])
         self.assertFalse(recipe["mutationAppliedByPlan"])
+        self.assertFalse(capabilities["definitionPlanning"]["draftPreview"]["supported"])
         self.assertEqual(2, recipe["version"])
         self.assertEqual("wgs84-spheroid", recipe["areaModel"])
         self.assertEqual(4326, recipe["geodeticSrid"])
@@ -3149,6 +3150,9 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertFalse(body["mutationApplied"])
         plan = body["derivedLayerPlan"]
         self.assertEqual("1", plan["version"])
+        self.assertFalse(plan["draftPreview"]["supported"])
+        self.assertTrue(plan["draftPreview"]["requiresDatabaseCreation"])
+        self.assertFalse(plan["draftPreview"]["proposalScoped"])
         self.assertEqual(
             {**request, "planFingerprint": plan["planFingerprint"]},
             plan["createRequest"],

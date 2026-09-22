@@ -35,12 +35,33 @@ applied to a different starting point.
 Both take `operations` and a `revision`, not a candidate document. You never
 send a whole workspace.
 
+For a disposable derived preview, first obtain approval for creation with
+`draft_expires_in_hours` as described in `mapp://guidance/derived-layers`. Pass
+its exact `name`, `assetId`, and `generation` in `draft_relations` to both check
+and create. The fingerprint binds ownership as well as workspace changes.
+Publication retains the relation; decline or its approved expiry schedules
+guarded cleanup. `derived_layers_drafts` reports the cleanup outcome.
+
 **5. Show the change before asking for it.** `proposals_show` gives the diff a
-reviewer reads. `proposals_preview_plan`, `proposals_preview_test` and
-`proposals_preview_screenshot` render the proposed state through a real browser
-and attach the result to the proposal. A proposal with evidence is worth far
+reviewer reads. `proposals_preview_plan` describes the intended view;
+`proposals_preview_test` and `proposals_preview_screenshot` render the proposed
+state through a real browser and attach the result to the proposal. A proposal with evidence is worth far
 more than one without, because the person deciding can see it rather than
 imagine it.
+
+Screenshot and test previews return immediately with an `operationId`, including
+when `hover: true`. Poll `visual_operations_show` after `pollAfterSeconds` until
+the status is terminal; each poll uses a fresh credential and the render keeps
+running independently. Use `artifacts_image` with a returned PNG artifact path
+to show the retained screenshot in chat. A running preview is not a pass.
+
+For a choropleth overview, use `framing: "layer"` to fit the full effective
+filtered layer, or `framing: "viewport"` to preserve supplied `centre` and
+`zoom`. Without those coordinates, viewport framing uses the configured locale
+startup view; it cannot read an unsaved browser viewport. The default
+`framing: "feature"` remains useful for close-up hover and feature-information
+checks. Area-wide screenshots can pass while a centre interaction finds no
+feature, so inspect the separate interaction evidence.
 
 **6. Apply only when a person agrees.** `proposals_apply` asks, in the session,
 and does nothing until answered. Pass `evidence_operation_id` from a preview
@@ -64,6 +85,13 @@ not by you, and the summary comes from the platform's record of the change.
 
 A refusal after you asked is a decision, not an error to work around. Do not
 retry a declined action with different wording.
+
+When the user rejects the proposal itself, `proposals_decline` records that
+final decision. Its owned disposable derived relations then become eligible
+for cleanup under the policy approved at creation. Refusing an apply approval
+alone does not decline the proposal; its drafts remain until the approved
+retention expiry unless it is explicitly declined or published. Report cleanup
+status from `derived_layers_drafts`; rejection does not prove deletion finished.
 
 ## Non-negotiable
 

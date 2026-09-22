@@ -24,7 +24,10 @@ check would find nothing to check with.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -48,6 +51,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, ImageContent
 from pydantic import BaseModel
 from pydantic import Field
 
@@ -94,6 +98,13 @@ DERIVED_LAYERS_LIST = {
     "scopes": ("inspect",),
 }
 
+DERIVED_LAYERS_DRAFTS = {
+    "operation_id": "derived-layers.drafts",
+    "method": "GET",
+    "path_template": "/api/derived-layers/drafts",
+    "scopes": ("inspect",),
+}
+
 FEDERATION_LIST = {
     "operation_id": "federation.aliases.list",
     "method": "GET",
@@ -119,6 +130,13 @@ PROPOSALS_LIST = {
     "scopes": ("inspect",),
 }
 
+ARTIFACTS_IMAGE = {
+    "operation_id": "visual.artifacts.image",
+    "method": "GET",
+    "path_template": "/api/visual-artifacts/{runId}/{filename}",
+    "scopes": ("visual",),
+}
+
 PROPOSALS_PREVIEW_PLAN = {
     "operation_id": "proposals.preview-plan",
     "method": "POST",
@@ -134,10 +152,8 @@ PROPOSALS_PREVIEW_TEST = {
     # 422 carries the outcome, not an error: the checks failed and the
     # images exist.
     "result_statuses": (422,),
-    # Measured at 20.8 and 24.4 seconds for one render; the read default of
-    # 15 would report a working platform as unavailable. Under the
-    # credential's 60-second life on purpose.
-    "timeout": 45.0,
+    # Only waits for durable background admission, never for Chromium.
+    "timeout": 15.0,
 }
 
 PROPOSALS_PREVIEW_SCREENSHOT = {
@@ -148,16 +164,21 @@ PROPOSALS_PREVIEW_SCREENSHOT = {
     # 422 carries the outcome, not an error: the checks failed and the
     # images exist.
     "result_statuses": (422,),
-    # Measured at 20.8 and 24.4 seconds for one render; the read default of
-    # 15 would report a working platform as unavailable. Under the
-    # credential's 60-second life on purpose.
-    "timeout": 45.0,
+    # Only waits for durable background admission, never for Chromium.
+    "timeout": 15.0,
 }
 
 PROPOSALS_CREATE = {
     "operation_id": "proposals.create",
     "method": "POST",
     "path_template": "/api/proposals",
+    "scopes": ("propose",),
+}
+
+PROPOSALS_DECLINE = {
+    "operation_id": "proposals.decline",
+    "method": "POST",
+    "path_template": "/api/proposals/{proposalId}/decline",
     "scopes": ("propose",),
 }
 
@@ -334,6 +355,13 @@ OPERATIONS_SHOW = {
     "method": "GET",
     "path_template": "/api/operations/{operationId}",
     "scopes": ("derive",),
+}
+
+VISUAL_OPERATIONS_SHOW = {
+    "operation_id": "visual.operations.show",
+    "method": "GET",
+    "path_template": "/api/visual-operations/{operationId}",
+    "scopes": ("visual",),
 }
 
 #: The irreversible half of the loop. Each requires an approval receipt, which
@@ -722,7 +750,7 @@ def _proposal_summary(proposal):
     """
     proposal = proposal if isinstance(proposal, dict) else {}
     explanation = proposal.get("explanation")
-    return {
+    summary = {
         "proposalId": proposal.get("id"),
         "status": proposal.get("status"),
         "created": proposal.get("created"),
@@ -731,6 +759,10 @@ def _proposal_summary(proposal):
         if isinstance(explanation, str) and len(explanation) > 200
         else explanation,
     }
+    for key in ("draftRelations", "draftCleanup"):
+        if key in proposal:
+            summary[key] = proposal[key]
+    return summary
 
 
 def _change_preview(value):
@@ -879,34 +911,67 @@ def _visual_outcome(payload):
     visual = visual if isinstance(visual, dict) else {}
     plan = result.get("plan") or payload.get("plan")
     plan = plan if isinstance(plan, dict) else {}
+    target = operation.get("target")
+    target = target if isinstance(target, dict) else {}
+    error = operation.get("error")
+    error = error if isinstance(error, dict) else {}
 
     failed = []
     diagnosis = visual.get("diagnosis")
-    for side in ("original", "candidate"):
-        checks = (diagnosis or {}).get(side) if isinstance(diagnosis, dict) else None
-        checks = (checks or {}).get("checks") if isinstance(checks, dict) else None
+    diagnosis = diagnosis if isinstance(diagnosis, dict) else {}
+    sides = [(side, diagnosis.get(side)) for side in ("original", "candidate")]
+    if isinstance(diagnosis.get("checks"), list):
+        source = result.get("source") or target.get("source")
+        side = (
+            "live"
+            if source == "live" or operation.get("kind") == "visual.test"
+            else "candidate"
+        )
+        sides.append((side, diagnosis))
+    for side, side_diagnosis in sides:
+        checks = side_diagnosis.get("checks") if isinstance(side_diagnosis, dict) else None
         for check in checks if isinstance(checks, list) else []:
             if isinstance(check, dict) and not check.get("passed"):
                 failed.append({"side": side, "check": check.get("id"),
                                "observed": _change_preview(check.get("observed"))})
 
     detail = {
-        "proposalId": payload.get("proposalId") or result.get("proposalId"),
+        "proposalId": (
+            payload.get("proposalId") or result.get("proposalId")
+            or target.get("proposalId")
+        ),
         "operationId": operation.get("id") or result.get("operationId"),
         "status": operation.get("status"),
-        "layer": plan.get("layer"),
+        "stage": operation.get("stage"),
+        "layer": plan.get("layer") or target.get("layer"),
         "layerTitle": plan.get("layerTitle"),
-        "passed": visual.get("passed"),
-        "failedStage": visual.get("failedStage"),
+        "passed": (
+            False if operation.get("status") == "failed"
+            else None if operation.get("status") in {"running", "indeterminate"}
+            else visual.get("passed")
+        ),
+        "failedStage": (
+            visual.get("failedStage") or result.get("failedStage")
+            or error.get("failedStage")
+        ),
         "failedChecks": failed,
         # The point of the call: where the rendered images are.
         "artifacts": visual.get("artifacts") or {},
         "warnings": plan.get("warnings") or [],
     }
-    error = operation.get("error")
-    if isinstance(error, dict):
+    if error:
         detail["error"] = {"code": error.get("code"),
                            "message": error.get("message")}
+    if operation.get("status") == "running" and operation.get("id"):
+        detail["pollTool"] = "visual_operations_show"
+        detail["pollAfterSeconds"] = 5
+        detail["statusUrl"] = f"/api/visual-operations/{operation['id']}"
+    if detail["artifacts"]:
+        detail["artifactTool"] = "artifacts_image"
+        detail["artifactInstructions"] = (
+            "Call artifacts_image(artifact_path=<PNG artifact value>) to display"
+            " a retained screenshot in chat."
+        )
     return detail
 
 
@@ -1686,6 +1751,21 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         )
 
     @tool(
+        operation=DERIVED_LAYERS_DRAFTS,
+        name="derived_layers_drafts",
+        description=(
+            "Inspect disposable derived relations, their proposal ownership,"
+            " expiry, and automatic cleanup results. Metadata only; neither"
+            " deletes relations nor changes retention."
+        ),
+    )
+    def derived_layers_drafts() -> dict:
+        return _without_meta(spend(
+            DERIVED_LAYERS_DRAFTS,
+            path=DERIVED_LAYERS_DRAFTS["path_template"],
+        ))
+
+    @tool(
         operation=DERIVED_LAYERS_LIST,
         name="derived_layers_show",
         description=(
@@ -1727,7 +1807,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " the probes the platform runs against the sources, the shape it"
             " would produce, and a planFingerprint. Pass that fingerprint to"
             " derived_layers_create and the create is refused if anything"
-            " moved in between. Creates nothing and asks nobody."
+            " moved in between. Creates no persistent relation and asks nobody."
+            " Optional draft_expires_in_hours plans disposable database state"
+            " with preauthorized cleanup; rendering still needs an approved"
+            " database creation. Use identical draft retention when creating."
         ),
     )
     def derived_layers_plan(
@@ -1738,6 +1821,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         geometry_column: str,
         kind: str | None = None,
         description: str | None = None,
+        draft_expires_in_hours: int | None = None,
     ) -> dict:
         """The dry run, and the reason `create` is not the first step.
 
@@ -1754,6 +1838,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 name=name, query=query, sources=sources,
                 id_column=id_column, geometry_column=geometry_column,
                 kind=kind, description=description,
+                draft_expires_in_hours=draft_expires_in_hours,
             ),
         ))
 
@@ -1765,7 +1850,11 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " showing the plan. Pass plan_fingerprint from"
             " derived_layers_plan so the create is refused if the sources"
             " moved since you looked. This writes to the database directly --"
-            " there is no proposal and no review queue."
+            " there is no proposal and no review queue for creation. By default"
+            " the relation persists. Optional draft_expires_in_hours explicitly"
+            " authorizes automatic cleanup after proposal decline or expiry;"
+            " publication makes the draft permanent. A preview-only request"
+            " is not approval for this database creation."
         ),
     )
     async def derived_layers_create(
@@ -1779,6 +1868,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         description: str | None = None,
         plan_fingerprint: str | None = None,
         background: bool | None = None,
+        draft_expires_in_hours: int | None = None,
     ) -> dict:
         """The first tool that creates a database object.
 
@@ -1792,13 +1882,17 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
             kind=kind, description=description,
+            draft_expires_in_hours=draft_expires_in_hours,
         )
         if plan_fingerprint is not None:
             body["planFingerprint"] = plan_fingerprint
         if background is not None:
             body["background"] = background
         packet = {
-            "summary": f"Create the derived relation {name}.",
+            "summary": (
+                f"Create the persistent database relation {name}. "
+                "It remains even if the workspace proposal is never applied."
+            ),
             "changeCount": 1,
             "changes": [{"op": "create", "path": f"derived_layers.{name}",
                          "was": None, "becomes": _change_preview(query)}],
@@ -1807,7 +1901,27 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 "idColumn": id_column, "geometryColumn": geometry_column,
             },
             "planned": plan_fingerprint is not None,
+            "note": (
+                "This creates a persistent database relation now. It is not a "
+                "temporary preview: it remains even if the workspace proposal "
+                "is rejected or never applied. Workspace publication requires "
+                "separate approval."
+            ),
         }
+        if "draft" in body:
+            packet["definition"]["draft"] = dict(body["draft"])
+            packet["summary"] = (
+                f"Create the disposable database relation {name} for "
+                f"{draft_expires_in_hours} hours. Authorize automatic cleanup "
+                "after its proposal is declined or retention expires."
+            )
+            packet["note"] = (
+                "This creates persistent database state now and authorizes "
+                "automatic deletion after proposal decline or expiry, once "
+                "active previews and dependencies permit. Bind the returned "
+                "name, assetId and generation to a workspace proposal. "
+                "Publication makes it permanent and requires separate approval."
+            )
         receipt = await approval_gate(
             ctx, DERIVED_LAYERS_CREATE,
             path=DERIVED_LAYERS_CREATE["path_template"], body=body,
@@ -1997,6 +2111,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
 
     def _derived_definition(
         *, name, query, sources, id_column, geometry_column, kind, description,
+        draft_expires_in_hours=None,
     ):
         """The definition body, built once and in one order.
 
@@ -2015,6 +2130,14 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         }
         if description is not None:
             body["description"] = description
+        if draft_expires_in_hours is not None:
+            if (type(draft_expires_in_hours) is not int
+                    or not 1 <= draft_expires_in_hours <= 168):
+                raise ToolError("draft_expires_in_hours must be an integer from 1 to 168.")
+            body["draft"] = {
+                "expiresInHours": draft_expires_in_hours,
+                "cleanupApproved": True,
+            }
         return body
 
     def _derived_entry(name):
@@ -2184,13 +2307,19 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " proposal would leave it, the background layers, the effective"
             " filter and any warnings. Renders nothing and costs nothing to"
             " run. Use it before the screenshot to check the right thing"
-            " would be drawn."
+            " would be drawn. Use framing=layer to fit the complete filtered"
+            " layer or framing=viewport with centre/zoom for a map area"
+            " (otherwise the configured locale view)."
         ),
     )
     def proposals_preview_plan(
         proposal_id: str,
         layer: str,
         locale: str | None = None,
+        framing: str = "feature",
+        centre: list[float] | None = None,
+        zoom: float | None = None,
+        viewport: dict | None = None,
     ) -> dict:
         """The cheap half of review evidence.
 
@@ -2209,10 +2338,63 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         body = {"layer": layer}
         if locale is not None:
             body["locale"] = locale
+        if framing != "feature":
+            body["framing"] = framing
+        if centre is not None:
+            body["centre"] = centre
+        if zoom is not None:
+            body["zoom"] = zoom
+        if viewport is not None:
+            body["viewport"] = viewport
         payload = _without_meta(
             spend(PROPOSALS_PREVIEW_PLAN, path=path, body=body)
         )
         return payload
+
+    @tool(
+        operation=ARTIFACTS_IMAGE,
+        name="artifacts_image",
+        description=(
+            "Display a retained preview screenshot as an image in this chat. "
+            "Pass a PNG path from the artifacts returned by a completed visual "
+            "operation (usually afterMap, afterPage, or afterHoverTooltip). "
+            "Reads one image, maximum 8 MiB, with a fresh visual credential."
+        ),
+    )
+    def artifacts_image(artifact_path: str) -> CallToolResult:
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}/[a-z-]+\.png", artifact_path,
+        ) is None:
+            raise ToolError("Pass the relative PNG artifact path returned by a visual operation.")
+        run_id, filename = artifact_path.split("/")
+        path = ARTIFACTS_IMAGE["path_template"].replace(
+            "{runId}", run_id,
+        ).replace("{filename}", filename)
+        payload = spend(ARTIFACTS_IMAGE, path=path)
+        artifact = payload.get("artifact") if isinstance(payload, dict) else None
+        encoded = artifact.get("data") if isinstance(artifact, dict) else None
+        maximum = 8 * 1024 * 1024
+        if (
+            not isinstance(artifact, dict)
+            or artifact.get("path") != artifact_path
+            or artifact.get("mimeType") != "image/png"
+            or not isinstance(encoded, str)
+            or len(encoded) > 4 * ((maximum + 2) // 3)
+        ):
+            raise ToolError("The platform returned an invalid or oversized screenshot.")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise ToolError("The platform returned an invalid screenshot.") from None
+        if (
+            len(data) > maximum
+            or len(data) != artifact.get("sizeBytes")
+            or not data.startswith(b"\x89PNG\r\n\x1a\n")
+        ):
+            raise ToolError("The platform returned an invalid or oversized screenshot.")
+        return CallToolResult(content=[
+            ImageContent(type="image", data=encoded, mimeType="image/png"),
+        ])
 
     @tool(
         operation=PROPOSALS_PREVIEW_SCREENSHOT,
@@ -2220,9 +2402,11 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         description=(
             "Render a proposed change through a real browser and attach the"
             " images to the proposal, so a person can see what it would look"
-            " like before applying it. Returns where the images are, whether"
-            " the checks passed, and which failed. Applies nothing. Takes"
-            " about five seconds."
+            " like before applying it. Returns an operationId immediately;"
+            " poll visual_operations_show for checks and images. Supports hover."
+            " Use framing=layer for the complete filtered choropleth, or"
+            " framing=viewport with centre/zoom for a requested map area;"
+            " omitted centre/zoom use the configured locale view. Applies nothing."
         ),
     )
     def proposals_preview_screenshot(
@@ -2230,52 +2414,31 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         layer: str,
         hover: bool = False,
         locale: str | None = None,
+        framing: str = "feature",
+        centre: list[float] | None = None,
+        zoom: float | None = None,
+        viewport: dict | None = None,
     ) -> dict:
-        """The evidence a reviewer actually looks at.
+        """Start durable evidence work and return immediately.
 
-        Run in the foreground deliberately. The platform will background this
-        and hand back an operation to poll, but `operations_show` costs
-        `derive` while the configuration API demands `visual` to inspect an
-        operation of this kind -- so an agent that backgrounded it could start
-        a screenshot and then not be allowed to read the outcome. Waiting the
-        five seconds avoids inventing a way around that.
-
-        `hover` defaults to False and True is refused, which is a limit of
-        this surface rather than of the platform.
-
-        Measured against one proposal: `hover=false` renders in 14.4 seconds,
-        `hover=true` in 97.1, and omitting it entirely in 100 to 166 -- the
-        hover path drives real pointer interaction and waits on tooltips. A
-        token B lives sixty seconds, so a hover render cannot finish before the
-        credential authorising it expires. Attempting one spends a minute and
-        returns "the configuration API is unavailable", which is both slow and
-        untrue.
-
-        So it is refused up front, with the alternative named. The dashboard
-        and the CLI hold a session rather than a request-bound credential and
-        can wait as long as it takes.
-
-        Omitting `hover` would be the honest default and is not available for
-        the same reason: the platform reads an absent hover as "decide for
-        yourself", and what it decides costs more than the credential has. A
-        separate configuration-API bug made an absent hover fail outright
-        rather than merely slowly; that is fixed, and this limit is what
-        remains.
+        Browser work can outlive a short-lived request credential. The server
+        retains the accepted operation; visual_operations_show spends a fresh
+        credential on each poll without restarting the render.
         """
-        if hover:
-            raise ToolError(
-                "A hover render takes about 97 seconds and the credential"
-                " authorising this request lives 60, so it cannot complete"
-                " here. Run it from the dashboard or the CLI, which hold a"
-                " session rather than a per-request credential. Without hover"
-                " this returns in about 15 seconds."
-            )
         path = PROPOSALS_PREVIEW_SCREENSHOT["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
-        body = {"layer": layer, "hover": hover}
+        body = {"layer": layer, "hover": hover, "background": True}
         if locale is not None:
             body["locale"] = locale
+        if framing != "feature":
+            body["framing"] = framing
+        if centre is not None:
+            body["centre"] = centre
+        if zoom is not None:
+            body["zoom"] = zoom
+        if viewport is not None:
+            body["viewport"] = viewport
         return _visual_outcome(
             spend(PROPOSALS_PREVIEW_SCREENSHOT, path=path, body=body)
         )
@@ -2287,7 +2450,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "Render a proposed change and compare it against the workspace as"
             " it stands, reporting whether the checks passed and which did"
             " not. The same evidence as the screenshot, judged rather than"
-            " just captured. Applies nothing."
+            " just captured. Returns an operationId immediately; poll"
+            " visual_operations_show. Supports hover, framing=layer for the"
+            " complete filtered layer, or framing=viewport for supplied"
+            " centre/zoom (otherwise the configured locale view). Applies nothing."
         ),
     )
     def proposals_preview_test(
@@ -2295,27 +2461,26 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         layer: str,
         hover: bool = False,
         locale: str | None = None,
+        framing: str = "feature",
+        centre: list[float] | None = None,
+        zoom: float | None = None,
+        viewport: dict | None = None,
     ) -> dict:
-        """The judged form: the platform decides whether the render is
-        acceptable rather than leaving a person to compare two images.
-
-        The same hover limit applies and for the same measured reason; see
-        `proposals_preview_screenshot`.
-        """
-        if hover:
-            raise ToolError(
-                "A hover render takes about 97 seconds and the credential"
-                " authorising this request lives 60, so it cannot complete"
-                " here. Run it from the dashboard or the CLI, which hold a"
-                " session rather than a per-request credential. Without hover"
-                " this returns in about 15 seconds."
-            )
+        """Start candidate validation; poll visual_operations_show for evidence."""
         path = PROPOSALS_PREVIEW_TEST["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
-        body = {"layer": layer, "hover": hover}
+        body = {"layer": layer, "hover": hover, "background": True}
         if locale is not None:
             body["locale"] = locale
+        if framing != "feature":
+            body["framing"] = framing
+        if centre is not None:
+            body["centre"] = centre
+        if zoom is not None:
+            body["zoom"] = zoom
+        if viewport is not None:
+            body["viewport"] = viewport
         return _visual_outcome(
             spend(PROPOSALS_PREVIEW_TEST, path=path, body=body)
         )
@@ -2328,7 +2493,9 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " `operations` and `revision` as proposals_check plus the"
             " `checkFingerprint` it returned, so a proposal can only be made"
             " from a change that was validated. Applies nothing: a person"
-            " reviews and applies separately."
+            " reviews and applies separately. Pass the identical draft_relations"
+            " bindings from proposals_check to claim disposable relations; each"
+            " binding names name, assetId and generation."
         ),
     )
     def proposals_create(
@@ -2336,6 +2503,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         revision: str,
         check_fingerprint: str,
         explanation: str | None = None,
+        draft_relations: list[dict] | None = None,
     ) -> dict:
         """The first tool here that changes durable state, and the narrowest
         way to do it.
@@ -2365,6 +2533,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         }
         if explanation is not None:
             body["explanation"] = explanation
+        if draft_relations is not None:
+            body["draftRelations"] = draft_relations
         payload = spend(
             PROPOSALS_CREATE, path=PROPOSALS_CREATE["path_template"], body=body
         )
@@ -2380,6 +2550,35 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             _change_summary(entry)
             for entry in (diff if isinstance(diff, list) else [])
         ]
+        return detail
+
+    @tool(
+        operation=PROPOSALS_DECLINE,
+        name="proposals_decline",
+        description=(
+            "Reject a pending workspace proposal when the user has decided"
+            " against it. Applies no workspace change. Schedules guarded"
+            " cleanup only for its explicitly owned disposable relations,"
+            " under the cleanup policy approved at creation. Declining an"
+            " apply approval alone does not reject the proposal; this tool is"
+            " the separate final rejection."
+        ),
+    )
+    def proposals_decline(proposal_id: str, reason: str | None = None) -> dict:
+        path = PROPOSALS_DECLINE["path_template"].replace(
+            "{proposalId}", quote(proposal_id, safe="")
+        )
+        body = {} if reason is None else {"reason": reason}
+        payload = spend(PROPOSALS_DECLINE, path=path, body=body)
+        proposal = payload.get("proposal")
+        proposal = proposal if isinstance(proposal, dict) else {}
+        detail = _proposal_summary(proposal)
+        detail["declineReason"] = proposal.get("declineReason")
+        if proposal.get("draftRelations"):
+            detail["cleanupNote"] = (
+                "Owned disposable relations are eligible for guarded automatic "
+                "cleanup. Inspect derived_layers_drafts for completion or blockers."
+            )
         return detail
 
     @tool(
@@ -2437,13 +2636,16 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "Validate workspace changes without proposing them: whether they"
             " are valid, what they would change, and any warnings. Returns a"
             " checkFingerprint. Takes `operations` and the `revision` they"
-            " apply to, which layers_list reports. Writes nothing."
+            " apply to, which layers_list reports. Optional draft_relations"
+            " binds disposable name, assetId and generation identities into"
+            " the fingerprint. Writes nothing."
         ),
     )
     def proposals_check(
         operations: list[dict],
         revision: str,
         explanation: str | None = None,
+        draft_relations: list[dict] | None = None,
     ) -> dict:
         """The first thing on this surface that costs a write scope to read.
 
@@ -2466,6 +2668,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         body = {"revision": revision, "operations": operations}
         if explanation is not None:
             body["explanation"] = explanation
+        if draft_relations is not None:
+            body["draftRelations"] = draft_relations
         payload = spend(
             PROPOSALS_CHECK, path=PROPOSALS_CHECK["path_template"], body=body
         )
@@ -2473,7 +2677,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         check = check if isinstance(check, dict) else {}
         diff = check.get("diff")
         warnings = check.get("warnings")
-        return {
+        detail = {
             "valid": check.get("valid"),
             # What `proposals_create` will require, and the only reason to keep
             # a fingerprint here at all.
@@ -2485,6 +2689,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
                 for entry in (diff if isinstance(diff, list) else [])
             ],
         }
+        for key in ("draftRelations", "draftCleanup"):
+            if key in check:
+                detail[key] = check[key]
+        return detail
 
     @tool(
         operation=SEMANTIC_PROPOSALS_CHECK,
@@ -2807,6 +3015,12 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "originalRevision": proposal.get("originalRevision"),
             "currentRevision": payload.get("revision"),
         }
+        if proposal.get("draftRelations"):
+            packet["draftRelations"] = proposal["draftRelations"]
+            packet["note"] = (
+                "Publishing this proposal retains its bound disposable "
+                "derived relations permanently."
+            )
         if applicable is not None:
             packet["applicability"] = applicable
         warnings = proposal.get("warnings")
@@ -2823,19 +3037,19 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         to show; what that run found comes from the platform, so an agent
         cannot report a pass that did not happen.
 
-        A failure here does not fail the apply. Reading an operation costs
-        `derive`, which every preset but `discovery` carries and a hand-picked
-        grant may not, and an apply that refuses because its *illustration*
+        A failure here does not fail the apply. Reading visual evidence costs
+        `visual`, which a hand-picked grant may not carry, and an apply that
+        refuses because its *illustration*
         could not be fetched would be refusing the wrong thing. What is not
         done is dropping it quietly: the packet says evidence was asked for
         and why it is missing, so the person decides knowing there is a render
         they are not looking at.
         """
-        target = OPERATIONS_SHOW["path_template"].replace(
+        target = VISUAL_OPERATIONS_SHOW["path_template"].replace(
             "{operationId}", quote(operation_id, safe="")
         )
         try:
-            return _visual_outcome(spend(OPERATIONS_SHOW, path=target))
+            return _visual_outcome(spend(VISUAL_OPERATIONS_SHOW, path=target))
         except ToolError as refusal:
             return {
                 "operationId": operation_id,
@@ -2919,6 +3133,24 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         is the difference, and nothing else here reports it.
         """
         return _without_meta(spend(XYZ_STATUS, path=XYZ_STATUS["path_template"]))
+
+    @tool(
+        operation=VISUAL_OPERATIONS_SHOW,
+        name="visual_operations_show",
+        description=(
+            "Poll an asynchronous proposal preview or visual test by operationId."
+            " Returns status, stage, completed checks and retained artifact paths."
+            " While running, wait pollAfterSeconds before polling again. Once"
+            " complete, call artifacts_image with a PNG artifact path to display"
+            " it. Uses visual permission and a fresh credential on each poll."
+        ),
+    )
+    def visual_operations_show(operation_id: str) -> dict:
+        """Read accepted visual work without tying its life to this request."""
+        path = VISUAL_OPERATIONS_SHOW["path_template"].replace(
+            "{operationId}", quote(operation_id, safe="")
+        )
+        return _visual_outcome(spend(VISUAL_OPERATIONS_SHOW, path=path))
 
     @tool(
         operation=OPERATIONS_SHOW,

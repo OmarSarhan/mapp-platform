@@ -1031,6 +1031,7 @@ case "${1:-}" in
       --env PYTHONPATH=/app \
       --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
       --env "MAPP_BOOTSTRAP_DATABASE_URL=${control_test_url}" \
+      --env "MAPP_DRAFT_TEST_DSN=${control_test_url}" \
       config-ui \
       python -m unittest discover -s /workspace/config-ui/tests -v 2>&1 \
       | tee "${config_ui_log}"; then

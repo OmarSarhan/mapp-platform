@@ -2574,34 +2574,118 @@ class PreviewEvidenceTests(ToolTestCase):
         # 6,174 bytes of per-check diagnosis in the real reply.
         self.assertNotIn("diagnosis", json.dumps(detail))
 
-    def test_hover_is_sent_as_false_because_nothing_else_completes(self) -> None:
-        """Measured on one proposal: hover=false renders in 14.4 seconds,
-        hover=true in 97.1, and omitting it in 100 to 166. A token B lives 60,
-        so false is the only value that finishes before the credential
-        authorising the request expires."""
-        api = FakeConfigApi(answer=SHOT)
-        self.as_caller(caller(scopes=AUTHORING))
-        self.build_named("proposals_preview_screenshot", config_api=api)(
-            proposal_id="p-1", layer="Bus_Stops")
-        self.assertIs(False, api.calls[0]["body"]["hover"])
-        self.assertEqual("POST", api.calls[0]["method"])
-
-    def test_asking_for_hover_is_refused_before_it_is_attempted(self) -> None:
-        """Rather than spending a minute and reporting the platform as
-        unavailable, which is both slow and untrue. The refusal names the
-        measurement and the surface that can do it."""
+    def test_previews_start_background_work_including_hover(self) -> None:
         for name in ("proposals_preview_screenshot", "proposals_preview_test"):
-            with self.subTest(tool=name):
-                api = FakeConfigApi(answer=SHOT)
+            for hover in (False, True):
+                with self.subTest(tool=name, hover=hover):
+                    api = FakeConfigApi(answer={"operation": {
+                        "id": "job-1", "status": "running", "stage": "accepted",
+                        "target": {"proposalId": "p-1", "layer": "Bus_Stops"},
+                    }})
+                    self.as_caller(caller(scopes="mcp:connect inspect visual"))
+                    detail = self.build_named(name, config_api=api)(
+                        proposal_id="p-1", layer="Bus_Stops", hover=hover)
+                    self.assertEqual({"layer": "Bus_Stops", "hover": hover,
+                                      "background": True}, api.calls[0]["body"])
+                    self.assertEqual("running", detail["status"])
+                    self.assertEqual("accepted", detail["stage"])
+                    self.assertEqual("job-1", detail["operationId"])
+                    self.assertEqual("visual_operations_show", detail["pollTool"])
+                    self.assertEqual("p-1", detail["proposalId"])
+                    self.assertIsNone(detail["passed"])
+
+    def test_visual_poll_uses_fresh_visual_credentials_and_returns_evidence(self):
+        class FreshExchange(FakeExchange):
+            def exchange(self, **kwargs):
+                super().exchange(**kwargs)
+                return f"fresh-{len(self.calls)}"
+
+        exchange = FreshExchange()
+        api = FakeConfigApi(answer=SHOT)
+        self.as_caller(caller(scopes="mcp:connect inspect visual"))
+        poll = self.build_named("visual_operations_show", exchange=exchange,
+                                config_api=api)
+        for _ in range(2):
+            detail = poll(operation_id="odd/id")
+            self.assertFalse(detail["passed"])
+            self.assertIn("afterMap", detail["artifacts"])
+            self.assertEqual("artifacts_image", detail["artifactTool"])
+        self.assertEqual(["fresh-1", "fresh-2"], [c["token"] for c in api.calls])
+        for spent in exchange.calls:
+            self.assertEqual("visual", spent["scope"])
+            self.assertEqual("visual.operations.show", spent["operation_id"])
+            self.assertEqual("/api/visual-operations/odd%2Fid", spent["path"])
+        self.assertTrue(all(c["method"] == "GET" for c in api.calls))
+
+    def test_visual_poll_without_visual_scope_is_refused(self):
+        exchange = FakeExchange()
+        self.as_caller(caller(scopes=WIDE))
+        with self.assertRaises(ToolError):
+            self.build_named("visual_operations_show", exchange=exchange)(
+                operation_id="op-1")
+        self.assertEqual([], exchange.calls)
+
+    def test_visual_poll_keeps_failed_checks_from_single_browser_runs(self):
+        for kind, side in (("proposal.visual-test", "candidate"),
+                           ("visual.test", "live")):
+            with self.subTest(kind=kind):
                 self.as_caller(caller(scopes=AUTHORING))
-                with self.assertRaises(ToolError) as raised:
+                detail = self.tool("visual_operations_show", {
+                    "operation": {"id": "job-1", "kind": kind,
+                                  "status": "failed", "result": {
+                        "visual": {"passed": False, "diagnosis": {"checks": [
+                            {"id": "visual.http", "passed": True},
+                            {"id": "visual.hover", "passed": False,
+                             "observed": "no tooltip"},
+                        ]}},
+                    }},
+                })(operation_id="job-1")
+                self.assertEqual([{"side": side, "check": "visual.hover",
+                                   "observed": "no tooltip"}], detail["failedChecks"])
+
+    def test_visual_poll_keeps_planning_and_watchdog_failure_stages(self):
+        for location, stage in (("result", "candidate-page-readiness"),
+                                ("error", "planning")):
+            with self.subTest(location=location):
+                self.as_caller(caller(scopes=AUTHORING))
+                operation = {"id": "job-1", "status": "failed",
+                             location: {"failedStage": stage}}
+                detail = self.tool("visual_operations_show", {
+                    "operation": operation})(operation_id="job-1")
+                self.assertEqual(stage, detail["failedStage"])
+                self.assertEqual({}, detail["artifacts"])
+                self.assertNotIn("pollTool", detail)
+
+    def test_visual_poll_never_reports_pass_for_untrusted_or_incomplete_evidence(self):
+        for status, passed in (("failed", False), ("running", None),
+                               ("indeterminate", None)):
+            with self.subTest(status=status):
+                self.as_caller(caller(scopes=AUTHORING))
+                detail = self.tool("visual_operations_show", {
+                    "operation": {
+                        "id": "job-1", "status": status,
+                        "result": {"visual": {"passed": True}},
+                        "error": {"code": "visual.binding_mismatch"},
+                    },
+                })(operation_id="job-1")
+                self.assertIs(passed, detail["passed"])
+
+    def test_preview_tools_forward_area_framing(self):
+        for name in ("proposals_preview_plan", "proposals_preview_screenshot",
+                     "proposals_preview_test"):
+            for framing in ("viewport", "layer"):
+                with self.subTest(tool=name, framing=framing):
+                    api = FakeConfigApi(answer=SHOT)
+                    self.as_caller(caller(scopes=AUTHORING))
                     self.build_named(name, config_api=api)(
-                        proposal_id="p-1", layer="Bus_Stops", hover=True)
-                message = str(raised.exception)
-                self.assertIn("60", message)
-                self.assertIn("dashboard", message)
-                # Refused here, so nothing was spent reaching the platform.
-                self.assertEqual([], api.calls)
+                        proposal_id="p-1", layer="Bus_Stops", framing=framing,
+                        centre=[-1.5, 53.8], zoom=11,
+                        viewport={"width": 1080, "height": 720})
+                    body = api.calls[0]["body"]
+                    self.assertEqual(framing, body["framing"])
+                    self.assertEqual([-1.5, 53.8], body["centre"])
+                    self.assertEqual(11, body["zoom"])
+                    self.assertEqual({"width": 1080, "height": 720}, body["viewport"])
 
     def test_each_preview_costs_the_visual_scope(self) -> None:
         for name in ("proposals_preview_plan", "proposals_preview_screenshot",
@@ -2670,15 +2754,13 @@ class PreviewEvidenceTests(ToolTestCase):
                 "proposals_preview_screenshot", config_api=Refusing())(
                 proposal_id="p-1", layer="Bus_Stops")
 
-    def test_a_render_is_allowed_longer_than_a_read(self) -> None:
-        """Measured at 20.8 and 24.4 seconds against a 15-second read default,
-        which reported a working platform as unavailable. Bounded under the
-        credential's own 60-second life."""
+    def test_preview_admission_is_bounded_below_credential_lifetime(self) -> None:
+        """HTTP waits for admission; the durable job owns the browser wait."""
         from runtime import PROPOSALS_PREVIEW_SCREENSHOT, PROPOSALS_PREVIEW_TEST
 
         for descriptor in (PROPOSALS_PREVIEW_SCREENSHOT, PROPOSALS_PREVIEW_TEST):
             with self.subTest(operation=descriptor["operation_id"]):
-                self.assertGreater(descriptor["timeout"], 25)
+                self.assertGreater(descriptor["timeout"], 0)
                 self.assertLess(descriptor["timeout"], 60)
 
 

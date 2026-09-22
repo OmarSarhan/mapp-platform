@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from functools import wraps
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
@@ -57,6 +58,11 @@ from federation_schema import (
 )
 from federation_store import MAX_ALIASES, MAX_GROUPS, FederationAliasStore
 from static_files import safe_static_path
+from visual_artifacts import read_visual_image, VisualArtifactError
+from derived_drafts import (
+    CLEANUP_INTERVAL_SECONDS, DraftLifecycle, DraftLifecycleError,
+    lifecycle_lock, normalize_bindings, retain_browser_lease,
+)
 from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
 import canonical
@@ -212,6 +218,7 @@ if not 30 <= VISUAL_BACKGROUND_TIMEOUT_SECONDS <= 600:
         "VISUAL_BACKGROUND_TIMEOUT_SECONDS must be between 30 and 600."
     )
 SAVE_LOCK = threading.Lock()
+DRAFT_CLEANUP_WAKE = threading.Event()
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
 DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
@@ -4033,6 +4040,34 @@ def start_derived_background(
         raise
 
 
+def draft_guarded(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        root = getattr(args[0], "root", CONTROL.root) if args else CONTROL.root
+        with lifecycle_lock(root) if DERIVED is not None else nullcontext():
+            return function(*args, **kwargs)
+    return guarded
+
+
+def draft_lifecycle() -> DraftLifecycle:
+    if DERIVED is None:
+        raise DraftLifecycleError("Derived-layer database management is not configured.")
+    return DraftLifecycle(CONTROL, DERIVED, read_workspace)
+
+
+def run_draft_cleanup():
+    while True:
+        try:
+            results = draft_lifecycle().sweep()
+            if any(item["outcome"] == "dropped" for item in results):
+                schedule_semantic_outbox()
+        except Exception:
+            LOGGER.exception("Draft cleanup could not verify its state; retaining relations")
+        DRAFT_CLEANUP_WAKE.wait(CLEANUP_INTERVAL_SECONDS)
+        DRAFT_CLEANUP_WAKE.clear()
+
+
+@draft_guarded
 def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
     encoded = (
         json.dumps(
@@ -4046,6 +4081,7 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
         _, _, current_revision = read_workspace()
         if not isinstance(expected, str) or expected != current_revision:
             raise FileExistsError("Workspace changed on disk. Reload before saving.")
+        publication_intent = draft_lifecycle().prepare_publication(candidate) if DERIVED is not None else None
         backup = WORKSPACE.with_suffix(WORKSPACE.suffix + ".bak")
         shutil.copyfile(WORKSPACE, backup)
         fd, temporary = tempfile.mkstemp(prefix=".workspace-", suffix=".json", dir=WORKSPACE.parent)
@@ -4071,6 +4107,11 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+        if publication_intent is not None:
+            try:
+                draft_lifecycle().commit_publication(publication_intent)
+            except Exception:
+                LOGGER.exception("Draft publication committed; retaining recovery metadata")
     return encoded, next_revision
 
 
@@ -4125,6 +4166,7 @@ def _atomic_preview_text(path: Path, value: str, mode: int = 0o600) -> None:
             os.unlink(temporary_name)
 
 
+@draft_guarded
 def prepare_workspace_preview(
     workspace: dict,
     expected_hash: str,
@@ -4614,6 +4656,7 @@ def plugin_preview_checks(workspace: dict, locale_key: str, layers: list[str]) -
     return checks
 
 
+@draft_guarded
 def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
                        target_url: str) -> tuple[int, dict]:
     panels = visual_panels(payload)
@@ -4646,6 +4689,8 @@ def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
         },
         allow_nan=False,
     ).encode()
+    if DERIVED is not None:
+        retain_browser_lease(CONTROL.root)
     try:
         with urlopen(Request(
             os.environ.get(
@@ -4795,6 +4840,7 @@ def requested_hover(payload: dict) -> bool | None:
     return payload["hover"]
 
 
+@draft_guarded
 def apply_proposal_and_reload(
     store: ControlStore,
     proposal: dict,
@@ -4820,6 +4866,8 @@ def apply_proposal_and_reload(
                 raise FileExistsError(
                     "Workspace changed on disk. Reload before saving."
                 )
+            if proposal.get("draftRelations"):
+                draft_lifecycle().validate_publication(proposal)
             proposal["status"] = "applying"
             proposal["applyingStarted"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
@@ -4872,6 +4920,16 @@ def apply_proposal_and_reload(
                     proposal_write(store, proposal)
                     raise
 
+        if proposal.get("draftRelations"):
+            # The workspace is already committed. If metadata promotion fails,
+            # the cleanup worker will see the live reference and recover it.
+            # Do not turn a committed publication into a retryable preflight.
+            try:
+                DERIVED.adopt_drafts(
+                    proposal["draftRelations"], proposal_id=proposal["id"],
+                )
+            except Exception:
+                LOGGER.exception("Draft promotion pending after workspace publication")
         fingerprint = workspace_fingerprint(encoded)
         try:
             reload_result = request_reload(fingerprint)
@@ -6756,11 +6814,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "federation:register"
             )
         if method == "GET":
+            if path.startswith("/api/visual-operations/"):
+                return "visual"
             if re.fullmatch(r"/api/layers/[^/]+/(values|statistics)", path):
                 return "derive"
             if path.startswith("/api/operations/"):
                 return None
-            if path.startswith("/api/artifacts/"):
+            if path.startswith(("/api/artifacts/", "/api/visual-artifacts/")):
                 return "visual"
             return "inspect"
         if re.fullmatch(
@@ -7466,6 +7526,19 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.OK, {
                 "backgroundJobs": derived_background_capacity(),
             })
+        elif path == "/api/derived-layers/drafts":
+            try:
+                drafts = DERIVED.list_drafts(limit=100, include_terminal=True) if DERIVED else []
+                self._json(HTTPStatus.OK, {
+                    "drafts": drafts, "limit": 100,
+                    "possiblyTruncated": len(drafts) == 100,
+                    "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
+                })
+            except Exception:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "error": "Draft lifecycle records are unavailable.",
+                    "code": "derived_layer.drafts_unavailable",
+                })
         elif path == "/api/derived-layers/capabilities":
             try:
                 result = (
@@ -8074,9 +8147,17 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         elif path == "/api/xyz/status":
             self._json(HTTPStatus.OK, reload_status())
-        elif path.startswith("/api/operations/"):
+        elif path.startswith(("/api/operations/", "/api/visual-operations/")):
             try:
                 operation = CONTROL.read_operation(path.rsplit("/", 1)[1])
+                if path.startswith("/api/visual-operations/") and operation.get("kind") not in {
+                    "visual.test", "proposal.visual-test", "proposal.screenshot",
+                }:
+                    self._json(HTTPStatus.NOT_FOUND, {
+                        "error": "Unknown visual operation.",
+                        "code": "operation.not_found",
+                    })
+                    return
                 # Deliberately the *read* scope for the derived-layer kinds,
                 # not the lifecycle one they now cost to perform. Inspecting an
                 # operation is a read: /api/derived-layers already reports the
@@ -8111,6 +8192,20 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"operation": operation})
             except FileNotFoundError as exc:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc), "code": "operation.not_found"})
+        elif path.startswith("/api/visual-artifacts/"):
+            try:
+                if urlparse(self.path).query:
+                    raise VisualArtifactError(
+                        "Visual image retrieval does not accept query parameters.",
+                        code="visual.artifact_path_invalid", status=400,
+                    )
+                artifact = read_visual_image(
+                    CONTROL.root / "artifacts",
+                    path.removeprefix("/api/visual-artifacts/"),
+                )
+                self._json(HTTPStatus.OK, {"artifact": artifact})
+            except VisualArtifactError as exc:
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
         elif path.startswith("/api/artifacts/"):
             relative = path.removeprefix("/api/artifacts/")
             artifact = (CONTROL.root / "artifacts" / relative).resolve()
@@ -8208,6 +8303,16 @@ class Handler(SimpleHTTPRequestHandler):
         actor = self._authorized(state_change=True)
         if not actor:
             return
+        guarded = request_path in {
+            "/api/workspace", "/api/mutate", "/api/proposals", "/api/proposals/check",
+            "/api/visual-plan", "/api/visual-test",
+        } or request_path.startswith("/api/proposals/")
+        if guarded and DERIVED is not None:
+            with lifecycle_lock(CONTROL.root):
+                return self._post_authorized(actor, request_path)
+        return self._post_authorized(actor, request_path)
+
+    def _post_authorized(self, actor, request_path):
         operation_cancel_path = re.fullmatch(
             r"/api/operations/([0-9a-f]{32})/cancel",
             request_path,
@@ -9047,6 +9152,8 @@ class Handler(SimpleHTTPRequestHandler):
                 recipe_plan = {
                     **recipe_plan,
                     "createRequest": create_request,
+                    "draftPreview": DerivedLayerStore.draft_preview_capability(),
+                    "draftLifecycle": DerivedLayerStore.draft_lifecycle_capability(),
                     "resolvedSpatialScope": resolved_create_request[
                         "spatialScope"
                     ],
@@ -9082,6 +9189,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 derived_layer_plan = {
                     "version": "1",
+                    "draftPreview": DerivedLayerStore.draft_preview_capability(),
+                    "draftLifecycle": DerivedLayerStore.draft_lifecycle_capability(),
                     "createRequest": {
                         **create_request,
                         "planFingerprint": plan_fingerprint,
@@ -10854,6 +10963,8 @@ class Handler(SimpleHTTPRequestHandler):
                     update_visual_operation_progress(
                         operation["id"], "browser-execution"
                     )
+                    if DERIVED is not None:
+                        retain_browser_lease(CONTROL.root)
                     with urlopen(Request(
                         os.environ.get("BROWSER_RUNNER_URL", "http://browser-runner:8080/run"),
                         data=runner_payload,
@@ -11270,6 +11381,13 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.CONFLICT, {"error": "Workspace changed on disk. Reload before continuing."})
                     return
                 candidate, diff = apply_operations(current_workspace, payload.get("operations") or [])
+                draft_bindings = normalize_bindings(payload.get("draftRelations", []))
+                if draft_bindings:
+                    if request_path == "/api/mutate":
+                        raise DraftLifecycleError("Draft ownership requires a checked workspace proposal.")
+                    draft_lifecycle().validate_bindings(
+                        draft_bindings, candidate, current_workspace, actor,
+                    )
                 errors = validate_candidate(candidate, current_workspace)
                 if errors:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Validation failed.", "errors": annotated(errors)})
@@ -11281,6 +11399,7 @@ class Handler(SimpleHTTPRequestHandler):
                         current_workspace, expected, candidate,
                         payload.get("operations") or [], diff,
                         payload.get("explanation"),
+                        **({"draft_relations": draft_bindings} if draft_bindings else {}),
                     )
                     if (
                         not isinstance(supplied_check, str)
@@ -11297,6 +11416,7 @@ class Handler(SimpleHTTPRequestHandler):
                         current_workspace, expected, candidate,
                         payload.get("operations") or [], diff,
                         payload.get("explanation"),
+                        **({"draft_relations": draft_bindings} if draft_bindings else {}),
                     )
                     _, warnings = semantic_publication_diagnostics(
                         candidate,
@@ -11322,7 +11442,18 @@ class Handler(SimpleHTTPRequestHandler):
                             if validated_check is not None
                             else None
                         ),
+                        **({"draft_relations": draft_bindings} if draft_bindings else {}),
                     )
+                    if draft_bindings:
+                        try:
+                            DERIVED.bind_drafts(
+                                draft_bindings, proposal["id"], actor,
+                                allow_other_owner=actor == "admin",
+                            )
+                        except Exception:
+                            proposal["status"] = "draft_binding_failed"
+                            proposal_write(CONTROL, proposal)
+                            raise
                     if supplied_check is not None:
                         proposal["checkFingerprint"] = supplied_check
                     _, warnings = semantic_publication_diagnostics(
@@ -11437,6 +11568,8 @@ class Handler(SimpleHTTPRequestHandler):
                             and current_matches_original_revision
                         )
                     if validate_before_apply:
+                        if proposal.get("draftRelations") and proposal["status"] == "pending":
+                            draft_lifecycle().validate_publication(proposal)
                         errors = validate_candidate(
                             proposal["candidate"],
                             proposal.get("original"),
@@ -11554,6 +11687,7 @@ class Handler(SimpleHTTPRequestHandler):
                     proposal["declineReason"] = payload.get("reason")
                     proposal_write(CONTROL, proposal)
                 CONTROL.audit("proposal.declined", actor=actor, remote=self._remote(), details={"id": proposal["id"]})
+                DRAFT_CLEANUP_WAKE.set()
                 self._json(HTTPStatus.OK, {"proposal": proposal})
                 return
             candidate = payload.get("workspace")
@@ -11627,6 +11761,10 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                 },
             )
+        except DraftLifecycleError as exc:
+            self._json(HTTPStatus.CONFLICT, {
+                "error": str(exc), "code": "derived_draft.lifecycle_conflict",
+            })
         except json.JSONDecodeError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Request body is not valid JSON."})
         except DerivedLayerDependencyError as exc:
@@ -12027,6 +12165,12 @@ if __name__ == "__main__":
         name="semantic-outbox",
         daemon=True,
     ).start()
+    if DERIVED:
+        threading.Thread(
+            target=run_draft_cleanup,
+            name="derived-draft-cleanup",
+            daemon=True,
+        ).start()
     # Only where a registry exists: without FEDERATION_DATABASE_URL
     # FEDERATION is None,
     # and a thread whose every pass is a no-op is just a thread to explain.

@@ -163,13 +163,13 @@ clients still use the route and response contract owned by the server.
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
 | `derived-layers capabilities` | `GET /api/derived-layers/capabilities` | — | Any authenticated credential; contains planning methods and limits but no workspace rows |
-| `derived-layers jobs\|list\|show\|map-extent` | Other `GET /api/derived-layers/*` routes | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview | `inspect` |
+| `derived-layers jobs\|list\|show\|map-extent`; MCP `derived_layers_drafts` | Other `GET /api/derived-layers/*` routes, including `/api/derived-layers/drafts` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview; `derived-layers.drafts` for disposable lifecycle status | `inspect` |
 | `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
 | `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Proposal GET routes | — | `inspect` |
-| `proposals decline` | `POST /api/proposals/{proposalId}/decline` | — | `propose` |
+| `proposals decline`; MCP `proposals_decline` | `POST /api/proposals/{proposalId}/decline` | `proposals.decline` | `propose` |
 | `proposals apply` | `POST /api/proposals/{proposalId}/apply` | `proposals.apply` | `apply` |
 | `visual-plan`, `visual-test`, `screenshot` | `POST /api/visual-plan`, `POST /api/visual-test` | `visual.plan`, `visual.test`, `visual.screenshot` | `visual` |
 | `proposals preview-plan\|preview-test\|preview-screenshot` | Proposal visual-plan, visual-test, and screenshot routes | `proposals.preview-plan`, `proposals.preview-test`, `proposals.preview-screenshot` | `visual` |
@@ -386,6 +386,7 @@ readiness does not disable derived queries that do not use H3.
 | `GET /api/proposals/<id>` | Complete proposal record |
 | `GET /api/xyz/status` | Requested/applied reload generations and health |
 | `GET /api/artifacts/<path>` | Authenticated visual report or image |
+| `GET /api/visual-artifacts/{runId}/{filename}` | Bounded retained screenshot as base64 PNG; `visual.artifacts.image`, scope `visual`, MCP-compatible |
 | `GET /api/connect` | Validate any bearer token and report its actor, granted scopes, token ID, and expiry without requiring an inspect scope |
 | `GET /api/auth/me` | Current actor and reported scopes; session list for administrators |
 | `GET /api/capabilities` | Stable action IDs, risks, routes, schemas, and operation kinds |
@@ -825,7 +826,55 @@ hash joins do not accrue nested-loop pair work.
 
 The top-level `definitionPlanning` capability advertises the non-mutating plan
 path, access-path version/method, evidence caps, and closed advisory warning
-codes. `accessPathProbe.sources` reports each declared relation's kind, opaque
+codes. Planning leaves no persistent relation and provides no rendered map.
+Its `draftPreview` information distinguishes approved disposable database state
+from non-mutating rendering: a screenshot still requires database creation.
+`draftPreview.supported` stays false for non-mutating rendering;
+`definitionPlanning.draftLifecycle.supported` advertises the disposable lifecycle
+separately, including its retention bounds, exact identity fields, triggers,
+promotion behavior, and cleanup guards.
+
+`POST /api/derived-layers` and its `/plan` counterpart optionally accept
+`draft: {expiresInHours: integer, cleanupApproved: true}`. Both members are
+required; no other members are accepted; retention is 1–168 hours. The policy
+is included in the plan fingerprint and creation's approval-bound request.
+Omission preserves permanent creation. MCP exposes the policy through
+`draft_expires_in_hours` and explicitly presents automatic cleanup in the
+creation approval prompt. Planning does not authorize creation or cleanup.
+
+`POST /api/proposals/check` and `POST /api/proposals` optionally accept
+`draftRelations`, at most 64 closed objects with `name` (managed identifier),
+`assetId` (canonical UUID), and `generation` (positive integer). Send identical
+bindings to check and create; the check fingerprint covers them. The bindings
+claim only explicitly disposable relations referenced by the candidate, never
+existing permanent relations. Publication promotes the bound relations;
+decline or approved retention expiry makes them eligible for guarded cleanup.
+Cleanup waits for active previews and rechecks live/pending workspace use,
+database dependencies, and exact identity/generation; it never cascades.
+
+`GET /api/derived-layers/drafts` (`derived-layers.drafts`, scope `inspect`) and
+MCP `derived_layers_drafts` return retained lifecycle metadata and cleanup
+results. These are read-only status surfaces, with no executable cleanup
+endpoint. Deferred and failed cleanup remains visible for retry. Existing
+relations and proposals have no inferred ownership and are unaffected.
+The listing is bounded to 100 records and returns `drafts`, `limit`,
+`possiblyTruncated`, and `cleanupIntervalSeconds` (60). It does not expose data
+rows or grant authority to force deletion.
+Each draft reports exact identity, `proposalId`, `createdAt`, `expiresAt`,
+`expiresInHours`, `cleanupApproved`, and `state` (`active`, `adopted`, or
+`dropped`), with `lastCleanupAttemptAt`, `lastCleanupReason`, `lastCleanupError`,
+`adoptedAt`, and `droppedAt` when available. A blocked cleanup remains active;
+`dropped` is the successful deletion state. Replacement and refresh are refused
+while a draft is active, preserving its approved identity and definition.
+
+`POST /api/proposals/{proposalId}/decline` (`proposals.decline`, scope `propose`)
+accepts optional `reason` (at most 2,000 characters) and no other properties.
+MCP `proposals_decline` exposes this final rejection as a single-use operation.
+It schedules only the proposal's explicitly owned disposable relations under
+their creation-authorized policy. A declined apply approval is a different
+event: it does not reject the proposal or trigger cleanup before expiry.
+
+`accessPathProbe.sources` reports each declared relation's kind, opaque
 database execution group, planner-estimate source, statistics availability,
 and capped `indexMetadata`. An available inventory may include estimated rows,
 `lastAnalyze`, index method and validity/readiness, uniqueness, safe bounded
@@ -1108,12 +1157,37 @@ the durable `operationId`. Failed operations retain any plan, diagnosis,
 report, and artifact paths produced before failure; a request rejected before
 browser execution returns a structured error and operation without claiming
 artifacts. Only paths for files actually retained by the runner are advertised.
+`GET /api/visual-artifacts/{runId}/{filename}` accepts a relative PNG artifact
+path from this evidence and returns `artifact: {path, mimeType, sizeBytes, data}`,
+where `data` is base64 and `mimeType` is `image/png`. This read requires `visual`
+and supports request-bound MCP credentials. Images are limited to 8 MiB and
+must be named in the same browser run's retained `report.json` (maximum 2 MiB).
+Only known screenshot filenames are accepted; symlinks and path traversal are
+refused. Authenticated responses are uncached. Missing or unretained images
+return `404 visual.artifact_not_found`, invalid paths return
+`400 visual.artifact_path_invalid`, and oversized files return
+`413 visual.artifact_too_large`. The existing raw `/api/artifacts/` route
+continues to serve session and ordinary bearer clients only.
+MCP clients call `artifacts_image(artifact_path=...)` with a returned PNG path,
+such as the value of `afterMap` or `afterHoverTooltip`, to receive native MCP
+image content that the conversation can display. This fetch obtains a fresh
+credential independently of the preview operation.
 Visual-test and screenshot requests may set `background: true`. The server
 returns `202 Accepted` with `operation` and `statusUrl`, continues browser work
 independently of that HTTP connection, and atomically writes the complete
 result/error envelope before the operation becomes terminal. A caller whose
 local wait expires can continue polling the same operation without restarting
 Chromium or losing its eventual report.
+MCP preview screenshot/test tools always use background execution, including
+`hover: true`. They return an `operationId`, stage, and
+`pollTool: "visual_operations_show"`. Poll with that tool after
+`pollAfterSeconds`; each poll exchanges a fresh, request-bound credential for
+`GET /api/visual-operations/{operationId}` with the same `visual` authority.
+This route accepts only visual operation kinds and retains completed evidence
+and errors; the existing `/api/operations/{operationId}` route is unchanged.
+The request credential is needed to admit the work and does not set the
+background browser deadline. Do not restart a preview because its status is
+still `running`.
 Running visual operations persist stage heartbeats in `stage` and advance
 `updated`. Terminal records set `finished` to the same durable timestamp as
 their final `updated`; active records are never removed by bounded history
@@ -1189,7 +1263,8 @@ page screenshot as panel evidence. Existing page, map, report, and
 feature-information artifacts are preserved.
 
 Active `style.hover` configuration is exercised automatically at the planned
-representative feature. Visual-test and proposal preview requests may set
+map centre (a representative feature with default `feature` framing).
+Visual-test and proposal preview requests may set
 `hover: true` to require that evidence or `hover: false` to deliberately
 suppress it. `expectedHoverText` accepts up to 20 non-empty strings and also
 requires hover evidence unless hover is explicitly suppressed. The browser
@@ -1202,9 +1277,36 @@ tooltip evidence. A successful capture is exposed as
 `beforeHoverTooltip` and `afterHoverTooltip` for the corresponding original
 and candidate sides.
 
-For probeable database layers, visual planning focuses a representative
-feature near the layer extent centre and records an `interaction` plan for the
-browser runner. A proposal screenshot publishes the retained original and then
+All visual plans, tests, and proposal screenshots accept `framing`:
+
+- `feature` (default) focuses one representative feature near the effective
+  filtered layer extent centre, retaining the existing interaction view.
+- `layer` fits the full effective layer extent for choropleth review. Counts
+  and bounds use the same fixed filters, feature-set and lookup restrictions
+  as the rendered layer. It skips representative-feature selection and applies
+  no feature-level minimum zoom. It requires a probeable database layer and
+  cannot be combined with `centre` or `zoom` overrides.
+- `viewport` preserves supplied `centre` and `zoom` (both are required when
+  either is supplied); otherwise it uses the effective locale's configured
+  startup view. It does not inspect an unsaved browser viewport. The plan
+  identifies a configured view with `source: "workspace-viewport"` and an
+  explicit view with `source: "explicit-view"`.
+
+`viewport` is the browser image size in pixels; `framing: "viewport"` selects
+map framing. For `layer`, bounded image dimensions are used to fit the extent,
+with a conservative 1080×1080 default matching proposal screenshots. Layer and
+viewport framing retain centre interaction attempts without claiming a known
+feature ID; an empty centre or small features may fail hover or information
+checks. Use a separate feature-framed run for close-up interaction evidence.
+Framing does not change the layer activation behavior controlled by `viewMode`.
+
+The MCP tools `proposals_preview_plan`, `proposals_preview_screenshot` and
+`proposals_preview_test` accept the same `framing`, `centre`, `zoom` and pixel
+`viewport` arguments. Use `framing: "viewport"` for the configured/supplied map
+area or `framing: "layer"` for the complete effective choropleth extent.
+
+Visual planning records an `interaction` plan for the browser runner. A
+proposal screenshot publishes the retained original and then
 the candidate to the same isolated preview process and renders both at the
 same view. Its `beforePage`/`beforeMap` artifacts therefore represent the
 original proposal revision, while `afterPage`/`afterMap` represent the
@@ -1215,8 +1317,9 @@ database planning and does not run the relation-wide feature-count, extent, or
 representative-feature queries. The plan preserves the exact explicit view and
 records a browser-centre interaction without claiming a preselected feature
 ID. Hover and clicked-feature evidence then pass only if the browser actually
-finds the expected content at that map centre. A centre-only or zoom-only
-override still needs automatic framing for the missing part.
+finds the expected content at that map centre. With default `feature` framing,
+a centre-only or zoom-only override still needs automatic framing for the
+missing part.
 
 Database failures during automatic planning are read-only visual errors. A
 timeout returns HTTP 422 with `code: "visual.planning_timeout"`,
@@ -1229,8 +1332,9 @@ screenshot submissions still create and terminalize a durable operation at
 the `planning` stage; metadata-only visual-plan requests do not create one.
 
 When the focused diff changes the selected layer's `infoj` feature-information
-configuration, the runner selects a representative feature, waits for XYZ's
-expanded `.location-view` panel to finish loading, and uses the selected state
+configuration, the runner attempts to select a feature at the planned map
+centre, waits for XYZ's expanded `.location-view` panel to finish loading,
+and uses the selected state
 for that side's comparison image. An edit to an existing layer captures both
 sides; an added layer captures the candidate only, and a removed layer captures
 the retained original only. The response records this per-side intent and

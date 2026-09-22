@@ -355,11 +355,11 @@ class LegacySessionTests(unittest.TestCase):
              # the checks that cost a propose scope nor the creates that spend
              # it are shown to it.
              "proposals_check", "semantic_proposals_check",
-             "proposals_create", "semantic_proposals_create",
+             "proposals_create", "proposals_decline", "semantic_proposals_create",
              # Evidence tools: they render a proposal through a browser, which
              # costs `visual` and is granted with the authoring preset.
              "proposals_preview_plan", "proposals_preview_screenshot",
-             "proposals_preview_test",
+             "proposals_preview_test", "visual_operations_show", "artifacts_image",
              # The irreversible half, added in wave 6. An analysis grant
              # reads; these write the workspace, write curated meaning and
              # tell the tile service to serve the result, and each costs a

@@ -17,15 +17,15 @@ Every number in this guide is checked against the code by
 
 MAPP publishes an **MCP server**: a fixed set of tools an AI assistant can
 call. It is not the configuration API with a chat interface in front of it —
-it is a deliberately narrower surface, 52 tools against the platform's 69
+it is a deliberately narrower surface, 56 tools against the platform's 73
 actions, and the things left out were left out on purpose.
 
 Three facts decide everything else:
 
 1. **An agent sees only the tools its permissions allow.** Not "sees them and
    is refused" — they are absent from the list it is given.
-2. **Nothing consequential happens without you.** 39 of the 52 tools only
-   read. Of the 13 that write, 6 write into a review queue you work through,
+2. **Nothing consequential happens without you.** 42 of the 56 tools only
+   read. Of the 14 that write, 7 write into a review queue you work through,
    and the remaining 7 ask your permission at the moment they run.
 3. **Permission is for one exact request**, not for a period or a kind of
    action. Saying yes to applying one proposal authorises that proposal and
@@ -244,17 +244,17 @@ preset is actually shown:
 
 | Preset | Tools | What it can do |
 | --- | --- | --- |
-| **Discovery** | 20 | Find out what exists. The platform contract, the layer list, capabilities |
-| **Analysis** | 33 | Read the workspace properly: layer configuration, catalogue, aggregate values, curated meaning. **The sensible default** |
-| **Analysis (federated)** | 36 | The same, plus which third-party databases this instance reads |
-| **Author** | 40 | Compose changes and attach rendered evidence to them. Applies nothing |
-| **Author and apply** | 43 | The above, plus applying a reviewed proposal and reloading the map |
-| **Author, apply and build derived layers** | 48 | The above, plus creating and dropping the database relations layers read. The widest offered |
+| **Discovery** | 21 | Find out what exists. The platform contract, the layer list, capabilities |
+| **Analysis** | 34 | Read the workspace properly: layer configuration, catalogue, aggregate values, curated meaning. **The sensible default** |
+| **Analysis (federated)** | 37 | The same, plus which third-party databases this instance reads |
+| **Author** | 44 | Compose changes and attach rendered evidence to them. Applies nothing |
+| **Author and apply** | 47 | The above, plus applying a reviewed proposal and reloading the map |
+| **Author, apply and build derived layers** | 52 | The above, plus creating and dropping the database relations layers read. The widest offered |
 
 Start with **Analysis**. Widening later is one dashboard change and one
 reconnection.
 
-Why even the widest preset does not reach all 52: two scopes sit outside it.
+Why even the widest preset does not reach all 56: two scopes sit outside it.
 `federation:observe` reveals which third-party databases this instance reads —
 offered, but only through *Analysis (federated)*, so you choose it rather than
 inherit it. `semantic:source` lists database tables no layer uses, and is in no
@@ -297,11 +297,12 @@ one extra step.
 reloading the map, and creating, replacing, refreshing or dropping a derived
 layer.
 
-**Does not ask** (6): creating a workspace or semantic proposal, and the three
-preview tools that render evidence. None of these changes what the map serves
-— they add to a queue you review, or attach a picture to something in it.
+**Does not ask** (7): creating a workspace or semantic proposal, the preview
+tools that attach evidence, and rejecting a workspace proposal. Rejection can
+trigger cleanup of disposable draft relations under the policy already approved
+when they were created. Permanent relations are unaffected.
 
-**Reads** (39): everything else.
+**Reads** (42): everything else.
 
 ### Dropping a derived layer
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from derived_drafts import lifecycle_lock, normalize_bindings
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
 from federation_schema import (
     ALIAS_PATTERN as GROUP_NAME_PATTERN,
@@ -590,6 +591,18 @@ def _semantic_proposal_input_schema(*, require_fingerprint: bool) -> dict[str, A
     }
 
 
+def _visual_framing_schema() -> dict[str, Any]:
+    return {
+        "type": "string",
+        "enum": ["feature", "layer", "viewport"],
+        "default": "feature",
+        "description": (
+            "Frame one representative feature, the complete effective filtered "
+            "layer extent, or a supplied/configured map view."
+        ),
+    }
+
+
 def _live_visual_input_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -604,6 +617,7 @@ def _live_visual_input_schema() -> dict[str, Any]:
                 "maxItems": 2,
             },
             "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+            "framing": _visual_framing_schema(),
             "background": {"type": "boolean"},
             "hover": {"type": "boolean"},
             "expectedHoverText": {
@@ -629,6 +643,26 @@ def _live_visual_input_schema() -> dict[str, Any]:
         },
         "additionalProperties": True,
     }
+
+
+DRAFT_RELATIONS_SCHEMA = {
+    "type": "array",
+    "maxItems": 64,
+    "uniqueItems": True,
+    "items": {
+        "type": "object",
+        "required": ["name", "assetId", "generation"],
+        "properties": {
+            "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+            "assetId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            },
+            "generation": {"type": "integer", "minimum": 1},
+        },
+        "additionalProperties": False,
+    },
+}
 
 
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -1047,6 +1081,12 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "risk": "inspect",
         "scope": "inspect",
     },
+    "derived-layers.drafts": {
+        "method": "GET",
+        "path": "/api/derived-layers/drafts",
+        "risk": "inspect",
+        "scope": "inspect",
+    },
     "derived-layers.background-jobs": {
         "method": "GET",
         "path": "/api/derived-layers/background-jobs",
@@ -1090,6 +1130,17 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "geometryColumn": {"type": "string"},
                 "description": {"type": "string"},
                 "background": {"type": "boolean"},
+                "draft": {
+                    "type": "object",
+                    "required": ["expiresInHours", "cleanupApproved"],
+                    "properties": {
+                        "expiresInHours": {
+                            "type": "integer", "minimum": 1, "maximum": 168,
+                        },
+                        "cleanupApproved": {"const": True},
+                    },
+                    "additionalProperties": False,
+                },
                 "planFingerprint": {
                     "type": "string",
                     "pattern": "^sha256:[0-9a-f]{64}$",
@@ -1270,6 +1321,12 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         # rest still refuse.
         "risk": "inspect",
         "scope": "derive",
+    },
+    "visual.operations.show": {
+        "method": "GET",
+        "pathTemplate": "/api/visual-operations/{operationId}",
+        "risk": "inspect",
+        "scope": "visual",
     },
     "derived-layers.capabilities": {
         "method": "GET",
@@ -1456,6 +1513,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "revision": {"type": "string", "minLength": 1},
                 "operations": {"type": "array", "minItems": 1},
                 "explanation": {"type": "string"},
+                "draftRelations": copy.deepcopy(DRAFT_RELATIONS_SCHEMA),
             },
             "additionalProperties": False,
         },
@@ -1473,7 +1531,19 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "operations": {"type": "array", "minItems": 1},
                 "explanation": {"type": "string"},
                 "checkFingerprint": {"type": "string"},
+                "draftRelations": copy.deepcopy(DRAFT_RELATIONS_SCHEMA),
             },
+            "additionalProperties": False,
+        },
+    },
+    "proposals.decline": {
+        "method": "POST",
+        "pathTemplate": "/api/proposals/{proposalId}/decline",
+        "risk": "propose",
+        "scope": "propose",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"reason": {"type": "string", "maxLength": 2000}},
             "additionalProperties": False,
         },
     },
@@ -1504,6 +1574,19 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "operationKind": "visual.test",
         "inputSchema": _live_visual_input_schema(),
     },
+    "visual.artifacts.image": {
+        "method": "GET",
+        "pathTemplate": "/api/visual-artifacts/{runId}/{filename}",
+        "risk": "read",
+        "scope": "visual",
+        "inputSchema": {
+            "type": "object", "properties": {}, "additionalProperties": False,
+        },
+        "description": (
+            "Read a retained browser screenshot as base64 PNG (maximum 8 MiB). "
+            "The image must be listed in its browser run report."
+        ),
+    },
     "proposals.preview-plan": {
         "method": "POST",
         "pathTemplate": "/api/proposals/{proposalId}/visual-plan",
@@ -1517,6 +1600,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "framing": _visual_framing_schema(),
                 "viewMode": {
                     "type": "string",
                     "enum": ["focus", "default"],
@@ -1552,6 +1636,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "framing": _visual_framing_schema(),
                 "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
@@ -1599,6 +1684,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
                 "locale": {"type": "string"},
                 "centre": {"type": "array", "minItems": 2, "maxItems": 2},
                 "zoom": {"type": "number", "minimum": 0, "maximum": 22},
+                "framing": _visual_framing_schema(),
                 "background": {"type": "boolean"},
                 "viewMode": {
                     "type": "string",
@@ -2515,7 +2601,9 @@ def proposal_create(
     explanation: str | None = None,
     *,
     plugin_catalogue_fingerprint: str | None = None,
+    draft_relations: list | None = None,
 ) -> dict:
+    bindings = normalize_bindings(draft_relations if draft_relations is not None else [])
     proposal_id = (
         f"{int(time.time())}-{workspace_hash(candidate)[:12]}-"
         f"{secrets.token_hex(3)}"
@@ -2539,34 +2627,39 @@ def proposal_create(
         "original": original,
         "candidate": candidate,
         "warnings": [],
+        **({"draftRelations": bindings} if bindings else {}),
     }
-    path = store.proposals / proposal_id
-    path.mkdir(mode=0o700)
-    proposal_path = path / "proposal.json"
-    _atomic_text(
-        proposal_path,
-        json.dumps(
-            proposal,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        ) + "\n",
-    )
-    store.audit("proposal.created", actor=actor, details={"id": proposal_id, "candidateHash": proposal["candidateHash"]})
+    with lifecycle_lock(store.root):
+        path = store.proposals / proposal_id
+        path.mkdir(mode=0o700)
+        proposal_path = path / "proposal.json"
+        _atomic_text(
+            proposal_path,
+            json.dumps(
+                proposal,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            ) + "\n",
+        )
+        store.audit("proposal.created", actor=actor, details={"id": proposal_id, "candidateHash": proposal["candidateHash"]})
     return proposal
 
 
 def proposal_check(original: dict, original_revision: str, candidate: dict,
                    operations: list, diff: list,
-                   explanation: str | None = None) -> dict:
+                   explanation: str | None = None, *,
+                   draft_relations: list | None = None) -> dict:
     """Return proposal evidence without allocating or persisting a proposal."""
     candidate_hash = workspace_hash(candidate)
     plugin_fingerprint = external_plugin_catalogue()["fingerprint"]
+    bindings = normalize_bindings(draft_relations if draft_relations is not None else [])
     fingerprint = hashlib.sha256(json.dumps({
         "revision": original_revision,
         "candidateHash": candidate_hash,
         "operations": operations,
         "pluginCatalogueFingerprint": plugin_fingerprint,
+        **({"draftRelations": bindings} if bindings else {}),
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
        allow_nan=False).encode()).hexdigest()
     return {
@@ -2581,6 +2674,7 @@ def proposal_check(original: dict, original_revision: str, candidate: dict,
         "diff": diff,
         "explanation": explanation or explain_diff(diff),
         "warnings": [],
+        **({"draftRelations": bindings} if bindings else {}),
     }
 
 
@@ -2601,15 +2695,11 @@ def proposal_read(store, proposal_id: str) -> dict:
 
 def proposal_write(store, proposal: dict) -> None:
     path = store.proposals / proposal["id"] / "proposal.json"
-    _atomic_text(
-        path,
-        json.dumps(
-            proposal,
-            indent=2,
-            ensure_ascii=False,
-            allow_nan=False,
-        ) + "\n",
-    )
+    with lifecycle_lock(store.root):
+        _atomic_text(
+            path,
+            json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        )
 
 
 def _proposal_summary(path: Path) -> dict:
@@ -3412,8 +3502,29 @@ def visual_plan(
     visual_request: dict | None = None,
 ) -> dict:
     visual_request = visual_request or {}
+    framing = visual_request.get("framing", "feature")
+    if framing not in ("feature", "layer", "viewport"):
+        raise ValueError("Visual framing must be 'feature', 'layer', or 'viewport'.")
     override = _visual_override(visual_request)
+    if framing == "layer" and override:
+        raise ValueError("Layer framing cannot be combined with centre or zoom overrides.")
     selected_locale, locale = select_locale(workspace, locale_key)
+    configured_viewport = framing == "viewport" and not override
+    if framing == "viewport":
+        if override and not {"centre", "zoom"}.issubset(override):
+            raise ValueError("Viewport framing requires both centre and zoom when supplied.")
+        if configured_viewport:
+            view = locale.get("view") or {}
+            try:
+                override = _visual_override({
+                    "centre": [view.get("lng"), view.get("lat")],
+                    "zoom": view.get("z"),
+                })
+            except ValueError as exc:
+                raise ValueError(
+                    "Viewport framing requires a valid configured locale view "
+                    "or supplied centre and zoom."
+                ) from exc
     background_layers = [
         key
         for key, candidate in (locale.get("layers") or {}).items()
@@ -3433,6 +3544,11 @@ def visual_plan(
     layer_title = layer_title.strip() or layer_key
     hover_plan = visual_hover_plan(layer)
     probeable = is_probeable_database_layer(layer)
+    if framing == "layer" and not probeable:
+        raise ValueError(
+            "Layer framing requires a probeable database layer; use viewport "
+            "framing with a supplied or configured map view for this source."
+        )
     filter_descriptor, _ = effective_layer_filter_descriptor(layer)
     activation = {
         "configuredKey": layer_key,
@@ -3455,13 +3571,20 @@ def visual_plan(
             "layer": layer_key,
             "layerTitle": layer_title,
             "locale": selected_locale,
-            "source": "browser-centre-feature",
+            "source": "workspace-viewport" if configured_viewport else "browser-centre-feature",
+            "framing": "viewport",
             "backgroundLayers": background_layers,
             "centre": override["centre"],
             "zoom": override["zoom"],
             "warnings": [
-                "The complete explicit view skips database-wide feature-count "
-                "and extent queries; browser interaction targets the map centre."
+                (
+                    "The configured locale startup view is used; this does not "
+                    "read an unsaved browser viewport."
+                    if configured_viewport else
+                    "The supplied centre and zoom determine the map view."
+                ),
+                "Viewport framing skips database-wide feature-count and extent "
+                "queries; browser interaction targets the map centre.",
             ],
             "effectiveDataset": {
                 "locale": selected_locale,
@@ -3470,9 +3593,9 @@ def visual_plan(
                 "source": dataset_source,
                 "effectiveFilter": filter_descriptor,
                 "query": {
-                    "scope": "explicit-browser-view",
+                    "scope": "configured-workspace-view" if configured_viewport else "explicit-browser-view",
                     "skipped": True,
-                    "reason": "complete-explicit-view",
+                    "reason": "configured-locale-view" if configured_viewport else "complete-explicit-view",
                 },
                 "activation": activation,
                 "filteredFeatureCount": None,
@@ -3504,6 +3627,7 @@ def visual_plan(
             "layerTitle": layer_title,
             "locale": selected_locale,
             "source": "workspace-view",
+            "framing": framing,
             "backgroundLayers": background_layers,
             "warnings": [
                 "This layer uses an external or advanced XYZ source, so the "
@@ -3634,6 +3758,68 @@ def visual_plan(
             },
         )
     centre_x, centre_y = (west + east) / 2, (south + north) / 2
+    if framing == "layer":
+        viewport = visual_request.get("viewport", {})
+        if not isinstance(viewport, dict):
+            raise ValueError("Visual viewport must be an object with width and height.")
+        dimensions = {}
+        for key, default, minimum, maximum in (
+            ("width", 1080, 320, 2560),
+            ("height", 1080, 240, 1440),
+        ):
+            value = viewport.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError(f"Visual viewport {key} must be an integer from {minimum} to {maximum}.")
+            dimensions[key] = value
+        resolution = max(
+            max(east - west, 25.0) / (dimensions["width"] * .7),
+            max(north - south, 25.0) / (dimensions["height"] * .7),
+        )
+        zoom = max(0, min(22, math.log2(156543.03392804097 / resolution)))
+        centre = [
+            math.degrees(centre_x / 6378137.0),
+            math.degrees(math.atan(math.sinh(centre_y / 6378137.0))),
+        ]
+        plan = {
+            "layer": layer_key,
+            "layerTitle": layer_title,
+            "locale": selected_locale,
+            "source": "postgis-layer",
+            "framing": "layer",
+            "backgroundLayers": background_layers,
+            "database": db_name,
+            "table": layer["table"],
+            "geometry": layer["geom"],
+            "featureIdField": layer["qID"],
+            "geometryType": geometry_type,
+            "featureCount": count,
+            "defaultFilterApplied": filter_applied,
+            "effectiveDataset": {
+                **effective_dataset,
+                "query": {
+                    **effective_dataset["query"],
+                    "representative": "skipped-for-layer-framing",
+                },
+                "filteredFeatureCount": count,
+                "representativeFeature": None,
+            },
+            "bounds3857": [west, south, east, north],
+            "focusBounds3857": [west, south, east, north],
+            "centre": centre,
+            "zoom": round(zoom, 2),
+            "interaction": {
+                "type": "click-centre-feature",
+                "expectedLayer": layer_key,
+                "expectedLayerTitle": layer_title,
+            },
+            "warnings": [
+                "The view fits the complete effective filtered layer extent. "
+                "Centre interactions may not find a feature at this scale.",
+            ],
+        }
+        if hover_plan:
+            plan["hover"] = hover_plan
+        return plan
     sample_query = sql.SQL("""
       WITH rendered AS (
         SELECT *
@@ -3729,6 +3915,7 @@ def visual_plan(
         "layerTitle": layer_title,
         "locale": selected_locale,
         "source": "postgis-feature",
+        "framing": "feature",
         "backgroundLayers": background_layers,
         "database": db_name,
         "table": layer["table"],

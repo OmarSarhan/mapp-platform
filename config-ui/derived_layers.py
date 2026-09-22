@@ -1452,7 +1452,7 @@ def validate_definition(payload: dict[str, Any]) -> dict[str, Any]:
         set(payload)
         - {
             "name", "kind", "query", "sources", "idColumn",
-            "geometryColumn", "description", "spatialScope",
+            "geometryColumn", "description", "spatialScope", "draft",
         }
     )
     if unknown:
@@ -1516,6 +1516,21 @@ def validate_definition(payload: dict[str, Any]) -> dict[str, Any]:
         "description": str(payload.get("description", "")).strip()[:2000],
         "spatialScope": validate_spatial_scope(payload.get("spatialScope")),
     }
+    if "draft" in payload:
+        draft = payload["draft"]
+        if (
+            not isinstance(draft, dict)
+            or set(draft) != {"expiresInHours", "cleanupApproved"}
+            or draft.get("cleanupApproved") is not True
+            or isinstance(draft.get("expiresInHours"), bool)
+            or not isinstance(draft.get("expiresInHours"), int)
+            or not 1 <= draft["expiresInHours"] <= 168
+        ):
+            raise DerivedLayerError(
+                "Draft requires cleanupApproved=true and an integer "
+                "expiresInHours between 1 and 168, with no other properties."
+            )
+        definition["draft"] = dict(draft)
     _query_shape_guard(definition)
     return definition
 
@@ -1843,6 +1858,36 @@ class DerivedLayerStore:
                 "ALTER TABLE {}._semantic_outbox ADD COLUMN IF NOT EXISTS "
                 + claim_column
             ).format(sql.Identifier(SCHEMA)))
+        # No foreign key: the immutable asset identity and cleanup history must
+        # survive dropping a definition and subsequent reuse of its name.
+        cur.execute(sql.SQL("""
+            CREATE TABLE IF NOT EXISTS {}._drafts (
+              asset_id uuid PRIMARY KEY,
+              name text NOT NULL,
+              generation bigint NOT NULL CHECK (generation > 0),
+              created_by text NOT NULL,
+              created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+              expires_at timestamptz NOT NULL,
+              expires_in_hours integer NOT NULL
+                CHECK (expires_in_hours BETWEEN 1 AND 168),
+              proposal_id text,
+              state text NOT NULL DEFAULT 'active'
+                CHECK (state IN ('active', 'adopted', 'dropped')),
+              last_cleanup_attempt_at timestamptz,
+              last_cleanup_reason text,
+              last_cleanup_error text,
+              adopted_at timestamptz,
+              dropped_at timestamptz
+            )
+        """).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL("""
+            CREATE INDEX IF NOT EXISTS derived_drafts_cleanup_idx
+            ON {}._drafts (last_cleanup_attempt_at NULLS FIRST, created_at)
+            WHERE state = 'active'
+        """).format(sql.Identifier(SCHEMA)))
+        cur.execute(sql.SQL("REVOKE ALL ON {}._drafts FROM PUBLIC").format(
+            sql.Identifier(SCHEMA)
+        ))
         cur.execute(sql.SQL("""
             CREATE TABLE IF NOT EXISTS {}._maintenance (
               -- 'reset-data' is a persisted identifier, not the CLI command
@@ -2064,6 +2109,10 @@ class DerivedLayerStore:
             "revision": item.pop("semanticRevision"),
         }
         item["semanticProfile"] = profile
+        if item.get("draft"):
+            item["draft"] = DerivedLayerStore._draft_public(item["draft"])
+        else:
+            item.pop("draft", None)
         return item
 
     @staticmethod
@@ -2621,11 +2670,53 @@ class DerivedLayerStore:
         }
 
     @staticmethod
+    def draft_preview_capability() -> dict[str, Any]:
+        return {
+            "supported": False,
+            "code": "derived_layer.draft_preview_unavailable",
+            "requiresDatabaseCreation": True,
+            "proposalScoped": False,
+            "message": (
+                "Planning leaves no persistent relation and cannot render a "
+                "map. Rendering requires a separately approved database "
+                "creation. Relations are permanent by default. Explicitly "
+                "disposable drafts can instead use draftLifecycle cleanup "
+                "after proposal rejection or their approved expiry."
+            ),
+        }
+
+    @staticmethod
+    def draft_lifecycle_capability() -> dict[str, Any]:
+        return {
+            "supported": True,
+            "default": "permanent",
+            "requiresDatabaseCreation": True,
+            "requiresCleanupApproval": True,
+            "createProperty": "draft",
+            "createFields": {
+                "cleanupApproved": {"const": True},
+                "expiresInHours": {"type": "integer", "minimum": 1, "maximum": 168},
+            },
+            "proposalProperty": "draftRelations",
+            "identityFields": ["name", "assetId", "generation"],
+            "cleanupTriggers": ["proposal-declined", "proposal-cancelled", "expired"],
+            "retainedOn": ["applied", "live-workspace-reference"],
+            "cleanupGuards": [
+                "exact-immutable-identity", "live-workspace", "other-pending-proposals",
+                "active-previews", "database-dependencies",
+            ],
+            "activeDraftReplaceAndRefresh": False,
+            "existingRelationsEnrolled": False,
+        }
+
+    @staticmethod
     def definition_planning_capability() -> dict[str, Any]:
         return {
             "version": "1",
             "path": "/api/derived-layers/plan",
             "mutationApplied": False,
+            "draftPreview": DerivedLayerStore.draft_preview_capability(),
+            "draftLifecycle": DerivedLayerStore.draft_lifecycle_capability(),
             "accessPathProbe": {
                 "version": ACCESS_PATH_VERSION,
                 "method": ACCESS_PATH_METHOD,
@@ -4193,6 +4284,7 @@ class DerivedLayerStore:
             definition = self.get_in_transaction(cur, name)
             if not definition:
                 raise FileNotFoundError(name)
+            self._reject_active_draft_mutation(definition)
             if definition["kind"] != "materialized":
                 raise DerivedLayerError("Only materialized views can be refreshed.")
             self._require_resolved_spatial_scope(definition)
@@ -4222,7 +4314,11 @@ class DerivedLayerStore:
                        semantic_asset_id AS "semanticAssetId",
                        semantic_generation AS "semanticGeneration",
                        semantic_status AS "semanticStatus",
-                       semantic_revision AS "semanticRevision"
+                       semantic_revision AS "semanticRevision",
+                       (SELECT to_jsonb(draft_record)
+                        FROM derived_layers._drafts AS draft_record
+                        WHERE draft_record.asset_id =
+                              _definitions.semantic_asset_id) AS draft
                 FROM {}._definitions
                 ORDER BY name
             """).format(sql.Identifier(SCHEMA)))
@@ -4305,7 +4401,11 @@ class DerivedLayerStore:
                        semantic_asset_id AS "semanticAssetId",
                        semantic_generation AS "semanticGeneration",
                        semantic_status AS "semanticStatus",
-                       semantic_revision AS "semanticRevision"
+                       semantic_revision AS "semanticRevision",
+                       (SELECT to_jsonb(draft_record)
+                        FROM derived_layers._drafts AS draft_record
+                        WHERE draft_record.asset_id =
+                              _definitions.semantic_asset_id) AS draft
                 FROM {}._definitions
                 {}
                 ORDER BY name
@@ -4330,7 +4430,11 @@ class DerivedLayerStore:
                        semantic_asset_id AS "semanticAssetId",
                        semantic_generation AS "semanticGeneration",
                        semantic_status AS "semanticStatus",
-                       semantic_revision AS "semanticRevision"
+                       semantic_revision AS "semanticRevision",
+                       (SELECT to_jsonb(draft_record)
+                        FROM derived_layers._drafts AS draft_record
+                        WHERE draft_record.asset_id =
+                              _definitions.semantic_asset_id) AS draft
                 FROM {}._definitions WHERE name = %s
             """).format(sql.Identifier(SCHEMA)), (name,))
             item = cur.fetchone()
@@ -4345,6 +4449,214 @@ class DerivedLayerStore:
             raise DerivedLayerError("Invalid derived-layer name.")
         with self._connect() as connection, connection.cursor() as cur:
             return self._incoming_dependents(cur, name)
+
+    @staticmethod
+    def _draft_public(row: dict[str, Any]) -> dict[str, Any]:
+        fields = {
+            "asset_id": "assetId", "name": "name", "generation": "generation",
+            "created_by": "createdBy", "created_at": "createdAt",
+            "expires_at": "expiresAt", "expires_in_hours": "expiresInHours",
+            "proposal_id": "proposalId", "state": "state",
+            "last_cleanup_attempt_at": "lastCleanupAttemptAt",
+            "last_cleanup_reason": "lastCleanupReason",
+            "last_cleanup_error": "lastCleanupError",
+            "adopted_at": "adoptedAt", "dropped_at": "droppedAt",
+        }
+        result = {public: row.get(stored) for stored, public in fields.items()}
+        result["assetId"] = str(result["assetId"])
+        result["generation"] = int(result["generation"])
+        result["cleanupApproved"] = True
+        for key, value in result.items():
+            if isinstance(value, (date, datetime)):
+                result[key] = value.isoformat()
+        return result
+
+    @staticmethod
+    def _draft_binding(binding: dict[str, Any]) -> tuple[str, str, int]:
+        if not isinstance(binding, dict):
+            raise DerivedLayerError("Draft identity must be an object.")
+        name, asset_id, generation = (
+            binding.get("name"), binding.get("assetId"), binding.get("generation"),
+        )
+        try:
+            valid_asset = isinstance(asset_id, str) and str(uuid.UUID(asset_id)) == asset_id
+        except ValueError:
+            valid_asset = False
+        if (
+            not isinstance(name, str) or not NAME_RE.fullmatch(name)
+            or not valid_asset or isinstance(generation, bool)
+            or not isinstance(generation, int) or generation < 1
+        ):
+            raise DerivedLayerError("Draft requires an exact name, assetId and generation.")
+        return name, asset_id, generation
+
+    @classmethod
+    def _draft_bindings(cls, bindings: list[dict[str, Any]]) -> list[tuple[str, str, int]]:
+        if not isinstance(bindings, list) or not 1 <= len(bindings) <= 100:
+            raise DerivedLayerError("Provide between 1 and 100 draft identities.")
+        identities = [cls._draft_binding(binding) for binding in bindings]
+        if len({identity[0] for identity in identities}) != len(identities):
+            raise DerivedLayerError("Duplicate draft identities are not allowed.")
+        return identities
+
+    def _draft_in_transaction(self, cur, identity: tuple[str, str, int]) -> dict[str, Any]:
+        name, asset_id, generation = identity
+        cur.execute(sql.SQL("""
+            SELECT * FROM {}._drafts WHERE asset_id = %s FOR UPDATE
+        """).format(sql.Identifier(SCHEMA)), (asset_id,))
+        row = cur.fetchone()
+        if not row or row["name"] != name or row["generation"] != generation:
+            raise DerivedLayerError("Draft identity changed or was not registered.")
+        return row
+
+    def _require_draft_definition(self, cur, identity: tuple[str, str, int]) -> dict[str, Any]:
+        definition = self.get_in_transaction(cur, identity[0])
+        profile = (definition or {}).get("semanticProfile", {})
+        if profile.get("assetId") != identity[1] or profile.get("generation") != identity[2]:
+            raise DerivedLayerError("Draft relation identity changed; automatic cleanup is blocked.")
+        return definition
+
+    def list_drafts(self, limit: int = 100, *, include_terminal: bool = False) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise DerivedLayerError("Draft journal limit must be between 1 and 100.")
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("""
+                SELECT * FROM {}._drafts
+                WHERE (%s OR state = 'active')
+                ORDER BY last_cleanup_attempt_at NULLS FIRST, created_at, asset_id
+                LIMIT %s
+            """).format(sql.Identifier(SCHEMA)), (include_terminal, limit))
+            return [self._draft_public(row) for row in cur.fetchall()]
+
+    def drafts_for_names(self, names: list[str] | set[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+        """Resolve active draft references before recording publication intent.
+
+        Historical names never authorize adoption: every active journal entry
+        must still identify exactly the registered relation and generation.
+        """
+        if (
+            not isinstance(names, (list, set, tuple)) or len(names) > 1000
+            or any(not isinstance(name, str) or not NAME_RE.fullmatch(name) for name in names)
+        ):
+            raise DerivedLayerError("Draft reference lookup requires at most 1000 valid relation names.")
+        if not names:
+            return []
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("""
+                SELECT draft.*,
+                       COALESCE(definition.semantic_asset_id = draft.asset_id
+                         AND definition.semantic_generation = draft.generation,
+                         false) AS identity_matches
+                FROM {}._drafts AS draft
+                LEFT JOIN {}._definitions AS definition ON definition.name = draft.name
+                WHERE draft.state = 'active' AND draft.name = ANY(%s)
+                ORDER BY draft.name, draft.asset_id
+            """).format(sql.Identifier(SCHEMA), sql.Identifier(SCHEMA)), (sorted(set(names)),))
+            rows = list(cur.fetchall())
+            if any(not row["identity_matches"] for row in rows):
+                raise DerivedLayerError("Draft relation identity changed; publication adoption is blocked.")
+            return [self._draft_public(row) for row in rows]
+
+    def bind_drafts(
+        self, bindings: list[dict[str, Any]], proposal_id: str, actor: str,
+        *, allow_other_owner: bool = False,
+    ) -> list[dict[str, Any]]:
+        identities = self._draft_bindings(bindings)
+        if not isinstance(proposal_id, str) or not proposal_id or len(proposal_id) > 200:
+            raise DerivedLayerError("Invalid draft proposal identity.")
+        result = []
+        with self._mutation_connection() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
+            self._ensure_changes_allowed(cur)
+            for identity in identities:
+                row = self._draft_in_transaction(cur, identity)
+                self._require_draft_definition(cur, identity)
+                if row["state"] != "active":
+                    raise DerivedLayerError("Only active drafts can be bound to a proposal.")
+                if row["created_by"] != actor and not allow_other_owner:
+                    raise DerivedLayerError("A draft may only be bound by its creator or an administrator.")
+                if row["proposal_id"] not in (None, proposal_id):
+                    raise DerivedLayerError("Draft already belongs to another proposal.")
+                cur.execute(sql.SQL("""
+                    UPDATE {}._drafts SET proposal_id = %s
+                    WHERE asset_id = %s AND expires_at > clock_timestamp()
+                    RETURNING *
+                """).format(sql.Identifier(SCHEMA)), (proposal_id, identity[1]))
+                updated = cur.fetchone()
+                if not updated:
+                    raise DerivedLayerError("Expired drafts cannot be bound to a proposal.")
+                result.append(self._draft_public(updated))
+        return result
+
+    def adopt_drafts(
+        self, bindings: list[dict[str, Any]], proposal_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        identities = self._draft_bindings(bindings)
+        result = []
+        with self._mutation_connection() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
+            self._ensure_changes_allowed(cur)
+            for identity in identities:
+                row = self._draft_in_transaction(cur, identity)
+                if proposal_id is not None and row["proposal_id"] != proposal_id:
+                    raise DerivedLayerError("Draft proposal ownership changed.")
+                if row["state"] == "adopted":
+                    result.append(self._draft_public(row))
+                    continue
+                if row["state"] != "active":
+                    raise DerivedLayerError("A dropped draft cannot be adopted.")
+                self._require_draft_definition(cur, identity)
+                cur.execute(sql.SQL("""
+                    UPDATE {}._drafts
+                    SET state = 'adopted', adopted_at = clock_timestamp(),
+                        last_cleanup_error = NULL
+                    WHERE asset_id = %s RETURNING *
+                """).format(sql.Identifier(SCHEMA)), (identity[1],))
+                result.append(self._draft_public(cur.fetchone()))
+        return result
+
+    def record_draft_cleanup(
+        self, binding: dict[str, Any], reason: str, error: str | None = None,
+    ) -> None:
+        name, asset_id, generation = self._draft_binding(binding)
+        # Callers provide stable reason codes and sanitized errors, never SQL.
+        with self._connect() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("""
+                UPDATE {}._drafts
+                SET last_cleanup_attempt_at = clock_timestamp(),
+                    last_cleanup_reason = %s, last_cleanup_error = %s
+                WHERE asset_id = %s AND name = %s AND generation = %s
+                  AND state = 'active'
+            """).format(sql.Identifier(SCHEMA)), (
+                str(reason)[:200], str(error)[:500] if error is not None else None,
+                asset_id, name, generation,
+            ))
+
+    def cleanup_draft(
+        self, binding: dict[str, Any], actor: str = "system:draft-cleanup",
+    ) -> dict[str, Any]:
+        """Drop after the coordinator holds workspace/preview exclusion guards."""
+        identity = self._draft_binding(binding)
+        with self._mutation_connection() as connection, connection.cursor() as cur:
+            self._acquire_mutation_lock(connection)
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            self._ensure_changes_allowed(cur)
+            row = self._draft_in_transaction(cur, identity)
+            if row["state"] == "dropped":
+                return self._draft_public(row)
+            if row["state"] != "active":
+                raise DerivedLayerError("Adopted drafts are permanent and cannot be automatically dropped.")
+            definition = self._require_draft_definition(cur, identity)
+            self._drop_in_transaction(cur, definition, actor, cleanup_reason="automatic-cleanup")
+            return self._draft_public(self._draft_in_transaction(cur, identity))
+
+    @staticmethod
+    def _reject_active_draft_mutation(definition: dict[str, Any]) -> None:
+        if definition.get("draft", {}).get("state") == "active":
+            raise DerivedLayerError(
+                "Active draft relations cannot be replaced or refreshed; "
+                "apply their owning proposal first or create a new draft."
+            )
 
     def create(
         self,
@@ -4441,6 +4753,7 @@ class DerivedLayerStore:
                     target, sql.Identifier(self.reader_role)
                 )
             )
+            asset_id = str(uuid.uuid4())
             cur.execute(
                 sql.SQL("""
                     INSERT INTO {}._definitions
@@ -4461,9 +4774,21 @@ class DerivedLayerStore:
                         if definition["spatialScope"] is not None else None
                     ),
                     actor, definition["kind"] == "materialized",
-                    str(uuid.uuid4()),
+                    asset_id,
                 ),
             )
+            if "draft" in definition:
+                cur.execute(sql.SQL("""
+                    INSERT INTO {}._drafts
+                      (asset_id, name, generation, created_by,
+                       expires_at, expires_in_hours)
+                    VALUES (%s, %s, 1, %s,
+                            clock_timestamp() + %s * interval '1 hour', %s)
+                """).format(sql.Identifier(SCHEMA)), (
+                    asset_id, definition["name"], actor,
+                    definition["draft"]["expiresInHours"],
+                    definition["draft"]["expiresInHours"],
+                ))
             item = self.get_in_transaction(cur, definition["name"])
             item.update(output)
             item["queryPlanProbe"] = query_plan_probe
@@ -4490,7 +4815,11 @@ class DerivedLayerStore:
                    semantic_asset_id AS "semanticAssetId",
                    semantic_generation AS "semanticGeneration",
                    semantic_status AS "semanticStatus",
-                   semantic_revision AS "semanticRevision"
+                   semantic_revision AS "semanticRevision",
+                   (SELECT to_jsonb(draft_record)
+                    FROM derived_layers._drafts AS draft_record
+                    WHERE draft_record.asset_id =
+                          _definitions.semantic_asset_id) AS draft
             FROM {}._definitions WHERE name = %s
         """).format(sql.Identifier(SCHEMA)), (name,))
         item = cur.fetchone()
@@ -4515,6 +4844,7 @@ class DerivedLayerStore:
             definition = self.get_in_transaction(cur, name)
             if not definition:
                 raise FileNotFoundError(name)
+            self._reject_active_draft_mutation(definition)
             if definition["kind"] != "materialized":
                 raise DerivedLayerError("Only materialized views can be refreshed.")
             self._require_resolved_spatial_scope(definition)
@@ -4593,6 +4923,8 @@ class DerivedLayerStore:
         cancellation: DerivedLayerCancellation | None = None,
     ) -> dict[str, Any]:
         definition = validate_definition(payload)
+        if "draft" in definition:
+            raise DerivedLayerError("Draft ownership can only be specified when creating a relation.")
         if definition["name"] != name:
             raise DerivedLayerError("Replacement name must match the existing relation.")
         with self._mutation_connection(cancellation) as connection, connection.cursor() as cur:
@@ -4605,6 +4937,7 @@ class DerivedLayerStore:
             current = self.get_in_transaction(cur, name)
             if not current:
                 raise FileNotFoundError(name)
+            self._reject_active_draft_mutation(current)
             self._require_resolved_spatial_scope(definition)
             if cancellation is not None:
                 cancellation.report_progress("query-preflight")
@@ -4805,46 +5138,65 @@ class DerivedLayerStore:
             definition = self.get_in_transaction(cur, name)
             if not definition:
                 raise FileNotFoundError(name)
-            dependents = self._incoming_dependents(cur, name)
-            if dependents:
-                raise DerivedLayerDependencyError(name, dependents)
-            fields = self._semantic_fields(cur, name)
-            cur.execute(sql.SQL("""
-                UPDATE {}._definitions
-                SET semantic_generation = semantic_generation + 1,
-                    semantic_status = 'pending_archive',
-                    semantic_revision = NULL
-                WHERE name = %s
-            """).format(sql.Identifier(SCHEMA)), (name,))
-            definition = self.get_in_transaction(cur, name)
-            self._enqueue_semantic_event(
-                cur,
-                definition,
-                "archive",
-                actor,
-                fields,
-            )
-            keyword = (
-                sql.SQL("MATERIALIZED VIEW")
-                if definition["kind"] == "materialized"
-                else sql.SQL("VIEW")
-            )
-            cur.execute("SAVEPOINT derived_drop_guard")
-            try:
-                cur.execute(
-                    sql.SQL("DROP {} {} RESTRICT").format(
-                        keyword, sql.Identifier(SCHEMA, name)
-                    )
+            return self._drop_in_transaction(cur, definition, actor)
+
+    def _drop_in_transaction(
+        self, cur, definition: dict[str, Any], actor: str,
+        *, cleanup_reason: str = "manual-drop",
+    ) -> dict[str, Any]:
+        name = definition["name"]
+        dependents = self._incoming_dependents(cur, name)
+        if dependents:
+            raise DerivedLayerDependencyError(name, dependents)
+        fields = self._semantic_fields(cur, name)
+        cur.execute(sql.SQL("""
+            UPDATE {}._definitions
+            SET semantic_generation = semantic_generation + 1,
+                semantic_status = 'pending_archive',
+                semantic_revision = NULL
+            WHERE name = %s
+        """).format(sql.Identifier(SCHEMA)), (name,))
+        definition = self.get_in_transaction(cur, name)
+        self._enqueue_semantic_event(
+            cur,
+            definition,
+            "archive",
+            actor,
+            fields,
+        )
+        keyword = (
+            sql.SQL("MATERIALIZED VIEW")
+            if definition["kind"] == "materialized"
+            else sql.SQL("VIEW")
+        )
+        cur.execute("SAVEPOINT derived_drop_guard")
+        try:
+            cur.execute(
+                sql.SQL("DROP {} {} RESTRICT").format(
+                    keyword, sql.Identifier(SCHEMA, name)
                 )
-            except psycopg.errors.DependentObjectsStillExist:
-                cur.execute("ROLLBACK TO SAVEPOINT derived_drop_guard")
-                raise DerivedLayerDependencyError(
-                    name,
-                    self._incoming_dependents(cur, name),
-                ) from None
-            cur.execute(sql.SQL("DELETE FROM {}._definitions WHERE name = %s").format(
-                sql.Identifier(SCHEMA)
-            ), (name,))
+            )
+        except psycopg.errors.DependentObjectsStillExist:
+            cur.execute("ROLLBACK TO SAVEPOINT derived_drop_guard")
+            raise DerivedLayerDependencyError(
+                name,
+                self._incoming_dependents(cur, name),
+            ) from None
+        cur.execute(sql.SQL("DELETE FROM {}._definitions WHERE name = %s").format(
+            sql.Identifier(SCHEMA)
+        ), (name,))
+        cur.execute(sql.SQL("""
+            UPDATE {}._drafts
+            SET state = 'dropped', dropped_at = clock_timestamp(),
+                last_cleanup_attempt_at = clock_timestamp(),
+                last_cleanup_reason = %s, last_cleanup_error = NULL
+            WHERE asset_id = %s AND state IN ('active', 'adopted')
+            RETURNING *
+        """).format(sql.Identifier(SCHEMA)), (
+            cleanup_reason, definition["semanticProfile"]["assetId"],
+        ))
+        if "draft" in definition:
+            definition["draft"] = self._draft_public(cur.fetchone())
         return definition
 
     def claim_semantic_events(

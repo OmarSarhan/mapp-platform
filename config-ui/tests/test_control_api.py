@@ -569,6 +569,14 @@ class ControlApiTests(ControlStoreTestCase):
             },
         )
         self.assertEqual("meta", payload["responseEnvelope"]["metadataField"])
+        for action_id in (
+            "visual.plan", "visual.test", "proposals.preview-plan",
+            "proposals.preview-test", "proposals.preview-screenshot",
+        ):
+            self.assertEqual(
+                ["feature", "layer", "viewport"],
+                actions[action_id]["inputSchema"]["properties"]["framing"]["enum"],
+            )
         # `visual.screenshot` was a byte-identical duplicate of `visual.test`
         # on the same route, removed in Phase 1 wave 4 because a route claimed
         # by two ids cannot be resolved for an exchanged credential at all.
@@ -1472,6 +1480,92 @@ class ControlApiTests(ControlStoreTestCase):
             "hover-centre-feature",
             plan["hover"]["type"],
         )
+
+    def test_viewport_framing_uses_effective_locale_startup_view(self):
+        workspace = self.database_visual_workspace()
+        workspace["locale"]["view"] = {"lng": -1.5, "lat": 53.8, "z": 11}
+        workspace["locales"] = {"north": {"view": {"lng": -1.6, "z": 10}}}
+        layer = workspace["locale"]["layers"]["Arrivals 1951-1960"]
+        layer["featureSet"] = ["oa-1"]
+        with patch("control_api.psycopg.connect") as connect:
+            plan = visual_plan(
+                workspace, "Arrivals 1951-1960", {}, "north",
+                visual_request={"framing": "viewport"},
+            )
+        connect.assert_not_called()
+        self.assertEqual("workspace-viewport", plan["source"])
+        self.assertEqual("viewport", plan["framing"])
+        self.assertEqual([-1.6, 53.8], plan["centre"])
+        self.assertEqual(10, plan["zoom"])
+        self.assertEqual("configured-locale-view", plan["effectiveDataset"]["query"]["reason"])
+        self.assertEqual(["featureSet"], plan["effectiveDataset"]["effectiveFilter"]["restrictions"])
+        self.assertIsNone(plan["effectiveDataset"]["filteredFeatureCount"])
+        self.assertNotIn("expectedFeatureId", plan["interaction"])
+        self.assertIn("unsaved browser viewport", " ".join(plan["warnings"]))
+
+    def test_viewport_framing_preserves_supplied_area_without_database_queries(self):
+        with patch("control_api.psycopg.connect") as connect:
+            plan = visual_plan(
+                self.database_visual_workspace(), "Arrivals 1951-1960", {},
+                visual_request={"framing": "viewport", "centre": [-1.5, 53.8], "zoom": 10},
+            )
+        connect.assert_not_called()
+        self.assertEqual("explicit-view", plan["source"])
+        self.assertEqual("viewport", plan["framing"])
+        self.assertEqual([-1.5, 53.8], plan["centre"])
+        self.assertEqual(10, plan["zoom"])
+
+    def test_ambiguous_or_unavailable_framing_is_rejected_before_database_queries(self):
+        for request in (
+            {"framing": "unknown"},
+            {"framing": "viewport"},
+            {"framing": "viewport", "zoom": 11},
+            {"framing": "viewport", "centre": [-1.5, 53.8]},
+            {"framing": "layer", "zoom": 11},
+        ):
+            with self.subTest(request=request), patch("control_api.psycopg.connect") as connect:
+                with self.assertRaises(ValueError):
+                    visual_plan(self.database_visual_workspace(), "Arrivals 1951-1960", {}, visual_request=request)
+                connect.assert_not_called()
+
+    def test_layer_framing_fits_filtered_full_extent_without_representative_zoom(self):
+        workspace = self.database_visual_workspace()
+        layer = workspace["locale"]["layers"]["Arrivals 1951-1960"]
+        layer["filter"] = {"default": {"published": {"boolean": True}}}
+        layer["featureSet"] = ["oa-1", "oa-2"]
+        layer["featureLookup"] = [{"id": "oa-2"}]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = (6147, -200000, 7000000, -150000, 7100000, "ST_Polygon")
+        connection.cursor.return_value = cursor
+        with patch("control_api.psycopg.connect", return_value=connection) as connect:
+            plan = visual_plan(
+                workspace, "Arrivals 1951-1960", {"MAPP": "postgresql://example.invalid/mapp"},
+                visual_request={"framing": "layer", "viewport": {"width": 1080, "height": 720}},
+            )
+        connect.assert_called_once()
+        query, params = cursor.execute.call_args_list[2].args
+        self.assertIn('"published" IS TRUE', query.as_string(None))
+        self.assertEqual(['["oa-1","oa-2"]', '["oa-2"]'], params)
+        self.assertEqual("postgis-layer", plan["source"])
+        self.assertEqual("layer", plan["framing"])
+        self.assertEqual(6147, plan["featureCount"])
+        self.assertEqual(plan["bounds3857"], plan["focusBounds3857"])
+        self.assertEqual([-200000, 7000000, -150000, 7100000], plan["bounds3857"])
+        self.assertLess(plan["zoom"], 10)
+        self.assertAlmostEqual(-1.57205, plan["centre"][0], places=4)
+        self.assertIsNone(plan["effectiveDataset"]["representativeFeature"])
+        self.assertNotIn("featureId", plan)
+        self.assertNotIn("expectedFeatureId", plan["interaction"])
+        self.assertEqual("hover-centre-feature", plan["hover"]["type"])
+        self.assertEqual(["filter.default", "featureSet", "featureLookup"], plan["effectiveDataset"]["effectiveFilter"]["restrictions"])
+
+    def test_layer_framing_rejects_external_sources_instead_of_claiming_an_extent(self):
+        workspace = {"locale": {"layers": {"External": {"format": "tiles"}}}}
+        with self.assertRaisesRegex(ValueError, "probeable database layer"):
+            visual_plan(workspace, "External", {}, visual_request={"framing": "layer"})
 
     def test_explicit_advanced_view_keeps_effective_filter_diagnostics(self):
         workspace = {"locale": {"layers": {"External": {

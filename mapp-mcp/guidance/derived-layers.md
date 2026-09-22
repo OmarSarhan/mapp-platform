@@ -1,9 +1,10 @@
 # Managed derived relations
 
 Use a derived layer when one rendered relation must combine or spatially derive
-data from source relations. These act on the database directly — there is no
-proposal, no review queue and no diff to read beforehand — which is why every
-one of them asks a person first.
+data from source relations. These act on the database directly, without a
+database proposal or review queue. Creation and explicit mutation ask a person
+first. Disposable draft creation
+can also authorize guarded automatic cleanup under the recorded policy.
 
 Requires `derive:manage`, the widest scope an operator can grant.
 
@@ -29,6 +30,12 @@ accepted identifiers itself.
 
 ## Plan before you create
 
+For a request to preview before making any change, explain that rendering still
+requires approved database creation. Planning is non-mutating; rendering a new
+derived result is not. Disposable drafts reduce retained clutter but create a
+real relation that other database connections can read. A preview request alone
+is not approval for creation or its automatic cleanup policy.
+
 `derived_layers_plan` runs the probes the platform would run, reports what
 would happen, and returns a `plan_fingerprint`. Pass that fingerprint to
 `derived_layers_create` and the create is refused if the sources moved in
@@ -37,6 +44,45 @@ between.
 This matters more here than for a workspace proposal: a derived layer leaves no
 proposal behind, so the plan is the only description of the change that exists
 before the change does.
+
+The plan leaves no persistent relation. It does not execute the output query,
+compute observed quintiles, or render a map. Its estimates are not evidence of
+the actual numeric distribution. After approved creation, use the bounded
+aggregate-only numeric inspection tools on the effective layer dataset to
+choose and verify category breaks.
+
+## Disposable relations for proposal previews
+
+For an explicitly disposable preview, pass `draft_expires_in_hours` (an integer
+from 1 to 168) to both `derived_layers_plan` and `derived_layers_create`. Keep
+that value identical when using the plan fingerprint. The creation prompt
+authorizes the real database change and dependency-checked automatic deletion
+after its proposal is declined or retention expires. Without this parameter,
+creation keeps the existing permanent lifecycle.
+
+Pass the created relation's exact `name`, stable `assetId`, and `generation` as
+one `draft_relations` binding in both `proposals_check` and `proposals_create`.
+Those identities are bound into the check fingerprint. The candidate must use
+the relation. Never infer ownership from names, age, or the fact that a relation
+is absent from the live map, and never attach a pre-existing permanent relation
+to obtain automatic deletion rights.
+
+Applying the workspace proposal publishes and retains its disposable relations.
+Declining its proposal makes them eligible for cleanup after active previews
+finish. Abandoned drafts become eligible only at their explicitly approved
+expiry. Live workspace use, other pending proposals, PostgreSQL dependencies,
+and active previews block deletion. Cleanup rechecks identity and generation,
+uses no cascading drop, records its result, and retries deferred work.
+
+Use `derived_layers_drafts` to inspect ownership, retention, and cleanup results.
+When the user rejects the preview, call `proposals_decline` for the owning
+proposal. Refusing an apply approval only refuses that attempt; it does not
+decline the proposal or trigger immediate cleanup. The draft still has its
+approved retention deadline. Never infer a final rejection from silence.
+
+A pending proposal is not itself authorization to delete an ordinary relation;
+existing relations and proposals are not retroactively enrolled. A blocked
+cleanup is an operational result to report, not permission to force a drop.
 
 ## Spatial scope is fixed at creation
 

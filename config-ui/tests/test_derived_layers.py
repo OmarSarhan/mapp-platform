@@ -2861,6 +2861,11 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         definition_planning = capabilities["definitionPlanning"]
         self.assertEqual("/api/derived-layers/plan", definition_planning["path"])
         self.assertFalse(definition_planning["mutationApplied"])
+        draft = definition_planning["draftPreview"]
+        self.assertFalse(draft["supported"])
+        self.assertTrue(draft["requiresDatabaseCreation"])
+        self.assertFalse(draft["proposalScoped"])
+        self.assertEqual("derived_layer.draft_preview_unavailable", draft["code"])
         index_metadata = definition_planning["accessPathProbe"][
             "indexMetadata"
         ]
