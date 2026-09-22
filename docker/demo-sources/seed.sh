@@ -73,9 +73,12 @@ seed_one() {
 
   # The source containers install openssl and generate a certificate before
   # postgres starts, and their healthcheck is a socket-local pg_isready that
-  # can report healthy while docker-entrypoint-initdb.d is still running. Wait
-  # for the server itself rather than for the container.
-  "${compose[@]}" exec -T "${service}" sh -c 'until pg_isready -q; do sleep 1; done'
+  # can report healthy while docker-entrypoint-initdb.d is still running. The
+  # temporary initialization server has no TCP listener. Probe TCP with the
+  # configured role and database, avoiding spurious "role root does not exist"
+  # errors from pg_isready's default identity.
+  "${compose[@]}" exec -T "${service}" sh -c \
+    'until pg_isready -q -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 1; done'
 
   # docker-entrypoint-initdb.d only runs for a new volume. Reapply the packaged
   # reader budget here so `mapp demo` upgrades retained census/ops volumes too.

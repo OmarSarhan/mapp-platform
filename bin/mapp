@@ -975,6 +975,7 @@ case "${1:-}" in
   all)
     ensure_bundled_database_upgraded
     run_with_buildkit_lease_retry "${compose[@]}" up --detach --build "${runtime_services[@]}"
+    ensure_runtime_client_registered
     "${ROOT_DIR}/scripts/verify.sh"
     ;;
   verify)

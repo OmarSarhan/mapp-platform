@@ -407,3 +407,19 @@ class McpSurfaceSwitchTests(unittest.TestCase):
             "verify.sh resolves MAPP_MCP more than once; resolve it into"
             " mcp_surface and use that",
         )
+
+    def test_all_registers_the_runtime_before_verification(self) -> None:
+        """A fresh `all` must not leave every authenticated MCP call at 503."""
+        text = LAUNCHER.read_text()
+        branch = re.search(r"\n  all\)\n(.*?)\n    ;;", text, re.S)
+        self.assertIsNotNone(branch, "the all command branch is missing")
+        body = branch.group(1)
+        started = body.index('up --detach --build "${runtime_services[@]}"')
+        registration = re.search(
+            r"^    ensure_runtime_client_registered$", body, re.M
+        )
+        self.assertIsNotNone(registration, "all does not register the MCP runtime")
+        registered = registration.start()
+        verified = body.index('"${ROOT_DIR}/scripts/verify.sh"')
+        self.assertLess(started, registered)
+        self.assertLess(registered, verified)
