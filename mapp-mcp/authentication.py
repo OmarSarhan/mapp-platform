@@ -23,8 +23,11 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import logging
 
 from introspection_client import IntrospectionUnavailable
+
+LOGGER = logging.getLogger("mapp_mcp.authentication")
 
 #: What a client must hold merely to open a session. Anything a tool needs is
 #: checked per tool, against the grant, later.
@@ -176,6 +179,20 @@ class BearerAuthentication:
         )
 
     async def _unavailable(self, send, detail: str) -> None:
+        # The body stays generic: the caller is unauthenticated, and what broke
+        # inside this deployment is not theirs to read. The detail is not
+        # discarded though, which it used to be -- the parameter was accepted
+        # and never used, so the one sentence naming the cause was computed and
+        # thrown away on every failure.
+        #
+        # It matters because the two causes need opposite responses and produce
+        # the same 503. "the authorization component is unavailable" is a
+        # component that is down; "introspection refused this component" is a
+        # runtime whose own credential is not registered, which happens when
+        # `./bin/mapp mcp-runtime-register` has not run or ran against a
+        # different MAPP_MCP_CLIENT_SECRET. An operator reading the wire
+        # message alone goes looking for a service that is running perfectly.
+        LOGGER.error("refusing an RPC call with 503: %s", detail)
         await _write(
             send,
             503,

@@ -264,6 +264,34 @@ class UnavailableTests(unittest.TestCase):
         self.assertNotIn("www-authenticate", response.headers)
         self.assertEqual(0, inner.calls)
 
+    def test_the_cause_is_logged_even_though_the_body_is_generic(self) -> None:
+        """Two causes produce this same 503 and need opposite responses.
+
+        A component that is genuinely down, and a runtime whose own credential
+        is rejected -- the second happens when `mcp-runtime-register` has not
+        run, or ran against a different MAPP_MCP_CLIENT_SECRET. The body must
+        stay generic, because the caller is unauthenticated and what broke in
+        here is not theirs to read, so the log is the only place the
+        distinction can live.
+
+        It lived nowhere: `_unavailable` took the detail and never used it, so
+        an operator reading the wire message went looking for a service that
+        was running perfectly.
+        """
+        detail = "introspection refused this component: HTTP 401"
+        app, _, _, _ = stack(raises=IntrospectionUnavailable(detail))
+        with self.assertLogs("mapp_mcp.authentication", level="ERROR") as logged:
+            response = rpc(app, token=TOKEN)
+        self.assertEqual(503, response.status)
+        self.assertNotIn(
+            detail, response.body.decode(),
+            "the wire body must not carry deployment internals",
+        )
+        self.assertTrue(
+            any(detail in line for line in logged.output),
+            f"the cause was not logged; got {logged.output}",
+        )
+
 
 class CacheTests(unittest.TestCase):
     def test_the_metadata_document_is_never_authenticated(self) -> None:
