@@ -395,16 +395,21 @@ ensure_runtime_client_registered() {
     # Blank is a deliberate configuration: run without the MCP runtime.
     return 0
   fi
-  # No --build: this runs after the images are built, and a `run --build`
-  # whose output is redirected cannot render its progress on an interactive
-  # terminal. No `2>&1` to /dev/null either -- the reason this failed is the
-  # one thing worth keeping, because the symptom it produces names something
-  # else entirely. An unregistered runtime makes every MCP call answer 503
-  # "The authorization component is unavailable", which is false: the
-  # component is up and the runtime's own credential is what is missing.
+  # `exec`, not `run`: this is called immediately after `up --build` has
+  # brought config-ui up, so there is a running container to use and no
+  # reason to resolve an image at all. It also sidesteps the two ways a
+  # `run` goes wrong here -- pulling an image this repository builds, and
+  # rendering build progress into a capture, which fails on an interactive
+  # terminal.
+  #
+  # The output is kept rather than discarded. The reason this failed is the
+  # one thing worth having, because the symptom it produces names something
+  # else entirely: an unregistered runtime makes every MCP call answer 503
+  # "The authorization component is unavailable", which is false -- the
+  # component is up, and the runtime's own credential is what is missing.
   local registration
   if ! registration="$(printf '%s\n' "${secret}" \
-    | "${compose[@]}" run --rm --no-deps -T config-ui \
+    | "${compose[@]}" exec -T config-ui \
         python config_admin.py mcp-runtime-register \
           --root /control --secret-stdin 2>&1)"; then
     printf 'Could not register the MCP runtime client; MCP calls will be refused with 503 "authorization_unavailable".\n' >&2
