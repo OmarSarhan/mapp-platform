@@ -75,9 +75,17 @@ tools). Check they are healthy:
 ./bin/mapp ps
 ```
 
-The agent surface lives on its own hostname, `http://mcp.localhost` by default
-— separate from the map and the dashboard. `*.localhost` resolves to your own
-machine without any hosts-file entry.
+The agent surface lives on its own origin, `http://localhost:8181` by default —
+separate from the map and the dashboard. The port is what separates it; a
+different port is a different origin as far as a browser is concerned.
+
+> **Why a port rather than a name like `mcp.localhost`.** MCP clients refuse to
+> send credentials to an `http://` token endpoint unless the host is literally
+> `localhost`, `127.0.0.1` or `::1`. A subdomain is not exempt, so a `.localhost`
+> name gets you through sign-in and consent and then fails at the token request,
+> with the only evidence in the client's own log. authlib applies the same rule
+> on the server side. Over HTTPS in production none of this applies, and
+> `PRODUCTION_MCP_SITE` is a normal hostname.
 
 ---
 
@@ -111,7 +119,7 @@ It prints a client ID like `mcp-NgbtAji4QKqEGrLa`.
 ```bash
 claude mcp add --transport http \
   --client-id mcp-NgbtAji4QKqEGrLa --callback-port 8484 \
-  mapp http://mcp.localhost/mcp
+  mapp http://localhost:8181/mcp
 ```
 
 Or as a project `.mcp.json`:
@@ -121,7 +129,7 @@ Or as a project `.mcp.json`:
   "mcpServers": {
     "mapp": {
       "type": "http",
-      "url": "http://mcp.localhost/mcp",
+      "url": "http://localhost:8181/mcp",
       "oauth": {
         "clientId": "mcp-NgbtAji4QKqEGrLa",
         "callbackPort": 8484,
@@ -145,7 +153,7 @@ Or as a project `.mcp.json`:
 
 ## Step 4 — the first connection
 
-Your assistant opens a browser at `mcp.localhost`. You will:
+Your assistant opens a browser at `localhost:8181`. You will:
 
 1. **Sign in** with the administrator password. This is the authorization
    server, not the dashboard, so it asks even if the dashboard is already open

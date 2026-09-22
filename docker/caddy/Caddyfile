@@ -48,7 +48,7 @@
 # emit, leaving them with default-src 'none' and no styling. Verified against
 # caddy 2.11.4. The rule this encodes: the application owns CSP on every
 # response it serves, and Caddy sets CSP only where Caddy itself responds.
-{$MCP_SITE:http://mcp.localhost} {
+{$MCP_SITE:http://localhost:8181} {
 	header {
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY

@@ -29,6 +29,87 @@ def site_block(opening: str) -> str:
     raise AssertionError(f"unterminated site block for {opening!r}")
 
 
+def mcp_site_opening() -> str:
+    """The `{$MCP_SITE:...} {` line that opens the MCP site block."""
+    match = re.search(r"\{\$MCP_SITE:[^}]*\} \{", CADDYFILE)
+    assert match, "the Caddyfile no longer has an MCP site block"
+    return match.group(0)
+
+
+#: Hosts an MCP client will send credentials to over plain http. Everything
+#: else must be https. The Claude extension states the rule in its own
+#: refusal, and authlib applies the same one server-side, which is why the
+#: development deployment needs AUTHLIB_INSECURE_TRANSPORT at all.
+TLS_EXEMPT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+class HttpOriginTests(unittest.TestCase):
+    """An http MCP origin must be one a client will actually use.
+
+    `mcp.localhost` is a *subdomain* of localhost and is not exempt, so the
+    Claude extension completed consent, received the authorization code and
+    then refused to exchange it:
+
+        Refusing to send credentials to non-https token endpoint
+        'http://mcp.localhost/oauth/token'. OAuth token requests MUST use TLS
+        (localhost / 127.0.0.1 / ::1 are exempt).
+
+    Nothing on this side reported a fault -- the grant was live and the server
+    was waiting -- so the failure was only visible in the client's log. A port
+    keeps it a distinct origin from the map without leaving the exempt set.
+    """
+
+    def origins(self):
+        """Every default MCP origin this repository ships."""
+        template = (ROOT / ".env.example").read_text()
+        found = {
+            "env.example": re.search(r"^MCP_SITE=(\S+)", template, re.M).group(1),
+            "Caddyfile": re.search(
+                r"\{\$MCP_SITE:([^}]*)\}", CADDYFILE
+            ).group(1),
+        }
+        return found
+
+    def test_an_http_origin_uses_a_host_clients_exempt_from_tls(self) -> None:
+        for where, origin in self.origins().items():
+            with self.subTest(source=where, origin=origin):
+                if not origin.startswith("http://"):
+                    continue
+                host = origin[len("http://"):].split("/")[0].rsplit(":", 1)[0]
+                self.assertIn(
+                    host, TLS_EXEMPT_HOSTS,
+                    f"{origin} is plain http on a host no MCP client will send"
+                    " credentials to. Use localhost, 127.0.0.1 or ::1 -- a"
+                    " port keeps it a separate origin -- or serve it over TLS.",
+                )
+
+    def test_the_published_port_is_the_one_the_origin_names(self) -> None:
+        """Caddy listens on the port inside MCP_SITE, so the port Compose
+        publishes must be that same number. A mapping onto a fixed container
+        port works until somebody changes MCP_SITE, and then publishes a port
+        nothing is listening on -- with every container healthy."""
+        template = (ROOT / ".env.example").read_text()
+        site = re.search(r"^MCP_SITE=(\S+)", template, re.M).group(1)
+        port = re.search(r"^MCP_PORT=(\S+)", template, re.M).group(1)
+        self.assertTrue(
+            site.endswith(f":{port}"),
+            f"MCP_SITE ({site}) and MCP_PORT ({port}) name different ports",
+        )
+        compose = (ROOT / "compose.yaml").read_text()
+        self.assertIn(
+            "${MCP_PORT:-" + port + "}:${MCP_PORT:-" + port + '}"', compose,
+            "Compose must publish the MCP port onto itself, because Caddy"
+            " listens on whatever port MCP_SITE names",
+        )
+
+    def test_the_two_defaults_agree(self) -> None:
+        """The Caddyfile default is what a deployment with no MCP_SITE gets,
+        and .env.example is what every `./bin/mapp init` writes. If they
+        disagree, one of them is never exercised."""
+        origins = self.origins()
+        self.assertEqual(origins["env.example"], origins["Caddyfile"])
+
+
 class CaddyContractTests(unittest.TestCase):
     def test_request_body_limit_matches_the_api_binary_limit(self) -> None:
         self.assertIn("max_size 5MiB", CADDYFILE)
@@ -46,7 +127,10 @@ class McpOriginTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.block = site_block("{$MCP_SITE:http://mcp.localhost} {")
+        # Derived, not spelled out: the default origin moved once already
+        # (mcp.localhost -> a loopback host and port) and this line was the
+        # sibling that broke.
+        self.block = site_block(mcp_site_opening())
 
     def test_exactly_four_authorization_paths_reach_that_socket(self) -> None:
         matcher = re.search(r"@auth_public path ([^\n]+)", self.block)

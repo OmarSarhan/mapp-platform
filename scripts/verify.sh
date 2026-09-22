@@ -2942,10 +2942,15 @@ if [[ "${production}" == true ]]; then
 else
   map_url="http://${published_http}"
   config_url="${map_url}"
-  mcp_url="${map_url}"
   map_headers=(--header 'Host: localhost')
   config_headers=(--header 'Host: config.localhost')
-  mcp_headers=(--header 'Host: mcp.localhost')
+  # The MCP origin has its own published port and a real loopback host, so it
+  # is reached directly rather than by pointing a Host header at the shared
+  # edge port. It has to be: an MCP client will not send credentials to an
+  # http token endpoint on anything but localhost, 127.0.0.1 or ::1, so the
+  # origin cannot be a *.localhost name the way the map and dashboard are.
+  mcp_url="$("${compose[@]}" exec -T caddy sh -c 'printf %s "$MCP_SITE"')"
+  mcp_headers=()
 fi
 map_url="${map_url%/}"
 config_url="${config_url%/}"
@@ -3064,13 +3069,17 @@ print(parts.port or (443 if parts.scheme == "https" else 80), end="")')"
 if [[ "${production}" == true ]]; then
   expected_edge_port="${https_port}"
 else
-  expected_edge_port="${published_http##*:}"
+  # The port Compose publishes for the MCP origin, not the shared HTTP one.
+  # The point of the check is that a client following the advertised URL
+  # reaches something, and in development that is a port of its own.
+  published_mcp="$("${compose[@]}" port caddy "$(dotenv_value MCP_PORT)" | tail -n 1)"
+  expected_edge_port="${published_mcp##*:}"
 fi
 if [[ "${advertised_port}" != "${expected_edge_port}" ]]; then
   printf 'The MCP authorization server advertises %s, on port %s, but the edge is published on port %s.\n' \
     "${advertised_endpoint}" "${advertised_port}" "${expected_edge_port}" >&2
   printf '  A client reads that URL out of the metadata document and follows it, so it would reach nothing.\n' >&2
-  printf '  Make HTTP_PORT match the port in MCP_SITE (no port means 80).\n' >&2
+  printf '  Make MCP_PORT match the port in MCP_SITE.\n' >&2
   exit 1
 fi
 printf 'The MCP authorization endpoint it advertises is on the published edge port (%s).\n' \

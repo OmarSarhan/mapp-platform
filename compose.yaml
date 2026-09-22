@@ -110,8 +110,8 @@ services:
     init: true
     user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
     environment:
-      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
-      MCP_RESOURCE: ${MCP_SITE:-http://mcp.localhost}/mcp
+      MCP_ISSUER: ${MCP_SITE:-http://localhost:8181}
+      MCP_RESOURCE: ${MCP_SITE:-http://localhost:8181}/mcp
       # What an exchanged token B is for. Must differ from MCP_RESOURCE: equal
       # values would let a token A be replayed at the configuration API, and
       # the component refuses to start if they match.
@@ -120,7 +120,7 @@ services:
       MCP_AUTH_SOCKET: /run/mapp-auth/mapp-auth.sock
       MCP_AUTH_SECURE_COOKIES: ${MCP_AUTH_SECURE_COOKIES:-}
       # authlib refuses http:// for anything but literal localhost or a
-      # loopback IP, and the development origin is http://mcp.localhost, so
+      # loopback IP, and the development origin is http://localhost:8181, so
       # every /oauth call would fail closed without this. The production
       # overlay clears it, and a test pins that it is cleared.
       AUTHLIB_INSECURE_TRANSPORT: ${AUTHLIB_INSECURE_TRANSPORT-1}
@@ -175,8 +175,8 @@ services:
       # because the issuer is never fetched from here: this service sits on an
       # internal-only network where the public origin does not resolve, so a
       # runtime that tried to read issuer metadata would hang until its timeout.
-      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
-      MCP_ISSUER: ${MCP_SITE:-http://mcp.localhost}
+      MCP_SITE: ${MCP_SITE:-http://localhost:8181}
+      MCP_ISSUER: ${MCP_SITE:-http://localhost:8181}
       # Every live call goes here instead: the authorization component's control
       # listener, which is reachable on mcp-control and nowhere else.
       MCP_AUTH_URL: http://mcp-auth:8080
@@ -254,7 +254,7 @@ services:
       # Read only to compose the connection details the dashboard hands an
       # operator for an agent client. Never fetched from here: this service has
       # no route to the public origin.
-      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      MCP_SITE: ${MCP_SITE:-http://localhost:8181}
       # Where an operator reaches this dashboard. Used to compose the approval
       # link an agent hands a person, which has to be an address in *their*
       # browser -- the internal service name this container answers on is not
@@ -329,10 +329,19 @@ services:
       - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-80}:80"
       - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443"
       - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-443}:443/udp"
+      # The MCP origin. Its own port rather than a *.localhost name,
+      # because an MCP client will not send credentials to an http
+      # token endpoint on anything but a literal loopback host.
+      #
+      # The same number on both sides, and it has to be: Caddy listens on
+      # whatever port MCP_SITE names, so a mapping onto a fixed container
+      # port would publish a port nothing was listening on the moment
+      # anyone changed MCP_SITE. A test pins MCP_PORT against MCP_SITE.
+      - "${EDGE_BIND_ADDRESS:-127.0.0.1}:${MCP_PORT:-8181}:${MCP_PORT:-8181}"
     environment:
       MAP_SITE: ${MAP_SITE:-http://localhost}
       CONFIG_SITE: ${CONFIG_SITE:-http://config.localhost}
-      MCP_SITE: ${MCP_SITE:-http://mcp.localhost}
+      MCP_SITE: ${MCP_SITE:-http://localhost:8181}
       CADDY_EMAIL: ${CADDY_EMAIL:-admin@example.invalid}
     volumes:
       - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro

@@ -144,7 +144,7 @@ politely; point no DNS at it and nothing reaches it.
 ## The third public origin
 
 The platform now publishes three hostnames. `MCP_SITE` is the MCP origin,
-defaulting to `http://mcp.localhost` for local work; production sets
+defaulting to `http://localhost:8181` for local work; production sets
 `PRODUCTION_MCP_SITE`, which the hardening overlay maps onto both Caddy and the
 component. It must be an HTTPS origin on port 443 with a public, resolvable,
 non-reserved DNS hostname, distinct from the map and configuration hostnames —
@@ -303,7 +303,8 @@ now pins that the credential is never passed as an environment value.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MCP_SITE` | `http://mcp.localhost` | The public MCP origin Caddy serves and the value Compose feeds to `MCP_ISSUER` and `MCP_RESOURCE` |
+| `MCP_SITE` | `http://localhost:8181` | The public MCP origin Caddy serves and the value Compose feeds to `MCP_ISSUER` and `MCP_RESOURCE` |
+| `MCP_PORT` | `8181` | Host port published for the MCP origin. It must agree with the port in `MCP_SITE`: Caddy listens on the one in the site address and Compose publishes this one |
 | `PRODUCTION_MCP_SITE` | unset | Required for production; replaces `MCP_SITE` on Caddy and the component under the hardening overlay |
 | `MCP_ISSUER` | `MCP_SITE` | The issuer identifier in metadata and in the RFC 9207 `iss` parameter |
 | `MCP_RESOURCE` | `${MCP_SITE}/mcp` | What token A is for |
@@ -326,7 +327,7 @@ authorises whatever it claims:
 expression, and the configuration API checks it on every introspection. If the
 two disagreed, every exchanged token would be refused with nothing to indicate
 why. A test asserts the resolved values are equal.
-| `AUTHLIB_INSECURE_TRANSPORT` | `1` | Development only: authlib refuses `http://` for anything but literal localhost, and the local origin is `http://mcp.localhost`. The production overlay clears it, and a test pins that it is cleared |
+| `AUTHLIB_INSECURE_TRANSPORT` | `1` | Development only: authlib refuses `http://` for anything but a literal loopback host. The local origin is `http://localhost:8181`, which satisfies that rule and the identical one MCP clients apply -- the port separates the origin without leaving the exempt set. The production overlay clears it, and a test pins that it is cleared |
 | `CONTROL_DATABASE_URL` | empty in the base model | The `mapp_control` DSN. Supplied by `compose.bundled-db.yaml`; an external-PostgreSQL deployment must set it explicitly |
 
 `MCP_AUTH_SECURE_COOKIES` is compared against a literal because the platform
@@ -695,7 +696,7 @@ Then either the CLI:
 ```
 claude mcp add --transport http \
     --client-id <the id printed above> --callback-port 8080 \
-    mapp http://mcp.localhost/mcp
+    mapp http://localhost:8181/mcp
 ```
 
 or, for the IDE extension, the same thing as configuration — the `oauth`
@@ -707,7 +708,7 @@ attempts Dynamic Client Registration and is refused:
   "mcpServers": {
     "mapp": {
       "type": "http",
-      "url": "http://mcp.localhost/mcp",
+      "url": "http://localhost:8181/mcp",
       "oauth": {
         "clientId": "<the id printed above>",
         "callbackPort": 8080,
