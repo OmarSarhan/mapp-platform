@@ -71,8 +71,18 @@ filtered layer, or `framing: "viewport"` to preserve supplied `centre` and
 `zoom`. Without those coordinates, viewport framing uses the configured locale
 startup view; it cannot read an unsaved browser viewport. The default
 `framing: "feature"` remains useful for close-up hover and feature-information
-checks. Area-wide screenshots can pass while a centre interaction finds no
-feature, so inspect the separate interaction evidence.
+checks. Overviews skip automatic hover and inferred information-panel checks
+because the centre may contain no feature. Report that evidence gap and use a
+separate feature-framed run when interaction evidence matters. Explicit
+`hover: true`, expected hover text, and expected information text remain required
+checks; request them at a known feature location.
+
+Inspect `visual.renderPassed` separately from `visual.passed` and
+`visual.evidenceComplete`. A failed evidence check can retain useful map,
+hover, or panel artifacts; retrieve those without rerendering. Report the
+operation's original `requestId`, `failedStage`, `failureReason`, and
+`failedChecks` when diagnosing a failure. Do not describe partial or skipped
+interaction evidence as a complete pass.
 
 **6. Apply only when a person agrees.** `proposals_apply` asks, in the session,
 and does nothing until answered. Pass `evidence_operation_id` from a preview

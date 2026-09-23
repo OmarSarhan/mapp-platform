@@ -7085,6 +7085,8 @@ class ReloadRouteTests(unittest.TestCase):
                 "create_operation",
                 return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",
@@ -7365,6 +7367,8 @@ class ApplyRouteTests(unittest.TestCase):
                 "create_operation",
                 return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",
@@ -7453,6 +7457,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             patch.object(
                 app.CONTROL, "create_operation", return_value=running,
             ) as create_operation,
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL, "finish_operation", side_effect=finish,
             ) as finish_operation,
@@ -7560,6 +7566,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
                 "create_operation",
                 return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",
@@ -7638,6 +7646,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             patch.object(
                 app.CONTROL, "create_operation", return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL, "finish_operation", side_effect=finish,
             ) as finish_operation,
@@ -8311,6 +8321,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             patch.object(
                 app.CONTROL, "create_operation", return_value=running
             ) as create_operation,
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",
@@ -8395,6 +8407,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             patch.object(
                 app.CONTROL, "create_operation", return_value=running
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL, "finish_operation", side_effect=finish
             ),
@@ -8443,6 +8457,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             patch.object(
                 app.CONTROL, "create_operation", return_value=running
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL, "finish_operation", side_effect=finish
             ),
@@ -8508,6 +8524,7 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
                     time.sleep(0.01)
 
             self.assertEqual("succeeded", operation["status"])
+            self.assertEqual(handler._request_id, operation["result"]["requestId"])
             self.assertEqual(
                 "run-background/report.json",
                 operation["result"]["visual"]["artifacts"]["report"],
@@ -8593,6 +8610,57 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
 
         self.assertEqual(terminal, result)
         self.assertEqual(2, control.finish_operation.call_count)
+
+    def test_overview_screenshot_skips_inferred_info_but_enforces_explicit_expectations(self):
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                payload = {"layer": "Stops", "framing": "layer"}
+                if explicit:
+                    payload["expectedInfoPanelText"] = ["Stop name"]
+                handler, responses = self.handler("/api/proposals/proposal-1/screenshot", payload)
+                proposal = self.proposal()
+                proposal["candidate"]["locale"]["layers"]["Stops"]["infoj"] = [{"title": "Stop name"}]
+                proposal["candidateHash"] = app.workspace_hash(proposal["candidate"])
+                def run(layer, plan, payload, **kwargs):
+                    candidate = payload["metadata"]["source"] == "candidate"
+                    required = explicit and candidate
+                    self.assertEqual(required, "interaction" in plan)
+                    if required:
+                        self.assertTrue(plan["interaction"]["requireInfoPanel"])
+                    return (HTTPStatus.UNPROCESSABLE_ENTITY if required else HTTPStatus.OK), {
+                        "runId": "run", "passed": not required, "renderPassed": True,
+                        "evidenceComplete": not required, "metadata": payload["metadata"],
+                        "failureReason": "info-panel-not-opened" if required else None,
+                        "failedStage": "information-panel" if required else None,
+                        "failedChecks": [{"id": "visual.feature_interaction", "failureReason": "info-panel-not-opened"}] if required else [],
+                        "artifacts": {"beforeMap": "run/before-map.png"},
+                    }
+                with (
+                    patch.object(app, "preview_proposal", return_value=proposal),
+                    patch.object(app, "visual_plan", return_value={
+                        "locale": "locale", "framing": "layer",
+                        "interaction": {"type": "click-centre-feature", "automatic": False,
+                                        "skipReason": "overview-has-no-feature-target"},
+                    }),
+                    patch.object(app, "prepare_original_preview", return_value={}),
+                    patch.object(app, "prepare_candidate_preview", return_value={}),
+                    patch.object(app, "run_browser_visual", side_effect=run),
+                    patch.object(app.CONTROL, "audit"),
+                ):
+                    handler.do_POST()
+                status, body = responses[0]
+                self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY if explicit else HTTPStatus.OK, status)
+                self.assertTrue(body["visual"]["renderPassed"])
+                self.assertFalse(body["visual"]["evidenceComplete"])
+                if explicit:
+                    error = body["operation"]["error"]
+                    self.assertEqual("info-panel-not-opened", error["failureReason"])
+                    self.assertEqual(handler._request_id, error["requestId"])
+                    self.assertTrue(error["renderPassed"])
+                else:
+                    evidence = body["visual"]["comparison"]["featureInfoEvidence"]["candidate"]
+                    self.assertTrue(evidence["skipped"])
+                    self.assertFalse(evidence["captured"])
 
     def test_information_screenshot_selects_feature_in_both_comparison_images(self):
         handler, responses = self.handler(
@@ -8902,6 +8970,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
                 "create_operation",
                 return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",
@@ -8951,6 +9021,8 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
                 "create_operation",
                 return_value=running,
             ),
+            patch.object(app.CONTROL, "read_operation", return_value=running),
+            patch.object(app.CONTROL, "update_operation_progress"),
             patch.object(
                 app.CONTROL,
                 "finish_operation",

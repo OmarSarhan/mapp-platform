@@ -1243,7 +1243,14 @@ deadlines. A timeout becomes `failed` with `visual.run_timeout`,
 `visual.artifact_persistence_timeout`, `visual.browser_transport_timeout`, or
 the outer `visual.operation_timeout`; `failedStage`, the effective timeout,
 and bounded browser console/page/request diagnostics are retained when
-available. Browser crashes retain the same stage diagnostics. The runner
+available. Terminal visual results and errors retain `requestId` from the
+original submission (poll requests have their own `meta.requestId`). Browser
+evidence failures also expose `failureReason` and `failedChecks` with the
+specific check IDs and reasons. `visual.renderPassed` reports successful map
+rendering independently of interaction/panel validation; `visual.evidenceComplete`
+is false when checks failed or overview interaction evidence was skipped.
+Retained artifacts remain retrievable on failed operations; partial evidence
+is not a complete validation pass. Browser crashes retain the same stage diagnostics. The runner
 bounds browser shutdown before releasing its concurrency slot, so a failed run
 cannot permanently reject later work. If a worker exits before its atomic
 terminal write is visible, the watchdog records
@@ -1291,7 +1298,10 @@ can verify the retained evidence resolution.
 
 Screenshot requests may also ask the browser runner to open XYZ layer drawers:
 `panel: "filtering"` for one panel, or `panels: ["filtering", "styling"]` for
-multiple panels. The runner first matches the layer's exact internal
+multiple panels. After feature information is captured, the runner returns to
+XYZ's Layers tab before revealing the group and layer controls. It waits for
+drawer expansion and dialog visibility before capturing the requested panel.
+The runner first matches the layer's exact internal
 `data-id`, falling back to its visible title, then opens XYZ's stable
 `filter-drawer` or `style-drawer` hook. For Filtering it also reveals the
 first matching configured filter control, without selecting a filter value.
@@ -1307,8 +1317,8 @@ records `found`, `attempted`, `opened`, `captured`, `expectedTextFound`,
 page screenshot as panel evidence. Existing page, map, report, and
 feature-information artifacts are preserved.
 
-Active `style.hover` configuration is exercised automatically at the planned
-map centre (a representative feature with default `feature` framing).
+Active `style.hover` configuration is exercised automatically with feature
+framing at the planned map centre. Overview frames skip automatic hover.
 Visual-test and proposal preview requests may set
 `hover: true` to require that evidence or `hover: false` to deliberately
 suppress it. `expectedHoverText` accepts up to 20 non-empty strings and also
@@ -1340,9 +1350,12 @@ All visual plans, tests, and proposal screenshots accept `framing`:
 `viewport` is the browser image size in pixels; `framing: "viewport"` selects
 map framing. For `layer`, bounded image dimensions are used to fit the extent,
 with a conservative 1080×1080 default matching proposal screenshots. Layer and
-viewport framing retain centre interaction attempts without claiming a known
-feature ID; an empty centre or small features may fail hover or information
-checks. Use a separate feature-framed run for close-up interaction evidence.
+viewport framing mark automatic centre interactions with `automatic: false`
+and `skipReason: "overview-has-no-feature-target"`. Inferred information-panel
+comparisons and automatic hover are skipped, with explicit skipped evidence;
+a rendered overview is not proof of feature interaction. Explicit `hover: true`,
+`expectedHoverText`, or `expectedInfoPanelText` still require their respective
+checks to pass. Use a separate feature-framed run for close-up interaction evidence.
 Framing does not change the layer activation behavior controlled by `viewMode`.
 
 The MCP tools `proposals_preview_plan`, `proposals_preview_screenshot` and
@@ -1365,8 +1378,8 @@ candidate—not merely pre-click and post-click candidate states.
 When both `centre` and `zoom` are supplied, the server validates them before
 database planning and does not run the relation-wide feature-count, extent, or
 representative-feature queries. The plan preserves the exact explicit view and
-records a browser-centre interaction without claiming a preselected feature
-ID. Hover and clicked-feature evidence then pass only if the browser actually
+records an optional browser-centre interaction without claiming a preselected feature
+ID. Explicitly requested hover and clicked-feature evidence pass only if the browser actually
 finds the expected content at that map centre. With default `feature` framing,
 a centre-only or zoom-only override still needs automatic framing for the
 missing part.
@@ -1382,7 +1395,7 @@ screenshot submissions still create and terminalize a durable operation at
 the `planning` stage; metadata-only visual-plan requests do not create one.
 
 When the focused diff changes the selected layer's `infoj` feature-information
-configuration, the runner attempts to select a feature at the planned map
+configuration with feature framing, the runner attempts to select a feature at the planned map
 centre, waits for XYZ's expanded `.location-view` panel to finish loading,
 and uses the selected state
 for that side's comparison image. An edit to an existing layer captures both
@@ -1392,7 +1405,9 @@ outcome under `comparison.featureInfoEvidence` and returns cropped
 `beforeInfoPanel` and/or `afterInfoPanel` artifacts for the sides that could be
 captured. For other proposal changes the comparison remains unselected so a
 point highlight does not hide a symbol-style change. The separate visual-test
-endpoint continues to exercise the planned candidate interaction.
+endpoint exercises the planned candidate interaction when automatic interaction
+is applicable or explicitly requested. Overview skips retain `skipped` and
+`skipReason` in the per-side evidence instead of claiming a captured panel.
 
 The evidence planner automatically expects the title or label of each changed,
 visible `infoj` entry. It also extracts visible text from a deliberately narrow

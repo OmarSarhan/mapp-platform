@@ -2,6 +2,7 @@ import http from "node:http";
 import {randomUUID} from "node:crypto";
 import {access, chmod, mkdir, readdir, writeFile} from "node:fs/promises";
 import {chromium} from "playwright";
+import {pathToFileURL} from "node:url";
 
 process.umask(0o077);
 
@@ -344,6 +345,12 @@ async function ensureDrawerOpen(drawer) {
   const attempted = await header.isVisible().catch(() => false);
   if (attempted) {
     await header.click({timeout: 2_000}).catch(() => null);
+    const handle = await drawer.elementHandle();
+    await drawer.page().waitForFunction(
+      element => element.classList.contains("expanded"), handle,
+      {timeout: 3_000},
+    ).catch(() => null);
+    await handle?.dispose();
   }
   const opened = await drawer.evaluate(
     element => element.classList.contains("expanded"),
@@ -373,6 +380,15 @@ async function findRequestedLayer(page, input) {
 }
 
 async function expandRequestedLayer(page, input) {
+  // Clicking a feature activates Locations and hides the layer list. Return
+  // through XYZ's real Layers tab before inspecting any group/panel controls.
+  const layersTab = page.locator('[data-id="layers"]').first();
+  if (await layersTab.isVisible().catch(() => false)) {
+    await layersTab.click({timeout: 3_000}).catch(() => null);
+    await page.locator(".drawer.layer-group, .drawer.layer-view").first().waitFor({
+      state: "visible", timeout: 3_000,
+    }).catch(() => null);
+  }
   const groups = Array.isArray(input.plan?.activeGroups)
     ? input.plan.activeGroups
     : [];
@@ -539,6 +555,9 @@ async function openPanel(page, panel, input, directory) {
     if (attempted) {
       await trigger.click({timeout: 2_000}).catch(() => null);
     }
+    await page.locator(`[data-id="${dataId}-dialog"]`).first().waitFor({
+      state: "visible", timeout: 3_000,
+    }).catch(() => null);
     target = await locatorWithDataId(
       page,
       "[data-id]",
@@ -617,11 +636,14 @@ async function exerciseHover(page, input, directory, timeout) {
     ? input.expectedHoverText.filter(value => typeof value === "string" && value)
     : [];
   const requested = input.hover !== false
-    && (input.hover === true || expectedText.length > 0 || configured);
+    && (input.hover === true || expectedText.length > 0
+      || (configured && input.plan?.hover?.automatic !== false));
   const result = {
     requested,
     configured,
     suppressed: input.hover === false,
+    skipped: !requested && input.plan?.hover?.automatic === false,
+    skipReason: !requested ? input.plan?.hover?.skipReason ?? null : null,
     attempted: false,
     opened: false,
     point: null,
@@ -1169,8 +1191,14 @@ async function runVisual(input) {
         "hover-target",
         () => exerciseHover(page, input, directory, timeout),
       );
-      report.interaction = null;
-      if (input.plan?.interaction?.type === "click-centre-feature") {
+      const interactionSkipped = input.plan?.interaction?.automatic === false
+        && input.plan?.interaction?.requireInfoPanel !== true;
+      report.interaction = interactionSkipped ? {
+        requested: false, skipped: true, attempted: false, opened: false,
+        captured: false, passed: true,
+        skipReason: input.plan.interaction.skipReason,
+      } : null;
+      if (input.plan?.interaction?.type === "click-centre-feature" && !interactionSkipped) {
         await runStage("information-panel", async () => {
           const interaction = input.plan.interaction;
           const expectedLayer = interaction.expectedLayer ?? input.layer ?? null;
@@ -1523,11 +1551,13 @@ async function runVisual(input) {
       },
       {
         id: "visual.hover",
+        informational: report.hover?.skipped === true,
         passed: report.hover ? report.hover.passed : true,
         observed: report.hover ?? null,
       },
       {
         id: "visual.feature_interaction",
+        informational: report.interaction?.skipped === true,
         passed: report.interaction ? report.interaction.passed : true,
         observed: report.interaction,
       },
@@ -1571,6 +1601,14 @@ async function runVisual(input) {
                         ? "page"
                         : "unknown",
   };
+  report.failedChecks = report.diagnosis.checks.filter(check => !check.passed).map(check => ({
+    id: check.id,
+    failureReason: check.observed?.failureReason || check.observed?.reason || check.id,
+  }));
+  report.failureReason = report.passed ? null
+    : report.failedChecks[0]?.failureReason || report.code || report.failedStage;
+  report.evidenceComplete = report.passed
+    && !report.interaction?.skipped && !report.hover?.skipped;
   try {
     const persistenceTimeout = Math.max(
       1,
@@ -1600,6 +1638,12 @@ async function runVisual(input) {
         filteringPanel: await retainedArtifact("filtering-panel.png"),
         stylingPanel: await retainedArtifact("styling-panel.png"),
       };
+      report.renderPassed = Boolean(
+        report.httpStatus >= 200 && report.httpStatus < 400
+        && report.canvasCount && report.activationDiagnostics?.activationPassed
+        && !report.pageErrors.length
+        && (report.artifacts.map || report.artifacts.beforeMap)
+      );
       await writeFile(
         `${directory}/report.json`,
         JSON.stringify(report, null, 2),
@@ -1620,8 +1664,10 @@ async function runVisual(input) {
   return report;
 }
 
-await secureArtifactTree();
+export {ensureDrawerOpen, expandRequestedLayer, openPanel, exerciseHover};
 
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+await secureArtifactTree();
 http.createServer(async (req, res) => {
   if (req.url === "/healthz") {
     return json(res, 200, {
@@ -1673,3 +1719,4 @@ http.createServer(async (req, res) => {
     activeRuns -= 1;
   }
 }).listen(port, "0.0.0.0");
+}

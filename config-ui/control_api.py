@@ -2908,6 +2908,23 @@ def apply_visual_override(plan: dict, payload: dict) -> dict:
     }
 
 
+def overview_interaction_policy(plan: dict) -> dict:
+    """An extent/viewport centre is not evidence of a feature hit target."""
+    for key in ("interaction", "hover"):
+        if isinstance(plan.get(key), dict):
+            plan[key] = {
+                **plan[key],
+                "automatic": False,
+                "skipReason": "overview-has-no-feature-target",
+            }
+    plan.setdefault("warnings", []).append(
+        "Automatic information-panel and hover checks are skipped for this overview. "
+        "Use feature framing for interaction evidence, or explicitly request "
+        "hover/expected information text at a known feature location."
+    )
+    return plan
+
+
 def is_probeable_database_layer(layer: Any) -> bool:
     """Return true only for the concrete relation form we can safely probe.
 
@@ -3675,7 +3692,7 @@ def visual_plan(
             })
         if hover_plan:
             plan["hover"] = hover_plan
-        return apply_visual_override(plan, visual_request)
+        return overview_interaction_policy(apply_visual_override(plan, visual_request))
     if not probeable:
         view = locale.get("view") or {}
         plan = {
@@ -3881,7 +3898,7 @@ def visual_plan(
         }
         if hover_plan:
             plan["hover"] = hover_plan
-        return plan
+        return overview_interaction_policy(plan)
     sample_query = sql.SQL("""
       WITH rendered AS (
         SELECT *

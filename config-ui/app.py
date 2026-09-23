@@ -4811,7 +4811,8 @@ def visual_failure_error(status: int, result: dict, message: str) -> dict:
         "code": result.get("code") or visual_failure_code(status),
         "message": message,
     }
-    for key in ("failedStage", "timeoutMilliseconds", "diagnostics"):
+    for key in ("failedStage", "failureReason", "failedChecks", "renderPassed",
+                "evidenceComplete", "timeoutMilliseconds", "diagnostics"):
         if result.get(key) is not None:
             error[key] = result[key]
     if result.get("diagnosis") is not None:
@@ -6136,6 +6137,12 @@ def finish_visual_operation(
     last_error: OSError | None = None
     for attempt in range(3):
         try:
+            request_id = (CONTROL.read_operation(operation_id).get("target") or {}).get("requestId")
+            if isinstance(request_id, str):
+                if result is not None:
+                    result = {**result, "requestId": request_id}
+                if error is not None:
+                    error = {**error, "requestId": request_id}
             return CONTROL.finish_operation(
                 operation_id,
                 status=status,
@@ -6254,6 +6261,8 @@ def run_visual_background(
     responses: list[tuple[int, dict]] = []
     handler = object.__new__(Handler)
     handler.path = request_path
+    request_id = (CONTROL.read_operation(operation_id).get("target") or {}).get("requestId")
+    handler.headers = {"X-Request-ID": request_id} if isinstance(request_id, str) else {}
     handler._host_allowed = lambda: True
     handler._authorized = lambda state_change=False: actor
     handler._authentication = authentication
@@ -9202,7 +9211,7 @@ class Handler(SimpleHTTPRequestHandler):
                         self._remote(),
                         getattr(self, "_authentication", {}) or {},
                         visual_background_kind,
-                        visual_background_target or {},
+                        {**(visual_background_target or {}), "requestId": self._request_id},
                     )
                     self._json(HTTPStatus.ACCEPTED, {
                         "operation": operation,
@@ -10245,6 +10254,7 @@ class Handler(SimpleHTTPRequestHandler):
                                 "source": "candidate",
                                 "proposalId": proposal_id,
                                 "candidateHash": proposal["candidateHash"],
+                                "requestId": self._request_id,
                                 "layer": layer_key,
                                 "groups": group_preview["groups"],
                                 "originalLayers": group_preview[
@@ -10321,6 +10331,17 @@ class Handler(SimpleHTTPRequestHandler):
                     ]))
                 base_interaction = plan.get("interaction")
                 for side in ("original", "candidate"):
+                    if (
+                        isinstance(base_interaction, dict)
+                        and base_interaction.get("automatic") is False
+                        and not explicit_info_text
+                        and feature_info_evidence[side]["requested"]
+                    ):
+                        feature_info_evidence[side].update({
+                            "requested": False,
+                            "skipped": True,
+                            "skipReason": base_interaction["skipReason"],
+                        })
                     feature_info_evidence[side]["planned"] = bool(
                         feature_info_evidence[side]["requested"]
                         and group_preview[side]["renderLayer"] is not None
@@ -10406,6 +10427,11 @@ class Handler(SimpleHTTPRequestHandler):
                     if isinstance(side_layer, dict):
                         hover_plan = visual_hover_plan(side_layer)
                         if hover_plan:
+                            if plan.get("framing") in {"layer", "viewport"}:
+                                hover_plan.update({
+                                    "automatic": False,
+                                    "skipReason": "overview-has-no-feature-target",
+                                })
                             side_plan["hover"] = hover_plan
                 if group_preview["original"]["renderLayer"] is None:
                     original_render_plan.pop("interaction", None)
@@ -10686,6 +10712,13 @@ class Handler(SimpleHTTPRequestHandler):
                             result = {
                                 "runId": candidate_result.get("runId"),
                                 "passed": status == HTTPStatus.OK,
+                                "renderPassed": candidate_result.get("renderPassed", False),
+                                "evidenceComplete": (
+                                    status == HTTPStatus.OK
+                                    and candidate_result.get("evidenceComplete", False)
+                                    and not any(feature_info_evidence[side].get("skipped")
+                                                for side in ("original", "candidate"))
+                                ),
                                 "metadata": binding,
                                 "error": (
                                     next((
@@ -10704,6 +10737,8 @@ class Handler(SimpleHTTPRequestHandler):
                                     for key in (
                                         "code",
                                         "failedStage",
+                                        "failureReason",
+                                        "failedChecks",
                                         "timeoutMilliseconds",
                                         "diagnostics",
                                     )
@@ -11027,6 +11062,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "source": "live",
                             "layer": layer_key,
                             "locale": payload.get("locale"),
+                            "requestId": self._request_id,
                         },
                     )
                 )
