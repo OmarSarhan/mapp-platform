@@ -46,6 +46,7 @@ from control_api import (
     select_locale,
     strict_json_loads,
     visual_plan,
+    visual_probe_layer,
     workspace_fingerprint,
     workspace_map_extent,
 )
@@ -1566,6 +1567,73 @@ class ControlApiTests(ControlStoreTestCase):
         workspace = {"locale": {"layers": {"External": {"format": "tiles"}}}}
         with self.assertRaisesRegex(ValueError, "probeable database layer"):
             visual_plan(workspace, "External", {}, visual_request={"framing": "layer"})
+
+    def test_street_level_zoom_table_plans_the_requested_stop_relation(self):
+        workspace = self.database_visual_workspace()
+        layers = workspace["locale"]["layers"]
+        layer = layers.pop("Arrivals 1951-1960")
+        layer.update({
+            "name": "Bus stops within 250 m of top-20 paths",
+            "table": None,
+            "tables": {"0": None, "15": "derived_layers.bus_stops_review"},
+        })
+        layers["Bus_Stops_Near_Top_20_Longest_Paths"] = layer
+        summary = MagicMock()
+        summary.__enter__.return_value = summary
+        summary_cursor = MagicMock()
+        summary_cursor.__enter__.return_value = summary_cursor
+        summary_cursor.fetchone.return_value = (
+            57, -200000, 7000000, -150000, 7100000, "ST_Point",
+        )
+        summary.cursor.return_value = summary_cursor
+        feature = MagicMock()
+        feature.__enter__.return_value = feature
+        feature_cursor = MagicMock()
+        feature_cursor.__enter__.return_value = feature_cursor
+        feature_cursor.fetchone.return_value = (
+            "11105", "ST_Point", -180000, 7050000, -180000, 7050000,
+            -1.55, 53.8,
+        )
+        feature.cursor.return_value = feature_cursor
+
+        with patch("control_api.psycopg.connect", side_effect=[summary, feature]):
+            plan = visual_plan(
+                workspace,
+                "Bus_Stops_Near_Top_20_Longest_Paths",
+                {"MAPP": "postgresql://example.invalid/mapp"},
+            )
+
+        self.assertEqual("Bus_Stops_Near_Top_20_Longest_Paths", plan["layer"])
+        self.assertEqual("derived_layers.bus_stops_review", plan["table"])
+        self.assertEqual("derived_layers.bus_stops_review", plan["effectiveDataset"]["source"]["relation"])
+        self.assertGreaterEqual(plan["zoom"], 15)
+        self.assertEqual({"0": None, "15": "derived_layers.bus_stops_review"}, layer["tables"])
+        self.assertIsNone(layer["table"])
+
+    def test_street_level_zoom_table_refuses_an_invisible_overview(self):
+        workspace = self.database_visual_workspace()
+        layer = workspace["locale"]["layers"]["Arrivals 1951-1960"]
+        layer["table"] = None
+        layer["tables"] = {"0": None, "15": "derived_layers.bus_stops_review"}
+        with patch("control_api.psycopg.connect") as connect:
+            with self.assertRaisesRegex(ValueError, "hidden below zoom 15"):
+                visual_plan(
+                    workspace, "Arrivals 1951-1960", {},
+                    visual_request={"framing": "viewport", "centre": [-1.5, 53.8], "zoom": 11},
+                )
+            connect.assert_not_called()
+
+    def test_switching_or_rehidden_zoom_tables_remain_browser_managed(self):
+        base = {"format": "mvt", "qID": "object_id", "geom": "geom_3857",
+                "table": None}
+        for tables in (
+            {"0": None, "15": "derived_layers.stops", "18": "derived_layers.other"},
+            {"0": None, "15": "derived_layers.stops", "18": None},
+            {"0": None, "00": None, "15": "derived_layers.stops"},
+        ):
+            with self.subTest(tables=tables):
+                layer = {**base, "tables": tables}
+                self.assertEqual((layer, None), visual_probe_layer(layer))
 
     def test_explicit_advanced_view_keeps_effective_filter_diagnostics(self):
         workspace = {"locale": {"layers": {"External": {

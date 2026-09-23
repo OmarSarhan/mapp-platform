@@ -4508,6 +4508,11 @@ def proposal_group_preview(
     candidate_layer = candidate_layers.get(requested_layer)
     original_present = isinstance(original_layer, dict)
     candidate_present = isinstance(candidate_layer, dict)
+    if not original_present and not candidate_present:
+        raise ValueError(
+            f"Unknown proposal layer in locale {selected_locale}: "
+            f"{requested_layer}"
+        )
     original_group = (
         original_layer.get("group") if original_present else None
     )
@@ -4546,11 +4551,15 @@ def proposal_group_preview(
             ]
         if not groups and requested_present and requested_layer not in selected:
             selected.append(requested_layer)
-        anchor_candidates = [
-            key
-            for key in selected
-            if is_probeable_database_layer(layers[key])
-        ] or selected
+        anchor_candidates = (
+            [requested_layer]
+            if requested_layer in selected
+            else [
+                key
+                for key in selected
+                if is_probeable_database_layer(layers[key])
+            ] or selected
+        )
         if not anchor_candidates:
             anchor_candidates = [
                 key

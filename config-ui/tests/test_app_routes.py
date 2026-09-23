@@ -7858,6 +7858,38 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             preview["candidate"]["backgroundLayers"],
         )
 
+    def test_group_preview_keeps_zoom_gated_requested_layer_as_anchor(self):
+        stops = {
+            "name": "Bus stops within 250 m of top-20 paths",
+            "format": "mvt", "table": None,
+            "tables": {"0": None, "15": "derived_layers.bus_stops_review"},
+            "geom": "geom_3857", "qID": "object_id",
+            "group": "Path demand & access (250 m)",
+        }
+        catchment = {
+            "name": "Dissolved 250 m catchments by path",
+            "format": "mvt", "table": "derived_layers.catchments",
+            "geom": "geom_3857", "qID": "component_id",
+            "group": "Path demand & access (250 m)",
+        }
+        layers = {
+            "Bus_Stops_Near_Top_20_Longest_Paths": stops,
+            "Top_20_Longest_Paths_250m_Buffer": catchment,
+        }
+        preview = app.proposal_group_preview(
+            {"original": {"locale": {"layers": layers}},
+             "candidate": {"locale": {"layers": layers}}},
+            "Bus_Stops_Near_Top_20_Longest_Paths", None,
+        )
+        self.assertEqual(
+            "Bus_Stops_Near_Top_20_Longest_Paths",
+            preview["candidate"]["anchorLayer"],
+        )
+        self.assertEqual(
+            "Bus_Stops_Near_Top_20_Longest_Paths",
+            preview["candidate"]["renderLayer"],
+        )
+
     def test_group_move_isolates_moved_layer_across_affected_groups(self):
         proposal = {
             "original": {

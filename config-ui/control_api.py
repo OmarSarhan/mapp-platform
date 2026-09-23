@@ -2923,6 +2923,47 @@ def is_probeable_database_layer(layer: Any) -> bool:
     )
 
 
+def visual_probe_layer(layer: Any) -> tuple[Any, int | None]:
+    """Resolve a single street-level relation without changing XYZ's layer.
+
+    A zoom map can hide a layer at low zoom and expose one relation above a
+    threshold. That is still one bounded dataset to probe. Maps that switch
+    between distinct relations or turn off again stay browser-managed: one
+    database probe could not describe their effective dataset reliably.
+    """
+    if is_probeable_database_layer(layer):
+        return layer, None
+    if not isinstance(layer, dict) or not isinstance(layer.get("tables"), dict):
+        return layer, None
+    tables = layer["tables"]
+    if not tables or "0" not in tables:
+        return layer, None
+    try:
+        ordered = sorted((int(zoom), relation) for zoom, relation in tables.items())
+    except (TypeError, ValueError):
+        return layer, None
+    if any(zoom < 0 or zoom > 22 for zoom, _ in ordered):
+        return layer, None
+    if len({zoom for zoom, _ in ordered}) != len(ordered):
+        return layer, None
+    if any(str(zoom) not in tables for zoom, _ in ordered):
+        return layer, None
+    visible = [(zoom, relation) for zoom, relation in ordered if relation is not None]
+    if not visible or not all(
+        isinstance(relation, str) and relation == visible[0][1]
+        for _, relation in visible
+    ):
+        return layer, None
+    first_zoom = visible[0][0]
+    if any(relation is not None for zoom, relation in ordered if zoom < first_zoom):
+        return layer, None
+    if any(relation is None for zoom, relation in ordered if zoom >= first_zoom):
+        return layer, None
+    resolved = {**layer, "table": visible[0][1]}
+    resolved.pop("tables")
+    return (resolved, first_zoom) if is_probeable_database_layer(resolved) else (layer, None)
+
+
 def _xyz_array_includes(values: list, item: Any) -> bool:
     """Model JavaScript Array.includes for strict JSON values.
 
@@ -3535,11 +3576,12 @@ def visual_plan(
             and candidate.get("display") is True
         )
     ]
-    layer = (locale.get("layers") or {}).get(layer_key)
-    if not isinstance(layer, dict):
+    requested_layer = (locale.get("layers") or {}).get(layer_key)
+    if not isinstance(requested_layer, dict):
         raise ValueError(
             f"Unknown layer in locale {selected_locale}: {layer_key}"
         )
+    layer, minimum_visible_zoom = visual_probe_layer(requested_layer)
     layer_title = layer.get("name") if isinstance(layer.get("name"), str) else layer_key
     layer_title = layer_title.strip() or layer_key
     hover_plan = visual_hover_plan(layer)
@@ -3548,6 +3590,15 @@ def visual_plan(
         raise ValueError(
             "Layer framing requires a probeable database layer; use viewport "
             "framing with a supplied or configured map view for this source."
+        )
+    if (
+        minimum_visible_zoom is not None
+        and "zoom" in override
+        and override["zoom"] < minimum_visible_zoom
+    ):
+        raise ValueError(
+            f"Layer {layer_key} is hidden below zoom {minimum_visible_zoom}; "
+            "choose a street-level viewport."
         )
     filter_descriptor, _ = effective_layer_filter_descriptor(layer)
     activation = {
@@ -3776,6 +3827,12 @@ def visual_plan(
             max(north - south, 25.0) / (dimensions["height"] * .7),
         )
         zoom = max(0, min(22, math.log2(156543.03392804097 / resolution)))
+        if minimum_visible_zoom is not None and zoom < minimum_visible_zoom:
+            raise ValueError(
+                f"Layer {layer_key} is hidden below zoom "
+                f"{minimum_visible_zoom}; its complete extent cannot be "
+                "shown at once. Use feature or street-level viewport framing."
+            )
         centre = [
             math.degrees(centre_x / 6378137.0),
             math.degrees(math.atan(math.sinh(centre_y / 6378137.0))),
@@ -3910,6 +3967,8 @@ def visual_plan(
         zoom = max(16, zoom)
     elif "POLYGON" in upper_geometry:
         zoom = max(14, zoom)
+    if minimum_visible_zoom is not None:
+        zoom = max(minimum_visible_zoom, zoom)
     plan = {
         "layer": layer_key,
         "layerTitle": layer_title,
