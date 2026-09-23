@@ -362,6 +362,15 @@ port matches what you registered.
 filter working. Check the client's scopes against the preset table above —
 tools an agent cannot call are not shown to it.
 
+**The assistant still shows the pre-upgrade tool arguments or is missing new
+tools after the MCP service was rebuilt.** MCP clients commonly cache the
+`tools/list` result for the life of their session. Reconnect or restart that
+client session, then call `describe_instance`; the current expanded visual
+surface reports `mapp-mcp/0.2.0`. Re-authorize only when the reconnected client
+is missing the required scope. A second authenticated session seeing newer
+tools is evidence that the first session's manifest is stale, not that the
+configuration API lacks the operation.
+
 **Everything refuses with a validation error naming a table.** Not an MCP
 problem. The workspace fails validation, which blocks proposing and applying
 alike. If the table is in a federated schema, check the source is still

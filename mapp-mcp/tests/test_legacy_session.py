@@ -32,7 +32,7 @@ import era_guard  # noqa: E402
 from app import build_app  # noqa: E402
 from asgi_harness import StubIntrospection, active  # noqa: E402
 from protected_resource import ProtectedResource  # noqa: E402
-from runtime import build_runtime_app  # noqa: E402
+from runtime import RUNTIME_NAME, RUNTIME_VERSION, build_runtime_app  # noqa: E402
 
 #: Distinguishable from `None`, which is a real choice: send no session
 #: identifier at all, as the handshake must.
@@ -409,6 +409,9 @@ class LegacySessionTests(unittest.TestCase):
         described = json.loads(payload["content"][0]["text"])
         self.assertIn(era_guard.HANDSHAKE_VERSIONS[-1], described["protocolVersions"])
         self.assertEqual(list(era_guard.SERVED_VERSIONS), described["protocolVersions"])
+        self.assertEqual(
+            f"{RUNTIME_NAME}/{RUNTIME_VERSION}", described["runtime"]
+        )
 
 
 #: The modern era carries per request what the handshake negotiated once. Both

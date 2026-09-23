@@ -58,6 +58,10 @@ def build_app(
         config_api_endpoint = os.environ.get(
             "MCP_CONFIG_API_URL", "http://config-ui:8080"
         )
+        config_api_resource = os.environ.get(
+            "MCP_CONFIG_API_RESOURCE",
+            "http://config.localhost/api",
+        )
         runtime = build_runtime_app(
             resource=resource,
             exchange=ExchangeClient(
@@ -68,14 +72,12 @@ def build_app(
                 # What a token B is for. Must differ from this server's own
                 # resource, or a token A and a token B would share an audience
                 # and the separation the design rests on would be gone.
-                config_api_resource=os.environ.get(
-                    "MCP_CONFIG_API_RESOURCE",
-                    "http://config.localhost/api",
-                ),
+                config_api_resource=config_api_resource,
                 client_id=os.environ.get("MAPP_MCP_CLIENT_ID", "mapp-mcp"),
                 client_secret=os.environ.get("MAPP_MCP_CLIENT_SECRET", ""),
             ),
             config_api=ConfigApiClient(endpoint=config_api_endpoint),
+            config_api_resource=config_api_resource,
         )
     if introspection is None:
         introspection = IntrospectionClient(

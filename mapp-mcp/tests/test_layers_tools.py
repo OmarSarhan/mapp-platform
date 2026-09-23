@@ -87,7 +87,10 @@ def caller(
 
 
 class ToolTestCase(unittest.TestCase):
-    def build_named(self, name, *, exchange=None, config_api=None):
+    def build_named(
+        self, name, *, exchange=None, config_api=None,
+        config_api_resource=None,
+    ):
         resource = ProtectedResource(
             origin="http://mcp.localhost", issuer="http://mcp.localhost"
         )
@@ -95,6 +98,7 @@ class ToolTestCase(unittest.TestCase):
             resource=resource,
             exchange=exchange or FakeExchange(),
             config_api=config_api or FakeConfigApi(),
+            config_api_resource=config_api_resource,
         )
         return server._tool_manager._tools[name].fn
 
@@ -2585,14 +2589,71 @@ class PreviewEvidenceTests(ToolTestCase):
                     self.as_caller(caller(scopes="mcp:connect inspect visual"))
                     detail = self.build_named(name, config_api=api)(
                         proposal_id="p-1", layer="Bus_Stops", hover=hover)
-                    self.assertEqual({"layer": "Bus_Stops", "hover": hover,
-                                      "background": True}, api.calls[0]["body"])
+                    expected = {"layer": "Bus_Stops", "hover": hover,
+                                "background": True}
+                    if name == "proposals_preview_screenshot":
+                        expected["deviceScaleFactor"] = 2.0
+                    self.assertEqual(expected, api.calls[0]["body"])
                     self.assertEqual("running", detail["status"])
                     self.assertEqual("accepted", detail["stage"])
                     self.assertEqual("job-1", detail["operationId"])
                     self.assertEqual("visual_operations_show", detail["pollTool"])
                     self.assertEqual("p-1", detail["proposalId"])
                     self.assertIsNone(detail["passed"])
+
+    def test_screenshot_exposes_high_resolution_and_panel_capture(self) -> None:
+        api = FakeConfigApi(answer={"operation": {
+            "id": "job-1", "status": "running", "stage": "accepted",
+            "target": {"proposalId": "p-1", "layer": "Bus_Stops"},
+        }})
+        self.as_caller(caller(scopes="mcp:connect inspect visual"))
+
+        self.build_named("proposals_preview_screenshot", config_api=api)(
+            proposal_id="p-1",
+            layer="Bus_Stops",
+            hover=True,
+            viewport={"width": 1920, "height": 1080},
+            device_scale_factor=3,
+            panels=["styling", "filtering"],
+            expected_panel_text=["Household type"],
+            expected_hover_text=["Lone parent"],
+            expected_info_panel_text=["Households"],
+        )
+
+        self.assertEqual(3, api.calls[0]["body"]["deviceScaleFactor"])
+        self.assertEqual(
+            ["styling", "filtering"], api.calls[0]["body"]["panels"]
+        )
+        self.assertEqual(
+            ["Household type"], api.calls[0]["body"]["expectedPanelText"]
+        )
+        self.assertEqual(
+            ["Lone parent"], api.calls[0]["body"]["expectedHoverText"]
+        )
+        self.assertEqual(
+            ["Households"], api.calls[0]["body"]["expectedInfoPanelText"]
+        )
+
+    def test_screenshot_manifest_advertises_framing_panels_and_scale_bounds(self):
+        resource = ProtectedResource(
+            origin="http://mcp.localhost", issuer="http://mcp.localhost"
+        )
+        server = build_runtime(
+            resource=resource,
+            exchange=FakeExchange(),
+            config_api=FakeConfigApi(),
+        )
+        properties = server._tool_manager._tools[
+            "proposals_preview_screenshot"
+        ].parameters["properties"]
+
+        self.assertEqual(
+            ["feature", "layer", "viewport"], properties["framing"]["enum"]
+        )
+        self.assertEqual(1, properties["device_scale_factor"]["minimum"])
+        self.assertEqual(3, properties["device_scale_factor"]["maximum"])
+        panel_items = properties["panels"]["anyOf"][0]["items"]
+        self.assertEqual(["filtering", "styling"], panel_items["enum"])
 
     def test_visual_poll_uses_fresh_visual_credentials_and_returns_evidence(self):
         class FreshExchange(FakeExchange):
@@ -2616,6 +2677,22 @@ class PreviewEvidenceTests(ToolTestCase):
             self.assertEqual("visual.operations.show", spent["operation_id"])
             self.assertEqual("/api/visual-operations/odd%2Fid", spent["path"])
         self.assertTrue(all(c["method"] == "GET" for c in api.calls))
+
+    def test_visual_poll_returns_authenticated_original_resolution_links(self):
+        self.as_caller(caller(scopes="mcp:connect inspect visual"))
+        detail = self.build_named(
+            "visual_operations_show",
+            config_api=FakeConfigApi(answer=SHOT),
+            config_api_resource="https://config.example.test/api",
+        )(operation_id="job-1")
+
+        self.assertEqual(
+            "https://config.example.test/api/artifacts/"
+            + detail["artifacts"]["afterMap"],
+            detail["authenticatedArtifactLinks"]["afterMap"],
+        )
+        self.assertNotIn("token", detail["authenticatedArtifactLinks"]["afterMap"])
+        self.assertNotIn("beforeReport", detail["authenticatedArtifactLinks"])
 
     def test_visual_poll_without_visual_scope_is_refused(self):
         exchange = FakeExchange()
@@ -2762,6 +2839,15 @@ class PreviewEvidenceTests(ToolTestCase):
             with self.subTest(operation=descriptor["operation_id"]):
                 self.assertGreater(descriptor["timeout"], 0)
                 self.assertLess(descriptor["timeout"], 60)
+
+    def test_workspace_proposal_check_has_a_bounded_authoring_deadline(
+        self,
+    ) -> None:
+        """Multi-layer validation must not inherit the 15-second read limit."""
+        from runtime import PROPOSALS_CHECK
+
+        self.assertEqual(45.0, PROPOSALS_CHECK["timeout"])
+        self.assertLess(PROPOSALS_CHECK["timeout"], 60)
 
 
 QUEUE_WITH_REVISION = {

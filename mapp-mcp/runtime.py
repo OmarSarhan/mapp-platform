@@ -29,7 +29,7 @@ import binascii
 import contextlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from urllib.parse import urlsplit
 
@@ -59,7 +59,7 @@ from pydantic import Field
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.1.0"
+RUNTIME_VERSION = "0.2.0"
 
 #: The one place the RPC path is written. The edge routes it, the guard screens
 #: it and the SDK mounts at it, and nothing rewrites it in between.
@@ -208,6 +208,11 @@ PROPOSALS_CHECK = {
     "method": "POST",
     "path_template": "/api/proposals/check",
     "scopes": ("propose",),
+    # A check can validate several database-backed layers and semantic
+    # publication diagnostics in one request. Keep ordinary reads at the
+    # 15-second client default, but allow this bounded authoring probe to
+    # finish while leaving margin inside token B's 60-second lifetime.
+    "timeout": 45.0,
 }
 
 SEMANTIC_PROPOSALS_CHECK = {
@@ -890,7 +895,46 @@ def _history_entry(entry):
     }
 
 
-def _visual_outcome(payload):
+def _authenticated_artifact_links(
+    artifacts: dict[str, Any], config_api_resource: str | None,
+) -> dict[str, str]:
+    """Build browser links that rely on the operator's dashboard session.
+
+    No bearer credential is put in the URL. The dashboard's existing
+    authenticated artifact route serves the original PNG bytes, which avoids
+    transporting a multi-megabyte base64 image through MCP and chat.
+    """
+    if not config_api_resource:
+        return {}
+    parsed = urlsplit(config_api_resource)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.rstrip("/").endswith("/api")
+        or parsed.username is not None
+    ):
+        return {}
+    api_base = config_api_resource.rstrip("/")
+    links = {}
+    for key, artifact_path in artifacts.items():
+        if (
+            isinstance(artifact_path, str)
+            and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}/[a-z-]+\.png",
+                artifact_path,
+            )
+        ):
+            run_id, filename = artifact_path.split("/")
+            links[key] = (
+                f"{api_base}/artifacts/{quote(run_id, safe='')}/"
+                f"{quote(filename, safe='')}"
+            )
+    return links
+
+
+def _visual_outcome(payload, *, config_api_resource: str | None = None):
     """A browser run reduced to what decides whether a change is acceptable.
 
     The reply is the largest on this surface: 112,998 bytes for one screenshot,
@@ -967,11 +1011,18 @@ def _visual_outcome(payload):
         detail["pollAfterSeconds"] = 5
         detail["statusUrl"] = f"/api/visual-operations/{operation['id']}"
     if detail["artifacts"]:
+        artifact_links = _authenticated_artifact_links(
+            detail["artifacts"], config_api_resource,
+        )
         detail["artifactTool"] = "artifacts_image"
         detail["artifactInstructions"] = (
             "Call artifacts_image(artifact_path=<PNG artifact value>) to display"
-            " a retained screenshot in chat."
+            " a retained screenshot in chat. For the original-resolution PNG,"
+            " open its authenticatedArtifactLinks entry while signed in to the"
+            " MAPP dashboard. The URL contains no bearer credential."
         )
+        if artifact_links:
+            detail["authenticatedArtifactLinks"] = artifact_links
     return detail
 
 
@@ -1137,21 +1188,26 @@ def _serve_guidance(server, document):
     return read
 
 
-def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
+def build_runtime(
+    *, resource, exchange=None, config_api=None,
+    config_api_resource: str | None = None,
+) -> Any:
     """The SDK application, with the read-only surface registered.
 
     `resource` is the protected-resource description, so the runtime can report
     the identity a client discovered rather than composing a second one.
     `exchange` and `config_api` are injected so the tools can be driven without
-    a broker or a platform behind them.
+    a broker or a platform behind them. `config_api_resource` is the public
+    dashboard API origin used only to construct authenticated artifact links;
+    it is never a credential.
     """
     server = MCPServer(
         name=RUNTIME_NAME,
         version=RUNTIME_VERSION,
         title="MAPP",
         description=(
-            "Read-only access to a MAPP instance's configured layers and"
-            " semantic profiles."
+            "Scoped inspection, proposal, visual-review, and approved-change"
+            " tools for a MAPP instance."
         ),
     )
 
@@ -2316,7 +2372,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         proposal_id: str,
         layer: str,
         locale: str | None = None,
-        framing: str = "feature",
+        framing: Literal["feature", "layer", "viewport"] = "feature",
         centre: list[float] | None = None,
         zoom: float | None = None,
         viewport: dict | None = None,
@@ -2404,6 +2460,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " images to the proposal, so a person can see what it would look"
             " like before applying it. Returns an operationId immediately;"
             " poll visual_operations_show for checks and images. Supports hover."
+            " Captures at 2x resolution by default; device_scale_factor accepts"
+            " 1-3. panels can include filtering and styling (the styling image"
+            " contains the rendered legend). Completed work returns signed-in"
+            " dashboard links to the original PNGs as well as chat images."
             " Use framing=layer for the complete filtered choropleth, or"
             " framing=viewport with centre/zoom for a requested map area;"
             " omitted centre/zoom use the configured locale view. Applies nothing."
@@ -2414,10 +2474,17 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         layer: str,
         hover: bool = False,
         locale: str | None = None,
-        framing: str = "feature",
+        framing: Literal["feature", "layer", "viewport"] = "feature",
         centre: list[float] | None = None,
         zoom: float | None = None,
         viewport: dict | None = None,
+        device_scale_factor: Annotated[
+            float, Field(ge=1, le=3)
+        ] = 2.0,
+        panels: list[Literal["filtering", "styling"]] | None = None,
+        expected_panel_text: list[str] | None = None,
+        expected_hover_text: list[str] | None = None,
+        expected_info_panel_text: list[str] | None = None,
     ) -> dict:
         """Start durable evidence work and return immediately.
 
@@ -2439,8 +2506,18 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             body["zoom"] = zoom
         if viewport is not None:
             body["viewport"] = viewport
+        body["deviceScaleFactor"] = device_scale_factor
+        if panels is not None:
+            body["panels"] = panels
+        if expected_panel_text is not None:
+            body["expectedPanelText"] = expected_panel_text
+        if expected_hover_text is not None:
+            body["expectedHoverText"] = expected_hover_text
+        if expected_info_panel_text is not None:
+            body["expectedInfoPanelText"] = expected_info_panel_text
         return _visual_outcome(
-            spend(PROPOSALS_PREVIEW_SCREENSHOT, path=path, body=body)
+            spend(PROPOSALS_PREVIEW_SCREENSHOT, path=path, body=body),
+            config_api_resource=config_api_resource,
         )
 
     @tool(
@@ -2461,7 +2538,7 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         layer: str,
         hover: bool = False,
         locale: str | None = None,
-        framing: str = "feature",
+        framing: Literal["feature", "layer", "viewport"] = "feature",
         centre: list[float] | None = None,
         zoom: float | None = None,
         viewport: dict | None = None,
@@ -2482,7 +2559,8 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         if viewport is not None:
             body["viewport"] = viewport
         return _visual_outcome(
-            spend(PROPOSALS_PREVIEW_TEST, path=path, body=body)
+            spend(PROPOSALS_PREVIEW_TEST, path=path, body=body),
+            config_api_resource=config_api_resource,
         )
 
     @tool(
@@ -3049,7 +3127,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             "{operationId}", quote(operation_id, safe="")
         )
         try:
-            return _visual_outcome(spend(VISUAL_OPERATIONS_SHOW, path=target))
+            return _visual_outcome(
+                spend(VISUAL_OPERATIONS_SHOW, path=target),
+                config_api_resource=config_api_resource,
+            )
         except ToolError as refusal:
             return {
                 "operationId": operation_id,
@@ -3142,7 +3223,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
             " Returns status, stage, completed checks and retained artifact paths."
             " While running, wait pollAfterSeconds before polling again. Once"
             " complete, call artifacts_image with a PNG artifact path to display"
-            " it. Uses visual permission and a fresh credential on each poll."
+            " it, or open an authenticatedArtifactLinks URL for the original"
+            " high-resolution PNG. Uses visual permission and a fresh credential"
+            " on each poll; links require a signed-in dashboard session and"
+            " contain no bearer token."
         ),
     )
     def visual_operations_show(operation_id: str) -> dict:
@@ -3150,7 +3234,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
         path = VISUAL_OPERATIONS_SHOW["path_template"].replace(
             "{operationId}", quote(operation_id, safe="")
         )
-        return _visual_outcome(spend(VISUAL_OPERATIONS_SHOW, path=path))
+        return _visual_outcome(
+            spend(VISUAL_OPERATIONS_SHOW, path=path),
+            config_api_resource=config_api_resource,
+        )
 
     @tool(
         operation=OPERATIONS_SHOW,
@@ -3905,7 +3992,10 @@ def build_runtime(*, resource, exchange=None, config_api=None) -> Any:
     return server
 
 
-def build_runtime_app(*, resource, exchange=None, config_api=None):
+def build_runtime_app(
+    *, resource, exchange=None, config_api=None,
+    config_api_resource: str | None = None,
+):
     """The ASGI application the guard wraps.
 
     Mounted at the path the request actually carries. Nothing strips it on the
@@ -3918,7 +4008,10 @@ def build_runtime_app(*, resource, exchange=None, config_api=None):
     what the RPC path is means one of them is eventually wrong.
     """
     server = build_runtime(
-        resource=resource, exchange=exchange, config_api=config_api
+        resource=resource,
+        exchange=exchange,
+        config_api=config_api,
+        config_api_resource=config_api_resource,
     )
     # DNS-rebinding protection, pointed at the origin this server actually
     # serves. It is on by default and defaults to 127.0.0.1, which is why an

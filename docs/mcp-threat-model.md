@@ -267,6 +267,13 @@ Successful or failed visual runs can retain PNG screenshots. The MCP
 content block, so the caller can display the evidence rather than receiving
 only an internal path.
 
+Completed MCP visual results also expose an authenticated dashboard URL for
+each retained PNG. The URL contains only the high-entropy run identifier and
+closed screenshot filename: it carries no bearer token, and opening it still
+requires an operator dashboard session. It serves the original bytes through
+the existing authenticated `/api/artifacts/` route so large or high-resolution
+captures do not have to cross the MCP/chat content channel.
+
 Retrieval accepts one syntactically bounded run identifier and one filename
 from a closed screenshot-name set. Every path component is opened relative to
 the artifact root with symlink following disabled. The run's bounded

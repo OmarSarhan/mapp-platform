@@ -1172,13 +1172,23 @@ MCP clients call `artifacts_image(artifact_path=...)` with a returned PNG path,
 such as the value of `afterMap` or `afterHoverTooltip`, to receive native MCP
 image content that the conversation can display. This fetch obtains a fresh
 credential independently of the preview operation.
+Completed MCP visual operations also return `authenticatedArtifactLinks` for
+each retained PNG. These point at the dashboard's authenticated
+`/api/artifacts/` route, contain no bearer credential, and serve the original
+PNG bytes rather than embedding base64 in the MCP response. The operator must
+already have a valid dashboard session. This path is suitable for captures too
+large for a chat client or when the reviewer needs native resolution.
 Visual-test and screenshot requests may set `background: true`. The server
 returns `202 Accepted` with `operation` and `statusUrl`, continues browser work
 independently of that HTTP connection, and atomically writes the complete
 result/error envelope before the operation becomes terminal. A caller whose
 local wait expires can continue polling the same operation without restarting
 Chromium or losing its eventual report.
-MCP preview screenshot/test tools always use background execution, including
+`proposals_preview_screenshot` captures at 2× device scale by default and
+exposes the API's bounded `device_scale_factor` (1–3). Its `panels` argument
+accepts `styling` and `filtering`; the styling-panel artifact includes the
+rendered theme legend. Hover and clicked-feature panel artifacts remain
+separate PNGs. MCP preview screenshot/test tools always use background execution, including
 `hover: true`. They return an `operationId`, stage, and
 `pollTool: "visual_operations_show"`. Poll with that tool after
 `pollAfterSeconds`; each poll exchanges a fresh, request-bound credential for
