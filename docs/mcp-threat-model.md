@@ -459,6 +459,21 @@ Long-lived operational state and browser artifacts need external storage
 monitoring and retention. The authorization database connection ceiling
 prefers refusal over unbounded queuing under load.
 
+### Blocking I/O and failure recovery
+
+Async mutation and approval tools dispatch synchronous broker/API I/O through
+AnyIO's bounded worker pool with caller context propagation. This keeps slow
+writes from blocking other MCP sessions or approval traffic on the event loop.
+Worker cancellation is shielded while submitted I/O completes; client disconnect
+still does not cancel an admitted database operation. Derived mutations default
+to durable background work and retain their existing admission and resource caps.
+
+Correlation IDs are validated hexadecimal strings, logged without request bodies,
+and confer no privilege. Transport error details contain only a closed cause,
+operation, timeout, and request ID. Missing mutation responses remain
+indeterminate. Profile metadata queries and semantic connection admission have
+bounded waits; these bounds do not constitute a global HTTP-thread admission cap.
+
 ## Compromised clients and infrastructure
 
 A hostile registered client is bounded by its live grant, exact operation

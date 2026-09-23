@@ -15,7 +15,9 @@ refresh. A **materialized** relation is faster to read and stale until
 `derived_layers_refresh` runs. Choose materialized only when the work is
 expensive enough to be worth the staleness, and say which you chose and why.
 
-The default is a view, because it is the cheap always-correct choice.
+The default is a view. It avoids materialized storage, but every read can
+repeat the complete calculation; a view is not a performance fallback for a
+query that fails the computation guard.
 
 ## Naming
 
@@ -50,6 +52,71 @@ compute observed quintiles, or render a map. Its estimates are not evidence of
 the actual numeric distribution. After approved creation, use the bounded
 aggregate-only numeric inspection tools on the effective layer dataset to
 choose and verify category breaks.
+
+## Execution, diagnostics, and retries
+
+MCP create, replace, and refresh default to `background=true`. After admission,
+poll the returned operation ID with `operations_show`, initially after two
+seconds and then at increasing intervals up to ten seconds. Do not issue a
+second mutation while the first is running. Background execution retains all
+SQL guards, resource ceilings, and output-validation timeouts; it separates the
+HTTP response from execution rather than increasing the query budget.
+
+Planning checks shape, declared geometry metadata, access paths, and estimates.
+Creation also executes the full result to validate IDs and geometry. A plan
+passing is not evidence that this execution will finish within the limit.
+Use the operation's stage, progress, SQLSTATE, failurePhase, rolledBack,
+stateUnchanged, and suggestedAction to distinguish expensive SQL from service
+or lock failures. Preserve requestId when reporting an incident.
+
+On `derived_layer.plan_stale`, re-plan the identical definition including its
+draft retention, review the new scope and probes, and submit the newly returned
+fingerprint. Never copy an actual fingerprint from an error straight into create.
+If it repeatedly changes, report that fact instead of looping automatically.
+On transport failure, the write outcome is unknown: inspect background jobs,
+the exact relation, and its exact semantic profile before retrying. A missing
+profile alone does not prove rollback; semantic delivery follows creation.
+
+Prefer `semantic_derived_profiles_show(name)` when the name is known. Otherwise
+fetch one `semantic_derived_profiles_list(limit=25)` page and follow its
+`pagination.nextCursor` only when needed. Avoid repeated full-catalog discovery
+or polling a list for the progress of one job.
+
+## Spatial correctness and efficient queries
+
+Use ready source profiles to confirm geometry type, SRID, completeness, and
+available indexes. For ground-distance requirements, use a suitable local
+metric CRS with understood distortion, or transform known-SRID inputs once to
+EPSG:4326 and use `ST_DWithin(a::geography, b::geography, radius_metres, true)`.
+EPSG:4326 geometry distances use degrees. EPSG:3857 distance units are projected
+metres and are not reliable ground metres. `ST_SetSRID` labels coordinates;
+use `ST_Transform` to change them.
+
+Define the target before choosing the predicate. For distance to a route, use
+the complete intended route geometry. For points inside an existing buffer,
+use an appropriate containment/intersection predicate in a common CRS; applying
+the radius again with `ST_DWithin` expands the buffer. Do not substitute a
+simplified display geometry or one route component without checking its meaning.
+
+Keep indexable predicates on source columns in their native CRS. Use a
+conservative candidate envelope that includes the full distance margin, then
+apply the exact distance predicate. Do not use an arbitrary degree conversion
+or an unadjusted Web Mercator margin that can exclude valid matches. A transform
+or geography cast on every pair may defeat source indexes, especially across
+foreign tables; inspect the plan and reduce candidate pairs first. Prefer
+`EXISTS` for membership, compute expensive distances once when needed, and
+deduplicate by the intended stable output ID. Preserve complete aggregate and
+ranking inputs: moving a map predicate before ranking changes the question.
+
+Validate with bounded counts and set differences, then limited nearest-distance
+diagnostics through authorized tools where available. State the metric, units,
+scope, and any diagnostic limitation; screenshots and cost estimates do not
+prove spatial membership. Do not change source indexes or relax guards without
+the corresponding administrative workflow.
+
+References: [ST_DWithin](https://postgis.net/docs/ST_DWithin.html),
+[ST_Transform](https://postgis.net/docs/ST_Transform.html),
+[ST_Intersects](https://postgis.net/docs/ST_Intersects.html).
 
 ## Disposable relations for proposal previews
 
@@ -129,4 +196,4 @@ A refresh reads every source row again. It asks a person every time, and that
 is not ceremony — it is the one operation here an agent could usefully repeat,
 and the database would be the thing paying for it.
 
-Pass `background=true` for a long one and follow it with `operations_show`.
+Keep the default `background=true` and follow it with `operations_show`.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -34,6 +36,62 @@ class DraftApprovalTests(unittest.IsolatedAsyncioTestCase):
     ENTRY = approvals.DerivedLifecycleTests.ENTRY
     agreeing = approvals.DerivedLifecycleTests.agreeing
 
+    async def test_slow_creation_keeps_the_event_loop_responsive(self):
+        entered, release = threading.Event(), threading.Event()
+        api = self.Api(self)
+        original_post = api.post
+        observed_callers = []
+
+        def slow_post(**kwargs):
+            if kwargs["path"] == "/api/derived-layers":
+                observed_callers.append(approvals.CURRENT_CALLER.get())
+                entered.set()
+                release.wait(2)
+            return original_post(**kwargs)
+
+        api.post = slow_post
+        create = self.build("derived_layers_create", api)
+        expected_caller = approvals.CURRENT_CALLER.get()
+        task = asyncio.create_task(create(
+            self.agreeing(), "new_h3", "SELECT 1", ["source_census.oa"],
+            "oa_id", "geom_3857",
+        ))
+        try:
+            self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+            # Before the worker bridge this cannot run until the blocking
+            # HTTP call has finished, including across unrelated sessions.
+            self.assertFalse(task.done())
+            self.assertEqual([expected_caller], observed_callers)
+        finally:
+            release.set()
+            await task
+        self.assertTrue(api.posted_to("/api/derived-layers")[0]["body"]["background"])
+
+    async def test_background_admission_returns_polling_guidance(self):
+        api = self.Api(self)
+        original_post = api.post
+
+        def post(**kwargs):
+            if kwargs["path"] == "/api/derived-layers":
+                return {"operation": {"id": "op", "status": "running"}}
+            return original_post(**kwargs)
+
+        api.post = post
+        create = self.build("derived_layers_create", api)
+        result = await create(self.agreeing(), "new_h3", "SELECT 1",
+                              ["source_census.oa"], "oa_id", "geom_3857")
+        self.assertEqual("operations_show", result["pollTool"])
+        self.assertEqual(2, result["pollAfterSeconds"])
+
+    async def test_explicit_synchronous_create_is_still_approval_bound(self):
+        api = self.Api(self)
+        create = self.build("derived_layers_create", api)
+        await create(self.agreeing(), "new_h3", "SELECT 1",
+                     ["source_census.oa"], "oa_id", "geom_3857", background=False)
+        body = api.posted_to("/api/derived-layers")[0]["body"]
+        self.assertIs(False, body["background"])
+        self.assertEqual(body, self.exchange.digests[0]["body"])
+
     def build(self, name, api):
         self.exchange = approvals.FakeExchange()
         server = build_runtime(
@@ -56,7 +114,7 @@ class DraftApprovalTests(unittest.IsolatedAsyncioTestCase):
         await create(self.agreeing(), *args, draft_expires_in_hours=24)
         planned = api.posted_to("/api/derived-layers/plan")[0]["body"]
         created = api.posted_to("/api/derived-layers")[0]["body"]
-        self.assertEqual(planned, created)
+        self.assertEqual({**planned, "background": True}, created)
         self.assertEqual(
             {"expiresInHours": 24, "cleanupApproved": True}, created["draft"])
         self.assertEqual(created, self.exchange.digests[0]["body"])
@@ -78,7 +136,7 @@ class DraftApprovalTests(unittest.IsolatedAsyncioTestCase):
         await create(self.agreeing(), *args, draft=draft)
         planned = api.posted_to("/api/derived-layers/plan")[0]["body"]
         created = api.posted_to("/api/derived-layers")[0]["body"]
-        self.assertEqual(planned, created)
+        self.assertEqual({**planned, "background": True}, created)
         self.assertEqual(draft, created["draft"])
         self.assertIn("24 hours", api.packet()["summary"])
 

@@ -40,6 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             "body": json.loads(raw) if raw else None,
             "authorization": self.headers.get("Authorization"),
             "contentType": self.headers.get("Content-Type"),
+            "requestId": self.headers.get("X-Request-ID"),
         })
         if Handler.delay:
             time.sleep(Handler.delay)
@@ -168,8 +169,11 @@ class ConfigApiClientTests(unittest.TestCase):
         Handler.delay = 0.5
         impatient = ConfigApiClient(endpoint=self.client.endpoint, timeout=0.1)
 
-        with self.assertRaises(ConfigApiUnavailable):
+        with self.assertRaises(ConfigApiUnavailable) as raised:
             impatient.get(path="/api/x", query="", token="t")
+        self.assertEqual("request_timeout", raised.exception.reason)
+        self.assertEqual(Handler.seen[0]["requestId"], raised.exception.request_id)
+        self.assertEqual(0.1, raised.exception.timeout)
 
         # The same client, given room for this one call.
         self.assertEqual({"ok": True},

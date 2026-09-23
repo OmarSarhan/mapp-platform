@@ -15,6 +15,7 @@ old credential is either spent or bound to a request that has already happened.
 from __future__ import annotations
 
 import json
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,10 +38,11 @@ class ConfigApiRefused(RuntimeError):
     """
 
     def __init__(self, message: str, *, status: int, code: str = "",
-                 errors: Any = None, body: Any = None) -> None:
+                 errors: Any = None, body: Any = None, request_id=None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.request_id = request_id
         self.errors = errors if isinstance(errors, list) else []
         #: The parsed response, for the operations whose refusal carries one.
         #: A failed browser validation answers 422 with the whole result --
@@ -50,7 +52,14 @@ class ConfigApiRefused(RuntimeError):
 
 
 class ConfigApiUnavailable(RuntimeError):
-    """The configuration API could not be reached."""
+    """A transport failure, with safe diagnostics and no retry assumption."""
+
+    def __init__(self, message="The configuration API is unavailable.", *,
+                 reason="connection_failed", request_id=None, timeout=None):
+        super().__init__(message)
+        self.reason = reason
+        self.request_id = request_id
+        self.timeout = timeout
 
 
 class ConfigApiClient:
@@ -98,9 +107,12 @@ class ConfigApiClient:
         operations that need longer say so.
         """
         url = self.endpoint + path + (f"?{query}" if query else "")
+        request_id = secrets.token_hex(16)
+        deadline = self.timeout if timeout is None else timeout
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
+            "X-Request-ID": request_id,
         }
         if receipt is not None:
             headers[self.APPROVAL_RECEIPT_HEADER] = receipt
@@ -115,7 +127,6 @@ class ConfigApiClient:
             method=method,
         )
         try:
-            deadline = self.timeout if timeout is None else timeout
             with urllib.request.urlopen(request, timeout=deadline) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -136,10 +147,18 @@ class ConfigApiClient:
                 code=str(detail.get("code") or ""),
                 errors=detail.get("errors"),
                 body=detail or None,
+                request_id=request_id,
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            cause = getattr(exc, "reason", exc)
+            reason = (
+                "request_timeout" if isinstance(cause, TimeoutError)
+                else "invalid_response" if isinstance(exc, ValueError)
+                else "connection_failed"
+            )
             raise ConfigApiUnavailable(
-                f"the configuration API is unavailable: {exc}"
+                "The configuration API did not return a usable response.",
+                reason=reason, request_id=request_id, timeout=deadline,
             ) from None
 
 

@@ -27,6 +27,8 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import json
+from functools import partial
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -59,7 +61,7 @@ from pydantic import Field
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.3.0"
+RUNTIME_VERSION = "0.4.0"
 
 
 class DraftRetention(BaseModel):
@@ -579,6 +581,7 @@ SEMANTIC_DERIVED_PROFILES_LIST = {
     "method": "GET",
     "path_template": "/api/semantic/derived-profiles",
     "scopes": ("semantic:inspect",),
+    "timeout": 25.0,
 }
 
 SEMANTIC_DERIVED_PROFILES_SHOW = {
@@ -586,6 +589,7 @@ SEMANTIC_DERIVED_PROFILES_SHOW = {
     "method": "GET",
     "path_template": "/api/semantic/derived-profiles/{name}",
     "scopes": ("semantic:inspect",),
+    "timeout": 25.0,
 }
 
 SEMANTIC_CATALOG_HISTORY = {
@@ -859,6 +863,42 @@ def _nearest_actions(wanted, actions):
     if not near:
         return ""
     return " Did you mean " + " or ".join(repr(name) for name in near) + "?"
+
+
+def _failure_diagnostics(payload):
+    """Keep bounded recovery facts, never SQL, credentials or raw exceptions."""
+    if not isinstance(payload, dict):
+        return {}
+    detail = {
+        key: value[:1000] if isinstance(value, str) else value
+        for key in (
+            "code", "failurePhase", "stateUnchanged", "rolledBack",
+            "indeterminate", "retryable", "safeState", "suggestedAction",
+            "mutationApplied", "expectedPlanFingerprint", "actualPlanFingerprint",
+            "downstream", "category", "contentionScope",
+        )
+        if (value := payload.get(key)) is not None
+        and isinstance(value, (str, bool, int, float))
+    }
+    meta = payload.get("meta") or {}
+    if isinstance(meta, dict) and re.fullmatch(
+        r"[a-f0-9]{32}", str(meta.get("requestId", ""))
+    ):
+        detail["requestId"] = meta["requestId"]
+    technical = payload.get("technicalDetail") or {}
+    if isinstance(technical, dict) and re.fullmatch(
+        r"[0-9A-Z]{5}", str(technical.get("sqlstate", ""))
+    ):
+        detail["sqlstate"] = technical["sqlstate"]
+    return detail
+
+
+def _derived_outcome(payload):
+    result = _without_meta(payload)
+    if isinstance(result.get("operation"), dict):
+        result["pollTool"] = "operations_show"
+        result["pollAfterSeconds"] = 2
+    return result
 
 
 def _without_meta(payload):
@@ -1342,9 +1382,8 @@ def build_runtime(
                 "The authorization component is unavailable; try again."
             ) from None
         try:
-            # A descriptor may ask for longer than the read default. Bounded
-            # below the credential's own 60-second life, so a tool that is
-            # going to fail says so before the token it holds expires.
+            # Credentials are redeemed on admission; their lifetime does not
+            # need to cover execution. Long mutations use durable jobs.
             deadline = operation.get("timeout")
             if operation["method"] == "GET":
                 return config_api.get(
@@ -1372,16 +1411,48 @@ def build_runtime(
             # says only that something is wrong, and the entry beneath names
             # the field and what the database said about it.
             hint = (operation.get("refusal_hints") or {}).get(refusal.code)
+            diagnostics = _failure_diagnostics(refusal.body)
+            if refusal.request_id:
+                diagnostics.setdefault("requestId", refusal.request_id)
             raise ToolError(
                 f"The platform refused this request: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
                 + _refusal_detail(refusal.errors)
                 + (f" {hint}" if hint else "")
+                + (" Diagnostics: " + json.dumps(diagnostics) if diagnostics else "")
             ) from None
-        except ConfigApiUnavailable:
+        except ConfigApiUnavailable as exc:
+            # A disconnected write may still be running or committed. Never
+            # turn a missing response into permission to repeat the mutation.
+            read_only = operation["method"] == "GET" or operation["operation_id"] in {
+                "derived-layers.plan", "proposals.check", "sql.test",
+                "semantic.proposals.check", "proposals.preview-plan",
+            }
+            diagnostics = {
+                "code": "config_api." + exc.reason,
+                "downstream": "configuration-api",
+                "operation": operation["operation_id"],
+                "requestId": exc.request_id,
+                "timeoutSeconds": exc.timeout,
+                "retryable": read_only,
+                "indeterminate": not read_only,
+            }
             raise ToolError(
-                "The configuration API is unavailable; try again."
+                "The configuration API is unavailable or did not respond in time. "
+                + ("Retry this read with a fresh request after a short delay. "
+                   if read_only else
+                   "The write outcome is unknown. Inspect operations and the target "
+                   "relation or proposal before retrying; it may still be running. ")
+                + "Diagnostics: " + json.dumps(diagnostics)
             ) from None
+
+    async def io_call(fn, *args, **kwargs):
+        # AnyIO preserves CURRENT_CALLER and uses a bounded worker pool. Keep
+        # cancellation shielded while a submitted write finishes its I/O.
+        return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
+
+    async def async_spend(operation, **kwargs):
+        return await io_call(spend, operation, **kwargs)
 
     async def approval_gate(
         ctx, operation, *, path, query="", body=None, tool_name, packet,
@@ -1433,12 +1504,12 @@ def build_runtime(
             # answered, so ask that before asking the person anything again --
             # a second prompt for a decision already made is how a two-call
             # flow turns into an endless one.
-            settled = _settled_decision(handle)
+            settled = await io_call(_settled_decision, handle)
             if settled is not None:
                 _forget_approval(caller, digest)
                 return settled
         else:
-            created = spend(
+            created = await async_spend(
                 APPROVALS_CREATE,
                 path=APPROVALS_CREATE["path_template"],
                 body={
@@ -1467,7 +1538,7 @@ def build_runtime(
                 # Not remembered either, because there is nothing to come back
                 # for -- the two-call flow exists to carry a handle across a
                 # decision somebody has yet to make.
-                return _claim(handle)
+                return await io_call(_claim, handle)
             _remember_approval(caller, digest, handle, approval_url)
 
         message = _approval_message(operation["operation_id"], packet)
@@ -1501,7 +1572,7 @@ def build_runtime(
             # Recorded either way. A decline is a decision a person made and
             # belongs in the audit trail; leaving the row pending would also
             # leave it decidable by somebody else afterwards.
-            spend(
+            await async_spend(
                 APPROVALS_CONFIRM,
                 path=APPROVALS_CONFIRM["path_template"],
                 body={"handle": handle, "accepted": accepted},
@@ -1509,7 +1580,7 @@ def build_runtime(
             _forget_approval(caller, digest)
             if not accepted:
                 raise ToolError(_APPROVAL_DECLINED)
-            return _claim(handle)
+            return await io_call(_claim, handle)
 
         # Neither mode. Today that is *every* client, because the transport
         # this runtime serves has no back-channel for server-initiated
@@ -1633,7 +1704,7 @@ def build_runtime(
             # client was still rendering the prompt has already answered, and
             # sleeping first would cost every such approval a poll interval
             # for nothing.
-            claimed = spend(
+            claimed = await async_spend(
                 APPROVALS_CLAIM,
                 path=APPROVALS_CLAIM["path_template"],
                 body={"handle": handle},
@@ -1892,6 +1963,8 @@ def build_runtime(
             " draft_expires_in_hours=24 to plan disposable database state"
             " with preauthorized cleanup; rendering still needs an approved"
             " database creation. Use identical draft retention when creating."
+            " Read mapp://guidance/derived-layers for spatial metrics, query"
+            " performance, background execution, and retry guidance."
         ),
     )
     def derived_layers_plan(
@@ -1933,7 +2006,8 @@ def build_runtime(
             " showing the plan. Pass plan_fingerprint from"
             " derived_layers_plan so the create is refused if the sources"
             " moved since you looked. This writes to the database directly --"
-            " there is no proposal and no review queue for creation. By default"
+            " there is no proposal and no review queue for creation. Background"
+            " execution is the default; poll operations_show. By default"
             " the relation persists. Optional draft or"
             " draft_expires_in_hours explicitly"
             " authorizes automatic cleanup after proposal decline or expiry;"
@@ -1951,7 +2025,7 @@ def build_runtime(
         kind: str | None = None,
         description: str | None = None,
         plan_fingerprint: str | None = None,
-        background: bool | None = None,
+        background: bool = True,
         draft_expires_in_hours: int | None = None,
         draft: DraftRetention | None = None,
     ) -> dict:
@@ -2013,7 +2087,7 @@ def build_runtime(
             path=DERIVED_LAYERS_CREATE["path_template"], body=body,
             tool_name="derived_layers_create", packet=packet,
         )
-        return _without_meta(spend(
+        return _derived_outcome(await async_spend(
             DERIVED_LAYERS_CREATE,
             path=DERIVED_LAYERS_CREATE["path_template"],
             body=body, receipt=receipt,
@@ -2026,7 +2100,8 @@ def build_runtime(
             "Replace an existing derived relation's definition. Asks you to"
             " approve first, showing what it is today and what it would"
             " become. Anything reading the relation sees the new definition"
-            " once this completes."
+            " once this completes. Background execution is the default; poll"
+            " operations_show."
         ),
     )
     async def derived_layers_replace(
@@ -2038,7 +2113,7 @@ def build_runtime(
         geometry_column: str,
         kind: str | None = None,
         description: str | None = None,
-        background: bool | None = None,
+        background: bool = True,
     ) -> dict:
         """Replacing is the quiet one, and the packet is why.
 
@@ -2049,7 +2124,7 @@ def build_runtime(
         because "what reads this" is the question a person should be asked
         here and is not asked by the operation itself.
         """
-        current = _derived_entry(name)
+        current = await io_call(_derived_entry, name)
         body = _derived_definition(
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
@@ -2058,7 +2133,7 @@ def build_runtime(
         body["confirmed"] = True
         if background is not None:
             body["background"] = background
-        dependents = _derived_dependents(name)
+        dependents = await io_call(_derived_dependents, name)
         packet = {
             "summary": f"Replace the definition of {name}.",
             "changeCount": 1,
@@ -2082,7 +2157,7 @@ def build_runtime(
             ctx, DERIVED_LAYERS_REPLACE, path=target, body=body,
             tool_name="derived_layers_replace", packet=packet,
         )
-        return _without_meta(spend(
+        return _derived_outcome(await async_spend(
             DERIVED_LAYERS_REPLACE, path=target, body=body, receipt=receipt,
         ))
 
@@ -2092,12 +2167,12 @@ def build_runtime(
         description=(
             "Recompute a materialised derived relation from its sources. The"
             " definition does not change; the numbers do. Asks you to approve"
-            " first. Pass background=true for a long one and follow it with"
+            " first. Background execution is the default; follow it with"
             " operations_show."
         ),
     )
     async def derived_layers_refresh(
-        ctx: Context, name: str, background: bool | None = None,
+        ctx: Context, name: str, background: bool = True,
     ) -> dict:
         """The mildest of the four, and still asked about.
 
@@ -2106,7 +2181,7 @@ def build_runtime(
         again, and an agent that could fire it unattended would be a way to
         spend the database's time.
         """
-        current = _derived_entry(name)
+        current = await io_call(_derived_entry, name)
         body = {"confirmed": True}
         if background is not None:
             body["background"] = background
@@ -2126,7 +2201,7 @@ def build_runtime(
                 "sources": current.get("sources") or [],
             },
         )
-        return _without_meta(spend(
+        return _derived_outcome(await async_spend(
             DERIVED_LAYERS_REFRESH, path=target, body=body, receipt=receipt,
         ))
 
@@ -2155,8 +2230,8 @@ def build_runtime(
         The platform refuses an in-use drop on its own; this does not rely on
         that, and the platform does not rely on this. Both, on purpose.
         """
-        current = _derived_entry(name)
-        dependents = _derived_dependents(name)
+        current = await io_call(_derived_entry, name)
+        dependents = await io_call(_derived_dependents, name)
         blocking = dependents["workspaceLayers"] + dependents["derivedLayers"]
         if blocking:
             # Refused before asking. The platform would refuse this too, and
@@ -2191,7 +2266,7 @@ def build_runtime(
                 "dependents": dependents,
             },
         )
-        return _without_meta(spend(
+        return _without_meta(await async_spend(
             DERIVED_LAYERS_DROP, path=target, body=body, receipt=receipt,
         ))
 
@@ -3017,7 +3092,7 @@ def build_runtime(
         holds; a summary assembled from what the model passed in would let the
         agent describe its own change.
         """
-        proposal = _apply_packet(proposal_id, evidence_operation_id)
+        proposal = await io_call(_apply_packet, proposal_id, evidence_operation_id)
         target = PROPOSALS_APPLY["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
@@ -3029,7 +3104,7 @@ def build_runtime(
             ctx, PROPOSALS_APPLY, path=target, body=body,
             tool_name="proposals_apply", packet=proposal,
         )
-        return _applied(spend(
+        return _applied(await async_spend(
             PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
         ))
 
@@ -3049,7 +3124,7 @@ def build_runtime(
         change different things and an operator should be able to hand over
         one without the other.
         """
-        packet = _semantic_apply_packet(proposal_id)
+        packet = await io_call(_semantic_apply_packet, proposal_id)
         target = SEMANTIC_PROPOSALS_APPLY["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
@@ -3058,7 +3133,7 @@ def build_runtime(
             ctx, SEMANTIC_PROPOSALS_APPLY, path=target, body=body,
             tool_name="semantic_proposals_apply", packet=packet,
         )
-        return _without_meta(spend(
+        return _without_meta(await async_spend(
             SEMANTIC_PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
         ))
 
@@ -3093,7 +3168,7 @@ def build_runtime(
             tool_name="xyz_reload",
             packet={"summary": "Reload the map from the workspace on disk."},
         )
-        return _without_meta(spend(
+        return _without_meta(await async_spend(
             XYZ_RELOAD, path=XYZ_RELOAD["path_template"], body=body,
             receipt=receipt,
         ))
@@ -3322,8 +3397,20 @@ def build_runtime(
         detail["result"] = {
             key: _change_preview(value) for key, value in result.items()
         }
+        if isinstance(operation.get("progress"), dict):
+            detail["progress"] = operation["progress"]
+        diagnostics = operation.get("diagnostics")
+        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("databasePhase"), str):
+            detail["databasePhase"] = diagnostics["databasePhase"][:100]
+        derived = result.get("derivedLayer")
+        if isinstance(derived, dict):
+            detail["result"]["derivedLayer"] = {
+                key: derived[key] for key in ("name", "kind", "semanticProfile", "draft")
+                if key in derived
+            }
         if error:
             detail["error"] = {
+                **_failure_diagnostics(error),
                 "code": error.get("code"),
                 "message": error.get("message"),
                 "diagnosis": _change_preview(error.get("diagnosis")),
@@ -3638,10 +3725,15 @@ def build_runtime(
             "Derived profiles: the managed relations the semantic service"
             " models, with the catalogued asset each corresponds to and"
             " whether it is ready. Use a name here with"
-            " semantic_derived_profiles_show."
+            " semantic_derived_profiles_show. Pages default to 25; pass the"
+            " returned pagination.nextCursor to continue. Prefer exact-name"
+            " show when you already know the relation name."
         ),
     )
-    def semantic_derived_profiles_list() -> dict:
+    def semantic_derived_profiles_list(
+        limit: Annotated[int, Field(ge=1, le=100)] = 25,
+        cursor: str | None = None,
+    ) -> dict:
         """The join between a derived relation and its catalogued meaning.
 
         `derived_layers_list` says a relation exists and `semantic_catalog_*`
@@ -3652,6 +3744,9 @@ def build_runtime(
             spend(
                 SEMANTIC_DERIVED_PROFILES_LIST,
                 path=SEMANTIC_DERIVED_PROFILES_LIST["path_template"],
+                query="limit=" + str(limit) + (
+                    "&cursor=" + quote(cursor, safe="") if cursor else ""
+                ),
             )
         )
 

@@ -1256,7 +1256,7 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("refresh", packet["changes"][0]["op"])
         self.assertEqual(["source_census.oa"], packet["sources"])
         self.assertEqual(
-            {"confirmed": True},
+            {"confirmed": True, "background": True},
             api.posted_to("/api/derived-layers/census_h3/refresh")[0]["body"],
         )
 

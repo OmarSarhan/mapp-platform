@@ -1568,6 +1568,38 @@ blindly retry either result: read the proposal, workspace revision, and XYZ
 status first. Dry-run mutation must return `saved: false`; a client should fail
 closed if a server does not make that guarantee.
 
+### Derived execution and MCP recovery diagnostics
+
+The MCP create, replace, and refresh tools default to `background=true` and
+return `pollTool: "operations_show"` plus an initial two-second polling hint.
+Explicit `background=false` remains supported; the HTTP API default is unchanged.
+Admission still runs its normal preflight. The worker revalidates sources and
+any supplied plan fingerprint and enforces the same transaction, computation,
+storage, uniqueness, geometry, and resource guards. Planning does not execute
+full output validation; a passing estimate can still time out during creation.
+SQLSTATE 57014 is reported as `derived_layer.query_cancelled`, with rollback and
+safe-state evidence; it does not recommend automatically repeating expensive SQL.
+
+MCP errors retain bounded recovery fields (including failure phase, SQLSTATE,
+rollback state, retryability, stale-plan fingerprints, and suggested action).
+Operation polling retains progress and the created relation's semantic and draft
+identity, so callers can bind an approved disposable result to a proposal.
+Raw SQL and transport exception strings are not exposed by these diagnostics.
+Transport timeouts, connection failures, and invalid JSON responses have distinct
+`config_api.*` codes. An unanswered write is indeterminate, not safe to retry.
+
+MCP generates a 32-character lowercase hexadecimal `X-Request-ID` for each API
+request. The API accepts that bounded correlation identifier (or generates one
+for missing/invalid input), returns it in response metadata and headers, and
+includes it in its request log. It carries no authorization or idempotency rights.
+
+MCP derived-profile listing accepts `limit` (1–100, default 25) and `cursor`.
+Use exact-name show for one known profile. Derived registry list/get/page reads
+have five-second SQL and two-second lock waits; database connection establishment
+has a five-second timeout. Semantic connection-slot admission waits at most one
+second before a 503 busy response; metadata readers use five-second SQL and
+one-second lock waits. These are per-stage limits, not a single end-to-end SLA.
+
 ## Compatibility testing
 
 Every platform/CLI release pair should test discovery, schema/rules, workspace
