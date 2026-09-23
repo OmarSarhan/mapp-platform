@@ -174,6 +174,20 @@ avoids an unbounded upstream calculation.
 
 ## Replacing is the quiet one
 
+To convert an existing ordinary view to a materialized relation, inspect it with
+`derived_layers_show`, check `dependencies_list`, then call
+`derived_layers_replace` with the inspected name, query, sources, ID column,
+geometry column and description, and `kind="materialized"`. The same tool with
+`kind="view"` converts back. Present the kind change and affected consumers for
+approval. Do not drop and recreate it to bypass replacement checks.
+
+Conversion retains the normal SQL, computation, dependency and storage guards;
+materialized output is a snapshot and needs `derived_layers_refresh` to update.
+Use the default background execution and poll `operations_show` at the returned
+interval rather than holding a request open. Active disposable drafts cannot be
+replaced or refreshed: publication must adopt them first. Conversion is a
+database operation and does not authorize a workspace change.
+
 A drop announces itself: the platform refuses it while anything still reads the
 relation. A replace does not. Every layer reading it keeps working and starts
 returning different numbers.

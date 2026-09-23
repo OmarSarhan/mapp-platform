@@ -29,6 +29,37 @@ def derived():
     return store
 
 
+class DraftCleanupStatusTests(unittest.TestCase):
+    def test_watcher_reports_bounded_sweep_and_retention_outcomes(self):
+        lifecycle = Mock()
+        lifecycle.sweep.return_value = [{"outcome": "dropped"}, {"outcome": "other-proposal-reference"}]
+        with (patch.object(app, "draft_lifecycle", return_value=lifecycle),
+              patch.object(app, "DRAFT_CLEANUP_STATUS", {}),
+              patch.object(app.DRAFT_CLEANUP_WAKE, "wait", side_effect=StopIteration),
+              patch.object(app, "schedule_semantic_outbox") as outbox):
+            with self.assertRaises(StopIteration):
+                app.run_draft_cleanup()
+            status = app.draft_cleanup_status()
+            self.assertIsNotNone(status["lastCompletedAt"])
+            self.assertIsNone(status["lastError"])
+            self.assertEqual({"dropped": 1, "other-proposal-reference": 1}, status["outcomes"])
+            self.assertEqual(20, status["batchLimit"])
+            outbox.assert_called_once_with()
+
+    def test_watcher_reports_failure_without_exposing_exception_details(self):
+        lifecycle = Mock()
+        lifecycle.sweep.side_effect = ValueError("private database details")
+        with (patch.object(app, "draft_lifecycle", return_value=lifecycle),
+              patch.object(app, "DRAFT_CLEANUP_STATUS", {}),
+              patch.object(app.DRAFT_CLEANUP_WAKE, "wait", side_effect=StopIteration),
+              patch.object(app.LOGGER, "exception")):
+            with self.assertRaises(StopIteration):
+                app.run_draft_cleanup()
+            status = app.draft_cleanup_status()
+            self.assertEqual("ValueError", status["lastError"])
+            self.assertNotIn("private", str(status))
+
+
 class DraftCheckTests(unittest.TestCase):
     def test_check_fingerprint_binds_exact_draft_identity_and_generation(self):
         base = proposal_check(ORIGINAL, "rev", CANDIDATE, OPERATIONS, [])

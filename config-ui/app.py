@@ -63,7 +63,7 @@ from visual_artifacts import (
     DOWNLOAD_PREFIX, VisualArtifactError, download_origin, issue_download, read_download, read_visual_image,
 )
 from derived_drafts import (
-    CLEANUP_INTERVAL_SECONDS, DraftLifecycle, DraftLifecycleError,
+    CLEANUP_BATCH, CLEANUP_INTERVAL_SECONDS, DraftLifecycle, DraftLifecycleError,
     lifecycle_lock, normalize_bindings, retain_browser_lease,
 )
 from svg_icons import safe_svg
@@ -222,6 +222,8 @@ if not 30 <= VISUAL_BACKGROUND_TIMEOUT_SECONDS <= 600:
     )
 SAVE_LOCK = threading.Lock()
 DRAFT_CLEANUP_WAKE = threading.Event()
+DRAFT_CLEANUP_STATUS_LOCK = threading.Lock()
+DRAFT_CLEANUP_STATUS = {"lastCompletedAt": None, "lastError": None, "outcomes": {}}
 SAVE_RELOAD_LOCK = threading.Lock()
 PREVIEW_LOCK = threading.RLock()
 DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
@@ -4082,10 +4084,29 @@ def run_draft_cleanup():
             results = draft_lifecycle().sweep()
             if any(item["outcome"] == "dropped" for item in results):
                 schedule_semantic_outbox()
-        except Exception:
+            with DRAFT_CLEANUP_STATUS_LOCK:
+                DRAFT_CLEANUP_STATUS.update({
+                    "lastCompletedAt": iso(), "lastError": None,
+                    "outcomes": {reason: sum(item["outcome"] == reason for item in results)
+                                 for reason in {item["outcome"] for item in results}},
+                })
+        except Exception as exc:
+            with DRAFT_CLEANUP_STATUS_LOCK:
+                DRAFT_CLEANUP_STATUS["lastError"] = type(exc).__name__
             LOGGER.exception("Draft cleanup could not verify its state; retaining relations")
         DRAFT_CLEANUP_WAKE.wait(CLEANUP_INTERVAL_SECONDS)
         DRAFT_CLEANUP_WAKE.clear()
+
+
+def draft_cleanup_status():
+    with DRAFT_CLEANUP_STATUS_LOCK:
+        return {
+            **DRAFT_CLEANUP_STATUS,
+            "enabled": DERIVED is not None,
+            "workerRunning": any(thread.name == "derived-draft-cleanup" and thread.is_alive()
+                                 for thread in threading.enumerate()),
+            "batchLimit": CLEANUP_BATCH,
+        }
 
 
 @draft_guarded
@@ -7625,6 +7646,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "drafts": drafts, "limit": 100,
                     "possiblyTruncated": len(drafts) == 100,
                     "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
+                    "cleanup": draft_cleanup_status(),
                 })
             except Exception:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {

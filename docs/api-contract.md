@@ -867,7 +867,12 @@ results. These are read-only status surfaces, with no executable cleanup
 endpoint. Deferred and failed cleanup remains visible for retry. Existing
 relations and proposals have no inferred ownership and are unaffected.
 The listing is bounded to 100 records and returns `drafts`, `limit`,
-`possiblyTruncated`, and `cleanupIntervalSeconds` (60). It does not expose data
+`possiblyTruncated`, and `cleanupIntervalSeconds` (60). Its additive `cleanup`
+object reports `enabled`, `workerRunning`, `batchLimit` (20), `lastCompletedAt`,
+`lastError` (exception class only, or null), and `outcomes` (counts by lifecycle
+result from the last completed sweep). These are process-local observations,
+reset on service restart; worker liveness alone does not prove successful
+deletion. It does not expose data
 rows or grant authority to force deletion.
 Each draft reports exact identity, `proposalId`, `createdAt`, `expiresAt`,
 `expiresInHours`, `cleanupApproved`, and `state` (`active`, `adopted`, or

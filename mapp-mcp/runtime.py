@@ -2105,7 +2105,9 @@ def build_runtime(
             " approve first, showing what it is today and what it would"
             " become. Anything reading the relation sees the new definition"
             " once this completes. Background execution is the default; poll"
-            " operations_show."
+            " operations_show. Set kind='materialized' to materialize an existing"
+            " view, or kind='view' to convert back, retaining its inspected SQL"
+            " and columns. Dependency and resource guards still apply."
         ),
     )
     async def derived_layers_replace(
@@ -2154,6 +2156,18 @@ def build_runtime(
                 else "Nothing else reads this relation."
             ),
         }
+        if body["kind"] != current.get("kind"):
+            packet["summary"] = f"Convert {name} from {current.get('kind')} to {body['kind']}."
+            packet["changes"].insert(0, {
+                "op": "replace", "path": f"derived_layers.{name}.kind",
+                "was": current.get("kind"), "becomes": body["kind"],
+            })
+            packet["changeCount"] = len(packet["changes"])
+            packet["note"] = (
+                "Materialized relations store a snapshot and require explicit refresh. "
+                "Ordinary views recompute on read. Database dependencies and the "
+                "normal query, storage and lifecycle guards can block conversion."
+            )
         target = DERIVED_LAYERS_REPLACE["path_template"].replace(
             "{name}", quote(name, safe="")
         )

@@ -1201,6 +1201,27 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("Nothing else reads", api.packet()["note"])
 
+    async def test_replace_exposes_materialization_conversion_in_approval(self) -> None:
+        for target_kind in ("view", "materialized"):
+            api = self.Api(self, dependents=self.reading())
+            # The fixture starts materialized; use an inspected view for the reverse direction.
+            if target_kind == "materialized":
+                original_get = api.get
+                def get(**kwargs):
+                    result = original_get(**kwargs)
+                    if kwargs["path"] == "/api/derived-layers":
+                        result["derivedLayers"] = [{**entry, "kind": "view"} for entry in result["derivedLayers"]]
+                    return result
+                api.get = get
+            replace = self.build("derived_layers_replace", api)
+            await replace(self.agreeing(), "census_h3", "SELECT 1", ["source_census.oa"],
+                          "oa_id", "geom_3857", kind=target_kind)
+            packet = api.packet()
+            self.assertIn("Convert census_h3", packet["summary"])
+            self.assertEqual(target_kind, packet["changes"][0]["becomes"])
+            mutation = next(call for call in api.calls if call["path"].endswith("/replace"))
+            self.assertEqual(target_kind, mutation["body"]["kind"])
+
     async def test_a_create_carries_the_definition_it_would_write(
         self,
     ) -> None:
