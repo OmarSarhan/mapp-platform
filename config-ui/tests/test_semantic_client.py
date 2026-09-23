@@ -44,6 +44,17 @@ class SemanticClientTests(unittest.TestCase):
             "internal-secret",
         )
 
+    def test_timeout_identifies_dependency_without_exposing_transport_details(self):
+        with patch.object(self.client.opener, "open", side_effect=TimeoutError("secret host")):
+            with self.assertRaises(SemanticClientError) as caught:
+                self.client.request("/v1/status")
+        error = caught.exception
+        self.assertEqual(504, error.status)
+        self.assertEqual("semantic.timeout", error.payload["code"])
+        self.assertEqual("semantic-service", error.payload["downstream"])
+        self.assertTrue(error.payload["retryable"])
+        self.assertNotIn("secret host", str(error))
+
     def test_request_uses_only_internal_auth_and_trusted_context(self):
         captured = {}
 

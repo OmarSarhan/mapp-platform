@@ -199,6 +199,14 @@ class SemanticClient:
                 payload=decoded,
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            timed_out = isinstance(getattr(exc, "reason", exc), TimeoutError)
             raise SemanticClientError(
-                "Semantic service is unavailable."
+                "Semantic service request timed out." if timed_out else
+                "Semantic service is unavailable.",
+                status=504 if timed_out else 503,
+                payload={
+                    "code": "semantic.timeout" if timed_out else "semantic.unavailable",
+                    "downstream": "semantic-service",
+                    "retryable": method == "GET",
+                },
             ) from exc

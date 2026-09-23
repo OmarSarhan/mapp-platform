@@ -1599,6 +1599,7 @@ class DerivedLayerStore:
             self.connection_string,
             autocommit=False,
             row_factory=dict_row,
+            connect_timeout=5,
         )
         try:
             with connection.cursor() as cur:
@@ -4344,8 +4345,17 @@ class DerivedLayerStore:
                 "materializationProbe": materialization_probe,
             }
 
+    @contextmanager
+    def _metadata_connection(self):
+        """Registry reads must not inherit the mutation's long SQL timeout."""
+        with self._connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '5s'")
+                cur.execute("SET LOCAL lock_timeout = '2s'")
+            yield connection
+
     def list(self) -> list[dict[str, Any]]:
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._metadata_connection() as connection, connection.cursor() as cur:
             cur.execute(sql.SQL("""
                 SELECT name, kind, sources, id_column AS "idColumn",
                        geometry_column AS "geometryColumn", description,
@@ -4430,7 +4440,7 @@ class DerivedLayerStore:
             or not 1 <= fetch_limit <= 101
         ):
             raise DerivedLayerError("Derived-layer page limit is invalid.")
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._metadata_connection() as connection, connection.cursor() as cur:
             where = sql.SQL("WHERE name > %s") if after_name else sql.SQL("")
             values = (after_name, fetch_limit) if after_name else (fetch_limit,)
             cur.execute(sql.SQL("""
@@ -4460,7 +4470,7 @@ class DerivedLayerStore:
     def get(self, name: str, *, include_query: bool = True) -> dict[str, Any]:
         if not NAME_RE.fullmatch(name):
             raise DerivedLayerError("Invalid derived-layer name.")
-        with self._connect() as connection, connection.cursor() as cur:
+        with self._metadata_connection() as connection, connection.cursor() as cur:
             cur.execute(sql.SQL("""
                 SELECT name, kind, query, sources,
                        id_column AS "idColumn",

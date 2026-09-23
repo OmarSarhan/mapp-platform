@@ -46,6 +46,7 @@ SCHEMA = "semantic"
 # instead. One slot below the role limit is left free deliberately, so an
 # operator can still psql in as the role while the service is saturated.
 MAX_CONCURRENT_CONNECTIONS = 3
+CONNECTION_QUEUE_TIMEOUT_SECONDS = 1
 # One name for the store-wide advisory lock that stands in for SQLite's
 # BEGIN IMMEDIATE.  Every writer that publishes a new catalog revision takes
 # it first, so those writers never interleave and can never acquire the
@@ -190,7 +191,17 @@ class SemanticStore:
         refused by PostgreSQL rather than only by this module.
         """
         with self._slot(self._reader_slots, self.reader_database_url) as connection:
-            yield connection
+            try:
+                connection.execute("SET SESSION statement_timeout = '5s'")
+                connection.execute("SET SESSION lock_timeout = '1s'")
+                yield connection
+            except psycopg.Error as exc:
+                if exc.sqlstate not in {"57014", "55P03"}:
+                    raise
+                raise SemanticError(
+                    "read_timeout", "Semantic metadata read exceeded its database wait limit.",
+                    status=503, details={"retryable": True},
+                ) from None
 
     @contextmanager
     def _slot(
@@ -199,7 +210,11 @@ class SemanticStore:
         database_url: str,
     ) -> Iterator[StoreConnection]:
         """Hold one of the role's connection slots for the whole session."""
-        slots.acquire()
+        if not slots.acquire(timeout=CONNECTION_QUEUE_TIMEOUT_SECONDS):
+            raise SemanticError(
+                "busy", "Semantic service connection capacity is busy; retry after a short delay.",
+                status=503, details={"retryable": True},
+            )
         try:
             connection = self._open(database_url)
         except BaseException:

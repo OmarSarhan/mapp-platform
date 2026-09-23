@@ -1719,6 +1719,21 @@ class CatalogSymbologyValidationTests(unittest.TestCase):
 
 
 class JsonResponseTests(unittest.TestCase):
+    def test_get_correlates_valid_request_ids_and_replaces_untrusted_values(self):
+        for supplied in ("a" * 32, "not-a-valid-id", ""):
+            with self.subTest(supplied=supplied):
+                handler = object.__new__(app.Handler)
+                handler.headers = {"X-Request-ID": supplied}
+                handler.path = "/healthz"
+                handler._host_allowed = Mock(return_value=False)
+                handler._json = Mock()
+                handler.do_GET()
+                self.assertRegex(handler._request_id, r"^[a-f0-9]{32}$")
+                if supplied == "a" * 32:
+                    self.assertEqual(supplied, handler._request_id)
+                else:
+                    self.assertNotEqual(supplied, handler._request_id)
+
     def test_derived_layer_timestamps_are_serialized_as_iso_8601(self):
         handler = object.__new__(app.Handler)
         handler._request_id = "request-test"
@@ -5317,7 +5332,7 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
         call = control.finish_operation.call_args
         self.assertEqual("failed", call.kwargs["status"])
         error = call.kwargs["error"]
-        self.assertEqual("derived_layer.database_error", error["code"])
+        self.assertEqual("derived_layer.query_cancelled", error["code"])
         self.assertEqual(
             {
                 "sqlstate": "57014",
@@ -5334,7 +5349,7 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
         self.assertEqual("database-transaction", error["failurePhase"])
         self.assertNotIn("indeterminate", error)
         self.assertNotIn("SECRET SQL", repr(error))
-        self.assertNotIn("retryable", error)
+        self.assertFalse(error["retryable"])
         self.assertNotIn("contentionScope", error)
 
     def test_background_mutation_contention_is_retryable_conflict(self):
@@ -6223,6 +6238,32 @@ class SemanticGatewayRouteTests(unittest.TestCase):
         handler._json = lambda status, body: responses.append((status, body))
         return handler, responses
 
+    def test_derived_profile_timeout_identifies_the_registry(self):
+        handler, responses = self.handler("/api/semantic/derived-profiles/example")
+        derived = Mock()
+        derived.get.side_effect = app.psycopg.errors.QueryCanceled("PRIVATE SQL")
+        with patch.object(app, "DERIVED", derived), patch.object(
+            app, "current_semantic_revision", return_value=1
+        ):
+            handler.do_GET()
+        status, payload = responses[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("semantic.derived_metadata_timeout", payload["code"])
+        self.assertEqual("derived-registry", payload["downstream"])
+        self.assertTrue(payload["retryable"])
+        self.assertNotIn("PRIVATE SQL", json.dumps(payload))
+
+    def test_semantic_capacity_failure_preserves_retryability(self):
+        handler, responses = self.handler("/api/semantic/catalog")
+        handler._semantic_error(app.SemanticClientError(
+            "Busy.", status=503, payload={"error": {
+                "code": "busy", "message": "Capacity is busy.",
+                "details": {"retryable": True},
+            }},
+        ))
+        self.assertEqual("semantic-service", responses[0][1]["downstream"])
+        self.assertTrue(responses[0][1]["retryable"])
+
     def test_derived_profile_readiness_is_served_from_local_outbox_state(self):
         handler, responses = self.handler(
             "/api/semantic/derived-profiles/places"
@@ -6823,7 +6864,7 @@ class SemanticGatewayRouteTests(unittest.TestCase):
                     status=status,
                     payload=envelope,
                 ))
-                self.assertEqual([(status, expected)], responses)
+                self.assertEqual([(status, {**expected, "downstream": "semantic-service"})], responses)
 
     def test_private_semantic_unauthorized_is_not_caller_authentication(self):
         handler, responses = self.handler("/api/semantic/catalog")

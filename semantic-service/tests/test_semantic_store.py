@@ -33,6 +33,30 @@ class SemanticStoreTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = fresh_store()
 
+    def test_reader_statement_timeout_releases_capacity(self):
+        with self.assertRaises(SemanticError) as caught:
+            with self.store._reader_connection() as connection:
+                connection.execute("SET statement_timeout = '20ms'")
+                connection.execute("SELECT pg_sleep(1)")
+        self.assertEqual("read_timeout", caught.exception.code)
+        self.assertEqual(503, caught.exception.status)
+        # The cancelled request leaves neither a connection nor a slot held.
+        with self.store.read_snapshot() as (_, revision):
+            self.assertIsInstance(revision, int)
+
+    def test_saturated_reader_queue_has_a_deadline(self):
+        for _ in range(MAX_CONCURRENT_CONNECTIONS):
+            self.store._reader_slots.acquire()
+        try:
+            with patch("semantic_store.CONNECTION_QUEUE_TIMEOUT_SECONDS", .01):
+                with self.assertRaises(SemanticError) as caught:
+                    self.store.catalog_revision()
+            self.assertEqual("busy", caught.exception.code)
+            self.assertEqual(503, caught.exception.status)
+        finally:
+            for _ in range(MAX_CONCURRENT_CONNECTIONS):
+                self.store._reader_slots.release()
+
     def test_concurrent_reads_queue_instead_of_exhausting_the_role(self) -> None:
         """Both semantic roles hold CONNECTION LIMIT 4.
 

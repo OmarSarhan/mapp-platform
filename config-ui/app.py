@@ -3546,6 +3546,7 @@ def derived_database_error(
     indeterminate: bool = False,
 ) -> dict:
     uncertain = indeterminate or not state_unchanged
+    query_cancelled = getattr(exc, "sqlstate", None) == "57014"
     lock_contention = (
         getattr(exc, "sqlstate", None) == "55P03"
         and not uncertain
@@ -3558,6 +3559,8 @@ def derived_database_error(
         "The database could not acquire a required lock before the "
         "derived-layer lock timeout."
         if lock_contention
+        else "The database cancelled the derived query because of a timeout or cancellation."
+        if query_cancelled
         else "The database could not apply this derived-layer change."
     )
     if lock_contention:
@@ -3572,6 +3575,13 @@ def derived_database_error(
             "Inspect the operation, managed derived layer, and catalog before "
             "retrying; the requested change may have committed."
         )
+    elif query_cancelled:
+        suggested_action = (
+            "Inspect the operation phase and query plan. Reduce repeated spatial "
+            "work and use indexable source predicates, then re-plan before retrying. "
+            "A successful plan estimates cost; creation still executes full output "
+            "validation. Background execution does not bypass database limits."
+        )
     else:
         suggested_action = (
             "Correct the query, declared source tables, or selected ID and "
@@ -3585,6 +3595,8 @@ def derived_database_error(
         "code": (
             "derived_layer.database_contention"
             if lock_contention
+            else "derived_layer.query_cancelled"
+            if query_cancelled
             else "derived_layer.database_error"
         ),
         "operation": operation,
@@ -3596,6 +3608,8 @@ def derived_database_error(
             "contentionScope": "postgresql-lock",
             "retryable": True,
         })
+    elif query_cancelled and not uncertain:
+        response.update({"category": "computation", "retryable": False})
     technical_detail = sanitized_postgres_detail(exc)
     if technical_detail:
         response["technicalDetail"] = technical_detail
@@ -6350,7 +6364,7 @@ class Handler(SimpleHTTPRequestHandler):
         return str(candidate or STATIC_ROOT / ".not-found")
 
     def log_message(self, fmt, *args):
-        print(f"{self.client_address[0]} {fmt % args}")
+        print(f"{self.client_address[0]} requestId={getattr(self, '_request_id', '-')} {fmt % args}")
 
     def handle_one_request(self):
         # Reset per-request state before anything is parsed. A handler instance
@@ -6958,6 +6972,10 @@ class Handler(SimpleHTTPRequestHandler):
             )
         if payload.get("details") is None:
             payload.pop("details", None)
+        payload.setdefault("downstream", "semantic-service")
+        details = payload.get("details")
+        if isinstance(details, dict) and isinstance(details.get("retryable"), bool):
+            payload.setdefault("retryable", details["retryable"])
         self._json(status, payload)
 
     def _collection_pagination_error(
@@ -7027,14 +7045,22 @@ class Handler(SimpleHTTPRequestHandler):
         return not ALLOWED_HOSTS or host in ALLOWED_HOSTS
 
     def do_OPTIONS(self):
-        self._request_id = secrets.token_hex(16)
+        supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
+        self._request_id = (
+            supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
+            else secrets.token_hex(16)
+        )
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
     def do_GET(self):
-        self._request_id = secrets.token_hex(16)
+        supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
+        self._request_id = (
+            supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
+            else secrets.token_hex(16)
+        )
         path = urlparse(self.path).path
         if not self._host_allowed():
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Unrecognized Host header."})
@@ -7213,7 +7239,21 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticClientError as exc:
                 self._semantic_error(exc)
-            except (DerivedLayerError, psycopg.Error) as exc:
+            except psycopg.Error as exc:
+                timed_out = getattr(exc, "sqlstate", None) in {"57014", "55P03"}
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE if timed_out else HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "Derived profile metadata read exceeded its database wait limit."
+                        if timed_out else "Derived profile metadata is unavailable.",
+                        "code": "semantic.derived_metadata_timeout"
+                        if timed_out else "semantic.derived_unavailable",
+                        "downstream": "derived-registry",
+                        "retryable": timed_out,
+                        "technicalDetail": sanitized_postgres_detail(exc),
+                    },
+                )
+            except DerivedLayerError as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": str(exc), "code": "semantic.derived_unavailable"},
@@ -8246,7 +8286,11 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
-        self._request_id = secrets.token_hex(16)
+        supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
+        self._request_id = (
+            supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
+            else secrets.token_hex(16)
+        )
         request_path = urlparse(self.path).path
         if not self._host_allowed():
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Unrecognized Host header."})
