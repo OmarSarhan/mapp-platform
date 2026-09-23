@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import json
@@ -58,7 +59,9 @@ from federation_schema import (
 )
 from federation_store import MAX_ALIASES, MAX_GROUPS, FederationAliasStore
 from static_files import safe_static_path
-from visual_artifacts import read_visual_image, VisualArtifactError
+from visual_artifacts import (
+    DOWNLOAD_PREFIX, VisualArtifactError, download_origin, issue_download, read_download, read_visual_image,
+)
 from derived_drafts import (
     CLEANUP_INTERVAL_SECONDS, DraftLifecycle, DraftLifecycleError,
     lifecycle_lock, normalize_bindings, retain_browser_lease,
@@ -1849,6 +1852,10 @@ def normalized_host(value: str) -> str | None:
 
 
 INTERNAL_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "config-ui"}
+ARTIFACT_DOWNLOAD_ORIGIN = download_origin(os.environ.get("ARTIFACT_DOWNLOAD_ORIGIN", ""))
+# This single-process service revokes outstanding five-minute links on restart.
+# No new secret file, database lookup, or image cache on the public read path.
+ARTIFACT_DOWNLOAD_KEY = secrets.token_bytes(32)
 ALLOWED_HOSTS = INTERNAL_ALLOWED_HOSTS | {
     host
     for value in os.environ.get("CONFIG_ALLOWED_HOSTS", "").split(",")
@@ -6364,7 +6371,10 @@ class Handler(SimpleHTTPRequestHandler):
         return str(candidate or STATIC_ROOT / ".not-found")
 
     def log_message(self, fmt, *args):
-        print(f"{self.client_address[0]} requestId={getattr(self, '_request_id', '-')} {fmt % args}")
+        message = ("artifact download [link redacted]"
+                   if getattr(self, "path", "").startswith(DOWNLOAD_PREFIX)
+                   else fmt % args)
+        print(f"{self.client_address[0]} requestId={getattr(self, '_request_id', '-')} {message}")
 
     def handle_one_request(self):
         # Reset per-request state before anything is parsed. A handler instance
@@ -7062,8 +7072,30 @@ class Handler(SimpleHTTPRequestHandler):
             else secrets.token_hex(16)
         )
         path = urlparse(self.path).path
+        is_download = path.startswith(DOWNLOAD_PREFIX)
         if not self._host_allowed():
             self._json(HTTPStatus.BAD_REQUEST, {"error": "Unrecognized Host header."})
+            return
+        if is_download:
+            try:
+                if urlparse(self.path).query:
+                    raise VisualArtifactError("Download links do not accept query parameters.",
+                                              code="visual.download_invalid", status=403)
+                artifact = read_download(CONTROL.root / "artifacts",
+                                         path.removeprefix(DOWNLOAD_PREFIX), ARTIFACT_DOWNLOAD_KEY)
+                body = base64.b64decode(artifact["data"])
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", 'attachment; filename="' +
+                                 artifact["path"].replace("/", "-") + '"')
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except VisualArtifactError as exc:
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
             return
         if path == "/api/public/identity":
             self._json(HTTPStatus.OK, {
@@ -8243,15 +8275,20 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc), "code": "operation.not_found"})
         elif path.startswith("/api/visual-artifacts/"):
             try:
-                if urlparse(self.path).query:
+                query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                mode = query.get("download", ["inline"])
+                if set(query) - {"download"} or mode not in (["inline"], ["link"], ["both"]):
                     raise VisualArtifactError(
-                        "Visual image retrieval does not accept query parameters.",
+                        "Use download=inline, link, or both with no other query parameters.",
                         code="visual.artifact_path_invalid", status=400,
                     )
-                artifact = read_visual_image(
-                    CONTROL.root / "artifacts",
-                    path.removeprefix("/api/visual-artifacts/"),
-                )
+                relative = path.removeprefix("/api/visual-artifacts/")
+                artifact = read_visual_image(CONTROL.root / "artifacts", relative,
+                                            **({"include_data": False} if mode == ["link"] else {}))
+                if mode != ["inline"]:
+                    artifact["download"] = issue_download(artifact, ARTIFACT_DOWNLOAD_KEY)
+                    if ARTIFACT_DOWNLOAD_ORIGIN:
+                        artifact["download"]["url"] = ARTIFACT_DOWNLOAD_ORIGIN + artifact["download"]["path"]
                 self._json(HTTPStatus.OK, {"artifact": artifact})
             except VisualArtifactError as exc:
                 self._json(exc.status, {"error": str(exc), "code": exc.code})

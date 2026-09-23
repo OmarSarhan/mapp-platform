@@ -3,12 +3,19 @@ from __future__ import annotations
 import base64
 import io
 import json
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from visual_artifacts import read_visual_image, VisualArtifactError
+from visual_artifacts import (
+    DOWNLOAD_PREFIX, download_origin, issue_download, read_download,
+    read_visual_image, VisualArtifactError,
+)
 from test_token_b_validation import TokenBTestCase, StubTokens, CONFIG_RESOURCE, GRANT, INSTANCE
 
 
@@ -18,6 +25,83 @@ PNG = base64.b64decode(
 
 
 class VisualArtifactTests(unittest.TestCase):
+    def test_signed_download_keeps_original_bytes_and_expires(self):
+        artifact = read_visual_image(self.root, "run-1/after-map.png", include_data=False)
+        self.assertNotIn("data", artifact)
+        self.assertEqual((1, 1), (artifact["width"], artifact["height"]))
+        download = issue_download(artifact, b"private-key", now=1000)
+        ticket = download["path"].removeprefix(DOWNLOAD_PREFIX)
+        result = read_download(self.root, ticket, b"private-key", now=1299)
+        self.assertEqual(PNG, base64.b64decode(result["data"]))
+        for now in (999, 1300, 9999):
+            with self.subTest(now=now), self.assertRaises(VisualArtifactError) as caught:
+                read_download(self.root, ticket, b"private-key", now=now)
+            self.assertEqual(403, caught.exception.status)
+
+    def test_download_rejects_tampering_wrong_key_and_changed_content(self):
+        artifact = read_visual_image(self.root, "run-1/after-map.png")
+        ticket = issue_download(artifact, b"private-key", now=1000)["path"].removeprefix(DOWNLOAD_PREFIX)
+        for malformed, key in ((ticket[:-1] + ("a" if ticket[-1] != "a" else "b"), b"private-key"),
+                               (ticket, b"another-key"), ("x" * 900, b"private-key")):
+            with self.subTest(ticket=malformed[:10]), patch("visual_artifacts.read_visual_image") as read:
+                with self.assertRaises(VisualArtifactError):
+                    read_download(self.root, malformed, key, now=1000)
+                read.assert_not_called()
+        self.image.write_bytes(PNG + b"changed")
+        with self.assertRaises(VisualArtifactError) as caught:
+            read_download(self.root, ticket, b"private-key", now=1000)
+        self.assertEqual(410, caught.exception.status)
+
+    def test_download_rechecks_report_and_symlinks(self):
+        artifact = read_visual_image(self.root, "run-1/after-map.png")
+        ticket = issue_download(artifact, b"private-key", now=1000)["path"].removeprefix(DOWNLOAD_PREFIX)
+        self.report.unlink()
+        with self.assertRaises(VisualArtifactError) as caught:
+            read_download(self.root, ticket, b"private-key", now=1000)
+        self.assertEqual(404, caught.exception.status)
+
+    def test_download_origin_is_explicit_and_not_an_open_redirect(self):
+        self.assertEqual("https://preview.example", download_origin("https://preview.example/"))
+        self.assertEqual("http://localhost:8181", download_origin("http://localhost:8181"))
+        for origin in ("http://example.com", "https://user:secret@example.com", "//example.com",
+                       "https://example.com/path", "https://example.com?token=a"):
+            with self.subTest(origin=origin), self.assertRaises(ValueError):
+                download_origin(origin)
+
+    def test_download_route_returns_attachment_without_a_dashboard_session(self):
+        import app
+        artifact = read_visual_image(self.root, "run-1/after-map.png")
+        link = issue_download(artifact, app.ARTIFACT_DOWNLOAD_KEY)
+        with patch.object(app.CONTROL, "root", self.root.parent):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                url = "http://127.0.0.1:" + str(server.server_port) + link["path"]
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    self.assertEqual(PNG, response.read())
+                    self.assertEqual('attachment; filename="run-1-after-map.png"',
+                                     response.headers["Content-Disposition"])
+                    self.assertEqual("private, no-store", response.headers["Cache-Control"])
+                    self.assertEqual("no-referrer", response.headers["Referrer-Policy"])
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(url + "tampered", timeout=5)
+                self.assertEqual(403, caught.exception.code)
+                caught.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=5)
+
+    def test_download_ticket_is_redacted_from_request_logs(self):
+        import app
+        handler = object.__new__(app.Handler)
+        handler.path = DOWNLOAD_PREFIX + "PRIVATE-CAPABILITY"
+        handler.client_address = ("127.0.0.1", 0)
+        with patch("builtins.print") as log:
+            handler.log_message('"%s" %s', handler.path, "200")
+        self.assertNotIn("PRIVATE-CAPABILITY", str(log.call_args))
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -138,6 +222,33 @@ class VisualArtifactRouteTests(unittest.TestCase):
 
 
 class VisualArtifactBindingTests(TokenBTestCase):
+    def test_download_issuance_binds_mode_and_never_returns_inline_data(self):
+        import app
+        import execution_envelope
+        tokens = StubTokens(record={
+            "active": True, "scope": "visual", "sub": GRANT,
+            "aud": CONFIG_RESOURCE, "client_id": "mapp-mcp-broker",
+        })
+        path = "/api/visual-artifacts/run-1/after-map.png"
+        handler = self.build(method="GET", path=path + "?download=link",
+                             body=b"", tokens=tokens, receipt=None)
+        handler._host_allowed = lambda: True
+        artifact = {"path": "run-1/after-map.png", "sha256": "a" * 64,
+                    "mimeType": "image/png", "sizeBytes": 123}
+        with patch.object(app, "read_visual_image", return_value=artifact) as read:
+            handler.do_GET()
+        self.assertEqual(200, self.responses[0][0])
+        self.assertNotIn("data", self.responses[0][1]["artifact"])
+        self.assertIn("download", self.responses[0][1]["artifact"])
+        self.assertEqual(False, read.call_args.kwargs["include_data"])
+        expected = execution_envelope.digest(
+            instance=INSTANCE, method="GET", operation_id="visual.artifacts.image",
+            path_template="/api/visual-artifacts/{runId}/{filename}",
+            path=path, query="download=link", body=None, resolved_defaults=None,
+            confirmation_fields=None, revision_binding=None,
+        )
+        self.assertEqual([("mapp_b_credential", "visual.artifacts.image", expected)], tokens.redeemed)
+
     def test_actual_authorization_redeems_the_image_path_before_reading(self):
         import app
         import execution_envelope

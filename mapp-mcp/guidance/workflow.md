@@ -54,7 +54,17 @@ Screenshot and test previews return immediately with an `operationId`, including
 when `hover: true`. Poll `visual_operations_show` after `pollAfterSeconds` until
 the status is terminal; each poll uses a fresh credential and the render keeps
 running independently. Use `artifacts_image` with a returned PNG artifact path
-to show the retained screenshot in chat. A running preview is not a pass.
+to show the retained screenshot and obtain a five-minute download of the exact
+original PNG. For high-resolution delivery, use `download="link"` to return
+only the download metadata, then present its URL and expiry to the user.
+Inline chat images may be resized by the client. Downloads preserve the reported
+pixel dimensions and SHA-256. The signed URL grants anyone holding it access to
+that one image until expiry, without a dashboard login or platform bearer token.
+After expiry or a service restart, request a fresh link; do not rerender.
+Do not substitute `authenticatedArtifactLinks`: those are dashboard-only URLs.
+If the download URL points at an unreachable localhost/internal host, report
+that `ARTIFACT_DOWNLOAD_ORIGIN` needs the browser-reachable MCP/tunnel origin;
+do not invent a public hostname. A running preview is not a pass.
 
 For a choropleth overview, use `framing: "layer"` to fit the full effective
 filtered layer, or `framing: "viewport"` to preserve supplied `centre` and

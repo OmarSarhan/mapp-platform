@@ -1171,16 +1171,42 @@ return `404 visual.artifact_not_found`, invalid paths return
 `400 visual.artifact_path_invalid`, and oversized files return
 `413 visual.artifact_too_large`. The existing raw `/api/artifacts/` route
 continues to serve session and ordinary bearer clients only.
-MCP clients call `artifacts_image(artifact_path=...)` with a returned PNG path,
-such as the value of `afterMap` or `afterHoverTooltip`, to receive native MCP
-image content that the conversation can display. This fetch obtains a fresh
-credential independently of the preview operation.
-Completed MCP visual operations also return `authenticatedArtifactLinks` for
-each retained PNG. These point at the dashboard's authenticated
-`/api/artifacts/` route, contain no bearer credential, and serve the original
-PNG bytes rather than embedding base64 in the MCP response. The operator must
-already have a valid dashboard session. This path is suitable for captures too
-large for a chat client or when the reviewer needs native resolution.
+MCP clients call `artifacts_image(artifact_path=...)` with a returned PNG path.
+The default `download="both"` returns native image content plus a short-lived
+original-resolution download. `download="link"` returns only metadata and the
+download, avoiding base64 image bytes in the MCP response. `download="inline"`
+preserves the image-only response. The tool spends a fresh visual credential.
+
+The API accepts the same optional `download=inline|link|both` query parameter
+(default `inline`) on `GET /api/visual-artifacts/{runId}/{filename}`. Issuance
+requires the existing `visual` authority and exact query binding. Metadata
+includes the PNG dimensions, byte count, SHA-256, and a `download` object with
+`path`, `url` when an origin is configured, `expiresAt` (Unix seconds), and
+`expiresInSeconds: 300`.
+
+`GET /artifact-downloads/{ticket}` serves the exact original bytes with
+`Content-Disposition: attachment`, no-store, nosniff and no-referrer headers.
+It requires only the signed capability, no dashboard session or OAuth bearer.
+The HMAC binds one retained path, its content hash and a five-minute expiry;
+changing any of these invalidates it. File and report checks still run on
+download. Expired, malformed or forged links return 403, changed bytes 410,
+and deleted/unretained files 404. Restarting the configuration service revokes
+all outstanding links. Links can be used repeatedly until expiry; they are
+not single-use and are not individually revoked with the issuing grant.
+
+The MCP-facing Caddy host proxies only `/artifact-downloads/*` to this route,
+stripping cookies and authorization headers. `ARTIFACT_DOWNLOAD_ORIGIN` sets
+the browser-reachable HTTPS origin (loopback HTTP is allowed for development).
+Compose defaults it to the MCP origin, including the production override.
+A tunnel must forward this path as well as `/mcp`; the backend cannot infer
+a client's external tunnel URL. Missing origin configuration returns a
+relative path only. The API and bundled Caddy redact signed capabilities from request/error logs;
+any additional external proxy logs must also redact this path.
+
+`authenticatedArtifactLinks` remain legacy dashboard-only URLs. They require
+a dashboard session and reachable dashboard host; they are not the download
+flow for an external MCP client. Chat image resizing does not affect downloads.
+
 Visual-test and screenshot requests may set `background: true`. The server
 returns `202 Accepted` with `operation` and `statusUrl`, continues browser work
 independently of that HTTP connection, and atomically writes the complete

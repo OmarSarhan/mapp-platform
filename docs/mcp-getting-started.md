@@ -366,7 +366,7 @@ tools an agent cannot call are not shown to it.
 tools after the MCP service was rebuilt.** MCP clients commonly cache the
 `tools/list` result for the life of their session. Reconnect or restart that
 client session, then call `describe_instance`; the current expanded visual
-surface reports `mapp-mcp/0.4.0`. Re-authorize only when the reconnected client
+surface reports `mapp-mcp/0.5.0`. Re-authorize only when the reconnected client
 is missing the required scope. A second authenticated session seeing newer
 tools is evidence that the first session's manifest is stale, not that the
 configuration API lacks the operation.
@@ -415,3 +415,17 @@ scopes.
   what each component does, and every operational decision behind them.
 - [`mcp-threat-model.md`](mcp-threat-model.md) — what this defends against,
   what it does not, and the residual risks stated plainly.
+
+### Original-resolution preview downloads
+
+`artifacts_image(artifact_path=..., download="link")` returns a five-minute
+signed PNG download without embedding the image in chat. Configure
+`ARTIFACT_DOWNLOAD_ORIGIN` when the user's browser reaches MCP through a
+different public origin or tunnel. It defaults to `MCP_SITE` in development
+and `PRODUCTION_MCP_SITE` in production. Forward `/artifact-downloads/*`
+through the same MCP-facing Caddy host. Remote origins must use HTTPS.
+
+No dashboard login or platform bearer token is needed to download. Anyone
+holding the link can read that one image until expiry; treat links as private.
+Expired links can be reissued through the image tool. Service restarts invalidate
+outstanding links. Chat display size is independent of the original PNG size.

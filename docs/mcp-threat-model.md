@@ -267,12 +267,32 @@ Successful or failed visual runs can retain PNG screenshots. The MCP
 content block, so the caller can display the evidence rather than receiving
 only an internal path.
 
-Completed MCP visual results also expose an authenticated dashboard URL for
-each retained PNG. The URL contains only the high-entropy run identifier and
-closed screenshot filename: it carries no bearer token, and opening it still
-requires an operator dashboard session. It serves the original bytes through
-the existing authenticated `/api/artifacts/` route so large or high-resolution
-captures do not have to cross the MCP/chat content channel.
+The image tool now defaults to inline content plus a five-minute signed download;
+its link-only mode transfers no inline PNG. Issuance uses the same visual scope
+and request-bound query check. The uncredentialed download route on the MCP
+origin checks a domain-separated HMAC over version, exact path, content SHA-256
+and expiry before touching files, then repeats the retained-report and symlink
+checks and rejects changed bytes. It serves an attachment with no-store,
+nosniff and no-referrer headers. It does not proxy arbitrary URLs.
+
+The signing key is 32 random bytes held only by the single configuration-service
+process. Restarting it invalidates links; no new secret file, artifact cache or
+public-request database lookup is introduced. Multi-replica deployments would
+need a reviewed shared-key design. Links expire after 300 seconds, may be
+downloaded repeatedly, and confer access only to the named image. They are
+bearer capabilities for that image, **not** platform bearer credentials.
+Revoking the issuing grant does not revoke a previously issued link.
+
+Caddy forwards only the narrow download path and strips incoming cookies and
+authorization. The download origin is deployment-controlled and must be HTTPS
+except for loopback development; it is not inferred from caller-controlled
+forwarding headers. API access logging and bundled Caddy request/error logging redact the
+capability. Any additional external proxy logging must redact it too. Anyone with the link may access that image during
+its lifetime, so the tool discloses that sharing property. There is no global
+download admission counter; each read remains subject to the 8 MiB bound.
+
+Legacy `authenticatedArtifactLinks` still require a dashboard session and
+reachable dashboard origin; they are explicitly distinguished from downloads.
 
 Retrieval accepts one syntactically bounded run identifier and one filename
 from a closed screenshot-name set. Every path component is opened relative to

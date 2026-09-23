@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import unittest
 
 from authentication import CURRENT_CALLER
@@ -51,6 +52,29 @@ class ArtifactImageTests(unittest.TestCase):
         self.invoke()
         self.invoke()
         self.assertEqual(2, len(self.exchange.calls))
+
+    def test_default_includes_download_and_link_mode_omits_inline_bytes(self):
+        self.artifact["download"] = {
+            "url": "https://mcp.example/artifact-downloads/signed",
+            "expiresInSeconds": 300,
+        }
+        result = self.invoke()
+        self.assertEqual(["text", "image"], [part.type for part in result.content])
+        self.assertNotIn("data", json.loads(result.content[0].text))
+        self.assertEqual("download=both", self.api.calls[-1]["query"])
+        self.assertEqual(self.api.calls[-1]["query"], self.exchange.calls[-1]["query"])
+        self.artifact.pop("data")
+        result = asyncio.run(self.server.call_tool("artifacts_image", {
+            "artifact_path": "run-1/after-map.png", "download": "link",
+        }))
+        self.assertEqual(["text"], [part.type for part in result.content])
+        self.assertEqual("download=link", self.api.calls[-1]["query"])
+
+    def test_link_mode_does_not_claim_a_missing_download_exists(self):
+        with self.assertRaises(ToolError):
+            asyncio.run(self.server.call_tool("artifacts_image", {
+                "artifact_path": "run-1/after-map.png", "download": "link",
+            }))
 
     def test_path_and_scope_refusals_do_not_spend_credentials(self):
         for path in ("../after-map.png", "/run-1/after-map.png", "run-1/report.json", "run-1/%2e%2e.png"):

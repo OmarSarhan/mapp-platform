@@ -269,6 +269,7 @@ services:
       PLUGIN_DIR: /instance-public/plugins
       PORT: 8080
       CONTROL_DIR: /control
+      ARTIFACT_DOWNLOAD_ORIGIN: ${ARTIFACT_DOWNLOAD_ORIGIN:-${MCP_SITE:-http://localhost:8181}}
       WORKSPACE_SCHEMA_PATH: /app/schema/workspace.schema.json
       RELOAD_DIR: /reload
       XYZ_VERSION: ${XYZ_REF:-v4.23.4}

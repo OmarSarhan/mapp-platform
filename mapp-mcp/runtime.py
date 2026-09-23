@@ -53,7 +53,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import CallToolResult, ImageContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field
 
@@ -61,7 +61,7 @@ from pydantic import Field
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.4.0"
+RUNTIME_VERSION = "0.5.0"
 
 
 class DraftRetention(BaseModel):
@@ -1063,11 +1063,15 @@ def _visual_outcome(payload, *, config_api_resource: str | None = None):
             detail["artifacts"], config_api_resource,
         )
         detail["artifactTool"] = "artifacts_image"
+        detail["downloadTool"] = "artifacts_image"
+        detail["downloadArguments"] = {"download": "link"}
         detail["artifactInstructions"] = (
             "Call artifacts_image(artifact_path=<PNG artifact value>) to display"
-            " a retained screenshot in chat. For the original-resolution PNG,"
-            " open its authenticatedArtifactLinks entry while signed in to the"
-            " MAPP dashboard. The URL contains no bearer credential."
+            " a retained screenshot and obtain a five-minute original-PNG download link."
+            " Use download=link to return only the link without inline image data."
+            " The signed link grants anyone holding it access to this image until expiry;"
+            " it contains no platform bearer token and requires no dashboard login."
+            " authenticatedArtifactLinks are separate dashboard-only links."
         )
         if artifact_links:
             detail["authenticatedArtifactLinks"] = artifact_links
@@ -2532,10 +2536,15 @@ def build_runtime(
             "Display a retained preview screenshot as an image in this chat. "
             "Pass a PNG path from the artifacts returned by a completed visual "
             "operation (usually afterMap, afterPage, or afterHoverTooltip). "
-            "Reads one image, maximum 8 MiB, with a fresh visual credential."
+            "Reads one image, maximum 8 MiB, with a fresh visual credential. "
+            "Defaults to an inline image plus a five-minute signed download link. "
+            "Use download=link for an original-resolution download without inline "
+            "image data. Anyone holding the link can read this one image until expiry."
         ),
     )
-    def artifacts_image(artifact_path: str) -> CallToolResult:
+    def artifacts_image(
+        artifact_path: str, download: Literal["inline", "link", "both"] = "both",
+    ) -> CallToolResult:
         if re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}/[a-z-]+\.png", artifact_path,
         ) is None:
@@ -2544,8 +2553,19 @@ def build_runtime(
         path = ARTIFACTS_IMAGE["path_template"].replace(
             "{runId}", run_id,
         ).replace("{filename}", filename)
-        payload = spend(ARTIFACTS_IMAGE, path=path)
+        payload = spend(ARTIFACTS_IMAGE, path=path,
+                        query="" if download == "inline" else "download=" + download)
         artifact = payload.get("artifact") if isinstance(payload, dict) else None
+        content = []
+        if isinstance(artifact, dict) and isinstance(artifact.get("download"), dict):
+            metadata = {key: artifact[key] for key in (
+                "path", "mimeType", "sizeBytes", "width", "height", "sha256", "download",
+            ) if key in artifact}
+            content.append(TextContent(type="text", text=json.dumps(metadata)))
+        if download == "link":
+            if not content or artifact.get("path") != artifact_path:
+                raise ToolError("The platform did not return a download link for this screenshot.")
+            return CallToolResult(content=content)
         encoded = artifact.get("data") if isinstance(artifact, dict) else None
         maximum = 8 * 1024 * 1024
         if (
@@ -2566,9 +2586,8 @@ def build_runtime(
             or not data.startswith(b"\x89PNG\r\n\x1a\n")
         ):
             raise ToolError("The platform returned an invalid or oversized screenshot.")
-        return CallToolResult(content=[
-            ImageContent(type="image", data=encoded, mimeType="image/png"),
-        ])
+        content.append(ImageContent(type="image", data=encoded, mimeType="image/png"))
+        return CallToolResult(content=content)
 
     @tool(
         operation=PROPOSALS_PREVIEW_SCREENSHOT,
@@ -3341,10 +3360,9 @@ def build_runtime(
             " Returns status, stage, completed checks and retained artifact paths."
             " While running, wait pollAfterSeconds before polling again. Once"
             " complete, call artifacts_image with a PNG artifact path to display"
-            " it, or open an authenticatedArtifactLinks URL for the original"
-            " high-resolution PNG. Uses visual permission and a fresh credential"
-            " on each poll; links require a signed-in dashboard session and"
-            " contain no bearer token."
+            " it and get a five-minute signed original-PNG download. Use"
+            " artifacts_image with download=link to omit inline image bytes."
+            " Uses visual permission and a fresh credential on each poll."
         ),
     )
     def visual_operations_show(operation_id: str) -> dict:

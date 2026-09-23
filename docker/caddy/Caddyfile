@@ -1,6 +1,17 @@
 {
 	email {$CADDY_EMAIL:admin@example.invalid}
 	admin off
+	# Signed image URLs are narrow bearer capabilities. Redact them from
+	# runtime/error logs too, even though access logging is disabled.
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "^/artifact-downloads/.*" "/artifact-downloads/[redacted]"
+				uri regexp "^/artifact-downloads/.*" "/artifact-downloads/[redacted]"
+			}
+		}
+	}
 }
 
 {$MAP_SITE:http://localhost} {
@@ -79,6 +90,15 @@
 	# The MCP resource itself, and the RFC 9728 metadata that names it. Both
 	# well-known spellings, because a client may derive either from the resource
 	# URL, and they serve the same document.
+	# Narrow signed image capabilities are verified by the configuration API.
+	# Do not forward ambient cookies or bearer credentials to this route.
+	handle /artifact-downloads/* {
+		reverse_proxy config-ui:8080 {
+			header_up Host config-ui
+			header_up -Authorization
+			header_up -Cookie
+		}
+	}
 	@mcp_public path /mcp /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp
 	handle @mcp_public {
 		reverse_proxy unix//run/mapp-mcp/mapp-mcp.sock {

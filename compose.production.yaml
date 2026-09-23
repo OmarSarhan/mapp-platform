@@ -11,6 +11,7 @@ services:
       # exchanged credential refused in production and nowhere else, with
       # nothing in the response to say why.
       MCP_CONFIG_API_RESOURCE: ${PRODUCTION_CONFIG_SITE:?Set PRODUCTION_CONFIG_SITE to the public HTTPS configuration origin}/api
+      ARTIFACT_DOWNLOAD_ORIGIN: ${ARTIFACT_DOWNLOAD_ORIGIN:-${PRODUCTION_MCP_SITE:?Set PRODUCTION_MCP_SITE to the public HTTPS MCP origin}}
 
   caddy:
     environment:

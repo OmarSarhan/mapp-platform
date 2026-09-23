@@ -1580,11 +1580,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "risk": "read",
         "scope": "visual",
         "inputSchema": {
-            "type": "object", "properties": {}, "additionalProperties": False,
+            "type": "object", "properties": {
+                "download": {"enum": ["inline", "link", "both"], "default": "inline"},
+            }, "additionalProperties": False,
         },
         "description": (
             "Read a retained browser screenshot as base64 PNG (maximum 8 MiB). "
             "The image must be listed in its browser run report."
+            " Optional download=link returns metadata and a five-minute signed"
+            " original-PNG download; download=both also includes base64 data."
         ),
     },
     "proposals.preview-plan": {
