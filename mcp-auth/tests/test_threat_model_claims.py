@@ -1,12 +1,12 @@
 """The threat model's load-bearing claims, as assertions.
 
 A threat model is read instead of the code, so a claim in it that quietly stops
-being true is worse than one that was never made. These pin the statements an
-owner accepted when they accepted the document -- not its prose, which is
-review's job, but the facts it rests on.
+being true is worse than one that was never made. These pin the statements the
+current document rests on -- not its prose, which is review's job, but the facts
+that must change with it.
 
 Each test names the sentence it defends. If a sentence changes, the test should
-change with it and be re-accepted, which is the point.
+change with it and be reviewed with the document, which is the point.
 """
 from __future__ import annotations
 
@@ -178,11 +178,14 @@ class ThreatModelClaimTests(unittest.TestCase):
     #: Split at Phase 1 wave 6, because the two halves now rest on different
     #: controls and collapsing them would hide which one is load-bearing.
     #:
-    #: Unattended: an agent holding the scope does these without asking. Each
-    #: writes a proposal record or attaches evidence to one; none changes what
-    #: the map serves.
+    #: Unattended: an agent holding the scope does these without asking. They
+    #: create or decline review state, attach evidence, or perform a dry run;
+    #: none publishes a workspace.
     UNATTENDED_MUTATIONS = [
         "proposals.create",
+        # Final rejection may make an explicitly disposable draft eligible
+        # for separately guarded cleanup under its creation policy.
+        "proposals.decline",
         "semantic.proposals.create",
         "proposals.preview-plan",
         "proposals.preview-test",
@@ -228,11 +231,10 @@ class ThreatModelClaimTests(unittest.TestCase):
     def test_no_unattended_mutation_changes_a_workspace(self) -> None:
         """The property the first list rests on, checked rather than asserted.
 
-        Each is either a proposal create, whose effect is an entry in a queue,
-        or a proposal preview, whose effect is an artifact attached to one.
-        Neither alters what the map serves. Since wave 6 that is no longer
-        kept true by the scopes being unofferable -- it is kept true by these
-        being the only mutations that ask nobody.
+        Each creates or declines a proposal, attaches preview evidence, or
+        performs the derived planning probe. None publishes a workspace.
+        Proposal decline can make an explicitly disposable relation eligible
+        for guarded cleanup under the policy approved when it was created.
         """
         from control_api import requires_approval
 
@@ -255,6 +257,73 @@ class ThreatModelClaimTests(unittest.TestCase):
                 )
                 self.assertIn(ACTION_SCHEMAS[name]["risk"], allowed_risks)
                 self.assertFalse(requires_approval(name))
+
+    def test_operation_and_read_counts_match_the_document(self) -> None:
+        self.assertIn("57 allowlisted", THREAT_MODEL)
+        self.assertIn("Forty-two are reads", THREAT_MODEL)
+        self.assertEqual(57, len(operations.OPERATIONS))
+        self.assertEqual(
+            42,
+            sum(
+                not operation.mutating
+                for operation in operations.OPERATIONS.values()
+            ),
+        )
+
+    def test_disposable_cleanup_requires_explicit_bounded_enrollment(
+        self,
+    ) -> None:
+        """Automatic deletion exists only for a reviewed draft creation."""
+        from derived_drafts import (
+            CLEANUP_BATCH,
+            CLEANUP_INTERVAL_SECONDS,
+            MAX_PROPOSALS,
+            MAX_SCAN_BYTES,
+            MAX_STATE_BYTES,
+        )
+
+        draft = ACTION_SCHEMAS["derived-layers.create"]["inputSchema"][
+            "properties"
+        ]["draft"]
+        self.assertEqual(
+            ["expiresInHours", "cleanupApproved"], draft["required"]
+        )
+        self.assertIs(
+            True, draft["properties"]["cleanupApproved"]["const"]
+        )
+        self.assertEqual(
+            (1, 168),
+            (
+                draft["properties"]["expiresInHours"]["minimum"],
+                draft["properties"]["expiresInHours"]["maximum"],
+            ),
+        )
+        self.assertFalse(draft["additionalProperties"])
+        self.assertEqual((20, 60), (CLEANUP_BATCH, CLEANUP_INTERVAL_SECONDS))
+        self.assertEqual(1000, MAX_PROPOSALS)
+        self.assertEqual(16 * 1024 * 1024, MAX_STATE_BYTES)
+        self.assertEqual(32 * 1024 * 1024, MAX_SCAN_BYTES)
+        for claim in (
+            "`{name, assetId, generation}`",
+            "`cleanupApproved: true`",
+            "`DROP ... RESTRICT`",
+        ):
+            self.assertIn(claim, THREAT_MODEL)
+
+    def test_retained_screenshot_read_is_scoped_and_bounded(self) -> None:
+        from visual_artifacts import MAX_IMAGE_BYTES, SCREENSHOT_FILENAMES
+
+        operation = operations.OPERATIONS["visual.artifacts.image"]
+        self.assertFalse(operation.mutating)
+        self.assertEqual(("visual",), operation.required_scopes)
+        self.assertEqual(
+            "read", ACTION_SCHEMAS["visual.artifacts.image"]["risk"]
+        )
+        self.assertEqual(8 * 1024 * 1024, MAX_IMAGE_BYTES)
+        self.assertIn("after-map.png", SCREENSHOT_FILENAMES)
+        self.assertIn(
+            "no automatic retention or total-storage quota", THREAT_MODEL
+        )
 
     def test_every_attended_mutation_actually_asks(self) -> None:
         """The property the second list rests on. A name added there without
