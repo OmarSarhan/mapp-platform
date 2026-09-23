@@ -27,6 +27,37 @@ class WorkspaceValidationTests(unittest.TestCase):
     def test_accepts_supported_workspace(self):
         self.assertEqual(validate_workspace(valid_workspace(), {"MAPP"}), [])
 
+    def test_mvt_srid_matches_xyz_strict_string_check_without_coercion(self):
+        for value in (3857, 3857.0, " 3857", "03857", "3857 ", "4326", None, True):
+            with self.subTest(srid=value):
+                data = valid_workspace()
+                data["locale"]["layers"]["Places"]["srid"] = value
+                errors = validate_workspace(data, {"MAPP"})
+                self.assertEqual(["locale.layers.Places.srid"], [e["path"] for e in errors])
+                self.assertIn('exact JSON string "3857"', errors[0]["message"])
+                self.assertEqual(value, data["locale"]["layers"]["Places"]["srid"])
+
+    def test_numeric_mvt_srid_in_inherited_locale_is_rejected(self):
+        data = valid_workspace()
+        data["locales"] = {"alternative": {"layers": {"Places": {"srid": 3857}}}}
+        errors = validate_workspace(data, {"MAPP"})
+        self.assertEqual(["locales.alternative.layers.Places.srid"], [e["path"] for e in errors])
+
+    def test_mvt_template_may_omit_srid_but_cannot_supply_numeric_srid(self):
+        data = valid_workspace()
+        data["locale"]["layers"]["Places"] = {"format": "mvt", "template": "example"}
+        self.assertEqual([], validate_workspace(data, {"MAPP"}))
+        data["locale"]["layers"]["Places"]["srid"] = 3857
+        self.assertEqual(["locale.layers.Places.srid"],
+                         [e["path"] for e in validate_workspace(data, {"MAPP"})])
+
+    def test_non_mvt_layers_keep_numeric_srid_support(self):
+        for format_ in ("geojson", "wkt", "vector", "cluster"):
+            with self.subTest(format=format_):
+                data = valid_workspace()
+                data["locale"]["layers"]["Places"].update(format=format_, srid=3857)
+                self.assertEqual([], validate_workspace(data, {"MAPP"}))
+
     def test_rejects_a_dbs_key_starting_with_a_digit(self):
         data = valid_workspace()
         data["dbs"] = "9council"
@@ -305,7 +336,7 @@ class WorkspaceValidationTests(unittest.TestCase):
                         "tables": {"0": "public.low", "12": "public.high"},
                         "geoms": {"0": "geom_low", "12": "geom_high"},
                         "qID": "id",
-                        "srid": 3857,
+                        "srid": "3857",
                         "style": {
                             "default": {
                                 "icon": [
@@ -331,7 +362,7 @@ class WorkspaceValidationTests(unittest.TestCase):
                         "dbs": "MAPP",
                         "table": "public.places",
                         "geom": "geom_3857",
-                        "srid": 3857,
+                        "srid": "3857",
                         "qID": "id",
                         "style": {
                             "default": {

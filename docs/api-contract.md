@@ -191,6 +191,12 @@ surface. The private semantic service, browser runner, preview publisher, and
 XYZ reload channels are internal service interfaces and must never be called
 by a remote CLI.
 
+MVT workspace layers require the exact JSON string `"srid": "3857"`. Numeric
+`"srid": 3857` is rejected at the layer's `srid` path because pinned XYZ skips
+those layers. This applies to effective named-locale overrides too. Database
+geometry metadata still uses numeric SRIDs; clients must use the string when
+constructing an MVT workspace layer. Validation does not coerce saved values.
+
 ## CLI operations for symbology, information swatches, and viewport counts
 
 The standalone CLI continues to use revision-bound proposal operations; this

@@ -504,7 +504,7 @@
           ],
           "pattern": "^[1-9][0-9]*$",
           "minimum": 1,
-          "description": "Geometry SRID. MVT specifically requires 3857 in XYZ v4.23.4."
+          "description": "Geometry SRID. MVT requires the exact JSON string \"3857\" in XYZ v4.23.4; the number 3857 prevents the layer from rendering."
         },
         "qID": {
           "$ref": "#/$defs/identifier",
@@ -858,10 +858,8 @@
           "then": {
             "properties": {
               "srid": {
-                "enum": [
-                  "3857",
-                  3857
-                ]
+                "type": "string",
+                "const": "3857"
               }
             }
           }

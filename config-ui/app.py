@@ -6067,6 +6067,8 @@ def annotated(errors):
             rule, phase = "semantic.derived_ready", "semantic"
         elif error.get("code") == "workspace.layer_key_noncanonical":
             rule, phase = "workspace.layer_key", "schema"
+        elif error.get("code") == "workspace.mvt_srid":
+            rule, phase = "workspace.mvt_srid", "schema"
         elif "fieldfx" in path:
             rule, phase = "sql.scalar_read_only", "security"
         elif ".plugins" in path or "Plugin" in message or "plugin" in message:

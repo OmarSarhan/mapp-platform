@@ -7174,6 +7174,38 @@ class CollectionPaginationRouteTests(unittest.TestCase):
 
 
 class ProposalCreationRouteTests(unittest.TestCase):
+    def test_numeric_mvt_srid_is_rejected_before_check_or_create(self):
+        from test_workspace_schema import valid_workspace
+
+        current = valid_workspace()
+        candidate = valid_workspace()
+        candidate["locale"]["layers"]["Places"]["srid"] = 3857
+        for path in ("/api/proposals/check", "/api/proposals"):
+            with self.subTest(path=path):
+                handler, responses = self.handler("a" * 64)
+                handler.path = path
+                with (
+                    patch.object(app, "read_workspace", return_value=(b"{}", current, "revision-1")),
+                    patch.object(app, "apply_operations", return_value=(candidate, [])),
+                    patch.object(app, "DB_CONNECTIONS", {"MAPP": "unused"}),
+                    patch.object(app, "semantic_publication_diagnostics", return_value=([], [])),
+                    patch.object(app, "discover_icons", return_value=[]),
+                    patch.object(app, "discover") as discover,
+                    patch.object(app, "proposal_check") as check,
+                    patch.object(app, "proposal_create") as create,
+                ):
+                    handler.do_POST()
+
+                self.assertEqual(HTTPStatus.UNPROCESSABLE_ENTITY, responses[0][0])
+                error, = responses[0][1]["errors"]
+                self.assertEqual("/locale/layers/Places/srid", error["pointer"])
+                self.assertEqual("workspace.mvt_srid", error["ruleId"])
+                self.assertEqual("schema", error["phase"])
+                self.assertIn('exact JSON string "3857"', error["message"])
+                discover.assert_not_called()
+                check.assert_not_called()
+                create.assert_not_called()
+
     @staticmethod
     def handler(check_fingerprint: str) -> tuple[app.Handler, list]:
         responses = []

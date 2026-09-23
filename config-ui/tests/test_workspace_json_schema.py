@@ -7,6 +7,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkspaceJsonSchemaTests(unittest.TestCase):
+    def test_mvt_srid_contract_requires_the_xyz_string_value(self):
+        schema = json.loads((ROOT / "config-ui/schema/workspace.schema.json").read_text())
+        constraint = next(
+            item["then"]["properties"]["srid"]
+            for item in schema["$defs"]["layer"]["allOf"]
+            if item.get("if", {}).get("properties", {}).get("format") == {"const": "mvt"}
+        )
+        self.assertEqual({"type": "string", "const": "3857"}, constraint)
+
     def test_schema_and_workspace_are_json(self):
         schema = json.loads(
             (ROOT / "config-ui/schema/workspace.schema.json").read_text()

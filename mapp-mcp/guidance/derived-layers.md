@@ -53,6 +53,11 @@ the actual numeric distribution. After approved creation, use the bounded
 aggregate-only numeric inspection tools on the effective layer dataset to
 choose and verify category breaks.
 
+When publishing a derived relation as an MVT workspace layer, set
+`"srid": "3857"` as an exact JSON string. Database geometry metadata reports
+numeric SRIDs, but copying the number into the workspace makes pinned XYZ skip
+the layer. Validation rejects it; correct the proposal before requesting review.
+
 ## Execution, diagnostics, and retries
 
 MCP create, replace, and refresh default to `background=true`. After admission,

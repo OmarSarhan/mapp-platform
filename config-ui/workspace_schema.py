@@ -723,10 +723,16 @@ def _validate_layer(key, layer, path, errors, available_dbs):
             valid_srid = 0 < int(srid) <= 999999
         except (TypeError, ValueError):
             valid_srid = False
-        if not valid_srid and not has_template:
+        if fmt == "mvt" and ("srid" in layer or not has_template):
+            if srid != "3857":
+                errors.append({
+                    "path": f"{path}.srid",
+                    "code": "workspace.mvt_srid",
+                    "message": 'MVT layers require srid as the exact JSON string "3857", '
+                    'not a number. XYZ v4.23.4 skips layers with other values.',
+                })
+        elif not valid_srid and not has_template:
             _error(errors, f"{path}.srid", "Must be a positive EPSG/SRID integer.")
-        elif valid_srid and fmt == "mvt" and int(srid) != 3857:
-            _error(errors, f"{path}.srid", "XYZ v4.23.4 requires SRID 3857 for MVT layers.")
         fields: set[str] = set()
         infoj = layer.get("infoj")
         if infoj is not None:
