@@ -713,6 +713,9 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
         store._initialize = MagicMock()
         store._catalog_query_probe = MagicMock()
         store._validate_catalog_dependencies = MagicMock()
+        store._validate_planned_output_metadata = MagicMock(
+            return_value={"geometryType": "Polygon", "srid": 3857},
+        )
         return store
 
     @staticmethod
@@ -3389,6 +3392,39 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             statements.index("EXPLAIN (VERBOSE, FORMAT JSON)"),
         )
         store._validate_catalog_dependencies.assert_called_once()
+        store._validate_planned_output_metadata.assert_called_once()
+
+    def test_catalog_probe_rejects_unknown_geometry_srid_before_explain(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = self.explain_plan()
+        store = self.store_with_cursor(cursor)
+        store._catalog_query_probe = (
+            DerivedLayerStore._catalog_query_probe.__get__(
+                store, DerivedLayerStore
+            )
+        )
+        payload = self.valid(spatialScope=self.spatial_scope())
+        store._dependencies = MagicMock(
+            return_value=sorted(payload["sources"]),
+        )
+        store._validate_planned_output_metadata.side_effect = (
+            DerivedLayerError(
+                "The selected geometry field must contain PostGIS geometry "
+                "with a known coordinate system (SRID)."
+            )
+        )
+
+        with self.assertRaisesRegex(
+            DerivedLayerError,
+            "known coordinate system",
+        ):
+            store.preflight_definition(payload)
+
+        statements = "\n".join(
+            str(call.args[0]) for call in cursor.execute.call_args_list
+        )
+        self.assertIn("ROLLBACK TO SAVEPOINT derived_catalog_probe", statements)
+        self.assertNotIn("EXPLAIN (VERBOSE, FORMAT JSON)", statements)
 
     def test_catalog_probe_approves_qualified_geometry_cast_before_view(self):
         cursor = MagicMock()
@@ -4220,6 +4256,20 @@ class DerivedLayerDefinitionTests(unittest.TestCase):
             with self.subTest(query=query):
                 with self.assertRaises(DerivedLayerError):
                     validate_definition(self.valid(query=query))
+
+    def test_quoted_explanatory_text_may_contain_sql_punctuation(self):
+        query = (
+            "SELECT cell_id, geom_3857, "
+            "'Source note; -- explanatory /* text */ UPDATE'::text AS note "
+            "FROM leeds.h3_cells"
+        )
+
+        definition = validate_definition(self.valid(
+            query=query,
+            sources=["leeds.h3_cells"],
+        ))
+
+        self.assertEqual(query, definition["query"])
 
     def test_rejects_unqualified_and_managed_sources(self):
         for sources in (

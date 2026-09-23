@@ -579,6 +579,32 @@ def _series_rows(arguments: tuple[Any, ...]) -> int | None:
     return abs(stop - start) // abs(step) + 1
 
 
+def _literal_series_range_rows(value: Any) -> int | None:
+    """Bound a FROM-clause RangeFunction made only of literal series."""
+    if not isinstance(value, dict) or value.get("@") != "RangeFunction":
+        return None
+    functions = tuple(value.get("functions", ()))
+    if not functions:
+        return None
+    total = 1
+    for item in functions:
+        call = item[0] if isinstance(item, (list, tuple)) and item else None
+        if (
+            not isinstance(call, dict)
+            or call.get("@") != "FuncCall"
+            or not _function_name(call)
+            or _function_name(call)[-1].lower() != "generate_series"
+        ):
+            return None
+        rows = _series_rows(tuple(call.get("args", ())))
+        if rows is None:
+            return None
+        total *= rows
+        if total > MAX_GENERATED_ROWS:
+            return None
+    return total
+
+
 def _range_contains_scope(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -929,11 +955,16 @@ def inspect_query_ast(query: str) -> QueryAstInspection:
                     and rarg.get("@") == "RangeFunction"
                     and rarg.get("lateral") is True
                 )
-                if not safe_lateral:
+                bounded_literal_series = (
+                    _literal_series_range_rows(rarg) is not None
+                )
+                if not safe_lateral and not bounded_literal_series:
                     reasons.append(_reason(
                         "cartesian_join",
                         "Cartesian, OR-connected, and JOIN ... ON TRUE "
-                        "predicates are not allowed; split alternatives into "
+                        "predicates are not allowed unless the right side is "
+                        "a bounded literal generate_series or an explicit "
+                        "LATERAL expansion; split other alternatives into "
                         "separately bounded queries.",
                     ))
         elif kind in {"RangeTableFunc", "JsonTable"}:

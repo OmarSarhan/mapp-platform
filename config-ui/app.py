@@ -10546,49 +10546,67 @@ class Handler(SimpleHTTPRequestHandler):
                                     ),
                                 })
                             candidate_status = status
-                            statuses = {original_status, candidate_status}
-                            status = (
-                                HTTPStatus.OK
-                                if statuses == {HTTPStatus.OK}
-                                else HTTPStatus.UNPROCESSABLE_ENTITY
-                                if HTTPStatus.UNPROCESSABLE_ENTITY in statuses
-                                else next(
-                                    (
-                                        item for item in statuses
-                                        if item != HTTPStatus.OK
-                                    ),
-                                    HTTPStatus.BAD_GATEWAY,
+                            candidate_evidence_passed = (
+                                feature_info_observations["candidate"][
+                                    "passed"
+                                ]
+                            )
+                            baseline_failure_informational = bool(
+                                candidate_status == HTTPStatus.OK
+                                and (
+                                    original_status
+                                    == HTTPStatus.UNPROCESSABLE_ENTITY
+                                    or not feature_info_observations[
+                                        "original"
+                                    ]["passed"]
                                 )
                             )
-                            if (
-                                status == HTTPStatus.OK
-                                and not all(
-                                    observation["passed"]
-                                    for observation
-                                    in feature_info_observations.values()
-                                )
-                            ):
+                            if candidate_status != HTTPStatus.OK:
+                                status = candidate_status
+                            elif not candidate_evidence_passed:
                                 status = HTTPStatus.UNPROCESSABLE_ENTITY
-                            failure_result = next((
-                                side_result
-                                for side_status, side_result in (
-                                    (candidate_status, candidate_result),
-                                    (original_status, original_result),
+                            elif original_status in {
+                                HTTPStatus.OK,
+                                HTTPStatus.UNPROCESSABLE_ENTITY,
+                            }:
+                                # A pre-existing baseline validation failure is
+                                # retained as comparison evidence, but it does
+                                # not make a candidate that passed the same
+                                # browser run fail review.
+                                status = HTTPStatus.OK
+                            else:
+                                status = (
+                                    original_status
+                                    or HTTPStatus.BAD_GATEWAY
                                 )
-                                if side_status != HTTPStatus.OK
-                            ), {})
+                            failure_result = (
+                                next((
+                                    side_result
+                                    for side_status, side_result in (
+                                        (candidate_status, candidate_result),
+                                        (original_status, original_result),
+                                    )
+                                    if side_status != HTTPStatus.OK
+                                ), {})
+                                if status != HTTPStatus.OK
+                                else {}
+                            )
                             result = {
                                 "runId": candidate_result.get("runId"),
                                 "passed": status == HTTPStatus.OK,
                                 "metadata": binding,
-                                "error": next((
-                                    side_result.get("error")
-                                    for side_result in (
-                                        candidate_result,
-                                        original_result,
-                                    )
-                                    if side_result.get("error")
-                                ), None),
+                                "error": (
+                                    next((
+                                        side_result.get("error")
+                                        for side_result in (
+                                            candidate_result,
+                                            original_result,
+                                        )
+                                        if side_result.get("error")
+                                    ), None)
+                                    if status != HTTPStatus.OK
+                                    else None
+                                ),
                                 **{
                                     key: failure_result[key]
                                     for key in (
@@ -10603,6 +10621,9 @@ class Handler(SimpleHTTPRequestHandler):
                                     "before": "original",
                                     "after": "candidate",
                                     "featureInfoPanel": feature_info_comparison,
+                                    "baselineFailureInformational": (
+                                        baseline_failure_informational
+                                    ),
                                     "featureInfoEvidence": (
                                         feature_info_observations
                                     ),
@@ -10624,6 +10645,9 @@ class Handler(SimpleHTTPRequestHandler):
                                     "candidate": candidate_result.get("diagnosis"),
                                     "featureInfoEvidence": (
                                         feature_info_observations
+                                    ),
+                                    "baselineFailureInformational": (
+                                        baseline_failure_informational
                                     ),
                                 },
                             }

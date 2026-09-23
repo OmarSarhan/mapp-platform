@@ -316,6 +316,27 @@ class QueryAstGuardTests(unittest.TestCase):
             "SELECT * FROM source.a a JOIN source.b b USING (id)"
         )
 
+    def test_literal_series_is_an_explicitly_bounded_row_multiplier(self):
+        for join in (
+            "CROSS JOIN generate_series(1, 5) AS section",
+            "JOIN generate_series(1, 5) AS section ON TRUE",
+        ):
+            with self.subTest(join=join):
+                inspection = inspect_query_ast(
+                    f"SELECT * FROM source.routes {join}"
+                )
+                series = inspection.calls_named({"generate_series"})[0]
+                self.assertTrue(series.bounded_set)
+                self.assertEqual(5, series.generated_rows)
+
+        self.assertIn(
+            "unbounded_row_generator",
+            self.reason_codes(
+                "SELECT * FROM source.routes CROSS JOIN "
+                "generate_series(1, routes.section_count) AS section"
+            ),
+        )
+
     def test_generic_and_postgis_row_expanders_are_rejected(self):
         functions = (
             "unnest(values)",

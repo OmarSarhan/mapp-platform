@@ -8570,6 +8570,94 @@ class CandidatePreviewRouteTests(ControlStoreTestCase):
             visual["artifacts"]["afterInfoPanel"],
         )
 
+    def test_original_information_failure_does_not_fail_passing_candidate(self):
+        handler, responses = self.handler(
+            "/api/proposals/proposal-1/screenshot", {"layer": "Stops"}
+        )
+        proposal = self.proposal()
+        proposal["original"]["locale"]["layers"]["Stops"]["infoj"] = [
+            {"title": "Name"},
+        ]
+        proposal["candidate"]["locale"]["layers"]["Stops"]["infoj"] = [
+            {"title": "Stop name"},
+        ]
+        proposal["originalHash"] = app.workspace_hash(proposal["original"])
+        proposal["candidateHash"] = app.workspace_hash(proposal["candidate"])
+
+        def run(_layer, plan, payload, **_kwargs):
+            source = payload["metadata"]["source"]
+            expected = plan["interaction"]["expectedInfoPanelText"]
+            if source == "original":
+                return HTTPStatus.UNPROCESSABLE_ENTITY, {
+                    "runId": "run-original",
+                    "passed": False,
+                    "metadata": payload["metadata"],
+                    "error": "The baseline information panel did not open.",
+                    "failedStage": "information-panel",
+                    "interaction": {
+                        "infoPanelExpanded": False,
+                        "expectedInfoPanelTextFound": {
+                            text: False for text in expected
+                        },
+                    },
+                    "diagnosis": {
+                        "outcome": "failed",
+                        "failedStage": "information-panel",
+                    },
+                    "artifacts": {
+                        "afterPage": "run-original/after-page.png",
+                        "afterMap": "run-original/after-map.png",
+                        "report": "run-original/report.json",
+                    },
+                }
+            return HTTPStatus.OK, {
+                "runId": "run-candidate",
+                "passed": True,
+                "metadata": payload["metadata"],
+                "interaction": {
+                    "infoPanelExpanded": True,
+                    "expectedInfoPanelTextFound": {
+                        text: True for text in expected
+                    },
+                },
+                "diagnosis": {"outcome": "passed"},
+                "artifacts": {
+                    "afterPage": "run-candidate/after-page.png",
+                    "afterMap": "run-candidate/after-map.png",
+                    "infoPanel": "run-candidate/info-panel.png",
+                    "report": "run-candidate/report.json",
+                },
+            }
+
+        with (
+            patch.object(app, "preview_proposal", return_value=proposal),
+            patch.object(app, "visual_plan", return_value={
+                "locale": "locale",
+                "interaction": {"type": "click-centre-feature"},
+            }),
+            patch.object(app, "prepare_original_preview", return_value={}),
+            patch.object(app, "prepare_candidate_preview", return_value={}),
+            patch.object(app, "run_browser_visual", side_effect=run),
+            patch.object(app.CONTROL, "audit"),
+        ):
+            handler.do_POST()
+
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertTrue(body["visual"]["passed"])
+        self.assertIsNone(body["visual"]["error"])
+        self.assertTrue(
+            body["visual"]["comparison"][
+                "baselineFailureInformational"
+            ]
+        )
+        self.assertFalse(
+            body["visual"]["comparison"]["original"]["passed"]
+        )
+        self.assertTrue(
+            body["visual"]["comparison"]["candidate"]["passed"]
+        )
+
     def test_added_layer_screenshot_captures_candidate_static_source_note(self):
         handler, responses = self.handler(
             "/api/proposals/proposal-1/screenshot",

@@ -13,6 +13,8 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 import psycopg
+from pglast import Error as PgLastError
+from pglast import scan as scan_sql
 from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -194,11 +196,11 @@ AREA_WEIGHTED_H3_MAX_MEASURES = 32
 AREA_WEIGHTED_H3_OUTPUT_COLUMNS = frozenset({
     "h3_id", "h3_resolution", "geom_3857",
 })
-FORBIDDEN_SQL = re.compile(
-    r"\b(?:alter|call|comment|copy|create|delete|do|drop|execute|grant|insert|"
-    r"listen|merge|notify|refresh|reset|revoke|set|truncate|update|vacuum)\b",
-    re.IGNORECASE,
-)
+FORBIDDEN_SQL_KEYWORDS = frozenset({
+    "ALTER", "CALL", "COMMENT", "COPY", "CREATE", "DELETE", "DO",
+    "DROP", "EXECUTE", "GRANT", "INSERT", "LISTEN", "MERGE", "NOTIFY",
+    "REFRESH", "RESET", "REVOKE", "SET", "TRUNCATE", "UPDATE", "VACUUM",
+})
 class DerivedLayerError(ValueError):
     pass
 
@@ -1447,6 +1449,35 @@ def _query_shape_guard(definition: dict[str, Any]) -> dict[str, Any]:
     return h3_expansion
 
 
+def _validate_sql_tokens(query: str) -> None:
+    """Reject statement syntax without treating quoted text as SQL syntax."""
+    try:
+        tokens = scan_sql(query)
+    except (PgLastError, ValueError) as exc:
+        raise DerivedLayerError(
+            f"PostgreSQL could not tokenize the derived-layer query: {exc}"
+        ) from None
+    if any(
+        token.name in {"ASCII_59", "SQL_COMMENT", "C_COMMENT"}
+        for token in tokens
+    ):
+        raise DerivedLayerError(
+            "SQL terminators and comments are not allowed."
+        )
+    forbidden = next(
+        (
+            token.name
+            for token in tokens
+            if token.name in FORBIDDEN_SQL_KEYWORDS
+        ),
+        None,
+    )
+    if forbidden is not None:
+        raise DerivedLayerError(
+            f"SQL keyword {forbidden} is not allowed."
+        )
+
+
 def validate_definition(payload: dict[str, Any]) -> dict[str, Any]:
     unknown = sorted(
         set(payload)
@@ -1474,17 +1505,9 @@ def validate_definition(payload: dict[str, Any]) -> dict[str, Any]:
     query = query.strip()
     if len(query.encode()) > 256 * 1024:
         raise DerivedLayerError("Derived-layer SQL is limited to 256 KiB.")
-    if ";" in query or "--" in query or "/*" in query or "*/" in query:
-        raise DerivedLayerError(
-            "SQL terminators and comments are not allowed."
-        )
+    _validate_sql_tokens(query)
     if not re.match(r"^(?:select|with)\b", query, re.IGNORECASE):
         raise DerivedLayerError("Derived-layer SQL must be one SELECT query.")
-    forbidden = FORBIDDEN_SQL.search(query)
-    if forbidden:
-        raise DerivedLayerError(
-            f"SQL keyword {forbidden.group(0).upper()} is not allowed."
-        )
     sources = payload.get("sources")
     if not isinstance(sources, list) or not sources:
         raise DerivedLayerError("Declare at least one source relation.")
@@ -2285,6 +2308,19 @@ class DerivedLayerStore:
             "geometryType": geometry_metadata["geometry_type"],
             "srid": int(geometry_metadata["srid"]),
         }
+
+    @classmethod
+    def _validate_planned_output_metadata(
+        cls,
+        cur,
+        definition: dict[str, Any],
+        relation_name: str,
+    ) -> dict[str, Any]:
+        """Apply the create-time geometry contract to the temporary plan view."""
+        return cls._validate_output_metadata(
+            cur,
+            {**definition, "name": relation_name},
+        )
 
     @staticmethod
     def _validate_output_rows(
@@ -4245,6 +4281,11 @@ class DerivedLayerStore:
                 definition,
                 probe_name,
                 inspection,
+            )
+            self._validate_planned_output_metadata(
+                cur,
+                definition,
+                probe_name,
             )
         except Exception:
             cur.execute("ROLLBACK TO SAVEPOINT derived_catalog_probe")
