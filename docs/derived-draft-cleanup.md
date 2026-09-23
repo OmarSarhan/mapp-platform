@@ -23,8 +23,10 @@ backfilled or inferred to be disposable.
    adoption, deletion, and retention reasons. A decline response means the
    rejection was recorded, not that the database relation has already gone.
 
-The MCP creation parameter is `draft_expires_in_hours`; proposal bindings use
-`draft_relations`. MCP `proposals_decline` records a final rejection through the
+The MCP plan/create tools accept the same `draft` object or
+`draft_expires_in_hours` as an equivalent convenience parameter; use one form
+consistently across plan and create. Proposal bindings use `draft_relations`.
+MCP `proposals_decline` records a final rejection through the
 existing proposal decline API. See the [API contract](api-contract.md) and
 [derived-layer guide](derived-layers.md) for the complete request contracts.
 

@@ -838,9 +838,12 @@ promotion behavior, and cleanup guards.
 `draft: {expiresInHours: integer, cleanupApproved: true}`. Both members are
 required; no other members are accepted; retention is 1–168 hours. The policy
 is included in the plan fingerprint and creation's approval-bound request.
-Omission preserves permanent creation. MCP exposes the policy through
-`draft_expires_in_hours` and explicitly presents automatic cleanup in the
-creation approval prompt. Planning does not authorize creation or cleanup.
+Omission preserves permanent creation. MCP exposes the same closed `draft`
+object or the equivalent `draft_expires_in_hours` convenience parameter; callers
+must use one form consistently on plan and create. The two MCP tools reject
+unknown arguments, so a misspelled retention parameter cannot silently create
+a permanent relation. Creation explicitly presents automatic cleanup in its
+approval prompt. Planning does not authorize creation or cleanup.
 
 `POST /api/proposals/check` and `POST /api/proposals` optionally accept
 `draftRelations`, at most 64 closed objects with `name` (managed identifier),
@@ -1314,6 +1317,11 @@ The MCP tools `proposals_preview_plan`, `proposals_preview_screenshot` and
 `proposals_preview_test` accept the same `framing`, `centre`, `zoom` and pixel
 `viewport` arguments. Use `framing: "viewport"` for the configured/supplied map
 area or `framing: "layer"` for the complete effective choropleth extent.
+For a layer whose zoom table is hidden at low zoom and names one relation from
+a threshold onward, visual planning probes that relation and keeps the
+requested layer as the preview anchor. Feature framing chooses at least the
+threshold zoom. A lower viewport zoom or a layer-wide extent that would hide
+the layer is rejected with a street-level framing hint.
 
 Visual planning records an `interaction` plan for the browser runner. A
 proposal screenshot publishes the retained original and then
@@ -1423,9 +1431,9 @@ Creating a real default where XYZ previously synthesized one requires adding
 the raw `/locale` property explicitly.
 
 Templates, external renderers, inline features, and zoom-keyed table or
-geometry mappings are preserved and schema-validated. They are not forced
-through a concrete database-relation probe when no single relation represents
-their effective source.
+geometry mappings are preserved and schema-validated. Zoom maps that switch
+relations, hide the layer again, or otherwise have no single effective
+relation are not forced through a concrete database-relation probe.
 
 ## Authentication and device authorization
 

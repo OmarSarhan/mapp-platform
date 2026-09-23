@@ -18,6 +18,7 @@ from test_layers_tools import (  # noqa: E402
     AUTHORING, CHECK, CREATED, FakeConfigApi, FakeExchange, caller,
 )
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 from runtime import _proposal_summary, build_runtime  # noqa: E402
 
 
@@ -66,6 +67,64 @@ class DraftApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("24 hours", packet["summary"])
         self.assertIn("Publication makes it permanent", packet["note"])
         self.assertIn("separate approval", packet["note"])
+
+    async def test_nested_draft_plan_and_create_send_identical_retention(self):
+        api = self.Api(self)
+        plan = self.build("derived_layers_plan", api)
+        create = self.build("derived_layers_create", api)
+        args = ("new_h3", "SELECT 1", ["source_census.oa"], "oa_id", "geom_3857")
+        draft = {"expiresInHours": 24, "cleanupApproved": True}
+        plan(*args, draft=draft)
+        await create(self.agreeing(), *args, draft=draft)
+        planned = api.posted_to("/api/derived-layers/plan")[0]["body"]
+        created = api.posted_to("/api/derived-layers")[0]["body"]
+        self.assertEqual(planned, created)
+        self.assertEqual(draft, created["draft"])
+        self.assertIn("24 hours", api.packet()["summary"])
+
+    async def test_conflicting_and_invalid_nested_draft_is_refused(self):
+        args = ("new_h3", "SELECT 1", ["source_census.oa"], "oa_id", "geom_3857")
+        for draft in (
+            {"expiresInHours": 24, "cleanupApproved": False},
+            {"expiresInHours": 24, "cleanupApproved": True, "extra": 1},
+            {"expiresInHours": 0, "cleanupApproved": True},
+            {"expiresInHours": 24},
+        ):
+            with self.subTest(draft=draft):
+                api = self.Api(self)
+                plan = self.build("derived_layers_plan", api)
+                with self.assertRaises(ToolError):
+                    plan(*args, draft=draft)
+                self.assertEqual([], api.calls)
+        api = self.Api(self)
+        plan = self.build("derived_layers_plan", api)
+        with self.assertRaises(ToolError):
+            plan(*args, draft={"expiresInHours": 24, "cleanupApproved": True},
+                 draft_expires_in_hours=24)
+        self.assertEqual([], api.calls)
+
+    def test_derived_tool_schema_rejects_unknown_arguments(self):
+        api = self.Api(self)
+        self.build("derived_layers_plan", api)
+        server = build_runtime(
+            resource=approvals.ProtectedResource(
+                origin="http://mcp.localhost", issuer="http://mcp.localhost"),
+            exchange=approvals.FakeExchange(), config_api=api,
+        )
+        arguments = {
+            "name": "new_h3", "query": "SELECT 1",
+            "sources": ["source_census.oa"], "id_column": "oa_id",
+            "geometry_column": "geom_3857",
+        }
+        for name in ("derived_layers_plan", "derived_layers_create"):
+            with self.subTest(name=name):
+                tool = server._tool_manager._tools[name]
+                self.assertFalse(tool.parameters.get("additionalProperties", True))
+                self.assertIn("draft", tool.parameters["properties"])
+                with self.assertRaises(ValidationError):
+                    tool.fn_metadata.arg_model.model_validate({
+                        **arguments, "draft_expiry_hours": 24,
+                    })
 
     async def test_declining_draft_creation_creates_nothing(self):
         api = self.Api(self)

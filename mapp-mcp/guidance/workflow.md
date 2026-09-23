@@ -36,8 +36,9 @@ Both take `operations` and a `revision`, not a candidate document. You never
 send a whole workspace.
 
 For a disposable derived preview, first obtain approval for creation with
-`draft_expires_in_hours` as described in `mapp://guidance/derived-layers`. Pass
-its exact `name`, `assetId`, and `generation` in `draft_relations` to both check
+`draft={"expiresInHours": 24, "cleanupApproved": true}` or
+`draft_expires_in_hours=24` as described in `mapp://guidance/derived-layers`.
+Pass its exact `name`, `assetId`, and `generation` in `draft_relations` to both check
 and create. The fingerprint binds ownership as well as workspace changes.
 Publication retains the relation; decline or its approved expiry schedules
 guarded cleanup. `derived_layers_drafts` reports the cleanup outcome.

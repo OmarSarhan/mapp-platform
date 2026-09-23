@@ -72,7 +72,10 @@ and the exact relation identity and generation before deleting. It never uses
 successful cleanup uses the existing semantic archive lifecycle. The read-only
 `GET /api/derived-layers/drafts` route (`inspect`) reports draft ownership,
 retention, and cleanup outcomes. MCP exposes this as `derived_layers_drafts`,
-creation retention as `draft_expires_in_hours`, and bindings as `draft_relations`.
+creation retention as either `draft_expires_in_hours` or
+`draft={"expiresInHours": 24, "cleanupApproved": true}` (use one form on both
+plan and create), and bindings as `draft_relations`. Unknown arguments to these
+MCP tools are rejected rather than silently ignored.
 MCP `proposals_decline` records a final proposal rejection through
 `POST /api/proposals/{proposalId}/decline`. Refusing an apply approval alone
 leaves the proposal pending; cleanup then waits for final rejection or the

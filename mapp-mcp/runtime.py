@@ -52,14 +52,22 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, ImageContent
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field
 
 #: Advertised to clients as the server's identity. Not a version of the
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.2.0"
+RUNTIME_VERSION = "0.3.0"
+
+
+class DraftRetention(BaseModel):
+    """The configuration API's closed disposable-relation contract."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=False)
+    expires_in_hours: Annotated[int, Field(alias="expiresInHours", ge=1, le=168)]
+    cleanup_approved: Literal[True] = Field(alias="cleanupApproved")
 
 #: The one place the RPC path is written. The edge routes it, the guard screens
 #: it and the SDK mounts at it, and nothing rewrites it in between.
@@ -1226,7 +1234,23 @@ def build_runtime(
         """
         if operation is not None:
             tool_scopes[name] = tuple(operation["scopes"])
-        return server.tool(name=name, description=description)
+        register = server.tool(name=name, description=description)
+
+        def decorated(fn):
+            registered = register(fn)
+            if name in {"derived_layers_plan", "derived_layers_create"}:
+                # The SDK's generated Pydantic model normally ignores extra
+                # arguments. On a derived create that silently turned a
+                # caller's `draft` into a permanent relation. Fail closed at
+                # the tool boundary, before approval or credential exchange.
+                sdk_tool = server._tool_manager._tools[name]
+                arg_model = sdk_tool.fn_metadata.arg_model
+                arg_model.model_config["extra"] = "forbid"
+                arg_model.model_rebuild(force=True)
+                sdk_tool.parameters = arg_model.model_json_schema(by_alias=True)
+            return registered
+
+        return decorated
 
     @tool(
         operation=None,  # Answers from this process; reaches no platform route.
@@ -1864,7 +1888,8 @@ def build_runtime(
             " would produce, and a planFingerprint. Pass that fingerprint to"
             " derived_layers_create and the create is refused if anything"
             " moved in between. Creates no persistent relation and asks nobody."
-            " Optional draft_expires_in_hours plans disposable database state"
+            " Pass draft={expiresInHours: 24, cleanupApproved: true} or"
+            " draft_expires_in_hours=24 to plan disposable database state"
             " with preauthorized cleanup; rendering still needs an approved"
             " database creation. Use identical draft retention when creating."
         ),
@@ -1878,6 +1903,7 @@ def build_runtime(
         kind: str | None = None,
         description: str | None = None,
         draft_expires_in_hours: int | None = None,
+        draft: DraftRetention | None = None,
     ) -> dict:
         """The dry run, and the reason `create` is not the first step.
 
@@ -1895,6 +1921,7 @@ def build_runtime(
                 id_column=id_column, geometry_column=geometry_column,
                 kind=kind, description=description,
                 draft_expires_in_hours=draft_expires_in_hours,
+                draft=draft,
             ),
         ))
 
@@ -1907,7 +1934,8 @@ def build_runtime(
             " derived_layers_plan so the create is refused if the sources"
             " moved since you looked. This writes to the database directly --"
             " there is no proposal and no review queue for creation. By default"
-            " the relation persists. Optional draft_expires_in_hours explicitly"
+            " the relation persists. Optional draft or"
+            " draft_expires_in_hours explicitly"
             " authorizes automatic cleanup after proposal decline or expiry;"
             " publication makes the draft permanent. A preview-only request"
             " is not approval for this database creation."
@@ -1925,6 +1953,7 @@ def build_runtime(
         plan_fingerprint: str | None = None,
         background: bool | None = None,
         draft_expires_in_hours: int | None = None,
+        draft: DraftRetention | None = None,
     ) -> dict:
         """The first tool that creates a database object.
 
@@ -1939,6 +1968,7 @@ def build_runtime(
             id_column=id_column, geometry_column=geometry_column,
             kind=kind, description=description,
             draft_expires_in_hours=draft_expires_in_hours,
+            draft=draft,
         )
         if plan_fingerprint is not None:
             body["planFingerprint"] = plan_fingerprint
@@ -1968,7 +1998,7 @@ def build_runtime(
             packet["definition"]["draft"] = dict(body["draft"])
             packet["summary"] = (
                 f"Create the disposable database relation {name} for "
-                f"{draft_expires_in_hours} hours. Authorize automatic cleanup "
+                f"{body['draft']['expiresInHours']} hours. Authorize automatic cleanup "
                 "after its proposal is declined or retention expires."
             )
             packet["note"] = (
@@ -2167,7 +2197,7 @@ def build_runtime(
 
     def _derived_definition(
         *, name, query, sources, id_column, geometry_column, kind, description,
-        draft_expires_in_hours=None,
+        draft_expires_in_hours=None, draft=None,
     ):
         """The definition body, built once and in one order.
 
@@ -2186,7 +2216,20 @@ def build_runtime(
         }
         if description is not None:
             body["description"] = description
-        if draft_expires_in_hours is not None:
+        if draft is not None and draft_expires_in_hours is not None:
+            raise ToolError(
+                "Pass either draft or draft_expires_in_hours, not both."
+            )
+        if draft is not None:
+            try:
+                retention = DraftRetention.model_validate(draft)
+            except ValidationError:
+                raise ToolError(
+                    "draft must contain expiresInHours (1-168) and "
+                    "cleanupApproved: true, with no other fields."
+                ) from None
+            body["draft"] = retention.model_dump(by_alias=True)
+        elif draft_expires_in_hours is not None:
             if (type(draft_expires_in_hours) is not int
                     or not 1 <= draft_expires_in_hours <= 168):
                 raise ToolError("draft_expires_in_hours must be an integer from 1 to 168.")
@@ -3243,25 +3286,23 @@ def build_runtime(
         operation=OPERATIONS_SHOW,
         name="operations_show",
         description=(
-            "One asynchronous operation: its kind, status, stage and when it"
-            " changed, with its result and any error reduced to their shape."
-            " Use it to tell finished work from failed work. Takes an"
-            " operationId."
+            "Inspect a derived-layer asynchronous operation using derive"
+            " permission. Visual preview operations require visual permission:"
+            " use visual_operations_show for those. Takes an operationId."
         ),
     )
     def operations_show(operation_id: str) -> dict:
         """Whether the work finished, and if not, what it said.
 
         `derived_layers_jobs` says how much work is in flight; this says what
-        happened to one piece of it. Refresh, replace and visual checks all
-        run asynchronously and report nowhere else.
+        happened to one derived operation. Visual checks use the separate
+        visual_operations_show route and scope.
 
-        `result` and `error.diagnosis` are reduced rather than returned: a
-        failed visual test carries 15,381 bytes of run detail and 6,174 of
-        per-check diagnosis, against 34 bytes of message saying what went
-        wrong. The shape is kept so the reduction is visible -- an agent can
-        see that a `visual` block exists and how many keys it has, which is
-        the honest way to say "there is more here than you were given".
+        `result` and `error.diagnosis` are reduced rather than returned.
+        A derived operation may carry bulky diagnostic fields; retaining their
+        shape makes it clear that more detail exists without flooding the MCP
+        response. Visual operations use visual_operations_show, which retains
+        image paths and authenticated artifact links.
         """
         path = OPERATIONS_SHOW["path_template"].replace(
             "{operationId}", quote(operation_id, safe="")

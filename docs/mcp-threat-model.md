@@ -292,6 +292,14 @@ Browser artifacts currently have no automatic retention or total-storage quota,
 so operators must monitor and remove operational artifacts under their
 retention policy.
 
+### Disposable derived creation arguments
+
+`derived_layers_plan` and `derived_layers_create` accept the API's closed
+`draft` object or the equivalent `draft_expires_in_hours` convenience
+parameter. They reject unknown top-level arguments and conflicting forms.
+This prevents an MCP client typo or stale schema from dropping the retention
+request and turning a disposable preview relation into a permanent one.
+
 ### Viewport framing
 
 Feature-focused framing and full-map-area framing use the same effective

@@ -53,8 +53,9 @@ choose and verify category breaks.
 
 ## Disposable relations for proposal previews
 
-For an explicitly disposable preview, pass `draft_expires_in_hours` (an integer
-from 1 to 168) to both `derived_layers_plan` and `derived_layers_create`. Keep
+For an explicitly disposable preview, pass `draft={"expiresInHours": 24,
+"cleanupApproved": true}` or `draft_expires_in_hours=24` (an integer from 1
+to 168) to both `derived_layers_plan` and `derived_layers_create`. Keep
 that value identical when using the plan fingerprint. The creation prompt
 authorizes the real database change and dependency-checked automatic deletion
 after its proposal is declined or retention expires. Without this parameter,
