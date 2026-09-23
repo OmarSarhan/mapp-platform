@@ -329,8 +329,8 @@ export function FederatedSources({api, close}) {
     && selected.lastObservationId !== null
     && selected.lastObservationId !== undefined;
 
-  return <div className="modal-backdrop">
-    <section className="panel security-panel federation-panel" role="dialog" aria-modal="true" aria-labelledby="federation-title">
+  return <div className="management-page">
+    <section className="panel security-panel federation-panel" role="region" aria-labelledby="federation-title">
       <div className="form-head">
         <div>
           <h2 id="federation-title">Federated sources</h2>

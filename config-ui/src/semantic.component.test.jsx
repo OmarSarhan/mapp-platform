@@ -762,6 +762,9 @@ describe('SemanticCatalog', () => {
 
     expect(screen.getByText('Choose up to 25 fields')).toBeTruthy();
     const savedStatus = screen.getByText('Saved semantic value');
+    fireEvent.click(savedStatus);
+    expect(savedStatus.closest('details').open).toBe(true);
+    expect(screen.getByRole('region', {name: 'Saved metadata for field_1'}).textContent).toContain('Existing field description');
     const savedField = screen.getByRole('checkbox', {name: 'field_1'});
     expect(savedField.disabled).toBe(false);
     expect(savedField.getAttribute('aria-describedby')).toBe(savedStatus.id);

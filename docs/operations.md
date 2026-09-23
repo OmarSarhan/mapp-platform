@@ -1,5 +1,30 @@
 # Operations
 
+The dashboard opens Sources, Derived layers, Semantic catalog, Federated sources,
+and Access & audit in the area below the persistent navigation bar. Switching
+sections retains unsaved forms. Sources offers search and database/relation-type
+filters, with column metadata beside the selected relation. Reload config and
+Reload XYZ are grouped in the header; reloading XYZ uses saved configuration and
+preserves unsaved workspace edits. Saved semantic value badges expand to show
+the stored annotation and its profile version without requesting source rows.
+
+Derived layers shows the existing automatic draft watcher's health, last sweep
+and per-draft retention reason. It checks at 60-second intervals in batches of
+20, only for explicitly disposable relations with an approved cleanup policy.
+Expiry or rejection makes a draft eligible, not guaranteed to be deleted. Exact
+asset identity, ownership, live and pending references, active previews, and
+database dependencies are rechecked under lifecycle locking. Uncertain state
+is retained and deletion never cascades. Published drafts are adopted and kept;
+ordinary permanent relations have no inferred expiry. Dashboard status polling
+is read-only, runs only while Derived layers is active, and adds no new deletion
+criteria or cleanup authority.
+
+For a point layer, use **Edit symbols and icons → Appearance and legend**.
+Choose the default symbol (including Custom SVG), colour and scale there; a
+data-driven theme has separate **Edit symbol or icon** controls for each class.
+Zoom-dependent source layers use the same appearance controls while their
+source table/geometry mappings remain in Advanced layer JSON.
+
 ## Service lifecycle
 
 ```sh

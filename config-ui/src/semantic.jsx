@@ -786,8 +786,8 @@ export function SemanticCatalog({api, close, identity}) {
     }
   };
 
-  return <div className="modal-backdrop">
-    <section className="panel security-panel semantic-panel" role="dialog" aria-modal="true" aria-labelledby="semantic-title">
+  return <div className="management-page">
+    <section className="panel security-panel semantic-panel" role="region" aria-labelledby="semantic-title">
       <div className="form-head">
         <div>
           <h2 id="semantic-title">Semantic catalog</h2>
@@ -1037,10 +1037,16 @@ export function SemanticCatalog({api, close, identity}) {
                             />
                             <span>{field.name || field.id}</span>
                           </label>
-                          {hasSavedAnnotation && <small
-                            className="semantic-field-status"
-                            id={statusId}
-                          >Saved semantic value</small>}
+                          {hasSavedAnnotation && <details className="semantic-saved-value">
+                            <summary className="semantic-field-status" id={statusId}>Saved semantic value</summary>
+                            <section aria-label={`Saved metadata for ${field.name || field.id}`}>
+                              <strong>{field.name || field.id}</strong>
+                              <p className="muted">Saved field annotations · profile version {selected.version}</p>
+                              <dl>{Object.entries(annotation).map(([key,value])=><div key={key}>
+                                <dt>{key}</dt><dd>{typeof value==='string'?value:<pre>{formatJson(value)}</pre>}</dd>
+                              </div>)}</dl>
+                            </section>
+                          </details>}
                         </div>;
                       })}
                     </div>

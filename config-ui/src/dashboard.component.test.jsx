@@ -686,6 +686,78 @@ afterEach(() => {
 });
 
 describe('Dashboard managed save lifecycle', () => {
+  test('edits symbols on zoom-dependent layers without rewriting their source mapping', async () => {
+    const zoomLayer = {
+      name: 'Zoom stops', format: 'mvt', table: null,
+      tables: {'0': null, '15': 'transit.stops'}, geom: 'geom', qID: 'id',
+      style: {default: {icon: {type: 'markerLetter', letter: 'B', color: '#16a34a'}}},
+    };
+    const fallback = standardFetch(() => response({}));
+    vi.stubGlobal('fetch', vi.fn(async (path, options) => {
+      if (path === '/api/workspace') return response({workspace: {
+        ...workspace, locale: {...workspace.locale, layers: {Zoom_stops: zoomLayer}},
+      }, revision: 'rev-1'});
+      if (path === '/api/catalog') return response({databases: ['MAPP'], tables: [{
+        dbs: 'MAPP', schema: 'transit', table: 'stops',
+        columns: [{name: 'geom', geometryType: 'Point', srid: 3857}, {name: 'id', type: 'integer'}],
+      }]});
+      return fallback(path, options);
+    }));
+    render(<Dashboard openSecurity={() => {}}/>);
+    fireEvent.click(await screen.findByRole('button', {name: 'Zoom stops'}));
+    fireEvent.click(screen.getByRole('button', {name: 'Edit symbols and icons'}));
+    const normal = screen.getByText('Default symbology').closest('.subpanel');
+    fireEvent.change(within(normal).getByLabelText('Symbol'), {target: {value: 'diamond'}});
+    const edited = JSON.parse(screen.getByLabelText('Advanced layer JSON').value);
+    expect(edited.style.default.icon.type).toBe('diamond');
+    expect(edited.tables).toEqual(zoomLayer.tables);
+    expect(edited.table).toBeNull();
+    expect(edited.geom).toBe('geom');
+    expect(edited.qID).toBe('id');
+  });
+
+  test('keeps unsaved workspace and derived forms when navigating full-page sections', async () => {
+    const fallback = standardFetch(() => response({}));
+    vi.stubGlobal('fetch', vi.fn(async (path, options) => {
+      if (path === '/api/auth/me') return response({actor: 'admin', scopes: ['admin']});
+      if (path === '/api/derived-layers') return response({derivedLayers: []});
+      if (path === '/api/derived-layers/capabilities') return response({});
+      if (path === '/api/derived-layers/drafts') return response({drafts: [], cleanup: {workerRunning: true}});
+      return fallback(path, options);
+    }));
+    render(<Root/>);
+    fireEvent.change(await screen.findByDisplayValue('demo'), {target: {value: 'Unsaved workspace'}});
+    const reloads = screen.getByRole('group', {name: 'Reload controls'});
+    expect(within(reloads).getByRole('button', {name: 'Reload config'})).toBeTruthy();
+    expect(within(reloads).getByRole('button', {name: 'Reload XYZ'})).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'Derived layers'}));
+    const manager = await screen.findByRole('region', {name: 'Derived layers'});
+    expect(manager.closest('.modal-backdrop')).toBeNull();
+    fireEvent.change(within(manager).getByLabelText('Name'), {target: {value: 'unsaved_definition'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Workspace', exact: true}));
+    expect(screen.getByDisplayValue('Unsaved workspace')).toBeTruthy();
+    expect(manager.closest('main').hidden).toBe(true);
+    fireEvent.click(screen.getByRole('button', {name: 'Derived layers'}));
+    expect(screen.getByDisplayValue('unsaved_definition')).toBeTruthy();
+    expect(manager.closest('main').hidden).toBe(false);
+  });
+
+  test('opens a new requested relation after the derived page has already been visited', async () => {
+    vi.stubGlobal('fetch', vi.fn(async path => {
+      if (path === '/api/derived-layers') return response({derivedLayers: []});
+      if (path === '/api/derived-layers/capabilities') return response({});
+      if (path === '/api/derived-layers/drafts') return response({drafts: []});
+      return response({derivedLayer: {name: path.split('/').at(-1), kind: 'view',
+        sources: ['transit.stops'], idColumn: 'id', geometryColumn: 'geom', query: 'SELECT id, geom FROM transit.stops'}});
+    }));
+    const {rerender} = render(<DerivedLayers close={() => {}}/>);
+    await screen.findByRole('region', {name: 'Derived layers'});
+    rerender(<DerivedLayers close={() => {}} initialName="first" initialRequestKey={1}/>);
+    await screen.findByDisplayValue('first');
+    rerender(<DerivedLayers close={() => {}} initialName="second" initialRequestKey={2}/>);
+    await screen.findByDisplayValue('second');
+  });
+
   test('requires an explicit action to add a selected catalog table as a layer', async () => {
     const catalogTable = {
       dbs: 'MAPP',
@@ -2092,7 +2164,7 @@ describe('Dashboard managed save lifecycle', () => {
     expect(liveRegion.getAttribute('aria-live')).toBe('polite');
     expect(liveRegion.getAttribute('aria-atomic')).toBe('true');
     expect(screen.getByRole('button', {name: 'Validate'}).disabled).toBe(true);
-    expect(screen.getByRole('button', {name: 'Reload editor'}).disabled).toBe(true);
+    expect(screen.getByRole('button', {name: 'Reload config'}).disabled).toBe(true);
     expect(screen.getByRole('button', {name: 'Access & audit'}).disabled).toBe(true);
     expect(container.querySelector('.workspace-commandbar select').disabled).toBe(true);
 
