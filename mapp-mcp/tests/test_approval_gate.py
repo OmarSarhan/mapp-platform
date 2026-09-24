@@ -243,6 +243,73 @@ class FormModeTests(GateTestCase):
             await self.gate(ctx)
 
 
+class ConfirmationFailureTests(GateTestCase):
+    async def test_cancel_and_invalid_form_never_record_a_decline(self):
+        from approval_diagnostics import ApprovalError
+        for mode, action, data, code in (
+            ("url", "cancel", None, "approval.cancelled"),
+            ("form", "cancel", None, "approval.cancelled"),
+            ("form", "accept", None, "approval.confirmation_invalid"),
+            ("form", "accept", Confirmation("true"), "approval.confirmation_invalid"),
+            ("url", "unexpected", None, "approval.confirmation_invalid"),
+        ):
+            api = FakeConfigApi()
+            ctx = FakeContext(elicitation=Capability(**{mode: {}}), **{mode: Answer(action, data)})
+            with self.subTest(mode=mode, action=action), self.assertRaises(ApprovalError) as raised:
+                await self.gate(ctx, config_api=api)
+            self.assertEqual(code, raised.exception.detail['code'])
+            self.assertEqual(APPROVAL_URL, raised.exception.detail['approvalUrl'])
+            self.assertFalse(api.posted_to(APPROVALS_CONFIRM['path_template']))
+            self.assertFalse(api.posted_to(APPROVALS_CLAIM['path_template']))
+
+    async def test_confirmation_exceptions_are_distinct_and_redacted(self):
+        from approval_diagnostics import ApprovalError
+        from mcp.shared.exceptions import MCPError
+        for error, code in (
+            (TimeoutError('secret-token'), 'approval.confirmation_timeout'),
+            (NotImplementedError('secret-token'), 'approval.confirmation_unsupported'),
+            (OSError('secret-token'), 'approval.confirmation_transport'),
+            (RuntimeError('secret-token'), 'approval.confirmation_failed'),
+            (MCPError(code=-32601, message='secret-token'), 'approval.confirmation_unsupported'),
+            (MCPError(code=-32000, message='secret-token', data={'code':'policy_rejected'}), 'approval.policy_rejected'),
+            (MCPError(code=-32601, message='secret-token', data={'code':'policy_rejected'}), 'approval.policy_rejected'),
+        ):
+            api = FakeConfigApi()
+            ctx = FakeContext(elicitation=Capability(url={}))
+            async def fail(**kwargs): raise error
+            ctx.elicit_url = fail
+            with self.subTest(code=code), self.assertRaises(ApprovalError) as raised:
+                await self.gate(ctx, config_api=api)
+            self.assertEqual(code, raised.exception.detail['code'])
+            if code == 'approval.policy_rejected': self.assertNotIn('approvalUrl', raised.exception.detail)
+            self.assertNotIn('secret-token', str(raised.exception))
+            self.assertFalse(api.posted_to(APPROVALS_CONFIRM['path_template']))
+
+    async def test_url_decline_closes_the_request_without_a_fallback_or_receipt(self):
+        from approval_diagnostics import ApprovalError
+        api = FakeConfigApi()
+        ctx = FakeContext(elicitation=Capability(url={}), url=Answer('decline'))
+        with self.assertRaises(ApprovalError) as raised:
+            await self.gate(ctx, config_api=api)
+        self.assertEqual('approval.elicitation_declined', raised.exception.detail['code'])
+        self.assertNotIn('approvalUrl', raised.exception.detail)
+        self.assertEqual([False], [call['body']['accepted'] for call in api.posted_to(APPROVALS_CONFIRM['path_template'])])
+        self.assertFalse(api.posted_to(APPROVALS_CLAIM['path_template']))
+
+    async def test_dashboard_approval_after_cancellation_is_collected_without_reprompt(self):
+        from approval_diagnostics import ApprovalError
+        self.as_caller()
+        api = FakeConfigApi()
+        gate = self.build(config_api=api)
+        ctx = FakeContext(elicitation=Capability(url={}), url=Answer('cancel'))
+        kwargs = dict(path='/api/proposals/p-1', tool_name='proposals_apply', packet=PACKET)
+        with self.assertRaises(ApprovalError): await gate(ctx, PROPOSALS_SHOW, **kwargs)
+        self.assertEqual(RECEIPT, await gate(ctx, PROPOSALS_SHOW, **kwargs))
+        self.assertEqual(1, len(ctx.asked))
+        self.assertEqual(1, len(api.posted_to(APPROVALS_CREATE['path_template'])))
+        self.assertFalse(api.posted_to(APPROVALS_CONFIRM['path_template']))
+
+
 class UrlModeTests(GateTestCase):
     async def test_the_person_is_sent_to_the_page_for_this_request(self) -> None:
         ctx = FakeContext(
@@ -811,6 +878,30 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             elicitation=Capability(form={}),
             form=Answer("accept", Confirmation(True)),
         )
+
+    async def test_wire_error_is_structured_and_logs_do_not_contain_secrets_or_links(self):
+        import json
+        api = self.Api(self)
+        self.build('proposals_apply', api)  # installs the authenticated test caller
+        server = build_runtime(resource=ProtectedResource(origin='http://mcp.localhost', issuer='http://mcp.localhost'),
+                               exchange=FakeExchange(), config_api=api)
+        ctx = FakeContext(elicitation=Capability(url={}), url=Answer('cancel'))
+        with self.assertLogs('mapp.approval', level='INFO') as logs:
+            result = await server.call_tool('proposals_apply', {'proposal_id':'p-1', 'evidence_operation_id':'op-7'}, context=ctx)
+        self.assertTrue(result.is_error)
+        error = result.structured_content['error']
+        self.assertEqual('approval.cancelled', error['code'])
+        self.assertEqual('url', error['mode'])
+        self.assertEqual('cancel', error['action'])
+        self.assertEqual(APPROVAL_URL, error['approvalUrl'])
+        self.assertRegex(error['correlationId'], r'^[a-f0-9]{32}$')
+        self.assertEqual(error, json.loads(result.content[0].text)['error'])
+        self.assertFalse(api.posted_to('/api/proposals/p-1/apply'))
+        logged = '\n'.join(logs.output)
+        for secret in (HANDLE, RECEIPT, APPROVAL_URL, 'mapp_a_live', 'mapp_b_minted'):
+            self.assertNotIn(secret, logged)
+        self.assertIn(error['correlationId'], logged)
+        self.assertIn('confirmation.response', logged)
 
     async def test_preview_mismatch_and_partial_evidence_do_not_request_approval(self):
         for mutation in ("binding", "incomplete", "expired"):

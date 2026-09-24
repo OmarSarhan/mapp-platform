@@ -14,6 +14,8 @@ old credential is either spent or bound to a request that has already happened.
 
 from __future__ import annotations
 
+from approval_diagnostics import TRACE, trace
+
 import json
 import secrets
 import urllib.error
@@ -108,6 +110,8 @@ class ConfigApiClient:
         """
         url = self.endpoint + path + (f"?{query}" if query else "")
         request_id = secrets.token_hex(16)
+        if TRACE.get() is not None:
+            trace("platform.request", requestId=request_id)
         deadline = self.timeout if timeout is None else timeout
         headers = {
             "Accept": "application/json",
@@ -128,8 +132,12 @@ class ConfigApiClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=deadline) as response:
+                if TRACE.get() is not None:
+                    trace("platform.response", requestId=request_id, status=response.status)
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if TRACE.get() is not None:
+                trace("platform.response", requestId=request_id, status=exc.code)
             try:
                 detail = json.loads(exc.read().decode("utf-8"))
             except (ValueError, UnicodeDecodeError, OSError):
@@ -156,6 +164,8 @@ class ConfigApiClient:
                 else "invalid_response" if isinstance(exc, ValueError)
                 else "connection_failed"
             )
+            if TRACE.get() is not None:
+                trace("platform.error", requestId=request_id, code=reason, exceptionType=type(exc).__name__)
             raise ConfigApiUnavailable(
                 "The configuration API did not return a usable response.",
                 reason=reason, request_id=request_id, timeout=deadline,

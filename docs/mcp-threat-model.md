@@ -565,3 +565,14 @@ artifact bytes invalidate an older confirmation. This proves which evidence
 was offered, not that a human examined every image or that the spatial query is
 correct. Study-boundary reports explicitly retain unknowns rather than infer
 clipping from arbitrary SQL, layer titles, masks or drawn circles.
+
+
+Confirmation diagnostics distinguish a client cancellation, client-returned
+URL decline, recorded proposal decline, malformed data and unavailable transport.
+Cancellation and malformed responses do not create negative approval decisions;
+explicit declines close their approval request. Recoverable elicitation failures
+can disclose the existing authenticated dashboard approval page; the agent still
+cannot decide or manufacture a receipt. Explicit client policy rejections do not
+receive fallback instructions. Correlation logs retain modes, bounded response
+facts and platform request IDs, never packets, credentials or download links.
+These records do not prove that a human saw the client's confirmation UI.

@@ -16,7 +16,7 @@ COPY requirements.txt /app/
 # none of them needs the --no-deps treatment Authlib does.
 RUN pip install --no-cache-dir --requirement /app/requirements.txt
 
-COPY --chown=mappmcp:mappmcp VERSION app.py authentication.py canonical.py config_api_client.py era_guard.py exchange_client.py execution_envelope.py introspection_client.py protected_resource.py runtime.py server.py /app/
+COPY --chown=mappmcp:mappmcp VERSION app.py approval_diagnostics.py authentication.py canonical.py config_api_client.py era_guard.py exchange_client.py execution_envelope.py introspection_client.py protected_resource.py runtime.py server.py /app/
 # The guidance documents the runtime serves as MCP resources. A directory
 # rather than named files, because adding a fourth should not need a
 # Dockerfile edit -- and an absent one is a resource that lists and then fails

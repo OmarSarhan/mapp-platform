@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+from html.parser import HTMLParser
 import json
 import logging
 import math
@@ -4354,6 +4355,34 @@ _STATIC_INFO_LITERAL = re.compile(
 )
 
 
+class _VisibleInfoText(HTMLParser):
+    """Preserve inline text adjacency; block markup supplies word boundaries."""
+    blocks = frozenset({"p", "div", "br", "hr", "li", "ul", "ol", "table", "tr", "td", "th",
+                        "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "blockquote",
+                        "pre", "details", "summary", "dl", "dt", "dd"})
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self.hidden += 1
+        if not self.hidden and tag in self.blocks:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self.hidden = max(0, self.hidden - 1)
+        if not self.hidden and tag in self.blocks:
+            self.parts.append(" ")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.parts.append(data)
+
+
 def _static_info_text(entry: dict) -> str | None:
     """Return visible text only for a simple, constant information expression."""
     expression = entry.get("fieldfx")
@@ -4364,7 +4393,10 @@ def _static_info_text(entry: dict) -> str | None:
         return None
     text = match.group(1).replace("''", "'")
     if entry.get("type") == "html":
-        text = html.unescape(re.sub(r"<[^<>]*>", " ", text))
+        parser = _VisibleInfoText()
+        parser.feed(text)
+        parser.close()
+        text = "".join(parser.parts)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:1000] or None
 

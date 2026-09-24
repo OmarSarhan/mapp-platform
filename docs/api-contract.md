@@ -1714,3 +1714,46 @@ SQL or hydrating semantic profiles. The platform map-extent wrapper selects
 whole intersecting features and does not clip them. Arbitrary SQL clipping,
 user-drawn circles and inferred study boundaries remain explicitly unknown.
 No filter, geometry, visibility, or live workspace configuration is changed.
+
+
+### MCP confirmation outcomes (runtime 0.5.1)
+
+Confirmation failures return `isError: true` with the same error object in
+`structuredContent.error` and JSON text content. Each has a stable `code`,
+`correlationId`, `message` and `applyAttempted: false`; confirmation-stage failures
+also identify mode, elicitation ID and approval reference when available.
+
+- `approval.declined`: a form or platform decision was declined.
+- `approval.elicitation_declined`: the client returned decline to opening the
+  URL confirmation; its approval request is closed. This does not identify
+  whether a person or client policy returned that action.
+- `approval.cancelled`: the client cancelled; no negative decision is recorded.
+- `approval.confirmation_invalid`: malformed action/data or validation failure;
+  an accepted dialog without a boolean `approve` does not become a decline.
+- `approval.confirmation_unsupported`, `approval.confirmation_timeout`,
+  `approval.confirmation_transport`, `approval.confirmation_failed`: distinct
+  failures to complete elicitation. Arbitrary exception text is never returned.
+- `approval.policy_rejected`: an explicitly identified client policy rejection;
+  resolve the policy rather than route around it. No fallback link is offered.
+- `approval.decision_timeout`, `approval.expired`, `approval.receipt_missing`:
+  waiting on a dashboard decision, expired request, or missing spendable receipt.
+
+Recoverable confirmation errors include `approvalUrl` and `nextStep`. A person
+must decide on that authenticated dashboard page; retrying the identical tool
+arguments then collects the decision before attempting another prompt. Neither
+conversational approval, opening the URL, nor cancellation authorizes a write.
+Explicit declines do not receive fallback instructions. A tool retry must never
+be used to repeat a committed workspace write after reload failure.
+
+Runtime diagnostics correlate the tool invocation, request binding, advertised
+confirmation modes, selected mode, elicitation response, platform request IDs
+and final outcome. Logs exclude request bodies, packets, URLs, credentials and
+raw exception messages. A client-returned `decline` cannot be attributed to a
+human or policy without client-side evidence.
+
+Failed `visual.feature_interaction` checks now retain bounded identity flags,
+expected/observed layer and feature IDs, missing expected text, and observed
+popup text (up to 2,000 characters), alongside failure reason and request ID.
+Static HTML expectations preserve inline text adjacency, add block separators,
+and omit script/style content; they do not insert whitespace around inline
+links or weaken the matching of actual content differences.

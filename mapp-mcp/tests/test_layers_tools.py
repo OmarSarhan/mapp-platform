@@ -2547,6 +2547,24 @@ class PreviewEvidenceTests(ToolTestCase):
         self.assertEqual("Bus Stops (proposed)", detail["plan"]["layerTitle"])
         self.assertNotIn("meta", detail)
 
+    def test_interaction_failure_exposes_bounded_assertion_values(self):
+        from runtime import _visual_outcome
+        result = _visual_outcome({'operation':{'status':'failed','result':{'requestId':'r1','visual':{
+            'failureReason':'expected-info-panel-text-missing','diagnosis':{'candidate':{'checks':[{
+                'id':'visual.feature_interaction','passed':False,'observed':{
+                    'expectedLayer':'Census','observedLayer':'Census','expectedFeatureId':'OA1','observedFeatureId':'OA1',
+                    'expectedLayerFound':True,'expectedFeatureIdFound':True,
+                    'expectedInfoPanelTextFound':{'Expected text':False,'Present':True},
+                    'infoPanelTextSample':'Actual text','privateUnrelated':'excluded',
+                }}]}}}}}})
+        self.assertEqual('r1', result['requestId'])
+        self.assertEqual('expected-info-panel-text-missing', result['failureReason'])
+        detail=result['failedChecks'][0]['observed']
+        self.assertEqual(['Expected text'],detail['missingExpectedText'])
+        self.assertEqual('Actual text',detail['observedTextSample'])
+        self.assertTrue(detail['expectedFeatureIdFound'])
+        self.assertNotIn('privateUnrelated',detail)
+
     def test_the_artifacts_survive_whole(self) -> None:
         """They are the product of the call: 650 bytes of paths to the images
         somebody is going to look at."""

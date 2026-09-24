@@ -7460,6 +7460,21 @@ class ApplyRouteTests(unittest.TestCase):
         self.assertEqual("indeterminate", responses[0][1]["operation"]["status"])
 
 
+class StaticInfoTextTests(unittest.TestCase):
+    def extract(self, markup):
+        return app._static_info_text({'type': 'html', 'fieldfx': "'" + markup.replace("'", "''") + "'::text"})
+
+    def test_inline_links_do_not_insert_spaces_before_punctuation(self):
+        self.assertEqual('Source: Dataset, boundaries. A&B.', self.extract('Source: <a href="https://example.test">Dataset</a>, <a>boundaries</a>. A&amp;B.'))
+        self.assertEqual('households', self.extract('<b>house</b>holds'))
+
+    def test_block_breaks_entities_and_hidden_scripts(self):
+        self.assertEqual('First Second Third ©', self.extract('<p>First</p><div>Second<br>Third&nbsp;©</div><script>hidden()</script><style>.hidden {}</style>'))
+
+    def test_real_content_differences_remain_visible(self):
+        self.assertNotEqual('Total 30%', self.extract('<p>Total <strong>31%</strong></p>'))
+
+
 class CandidatePreviewRouteTests(ControlStoreTestCase):
     @staticmethod
     def handler(path: str, payload: dict) -> tuple[app.Handler, list]:

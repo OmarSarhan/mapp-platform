@@ -367,7 +367,7 @@ tools an agent cannot call are not shown to it.
 tools after the MCP service was rebuilt.** MCP clients commonly cache the
 `tools/list` result for the life of their session. Reconnect or restart that
 client session, then call `describe_instance`; the current expanded visual
-surface reports `mapp-mcp/0.5.0`. Re-authorize only when the reconnected client
+surface reports `mapp-mcp/0.5.1`. Re-authorize only when the reconnected client
 is missing the required scope. A second authenticated session seeing newer
 tools is evidence that the first session's manifest is stale, not that the
 configuration API lacks the operation.

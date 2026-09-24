@@ -28,6 +28,7 @@ import base64
 import binascii
 import contextlib
 import json
+import secrets
 from functools import partial
 import re
 from pathlib import Path
@@ -38,6 +39,7 @@ from urllib.parse import urlsplit
 import anyio
 
 import era_guard
+from approval_diagnostics import ApprovalError, DiagnosticToolError, TRACE, trace
 from authentication import CURRENT_CALLER
 from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
@@ -61,7 +63,7 @@ from pydantic import Field
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.5.0"
+RUNTIME_VERSION = "0.5.1"
 
 
 class DraftRetention(BaseModel):
@@ -281,13 +283,6 @@ APPROVAL_POLL_SECONDS = 2
 #: session and far below anything that matters for memory.
 APPROVAL_MEMORY_LIMIT = 256
 
-#: Said the same way wherever a person says no, so a declined approval reads
-#: as a decision rather than as a failure the agent should work around.
-_APPROVAL_DECLINED = (
-    "You declined this change, so nothing was done."
-)
-
-
 class _ApprovalConfirmation(BaseModel):
     """What a form-mode client asks the person.
 
@@ -296,6 +291,8 @@ class _ApprovalConfirmation(BaseModel):
     here would be a place for the model's framing to reach the person's
     answer.
     """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     approve: bool = Field(
         description="Approve this change? It cannot be undone automatically.",
@@ -997,6 +994,27 @@ def _authenticated_artifact_links(
     return links
 
 
+def _interaction_diagnostics(observed):
+    if not isinstance(observed, dict):
+        return None
+    detail = {key: observed[key] for key in (
+        "failureReason", "expectedLayer", "observedLayer", "expectedFeatureId", "observedFeatureId",
+        "expectedLayerFound", "expectedFeatureIdFound", "identityObserved", "panelOpened",
+        "panelStable", "artifactCaptured", "targetPlanned", "attempted")
+        if isinstance(observed.get(key), (str, int, bool))}
+    detail = {key: value[:300] if isinstance(value, str) else value for key, value in detail.items()}
+    checks = observed.get("expectedInfoPanelTextFound") or {}
+    if isinstance(checks, dict):
+        missing = [text for text, found in checks.items() if found is False and isinstance(text, str)]
+        detail["missingExpectedText"] = [text[:1000] for text in missing[:5]]
+        detail["missingExpectedTextCount"] = len(missing)
+    sample = observed.get("infoPanelTextSample")
+    if isinstance(sample, str):
+        detail["observedTextSample"] = sample[:2000]
+        detail["observedTextTruncated"] = observed.get("infoPanelTextLength", len(sample)) > len(sample[:2000])
+    return detail
+
+
 def _visual_outcome(payload, *, config_api_resource: str | None = None):
     """A browser run reduced to what decides whether a change is acceptable.
 
@@ -1040,7 +1058,7 @@ def _visual_outcome(payload, *, config_api_resource: str | None = None):
         for check in checks if isinstance(checks, list) else []:
             if isinstance(check, dict) and not check.get("passed"):
                 failed.append({"side": side, "check": check.get("id"),
-                               "observed": _change_preview(check.get("observed"))})
+                               "observed": _interaction_diagnostics(check.get("observed")) if check.get("id") == "visual.feature_interaction" else _change_preview(check.get("observed"))})
 
     detail = {
         "proposalId": (
@@ -1062,6 +1080,8 @@ def _visual_outcome(payload, *, config_api_resource: str | None = None):
             or error.get("failedStage")
         ),
         "failedChecks": failed,
+        "failureReason": visual.get("failureReason") or error.get("failureReason"),
+        "requestId": result.get("requestId") or target.get("requestId"),
         # The point of the call: where the rendered images are.
         "artifacts": visual.get("artifacts") or {},
         "warnings": plan.get("warnings") or [],
@@ -1365,6 +1385,7 @@ def build_runtime(
         by driving a real client; the unit tests called the functions directly
         and agreed with the code while the property was false.
         """
+        trace("platform.dispatch", operationId=operation["operation_id"])
         caller = CURRENT_CALLER.get()
         if caller is None:
             # Unreachable through the middleware, which refuses before dispatch.
@@ -1395,12 +1416,12 @@ def build_runtime(
                 scope=" ".join(operation["scopes"]),
             )
         except ExchangeRefused as refusal:
-            raise ToolError(f"The platform refused this request: {refusal}") from None
+            raise DiagnosticToolError(f"The platform refused this request: {refusal}", code="auth.exchange_refused") from None
         except ExchangeUnavailable:
             # Deliberately not the underlying text: it describes this
             # component's plumbing, and an agent cannot act on it.
-            raise ToolError(
-                "The authorization component is unavailable; try again."
+            raise DiagnosticToolError(
+                "The authorization component is unavailable; try again.", code="auth.exchange_unavailable"
             ) from None
         try:
             # Credentials are redeemed on admission; their lifetime does not
@@ -1435,12 +1456,13 @@ def build_runtime(
             diagnostics = _failure_diagnostics(refusal.body)
             if refusal.request_id:
                 diagnostics.setdefault("requestId", refusal.request_id)
-            raise ToolError(
+            raise DiagnosticToolError(
                 f"The platform refused this request: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
                 + _refusal_detail(refusal.errors)
                 + (f" {hint}" if hint else "")
-                + (" Diagnostics: " + json.dumps(diagnostics) if diagnostics else "")
+                + (" Diagnostics: " + json.dumps(diagnostics) if diagnostics else ""),
+                code=refusal.code or "config_api.refused", diagnostics=diagnostics,
             ) from None
         except ConfigApiUnavailable as exc:
             # A disconnected write may still be running or committed. Never
@@ -1458,13 +1480,14 @@ def build_runtime(
                 "retryable": read_only,
                 "indeterminate": not read_only,
             }
-            raise ToolError(
+            raise DiagnosticToolError(
                 "The configuration API is unavailable or did not respond in time. "
                 + ("Retry this read with a fresh request after a short delay. "
                    if read_only else
                    "The write outcome is unknown. Inspect operations and the target "
                    "relation or proposal before retrying; it may still be running. ")
-                + "Diagnostics: " + json.dumps(diagnostics)
+                + "Diagnostics: " + json.dumps(diagnostics),
+                code=diagnostics['code'], diagnostics=diagnostics,
             ) from None
 
     async def io_call(fn, *args, **kwargs):
@@ -1518,6 +1541,11 @@ def build_runtime(
         # there is nothing to look it up by. Held *here* rather than passed
         # back through the agent for the reason nothing approval-shaped is
         # ever a tool argument: the model never sees it and cannot supply it.
+        current = TRACE.get()
+        if current is not None:
+            current.update(operationId=operation["operation_id"], requestDigest=digest)
+            current.update({key: body[key] for key in ("candidateHash", "originalRevision", "evidenceOperationId", "evidenceFingerprint") if isinstance(body, dict) and key in body})
+        trace("approval.bound")
         remembered = _remembered_approval(caller, digest)
         if remembered is not None:
             handle, approval_url = remembered
@@ -1525,7 +1553,12 @@ def build_runtime(
             # answered, so ask that before asking the person anything again --
             # a second prompt for a decision already made is how a two-call
             # flow turns into an endless one.
-            settled = await io_call(_settled_decision, handle)
+            try:
+                settled = await io_call(_settled_decision, handle)
+            except ApprovalError as exc:
+                if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
+                    _forget_approval(caller, digest)
+                raise
             if settled is not None:
                 _forget_approval(caller, digest)
                 return settled
@@ -1544,7 +1577,7 @@ def build_runtime(
             handle = created.get("handle")
             approval_url = created.get("approvalUrl") or ""
             if not handle:
-                raise ToolError(
+                raise ApprovalError("approval.invalid_response",
                     "The platform accepted the approval request but named no"
                     " handle, so there is nothing to wait on."
                 )
@@ -1562,65 +1595,87 @@ def build_runtime(
                 return await io_call(_claim, handle)
             _remember_approval(caller, digest, handle, approval_url)
 
+        if TRACE.get() is not None:
+            # Reference is a public dashboard identifier, never a receipt/handle.
+            TRACE.get()["approvalReference"] = (match.group(1) if (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)) else None)
         message = _approval_message(operation["operation_id"], packet)
         modes = _elicitation_modes(ctx)
-        if "url" in modes:
-            # The best version: the decision is made in a browser session the
-            # agent does not control, looking at the rendered evidence rather
-            # than at a summary the model composed.
-            outcome = await ctx.elicit_url(
-                message=message + " Open the approval page to see the change"
-                                  " and decide.",
-                url=approval_url,
-                elicitation_id=digest,
-            )
-            if outcome.action != "accept":
-                raise ToolError(_APPROVAL_DECLINED)
-            receipt = await _await_decision(ctx, handle, approval_url)
+        mode = "url" if "url" in modes else "form" if "form" in modes else "dashboard"
+        current = TRACE.get()
+        if current is not None:
+            current.update(mode=mode, phase="confirmation", confirmationId=digest,
+                           elicitationId=digest if mode == "url" else None, clientModes=sorted(modes))
+        trace("confirmation.requested", mode=mode, clientModes=sorted(modes),
+              confirmationSchema="approve:required-strict-boolean;extra:forbid" if mode == "form" else "url-action",
+              confirmationId=digest, elicitationId=digest if mode == "url" else None)
+        if mode == "dashboard":
+            raise ApprovalError("approval.confirmation_unsupported",
+                "This client cannot display a confirmation request. This needs your approval before it can happen. " + str((packet or {}).get("summary") or "")[:500],
+                approval_url=approval_url)
+        try:
+            with anyio.fail_after(APPROVAL_WAIT_SECONDS):
+                if mode == "url":
+                    outcome = await ctx.elicit_url(
+                        message=message + " Open the approval page to see the change and decide.",
+                        url=approval_url, elicitation_id=digest)
+                else:
+                    outcome = await ctx.elicit(message, _ApprovalConfirmation)
+        except Exception as exc:
+            rpc_error = getattr(exc, "error", None)
+            rpc_code = getattr(rpc_error, "code", None)
+            rpc_data = getattr(rpc_error, "data", None)
+            if isinstance(rpc_data, dict) and rpc_data.get("code") in ("policy_rejected", "approval.policy_rejected"):
+                code = "approval.policy_rejected"
+            elif isinstance(exc, TimeoutError):
+                code = "approval.confirmation_timeout"
+            elif isinstance(exc, NotImplementedError) or rpc_code == -32601:
+                code = "approval.confirmation_unsupported"
+            elif isinstance(exc, ValidationError) or rpc_code == -32602:
+                code = "approval.confirmation_invalid"
+            elif isinstance(exc, (OSError, anyio.BrokenResourceError, anyio.EndOfStream)):
+                code = "approval.confirmation_transport"
+            else:
+                code = "approval.confirmation_failed"
+            trace("confirmation.error", code=code, exceptionType=type(exc).__name__, rpcCode=rpc_code)
+            # No raw exception text: clients can echo URLs or credentials in it.
+            if code == "approval.policy_rejected":
+                raise ApprovalError(code, "The client reported a policy rejection. Resolve that policy decision before retrying; nothing was applied.") from None
+            raise ApprovalError(code, "The client confirmation did not complete. No approval decision was recorded by this handler.",
+                                approval_url=approval_url) from None
+        action = getattr(outcome, "action", None)
+        data = getattr(outcome, "data", None)
+        approve = getattr(data, "approve", None)
+        trace("confirmation.response", action=action if action in ("accept", "decline", "cancel") else "invalid",
+              approve=approve if isinstance(approve, bool) else None)
+        if action == "cancel":
+            raise ApprovalError("approval.cancelled", "The client cancelled the confirmation. This is not a recorded decline.",
+                                approval_url=approval_url, action=action)
+        if action not in ("accept", "decline") or (mode == "form" and action == "accept" and not isinstance(approve, bool)):
+            raise ApprovalError("approval.confirmation_invalid", "The client returned an invalid confirmation response. No approval decision was recorded.",
+                                approval_url=approval_url)
+        if mode == "url":
+            if action == "decline":
+                await async_spend(APPROVALS_CONFIRM, path=APPROVALS_CONFIRM["path_template"],
+                                  body={"handle": handle, "accepted": False})
+                _forget_approval(caller, digest)
+                raise ApprovalError("approval.elicitation_declined", "The client returned decline for opening the approval page. The approval request was closed; nothing was applied. This does not establish who declined.", action=action)
+            try:
+                receipt = await _await_decision(ctx, handle, approval_url)
+            except ApprovalError as exc:
+                if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
+                    _forget_approval(caller, digest)
+                raise
             _forget_approval(caller, digest)
-            # Tells the client the out-of-band step is over, so it can stop
-            # showing the person a link to a page that no longer needs them.
             with contextlib.suppress(Exception):
                 await ctx.session.send_elicit_complete(digest)
             return receipt
-
-        if "form" in modes:
-            outcome = await ctx.elicit(message, _ApprovalConfirmation)
-            accepted = (
-                outcome.action == "accept"
-                and getattr(outcome.data, "approve", False) is True
-            )
-            # Recorded either way. A decline is a decision a person made and
-            # belongs in the audit trail; leaving the row pending would also
-            # leave it decidable by somebody else afterwards.
-            await async_spend(
-                APPROVALS_CONFIRM,
-                path=APPROVALS_CONFIRM["path_template"],
-                body={"handle": handle, "accepted": accepted},
-            )
-            _forget_approval(caller, digest)
-            if not accepted:
-                raise ToolError(_APPROVAL_DECLINED)
-            return await io_call(_claim, handle)
-
-        # Neither mode. Today that is *every* client, because the transport
-        # this runtime serves has no back-channel for server-initiated
-        # requests -- measured, not assumed, and pinned by
-        # TransportCannotElicitTests. So this is the working path rather than
-        # the fallback, and it is a two-call flow: the first call asks and
-        # says where, the second spends the answer.
-        #
-        # Refused rather than left hanging, because nothing has told the
-        # person to open the page -- the refusal is what the agent repeats to
-        # them, and it carries the summary so they know what they are being
-        # asked to allow before they follow a link.
-        summary = (packet or {}).get("summary")
-        raise ToolError(
-            f"This needs your approval before it can happen.{
-                ' ' + summary if summary else ''
-            } Approve it here: {approval_url}"
-            " -- then ask me to try again and I will pick up your decision."
-        )
+        accepted = action == "accept" and approve is True
+        await async_spend(APPROVALS_CONFIRM, path=APPROVALS_CONFIRM["path_template"],
+                          body={"handle": handle, "accepted": accepted})
+        _forget_approval(caller, digest)
+        if not accepted:
+            raise ApprovalError("approval.declined", "The confirmation was declined by the client; nothing was applied.", action=action)
+        return await io_call(_claim, handle)
 
     #: Approvals this process has asked for and not yet spent, keyed by the
     #: grant and the exact request. Small and short-lived: an entry is dropped
@@ -1670,15 +1725,15 @@ def build_runtime(
         if status == "pending":
             return None
         if status == "declined":
-            raise ToolError(_APPROVAL_DECLINED)
+            raise ApprovalError("approval.declined", "The recorded approval was declined; nothing was applied.")
         if status == "expired":
-            raise ToolError(
+            raise ApprovalError("approval.expired",
                 "The approval request expired before it was decided. Ask me"
                 " to try again if you still want this change."
             )
         receipt = claimed.get("receipt")
         if not receipt:
-            raise ToolError(
+            raise ApprovalError("approval.receipt_missing",
                 "The approval was recorded but no receipt came back, so this"
                 " request cannot proceed. Ask me to try again."
             )
@@ -1698,14 +1753,14 @@ def build_runtime(
         status = claimed.get("status")
         receipt = claimed.get("receipt")
         if status == "declined":
-            raise ToolError(_APPROVAL_DECLINED)
+            raise ApprovalError("approval.declined", "The recorded approval was declined; nothing was applied.")
         if status == "expired":
-            raise ToolError(
+            raise ApprovalError("approval.expired",
                 "The approval request expired before it was decided. Ask me"
                 " to try again if you still want this change."
             )
         if not receipt:
-            raise ToolError(
+            raise ApprovalError("approval.receipt_missing",
                 "The approval was recorded but no receipt came back, so this"
                 " request cannot proceed. Ask me to try again."
             )
@@ -1733,9 +1788,9 @@ def build_runtime(
             status = claimed.get("status")
             if status != "pending":
                 if status == "declined":
-                    raise ToolError(_APPROVAL_DECLINED)
+                    raise ApprovalError("approval.declined", "The recorded approval was declined; nothing was applied.")
                 if status == "expired":
-                    raise ToolError(
+                    raise ApprovalError("approval.expired",
                         "The approval request expired before it was decided."
                         " Ask me to try again if you still want this change."
                     )
@@ -1745,7 +1800,7 @@ def build_runtime(
                     # approved request answers without one, so this is what a
                     # lost first answer looks like -- not a refusal, and not
                     # something a retry of this call can recover.
-                    raise ToolError(
+                    raise ApprovalError("approval.receipt_missing",
                         "The approval was recorded but no receipt came back,"
                         " so this request cannot proceed. Ask me to try again."
                     )
@@ -1754,11 +1809,8 @@ def build_runtime(
                 break
             await anyio.sleep(min(APPROVAL_POLL_SECONDS, deadline))
             deadline -= APPROVAL_POLL_SECONDS
-        raise ToolError(
-            "Nobody decided within the time this call can wait. The request"
-            f" is still waiting at {approval_url} -- approve it there, then"
-            " ask me to try again."
-        )
+        raise ApprovalError("approval.decision_timeout",
+            "Nobody decided within the time this call can wait. The request is still waiting.", approval_url=approval_url)
 
     @tool(
         operation=LAYERS_LIST,
@@ -3148,11 +3200,11 @@ def build_runtime(
         review = (proposal.get("evidence") or {}).get("review") or {}
         binding = review.get("binding") or {}
         if not review.get("eligible"):
-            raise ToolError("A fresh retained candidate preview is required. Run proposals_preview_screenshot, poll visual_operations_show, show the review links, then pass its evidence_operation_id. Visual permission is required.")
+            raise ApprovalError("proposal.preview_required", "A fresh retained candidate preview is required. Run proposals_preview_screenshot, poll visual_operations_show, show the review links, then pass its evidence_operation_id. Visual permission is required.")
         if any(binding.get(key) != proposal.get(key) for key in ("proposalId", "candidateHash", "originalRevision")) or binding.get("evidenceOperationId") != evidence_operation_id:
-            raise ToolError("Preview does not match this proposal and revision. Render and review the correct candidate before confirming.")
+            raise ApprovalError("proposal.preview_mismatch", "Preview does not match this proposal and revision. Render and review the correct candidate before confirming.")
         if not review.get("complete") and not acknowledge_incomplete_preview:
-            raise ToolError("Preview captures or checks are incomplete. Render complete evidence, or ask the user to approve the listed gaps with acknowledge_incomplete_preview=true.")
+            raise ApprovalError("proposal.preview_incomplete", "Preview captures or checks are incomplete. Render complete evidence, or ask the user to approve the listed gaps with acknowledge_incomplete_preview=true.")
         target = PROPOSALS_APPLY["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
@@ -3166,6 +3218,9 @@ def build_runtime(
             ctx, PROPOSALS_APPLY, path=target, body=body,
             tool_name="proposals_apply", packet=proposal,
         )
+        if TRACE.get() is not None:
+            TRACE.get()["phase"] = "apply"
+        trace("apply.requested")
         return _applied(await async_spend(
             PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
         ))
@@ -3256,13 +3311,13 @@ def build_runtime(
             # Refused before anybody is asked. A person asked to approve an
             # applied proposal would be agreeing to nothing, and the platform
             # would refuse afterwards anyway -- with a prompt already spent.
-            raise ToolError(
+            raise ApprovalError("proposal.not_applicable",
                 f"This proposal is {status}, so there is nothing to apply."
                 " proposals_list shows which are still pending."
             )
         applicable = _applicability(proposal, payload.get("revision"))
         if applicable == "superseded":
-            raise ToolError("Workspace revision changed. Create and preview a new proposal before requesting approval.")
+            raise ApprovalError("proposal.revision_conflict", "Workspace revision changed. Create and preview a new proposal before requesting approval.")
         packet = {
             "summary": proposal.get("explanation")
             or f"Apply proposal {proposal_id}.",
@@ -4176,6 +4231,32 @@ def build_runtime(
             if frozenset(tool_scopes.get(described.name, ())) <= held
         ]
 
+    sdk_call_tool = server.call_tool
+
+    async def call_tool(name, arguments, context=None):
+        token = TRACE.set({"correlationId": secrets.token_hex(16), "tool": name, "phase": "tool"})
+        trace("tool.started")
+        try:
+            result = await sdk_call_tool(name, arguments, context)
+            trace("tool.completed")
+            return result
+        except ToolError as exc:
+            cause = exc
+            while cause is not None and not isinstance(cause, DiagnosticToolError):
+                cause = cause.__cause__
+            if isinstance(cause, DiagnosticToolError):
+                trace("tool.refused", code=cause.detail['code'])
+                return CallToolResult(isError=True, structuredContent={"error": cause.detail},
+                    content=[TextContent(type="text", text=json.dumps({"error": cause.detail}))])
+            trace("tool.failed", exceptionType=type(exc).__name__)
+            raise
+        except BaseException as exc:
+            trace("tool.aborted", exceptionType=type(exc).__name__)
+            raise
+        finally:
+            TRACE.reset(token)
+
+    server.call_tool = call_tool
     server.list_tools = list_tools
     # Exposed so tests can derive what a given grant should see from the same
     # values the filter uses, rather than restating a list that drifts.

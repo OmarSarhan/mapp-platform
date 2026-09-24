@@ -78,6 +78,21 @@ class ConfigApiClientTests(unittest.TestCase):
         Handler.seen = []
         Handler.delay = 0.0
 
+    def test_correlated_logs_link_the_platform_request_without_credentials(self):
+        from approval_diagnostics import TRACE
+        token = TRACE.set({'correlationId':'c'*32, 'tool':'proposals_apply'})
+        try:
+            with self.assertLogs('mapp.approval', level='INFO') as logs:
+                self.client.post(path='/api/approvals', query='', token='secret-token',
+                                 receipt='secret-receipt', body={'packet':'secret-body'})
+            joined = '\n'.join(logs.output)
+            self.assertIn('c'*32, joined)
+            self.assertIn(Handler.seen[0]['requestId'], joined)
+            for value in ('secret-token','secret-receipt','secret-body'):
+                self.assertNotIn(value, joined)
+        finally:
+            TRACE.reset(token)
+
     def test_a_get_sends_no_body_and_no_content_type(self):
         """A GET with a body is a different request from one without, and the
         digest the credential is bound to distinguishes them."""

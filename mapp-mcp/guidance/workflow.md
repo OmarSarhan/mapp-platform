@@ -163,3 +163,12 @@ stops outside a study circle. Distinguish whole-feature selection from geometry
 clipping and visual masking. Unknown means unverified; neither a layer name nor
 a visible circle proves a spatial restriction. Do not introduce data-specific
 predicates or assume that a map-extent scope clips features.
+
+
+When confirmation fails, read `structuredContent.error.code` and report its
+`correlationId`. Cancellation is not a user decline. If the response offers an
+`approvalUrl`, show it to the person so they can explicitly decide, then retry
+identical tool arguments to collect that decision. Do not treat conversational
+approval or opening the page as the platform decision. An explicit decline or
+client policy rejection is not permission to use an alternate approval route.
+Never retry an indeterminate or committed apply automatically.

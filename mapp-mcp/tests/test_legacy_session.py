@@ -648,7 +648,7 @@ class CrossSessionElicitationTests(unittest.TestCase):
     from a harness that cannot detect success would prove nothing at all.
     """
 
-    def run_case(self, *, answer_on_victim):
+    def run_case(self, *, answer_on_victim, mode="form", action="decline"):
         """Drive one eliciting call and answer it from one session or another.
 
         Returns whether the victim's call completed. The two cases differ in
@@ -668,7 +668,7 @@ class CrossSessionElicitationTests(unittest.TestCase):
                             "protocolVersion": V,
                             # Declaring form elicitation is what makes the
                             # runtime ask rather than send them to a dashboard.
-                            "capabilities": {"elicitation": {"form": {}}},
+                            "capabilities": {"elicitation": {mode: {}}},
                             "clientInfo": {"name": "probe", "version": "1"},
                         },
                     })
@@ -712,13 +712,19 @@ class CrossSessionElicitationTests(unittest.TestCase):
                 answerer = victim if answer_on_victim else attacker
                 await answerer.request(
                     {"jsonrpc": "2.0", "id": prompt[0]["id"],
-                     "result": {"action": "decline"}},
+                     "result": {"action": action}},
                     version=V,
                 )
                 try:
                     await asyncio.wait_for(call, timeout=5)
                     outcome["answered"] = True
                     outcome["text"] = self.text_of(seen[0][2] if seen else "")
+                    for line in seen[0][2].splitlines():
+                        if line.startswith('data: '):
+                            frame = json.loads(line[6:])
+                            if frame.get('id') == 7:
+                                outcome['result'] = frame.get('result')
+                    outcome['prompt'] = prompt[0]['params']
                 except asyncio.TimeoutError:
                     # Still waiting on a prompt nobody it trusts has answered.
                     call.cancel()
@@ -747,6 +753,18 @@ class CrossSessionElicitationTests(unittest.TestCase):
                 part.get("text", "") for part in result.get("content", [])
             )
         return ""
+
+    def test_url_cancellation_returns_structured_error_and_dashboard_link(self):
+        result = self.run_case(answer_on_victim=True, mode='url', action='cancel')
+        self.assertTrue(result['answered'])
+        self.assertTrue(result['result']['isError'])
+        error = result['result']['structuredContent']['error']
+        self.assertEqual('approval.cancelled', error['code'])
+        self.assertEqual('cancel', error['action'])
+        self.assertEqual('url', error['mode'])
+        self.assertRegex(error['correlationId'], '^[a-f0-9]{32}$')
+        self.assertIn('#approvals/', error['approvalUrl'])
+        self.assertEqual('url', result['prompt']['mode'])
 
     def test_the_right_session_can_answer(self) -> None:
         """The positive control, and it earned its place.
