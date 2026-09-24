@@ -291,6 +291,34 @@ If your assistant cannot show prompts, it will instead give you a link to the
 dashboard and ask you to try again after you approve there. Same permission,
 one extra step.
 
+### Apply returns a decline without showing a prompt
+
+`approval.elicitation_declined` with `mode: "url"`, `action: "decline"`
+and `applyAttempted: false` means the MCP client refused the request to open
+the approval page. It does not prove that a person clicked Decline. A client
+can advertise elicitation support while its current policy suppresses prompts.
+Conversational approval does not answer this separate confirmation request.
+
+For Codex, check the affected session's effective approval settings, including
+session overrides and managed policy. Interactive runs use
+`approval_policy = "on-request"`; when using granular approval policy,
+`mcp_elicitations = true` allows MCP prompts to surface. To have the person
+review eligible prompts, use `approvals_reviewer = "user"`. These are client
+settings, not MAPP settings or tool arguments. See the
+[Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+If no prompt appeared, the client developer should trace
+`mcpServer/elicitation/request` and its response using the returned elicitation
+ID, alongside the effective policy and any UI timeout or automatic review.
+MAPP's correlation ID connects the server-side exchange to configuration API
+requests, but cannot identify who or what produced a bare client `decline`.
+
+Resolve the client confirmation issue before a user-authorized retry. Do not
+switch confirmation routes automatically after a decline, fabricate acceptance,
+or bypass preview binding. A closed approval request cannot be reused. Before
+retrying, inspect the proposal and evidence again; a newer successful preview
+does not rewrite the failed checks in an older preview operation.
+
 ### What asks, and what does not
 
 **Asks you** (7): applying a workspace proposal, applying a semantic proposal,
