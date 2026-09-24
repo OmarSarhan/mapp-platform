@@ -322,6 +322,7 @@ function PrimaryNavigation({children}){
 
 export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null,activeArea="workspace",openWorkspace=()=>{},children}){
  const [ws,setWs]=useState(null),[rev,setRev]=useState(),[catalog,setCatalog]=useState([]),[databases,setDatabases]=useState([]),[icons,setIcons]=useState([]),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[derivedUpdate,setDerivedUpdate]=useState(null);
+ const [boundaryData,setBoundaryData]=useState(null);
  const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving',reloading=activity==='reloading';
  const beginActivity=next=>{if(activityRef.current)return false;activityRef.current=next;setActivity(next);return true};
  const endActivity=completed=>{if(activityRef.current!==completed)return;activityRef.current=null;setActivity(null)};
@@ -331,6 +332,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
  useEffect(()=>{load(true);poll();const id=setInterval(poll,10000);return()=>clearInterval(id)},[]);
  useEffect(()=>{const receive=event=>setDerivedUpdate({derivedLayer:event.detail,nonce:Date.now()});window.addEventListener('mapp-derived-layer-changed',receive);return()=>window.removeEventListener('mapp-derived-layer-changed',receive)},[]);
  const currentDerivedChange=derivedChange||derivedUpdate;
+ useEffect(()=>{let active=true;setBoundaryData(null);if(ws)api(`/api/layers?locale=${encodeURIComponent(localeKey)}`).then(result=>{if(active)setBoundaryData(result)}).catch(()=>{});return()=>{active=false}},[localeKey,rev,derivedUpdate]);
  useEffect(()=>{if(!currentDerivedChange?.derivedLayer)return;let active=true;(async()=>{try{const data=await api('/api/catalog');if(!active)return;setCatalog(data.tables);setDatabases(data.databases);setWs(old=>{const reconciled=reconcileDerivedWorkspace(old,currentDerivedChange.derivedLayer,data.tables);if(reconciled.summary.layers){setDirty(true);setErrors([]);setStatus({kind:'pending',message:`Updated ${reconciled.summary.layers} workspace layer(s): ${reconciled.summary.added} field(s) added and ${reconciled.summary.removed} removed. Review, then save and reload XYZ.`})}return reconciled.workspace})}catch(e){if(active)setStatus({kind:'error',message:'The derived layer changed, but the workspace catalog could not be refreshed.',errors:[{path:'catalog',message:e.message}]})}})();return()=>{active=false}},[currentDerivedChange]);
  useEffect(()=>{const fn=e=>{if(dirty){e.preventDefault();e.returnValue=''}};addEventListener('beforeunload',fn);return()=>removeEventListener('beforeunload',fn)},[dirty]);
  const update=fn=>{if(activityRef.current)return;setWs(old=>{const x=clone(old);fn(x);return x});setDirty(true);setErrors([]);setStatus(null)};
@@ -408,7 +410,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
       <button disabled={!dirty||busy} className="save-button" onClick={save}><Save size={17} aria-hidden="true"/>{saving?'Restarting XYZ…':'Save & reload XYZ'}</button>
      </div>
     </div>
-    <div className="editor-scroll">{namedReadOnly&&<div className="status-bar locale-readonly"><div><strong>Effective named locale — read-only in the dashboard.</strong><p>XYZ composes this view from the default locale and its raw named override. Use config-cli or the API for focused JSON Pointer edits without flattening inheritance.</p></div></div>}{layer?(namedReadOnly?<EffectiveLayer layerKey={selected} layer={layer} table={table}/>:<Layer workspace={ws} localeKey={localeKey} layerKey={selected} layer={layer} table={table} catalog={catalog} databases={databases} icons={icons} plugins={pluginCatalogue} workspaceDb={ws.dbs} setLayer={setLayer} renameLayer={renameLayer} remove={()=>{mutateLayers((x,l)=>delete l.layers[selected]);setSelected()}}/>):<Workspace ws={ws} loc={loc} databases={databases} plugins={pluginCatalogue} mutate={mutate} mutateWorkspace={mutateWorkspace} localeReadOnly={namedReadOnly}/>}</div>
+    <div className="editor-scroll">{layer&&<BoundaryReport report={JSON.stringify(boundaryData?.layers?.[selected])===JSON.stringify(layer)?boundaryData?.boundaryReports?.[selected]:null}/>}{namedReadOnly&&<div className="status-bar locale-readonly"><div><strong>Effective named locale — read-only in the dashboard.</strong><p>XYZ composes this view from the default locale and its raw named override. Use config-cli or the API for focused JSON Pointer edits without flattening inheritance.</p></div></div>}{layer?(namedReadOnly?<EffectiveLayer layerKey={selected} layer={layer} table={table}/>:<Layer workspace={ws} localeKey={localeKey} layerKey={selected} layer={layer} table={table} catalog={catalog} databases={databases} icons={icons} plugins={pluginCatalogue} workspaceDb={ws.dbs} setLayer={setLayer} renameLayer={renameLayer} remove={()=>{mutateLayers((x,l)=>delete l.layers[selected]);setSelected()}}/>):<Workspace ws={ws} loc={loc} databases={databases} plugins={pluginCatalogue} mutate={mutate} mutateWorkspace={mutateWorkspace} localeReadOnly={namedReadOnly}/>}</div>
    </section>
   </>}
   </main>
@@ -437,6 +439,15 @@ function SourceCatalog({catalog,selected,onSelect,search,setSearch,addTable,name
    </>:<div className="catalog-empty"><Database size={32}/><h2>Select a source</h2><p>Its columns and available actions will appear here.</p></div>}</section>
   </div>
  </section>;
+}
+export function BoundaryReport({report}){
+ return <section className="layer-section boundary-report" aria-label="Boundary behavior"><h2>Boundary behavior</h2>{report?<>
+  <p><strong>Study boundary: {report.studyBoundary.status}.</strong> {report.studyBoundary.reason}</p>
+  <p><strong>Feature selection: {report.featureSelection.status}.</strong> {report.featureSelection.description}</p>
+  {report.featureSelection.platformScopes.map(item=><details key={item.relation}><summary>{item.relation}: configured map extent, whole intersecting features</summary><pre>{JSON.stringify(item.boundary,null,2)}</pre></details>)}
+  <p><strong>Geometry clipping: {report.geometryClipping.status}.</strong> {report.geometryClipping.description}</p>
+  <p><strong>Visual mask: {report.visualMask.status}.</strong> {report.visualMask.description}</p>
+ </>:<p>Boundary behavior is unknown for this configuration. Save or reload to inspect current metadata. A drawn circle or layer name does not establish filtering or clipping.</p>}</section>;
 }
 function DerivedLayerHeaderMenu({disabled,openDerivedLayers}){
  const [items,setItems]=useState([]),[loading,setLoading]=useState(false),[error,setError]=useState('');
@@ -783,24 +794,28 @@ export function ApprovalDetail({approval,busy,decide}){
  const packet=approval.packet||{};
  const changes=Array.isArray(packet.changes)?packet.changes:[];
  const evidence=packet.evidence||null;
- const [confirming,setConfirming]=useState(false);
+ const [confirming,setConfirming]=useState(false),[acknowledged,setAcknowledged]=useState(false);
+ useEffect(()=>{setConfirming(false);setAcknowledged(false)},[approval.reference]);
+ const review=evidence?.review,incomplete=review&&!review.complete;
  return <div className="approval-detail">
   <h4>{approval.operation}</h4>
   <p className="muted">Asked by <strong>{approval.tool||'an agent'}</strong> using client <code>{approval.client}</code>. Costs <code>{(approval.scopes||[]).join(' ')}</code>. Expires {approval.expires}.</p>
   {approval.risk&&<p className={`approval-risk approval-risk-${approval.risk}`}>Risk: {approval.risk}</p>}
   {packet.summary&&<p className="approval-summary">{packet.summary}</p>}
+  {review?.binding&&<p className="approval-binding">Proposal <code>{review.binding.proposalId}</code> · preview <code>{review.binding.evidenceOperationId}</code><br/>Candidate <code>{review.binding.candidateHash}</code></p>}
   {changes.length>0&&<><h5>Changes ({packet.changeCount??changes.length})</h5><ul className="approval-changes">{changes.map((change,index)=><ApprovalChange key={index} change={change}/>)}</ul>{packet.changeCount>changes.length&&<p className="muted">Showing {changes.length} of {packet.changeCount}. The rest are in the proposal.</p>}</>}
   {evidence&&<><h5>Evidence</h5>
    <p className={evidence.passed?'approval-evidence-pass':'approval-evidence-fail'}>Visual check {evidence.passed?'passed':`failed at ${evidence.failedStage||'an unnamed stage'}`}.</p>
    {Array.isArray(evidence.failedChecks)&&evidence.failedChecks.length>0&&<ul className="approval-changes">{evidence.failedChecks.map((check,index)=><li key={index}><code>{check.check}</code> <span className="muted">({check.side})</span></li>)}</ul>}
-   {evidence.artifacts&&<div className="approval-artifacts">{Object.entries(evidence.artifacts).map(([name,href])=><a key={name} href={`/api/artifacts/${href}`} target="_blank" rel="noreferrer">{name}</a>)}</div>}
+   {review?<div className="approval-review-captures">{review.captures.map(capture=><div key={`${capture.side}-${capture.kind}`}><strong>{capture.side} · {capture.kind}</strong>{capture.status==='captured'?<a href={capture.download?.url||capture.download?.path} target="_blank" rel="noreferrer">Download {capture.side} {capture.kind} PNG ({capture.width} × {capture.height})</a>:<span>{capture.status}</span>}</div>)}<p>Links expire after one hour. Ask the agent to poll the preview again to renew them.</p></div>:evidence.artifacts&&<div className="approval-artifacts">{Object.entries(evidence.artifacts).filter(([,href])=>href).map(([name,href])=><a key={name} href={`/api/artifacts/${href}`} target="_blank" rel="noreferrer">{name}</a>)}</div>}
+   {incomplete&&<label className="check"><input type="checkbox" checked={acknowledged} onChange={event=>setAcknowledged(event.target.checked)}/><span>I have reviewed and accept the incomplete captures or failed checks. Missing candidate captures: {(review.missingCandidateCaptures||[]).join(', ')||'none'}.</span></label>}
   </>}
   {!changes.length&&!evidence&&<p className="muted">This request carried no summary. Approving it grants the operation named above and nothing else, but you are deciding on less than you should be — ask the agent to include a packet.</p>}
   <div className="approval-actions">
    <button className="danger" disabled={busy} onClick={()=>decide(approval.reference,false)}>Decline</button>
    {confirming
-    ?<button disabled={busy} onClick={()=>decide(approval.reference,true)}>{busy?'Approving…':`Yes — approve ${approval.operation}`}</button>
-    :<button disabled={busy} onClick={()=>setConfirming(true)}>Approve…</button>}
+    ?<button disabled={busy||incomplete&&!acknowledged} onClick={()=>decide(approval.reference,true)}>{busy?'Approving…':`Yes — approve ${approval.operation}`}</button>
+    :<button disabled={busy||incomplete&&!acknowledged} onClick={()=>setConfirming(true)}>Approve…</button>}
   </div>
  </div>;
 }
@@ -819,7 +834,7 @@ export function ApprovalWindows({windows,clients,busy,open,revoke}){
  const agents=clients.filter(client=>!client.confidential&&!client.disabled);
  const live=windows.filter(item=>item.live);
  return <><h3>Standing approvals {live.length>0&&<span className="approval-count">{live.length}</span>}</h3>
-  <p className="muted">Turn on automatic approval for an MCP client to let it perform any action its current permissions allow, including semantic and federation changes. It stays on until you turn it off, with no time or action limit. Enabling requires a sign-in within the last 15 minutes.</p>
+  <p className="muted">Automatic approval covers permitted actions including semantic and federation changes. Applying a map proposal always requires a separate confirmation of that proposal and its preview. It stays on until you turn it off, with no time or action limit. Enabling requires a sign-in within the last 15 minutes.</p>
   {agents.length===0&&<p className="muted">Register an MCP agent client to enable standing approval.</p>}
   {agents.map(client=>{
    const approval=live.find(item=>item.clientId===client.clientId);

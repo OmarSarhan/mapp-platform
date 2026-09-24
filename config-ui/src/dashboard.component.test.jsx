@@ -2736,7 +2736,7 @@ describe('Standing approvals', () => {
     expect(screen.getByRole('switch', {name: 'Automatic approval for Claude Code'}).getAttribute('aria-checked')).toBe('false');
     expect(screen.queryAllByRole('combobox')).toHaveLength(0);
     expect(screen.queryAllByRole('spinbutton')).toHaveLength(0);
-    expect(screen.getByText(/any action its current permissions allow/)).toBeTruthy();
+    expect(screen.getByText(/Applying a map proposal always requires a separate confirmation/)).toBeTruthy();
     expect(screen.getByText(/no time or action limit/)).toBeTruthy();
   });
 
@@ -2840,6 +2840,19 @@ describe('Agent approvals', () => {
 
     fireEvent.click(screen.getByText('Decline'));
     expect(decide).toHaveBeenCalledWith('a'.repeat(64), false);
+  });
+
+  test('partial preview approval requires acknowledgment and links the original PNG', () => {
+    const approval = {...WAITING, packet: {...WAITING.packet, evidence: {...WAITING.packet.evidence, review: {
+      complete: false, binding: {proposalId: 'p-1', candidateHash: 'abc', evidenceOperationId: 'op-1'},
+      captures: [{side:'candidate',kind:'map',status:'captured',width:2160,height:3240,download:{url:'https://example.test/original.png'}},
+                 {side:'candidate',kind:'popup',status:'missing'}],
+    }}}};
+    render(<ApprovalDetail approval={approval} busy={false} decide={vi.fn()}/>);
+    expect(screen.getByText('Approve…').disabled).toBe(true);
+    expect(screen.getByRole('link', {name:/candidate map/}).getAttribute('href')).toBe('https://example.test/original.png');
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect(screen.getByText('Approve…').disabled).toBe(false);
   });
 
   test('a request with no packet says so rather than looking routine', () => {

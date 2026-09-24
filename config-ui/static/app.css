@@ -480,3 +480,7 @@ button[role=switch][aria-checked=true]{border-color:var(--brand);background:var(
  .reload-actions .header-reload span{display:inline}
  .reload-actions button svg{display:none}
 }
+.approval-binding{overflow-wrap:anywhere}
+.approval-review-captures{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}
+.approval-review-captures>div{display:grid;gap:8px;padding:12px;border:1px solid var(--line)}
+.approval-review-captures>p{grid-column:1/-1}
