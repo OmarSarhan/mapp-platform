@@ -172,3 +172,11 @@ identical tool arguments to collect that decision. Do not treat conversational
 approval or opening the page as the platform decision. An explicit decline or
 client policy rejection is not permission to use an alternate approval route.
 Never retry an indeterminate or committed apply automatically.
+
+Runtime 0.5.2 chooses form confirmation for HTTP approval pages when the client
+supports forms; HTTPS approval pages can use URL mode. This avoids the Codex
+VS Code extension rejecting HTTP URL prompts before displaying them. A form
+still requires the person's explicit response. If a decline persists with an
+interactive client policy, report the runtime version, host UI, correlation ID
+and selected mode; do not assume another policy change will fix it or retry
+apply without resolving the confirmation issue.

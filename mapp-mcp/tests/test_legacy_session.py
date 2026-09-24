@@ -66,8 +66,9 @@ class FakeExchange:
 
 
 class FakeConfigApi:
-    def __init__(self) -> None:
+    def __init__(self, approval_url=None) -> None:
         self.calls = []
+        self.approval_url = approval_url or "https://config.localhost/#approvals/" + "a" * 64
 
     def get(self, **kwargs):
         self.calls.append(kwargs)
@@ -84,8 +85,7 @@ class FakeConfigApi:
         self.calls.append(kwargs)
         if kwargs["path"] == "/api/approvals":
             return {"handle": "h", "reference": "a" * 64,
-                    "approvalUrl": "http://config.localhost/#approvals/"
-                                   + "a" * 64}
+                    "approvalUrl": self.approval_url}
         if kwargs["path"] == "/api/approvals/claim":
             return {"status": "approved", "receipt": "receipt-value"}
         if kwargs["path"] == "/api/approvals/confirm":

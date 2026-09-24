@@ -36,7 +36,7 @@ from authentication import CURRENT_CALLER  # noqa: E402
 
 HANDLE = "handle-value"
 RECEIPT = "receipt-value"
-APPROVAL_URL = "http://mapp.localhost/#approvals/" + "a" * 64
+APPROVAL_URL = "https://mapp.localhost/#approvals/" + "a" * 64
 
 PACKET = {"summary": "Rename the passport layer folder.", "changeCount": 112}
 
@@ -58,11 +58,12 @@ class FakeExchange:
 class FakeConfigApi:
     """Answers the approval routes; records everything, including receipts."""
 
-    def __init__(self, *, statuses=None) -> None:
+    def __init__(self, *, statuses=None, approval_url=APPROVAL_URL) -> None:
         # Consumed in order, so a test can make the first poll pending.
         self.statuses = list(statuses or [{"status": "approved",
                                            "receipt": RECEIPT}])
         self.calls = []
+        self.approval_url = approval_url
 
     def get(self, **kwargs):
         self.calls.append({"method": "GET", **kwargs})
@@ -72,7 +73,7 @@ class FakeConfigApi:
         self.calls.append({"method": "POST", **kwargs})
         if kwargs["path"] == APPROVALS_CREATE["path_template"]:
             return {"handle": HANDLE, "reference": "a" * 64,
-                    "approvalUrl": APPROVAL_URL}
+                    "approvalUrl": self.approval_url}
         if kwargs["path"] == APPROVALS_CLAIM["path_template"]:
             return (self.statuses.pop(0) if len(self.statuses) > 1
                     else self.statuses[0])
@@ -171,6 +172,54 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class FormModeTests(GateTestCase):
+    def test_form_wire_schema_is_restricted_but_response_validation_remains_strict(self):
+        from runtime import _ApprovalConfirmation
+        from mcp.server.elicitation import render_elicitation_schema
+        from pydantic import ValidationError
+        schema = render_elicitation_schema(_ApprovalConfirmation)
+        self.assertEqual({'type', 'properties', 'required'}, set(schema))
+        self.assertEqual(['approve'], schema['required'])
+        self.assertEqual({'approve'}, set(schema['properties']))
+        self.assertIs(True, _ApprovalConfirmation.model_validate({'approve': True}).approve)
+        for invalid in ({}, {'approve': 'true'}, {'approve': 1},
+                        {'approve': True, 'unexpected': True}):
+            with self.subTest(content=invalid), self.assertRaises(ValidationError):
+                _ApprovalConfirmation.model_validate(invalid)
+
+    async def test_http_instance_asks_native_form_before_any_url_request(self):
+        api = FakeConfigApi(approval_url=APPROVAL_URL.replace('https:', 'http:'))
+        ctx = FakeContext(elicitation=Capability(form={}, url={}),
+                          form=Answer('accept', Confirmation(True)),
+                          url=Answer('decline'))
+        self.assertEqual(RECEIPT, await self.gate(ctx, config_api=api))
+        self.assertEqual(['form'], [asked[0] for asked in ctx.asked])
+        self.assertEqual([True], [call['body']['accepted'] for call in
+                                 api.posted_to(APPROVALS_CONFIRM['path_template'])])
+
+    async def test_http_form_decline_never_tries_url_or_claims_receipt(self):
+        from approval_diagnostics import ApprovalError
+        api = FakeConfigApi(approval_url=APPROVAL_URL.replace('https:', 'http:'))
+        ctx = FakeContext(elicitation=Capability(form={}, url={}),
+                          form=Answer('decline'), url=Answer('accept'))
+        with self.assertRaises(ApprovalError) as raised:
+            await self.gate(ctx, config_api=api)
+        self.assertEqual('approval.declined', raised.exception.detail['code'])
+        self.assertEqual(['form'], [asked[0] for asked in ctx.asked])
+        self.assertFalse(api.posted_to(APPROVALS_CLAIM['path_template']))
+        self.assertNotIn('approvalUrl', raised.exception.detail)
+
+    async def test_http_url_only_client_is_told_about_https_before_prompting(self):
+        from approval_diagnostics import ApprovalError
+        api = FakeConfigApi(approval_url=APPROVAL_URL.replace('https:', 'http:'))
+        ctx = FakeContext(elicitation=Capability(url={}), url=Answer('decline'))
+        with self.assertRaises(ApprovalError) as raised:
+            await self.gate(ctx, config_api=api)
+        self.assertEqual('approval.confirmation_unsupported', raised.exception.detail['code'])
+        self.assertIn('HTTPS', raised.exception.detail['message'])
+        self.assertEqual([], ctx.asked)
+        self.assertFalse(api.posted_to(APPROVALS_CONFIRM['path_template']))
+        self.assertFalse(api.posted_to(APPROVALS_CLAIM['path_template']))
+
     async def test_a_yes_produces_a_receipt(self) -> None:
         api = FakeConfigApi()
         ctx = FakeContext(
@@ -270,6 +319,7 @@ class ConfirmationFailureTests(GateTestCase):
             (NotImplementedError('secret-token'), 'approval.confirmation_unsupported'),
             (OSError('secret-token'), 'approval.confirmation_transport'),
             (RuntimeError('secret-token'), 'approval.confirmation_failed'),
+            (ValueError('secret-token'), 'approval.confirmation_invalid'),
             (MCPError(code=-32601, message='secret-token'), 'approval.confirmation_unsupported'),
             (MCPError(code=-32000, message='secret-token', data={'code':'policy_rejected'}), 'approval.policy_rejected'),
             (MCPError(code=-32601, message='secret-token', data={'code':'policy_rejected'}), 'approval.policy_rejected'),
@@ -288,11 +338,13 @@ class ConfirmationFailureTests(GateTestCase):
     async def test_url_decline_closes_the_request_without_a_fallback_or_receipt(self):
         from approval_diagnostics import ApprovalError
         api = FakeConfigApi()
-        ctx = FakeContext(elicitation=Capability(url={}), url=Answer('decline'))
+        ctx = FakeContext(elicitation=Capability(form={}, url={}),
+                          url=Answer('decline'), form=Answer('accept', Confirmation(True)))
         with self.assertRaises(ApprovalError) as raised:
             await self.gate(ctx, config_api=api)
         self.assertEqual('approval.elicitation_declined', raised.exception.detail['code'])
         self.assertNotIn('approvalUrl', raised.exception.detail)
+        self.assertEqual(['url'], [asked[0] for asked in ctx.asked])
         self.assertEqual([False], [call['body']['accepted'] for call in api.posted_to(APPROVALS_CONFIRM['path_template'])])
         self.assertFalse(api.posted_to(APPROVALS_CLAIM['path_template']))
 

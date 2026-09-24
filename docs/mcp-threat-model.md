@@ -154,12 +154,20 @@ Measured client declarations remain:
 
 | Client | Measured declaration | Approval path |
 | --- | --- | --- |
-| Codex CLI 0.155.0 | `elicitation: {form, url}` | URL |
+| Codex CLI 0.155.0 | `elicitation: {form, url}` | URL for HTTPS approval pages; otherwise form |
 | Claude Code 2.1.276 | `elicitation: {}` | Form |
 | Gemini CLI 0.58.0 | none | Dashboard |
 
 These measurements were recorded on 2026-09-18 and do not claim later client
 versions behave identically.
+
+Runtime 0.5.2 checks the approval URL before selecting URL mode. The Codex
+VS Code extension bundled with CLI 0.155.0-alpha.16.3 rejects HTTP URLs before
+showing its prompt; advertised URL support alone is insufficient. On HTTP
+instances, a client advertising form support receives the existing native
+form, with the same exact-request receipt binding. No automatic mode switch
+occurs after a decline or policy rejection. URL-only clients without a usable
+HTTPS approval URL receive the authenticated dashboard flow before prompting.
 
 An administrator may enable a standing approval for one registered client and
 one platform instance. It stays enabled until turned off.

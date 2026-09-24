@@ -63,7 +63,7 @@ from pydantic import Field
 #: platform: it is the version of this protocol surface, and it moves when the
 #: tool contract does rather than when MAPP does.
 RUNTIME_NAME = "mapp-mcp"
-RUNTIME_VERSION = "0.5.1"
+RUNTIME_VERSION = "0.5.2"
 
 
 class DraftRetention(BaseModel):
@@ -298,6 +298,17 @@ class _ApprovalConfirmation(BaseModel):
         description="Approve this change? It cannot be undone automatically.",
     )
 
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        schema = super().model_json_schema(*args, **kwargs)
+        # MCP's requestedSchema root is a restricted object, not arbitrary
+        # JSON Schema. Codex rejects these Pydantic additions before the UI.
+        # Runtime validation still forbids extra keys and coerced booleans.
+        schema.pop("title", None)
+        schema.pop("description", None)
+        schema.pop("additionalProperties", None)
+        return schema
+
 
 def _elicitation_modes(ctx) -> frozenset:
     """Which elicitation modes this client declared, measured not assumed.
@@ -322,6 +333,25 @@ def _elicitation_modes(ctx) -> frozenset:
     if getattr(elicitation, "form", None) is not None:
         modes.add("form")
     return frozenset(modes or {"form"})
+
+
+def _approval_mode(modes, approval_url):
+    """Select a supported prompt before asking; never fall back after denial.
+
+    URL-mode hosts can enforce HTTPS even for localhost. In particular, the
+    Codex VS Code UI declines HTTP URLs without displaying a prompt although
+    its MCP capabilities advertise both modes. A native form is appropriate
+    for this non-secret, request-bound decision on HTTP development instances.
+    """
+    try:
+        parsed = urlsplit(approval_url)
+        secure_url = (parsed.scheme == "https" and bool(parsed.hostname)
+                      and parsed.username is None and parsed.password is None)
+    except ValueError:
+        secure_url = False
+    if "url" in modes and secure_url:
+        return "url"
+    return "form" if "form" in modes else "dashboard"
 
 
 def _approval_message(operation_id: str, packet: dict) -> str:
@@ -1600,7 +1630,7 @@ def build_runtime(
             TRACE.get()["approvalReference"] = (match.group(1) if (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)) else None)
         message = _approval_message(operation["operation_id"], packet)
         modes = _elicitation_modes(ctx)
-        mode = "url" if "url" in modes else "form" if "form" in modes else "dashboard"
+        mode = _approval_mode(modes, approval_url)
         current = TRACE.get()
         if current is not None:
             current.update(mode=mode, phase="confirmation", confirmationId=digest,
@@ -1610,7 +1640,10 @@ def build_runtime(
               confirmationId=digest, elicitationId=digest if mode == "url" else None)
         if mode == "dashboard":
             raise ApprovalError("approval.confirmation_unsupported",
-                "This client cannot display a confirmation request. This needs your approval before it can happen. " + str((packet or {}).get("summary") or "")[:500],
+                "This client cannot display a supported confirmation request. "
+                "URL-mode confirmation requires a credential-free HTTPS approval URL; "
+                "otherwise the client must support form mode or use the authenticated dashboard. "
+                "This needs your approval before it can happen. " + str((packet or {}).get("summary") or "")[:500],
                 approval_url=approval_url)
         try:
             with anyio.fail_after(APPROVAL_WAIT_SECONDS):
@@ -1630,7 +1663,7 @@ def build_runtime(
                 code = "approval.confirmation_timeout"
             elif isinstance(exc, NotImplementedError) or rpc_code == -32601:
                 code = "approval.confirmation_unsupported"
-            elif isinstance(exc, ValidationError) or rpc_code == -32602:
+            elif isinstance(exc, (ValidationError, ValueError)) or rpc_code == -32602:
                 code = "approval.confirmation_invalid"
             elif isinstance(exc, (OSError, anyio.BrokenResourceError, anyio.EndOfStream)):
                 code = "approval.confirmation_transport"

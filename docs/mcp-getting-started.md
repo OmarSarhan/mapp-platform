@@ -299,6 +299,18 @@ the approval page. It does not prove that a person clicked Decline. A client
 can advertise elicitation support while its current policy suppresses prompts.
 Conversational approval does not answer this separate confirmation request.
 
+Runtime `mapp-mcp/0.5.2` fixes a separate VS Code compatibility issue: the
+Codex extension rejects HTTP URLs in URL-mode elicitation before displaying
+the prompt, even with interactive approval enabled. MAPP now selects native
+form confirmation when the approval URL uses HTTP and the client advertises
+form support. HTTPS approval URLs retain browser confirmation. This selection
+happens before elicitation; an actual decline never triggers a second route.
+The form still binds the exact request, candidate and preview and requires a
+strict boolean approval. Reconnect an existing MCP connection after updating
+the runtime, and confirm `describe_instance` reports the new version.
+The form schema also omits root metadata rejected by Codex's typed parser;
+strict validation of the person's response remains enabled on MAPP.
+
 For Codex, check the affected session's effective approval settings, including
 session overrides and managed policy. Interactive runs use
 `approval_policy = "on-request"`; when using granular approval policy,
@@ -312,6 +324,32 @@ If no prompt appeared, the client developer should trace
 ID, alongside the effective policy and any UI timeout or automatic review.
 MAPP's correlation ID connects the server-side exchange to configuration API
 requests, but cannot identify who or what produced a bare client `decline`.
+
+An effective `on-request` policy does not prove that the host displays
+elicitation requests. If the failure
+persists with user review enabled, record the exact launch mode (interactive
+terminal, IDE, desktop, `codex exec`, or an app-server wrapper). A custom
+app-server host must handle `mcpServer/elicitation/request`, display the request
+and return the person's action. Check for a default decline handler or a prompt
+that was dropped before reaching the UI. Do not assume that installing the CLI
+means the affected session is using its interactive terminal. See the
+[app-server elicitation contract](https://learn.chatgpt.com/docs/app-server#mcp-server-elicitation-requests).
+
+Developers can test the installed Codex app-server against MAPP's real HTTP
+confirmation path, using fake backing services and a host that cancels the
+prompt. From the repository root, with `mapp-mcp/requirements.txt` installed:
+
+```sh
+MAPP_CODEX_TEST_BINARY=/absolute/path/to/codex \
+  python -m unittest discover -s mapp-mcp/tests -p test_codex_confirmation.py -v
+```
+
+This opt-in test starts no model turn and connects to no live MAPP instance.
+It verifies that HTTPS uses URL mode, HTTP uses form mode, both requests reach
+the host, and cancellation remains cancellation with no confirmation, receipt
+claim, or reload request. Passing
+does not validate an IDE's UI, Windows-specific behavior, or a model-driven
+tool call's prompt routing; those require tracing the affected client host.
 
 Resolve the client confirmation issue before a user-authorized retry. Do not
 switch confirmation routes automatically after a decline, fabricate acceptance,

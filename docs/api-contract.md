@@ -1716,7 +1716,18 @@ user-drawn circles and inferred study boundaries remain explicitly unknown.
 No filter, geometry, visibility, or live workspace configuration is changed.
 
 
-### MCP confirmation outcomes (runtime 0.5.1)
+### MCP confirmation outcomes (runtime 0.5.2)
+
+Before elicitation, the runtime selects URL mode only when the client advertises
+it and the approval URL is an absolute, credential-free HTTPS URL. Otherwise it
+selects advertised form mode; if neither is usable it returns
+`approval.confirmation_unsupported` with the authenticated dashboard flow.
+This avoids clients silently rejecting HTTP URL prompts. It does not retry a
+declined prompt in another mode. Form confirmation retains the same strict
+boolean and canonical request/preview binding as HTTPS URL confirmation.
+The form's wire schema omits Pydantic's root `title`, `description` and `additionalProperties`,
+which Codex's restricted MCP schema parser rejects. Server-side validation
+continues to reject extra keys, missing approval and non-boolean values.
 
 Confirmation failures return `isError: true` with the same error object in
 `structuredContent.error` and JSON text content. Each has a stable `code`,
