@@ -1154,10 +1154,10 @@ def _layer_summary(key, layer):
         "key": key,
         "name": layer.get("name") or key,
         "group": layer.get("group"),
-        # A zoom-keyed mapping rather than one relation is a valid layer shape
-        # and is not queryable by `layers_values`; reported as-is rather than
-        # flattened into something that looks usable.
+        # Preserve zoom mappings so callers can discover their stored columns.
+        # The configuration API decides whether they resolve unambiguously.
         "table": table if isinstance(table, str) else None,
+        **({"tables": layer["tables"]} if isinstance(layer.get("tables"), dict) else {}),
         "displayFields": display,
     }
 
@@ -4049,6 +4049,8 @@ def build_runtime(
             "Distribution summary for one numeric column of one layer: range,"
             " central tendency and a histogram. Takes a column name from"
             " catalog_list, as layers_values does. Aggregates only, never rows."
+            " Single-relation zoom tiers resolve automatically; effectiveDataset"
+            " reports the relation and its minimum zoom."
         ),
     )
     def layers_statistics(
@@ -4087,6 +4089,9 @@ def build_runtime(
             "Bounded category counts for one field of one configured layer."
             " Returns aggregate counts from the layer's effective restrictions,"
             " never raw rows."
+            " Single-relation zoom tiers resolve automatically even when table"
+            " is null; effectiveDataset reports the relation and minimum zoom."
+            " A missing value in a truncated result does not prove absence."
         ),
     )
     def layers_values(

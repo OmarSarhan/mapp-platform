@@ -269,6 +269,18 @@ upper-bound candidate class counts. Empty distributions return null min/max
 and empty quantile/histogram arrays. Values are aggregates only; no source row
 or field value is returned.
 
+Both `/values` and `/statistics` support a zoom-dependent `tables` mapping
+when it exposes exactly one relation from a minimum zoom onward, including
+`table: null`. Resolution uses the same safe resolver as visual planning and
+does not modify the workspace. `effectiveDataset.relation` identifies the
+queried relation; `effectiveDataset.sourceResolution` then reports
+`mode: "single-relation-zoom-tiers"` and `minimumZoom`. These counts describe
+the effective restricted dataset, not current viewport visibility. Fixed
+geometry and feature ID are required; mappings that switch relations or hide
+the source again remain rejected. Read-only execution, five-second timeout,
+stored-column checks, output bounds, and permission requirements are unchanged.
+The MCP layer listing preserves `tables` for column discovery.
+
 Use a raw numeric field for statistics, filtering, and symbology. A separately
 formatted text field belongs only in hover and feature information. For a
 one-decimal display, a threshold such as `0.05` can be audited directly; a

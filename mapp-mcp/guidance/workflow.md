@@ -23,6 +23,17 @@ reads a relation, which is the question to ask before altering anything shared.
 A displayed field is not necessarily a column. `layers_values` needs a real
 column of the layer's table, which `catalog_list` resolves.
 
+For zoom-dependent layers, inspect `tables` even if `table` is null. When one
+relation is exposed from a minimum zoom onward, `layers_values` and
+`layers_statistics` resolve it automatically. Use that relation with
+`catalog_list` to discover stored columns and read the returned
+`effectiveDataset` for the actual relation, minimum zoom and restrictions.
+Mappings that switch datasets or hide the source again are deliberately
+refused; do not rewrite the workspace merely to inspect them. Counts are for
+the restricted dataset, not the current viewport. A truncated values response
+cannot prove a missing identifier is absent, and presence alone does not
+validate a spatial-distance calculation.
+
 **3. Build the smallest operation set.** One coherent change. Do not bundle
 unrelated edits into a proposal a person then has to accept or reject whole.
 

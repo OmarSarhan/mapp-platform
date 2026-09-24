@@ -2102,6 +2102,60 @@ class AuthenticationHeaderTests(unittest.TestCase):
 
 
 class LayersRouteTests(unittest.TestCase):
+    def test_aggregates_resolve_inherited_zoom_source_without_mutating_workspace(self):
+        workspace = {
+            "dbs": "main", "locale": {"layers": {"Stops": {
+                "format": "mvt", "table": None,
+                "tables": {"0": None, "15": "transit.stops"},
+                "geom": "geom", "qID": "id",
+                "filter": {"default": {"direction": {"match": "T"}}},
+            }}}, "locales": {"named": {"layers": {"Stops": {
+                "filter": {"default": {"active": {"match": "true"}}},
+            }}}},
+        }
+        original = json.dumps(workspace, sort_keys=True)
+        for statistics in (False, True):
+            with self.subTest(statistics=statistics):
+                cursor = MagicMock()
+                cursor.fetchone.side_effect = (
+                    [("integer", "int4", False), (0, 0, 0, None, None, None)]
+                    if statistics else [("integer", False), (0, 0, 0)]
+                )
+                cursor.fetchall.return_value = []
+                connect = MagicMock()
+                connect.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value = cursor
+                with (
+                    patch.object(app, "DB_CONNECTIONS", {"main": "postgresql://db"}),
+                    patch.object(app.psycopg, "connect", connect),
+                ):
+                    result = (app.aggregate_layer_statistics(workspace, "named", "Stops", "id", 2, [], [])
+                              if statistics else app.aggregate_layer_values(workspace, "named", "Stops", "id", 5))
+                dataset = result["effectiveDataset"]
+                self.assertEqual("transit.stops", dataset["relation"])
+                self.assertEqual({"mode": "single-relation-zoom-tiers", "minimumZoom": 15}, dataset["sourceResolution"])
+                self.assertEqual({"direction": {"match": "T"}, "active": {"match": "true"}}, dataset["effectiveFilter"]["fixedFilter"])
+                statements = [call.args[0] if isinstance(call.args[0], str) else call.args[0].as_string(None) for call in cursor.execute.call_args_list]
+                self.assertIn("SET TRANSACTION READ ONLY", statements)
+                self.assertIn("SET statement_timeout = '5000ms'", statements)
+                self.assertTrue(any('FROM "transit"."stops"' in statement for statement in statements))
+                self.assertEqual(original, json.dumps(workspace, sort_keys=True))
+
+    def test_ambiguous_zoom_sources_are_refused_before_connecting(self):
+        for tables in (
+            {"0": None, "15": "transit.stops", "18": "transit.other"},
+            {"0": None, "15": "transit.stops", "18": None},
+            {"0": None},
+        ):
+            workspace = {"dbs": "main", "locale": {"layers": {"Stops": {
+                "format": "mvt", "table": None, "tables": tables, "geom": "geom", "qID": "id",
+            }}}}
+            with self.subTest(tables=tables), patch.object(app.psycopg, "connect") as connect:
+                with self.assertRaisesRegex(ValueError, "no unambiguous queryable relation"):
+                    app.aggregate_layer_values(workspace, None, "Stops", "id", 5)
+                with self.assertRaisesRegex(ValueError, "no unambiguous queryable relation"):
+                    app.aggregate_layer_statistics(workspace, None, "Stops", "id", 2, [], [])
+                connect.assert_not_called()
+
     @staticmethod
     def handler(path: str) -> tuple[app.Handler, list[tuple[HTTPStatus, dict]]]:
         responses: list[tuple[HTTPStatus, dict]] = []

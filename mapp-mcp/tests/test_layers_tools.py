@@ -421,15 +421,22 @@ class ListingTests(ToolTestCase):
         self.assertNotIn("fields", entry)
 
     def test_a_zoom_keyed_table_is_not_reported_as_a_relation(self) -> None:
-        """A layer may map zoom levels to different relations. That shape is not
-        queryable by `layers_values`, so reporting it as one relation would
-        point the agent at a request that cannot work."""
+        """A malformed object in singular `table` is never a relation name."""
         payload = {"layers": {"Bus_Stops": {
             "name": "Bus Stops", "table": {"0": None, "15": "source_ops.bus_stops"},
         }}}
         self.as_caller(caller())
         entry = self.tool("layers_list", payload=payload)()["layers"][0]
         self.assertIsNone(entry["table"])
+
+    def test_zoom_sources_are_available_for_column_discovery(self) -> None:
+        tables = {"0": None, "15": "transit.stops"}
+        self.as_caller(caller())
+        entry = self.tool("layers_list", payload={"layers": {"Stops": {
+            "name": "Stops", "table": None, "tables": tables,
+        }}})()["layers"][0]
+        self.assertIsNone(entry["table"])
+        self.assertEqual(tables, entry["tables"])
 
     def test_the_listing_costs_only_the_discovery_scope(self) -> None:
         """A grant holding just the advertised pair can discover what exists.

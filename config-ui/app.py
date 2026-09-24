@@ -106,7 +106,7 @@ from control_api import (
     apply_operations, capabilities, contract, examples, plugin_manifest,
     decode_position_cursor,
     effective_layer_filter, effective_locales, enforce_collection_payload,
-    is_probeable_database_layer,
+    is_probeable_database_layer, visual_probe_layer,
     unpaginated_collection, paginate_collection, paginate_keyset_page,
     pagination_parameters,
     pointer_get, pointer_parts, proposal_check, proposal_create, proposal_list, proposal_read, proposal_write,
@@ -5139,6 +5139,26 @@ def layer_db(data: dict, layer: dict) -> str | None:
     return layer.get("dbs") or data.get("dbs")
 
 
+def aggregate_probe_layer(layer: dict) -> tuple[dict, dict]:
+    """Use the same unambiguous relation resolution as visual planning."""
+    resolved, minimum_zoom = visual_probe_layer(layer)
+    if not is_probeable_database_layer(resolved):
+        if isinstance(layer.get("tables"), dict):
+            raise ValueError(
+                "The zoom-dependent layer has no unambiguous queryable relation. "
+                "Aggregation supports one relation exposed from a minimum zoom, "
+                "with fixed geometry and feature ID; switching relations or "
+                "hiding the source again is not supported."
+            )
+        raise ValueError(
+            "The selected layer does not use a queryable database relation."
+        )
+    provenance = {} if minimum_zoom is None else {"sourceResolution": {
+        "mode": "single-relation-zoom-tiers", "minimumZoom": minimum_zoom,
+    }}
+    return resolved, provenance
+
+
 def aggregate_layer_values(
     data: dict,
     requested_locale: str | None,
@@ -5151,10 +5171,7 @@ def aggregate_layer_values(
     layer = (locale.get("layers") or {}).get(layer_key)
     if not isinstance(layer, dict):
         raise FileNotFoundError(layer_key)
-    if not is_probeable_database_layer(layer):
-        raise ValueError(
-            "The selected layer does not use a queryable database relation."
-        )
+    layer, source_provenance = aggregate_probe_layer(layer)
 
     db_name = layer_db(data, layer)
     database_url = DB_CONNECTIONS.get(db_name)
@@ -5258,6 +5275,7 @@ def aggregate_layer_values(
             "scope": "effective-locale-layer",
             "relation": relation_name,
             "effectiveFilter": filter_descriptor,
+            **source_provenance,
         },
         "totalCount": total_count,
         "nonNullCount": non_null_count,
@@ -5283,10 +5301,7 @@ def aggregate_layer_statistics(
     layer = (locale.get("layers") or {}).get(layer_key)
     if not isinstance(layer, dict):
         raise FileNotFoundError(layer_key)
-    if not is_probeable_database_layer(layer):
-        raise ValueError(
-            "The selected layer does not use a queryable database relation."
-        )
+    layer, source_provenance = aggregate_probe_layer(layer)
 
     db_name = layer_db(data, layer)
     database_url = DB_CONNECTIONS.get(db_name)
@@ -5539,6 +5554,7 @@ def aggregate_layer_statistics(
             "scope": "effective-locale-layer",
             "relation": relation_name,
             "effectiveFilter": filter_descriptor,
+            **source_provenance,
         },
         "totalCount": total_count,
         "nonNullCount": non_null_count,
