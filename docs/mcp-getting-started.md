@@ -316,9 +316,10 @@ permission is single-use and bound to that one relation.
 ## Standing approvals
 
 In **Security → Standing approvals**, turn on automatic approval for an MCP
-client. It can then perform any action its current permissions allow,
-including semantic administration and federation changes, until you turn it
-off. There is no time or action limit and no action-class selector.
+client. It can then perform permitted actions, including semantic administration
+and federation changes, until you turn it off. Map proposal application always
+needs individual confirmation bound to its preview. There is no time or action
+limit and no action-class selector.
 
 The approval is bound to that registered client and this platform instance.
 It applies across the client's consents, while every request must still have
@@ -418,7 +419,7 @@ scopes.
 
 ### Original-resolution preview downloads
 
-`artifacts_image(artifact_path=..., download="link")` returns a five-minute
+`artifacts_image(artifact_path=..., download="link")` returns a one-hour
 signed PNG download without embedding the image in chat. Configure
 `ARTIFACT_DOWNLOAD_ORIGIN` when the user's browser reaches MCP through a
 different public origin or tunnel. It defaults to `MCP_SITE` in development

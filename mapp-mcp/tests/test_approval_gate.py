@@ -729,7 +729,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             "id": "p-1",
             "status": "pending",
             "explanation": "Rename the passport layer folder.",
-            "originalRevision": "r-1",
+            "originalRevision": "r-1", "candidateHash": "a" * 64,
             "diff": [
                 {"op": "replace", "path": "/locale/layers/A/group",
                  "old": "Old", "value": "New"},
@@ -760,7 +760,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             if "/proposals/" in kwargs["path"]:
                 return self.proposal
             if kwargs["path"].startswith("/api/visual-operations/"):
-                return {"operation": {"result": {"visual": {
+                return {"review": {"eligible": True, "complete": True, "binding": {"proposalId": self.proposal["proposal"]["id"], "candidateHash": "a" * 64, "originalRevision": "r-1", "evidenceOperationId": "op-7", "evidenceFingerprint": "b" * 64}, "captures": []}, "operation": {"result": {"visual": {"passed": True,
                     "diagnosis": {"candidate": {"checks": [
                         {"id": "visual.layer_activation", "passed": False},
                     ]}},
@@ -812,12 +812,41 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             form=Answer("accept", Confirmation(True)),
         )
 
+    async def test_preview_mismatch_and_partial_evidence_do_not_request_approval(self):
+        for mutation in ("binding", "incomplete", "expired"):
+            api = self.Api(self)
+            original_get = api.get
+            def get(**kwargs):
+                result = original_get(**kwargs)
+                if "review" in result:
+                    if mutation == "binding": result["review"]["binding"]["candidateHash"] = "c" * 64
+                    if mutation == "incomplete": result["review"]["complete"] = False
+                    if mutation == "expired": result["review"]["eligible"] = False
+                return result
+            api.get = get
+            apply = self.build("proposals_apply", api)
+            with self.subTest(mutation=mutation), self.assertRaises(ToolError):
+                await apply(self.agreeing(), "p-1", "op-7")
+            self.assertFalse(api.posted_to(APPROVALS_CREATE["path_template"]))
+
+    async def test_partial_evidence_acknowledgment_is_in_the_confirmed_body(self):
+        api = self.Api(self)
+        original_get = api.get
+        def get(**kwargs):
+            result = original_get(**kwargs)
+            if "review" in result: result["review"]["complete"] = False
+            return result
+        api.get = get
+        apply = self.build("proposals_apply", api)
+        await apply(self.agreeing(), "p-1", "op-7", acknowledge_incomplete_preview=True)
+        self.assertTrue(api.posted_to("/api/proposals/p-1/apply")[0]["body"]["acknowledgeIncompletePreview"])
+
     async def test_the_person_is_shown_the_diff_not_the_arguments(self) -> None:
         """A summary assembled from what the model passed in would let the
         agent describe its own change."""
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
         self.assertEqual("Rename the passport layer folder.", packet["summary"])
         self.assertEqual(2, packet["changeCount"])
@@ -830,7 +859,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_warnings_reach_the_person_deciding(self) -> None:
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
         self.assertEqual(
             [{"ruleId": "layer.group", "message": "check me"}],
@@ -844,7 +873,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         }}
         api = self.Api(self, proposal=proposal)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
         self.assertEqual(binding, packet["draftRelations"])
         self.assertIn("permanently", packet["note"])
@@ -858,7 +887,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         apply = self.build("proposals_apply", api)
         await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
-        self.assertFalse(packet["evidence"]["passed"])
+        self.assertTrue(packet["evidence"]["passed"])
         self.assertEqual(
             {"afterMap": "run/after.png"}, packet["evidence"]["artifacts"]
         )
@@ -874,16 +903,15 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         apply = self.build(
             "proposals_apply", api, scopes="mcp:connect inspect apply",
         )
-        await apply(self.agreeing(), "p-1", "op-7")
-        packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
-        self.assertEqual("op-7", packet["evidence"]["operationId"])
-        self.assertIn("visual", packet["evidence"]["unavailable"])
-        self.assertNotIn("passed", packet["evidence"])
+        with self.assertRaisesRegex(ToolError, "Visual permission is required"):
+            await apply(self.agreeing(), "p-1", "op-7")
+        self.assertEqual([], api.posted_to(APPROVALS_CREATE["path_template"]))
 
     async def test_no_evidence_is_asked_for_when_none_is_named(self) -> None:
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        with self.assertRaisesRegex(ToolError, "preview is required"):
+            await apply(self.agreeing(), "p-1")
         self.assertEqual(
             [], [c for c in api.calls if "/api/visual-operations/" in c["path"]]
         )
@@ -900,7 +928,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         apply = self.build("proposals_apply", api)
         ctx = self.agreeing()
         with self.assertRaises(ToolError) as raised:
-            await apply(ctx, "p-1")
+            await apply(ctx, "p-1", "op-7")
         self.assertIn("applied", str(raised.exception))
         self.assertEqual([], ctx.asked)
         self.assertEqual(
@@ -914,7 +942,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             elicitation=Capability(form={}), form=Answer("decline"),
         )
         with self.assertRaises(ToolError):
-            await apply(ctx, "p-1")
+            await apply(ctx, "p-1", "op-7")
         self.assertEqual(
             [], api.posted_to("/api/proposals/p-1/apply"),
             "a declined apply must not reach the platform",
@@ -925,16 +953,16 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         credential, so the two cannot describe different requests."""
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        await apply(self.agreeing(), "p-1", "op-7")
         applied = api.posted_to("/api/proposals/p-1/apply")
         self.assertEqual(1, len(applied))
-        self.assertEqual({"approved": True}, applied[0]["body"])
+        self.assertEqual({"approved": True, "candidateHash": "a" * 64, "originalRevision": "r-1", "evidenceOperationId": "op-7", "evidenceFingerprint": "b" * 64, "acknowledgeIncompletePreview": False}, applied[0]["body"])
         self.assertEqual(RECEIPT, applied[0]["receipt"])
 
     async def test_a_successful_apply_reports_what_happened(self) -> None:
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        result = await apply(self.agreeing(), "p-1")
+        result = await apply(self.agreeing(), "p-1", "op-7")
         self.assertTrue(result["applied"])
         self.assertTrue(result["mapReloaded"])
         self.assertEqual("r-2", result["appliedRevision"])
@@ -954,7 +982,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
             "operation": {"id": "op-9"},
         })
         apply = self.build("proposals_apply", api)
-        result = await apply(self.agreeing(), "p-1")
+        result = await apply(self.agreeing(), "p-1", "op-7")
         self.assertTrue(result["applied"])
         self.assertFalse(result["mapReloaded"])
         self.assertIn("Do not apply again", result["note"])
@@ -999,7 +1027,7 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_proposal_id_is_encoded_into_the_path(self) -> None:
         api = self.Api(self)
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p/1")
+        await apply(self.agreeing(), "p/1", "op-7")
         self.assertTrue(
             any(c["path"] == "/api/proposals/p%2F1/apply"
                 for c in api.calls),
@@ -1012,14 +1040,14 @@ class ApplyToolTests(unittest.IsolatedAsyncioTestCase):
         api = self.Api(self, proposal={
             "proposal": {
                 "id": "p-1", "status": "pending", "explanation": "Many.",
-                "originalRevision": "r-1",
+                "originalRevision": "r-1", "candidateHash": "a" * 64,
                 "diff": [{"op": "replace", "path": f"/a/{n}"}
                          for n in range(50)],
             },
             "revision": "r-1",
         })
         apply = self.build("proposals_apply", api)
-        await apply(self.agreeing(), "p-1")
+        await apply(self.agreeing(), "p-1", "op-7")
         packet = api.posted_to(APPROVALS_CREATE["path_template"])[0]["body"]["packet"]
         self.assertEqual(50, packet["changeCount"])
         self.assertEqual(20, len(packet["changes"]))

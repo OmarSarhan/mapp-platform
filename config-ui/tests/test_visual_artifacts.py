@@ -31,9 +31,9 @@ class VisualArtifactTests(unittest.TestCase):
         self.assertEqual((1, 1), (artifact["width"], artifact["height"]))
         download = issue_download(artifact, b"private-key", now=1000)
         ticket = download["path"].removeprefix(DOWNLOAD_PREFIX)
-        result = read_download(self.root, ticket, b"private-key", now=1299)
+        result = read_download(self.root, ticket, b"private-key", now=4599)
         self.assertEqual(PNG, base64.b64decode(result["data"]))
-        for now in (999, 1300, 9999):
+        for now in (999, 4600, 9999):
             with self.subTest(now=now), self.assertRaises(VisualArtifactError) as caught:
                 read_download(self.root, ticket, b"private-key", now=now)
             self.assertEqual(403, caught.exception.status)

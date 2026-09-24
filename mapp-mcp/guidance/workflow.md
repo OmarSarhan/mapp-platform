@@ -65,7 +65,7 @@ Screenshot and test previews return immediately with an `operationId`, including
 when `hover: true`. Poll `visual_operations_show` after `pollAfterSeconds` until
 the status is terminal; each poll uses a fresh credential and the render keeps
 running independently. Use `artifacts_image` with a returned PNG artifact path
-to show the retained screenshot and obtain a five-minute download of the exact
+to show the retained screenshot and obtain a one-hour download of the exact
 original PNG. For high-resolution delivery, use `download="link"` to return
 only the download metadata, then present its URL and expiry to the user.
 Inline chat images may be resized by the client. Downloads preserve the reported
@@ -147,3 +147,19 @@ must take.
 
 A refusal naming a scope means the grant does not carry it. That is an
 operator's decision to change, not something to route around.
+
+
+Map proposal approval now requires a fresh preview operation (within 24 hours).
+Poll it and present `review.captures` map/legend/popup links and all missing slots
+before calling `proposals_apply` with `evidence_operation_id`. A standing approval
+window cannot approve a map change. If captures/checks are incomplete, explain
+the gaps and set `acknowledge_incomplete_preview=true` only when asking the user
+to explicitly accept those gaps. A retained rendered candidate map is mandatory;
+acknowledgment cannot override mismatched or stale evidence. The confirmation
+binds the exact candidate, source revision and retained artifact bytes.
+
+Use `layers_get` boundary reports and the preview's `plan.boundary` when explaining
+stops outside a study circle. Distinguish whole-feature selection from geometry
+clipping and visual masking. Unknown means unverified; neither a layer name nor
+a visible circle proves a spatial restriction. Do not introduce data-specific
+predicates or assume that a map-extent scope clips features.

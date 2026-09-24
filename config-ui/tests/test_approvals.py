@@ -419,21 +419,29 @@ class ApprovalWindowTests(ControlStoreTestCase):
 
     def request(self, store, **over):
         fields = dict(grant_id="oauth:grant-1", client_id=self.client_id,
-                      instance="instance-under-test", operation_id="proposals.apply",
-                      tool="proposals_apply", request_digest=DIGEST, risk="apply",
-                      scopes=["apply"], packet={"summary": "Rename a layer"})
+                      instance="instance-under-test", operation_id="xyz.reload",
+                      tool="xyz_reload", request_digest=DIGEST, risk="reload",
+                      scopes=["reload"], packet={"summary": "Rename a layer"})
         fields.update(over)
         return store.create_approval(**fields)
 
     def test_every_permitted_action_class_can_be_approved(self):
         store = self.store()
         self.window(store)
-        for risk, scope in (("apply", "apply"), ("reload", "reload"),
+        for risk, scope in (("reload", "reload"),
                             ("database-definition", "derive:manage"),
                             ("semantic-apply", "semantic:apply"),
                             ("federation-provision", "federation:provision")):
             with self.subTest(risk=risk):
                 self.assertTrue(self.request(store, risk=risk, scopes=[scope])["decided"])
+
+    def test_workspace_apply_never_consumes_a_standing_approval(self):
+        store = self.store()
+        self.window(store)
+        requested = self.request(store, operation_id="proposals.apply", risk="apply", scopes=["apply"])
+        self.assertFalse(requested["decided"])
+        self.assertIsNone(store.claim_receipt(requested["handle"]))
+        self.assertEqual(0, store.list_approval_windows()[0]["consumed"])
 
     def test_stays_enabled_beyond_old_time_and_count_limits(self):
         store = self.store()
@@ -470,11 +478,11 @@ class ApprovalWindowTests(ControlStoreTestCase):
         self.window(store)
         self.assertFalse(self.request(store, scopes=["semantic:admin"])["decided"])
         with store._db() as connection:
-            connection.execute("UPDATE control.oauth_grants SET scopes = '{reload}'")
+            connection.execute("UPDATE control.oauth_grants SET scopes = '{apply}'")
         self.assertFalse(self.request(store)["decided"])
         with store._db() as connection:
-            connection.execute("UPDATE control.oauth_grants SET scopes = '{apply}'")
-            connection.execute("UPDATE control.oauth_clients SET scopes = '{reload}' WHERE client_id = %s", (self.client_id,))
+            connection.execute("UPDATE control.oauth_grants SET scopes = '{reload}'")
+            connection.execute("UPDATE control.oauth_clients SET scopes = '{apply}' WHERE client_id = %s", (self.client_id,))
         self.assertFalse(self.request(store)["decided"])
 
     def test_enable_requires_enabled_agent_client_and_recent_session(self):

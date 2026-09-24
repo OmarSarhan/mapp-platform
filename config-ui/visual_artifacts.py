@@ -113,7 +113,7 @@ def read_visual_image(root: Path, relative: str, *, include_data: bool = True) -
     return result
 
 
-DOWNLOAD_TTL_SECONDS = 300
+DOWNLOAD_TTL_SECONDS = 3600
 DOWNLOAD_PREFIX = "/artifact-downloads/"
 
 

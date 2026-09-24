@@ -1456,7 +1456,7 @@ class ControlStore:
         # transaction, so turn-off cannot miss a receipt still being inserted.
         with self._db() as connection, connection.transaction():
             self._require_initialized(connection)
-            window = self.consume_approval_window(
+            window = None if operation_id == "proposals.apply" else self.consume_approval_window(
                 connection, grant_id=grant_id, client_id=client_id,
                 instance=instance, scopes=scopes,
             )

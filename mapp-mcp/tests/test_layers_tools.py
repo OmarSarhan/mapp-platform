@@ -2600,6 +2600,7 @@ class PreviewEvidenceTests(ToolTestCase):
                                 "background": True}
                     if name == "proposals_preview_screenshot":
                         expected["deviceScaleFactor"] = 2.0
+                        expected["panels"] = ["styling"]
                     self.assertEqual(expected, api.calls[0]["body"])
                     self.assertEqual("running", detail["status"])
                     self.assertEqual("accepted", detail["stage"])

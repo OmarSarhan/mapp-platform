@@ -169,7 +169,8 @@ A standing approval substitutes the decider, never the bound, single-use
 receipt. Disabling the client or advancing the recovery epoch closes it.
 
 **Residual:** a standing-approved client may execute every gated operation its
-live scopes permit without individual review. Turning the switch off cannot
+live scopes permit without individual review, except map proposal application,
+which requires individual preview-bound confirmation. Turning the switch off cannot
 undo an admitted or completed effect. This is the accepted approval-fatigue
 tradeoff and is why narrow scopes and database resource ceilings still matter.
 
@@ -267,7 +268,7 @@ Successful or failed visual runs can retain PNG screenshots. The MCP
 content block, so the caller can display the evidence rather than receiving
 only an internal path.
 
-The image tool now defaults to inline content plus a five-minute signed download;
+The image tool now defaults to inline content plus a one-hour signed download;
 its link-only mode transfers no inline PNG. Issuance uses the same visual scope
 and request-bound query check. The uncredentialed download route on the MCP
 origin checks a domain-separated HMAC over version, exact path, content SHA-256
@@ -548,3 +549,19 @@ The implementation tests pin the load-bearing counts, scope separations,
 approval requirements, disposable-draft enrollment bounds, cleanup scan
 bounds, and screenshot retrieval limits in
 `mcp-auth/tests/test_threat_model_claims.py`.
+
+
+### Map confirmation bound to retained evidence
+
+Map proposal application is excluded from standing automatic approval windows.
+Its individual confirmation binds proposal ID, candidate hash, original revision,
+visual operation ID and a fingerprint of retained original/candidate capture
+hashes. The configuration API independently checks the binding and a 24-hour
+age limit before writing. A retained rendered candidate map is mandatory;
+partial legend/popup/check evidence requires explicit acknowledgment in the
+confirmed body and dashboard. Download capabilities expire after one hour and
+can be renewed without changing the evidence fingerprint. Missing/replaced
+artifact bytes invalidate an older confirmation. This proves which evidence
+was offered, not that a human examined every image or that the spatial query is
+correct. Study-boundary reports explicitly retain unknowns rather than infer
+clipping from arbitrary SQL, layer titles, masks or drawn circles.

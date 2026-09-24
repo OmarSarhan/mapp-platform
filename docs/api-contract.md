@@ -1,5 +1,12 @@
 # Configuration API contract
 
+Invalid locale responses include `validLocales` and guidance to omit `locale`
+for the default. Locale keys are workspace identifiers, not inferred language
+codes. Unsupported workspace proposal operations return
+`code: proposal.operation_unsupported`, `supportedOperations: [set, unset]`, and
+a corrected example. `set` adds or replaces; `unset` removes. Returned diff
+verbs (`add`, `replace`, `remove`) are not accepted proposal input operations.
+
 The configuration API is the integration boundary between MAPP Platform and
 the separately released `mapp-config-cli`. The platform is authoritative for
 workspace structure, rules, validation, revision handling, proposals, reloads,
@@ -1205,12 +1212,12 @@ The API accepts the same optional `download=inline|link|both` query parameter
 requires the existing `visual` authority and exact query binding. Metadata
 includes the PNG dimensions, byte count, SHA-256, and a `download` object with
 `path`, `url` when an origin is configured, `expiresAt` (Unix seconds), and
-`expiresInSeconds: 300`.
+`expiresInSeconds: 3600`.
 
 `GET /artifact-downloads/{ticket}` serves the exact original bytes with
 `Content-Disposition: attachment`, no-store, nosniff and no-referrer headers.
 It requires only the signed capability, no dashboard session or OAuth bearer.
-The HMAC binds one retained path, its content hash and a five-minute expiry;
+The HMAC binds one retained path, its content hash and a one-hour expiry;
 changing any of these invalidates it. File and report checks still run on
 download. Expired, malformed or forged links return 403, changed bytes 410,
 and deleted/unretained files 404. Restarting the configuration service revokes
@@ -1671,3 +1678,39 @@ reads, dry-run mutation, validation failure, proposal lifecycle, stale
 revision, reload status, visual results, authentication failure, and redaction.
 The client should use the server's contract rather than duplicating evolving
 workspace rules.
+
+
+### Preview-bound map proposal confirmation
+
+`proposals.apply` requires `approved: true`, `candidateHash`, `originalRevision`,
+`evidenceOperationId`, and `evidenceFingerprint`. Obtain the four binding values
+from the terminal preview operation's `review.binding`; do not compute them or
+reuse values from another proposal. The API rechecks the candidate, revision,
+retained image hashes and a 24-hour preview age before writing. An already
+committed interrupted apply can still reconcile its reload without fresh images.
+Standing approval windows never approve `proposals.apply`; semantic proposals
+retain their separate policy. Older clients sending only `approved` receive
+`proposal.preview_required` and must be updated before applying.
+
+Polling a terminal proposal screenshot/test returns `review` with six slots:
+original/candidate map, legend (styling panel), and popup (information panel).
+Each captured slot includes original pixel dimensions, SHA-256 and a renewable
+one-hour download. Missing, unavailable and not-applicable slots are explicit.
+A rendered retained candidate map is mandatory. Incomplete captures/checks require
+`acknowledgeIncompletePreview: true` as part of the exact human-confirmed request;
+this cannot waive an absent map, mismatched candidate, or expired preview.
+Download renewal does not change the evidence fingerprint. Changing/removing an
+image does, so previously confirmed evidence cannot silently change.
+
+### Boundary behavior inspection
+
+`GET /api/layers` adds `boundaryReports` keyed by layer key, separate from the
+workspace configuration. MCP layer list/get and proposal preview plans expose
+these reports; the dashboard shows them above the selected layer editor.
+Reports distinguish study-boundary verification, platform feature selection,
+geometry clipping, and the locale's visual extent mask. A bounded derived
+registry read supplies known `spatialScope` envelopes without executing source
+SQL or hydrating semantic profiles. The platform map-extent wrapper selects
+whole intersecting features and does not clip them. Arbitrary SQL clipping,
+user-drawn circles and inferred study boundaries remain explicitly unknown.
+No filter, geometry, visibility, or live workspace configuration is changed.

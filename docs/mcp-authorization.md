@@ -545,8 +545,9 @@ sent it.
 ### Standing approvals
 
 **Security → Standing approvals** provides one switch per registered MCP
-agent client. An enabled approval covers every action the client's current
-permissions allow, including semantic administration and federation mutation.
+agent client. An enabled approval covers permitted actions including semantic
+administration and federation mutation. Map proposal application is excluded:
+it always requires individual confirmation bound to its preview.
 It remains enabled until turned off, with no expiry or action-count limit.
 The binding is the client and instance, so a new consent for the same client
 uses the same switch. The grant and registered client must both still allow

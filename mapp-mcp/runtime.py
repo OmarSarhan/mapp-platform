@@ -342,7 +342,17 @@ def _approval_message(operation_id: str, packet: dict) -> str:
         if isinstance(count, int) and count > 0
         else ""
     )
-    return f"MAPP wants to run {operation_id}.{detail}{scale}"
+    message = f"MAPP wants to run {operation_id}.{detail}{scale}"
+    review = ((packet or {}).get("evidence") or {}).get("review")
+    if isinstance(review, dict):
+        binding = review.get("binding") or {}
+        message += f"\nConfirm proposal {binding.get('proposalId')}, candidate {binding.get('candidateHash')}, preview {binding.get('evidenceOperationId')}."
+        for capture in review.get("captures") or []:
+            link = (capture.get("download") or {}).get("url")
+            message += f"\n{capture.get('side')} {capture.get('kind')}: {link or capture.get('status')}"
+        if not review.get("complete"):
+            message += "\nThis approval explicitly acknowledges incomplete preview captures/checks. Missing candidate captures: " + ", ".join(review.get("missingCandidateCaptures") or [])
+    return message
 
 SEMANTIC_PROPOSALS_LIST = {
     "operation_id": "semantic.proposals.list",
@@ -880,6 +890,11 @@ def _failure_diagnostics(payload):
         if (value := payload.get(key)) is not None
         and isinstance(value, (str, bool, int, float))
     }
+    for key in ("validLocales", "supportedOperations"):
+        if isinstance(payload.get(key), list):
+            detail[key] = [value[:200] for value in payload[key][:100] if isinstance(value, str)]
+    if isinstance(payload.get("example"), dict):
+        detail["example"] = _change_preview(payload["example"])
     meta = payload.get("meta") or {}
     if isinstance(meta, dict) and re.fullmatch(
         r"[a-f0-9]{32}", str(meta.get("requestId", ""))
@@ -1051,6 +1066,8 @@ def _visual_outcome(payload, *, config_api_resource: str | None = None):
         "artifacts": visual.get("artifacts") or {},
         "warnings": plan.get("warnings") or [],
     }
+    if isinstance(payload.get("review"), dict):
+        detail["review"] = payload["review"]
     if error:
         detail["error"] = {"code": error.get("code"),
                            "message": error.get("message")}
@@ -1067,7 +1084,7 @@ def _visual_outcome(payload, *, config_api_resource: str | None = None):
         detail["downloadArguments"] = {"download": "link"}
         detail["artifactInstructions"] = (
             "Call artifacts_image(artifact_path=<PNG artifact value>) to display"
-            " a retained screenshot and obtain a five-minute original-PNG download link."
+            " a retained screenshot and obtain a one-hour original-PNG download link."
             " Use download=link to return only the link without inline image data."
             " The signed link grants anyone holding it access to this image until expiry;"
             " it contains no platform bearer token and requires no dashboard login."
@@ -1772,7 +1789,7 @@ def build_runtime(
         return {
             "revision": payload.get("revision"),
             "locale": payload.get("locale"),
-            "layers": [_layer_summary(key, layer)
+            "layers": [{**_layer_summary(key, layer), "boundary": (payload.get("boundaryReports") or {}).get(key)}
                        for key, layer in _layers_of(payload)],
         }
 
@@ -1816,7 +1833,7 @@ def build_runtime(
                 "locale": payload.get("locale"),
                 # Ordered as asked, so a caller can read the reply against its
                 # own request rather than re-matching by key.
-                "layers": [{"key": key, "layer": found[key]} for key in wanted],
+                "layers": [{"key": key, "layer": found[key], "boundary": (payload.get("boundaryReports") or {}).get(key)} for key in wanted],
             }
         for key, layer in _layers_of(payload):
             if key == layer_key:
@@ -1825,6 +1842,7 @@ def build_runtime(
                     "locale": payload.get("locale"),
                     "key": key,
                     "layer": layer,
+                    "boundary": (payload.get("boundaryReports") or {}).get(key),
                 }
         known = [key for key, _ in _layers_of(payload)]
         # Naming the alternatives, because a wrong key is the likeliest mistake
@@ -2551,7 +2569,7 @@ def build_runtime(
             "Pass a PNG path from the artifacts returned by a completed visual "
             "operation (usually afterMap, afterPage, or afterHoverTooltip). "
             "Reads one image, maximum 8 MiB, with a fresh visual credential. "
-            "Defaults to an inline image plus a five-minute signed download link. "
+            "Defaults to an inline image plus a one-hour signed download link. "
             "Use download=link for an original-resolution download without inline "
             "image data. Anyone holding the link can read this one image until expiry."
         ),
@@ -2613,8 +2631,9 @@ def build_runtime(
             " poll visual_operations_show for checks and images. Supports hover."
             " Captures at 2x resolution by default; device_scale_factor accepts"
             " 1-3. panels can include filtering and styling (the styling image"
-            " contains the rendered legend). Completed work returns signed-in"
-            " dashboard links to the original PNGs as well as chat images."
+            " contains the rendered legend and is requested by default). Completed"
+            " work returns a review bundle with one-hour original-resolution links"
+            " and explicit missing-capture statuses before approval."
             " Use framing=layer for the complete filtered choropleth, or"
             " framing=viewport with centre/zoom for a requested map area;"
             " omitted centre/zoom use the configured locale view. Applies nothing."
@@ -2658,8 +2677,7 @@ def build_runtime(
         if viewport is not None:
             body["viewport"] = viewport
         body["deviceScaleFactor"] = device_scale_factor
-        if panels is not None:
-            body["panels"] = panels
+        body["panels"] = ["styling"] if panels is None else panels
         if expected_panel_text is not None:
             body["expectedPanelText"] = expected_panel_text
         if expected_hover_text is not None:
@@ -3104,14 +3122,15 @@ def build_runtime(
             "Apply a queued proposal: write its change to the workspace and"
             " reload the map. Asks you to approve first, showing what it would"
             " change, and does nothing until you agree. Takes a proposalId"
-            " from proposals_list. Pass evidence_operation_id -- the operation a"
+            " from proposals_list. Requires evidence_operation_id -- the operation a"
             " proposals_preview_* run returned -- to put the rendered evidence"
             " in front of the person deciding. This is not reversible by an"
             " undo; recovering means proposing the inverse change."
         ),
     )
     async def proposals_apply(
-        ctx: Context, proposal_id: str, evidence_operation_id: str | None = None
+        ctx: Context, proposal_id: str, evidence_operation_id: str | None = None,
+        acknowledge_incomplete_preview: bool = False,
     ) -> dict:
         """The first tool that changes what the map serves.
 
@@ -3126,13 +3145,23 @@ def build_runtime(
         agent describe its own change.
         """
         proposal = await io_call(_apply_packet, proposal_id, evidence_operation_id)
+        review = (proposal.get("evidence") or {}).get("review") or {}
+        binding = review.get("binding") or {}
+        if not review.get("eligible"):
+            raise ToolError("A fresh retained candidate preview is required. Run proposals_preview_screenshot, poll visual_operations_show, show the review links, then pass its evidence_operation_id. Visual permission is required.")
+        if any(binding.get(key) != proposal.get(key) for key in ("proposalId", "candidateHash", "originalRevision")) or binding.get("evidenceOperationId") != evidence_operation_id:
+            raise ToolError("Preview does not match this proposal and revision. Render and review the correct candidate before confirming.")
+        if not review.get("complete") and not acknowledge_incomplete_preview:
+            raise ToolError("Preview captures or checks are incomplete. Render complete evidence, or ask the user to approve the listed gaps with acknowledge_incomplete_preview=true.")
         target = PROPOSALS_APPLY["path_template"].replace(
             "{proposalId}", quote(proposal_id, safe="")
         )
         # Built once and passed to both. The digest the approval binds and the
         # digest the credential binds are computed from this same object, so
         # they cannot describe different requests.
-        body = {"approved": True}
+        body = {"approved": True, **{key: binding[key] for key in (
+            "candidateHash", "originalRevision", "evidenceOperationId", "evidenceFingerprint")},
+            "acknowledgeIncompletePreview": acknowledge_incomplete_preview}
         receipt = await approval_gate(
             ctx, PROPOSALS_APPLY, path=target, body=body,
             tool_name="proposals_apply", packet=proposal,
@@ -3232,6 +3261,8 @@ def build_runtime(
                 " proposals_list shows which are still pending."
             )
         applicable = _applicability(proposal, payload.get("revision"))
+        if applicable == "superseded":
+            raise ToolError("Workspace revision changed. Create and preview a new proposal before requesting approval.")
         packet = {
             "summary": proposal.get("explanation")
             or f"Apply proposal {proposal_id}.",
@@ -3241,6 +3272,7 @@ def build_runtime(
             # says how many were left out and the proposal holds them all.
             "changes": [_change_summary(entry) for entry in diff[:20]],
             "proposalId": proposal.get("id"),
+            "candidateHash": proposal.get("candidateHash"),
             "originalRevision": proposal.get("originalRevision"),
             "currentRevision": payload.get("revision"),
         }
@@ -3266,13 +3298,8 @@ def build_runtime(
         to show; what that run found comes from the platform, so an agent
         cannot report a pass that did not happen.
 
-        A failure here does not fail the apply. Reading visual evidence costs
-        `visual`, which a hand-picked grant may not carry, and an apply that
-        refuses because its *illustration*
-        could not be fetched would be refusing the wrong thing. What is not
-        done is dropping it quietly: the packet says evidence was asked for
-        and why it is missing, so the person decides knowing there is a render
-        they are not looking at.
+        Missing visual authority or unavailable evidence is reported explicitly.
+        The apply tool rejects such evidence before requesting confirmation.
         """
         target = VISUAL_OPERATIONS_SHOW["path_template"].replace(
             "{operationId}", quote(operation_id, safe="")
@@ -3374,7 +3401,7 @@ def build_runtime(
             " Returns status, stage, completed checks and retained artifact paths."
             " While running, wait pollAfterSeconds before polling again. Once"
             " complete, call artifacts_image with a PNG artifact path to display"
-            " it and get a five-minute signed original-PNG download. Use"
+            " it and get a one-hour signed original-PNG download. Use"
             " artifacts_image with download=link to omit inline image bytes."
             " Uses visual permission and a fresh credential on each poll."
         ),

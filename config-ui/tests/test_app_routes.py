@@ -2102,6 +2102,12 @@ class AuthenticationHeaderTests(unittest.TestCase):
 
 
 class LayersRouteTests(unittest.TestCase):
+    def test_unsupported_proposal_operation_names_the_input_contract(self):
+        with self.assertRaises(app.ActionableInputError) as caught:
+            app.apply_operations({"locale": {}}, [{"op": "replace", "path": "/locale", "value": {}}])
+        self.assertEqual(["set", "unset"], caught.exception.details["supportedOperations"])
+        self.assertEqual("set", caught.exception.details["example"]["op"])
+
     def test_aggregates_resolve_inherited_zoom_source_without_mutating_workspace(self):
         workspace = {
             "dbs": "main", "locale": {"layers": {"Stops": {
@@ -2296,13 +2302,11 @@ class LayersRouteTests(unittest.TestCase):
         ):
             handler.do_GET()
 
-        self.assertEqual(
-            (
-                HTTPStatus.BAD_REQUEST,
-                {"error": "Unknown locale: ", "code": "locale.not_found"},
-            ),
-            responses[0],
-        )
+        status, body = responses[0]
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertEqual("locale.not_found", body["code"])
+        self.assertEqual(["locale"], body["validLocales"])
+        self.assertIn("Omit locale", body["error"])
 
     def test_layer_values_returns_bounded_category_counts(self) -> None:
         cursor = MagicMock()
@@ -7363,6 +7367,17 @@ class ProposalCreationRouteTests(unittest.TestCase):
 
 
 class ApplyRouteTests(unittest.TestCase):
+    def test_approved_boolean_cannot_apply_without_preview_binding(self):
+        handler, responses = self.handler({"approved": True})
+        with (patch.object(app, "proposal_read", return_value=self.proposal()),
+              patch.object(app, "validate_candidate", return_value=[]),
+              patch.object(app, "apply_proposal_and_reload") as apply,
+              patch.object(app.CONTROL, "create_operation") as create):
+            handler.do_POST()
+        self.assertEqual("proposal.preview_required", responses[0][1]["code"])
+        apply.assert_not_called()
+        create.assert_not_called()
+
     @staticmethod
     def handler(payload: dict) -> tuple[app.Handler, list]:
         responses = []
@@ -7397,7 +7412,7 @@ class ApplyRouteTests(unittest.TestCase):
         self.assertEqual("proposal.approval_required", responses[0][1]["code"])
 
     def test_apply_exception_finishes_the_operation_as_indeterminate(self):
-        handler, responses = self.handler({"approved": True})
+        handler, responses = self.handler({"approved": True, "evidenceOperationId": "preview"})
         running = {"id": "b" * 32, "status": "running"}
 
         def finish(operation_id, *, status, result=None, error=None):
@@ -7411,6 +7426,8 @@ class ApplyRouteTests(unittest.TestCase):
         with (
             patch.object(app, "proposal_read", return_value=self.proposal()),
             patch.object(app, "validate_candidate", return_value=[]),
+            patch.object(app, "review_bundle", return_value={}),
+            patch.object(app, "validate_review", return_value={"evidenceOperationId": "preview"}),
             patch.object(
                 app,
                 "apply_proposal_and_reload",

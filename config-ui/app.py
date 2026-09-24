@@ -62,6 +62,8 @@ from static_files import safe_static_path
 from visual_artifacts import (
     DOWNLOAD_PREFIX, VisualArtifactError, download_origin, issue_download, read_download, read_visual_image,
 )
+from boundary_reporting import boundary_report, source_relations
+from proposal_review import review_bundle, validate_review, ProposalReviewError
 from derived_drafts import (
     CLEANUP_BATCH, CLEANUP_INTERVAL_SECONDS, DraftLifecycle, DraftLifecycleError,
     lifecycle_lock, normalize_bindings, retain_browser_lease,
@@ -99,7 +101,7 @@ from runtime_database import dbs_connection
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, iso, parse_time
 from control_api import (
-    ACTION_SCHEMAS,
+    ACTION_SCHEMAS, ActionableInputError,
     CONTRACT_VERSION, MAX_PAGE_LIMIT, PROPOSAL_LOCK, RULES,
     CollectionPaginationError, DATABASE_LAYER_FORMATS, VisualPlanningDatabaseError,
     VisualPlanningNoMatchingFeatures,
@@ -4708,6 +4710,20 @@ def plugin_preview_checks(workspace: dict, locale_key: str, layers: list[str]) -
 
 
 @draft_guarded
+def layer_boundary_reports(locale):
+    layers = locale.get("layers") or {}
+    relations = sorted({relation for layer in layers.values() if isinstance(layer, dict)
+                        for relation in source_relations(layer)})
+    scopes = {}
+    try:
+        if DERIVED:
+            scopes = DERIVED.boundary_scopes(relations)
+    except Exception:
+        # Inspection stays available when optional registry metadata is unavailable.
+        pass
+    return {key: boundary_report(locale, layer, scopes) for key, layer in layers.items() if isinstance(layer, dict)}
+
+
 def run_browser_visual(layer_key: str | None, plan: dict, payload: dict, *,
                        target_url: str) -> tuple[int, dict]:
     panels = visual_panels(payload)
@@ -7556,6 +7572,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.BAD_REQUEST, {
                     "error": str(exc),
                     "code": "layer.statistics_invalid",
+                    **getattr(exc, "details", {}),
                 })
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
@@ -7614,6 +7631,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.BAD_REQUEST, {
                     "error": str(exc),
                     "code": "layer.values_invalid",
+                    **getattr(exc, "details", {}),
                 })
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
@@ -7633,11 +7651,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "revision": current_revision,
                     "locale": locale_key,
                     "layers": layers if isinstance(layers, dict) else {},
+                    "boundaryReports": layer_boundary_reports(locale),
                 })
             except ValueError as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {
                     "error": str(exc),
                     "code": "locale.not_found",
+                    **getattr(exc, "details", {}),
                 })
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
@@ -7750,6 +7770,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "request the derived-layer extent again."
                     ),
                     "code": "derived_layer.map_extent_unavailable",
+                    **getattr(exc, "details", {}),
                 })
             except Exception:
                 self._json(
@@ -8319,7 +8340,10 @@ class Handler(SimpleHTTPRequestHandler):
                 progress = derived_operation_progress(operation)
                 if progress is not None:
                     operation["progress"] = progress
-                self._json(HTTPStatus.OK, {"operation": operation})
+                response = {"operation": operation}
+                if operation.get("kind") in {"proposal.screenshot", "proposal.visual-test"} and operation.get("status") in {"succeeded", "failed"}:
+                    response["review"] = review_bundle(operation, CONTROL.root / "artifacts", ARTIFACT_DOWNLOAD_KEY, ARTIFACT_DOWNLOAD_ORIGIN)
+                self._json(HTTPStatus.OK, response)
             except FileNotFoundError as exc:
                 self._json(HTTPStatus.NOT_FOUND, {"error": str(exc), "code": "operation.not_found"})
         elif path.startswith("/api/visual-artifacts/"):
@@ -9242,6 +9266,7 @@ class Handler(SimpleHTTPRequestHandler):
                         visual_background_target["candidateHash"] = proposal[
                             "candidateHash"
                         ]
+                        visual_background_target["originalRevision"] = proposal["originalRevision"]
                     operation = start_visual_background(
                         request_path,
                         payload,
@@ -10351,6 +10376,16 @@ class Handler(SimpleHTTPRequestHandler):
                     "viewMode": view_mode,
                     "pluginCatalogueFingerprint": proposal["pluginCatalogueFingerprint"],
                 })
+                _, review_locale = select_locale(proposal[plan_source], group_preview["locale"])
+                selected_review_layer = (review_locale.get("layers") or {}).get(plan_selection["anchorLayer"], {})
+                plan["boundary"] = layer_boundary_reports({**review_locale, "layers": {layer_key: selected_review_layer}}).get(layer_key)
+                plan["reviewRequirements"] = {}
+                for review_side in ("original", "candidate"):
+                    _, side_locale = select_locale(proposal[review_side], group_preview["locale"])
+                    side_layer = (side_locale.get("layers") or {}).get(layer_key) or {}
+                    plan["reviewRequirements"][review_side] = {
+                        "legend": bool(side_layer), "popup": bool(side_layer.get("infoj")),
+                    }
                 feature_info_evidence = proposal_feature_info_evidence(
                     proposal,
                     layer_key,
@@ -10391,6 +10426,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "source": "candidate",
                     "proposalId": proposal_id,
                     "candidateHash": proposal["candidateHash"],
+                    "originalRevision": proposal["originalRevision"],
                 }
                 if action == "visual-plan":
                     self._json(HTTPStatus.OK, {**binding, "plan": plan})
@@ -10661,6 +10697,10 @@ class Handler(SimpleHTTPRequestHandler):
                                 "afterHoverTooltip": candidate_artifacts.get(
                                     "hoverTooltip"
                                 ),
+                                "beforeStylingPanel": original_artifacts.get("stylingPanel"),
+                                "afterStylingPanel": candidate_artifacts.get("stylingPanel"),
+                                "beforeInfoPanel": original_artifacts.get("infoPanel"),
+                                "afterInfoPanel": candidate_artifacts.get("infoPanel"),
                             }
                             if feature_info_comparison:
                                 comparison_artifacts.update({
@@ -11771,6 +11811,23 @@ class Handler(SimpleHTTPRequestHandler):
                                 "ruleId": "proposal.validation",
                             })
                             return
+                    # A committed interrupted apply must remain recoverable even
+                    # if retained evidence has since expired or been removed.
+                    committed_recovery = False
+                    if proposal["status"] == "applying":
+                        _, current_workspace, _ = read_workspace()
+                        committed_recovery = workspace_hash(current_workspace) == proposal["candidateHash"]
+                    if not committed_recovery:
+                        try:
+                            evidence_id = payload.get("evidenceOperationId")
+                            if not isinstance(evidence_id, str) or not evidence_id:
+                                raise ProposalReviewError("Render and review a proposal preview before confirming application.")
+                            evidence = CONTROL.read_operation(evidence_id)
+                            review = review_bundle(evidence, CONTROL.root / "artifacts", ARTIFACT_DOWNLOAD_KEY, ARTIFACT_DOWNLOAD_ORIGIN)
+                            proposal["approvedReview"] = validate_review(proposal, payload, evidence, review)
+                        except (ProposalReviewError, FileNotFoundError) as exc:
+                            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": getattr(exc, "code", "proposal.preview_required")})
+                            return
                     operation = CONTROL.create_operation(
                         "proposal.apply",
                         actor,
@@ -12148,6 +12205,8 @@ class Handler(SimpleHTTPRequestHandler):
             # unreachable and lose exc.code/exc.status to the generic
             # ValueError branch.
             self._json(exc.status, {"error": str(exc), "code": exc.code})
+        except ActionableInputError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), **exc.details})
         except ValueError as exc:
             derived_operation = derived_request_operation(
                 request_path, derived_action_path,

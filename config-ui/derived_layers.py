@@ -4354,6 +4354,16 @@ class DerivedLayerStore:
                 cur.execute("SET LOCAL lock_timeout = '2s'")
             yield connection
 
+    def boundary_scopes(self, relations: list[str]) -> dict:
+        """One bounded registry read, without SQL execution or semantic hydration."""
+        names = [relation.split(".", 1)[1] for relation in relations
+                 if relation.startswith("derived_layers.") and NAME_RE.fullmatch(relation.split(".", 1)[1])]
+        if not names:
+            return {}
+        with self._metadata_connection() as connection, connection.cursor() as cur:
+            cur.execute(sql.SQL("SELECT name, spatial_scope FROM {}._definitions WHERE name = ANY(%s)").format(sql.Identifier(SCHEMA)), (names,))
+            return {"derived_layers." + row["name"]: row["spatial_scope"] for row in cur.fetchall()}
+
     def list(self) -> list[dict[str, Any]]:
         with self._metadata_connection() as connection, connection.cursor() as cur:
             cur.execute(sql.SQL("""

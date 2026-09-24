@@ -12,6 +12,7 @@ import os
 import re
 
 import canonical
+from boundary_reporting import boundary_report
 import secrets
 import tempfile
 import threading
@@ -1549,13 +1550,21 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
     "proposals.apply": {
+        "previewPolicy": {"required": True, "maxAgeSeconds": 86400, "standingApprovalAllowed": False, "incompleteEvidenceRequiresAcknowledgment": True},
         "method": "POST",
         "pathTemplate": "/api/proposals/{proposalId}/apply",
         "risk": "apply",
         "scope": "apply",
         "inputSchema": {
             "type": "object",
-            "properties": {"approved": {"const": True}},
+            "properties": {
+                "approved": {"const": True},
+                "candidateHash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "originalRevision": {"type": "string", "minLength": 1},
+                "evidenceOperationId": {"type": "string", "minLength": 1},
+                "evidenceFingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                "acknowledgeIncompletePreview": {"type": "boolean"},
+            },
             "required": ["approved"],
             "additionalProperties": False,
         },
@@ -2326,6 +2335,12 @@ def pointer_get(document: Any, pointer: str) -> Any:
     return value
 
 
+class ActionableInputError(ValueError):
+    def __init__(self, message: str, **details):
+        super().__init__(message)
+        self.details = details
+
+
 def apply_operations(document: dict, operations: list[dict]) -> tuple[dict, list[dict]]:
     if not isinstance(document, dict):
         raise ValueError("Workspace must be a JSON object.")
@@ -2337,6 +2352,13 @@ def apply_operations(document: dict, operations: list[dict]) -> tuple[dict, list
         if not isinstance(operation, dict):
             raise ValueError("Each workspace operation must be an object.")
         action = operation.get("op")
+        if action not in ("set", "unset"):
+            raise ActionableInputError(
+                f"Unsupported operation: {action}. Use set to add or replace a value, "
+                "or unset to remove it. add/replace/remove describe returned diffs only.",
+                code="proposal.operation_unsupported", supportedOperations=["set", "unset"],
+                example={"op": "set", "path": "/locale/layers/LAYER/name", "value": "New name"},
+            )
         path = operation.get("path")
         parts = pointer_parts(path)
         if not parts:
@@ -3068,7 +3090,12 @@ def select_locale(
     if requested is not None:
         locale = locales.get(requested)
         if not isinstance(locale, dict):
-            raise ValueError(f"Unknown locale: {requested}")
+            valid = sorted(key for key, value in locales.items() if isinstance(value, dict))
+            raise ActionableInputError(
+                f"Unknown locale: {requested}. Valid locales: {', '.join(valid) or '(none)'}. "
+                "Omit locale to select the default; locale keys are not inferred from language codes.",
+                validLocales=valid, example={"omit": "locale"},
+            )
         return requested, locale
     default = locales.get("locale")
     if isinstance(default, dict):
@@ -3077,7 +3104,8 @@ def select_locale(
     if len(usable) == 1:
         return usable[0]
     if len(usable) > 1:
-        raise ValueError("Workspace has multiple locales; select one explicitly.")
+        raise ActionableInputError("Workspace has multiple locales; select one explicitly: "
+                                   + ", ".join(sorted(locales)), validLocales=sorted(locales))
     raise ValueError("Workspace does not contain a usable locale.")
 
 
@@ -3643,6 +3671,7 @@ def visual_plan(
         plan = {
             "layer": layer_key,
             "layerTitle": layer_title,
+            "boundary": boundary_report(locale, requested_layer),
             "locale": selected_locale,
             "source": "workspace-viewport" if configured_viewport else "browser-centre-feature",
             "framing": "viewport",
@@ -3698,6 +3727,7 @@ def visual_plan(
         plan = {
             "layer": layer_key,
             "layerTitle": layer_title,
+            "boundary": boundary_report(locale, requested_layer),
             "locale": selected_locale,
             "source": "workspace-view",
             "framing": framing,
@@ -3862,6 +3892,7 @@ def visual_plan(
         plan = {
             "layer": layer_key,
             "layerTitle": layer_title,
+            "boundary": boundary_report(locale, requested_layer),
             "locale": selected_locale,
             "source": "postgis-layer",
             "framing": "layer",
@@ -3994,6 +4025,7 @@ def visual_plan(
     plan = {
         "layer": layer_key,
         "layerTitle": layer_title,
+        "boundary": boundary_report(locale, requested_layer),
         "locale": selected_locale,
         "source": "postgis-feature",
         "framing": "feature",

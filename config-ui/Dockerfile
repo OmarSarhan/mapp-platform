@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir --requirement requirements.txt
 
 COPY app.py workspace_schema.py plugin_registry.py svg_icons.py static_files.py visual_artifacts.py derived_drafts.py infoj_types.py control_plane.py control_schema.py control_api.py config_admin.py derived_layers.py derived_query_guard.py semantic_client.py mcp_token_client.py canonical.py execution_envelope.py gemini_client.py semantic_sources.py runtime_database.py relation_identity.py federation_schema.py federation_capability.py federation_store.py ./
 COPY schema ./schema
+COPY proposal_review.py ./
+COPY boundary_reporting.py ./
 COPY --from=web /web/dist ./static
 
 USER nobody
