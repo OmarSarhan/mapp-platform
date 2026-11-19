@@ -9,8 +9,8 @@ FROM ubuntu/squid:6.6-24.04_edge@sha256:8a3baed477e2c282ab8aa5edad442f6987324696
 # what that is.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade \
-      libssl3t64=3.0.13-0ubuntu3.15 \
-      openssl=3.0.13-0ubuntu3.15 \
+      libssl3t64=3.0.13-0ubuntu3.16 \
+      openssl=3.0.13-0ubuntu3.16 \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 3128

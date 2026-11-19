@@ -111,7 +111,46 @@ def transaction(connection: psycopg.Connection) -> Iterator[psycopg.Connection]:
         raise
 
 
-def migrate(connection: psycopg.Connection) -> list[int]:
+def restored_control_state(connection, *, expected_instance=None, require_current=False):
+    """Inspect an initialized restore without bootstrapping identity or the ledger."""
+    owner = connection.execute(
+        "SELECT pg_get_userbyid(nspowner) = current_user AS matches"
+        " FROM pg_namespace WHERE nspname = 'control'"
+    ).fetchone()
+    if not owner or not owner["matches"]:
+        raise RuntimeError("Restore the control schema and connect as its owner.")
+    tables = all_tables(connection)
+    if not {"schema_migrations", "metadata", "admin_credential"} <= tables:
+        raise RuntimeError("Restored control ledger or identity tables are missing.")
+    applied = applied_versions(connection)
+    known = sorted(MIGRATIONS)
+    if not applied or applied != known[:len(applied)]:
+        raise RuntimeError(f"Unsupported restored control migration ledger: {applied}.")
+    identity = connection.execute(
+        "SELECT value FROM control.metadata WHERE key = 'instance_id'"
+        " AND EXISTS (SELECT 1 FROM control.admin_credential WHERE id = 1 AND encoded <> '')"
+    ).fetchone()
+    if not identity or not identity["value"]:
+        raise RuntimeError("Restored instance ID or administrator credential is missing.")
+    instance = identity["value"]
+    if expected_instance is not None and instance != expected_instance:
+        raise RuntimeError("Restored instance ID differs from the backup manifest.")
+    if require_current and applied != known:
+        raise RuntimeError(
+            f"Restored control ledger ends at {applied[-1]}; run migrate-restored-control"
+            f" before invalidating pre-restore credentials (current version {known[-1]})."
+        )
+    if applied == known:
+        missing = set(TABLES_IN_DELETE_ORDER) - tables
+        epoch = connection.execute(
+            "SELECT to_regprocedure('control.current_recovery_epoch()') AS function"
+        ).fetchone()["function"]
+        if missing or epoch is None:
+            raise RuntimeError("Restored objects do not match the current control ledger.")
+    return instance, applied
+
+
+def migrate(connection: psycopg.Connection, *, restored_instance: str | None = None) -> list[int]:
     """Apply every unapplied migration. Returns the versions applied.
 
     One advisory lock and one transaction for the whole ladder: PostgreSQL DDL
@@ -131,6 +170,8 @@ def migrate(connection: psycopg.Connection) -> list[int]:
         connection.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))", (MIGRATION_LOCK,)
         )
+        if restored_instance is not None:
+            restored_control_state(connection, expected_instance=restored_instance)
         connection.execute(
             sql.SQL(
                 """
@@ -160,6 +201,8 @@ def migrate(connection: psycopg.Connection) -> list[int]:
                 (version,),
             )
             applied.append(version)
+        if restored_instance is not None:
+            restored_control_state(connection, expected_instance=restored_instance, require_current=True)
         connection.execute("COMMIT")
     except BaseException:
         connection.execute("ROLLBACK")

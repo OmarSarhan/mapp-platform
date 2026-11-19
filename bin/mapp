@@ -55,6 +55,7 @@ usage() {
     "  mcp-client-disable --client-id ID  disable an MCP client" \
     "  mcp-runtime-register register or rotate the MCP runtime's own credential" \
     "  migrate-rollback --to N [--confirm]  step the control schema ladder down; destructive, prints the plan first" \
+    "  migrate-restored-control [--expect-instance ID --confirm]  inspect or migrate an initialized restore before starting services" \
     "  advance-recovery-epoch [--confirm]  invalidate every credential a restored database brought back; destructive, prints the plan first" \
     "  census-check [topic] validate all or one reviewed census source without loading" \
     "  reset-system --confirm return the platform to its initial state: new database, seed workspace, new administrator password" \
@@ -650,6 +651,12 @@ case "${1:-}" in
     clear_edge_environment_overrides
     ;;
 esac
+if [[ "${1:-}" == "migrate-restored-control" || "${1:-}" == "advance-recovery-epoch" ]]; then
+  if [[ ! -s "${WORKSPACE_DIR}/workspace.json" || ! -d "${CONTROL_DIR}" ]]; then
+    printf 'Restore and verify the matching workspace and control files before recovery.\n' >&2
+    exit 2
+  fi
+fi
 check_state_owner
 init_state
 check_state_owner
@@ -1194,6 +1201,18 @@ case "${1:-}" in
     "${compose[@]}" up --detach --wait db >/dev/null
     "${compose[@]}" run --rm --build --no-deps config-ui \
       python config_admin.py revoke-tokens --root /control
+    ;;
+  migrate-restored-control)
+    running_services="$("${compose[@]}" --profile '*' ps --services --status running --status restarting --status paused)"
+    while IFS= read -r service; do
+      if [[ -n "${service}" && "${service}" != db ]]; then
+        printf 'Stop %s and isolate the database from other clients before restore migration.\n' "${service}" >&2
+        exit 2
+      fi
+    done <<< "${running_services}"
+    "${compose[@]}" up --detach --wait db >/dev/null
+    "${compose[@]}" run --rm --build --no-deps config-ui \
+      python config_admin.py migrate-restored-control --root /control "${@:2}"
     ;;
   advance-recovery-epoch)
     # Run after restoring a database and before serving traffic: a snapshot

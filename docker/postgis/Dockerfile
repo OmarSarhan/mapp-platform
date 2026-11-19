@@ -3,7 +3,7 @@ FROM golang:1.26.7-alpine3.23@sha256:b17af760035fc2f338eed92d448a6c67f2d45438844
 ARG GOSU_REPOSITORY=https://github.com/tianon/gosu.git
 ARG GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513
 
-RUN apk add --no-cache git=2.52.0-r0 \
+RUN apk add --no-cache git=2.52.1-r0 \
     && git init /src \
     && git -C /src fetch --depth 1 "${GOSU_REPOSITORY}" "${GOSU_COMMIT}" \
     && git -C /src checkout --detach FETCH_HEAD \
@@ -28,11 +28,11 @@ ARG H3_PG_REF=v4.2.3
 ARG H3_PG_COMMIT=a26630b8353d441e6bc8065c0a8dcaa3d89ef87b
 
 RUN set -eux; \
-    apk add --no-cache --virtual .h3-build-deps \
+    apk add --no-cache --upgrade --virtual .h3-build-deps \
       build-base=0.5-r4 \
       cmake=4.2.3-r0 \
-      git=2.54.0-r0 \
-      postgresql17-dev=17.11-r0; \
+      git=2.54.1-r0 \
+      postgresql17-dev=17.12-r0; \
     git clone --branch "${H3_PG_REF}" --depth 1 \
       https://github.com/postgis/h3-pg.git /tmp/h3-pg; \
     test "$(git -C /tmp/h3-pg rev-parse HEAD)" = "${H3_PG_COMMIT}"; \
