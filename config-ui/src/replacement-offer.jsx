@@ -137,7 +137,7 @@ export function ReplacementOffer({api, offer, workspace, reconcile, apply, dismi
     {metadata?.retry && <button type="button" onClick={() => setAttempt(n => n + 1)}>Check metadata again</button>}
     {proposal && <p>{proposal.summary.layers} default workspace layer(s) have suggested edits. {proposal.summary.added} information field(s) to add, {proposal.summary.removed} to remove. Review affected filters, hover and themes before saving.</p>}
     {!!proposal?.summary.skipped.length && <p>Edited locally since replacement, excluded from suggestions: {proposal.summary.skipped.join(', ')}.</p>}
-    {!!proposal?.summary.localeConflicts?.length && <p>Excluded because a named locale uses a different relation or zoom binding: {proposal.summary.localeConflicts.join(', ')}.</p>}
+    {!!proposal?.summary.localeConflicts?.length && <p>Some changes require manual review because a named locale has a conflicting field, relation, or zoom binding: {proposal.summary.localeConflicts.join(', ')}.</p>}
     {!!proposal?.summary.layers && !offer.gap && <button type="button" disabled={busy || checking} onClick={accept}>Use suggested unsaved edits</button>}
     <button type="button" disabled={checking} onClick={dismiss}>Dismiss workspace review</button>
   </section>;

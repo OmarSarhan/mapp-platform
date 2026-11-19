@@ -1,4 +1,5 @@
 import React from 'react';
+import {renderedLocales} from './api.js';
 import {afterEach, describe, expect, test, vi} from 'vitest';
 import {
   cleanup,
@@ -959,6 +960,27 @@ describe('Dashboard managed save lifecycle', () => {
     });
     expect(result.summary).toEqual({layers: 1, added: 1, removed: 1, skipped: [], localeConflicts: []});
     expect(source.locale.layers.Summary.infoj).toHaveLength(4);
+  });
+
+  test('leaves inherited field collisions for manual review while adding safe fields', () => {
+    const calculated = {field: 'total', type: 'numeric', fieldfx: 'length_m * 2'};
+    const source = {
+      ...workspace,
+      locale: {...workspace.locale, layers: {Summary: {
+        table: 'derived_layers.summary', qID: 'id', infoj: [],
+      }}},
+      locales: {west: {layers: {Summary: {infoj: [calculated]}}}},
+    };
+    const result = reconcileDerivedWorkspace(source, {
+      name: 'summary', columnChanges: {added: ['total', 'safe'], removed: [], changed: []},
+    }, [{name: 'total', type: 'integer'}, {name: 'safe', type: 'integer'}]);
+    expect(result.workspace.locale.layers.Summary.infoj.map(entry => entry.field)).toEqual(['safe']);
+    expect(result.workspace.locales.west.layers.Summary.infoj).toEqual([calculated]);
+    expect(result.summary.localeConflicts).toEqual(['west:Summary']);
+    expect(result.summary.added).toBe(1);
+    const west = renderedLocales(result.workspace).find(([name]) => name === 'west')[1];
+    expect(west.layers.Summary.infoj.map(entry => entry.field)).toEqual(['safe', 'total']);
+    expect(source.locale.layers.Summary.infoj).toEqual([]);
   });
 
   test('refreshes the derived-layer form after converting its kind', async () => {

@@ -247,7 +247,7 @@ test.each([{table:'source_west.roads'},{tables:{8:'source_west.roads'}}])(
   render(<Dashboard/>);
   await screen.findByRole('button',{name:'Roads'});
   emit(result('roads',2,{added:['total'],removed:['old'],changed:[]}));
-  await within(review('roads')).findByText(/different relation or zoom binding: west:Roads/);
+  await within(review('roads')).findByText(/conflicting field, relation, or zoom binding: west:Roads/);
   expect(accept(review('roads'))).toBeNull();
   expect(screen.getByRole('button',{name:'Save & reload XYZ'}).disabled).toBe(true);
 });
