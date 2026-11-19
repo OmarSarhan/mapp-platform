@@ -4527,9 +4527,15 @@ class DerivedLayerStore:
         result["assetId"] = str(result["assetId"])
         result["generation"] = int(result["generation"])
         result["cleanupApproved"] = True
-        for key, value in result.items():
-            if isinstance(value, (date, datetime)):
-                result[key] = value.isoformat()
+        for key in ("createdAt", "expiresAt", "lastCleanupAttemptAt", "adoptedAt", "droppedAt"):
+            value = result[key]
+            # PostgreSQL JSON timestamps trim trailing fractional zeros. A
+            # joined definition and a typed journal row must serialize alike.
+            if isinstance(value, str):
+                value = datetime.fromisoformat(value)
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                value = value.astimezone(timezone.utc)
+            result[key] = DerivedLayerStore._json_timestamp(value)
         return result
 
     @staticmethod

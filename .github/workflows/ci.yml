@@ -18,14 +18,14 @@ jobs:
     # unnoticed-dead locally until ./bin/mapp test was fixed.
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgis/postgis:17-3.5-alpine@sha256:978a2e6671c956d650d1f240dba7c73b8519a5f5af8685165fca616cc4ae3568
         env:
           POSTGRES_PASSWORD: semantic-ci
           POSTGRES_DB: mapp_semantic_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -40,7 +40,8 @@ jobs:
       - name: Install Python test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r config-ui/requirements.txt
+          python -m pip install -r config-ui/requirements.txt -r mcp-auth/requirements.txt
+          python -m pip install --no-deps -r mcp-auth/requirements-nodeps.txt
           python -m pip install -e etl
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -51,7 +52,7 @@ jobs:
             config-ui/package-lock.json
             browser-runner/package-lock.json
 
-      - name: Prepare the control schema database
+      - name: Prepare scratch databases
         env:
           PGPASSWORD: semantic-ci
         # The control schema is created by a superuser in the packaged image,
@@ -61,10 +62,15 @@ jobs:
             -v ON_ERROR_STOP=1 -c "CREATE DATABASE mapp_control_test"
           psql -h 127.0.0.1 -U postgres -d mapp_control_test \
             -v ON_ERROR_STOP=1 -c "CREATE SCHEMA control"
+          psql -h 127.0.0.1 -U postgres -d postgres \
+            -v ON_ERROR_STOP=1 -c "CREATE DATABASE mapp_census_test TEMPLATE template_postgis"
+          psql -h 127.0.0.1 -U postgres -d mapp_census_test \
+            -v ON_ERROR_STOP=1 -c "CREATE SCHEMA leeds"
 
       - name: Test configuration service
         env:
           CONTROL_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
+          MAPP_DRAFT_TEST_DSN: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_control_test?sslmode=disable
         # The control schema suite skips without a database, and a silent skip
         # is exactly the failure this guard exists to catch: the whole point of
         # those tests is that the SQL meets a real server.
@@ -93,18 +99,19 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare MCP conformance fixtures
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mapp-client" --no-save @openai/codex@0.167.0
+          echo "MAPP_CODEX_TEST_BINARY=$RUNNER_TEMP/mapp-client/node_modules/.bin/codex" >> "$GITHUB_ENV"
+          # The drift test compares current upstream guidance with its reviewed digest.
+          mkdir -p ../mapp-config-cli/docs
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/OmarSarhan/mapp-config-cli/main/docs/agent-workflow.md \
+            --output ../mapp-config-cli/docs/agent-workflow.md
+
       - name: Test MCP runtime
-        # No database and no network: the era guard, the metadata surface and
-        # the authentication middleware are driven directly over the ASGI
-        # contract, which is where their obligations live. Nothing here is
-        # conditional, so the guard is stricter than the others -- any skip at
-        # all means a test stopped running rather than a dependency being absent.
-        #
-        # The SDK is installed because it is a real dependency of this
-        # component now. The alternative -- injecting a fake runtime into every
-        # test that merely needs an application -- would leave the one path that
-        # actually constructs the SDK untested, which is the path a deployment
-        # takes.
+        # Exercise the SDK and real loopback confirmation client. Every test
+        # has its fixture here, so any skip fails the job.
         run: |
           set -o pipefail
           pip install --requirement mapp-mcp/requirements.txt
@@ -116,7 +123,9 @@ jobs:
           fi
 
       - name: Test ETL
-        run: PYTHONPATH=etl/src python -m unittest discover -s etl/tests -v
+        env:
+          CENSUS_TEST_DATABASE_URL: postgresql://postgres:semantic-ci@127.0.0.1:5432/mapp_census_test?sslmode=disable
+        run: PYTHONPATH=etl/src python etl/tests/run_ci.py
 
       - name: Install semantic service dependencies
         run: python -m pip install -r semantic-service/requirements.txt
