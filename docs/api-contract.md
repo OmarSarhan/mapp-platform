@@ -185,6 +185,7 @@ clients still use the route and response contract owned by the server.
 | `operations cancel` | `POST /api/operations/{operationId}/cancel` | `operations.cancel` | `derive:manage` with explicit confirmation for derived create, replace or refresh jobs |
 | `auth status\|device` | Auth identity and device-authorization routes | — | Any authenticated credential can read its identity; the CLI verifies the current target before using the unauthenticated device start/poll endpoints |
 | `semantic *` | `/api/semantic/*` | `semantic.*` | See [Semantic catalog and proposals](#semantic-catalog-and-proposals) for the exact additive scopes |
+| `derived-layers show` | `GET /api/derived-layers/{name}` | `derived-layers.show` | `inspect` for the stored definition |
 
 Not every HTTP endpoint is a standalone CLI command. `/api/auth/login`,
 `/api/auth/logout`, and the password, token, device-approval, and audit routes
@@ -815,7 +816,7 @@ is the definition observed at review time. PostgreSQL still checks incoming
 dependencies during the swap.
 
 The dashboard uses the completed operation's asset ID, generation and column
-changes to offer edits after matching metadata becomes ready. Accepting an offer checks the current generation again. Out-of-order changes with incomplete impact require manual review. Suggestions exclude subsequently edited layers and default layers whose named locales would inherit the edits against another relation or zoom binding. Calculated fields are preserved. Accepting suggestions
+changes to offer edits after matching metadata becomes ready. Accepting an offer checks the current generation again. Late completions with incomplete impact reopen manual review, including after a newer offer was accepted or dismissed. Suggestions exclude subsequently edited layers and default layers whose named locales would inherit the edits against another relation or zoom binding. Calculated fields are preserved. Accepting suggestions
 edits the local workspace. Publishing those edits requires a separate save or
 revision-bound proposal and apply.
 
