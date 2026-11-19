@@ -459,11 +459,16 @@ class CheckEnvironmentTests(unittest.TestCase):
         volume this command removes. An operator reading it would have agreed
         to something other than what happens.
         """
-        result = subprocess.run(
-            [ROOT / "bin/mapp", "reset-system"],
-            capture_output=True,
-            text=True,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.isolated_mapp_root(directory)
+            initialized = self.run_isolated_init(root)
+            self.assertEqual(0, initialized.returncode, initialized.stderr)
+            result = subprocess.run(
+                [root / "bin/mapp", "reset-system"],
+                env={**os.environ, "MAPP_ENV_FILE": str(root / ".env")},
+                capture_output=True,
+                text=True,
+            )
 
         self.assertEqual(2, result.returncode)
         warning = result.stderr.lower()

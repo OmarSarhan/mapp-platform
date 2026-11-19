@@ -5011,13 +5011,13 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
                 self.assertTrue(
                     app.request_derived_background_cancellation(second["id"])
                 )
-                deadline = time.monotonic() + 1
-                while (
-                    (control.read_operation(second["id"])["status"] != "cancelled"
-                     or app.derived_background_capacity()["activeJobs"] != 1)
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.01)
+                # The terminal record is written before the worker releases
+                # its slot. Wait for its final notification before reading both.
+                with app.DERIVED_BACKGROUND_JOB_CONDITION:
+                    self.assertTrue(app.DERIVED_BACKGROUND_JOB_CONDITION.wait_for(
+                        lambda: second["id"] not in app.DERIVED_BACKGROUND_CANCELLATIONS,
+                        timeout=1,
+                    ))
                 cancelled = control.read_operation(second["id"])
                 self.assertEqual("cancelled", cancelled["status"])
                 self.assertEqual(
