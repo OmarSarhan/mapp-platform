@@ -173,7 +173,6 @@ clients still use the route and response contract owned by the server.
 | `derived-layers jobs\|list\|show\|map-extent`; MCP `derived_layers_drafts` | Other `GET /api/derived-layers/*` routes, including `/api/derived-layers/drafts` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview; `derived-layers.drafts` for disposable lifecycle status | `inspect` |
 | `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
 | `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
-| `derived-layers show` | `GET /api/derived-layers/{name}` | `derived-layers.show` | `inspect` for the stored definition |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Proposal GET routes | — | `inspect` |
@@ -186,6 +185,7 @@ clients still use the route and response contract owned by the server.
 | `operations cancel` | `POST /api/operations/{operationId}/cancel` | `derived-layer.create`, `derived-layer.replace`, or `derived-layer.refresh` | `derive`; explicit confirmation required |
 | `auth status\|device` | Auth identity and device-authorization routes | — | Any authenticated credential can read its identity; the CLI verifies the current target before using the unauthenticated device start/poll endpoints |
 | `semantic *` | `/api/semantic/*` | `semantic.*` | See [Semantic catalog and proposals](#semantic-catalog-and-proposals) for the exact additive scopes |
+| `derived-layers show` | `GET /api/derived-layers/{name}` | `derived-layers.show` | `inspect` for the stored definition |
 
 Not every HTTP endpoint is a standalone CLI command. `/api/auth/login`,
 `/api/auth/logout`, and the password, token, device-approval, and audit routes
