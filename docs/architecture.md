@@ -57,13 +57,11 @@ service over a separate internal network shared only with it, and reaches the
 packaged database over the backend network. It has no public route, and its two
 database roles are confined to the `semantic` catalog schema.
 
-The MCP authorization component is the third public hostname and the one
-service Caddy does not reach over a network at all: it joins `backend` and the
-internal `mcp-control` network, deliberately not `edge`, and its public surface
-is a Unix socket in `var/mcp-auth` that Caddy mounts and proxies four paths to.
-`mcp-control` is shared only with the configuration service, which is where its
-internal exchange, introspection and revocation endpoints are reachable and the
-public origin is not. See [MCP authorization](mcp-authorization.md).
+When MCP is enabled, Caddy serves its hostname through two Unix sockets.
+Authorization requests reach `mcp-auth` and resource requests reach
+`mapp-mcp`. The runtime, authorization component and configuration service
+communicate over the private `mcp-control` network for token checks, exchange
+and scoped API calls. See [MCP authorization](mcp-authorization.md).
 
 ## Components
 
@@ -76,7 +74,8 @@ public origin is not. See [MCP authorization](mcp-authorization.md).
 | XYZ preview | Isolated rendering of a pending proposal candidate without changing the public map | `var/preview/workspace.json`, `var/preview-reload`, public assets |
 | Configuration service | Dashboard, catalog discovery, validation, proposals, audit, preview publication, reload requests, and optional review-only Gemini drafts with separately authorized bounded data context | `var/workspace`, `var/control`, `var/reload`, `var/preview`, `var/preview-reload` |
 | Semantic service | Durable generated facts, curated annotations, per-asset proposals, history, and archive tombstones | Schema `semantic` in the packaged database, read through a read-only role and written through the role that owns it |
-| MCP authorization component | Phase 0 OAuth 2.1 authorization server for the forthcoming MCP resource server: metadata, authorization code with PKCE, operator consent, token issuance, and an internal token exchange, introspection and revocation surface | Schema `control` in the packaged database; `var/mcp-auth` holds only its edge socket |
+| MCP authorization component | OAuth authorization, PKCE, consent, token issuance, exchange, introspection and revocation | Schema `control` in the packaged database and an edge socket in `var/mcp-auth` |
+| MCP resource server | Scoped agent tools that call the configuration API using request-bound exchanges | Runtime socket in `var/mapp-mcp` |
 | Browser runner | Authenticated visual validation with bounded map origin and isolated outbound asset access | `var/control/artifacts` |
 | Caddy | TLS, host routing, response headers, upstream file-provider guard | Caddy named volumes |
 | Standalone CLI | Remote inspection, proposals, application and verification | State on the separate client computer |
@@ -106,20 +105,19 @@ The ignored `var` tree contains live state:
   Caddy also mounts. It is recreated on start and is not state to back up.
 - `preview` contains the private candidate workspace used only by
   `xyz-preview`.
-- `semantic` contains the generated and curated semantic catalog, proposal
-  records, source-event receipts, and asset history.
+- `mapp-mcp` holds the optional resource server’s edge socket.
 - `reload` is a narrow generation/fingerprint channel between the
   configuration service and XYZ supervisor.
 - `preview-reload` is a separate generation/fingerprint channel between the
   configuration service and the preview XYZ supervisor.
 
-The control tree contains authentication material and sensitive operational
-records. The semantic tree is also mutable operational state. Neither may be
-mounted into XYZ or served as a public static resource.
+Keep the control files private. Only the configuration service and the services
+with specific artifact access should receive the corresponding mounts.
 
 ## Semantic metadata flow
 
-The semantic store is intentionally outside PostgreSQL and outside XYZ. It
+The semantic service stores profiles, proposals, history and event receipts
+in the packaged PostgreSQL database. It
 describes assets without becoming another client route to their rows. The
 configuration service alone may perform the separately scoped, bounded
 sample/statistics read used by an explicitly opted-in Gemini generation

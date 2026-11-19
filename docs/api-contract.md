@@ -171,9 +171,9 @@ clients still use the route and response contract owned by the server.
 | `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
 | `derived-layers capabilities` | `GET /api/derived-layers/capabilities` | — | Any authenticated credential; contains planning methods and limits but no workspace rows |
 | `derived-layers jobs\|list\|show\|map-extent`; MCP `derived_layers_drafts` | Other `GET /api/derived-layers/*` routes, including `/api/derived-layers/drafts` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview; `derived-layers.drafts` for disposable lifecycle status | `inspect` |
-| `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
-| `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
-| `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
+| `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive:manage` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
+| `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive:manage` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
+| `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive:manage`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Proposal GET routes | — | `inspect` |
 | `proposals decline`; MCP `proposals_decline` | `POST /api/proposals/{proposalId}/decline` | `proposals.decline` | `propose` |
@@ -182,7 +182,7 @@ clients still use the route and response contract owned by the server.
 | `proposals preview-plan\|preview-test\|preview-screenshot` | Proposal visual-plan, visual-test, and screenshot routes | `proposals.preview-plan`, `proposals.preview-test`, `proposals.preview-screenshot` | `visual` |
 | `xyz status\|reload` (`reload-xyz` is a client alias) | `GET /api/xyz/status`, `POST /api/xyz/reload` | `xyz.reload` for reload | `inspect` or `reload` |
 | `operations show\|wait` | `GET /api/operations/{operationId}` | Determined by the originating action's `operationKind` | The originating `visual`, `apply`, `reload`, or `derive` scope |
-| `operations cancel` | `POST /api/operations/{operationId}/cancel` | `derived-layer.create`, `derived-layer.replace`, or `derived-layer.refresh` | `derive`; explicit confirmation required |
+| `operations cancel` | `POST /api/operations/{operationId}/cancel` | `derived-layer.create`, `derived-layer.replace`, or `derived-layer.refresh` | `derive:manage`; explicit confirmation required |
 | `auth status\|device` | Auth identity and device-authorization routes | — | Any authenticated credential can read its identity; the CLI verifies the current target before using the unauthenticated device start/poll endpoints |
 | `semantic *` | `/api/semantic/*` | `semantic.*` | See [Semantic catalog and proposals](#semantic-catalog-and-proposals) for the exact additive scopes |
 
@@ -589,8 +589,9 @@ generated column; only a trusted source refresh can reflect that source-schema
 change.
 
 Derived relation creation stores a generated-profile outbox event in the same
-PostgreSQL transaction. The `derive` scope is sufficient for that automatic
-registration; it does not grant curated edit or apply rights. Profile states
+PostgreSQL transaction. A create authorized with `derive:manage` and
+`semantic:inspect` triggers that registration. Curated edits and application
+have their own scopes. Profile states
 reported by managed definitions are `registering`, `ready`, and
 `repair_required`. A new workspace reference to the relation is rejected until
 the current profile is `ready`; retaining an existing reference produces a
@@ -764,7 +765,7 @@ Managed derived-layer database actions are separate from workspace proposals:
   workspace change, or pass its `createRequest` through the generic planner
   when the create must be bound to reviewed scope and database-plan evidence.
 - `POST /api/derived-layers` creates a dependency-checked view or materialized
-  view with `derive` and `semantic:inspect`; every declared relation source
+  view with `derive:manage` and `semantic:inspect`; every declared relation source
   must have a ready semantic profile. Database functions, including H3 and
   PostGIS functions, are not relation sources and do not need their own
   semantic profiles. Source profile meaning is authoritative over an agent's

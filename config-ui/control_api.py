@@ -2083,7 +2083,7 @@ def contract(instance_id: str) -> dict[str, Any]:
             "tokens": "issued by config UI or approved device authorization",
             "scopes": [
                 "full", "inspect", "propose", "visual", "apply", "reload",
-                "derive", "semantic:inspect", "semantic:source",
+                "derive", "derive:manage", "semantic:inspect", "semantic:source",
                 "semantic:generate", "semantic:data",
                 "semantic:propose",
                 "semantic:apply", "semantic:admin",

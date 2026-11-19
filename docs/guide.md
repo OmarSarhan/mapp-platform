@@ -53,8 +53,8 @@ you attach the database that holds it.
 
 ## 2. Your first hour
 
-You need Docker with Compose, and roughly 10 GB of free disk. Everything runs in
-containers; nothing is installed on the host.
+Use Docker with Compose and reserve space for the images, source downloads,
+spatial indexes and database volumes. A cold run also builds the images.
 
 ```sh
 cd mapp-platform
@@ -108,9 +108,8 @@ without them is a list of column names.
 You can add the key later and run `./bin/mapp demo` again to fill them in;
 nothing needs rebuilding first.
 
-`demo` takes about 30 minutes without a Gemini key, most of it
-downloading the England Census 2021 Output Area dataset and cleaning geometries.
-With one it takes considerably longer, because every included field is described
+Demo runtime depends on download speed, geometry processing and image caches.
+Adding a Gemini key increases runtime because every included field is described
 in its own model call and `census_2021_england_oa` alone has 470 columns.
 `MAPP_DEMO_FIELD_LIMIT` in `.env` is the source of truth for the per-relation
 cap; a fresh environment sets it to `50`. Raise it for a fuller catalogue, set
@@ -200,19 +199,20 @@ automatically, turn on that client's **Standing approvals** switch.
 ### Two kinds of database
 
 **The packaged database** is MAPP's own. One per deployment, always present,
-started by Compose. It holds three schemas that matter:
+started by Compose. Its schemas include:
 
 - `derived_layers` — the layers MAPP computes, and the definitions that produce them
 - `federation` — the registry of attached sources, their observation history, and group labels
 - `semantic` — the catalogue of what MAPP knows about every relation it can see
+- `control` — the administrator credential, sessions, CLI tokens, device authorizations and OAuth records
 
 It also carries PostGIS and H3, because derived work runs there.
 
 **Source databases** are yours. MAPP never writes to them. It connects with a
 read-only role you provide and attaches the relations you explicitly allow.
 
-Everything else — dashboard authentication, the audit log, workspace
-proposals, artifacts — lives in files under `var/`, not in the database.
+The live workspace, file audit log, workspace proposals, operation records
+and visual artifacts live under `var/`.
 
 ### Why the split matters
 
@@ -402,8 +402,9 @@ database, so it needs Docker but not a running deployment.
 
 The packaged database is one PostgreSQL volume: back it up with `pg_dump` and
 you have the derived layers, the federation registry and the whole semantic
-catalogue. Back up `var/` alongside it for authentication, audit and
-proposals. Your source databases are yours and are not part of this.
+catalogue as well as the credentials in the control schema. Capture the live
+workspace and control files in the same quiesced interval. Each source owner
+backs up their source database separately.
 
 Read: [`backup-restore.md`](backup-restore.md)
 
