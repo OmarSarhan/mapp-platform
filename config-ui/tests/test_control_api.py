@@ -771,6 +771,14 @@ class ControlApiTests(ControlStoreTestCase):
         from control_plane import TOKEN_SCOPES
         self.assertEqual(TOKEN_SCOPES, set(authentication["scopes"]))
 
+    def test_sql_test_reference_matches_action_and_scope(self):
+        action = ACTION_SCHEMAS["sql.test"]
+        reference = (Path(__file__).resolve().parents[2] / "docs/api-contract.md").read_text()
+        self.assertIn(
+            f"| `sql test` | `{action['method']} {action['path']}` | `sql.test` | `{action['scope']}`",
+            reference,
+        )
+
     def test_pointer_and_operations_preserve_unrelated_values(self):
         source = {"locale": {"layers": {"Bus Stops": {"style": {"default": {"icon": {"fillColor": "#0f0", "scale": 1}}}}}}, "plugin": {"x": 1}}
         candidate, diff = apply_operations(source, [{

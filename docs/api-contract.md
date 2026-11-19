@@ -168,7 +168,7 @@ clients still use the route and response contract owned by the server.
 | `layers statistics` | `GET /api/layers/{layerKey}/statistics` | `layers.statistics` | `derive` + `semantic:inspect`; returns bounded numeric aggregates, never raw rows |
 | `validate` | `POST /api/validate` | — | Legacy `full` or administrator session; it never saves |
 | `set`, `unset`, `amend` | `POST /api/mutate` with `save: false` | — | Legacy `full` or administrator session; the CLI rejects direct save |
-| `sql test` | `POST /api/sql/test` | — | Legacy `full` or administrator session; read-only bounded probe |
+| `sql test` | `POST /api/sql/test` | `sql.test` | `derive` for the bounded read-only expression probe |
 | `derived-layers capabilities` | `GET /api/derived-layers/capabilities` | — | Any authenticated credential; contains planning methods and limits but no workspace rows |
 | `derived-layers jobs\|list\|show\|map-extent`; MCP `derived_layers_drafts` | Other `GET /api/derived-layers/*` routes, including `/api/derived-layers/drafts` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview; `derived-layers.drafts` for disposable lifecycle status | `inspect` |
 | `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive:manage` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
