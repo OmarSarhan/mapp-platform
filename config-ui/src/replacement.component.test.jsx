@@ -252,7 +252,7 @@ test.each([{table:'source_west.roads'},{tables:{8:'source_west.roads'}}])(
   expect(screen.getByRole('button',{name:'Save & reload XYZ'}).disabled).toBe(true);
 });
 
-test('an earlier completion arriving after the latest generation requires manual review',async()=>{
+test.each(['open','accepted','dismissed'])('a late removal reopens manual review with the newer offer %s',async(state)=>{
   mockApi(path=>{
     if(path==='/api/semantic/derived-profiles/roads')return {derivedProfile:binding('roads',3)};
     if(path==='/api/semantic/catalog/objects/asset%3Aroads')return {asset:asset('roads',3)};
@@ -260,8 +260,19 @@ test('an earlier completion arriving after the latest generation requires manual
   render(<Dashboard/>);
   await screen.findByRole('button',{name:'Roads'});
   emit(result('roads',3,{added:['total'],removed:[],changed:[]}));
-  await screen.findByRole('button',{name:'Use suggested unsaved edits'});
+  const apply=await screen.findByRole('button',{name:'Use suggested unsaved edits'});
+  if(state==='accepted'){
+    fireEvent.click(apply);
+    await screen.findByText(/Suggested edits are in the workspace editor/);
+  }else if(state==='dismissed'){
+    fireEvent.click(within(review('roads')).getByRole('button',{name:'Dismiss workspace review'}));
+  }
   emit(result('roads',2,{added:[],removed:['old'],changed:[]}));
   await within(review('roads')).findByText(/Review earlier changes manually/);
+  expect(within(review('roads')).getByText(/Late completion for generation 2.*Removed: old/)).toBeTruthy();
   expect(accept(review('roads'))).toBeNull();
+  expect(screen.getByRole('button',{name:'Save & reload XYZ'}).disabled).toBe(state!=='accepted');
+  fireEvent.click(within(review('roads')).getByRole('button',{name:'Dismiss workspace review'}));
+  emit(result('roads',2,{added:[],removed:['old'],changed:[]}));
+  expect(screen.queryByRole('region',{name:'Replacement of roads'})).toBeNull();
 });

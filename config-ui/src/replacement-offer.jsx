@@ -40,7 +40,7 @@ export function enqueueReplacement(offers, result, workspace) {
   // An old incarnation can report completion late. Recheck both identities by name.
   const others = offers.filter(offer => offer !== previous).map(offer =>
     offer.result.name === result.name ? {...offer, checkVersion:(offer.checkVersion || 0) + 1} : offer);
-  return [...others, {result, baseline, firstGeneration, gap}];
+  return [...others, {result, baseline, firstGeneration, gap, lateResults:previous?.lateResults}];
 }
 
 async function replacementMetadata(api, result, accepting=false) {
@@ -124,6 +124,11 @@ export function ReplacementOffer({api, offer, workspace, reconcile, apply, dismi
     <p>The database replacement committed. {profile && <>Generation {profile.generation} · {profile.status} at completion.</>}</p>
     {firstGeneration < profile?.generation && <p>Includes outstanding changes since generation {firstGeneration}.</p>}
     {offer.gap && <p>The complete sequence of replacement changes could not be verified. Review earlier changes manually.</p>}
+    {(offer.lateResults||[]).map(late=><p key={late.semanticProfile.generation}>
+      Late completion for generation {late.semanticProfile.generation}. {completeChanges(late.columnChanges)
+        ? `Added: ${late.columnChanges.added.join(', ')||'none'}. Removed: ${late.columnChanges.removed.join(', ')||'none'}. Type changed: ${late.columnChanges.changed.join(', ')||'none'}.`
+        : 'Column impact is incomplete.'}
+    </p>)}
     {completeChanges(changes) && <p>Added: {changes.added.join(', ') || 'none'}. Removed: {changes.removed.join(', ') || 'none'}. Type changed: {changes.changed.join(', ') || 'none'}.</p>}
     <p>Values can have a new meaning even when columns match. Review feature IDs, filters, hover text and symbology, including zoom-dependent layers. Review named-locale overrides through the API or CLI.</p>
     {result.consumerLabels?.length > 0 && <p>Direct workspace consumers: {result.consumerLabels.join(', ')}.</p>}

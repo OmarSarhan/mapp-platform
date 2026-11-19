@@ -75,6 +75,15 @@ class ControlApiTests(ControlStoreTestCase):
             ),
         )
 
+    def test_per_name_definition_reference_tracks_its_capability(self):
+        action = ACTION_SCHEMAS["derived-layers.show"]
+        reference = (Path(__file__).resolve().parents[2] / "docs/api-contract.md").read_text()
+        self.assertIn(
+            f"| `derived-layers show` | `{action['method']} {action['pathTemplate']}` | "
+            f"`derived-layers.show` | `{action['scope']}`",
+            reference,
+        )
+
     def test_contract_advertises_exactly_the_federation_cli_commands(self):
         # This assertion used to be the inverse: advertising a command the CLI
         # cannot run is a lie, and the CLI refuses anything unadvertised with

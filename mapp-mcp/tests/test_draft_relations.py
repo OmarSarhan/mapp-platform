@@ -100,7 +100,7 @@ class DraftApprovalTests(unittest.IsolatedAsyncioTestCase):
             exchange=self.exchange, config_api=api,
         )
         token = approvals.CURRENT_CALLER.set(caller(
-            scopes="mcp:connect inspect derive:manage semantic:inspect"))
+            scopes="mcp:connect inspect derive:manage semantic:inspect derive"))
         self.addCleanup(approvals.CURRENT_CALLER.reset, token)
         return server._tool_manager._tools[name].fn
 

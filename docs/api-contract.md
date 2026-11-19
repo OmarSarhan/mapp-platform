@@ -173,6 +173,7 @@ clients still use the route and response contract owned by the server.
 | `derived-layers jobs\|list\|show\|map-extent`; MCP `derived_layers_drafts` | Other `GET /api/derived-layers/*` routes, including `/api/derived-layers/drafts` | `derived-layers.background-jobs` for job inspection; `derived-layers.map-extent` for the extent preview; `derived-layers.drafts` for disposable lifecycle status | `inspect` |
 | `derived-layers plan` | `POST /api/derived-layers/plan` | `derived-layers.plan` | `derive` + `semantic:inspect`; resolves and fully preflights a create definition, returns bounded access-path evidence and a replay fingerprint, and applies no mutation |
 | `derived-layers plan-area-weighted-h3` | `POST /api/derived-layers/recipes/area-weighted-h3/plan` | `derived-layers.plan-area-weighted-h3` | `derive` + `semantic:inspect`; returns a resolved, fully preflighted create request and applies no mutation |
+| `derived-layers show` | `GET /api/derived-layers/{name}` | `derived-layers.show` | `inspect` for the stored definition |
 | `derived-layers create\|refresh\|replace\|drop` | Managed derived-layer POST routes | `derived-layers.create`, `derived-layers.refresh`, `derived-layers.replace`, `derived-layers.drop` | `derive`; create/replace also require `semantic:inspect` for ready relation-source profiles |
 | `proposals check\|create` | `POST /api/proposals/check`, `POST /api/proposals` | `proposals.check`, `proposals.create` | `propose` |
 | `proposals list\|show` | Proposal GET routes | — | `inspect` |
@@ -814,7 +815,7 @@ is the definition observed at review time. PostgreSQL still checks incoming
 dependencies during the swap.
 
 The dashboard uses the completed operation's asset ID, generation and column
-changes to offer edits after matching metadata becomes ready. Accepting an offer checks the current generation again. Out-of-order changes with incomplete impact require manual review. Suggestions exclude subsequently edited layers and default layers whose named locales would inherit the edits against another relation or zoom binding. Calculated fields are preserved. Accepting suggestions
+changes to offer edits after matching metadata becomes ready. Accepting an offer checks the current generation again. Late completions with incomplete impact reopen manual review, including after a newer offer was accepted or dismissed. Suggestions exclude subsequently edited layers and default layers whose named locales would inherit the edits against another relation or zoom binding. Calculated fields are preserved. Accepting suggestions
 edits the local workspace. Publishing those edits requires a separate save or
 revision-bound proposal and apply.
 

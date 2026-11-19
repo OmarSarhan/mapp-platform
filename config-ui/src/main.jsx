@@ -389,15 +389,23 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
  const receiveReplacement=(result,baseline=workspaceRef.current)=>{
   const profile=result?.semanticProfile;
   if(profile?.assetId&&Number.isInteger(profile.generation)){
-   const seen=observedGenerations.current;
-   const latest=seen.get(profile.assetId);
-   if(latest===profile.generation)return;
-   if(latest>profile.generation){
-    setOffers(current=>current.map(offer=>offer.result.semanticProfile?.assetId===profile.assetId&&
-     offer.firstGeneration>profile.generation?{...offer,gap:true,checkVersion:(offer.checkVersion||0)+1}:offer));
+   const histories=observedGenerations.current;
+   const history=histories.get(profile.assetId)||{generations:new Set(),latest:null,manualGeneration:null};
+   if(history.generations.has(profile.generation))return;
+   history.generations.add(profile.generation);
+   const latest=history.latest;
+   if(latest&&latest.semanticProfile.generation>profile.generation){
+    history.manualGeneration=latest.semanticProfile.generation;
+    setOffers(current=>{
+     const open=current.find(offer=>offer.result.semanticProfile?.assetId===profile.assetId);
+     const review={...(open||{result:latest,baseline,firstGeneration:latest.semanticProfile.generation}),
+      gap:true,lateResults:[...(open?.lateResults||[]),result],checkVersion:(open?.checkVersion||0)+1};
+     return open?current.map(offer=>offer===open?review:offer):[...current,review];
+    });
     return;
    }
-   seen.set(profile.assetId,profile.generation);
+   history.latest=result;
+   histories.set(profile.assetId,history);
   }
 
   setOffers(previous=>enqueueReplacement(previous,result,baseline));
@@ -413,7 +421,8 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
  const dismissOffer=offer=>setOffers(current=>current.filter(item=>item!==offer));
  const applyOffer=(offer,reviewedWorkspace,proposal)=>{
   const {assetId,generation}=offer.result.semanticProfile;
-  if(observedGenerations.current.get(assetId)!==generation)return;
+  const history=observedGenerations.current.get(assetId);
+  if(history?.latest.semanticProfile.generation!==generation||history.manualGeneration===generation)return;
   if(activityRef.current||workspaceRef.current!==reviewedWorkspace){
    setStatus({kind:'pending',message:'The editor changed during verification. Review the current suggestions again.'});
    return;

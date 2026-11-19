@@ -575,7 +575,7 @@ the new client switches explicitly after upgrading.
 
 Derived from the risk class, so this table is a consequence rather than a
 second list. `derive:manage` names the managed-relation lifecycle, which acts
-on the database directly with no proposal behind it. MCP discovery for create, replace, refresh and drop also requires `inspect` for the approval exchange. Replacement retains the inspected map extent locale and previews changed definition fields alongside the SQL and known consumers.
+on the database directly with no proposal behind it. MCP discovery for create, replace, refresh and drop also requires `inspect` for the approval exchange. Background create, replace and refresh require `derive` to retrieve the result with `operations_show`. With a narrower grant, pass `background=false` for a foreground result. Replacement retains the inspected map extent locale and previews changed definition fields alongside the SQL and known consumers.
 
 | Requires approval | Does not |
 | --- | --- |

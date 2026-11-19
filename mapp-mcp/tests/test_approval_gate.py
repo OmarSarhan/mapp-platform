@@ -1249,7 +1249,7 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 APPROVALS_CREATE["path_template"]
             )[0]["body"]["packet"]
 
-    def build(self, name, api):
+    def build(self, name, api, scopes="mcp:connect inspect derive semantic:inspect derive:manage"):
         server = build_runtime(
             resource=ProtectedResource(
                 origin="http://mcp.localhost", issuer="http://mcp.localhost"
@@ -1259,8 +1259,7 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         token = CURRENT_CALLER.set(Authenticated(
             {"sub": "oauth:grant",
-             "scope": "mcp:connect inspect derive semantic:inspect"
-                      " derive:manage",
+             "scope": scopes,
              "aud": "http://mcp.localhost/mcp"},
             "mapp_a_live",
         ))
@@ -1339,6 +1338,23 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ToolError) as raised:
             await drop(self.agreeing(), "no_such_thing")
         self.assertIn("no_such_thing", str(raised.exception))
+
+    async def test_minimum_grant_requires_foreground_before_approval_or_dispatch(self):
+        for verb in ("create", "replace", "refresh"):
+            with self.subTest(verb=verb):
+                api = self.Api(self)
+                arguments = ["census_h3"]
+                if verb != "refresh":
+                    arguments.extend(["SELECT 1", ["source_census.oa"], "id", "geom"])
+                fn = self.build("derived_layers_" + verb, api, scopes="mcp:connect inspect derive:manage semantic:inspect")
+                ctx = self.agreeing()
+                with self.assertRaisesRegex(ToolError, "background=false"):
+                    await fn(ctx, *arguments)
+                self.assertEqual([], ctx.asked)
+                self.assertEqual([], api.calls)
+                await fn(ctx, *arguments, background=False)
+                self.assertTrue(ctx.asked)
+                self.assertIs(False, api.calls[-1]["body"]["background"])
 
     async def test_a_replace_shows_what_it_is_today(self) -> None:
         """A replace is the quiet one: everything reading the relation keeps

@@ -981,6 +981,17 @@ def _failure_diagnostics(payload):
     return detail
 
 
+def _require_derived_polling(background):
+    if not background:
+        return
+    caller = CURRENT_CALLER.get()
+    if caller is None or not set(OPERATIONS_SHOW["scopes"]).issubset(caller.scopes):
+        raise ToolError(
+            "Background execution requires derive to poll operations_show. "
+            "Pass background=false to wait for a foreground result with the existing grant."
+        )
+
+
 def _derived_outcome(payload):
     result = _without_meta(payload)
     if isinstance(result.get("operation"), dict):
@@ -2148,7 +2159,7 @@ def build_runtime(
             " derived_layers_plan so the create is refused if the sources"
             " moved since you looked. This writes to the database directly --"
             " there is no proposal and no review queue for creation. Background"
-            " execution is the default; poll operations_show. By default"
+            " execution requires derive to poll operations_show. Set background=false for foreground execution. By default"
             " the relation persists. Optional draft or"
             " draft_expires_in_hours explicitly"
             " authorizes automatic cleanup after proposal decline or expiry;"
@@ -2178,6 +2189,7 @@ def build_runtime(
         query, the sources, the columns -- because there is nothing else for
         the person to read.
         """
+        _require_derived_polling(background)
         body = _derived_definition(
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
@@ -2242,7 +2254,7 @@ def build_runtime(
             " shows SQL excerpts and known consumers. On commit, published maps can"
             " show changed values or fail on removed fields. Set kind='materialized'"
             " or kind='view' to convert. Dependency and resource guards apply."
-            " Poll operations_show for the default background execution."
+            " Default background execution requires derive to poll operations_show. Set background=false to run in the foreground."
         ),
     )
     async def derived_layers_replace(
@@ -2257,6 +2269,7 @@ def build_runtime(
         background: bool = True,
     ) -> dict:
         """Review the inspected definition and known consumers before replacement."""
+        _require_derived_polling(background)
         if kind is not None and kind not in ("view", "materialized"):
             raise ToolError("Replacement kind must be view or materialized.")
         current = await io_call(derived_layers_show, name)
@@ -2355,8 +2368,8 @@ def build_runtime(
         description=(
             "Recompute a materialised derived relation from its sources. The"
             " definition does not change; the numbers do. Asks you to approve"
-            " first. Background execution is the default; follow it with"
-            " operations_show."
+            " first. Default background execution requires derive to poll"
+            " operations_show. Set background=false to run in the foreground."
         ),
     )
     async def derived_layers_refresh(
@@ -2369,6 +2382,7 @@ def build_runtime(
         again, and an agent that could fire it unattended would be a way to
         spend the database's time.
         """
+        _require_derived_polling(background)
         current = await io_call(derived_layers_show, name)
         body = {"confirmed": True}
         if background is not None:
