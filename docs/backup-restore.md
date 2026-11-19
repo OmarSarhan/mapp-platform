@@ -95,12 +95,22 @@ not place it in the same unencrypted archive as public release files.
    other database clients fenced through the private readiness checks. Stop
    automated restarts. Preserve the original backup for a fresh attempt.
 2. Restore `.env` from the approved secret store without committing it.
-3. Verify the archive checksums. On the isolated database service, restore
-   into an empty database with the required owners available. Use
-   `pg_restore --exit-on-error --single-transaction -d TARGET mapp.dump`
-   for a custom-format logical dump. Check schema/object owners, FDW mappings,
-   extensions and grants before running the control commands. A logical dump
-   of one database does not create cluster roles.
+3. Verify the archive checksums. For the bundled logical restore, initialize
+   the fresh volume's required roles using a separate bootstrap database name.
+   Leave the database named in the archive absent. With just the destination
+   database service running, restore from the maintenance database:
+
+   ```sh
+   pg_restore --exit-on-error --create -d postgres mapp.dump
+   ```
+
+   This restores the archived database name, settings and database-level
+   privileges, including the semantic roles' CONNECT grants. After successful
+   restore, set the deployment's database name back to the name in the manifest.
+   A failed create-and-restore may leave a partial database. Keep the target
+   fenced and retry on fresh storage. Check role settings, schema and object
+   ownership, FDW mappings, extensions and database privileges for every
+   service role. The dump relies on the destination's cluster roles.
 4. Restore `var/workspace` and `var/control`, including durable operation
    records, with the configured host UID/GID and restrictive modes. The
    semantic catalog and the control schema — the administrator credential,

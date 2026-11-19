@@ -169,6 +169,8 @@ class ResetCommandSafetyTests(unittest.TestCase):
         document = (ROOT / "docs/backup-restore.md").read_text(encoding="utf-8")
         self.assertIn("./bin/mapp advance-recovery-epoch --confirm", document)
         self.assertIn("including ones revoked since", document)
+        self.assertIn("pg_restore --exit-on-error --create", document)
+        self.assertLess(document.index("migrate-restored-control"), document.index("advance-recovery-epoch"))
         # Ordered before the stack starts, or a pre-restore credential is
         # usable in the window between.
         self.assertLess(

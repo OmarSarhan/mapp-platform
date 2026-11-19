@@ -282,10 +282,8 @@ class ControlStore:
         to print a plan and change nothing, and it was applying the entire
         forward ladder before computing that plan: a schema at version 4 came
         back at 6, and the command then exited 2 saying nothing had happened.
-        The recovery-epoch precondition had the same defect from the same
-        cause: it checks for migration 5 on a connection that had already
-        migrated past it, so the refusal the restore procedure documents could
-        never fire.
+        Recovery likewise needs to inspect the restored ledger before any
+        forward migration or invalidation.
         """
         connection = control_schema.connect()
         try:
