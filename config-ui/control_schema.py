@@ -134,7 +134,7 @@ RESTORE_SCHEMA_SIGNATURES = {
 
 
 def _restore_schema_signature(connection):
-    definitions = connection.execute("""
+    signature_query = """
         WITH owned AS (
             SELECT oid, relname FROM pg_class
             WHERE relnamespace = 'control'::regnamespace AND relkind = 'r'
@@ -154,8 +154,15 @@ def _restore_schema_signature(connection):
         SELECT t.relname, 'index', i.relname, pg_get_indexdef(i.oid)
         FROM owned t JOIN pg_index x ON x.indrelid = t.oid
         JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indisvalid AND x.indisready
-    """, (list(TABLES_IN_DELETE_ORDER) + ["schema_migrations"],))
-    records = sorted(tuple(row.values()) for row in definitions)
+    """
+    # pg_get_* renders SQL using session settings. Limit canonical formatting
+    # to this read, including when a sweep already owns the outer transaction.
+    with connection.transaction(force_rollback=True):
+        connection.execute("SET LOCAL quote_all_identifiers = off")
+        connection.execute("SET LOCAL search_path = pg_catalog, control")
+        connection.execute("SET LOCAL standard_conforming_strings = on")
+        definitions = connection.execute(signature_query, (list(TABLES_IN_DELETE_ORDER) + ["schema_migrations"],))
+        records = sorted(tuple(row.values()) for row in definitions)
     return hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest()
 
 
