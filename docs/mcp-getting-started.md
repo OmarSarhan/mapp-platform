@@ -17,7 +17,7 @@ Every number in this guide is checked against the code by
 
 MAPP publishes an **MCP server**: a fixed set of tools an AI assistant can
 call. It is not the configuration API with a chat interface in front of it —
-it is a deliberately narrower surface, 56 tools against the platform's 73
+it is a deliberately narrower surface, 56 tools against the platform's 74
 actions, and the things left out were left out on purpose.
 
 Three facts decide everything else:

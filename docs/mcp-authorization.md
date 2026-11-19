@@ -786,7 +786,7 @@ sign-in is what makes P19's 90-day floor and purge-under-pressure required.
 
 Phase 0 stops deliberately short in several places:
 
-- the operation allowlist covers 57 of the platform's 73 actions, and adding
+- the operation allowlist covers 58 of the platform's 74 actions, and adding
   one is a deliberate act in three places. It was 38 when Phase 0 closed;
 - a refused authorization is not recorded in the audit trail. A failed operator
   sign-in is (`auth.login_failed`), as are the client and grant lifecycle
