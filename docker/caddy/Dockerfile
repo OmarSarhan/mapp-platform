@@ -3,7 +3,7 @@ FROM golang:1.26.7-alpine3.23@sha256:b17af760035fc2f338eed92d448a6c67f2d45438844
 ARG CADDY_VERSION=v2.11.4
 ARG CADDY_COMMIT=e2eee6a7fce366321294c9c2a79f3146891dcbdf
 
-RUN apk add --no-cache git=2.52.0-r0 \
+RUN apk add --no-cache git=2.52.1-r0 \
     && git init /reviewed-source \
     && git -C /reviewed-source fetch --depth 1 \
       https://github.com/caddyserver/caddy.git "refs/tags/${CADDY_VERSION}" \
@@ -33,8 +33,8 @@ RUN go mod init mapp.invalid/caddy-build \
 FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
 
 RUN apk add --no-cache --upgrade \
-      c-ares=1.34.8-r0 \
-      curl=8.22.0-r0 \
-      libcurl=8.22.0-r0
+      c-ares=1.34.9-r0 \
+      curl=8.23.0-r0 \
+      libcurl=8.23.0-r0
 
 COPY --from=caddy-builder /out/caddy /usr/bin/caddy

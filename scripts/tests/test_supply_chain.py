@@ -160,9 +160,9 @@ class BaseImagePolicyTests(unittest.TestCase):
         )
         self.assertIn("golang.org/x/text@v0.39.0", caddy)
         self.assertIn("google.golang.org/grpc@v1.82.1", caddy)
-        self.assertIn("c-ares=1.34.8-r0", caddy)
-        self.assertIn("curl=8.22.0-r0", caddy)
-        self.assertIn("libcurl=8.22.0-r0", caddy)
+        self.assertIn("c-ares=1.34.9-r0", caddy)
+        self.assertIn("curl=8.23.0-r0", caddy)
+        self.assertIn("libcurl=8.23.0-r0", caddy)
         self.assertIn(
             "GOSU_COMMIT=6456aaa0f3c854d199d0f037f068eb97515b7513",
             postgis,
@@ -173,8 +173,8 @@ class BaseImagePolicyTests(unittest.TestCase):
         )
         self.assertIn("build-base=0.5-r4", postgis)
         self.assertIn("cmake=4.2.3-r0", postgis)
-        self.assertIn("git=2.54.0-r0", postgis)
-        self.assertIn("postgresql17-dev=17.11-r0", postgis)
+        self.assertIn("git=2.54.1-r0", postgis)
+        self.assertIn("postgresql17-dev=17.12-r0", postgis)
 
 
 class SupplyChainWorkflowTests(unittest.TestCase):
