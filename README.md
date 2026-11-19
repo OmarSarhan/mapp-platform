@@ -16,7 +16,7 @@ attached, and what it knows about their columns. Your data stays where it is.
 
 ## Try it
 
-Docker with Compose, and about 4 GB free. Nothing is installed on the host.
+Install Docker with Compose. Allow disk space for the images, database volumes and demo downloads.
 
 ```sh
 ./bin/mapp init --demo     # write .env and generate every secret
@@ -24,8 +24,7 @@ Docker with Compose, and about 4 GB free. Nothing is installed on the host.
 ./bin/mapp demo            # load two real open-data sources and publish a map
 ```
 
-`demo` takes around fifteen minutes, most of it downloading the England Census
-2021 Output Area dataset. Then open:
+Once `demo` finishes loading the England Census and Leeds data, open:
 
 - the map — <http://localhost>
 - the dashboard — <http://config.localhost>
@@ -76,7 +75,8 @@ covers preparing the source database itself.
 | `bin/mapp` | The wrapper every operation goes through |
 | `config-ui/` | Configuration dashboard and API |
 | `semantic-service/` | Private semantic catalogue service |
-| `mcp-auth/` | Phase 0 OAuth authorization component for the forthcoming MCP server |
+| `mcp-auth/` | OAuth authorization for the optional MCP service |
+| `mapp-mcp/` | Scoped agent tools for the configuration API |
 | `etl/` | Loader used by the demo to populate source databases |
 | `docker/` | Image definitions and database initialisation |
 | `scripts/` | `verify.sh`, acceptance and contract test helpers |
@@ -97,17 +97,11 @@ If you already know what you are looking for, its
 [reference index](docs/guide.md#10-reference-index) lists all of them with a
 line each.
 
-The platform's own state — the administrator credential, dashboard sessions,
-CLI tokens, device authorizations and the OAuth records of the Phase 0
-[MCP authorization component](docs/mcp-authorization.md) — lives in the
-`control` schema of the packaged database, not in files under `var/`. Its
-design decisions are recorded in
-[ADR 0001](docs/adr/0001-mcp-authorization-and-topology.md), its
-[threat model](docs/mcp-threat-model.md) covers the abuse cases, and the
-[Phase 0 evidence bundle](docs/mcp-phase0-evidence.md) carries the measured
-capacity and the gate status. That component is an unmerged feasibility spike:
-no agent client can be registered yet, so it cannot complete an authorization
-end to end.
+To enable the optional MCP services, register a client and authorize its tools,
+follow the [agent setup guide](docs/mcp-getting-started.md). The packaged
+database stores administrator, session, token and OAuth records in its
+`control` schema. See the [authorization model](docs/mcp-authorization.md)
+for the scope and approval rules.
 
 ## The remote client
 
