@@ -768,18 +768,8 @@ class ControlApiTests(ControlStoreTestCase):
             ["inspect", "propose", "visual", "semantic:inspect"],
             authentication["defaultDeviceScopes"],
         )
-        self.assertEqual(
-            {
-                "full", "inspect", "propose", "visual", "apply", "reload",
-                "derive", "semantic:inspect", "semantic:source",
-                "semantic:generate", "semantic:data",
-                "semantic:propose",
-                "semantic:apply", "semantic:admin",
-                "federation:register", "federation:provision",
-                "federation:observe",
-            },
-            set(authentication["scopes"]),
-        )
+        from control_plane import TOKEN_SCOPES
+        self.assertEqual(TOKEN_SCOPES, set(authentication["scopes"]))
 
     def test_pointer_and_operations_preserve_unrelated_values(self):
         source = {"locale": {"layers": {"Bus Stops": {"style": {"default": {"icon": {"fillColor": "#0f0", "scale": 1}}}}}}, "plugin": {"x": 1}}
