@@ -282,10 +282,8 @@ class ControlStore:
         to print a plan and change nothing, and it was applying the entire
         forward ladder before computing that plan: a schema at version 4 came
         back at 6, and the command then exited 2 saying nothing had happened.
-        The recovery-epoch precondition had the same defect from the same
-        cause: it checks for migration 5 on a connection that had already
-        migrated past it, so the refusal the restore procedure documents could
-        never fire.
+        Recovery likewise needs to inspect the restored ledger before any
+        forward migration or invalidation.
         """
         connection = control_schema.connect()
         try:
@@ -439,15 +437,19 @@ class ControlStore:
 
     # -- recovery epoch --------------------------------------------------
 
-    def recovery_epoch(self) -> int:
+    def recovery_epoch(self, *, expected_instance: str | None = None) -> int:
         with self._db(migrate=False) as connection:
-            self._require_initialized(connection)
+            control_schema.restored_control_state(
+                connection, expected_instance=expected_instance, require_current=True,
+            )
             row = connection.execute(
                 "SELECT control.current_recovery_epoch() AS epoch"
             ).fetchone()
             return int(row["epoch"])
 
-    def advance_recovery_epoch(self, *, reason: str = "restore") -> dict:
+    def advance_recovery_epoch(
+        self, *, reason: str = "restore", expected_instance: str | None = None,
+    ) -> dict:
         """Invalidate every credential minted before now. Returns what it did.
 
         The control for the one hole a database restore opens: a snapshot
@@ -495,24 +497,15 @@ class ControlStore:
         revoked: dict[str, int] = {}
         deleted: dict[str, int] = {}
         with self._db(migrate=False) as connection:
-            self._require_initialized(connection)
             connection.execute("BEGIN")
             try:
-                # The precondition is the function, not the row. If migration
-                # 5 has not run there is no mechanism at all and an advance
-                # would silently do nothing useful.
-                present = connection.execute(
-                    "SELECT 1 FROM pg_proc p"
-                    "  JOIN pg_namespace n ON n.oid = p.pronamespace"
-                    " WHERE n.nspname = %s AND p.proname = 'current_recovery_epoch'",
-                    (control_schema.SCHEMA,),
-                ).fetchone()
-                if present is None:
-                    raise RuntimeError(
-                        "The recovery epoch is not available; migration 5 has"
-                        " not been applied, so a restore cannot invalidate"
-                        " pre-restore credentials."
-                    )
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+                    (control_schema.MIGRATION_LOCK,),
+                )
+                control_schema.restored_control_state(
+                    connection, expected_instance=expected_instance, require_current=True,
+                )
                 # Upsert, not update. A missing row means zero -- which is what
                 # current_recovery_epoch() already reports -- and an absent row
                 # must not be able to brick the one control that matters at

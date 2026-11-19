@@ -82,7 +82,7 @@ class ConfigAdminTests(unittest.TestCase):
                     handled.append(command)
                     break
             else:
-                if command in ("init", "reset-password", "reset-demo",
+                if command in ("init", "migrate-restored-control", "reset-password", "reset-demo",
                                "revoke-tokens"):
                     handled.append(command)
         self.assertEqual(
@@ -286,6 +286,11 @@ class AdvanceRecoveryEpochCommandTests(ControlStoreTestCase):
         self.assertIn("oauth_grants", output)
         self.assertEqual(1, self.store.recovery_epoch())
 
+    def test_wrong_manifest_instance_refuses_the_sweep(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "manifest"):
+            self.run_command("--confirm", "--expect-instance", "wrong")
+        self.assertEqual(0, self.store.recovery_epoch())
+
     def test_it_says_so_when_nothing_was_live(self) -> None:
         """A restore of an idle snapshot is a normal case, not a silent no-op."""
         handled, output = self.run_command("--confirm")
@@ -324,7 +329,7 @@ class AdvanceRecoveryEpochCommandTests(ControlStoreTestCase):
             cs.rollback(connection, 4, accept_data_loss=True)
         with self.assertRaises(SystemExit) as caught:
             self.run_command("--confirm")
-        self.assertIn("migration 5", str(caught.exception))
+        self.assertIn("migrate-restored-control", str(caught.exception))
         self.assertIn("pre-restore credentials", str(caught.exception))
 
 
