@@ -771,13 +771,28 @@ class ControlApiTests(ControlStoreTestCase):
         from control_plane import TOKEN_SCOPES
         self.assertEqual(TOKEN_SCOPES, set(authentication["scopes"]))
 
-    def test_sql_test_reference_matches_action_and_scope(self):
-        action = ACTION_SCHEMAS["sql.test"]
+    def test_capability_reference_identifies_discovery_and_operation_actions(self):
         reference = (Path(__file__).resolve().parents[2] / "docs/api-contract.md").read_text()
-        self.assertIn(
-            f"| `sql test` | `{action['method']} {action['path']}` | `sql.test` | `{action['scope']}`",
-            reference,
-        )
+        rows = reference.splitlines()
+        actions = {action["id"]: action for action in capabilities("instance")["actions"]}
+        for command, identifiers in (
+            ("sql test", ["sql.test"]),
+            ("derived-layers capabilities", ["derived-layers.capabilities"]),
+            ("derived-layers jobs", ["derived-layers.list", "derived-layers.background-jobs",
+                                    "derived-layers.map-extent", "derived-layers.drafts"]),
+            ("operations show", ["operations.show"]),
+            ("operations cancel", ["operations.cancel"]),
+        ):
+            row = next(row for row in rows if row.startswith(f"| `{command}"))
+            _, _, routes, advertised, authority, _ = row.replace("\\|", "/").split("|")
+            for identifier in identifiers:
+                with self.subTest(command=command, action=identifier):
+                    action = actions[identifier]
+                    self.assertIn(f"`{identifier}`", advertised)
+                    self.assertIn(f"`{action['scope']}`", authority)
+                    if len(identifiers) == 1:
+                        path = action.get("path") or action["pathTemplate"]
+                        self.assertIn(f"{action['method']} {path}", routes)
 
     def test_pointer_and_operations_preserve_unrelated_values(self):
         source = {"locale": {"layers": {"Bus Stops": {"style": {"default": {"icon": {"fillColor": "#0f0", "scale": 1}}}}}}, "plugin": {"x": 1}}
