@@ -264,6 +264,14 @@ class DraftPostgreSQLTests(unittest.TestCase):
             active["name"], adopted["name"], dropped["name"], "permanent_relation", "absent_relation",
         }))
 
+    def test_json_and_typed_rows_return_identical_draft_timestamps(self):
+        draft = self.create()["draft"]
+        self.sql("UPDATE derived_layers._drafts SET created_at = %s WHERE asset_id = %s",
+                 ("2026-01-02T03:04:05.120000+00:00", draft["assetId"]))
+        joined = self.store.get(draft["name"])["draft"]
+        self.assertEqual([joined], self.store.drafts_for_names([draft["name"]]))
+        self.assertEqual([joined], self.store.list_drafts())
+
     def test_publication_lookup_blocks_missing_or_changed_draft_identity(self):
         draft = self.create()["draft"]
         self.sql("UPDATE derived_layers._definitions SET semantic_generation=2")
