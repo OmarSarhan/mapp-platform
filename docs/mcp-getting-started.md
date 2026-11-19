@@ -409,8 +409,9 @@ the upgrade; enable the new switch deliberately for each client you trust.
 
 - **One agent:** Security → MCP clients → withdraw. Immediate, including
   credentials already issued.
-- **One consent:** Security → MCP grants → revoke. Also closes any standing
-  approvals it holds.
+- **One consent:** Security → MCP grants → revoke. This withdraws authority
+  for that grant. Other live consents for the same client can still use its
+  standing approval. Turn off the client switch to end it across consents.
 - **Everything:** stop the platform without `MAPP_MCP=1`. The services do not
   start and the surface is gone.
 

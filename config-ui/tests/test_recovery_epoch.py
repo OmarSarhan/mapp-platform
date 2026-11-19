@@ -22,6 +22,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import control_schema as cs
 from control_plane import ControlStore
@@ -430,7 +431,7 @@ class AtomicityTests(RecoveryEpochTestCase):
         with self.assertRaises(RuntimeError) as caught:
             self.store.advance_recovery_epoch()
         message = str(caught.exception)
-        self.assertIn("migration 5", message)
+        self.assertIn("migrate-restored-control", message)
         self.assertIn("pre-restore credentials", message)
         # And nothing moved: the refusal precedes the counter.
         with self.store._db(migrate=False) as connection:
@@ -439,6 +440,98 @@ class AtomicityTests(RecoveryEpochTestCase):
             ).fetchone()
         self.assertIsNone(row, "migration 5's rollback removes the counter")
         self.assertEqual(before, 0)
+
+    def test_later_but_incomplete_ledgers_need_offline_migration(self) -> None:
+        for old in (5, 9, 10):
+            with self.subTest(old=old), self.store._db(migrate=False) as connection:
+                cs.rollback(connection, old, accept_data_loss=True)
+                for read_or_sweep in (self.store.recovery_epoch, self.store.advance_recovery_epoch):
+                    with self.assertRaisesRegex(RuntimeError, "migrate-restored-control"):
+                        read_or_sweep()
+                with self.assertRaisesRegex(RuntimeError, "manifest"):
+                    cs.migrate(connection, restored_instance="another-instance")
+                self.assertEqual(list(range(old + 1, max(cs.MIGRATIONS) + 1)),
+                                 cs.migrate(connection, restored_instance="instance"))
+                self.assertEqual(0, self.store.recovery_epoch())
+
+    def test_version_ten_objects_with_version_eleven_ledger_refuse_migration_and_sweep(self):
+        with self.store._db(migrate=False) as connection:
+            cs.rollback(connection, 10, accept_data_loss=True)
+            connection.execute("INSERT INTO control.schema_migrations(version) VALUES (11)")
+            try:
+                for operation in (
+                    lambda: cs.restored_control_state(connection),
+                    lambda: cs.migrate(connection, restored_instance="instance"),
+                    self.store.advance_recovery_epoch,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "do not match ledger version 11"):
+                        operation()
+                self.assertEqual(0, connection.execute(
+                    "SELECT control.current_recovery_epoch() AS epoch"
+                ).fetchone()["epoch"])
+            finally:
+                connection.execute("DELETE FROM control.schema_migrations WHERE version = 11")
+                cs.migrate(connection)
+
+    def test_restore_signature_is_independent_of_session_sql_rendering(self):
+        with self.store._db(migrate=False) as connection, cs.transaction(connection):
+            for setting in ("off", "on"):
+                with self.subTest(quote_all_identifiers=setting):
+                    connection.execute("SELECT set_config('quote_all_identifiers', %s, true)", (setting,))
+                    identity, versions = cs.restored_control_state(connection, require_current=True)
+                    self.assertEqual(("instance", max(cs.MIGRATIONS)), (identity, versions[-1]))
+                    self.assertEqual(setting, connection.execute(
+                        "SHOW quote_all_identifiers"
+                    ).fetchone()["quote_all_identifiers"])
+            # A valid inspection did not roll back the enclosing transaction.
+            self.assertEqual(0, connection.execute(
+                "SELECT control.current_recovery_epoch() AS epoch"
+            ).fetchone()["epoch"])
+
+    def test_missing_window_constraint_or_index_refuses_restore(self):
+        with self.store._db(migrate=False) as connection:
+            for change in (
+                "ALTER TABLE control.approval_windows DROP CONSTRAINT window_scope_shape",
+                "DROP INDEX control.approval_window_client_live_idx",
+            ):
+                with self.subTest(change=change):
+                    with self.assertRaisesRegex(RuntimeError, "do not match ledger"), cs.transaction(connection):
+                        connection.execute(change)
+                        cs.restored_control_state(connection, require_current=True)
+
+    def test_interrupted_restore_migration_preserves_the_old_ledger_and_identity(self) -> None:
+        with self.store._db(migrate=False) as connection:
+            cs.rollback(connection, 5, accept_data_loss=True)
+            with mock.patch.dict(cs.MIGRATIONS, {9: mock.Mock(side_effect=InterruptedError)}):
+                with self.assertRaises(InterruptedError):
+                    cs.migrate(connection, restored_instance="instance")
+            self.assertEqual(list(range(1, 6)), cs.applied_versions(connection))
+            self.assertNotIn("oauth_refresh_families", cs.all_tables(connection))
+            cs.migrate(connection, restored_instance="instance")
+        self.assertEqual(0, self.store.recovery_epoch())
+
+    def test_post_commit_audit_failure_leaves_epoch_and_revocations_observable(self) -> None:
+        self.seed_credentials()
+        with mock.patch.object(self.store, "audit", side_effect=OSError("fixture audit interruption")):
+            with self.assertRaises(OSError):
+                self.store.advance_recovery_epoch()
+        self.assertEqual(1, self.store.recovery_epoch())
+        self.assertTrue(self.revoked("oauth_grants", "grant_id", "g"))
+
+    def test_missing_or_future_ledger_and_missing_identity_refuse_migration(self) -> None:
+        with self.store._db(migrate=False) as connection:
+            for change in (
+                "INSERT INTO control.schema_migrations(version) VALUES (999)",
+                "DELETE FROM control.schema_migrations WHERE version = 3",
+                "DELETE FROM control.admin_credential",
+                "DELETE FROM control.metadata WHERE key = 'instance_id'",
+            ):
+                with self.subTest(change=change):
+                    # Each alteration is private to this transaction.
+                    with self.assertRaises(RuntimeError), cs.transaction(connection):
+                        connection.execute(change)
+                        cs.restored_control_state(connection, require_current=True)
+            self.assertEqual(0, self.store.recovery_epoch())
 
 
 if __name__ == "__main__":

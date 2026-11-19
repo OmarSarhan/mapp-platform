@@ -6,6 +6,7 @@ import secrets
 import sys
 from pathlib import Path
 
+import control_schema
 from control_plane import ControlStore
 
 
@@ -23,10 +24,12 @@ def parser() -> argparse.ArgumentParser:
             "mcp-client-disable",
             "mcp-runtime-register",
             "migrate-rollback",
+            "migrate-restored-control",
             "advance-recovery-epoch",
         ),
     )
     parser.add_argument("--root", default=os.environ.get("CONTROL_DIR", "/control"))
+    parser.add_argument("--expect-instance", help="Instance ID in the protected backup manifest.")
     parser.add_argument(
         "--password-stdin",
         action="store_true",
@@ -66,8 +69,7 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--confirm",
         action="store_true",
-        help="Perform a rollback. Without it the plan is printed and nothing"
-        " changes.",
+        help="Perform the requested administrative change after reviewing its plan.",
     )
     return parser
 
@@ -87,7 +89,11 @@ def advance_recovery_epoch_command(args, store) -> bool:
     if args.command != "advance-recovery-epoch":
         return False
     if not args.confirm:
-        print(f"Current recovery epoch: {store.recovery_epoch()}.")
+        try:
+            epoch = store.recovery_epoch(expected_instance=args.expect_instance)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
+        print(f"Current recovery epoch: {epoch}.")
         print()
         print(
             "Advancing it invalidates every credential this database now"
@@ -111,11 +117,10 @@ def advance_recovery_epoch_command(args, store) -> bool:
         )
         raise SystemExit(2)
     try:
-        result = store.advance_recovery_epoch(reason=args.reason or "operator")
+        result = store.advance_recovery_epoch(
+            reason=args.reason or "operator", expected_instance=args.expect_instance,
+        )
     except RuntimeError as exc:
-        # Now reachable: the store no longer migrates before checking. This is
-        # the refusal docs/backup-restore.md documents for a dump that predates
-        # the mechanism, so it must read as guidance rather than a traceback.
         raise SystemExit(str(exc)) from None
     print(f"Recovery epoch is now {result['epoch']}.")
     for table, count in sorted(result["revoked"].items()):
@@ -297,6 +302,24 @@ def mcp_client_command(args, store) -> bool:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.command == "migrate-restored-control":
+        try:
+            with control_schema.connect() as connection:
+                if args.confirm:
+                    if not args.expect_instance:
+                        raise SystemExit("Supply --expect-instance from the backup manifest.")
+                    applied = control_schema.migrate(connection, restored_instance=args.expect_instance)
+                    print(f"Control ledger is current. Applied migrations: {applied}.")
+                    print("Keep traffic closed and run advance-recovery-epoch.")
+                    return
+                instance, applied = control_schema.restored_control_state(
+                    connection, expected_instance=args.expect_instance,
+                )
+                pending = sorted(set(control_schema.MIGRATIONS) - set(applied))
+                print(f"Restored instance {instance}. Control ledger {applied}. Pending: {pending}.")
+                raise SystemExit(2)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
     store = ControlStore(Path(args.root))
     if advance_recovery_epoch_command(args, store):
         return
