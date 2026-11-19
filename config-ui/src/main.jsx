@@ -181,6 +181,14 @@ export function reconcileDerivedWorkspace(workspace,derived,columns,baseline=wor
   for(const name of added){
    const column=byName.get(name);
    if(!column||column.geometryType||name===layer.qID||name===derived.idColumn||kept.some(entry=>entry?.field===name))continue;
+   const fieldConflicts=namedLocales.filter(([,locale])=>(locale.layers?.[key]?.infoj||[]).some(entry=>entry?.field===name));
+   if(fieldConflicts.length){
+    for(const [localeName] of fieldConflicts){
+     const conflict=localeName+':'+key;
+     if(!summary.localeConflicts.includes(conflict))summary.localeConflicts.push(conflict);
+    }
+    continue;
+   }
    kept.push({type:infoTypeForColumn(column),title:title(name),field:name,inline:true,display:true,_dashboard:{catalogField:true}});
    summary.added++;
   }
