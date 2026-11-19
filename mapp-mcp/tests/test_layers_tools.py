@@ -2060,6 +2060,13 @@ class ToolVisibilityTests(ToolTestCase):
             self.assertNotIn("proposals_apply", self.listed("mcp:connect " + " ".join(scopes - {absent})))
         self.assertIn("proposals_apply", self.listed("mcp:connect inspect visual apply"))
 
+    def test_derived_mutation_discovery_requires_inspection_for_review_and_approval(self):
+        mutations = {f"derived_layers_{verb}" for verb in ("create", "replace", "refresh", "drop")}
+        narrow = "mcp:connect derive:manage semantic:inspect"
+        self.assertTrue(mutations.isdisjoint(self.listed(narrow)))
+        self.assertTrue(mutations.issubset(self.listed(narrow + " inspect")))
+        self.assertIn("derived_layers_plan", self.listed(narrow))
+
     def test_each_scope_adds_exactly_the_tools_that_need_it(self) -> None:
         base = set(self.listed("mcp:connect inspect"))
         widened = set(self.listed("mcp:connect inspect federation:observe"))

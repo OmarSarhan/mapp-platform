@@ -4209,6 +4209,11 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         derived.create.assert_not_called()
 
     def test_background_create_and_replace_receive_resolved_scope(self):
+        workspace = self.workspace()
+        default_extent = {"west": 1, "east": 2, "south": 3, "north": 4}
+        named_extent = {"west": -8, "east": -7, "south": 50, "north": 51}
+        workspace["locale"]["extent"] = default_extent
+        workspace["locales"]["city-centre"]["extent"] = named_extent
         cases = (
             (
                 "/api/derived-layers",
@@ -4224,7 +4229,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 self.definition(
                     confirmed=True,
                     background=True,
-                    spatialScope={"type": "workspace-map-extent"},
+                    spatialScope={"type": "workspace-map-extent", "locale": "city-centre"},
                 ),
                 "replace",
                 "roads_visible",
@@ -4237,7 +4242,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 with patch.object(
                     app,
                     "read_workspace",
-                    return_value=(b"{}", self.workspace(), "revision"),
+                    return_value=(b"{}", workspace, "revision"),
                 ), patch.object(app, "DERIVED", Mock()), patch.object(
                     app,
                     "start_derived_background",
@@ -4249,7 +4254,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 args = start.call_args.args
                 self.assertEqual(action, args[0])
                 self.assertEqual("workspace-map-extent", args[1]["spatialScope"]["type"])
-                self.assertIn("envelopes", args[1]["spatialScope"])
+                self.assertEqual([named_extent if name else default_extent], args[1]["spatialScope"]["envelopes"])
                 if name is not None:
                     self.assertEqual(name, args[4])
 

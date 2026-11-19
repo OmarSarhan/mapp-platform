@@ -809,14 +809,13 @@ database work.
 
 Replacement takes effect at database commit. On their next read, published
 maps can show different values or fail on a removed field. The review shows
-the stored and proposed SQL and known workspace and managed consumers.
+the stored and proposed SQL, changed definition fields and known workspace and managed consumers. Replacement retains the selected extent locale. The server resolves its current area before database work.
 External readers and undeclared dependencies may be absent. The stored SQL
 is the definition observed at review time. PostgreSQL still checks incoming
 dependencies during the swap.
 
 The dashboard uses the completed operation's asset ID, generation and column
-changes to offer edits after matching metadata becomes ready. Review subsequent
-local edits, calculated fields and named-locale overrides. Accepting suggestions
+changes to offer edits after matching metadata becomes ready. Accepting an offer checks the current generation again. Out-of-order changes with incomplete impact require manual review. Suggestions exclude subsequently edited layers and default layers whose named locales would inherit the edits against another relation or zoom binding. Calculated fields are preserved. Accepting suggestions
 edits the local workspace. Publishing those edits requires a separate save or
 revision-bound proposal and apply.
 

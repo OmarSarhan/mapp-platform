@@ -1358,6 +1358,30 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                          packet["dependents"]["workspaceLayers"])
         self.assertIn("immediately", packet["note"])
 
+    async def test_same_sql_preserves_named_extent_and_shows_definition_changes(self):
+        extents = {"locale": {"west": 2, "east": 3, "south": 0, "north": 1},
+                  "west": {"west": -8, "east": -7, "south": 50, "north": 51}}
+        self.ENTRY = {**self.ENTRY, "idColumn": "id", "geometryColumn": "geom",
+                      "description": "Regional labels",
+                      "spatialScope": {"type": "workspace-map-extent", "locale": "west",
+                                       "envelopes": [extents["west"]]}}
+        api = self.Api(self)
+        ctx = self.agreeing()
+        await self.build("derived_layers_replace", api)(
+            ctx, "census_h3", self.ENTRY["query"], ["source_census.labels"], "label_id", "label_geom",
+        )
+        body = api.posted_to("/api/derived-layers/census_h3/replace")[0]["body"]
+        self.assertEqual({"type": "workspace-map-extent", "locale": "west"}, body["spatialScope"])
+        self.assertEqual(self.ENTRY["spatialScope"]["envelopes"], [extents[body["spatialScope"]["locale"]]])
+        self.assertEqual("Regional labels", body["description"])
+        changes = {item["path"].rsplit(".", 1)[-1]: item for item in api.packet()["changes"]}
+        self.assertIn('"west": -8', changes["spatialScope"]["was"])
+        self.assertIn("west", changes["spatialScope"]["becomes"])
+        for key, old, new in (("geometryColumn", "geom", "label_geom"), ("idColumn", "id", "label_id")):
+            self.assertEqual((old, new), (changes[key]["was"], changes[key]["becomes"]))
+        for value in ("label_geom", "label_id", "source_census.labels", "extent of west"):
+            self.assertIn(value, ctx.asked[0][1])
+
     async def test_a_replace_with_no_dependents_says_so(self) -> None:
         api = self.Api(self, dependents=self.reading())
         replace = self.build("derived_layers_replace", api)

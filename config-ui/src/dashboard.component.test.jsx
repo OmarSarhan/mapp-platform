@@ -797,7 +797,7 @@ describe('Dashboard managed save lifecycle', () => {
     ]};
     const tables = vi.fn().mockReturnValueOnce(first)
       .mockResolvedValueOnce(response({error: 'reader unavailable'}, 502))
-      .mockResolvedValueOnce(response({tables: [row, {...row,table:'labels',columns:[{name:'id',type:'integer'}]}], databases: ['MAPP']}))
+      .mockResolvedValueOnce(response({tables: [row, {...row,table:'wgs84',columns:[{name:'id',primaryKey:true},{name:'geom',geometryType:'Point',srid:4326}]}, {...row,table:'labels',columns:[{name:'id',type:'integer'}]}], databases: ['MAPP']}))
       .mockResolvedValueOnce(response({error: 'reader unavailable'}, 502))
       .mockResolvedValueOnce(response({tables: [], databases: ['MAPP']}));
     const fallback = standardFetch(() => response({}));
@@ -821,6 +821,9 @@ describe('Dashboard managed save lifecycle', () => {
     expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', {name: /roads\.lines/}));
     expect(screen.getByText(/feature ID column is required/i)).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', {name: /roads\.wgs84/}));
+    expect(screen.getByText(/requires an EPSG:3857 geometry column/)).toBeTruthy();
     expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', {name: 'Refresh table discovery'}));
     await screen.findByText(/Showing last successful table discovery/);
@@ -954,7 +957,7 @@ describe('Dashboard managed save lifecycle', () => {
       reason: 'derived_schema_changed',
       relation: 'derived_layers.summary',
     });
-    expect(result.summary).toEqual({layers: 1, added: 1, removed: 1, skipped: []});
+    expect(result.summary).toEqual({layers: 1, added: 1, removed: 1, skipped: [], localeConflicts: []});
     expect(source.locale.layers.Summary.infoj).toHaveLength(4);
   });
 

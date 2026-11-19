@@ -486,6 +486,7 @@ DERIVED_LAYERS_CREATE = {
     "method": "POST",
     "path_template": "/api/derived-layers",
     "scopes": ("derive:manage", "semantic:inspect"),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
     "refusal_hints": {
         "derived_layer.plan_stale": (
@@ -501,6 +502,7 @@ DERIVED_LAYERS_REPLACE = {
     "method": "POST",
     "path_template": "/api/derived-layers/{name}/replace",
     "scopes": ("derive:manage", "semantic:inspect"),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
 }
 
@@ -509,6 +511,7 @@ DERIVED_LAYERS_DROP = {
     "method": "POST",
     "path_template": "/api/derived-layers/{name}/drop",
     "scopes": ("derive:manage",),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 60.0,
     "refusal_hints": {
         "derived_layer.in_use": (
@@ -525,6 +528,7 @@ DERIVED_LAYERS_REFRESH = {
     "scopes": ("derive:manage",),
     # Recomputing a materialised relation is the longest-running thing on this
     # surface, and `background` exists precisely because it can exceed a wait.
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
 }
 
@@ -2259,8 +2263,14 @@ def build_runtime(
         body = _derived_definition(
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
-            kind=kind or current.get("kind"), description=description,
+            kind=kind or current.get("kind"),
+            description=current.get("description") if description is None else description,
         )
+        stored_scope = current.get("spatialScope") or {}
+        locale = stored_scope.get("locale")
+        body["spatialScope"] = {"type": "workspace-map-extent"}
+        if locale:
+            body["spatialScope"]["locale"] = locale
         body["confirmed"] = True
         if background is not None:
             body["background"] = background
@@ -2304,6 +2314,30 @@ def build_runtime(
                 "Ordinary views recompute on read. Database dependencies and the "
                 "normal query, storage and lifecycle guards can block conversion."
             )
+        packet["note"] += (
+            f" The server resolves the current map extent of {locale or 'the default locale'}"
+            " for the replacement."
+        )
+        prior_area = "No stored map extent"
+        if stored_scope:
+            prior_area = f"{locale or 'default locale'}: " + json.dumps(stored_scope.get("envelopes") or [])
+        packet["changes"].append({
+            "op": "review", "path": f"derived_layers.{name}.spatialScope",
+            "was": prior_area, "becomes": f"Current workspace map extent for {locale or 'default locale'}",
+        })
+        for key in ("idColumn", "geometryColumn", "sources", "description"):
+            before = current.get(key)
+            after = body.get(key)
+            if before == after:
+                continue
+            if key == "sources":
+                before, after = json.dumps(before or []), json.dumps(after or [])
+            before, after = _sql_review(before or "", after or "")
+            packet["changes"].append({
+                "op": "replace", "path": f"derived_layers.{name}.{key}",
+                "was": before, "becomes": after,
+            })
+        packet["changeCount"] = len(packet["changes"])
         target = DERIVED_LAYERS_REPLACE["path_template"].replace(
             "{name}", quote(name, safe="")
         )

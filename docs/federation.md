@@ -14,7 +14,7 @@ approved once, verified continuously, and can be withdrawn.
 After provisioning, open **Sources** in the dashboard's default locale and wait
 for table discovery. A failed refresh can leave a last-known list on screen.
 Retry discovery before choosing a relation. Icons load independently. Choose
-a readable spatial table with a geometry column and a stable, unique feature
+a readable spatial table with an EPSG:3857 geometry column for vector tiles and a stable, unique feature
 identifier, then add it to the workspace. Check the suggested ID, geometry,
 style and feature information. Select **Save & reload XYZ**, wait for the
 matching reload and select a known feature on the published map.

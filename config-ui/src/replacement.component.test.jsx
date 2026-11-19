@@ -219,3 +219,49 @@ test('automatically retries a delayed delivery and keeps a recreated asset separ
   expect(review('roads')).toBe(newPanel);
   expect(fetch.mock.calls.filter(([,options])=>options?.method==='POST')).toHaveLength(0);
 });
+
+test('acceptance sees a replacement committed while the catalogue still serves the old generation',async()=>{
+  let objectReads=0, current=2;
+  mockApi(path=>{
+    if(path==='/api/semantic/derived-profiles/roads')return {derivedProfile:binding('roads',current)};
+    if(path==='/api/semantic/catalog/objects/asset%3Aroads'){
+      if(++objectReads===2)current=3;
+      return {asset:asset('roads',2)};
+    }
+  });
+  render(<Dashboard/>);
+  await screen.findByRole('button',{name:'Roads'});
+  emit(result('roads',2,{added:['total'],removed:['old'],changed:[]}));
+  fireEvent.click(await screen.findByRole('button',{name:'Use suggested unsaved edits'}));
+  await within(review('roads')).findByText(/replacement was superseded/);
+  expect(screen.getByRole('button',{name:'Save & reload XYZ'}).disabled).toBe(true);
+});
+
+test.each([{table:'source_west.roads'},{tables:{8:'source_west.roads'}}])(
+  'excludes a default layer whose field edits would reach a different locale binding %j',async override=>{
+  const data={...workspace,locales:{west:{layers:{Roads:override}}}};
+  mockApi(path=>{
+    if(path==='/api/semantic/derived-profiles/roads')return {derivedProfile:binding('roads',2)};
+    if(path==='/api/semantic/catalog/objects/asset%3Aroads')return {asset:asset('roads',2)};
+  },data);
+  render(<Dashboard/>);
+  await screen.findByRole('button',{name:'Roads'});
+  emit(result('roads',2,{added:['total'],removed:['old'],changed:[]}));
+  await within(review('roads')).findByText(/different relation or zoom binding: west:Roads/);
+  expect(accept(review('roads'))).toBeNull();
+  expect(screen.getByRole('button',{name:'Save & reload XYZ'}).disabled).toBe(true);
+});
+
+test('an earlier completion arriving after the latest generation requires manual review',async()=>{
+  mockApi(path=>{
+    if(path==='/api/semantic/derived-profiles/roads')return {derivedProfile:binding('roads',3)};
+    if(path==='/api/semantic/catalog/objects/asset%3Aroads')return {asset:asset('roads',3)};
+  });
+  render(<Dashboard/>);
+  await screen.findByRole('button',{name:'Roads'});
+  emit(result('roads',3,{added:['total'],removed:[],changed:[]}));
+  await screen.findByRole('button',{name:'Use suggested unsaved edits'});
+  emit(result('roads',2,{added:[],removed:['old'],changed:[]}));
+  await within(review('roads')).findByText(/Review earlier changes manually/);
+  expect(accept(review('roads'))).toBeNull();
+});
