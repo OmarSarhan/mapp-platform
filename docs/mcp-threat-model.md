@@ -38,8 +38,9 @@ The design aims to preserve these properties:
    but only as the already admitted operation. Its durable operation record is
    the pollable authority for the result.
 
-The MCP runtime currently publishes 56 tools backed by 57 allowlisted
-configuration operations. Forty-two are reads. Tool listing is filtered by the
+The MCP runtime currently publishes 56 tools backed by 58 allowlisted
+configuration operations. Forty-three are reads, including the per-name managed
+definition used to review replacement SQL. Tool listing is filtered by the
 grant, while the operation allowlist remains the downstream security boundary.
 
 ## Assets

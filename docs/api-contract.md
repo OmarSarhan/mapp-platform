@@ -381,7 +381,7 @@ request as approval.
 | `GET /api/derived-layers/capabilities` | Managed-view, executable H3-wrapper readiness, supported recipe availability, generated-row-aware nested-loop planning, and materialized-size guard availability |
 | `GET /api/derived-layers/map-extent?locale=KEY` | Preview the selected effective locale's configured north/east/south/west extent, with the legacy view-derived fallback when those bounds are incomplete |
 | `GET /api/derived-layers` | Managed derived-layer definitions |
-| `GET /api/derived-layers/<name>` | One definition including its SQL |
+| `GET /api/derived-layers/<name>` | One definition including its SQL. Use `?definition=true` for a relation named `drafts` or `capabilities` to distinguish it from the fixed resource |
 | `GET /api/semantic/status` | Semantic schema version, catalog revision, and advertised capabilities, including Gemini context limits when configured |
 | `GET /api/semantic/catalog?limit=N&cursor=CURSOR` | Export one bounded page of visible ready semantic assets at a catalog revision; archived assets are omitted even for administrators |
 | `GET /api/semantic/catalog/search?q=TEXT&limit=N&cursor=CURSOR` | Search one bounded page of visible ready generated and curated metadata; archived assets are omitted |
@@ -799,6 +799,25 @@ Managed derived-layer database actions are separate from workspace proposals:
   `blocked`, `matches`, and an operator-facing `message`. The route is
   read-only and does not discover external clients that only read from
   PostgreSQL.
+
+The foreground planner and managed writes resolve declared source bindings
+from compact, visibility-filtered pages of up to 100 at a single catalog
+revision. A scan stops when it has resolved the requested sources or exhausted
+its 20-page budget. A queued create or replacement repeats the check before
+database work.
+
+Replacement takes effect at database commit. On their next read, published
+maps can show different values or fail on a removed field. The review shows
+the stored and proposed SQL and known workspace and managed consumers.
+External readers and undeclared dependencies may be absent. The stored SQL
+is the definition observed at review time. PostgreSQL still checks incoming
+dependencies during the swap.
+
+The dashboard uses the completed operation's asset ID, generation and column
+changes to offer edits after matching metadata becomes ready. Review subsequent
+local edits, calculated fields and named-locale overrides. Accepting suggestions
+edits the local workspace. Publishing those edits requires a separate save or
+revision-bound proposal and apply.
 
 Creating a derived relation never adds it to the workspace or reloads XYZ.
 That remains a separately reviewed, revision-bound workspace proposal.
