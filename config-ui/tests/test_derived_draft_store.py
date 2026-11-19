@@ -7,7 +7,8 @@ These tests do not validate PostGIS or spatial planning.
 import os
 import unittest
 import uuid
-from unittest.mock import MagicMock
+from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
@@ -31,6 +32,22 @@ def payload(**overrides):
 
 
 class DraftValidationTests(unittest.TestCase):
+    def test_public_draft_timestamps_are_canonical_utc(self):
+        fields = {
+            "created_at": "createdAt", "expires_at": "expiresAt",
+            "last_cleanup_attempt_at": "lastCleanupAttemptAt",
+            "adopted_at": "adoptedAt", "dropped_at": "droppedAt",
+        }
+        for value in ("2026-01-01T21:19:05.12-05:45",
+                      datetime.fromisoformat("2026-01-02T03:04:05.120000+00:00")):
+            row = {"asset_id": str(uuid.uuid4()), "generation": 1,
+                   **dict.fromkeys(fields, value)}
+            result = DerivedLayerStore._draft_public(row)
+            for public in fields.values():
+                self.assertEqual("2026-01-02T03:04:05.120000+00:00", result[public])
+        result = DerivedLayerStore._draft_public({"asset_id": "unused", "generation": 1})
+        self.assertTrue(all(result[public] is None for public in fields.values()))
+
     def test_capability_distinguishes_cleanup_from_non_mutating_preview(self):
         planning = DerivedLayerStore.definition_planning_capability()
         self.assertFalse(planning["draftPreview"]["supported"])
@@ -268,9 +285,12 @@ class DraftPostgreSQLTests(unittest.TestCase):
         draft = self.create()["draft"]
         self.sql("UPDATE derived_layers._drafts SET created_at = %s WHERE asset_id = %s",
                  ("2026-01-02T03:04:05.120000+00:00", draft["assetId"]))
-        joined = self.store.get(draft["name"])["draft"]
-        self.assertEqual([joined], self.store.drafts_for_names([draft["name"]]))
-        self.assertEqual([joined], self.store.list_drafts())
+        for zone in ("UTC", "America/New_York", "+05:45"):
+            with self.subTest(zone=zone), patch.dict(os.environ, {"PGOPTIONS": f"-c timezone={zone}"}):
+                joined = self.store.get(draft["name"])["draft"]
+                self.assertEqual("2026-01-02T03:04:05.120000+00:00", joined["createdAt"])
+                self.assertEqual([joined], self.store.drafts_for_names([draft["name"]]))
+                self.assertEqual([joined], self.store.list_drafts())
 
     def test_publication_lookup_blocks_missing_or_changed_draft_identity(self):
         draft = self.create()["draft"]
