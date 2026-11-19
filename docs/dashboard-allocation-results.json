@@ -1,0 +1,721 @@
+{
+  "method": "CDP HeapProfiler sampling, including collected objects; allocation estimates, not retained heap or total native memory",
+  "results": [
+    {
+      "layers": 100,
+      "baseline": true,
+      "action": "search",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 79299620,
+      "profile": "100-baseline-search.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 22756624
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 20871792
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 6670004
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 4370100
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 3753832
+        },
+        {
+          "function": "repeat",
+          "url": "",
+          "line": 0,
+          "bytes": 1966628
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 1367256
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 1252148
+        }
+      ]
+    },
+    {
+      "layers": 100,
+      "baseline": true,
+      "action": "locale",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 165576100,
+      "profile": "100-baseline-locale.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 18505816
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 16959396
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 16321948
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 14630212
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 7524856
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 7256216
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 6869580
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 6675844
+        }
+      ]
+    },
+    {
+      "layers": 100,
+      "baseline": true,
+      "action": "edit",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 140965616,
+      "profile": "100-baseline-edit.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 16568108
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 16338616
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 6984004
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 6684848
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 6232416
+        },
+        {
+          "function": "performUnitOfWork",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 8424,
+          "bytes": 5902508
+        },
+        {
+          "function": "clone",
+          "url": "http://127.0.0.1:5179/src/main.jsx?import&baseline",
+          "line": 48,
+          "bytes": 4742492
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 3184216
+        }
+      ]
+    },
+    {
+      "layers": 100,
+      "baseline": false,
+      "action": "search",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 11778632,
+      "profile": "100-current-search.heapprofile",
+      "topFrames": [
+        {
+          "function": "exports.createElement",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-Cu7PHqHr.js?v=84351292",
+          "line": 602,
+          "bytes": 591060
+        },
+        {
+          "function": "exports.jsxDEV",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 190,
+          "bytes": 591044
+        },
+        {
+          "function": "ReactElement",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-Cu7PHqHr.js?v=84351292",
+          "line": 143,
+          "bytes": 458944
+        },
+        {
+          "function": "",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/lucide-react.js?v=84351292",
+          "line": 110,
+          "bytes": 426120
+        },
+        {
+          "function": "buildLucideIconNode",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/lucide-react.js?v=84351292",
+          "line": 97,
+          "bytes": 393472
+        },
+        {
+          "function": "defineKeyPropWarningGetter",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-Cu7PHqHr.js?v=84351292",
+          "line": 127,
+          "bytes": 328260
+        },
+        {
+          "function": "runWithFiberInDEV",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 844,
+          "bytes": 295152
+        },
+        {
+          "function": "exports.jsxDEV",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 190,
+          "bytes": 229888
+        }
+      ]
+    },
+    {
+      "layers": 100,
+      "baseline": false,
+      "action": "locale",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 35336220,
+      "profile": "100-current-locale.heapprofile",
+      "topFrames": [
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 7019172
+        },
+        {
+          "function": "repeat",
+          "url": "",
+          "line": 0,
+          "bytes": 2392744
+        },
+        {
+          "function": "push",
+          "url": "",
+          "line": 0,
+          "bytes": 780772
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 729720
+        },
+        {
+          "function": "performUnitOfWork",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 8424,
+          "bytes": 688592
+        },
+        {
+          "function": "defineKeyPropWarningGetter",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 87,
+          "bytes": 525588
+        },
+        {
+          "function": "performUnitOfWork",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 8424,
+          "bytes": 524636
+        },
+        {
+          "function": "updateProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 9923,
+          "bytes": 426172
+        }
+      ]
+    },
+    {
+      "layers": 100,
+      "baseline": false,
+      "action": "edit",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 105961112,
+      "profile": "100-current-edit.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 113,
+          "bytes": 16333220
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 113,
+          "bytes": 6700896
+        },
+        {
+          "function": "performUnitOfWork",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 8424,
+          "bytes": 6591088
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 5455720
+        },
+        {
+          "function": "exports.createElement",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-Cu7PHqHr.js?v=84351292",
+          "line": 602,
+          "bytes": 3575032
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 145,
+          "bytes": 2945780
+        },
+        {
+          "function": "pushHostContext",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 576,
+          "bytes": 2819216
+        },
+        {
+          "function": "",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/lucide-react.js?v=84351292",
+          "line": 206,
+          "bytes": 2131452
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": true,
+      "action": "search",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 759351864,
+      "profile": "1000-baseline-search.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 231910844
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 228085192
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 66283848
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 47665108
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 45781968
+        },
+        {
+          "function": "repeat",
+          "url": "",
+          "line": 0,
+          "bytes": 24877836
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 17111404
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 16033556
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": true,
+      "action": "locale",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 1504968272,
+      "profile": "1000-baseline-locale.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 247806012
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 246449752
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 227157168
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 227074372
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 68054128
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 66972136
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 50022404
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 48099908
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": true,
+      "action": "edit",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 881734432,
+      "profile": "1000-baseline-edit.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 170488824
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 163079712
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 70828224
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 113,
+          "bytes": 65481260
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 62121060
+        },
+        {
+          "function": "clone",
+          "url": "http://127.0.0.1:5179/src/main.jsx?import&baseline",
+          "line": 48,
+          "bytes": 46858608
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 35248684
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js?baseline",
+          "line": 145,
+          "bytes": 33025764
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": false,
+      "action": "search",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 33053700,
+      "profile": "1000-current-search.heapprofile",
+      "topFrames": [
+        {
+          "function": "defineKeyPropWarningGetter",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 87,
+          "bytes": 2364836
+        },
+        {
+          "function": "ReactElement",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 103,
+          "bytes": 2163668
+        },
+        {
+          "function": "",
+          "url": "http://127.0.0.1:5179/src/main.jsx?import",
+          "line": 5009,
+          "bytes": 2130612
+        },
+        {
+          "function": "exports.jsxDEV",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 190,
+          "bytes": 1904428
+        },
+        {
+          "function": "workLoopSync",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 8321,
+          "bytes": 1541152
+        },
+        {
+          "function": "",
+          "url": "http://127.0.0.1:5179/src/main.jsx?import",
+          "line": 5015,
+          "bytes": 1212848
+        },
+        {
+          "function": "toLowerCase",
+          "url": "",
+          "line": 0,
+          "bytes": 1180220
+        },
+        {
+          "function": "createFiberFromTypeAndProps",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2771,
+          "bytes": 1149408
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": false,
+      "action": "locale",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 194923336,
+      "profile": "1000-current-locale.heapprofile",
+      "topFrames": [
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 66185764
+        },
+        {
+          "function": "repeat",
+          "url": "",
+          "line": 0,
+          "bytes": 22222896
+        },
+        {
+          "function": "push",
+          "url": "",
+          "line": 0,
+          "bytes": 9715720
+        },
+        {
+          "function": "jsxDEVImpl",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 147,
+          "bytes": 5022112
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 4818920
+        },
+        {
+          "function": "addObjectDiffToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2406,
+          "bytes": 4065092
+        },
+        {
+          "function": "jsxDEVImpl",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=84351292",
+          "line": 147,
+          "bytes": 3839804
+        },
+        {
+          "function": "",
+          "url": "http://127.0.0.1:5179/src/main.jsx?import",
+          "line": 5015,
+          "bytes": 3774532
+        }
+      ]
+    },
+    {
+      "layers": 1000,
+      "baseline": false,
+      "action": "edit",
+      "operations": 15,
+      "samplingInterval": 32768,
+      "estimatedAllocatedBytes": 500064484,
+      "profile": "1000-current-edit.heapprofile",
+      "topFrames": [
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 113,
+          "bytes": 162906924
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 113,
+          "bytes": 63803348
+        },
+        {
+          "function": "addValueToProperties",
+          "url": "http://127.0.0.1:5179/node_modules/.vite/deps/react-dom_client.js?v=84351292",
+          "line": 2333,
+          "bytes": 58518128
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 145,
+          "bytes": 33287820
+        },
+        {
+          "function": "repeat",
+          "url": "",
+          "line": 0,
+          "bytes": 20321808
+        },
+        {
+          "function": "mergeLocale",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 113,
+          "bytes": 16316908
+        },
+        {
+          "function": "renderedLocales",
+          "url": "http://127.0.0.1:5179/src/api.js",
+          "line": 145,
+          "bytes": 13815008
+        },
+        {
+          "function": "push",
+          "url": "",
+          "line": 0,
+          "bytes": 8171048
+        }
+      ]
+    }
+  ],
+  "browser": "Chrome Headless Shell 156.0.8078.70",
+  "viewport": {
+    "width": 1280,
+    "height": 800,
+    "deviceScaleFactor": 1
+  },
+  "warmupOperations": 3,
+  "baseline": "5ac990aa8a8059c99314d2f56caf64bc3387fbbe"
+}

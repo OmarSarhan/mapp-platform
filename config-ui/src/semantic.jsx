@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 
 const formatJson = value => JSON.stringify(value ?? {}, null, 2);
 const emptyContextOptions = () => ({
@@ -221,62 +221,67 @@ export function SemanticCatalog({api, close, identity}) {
     ));
   }, [assets, search]);
 
-  const load = async (preferredId = selectedId) => {
-    const [
-      statusResult,
-      catalogResult,
-      sourceResult,
-      derivedResult,
-      proposalResult,
-    ] = await Promise.all([
-      api('/api/semantic/status'),
-      api(pagePath('/api/semantic/catalog')),
-      sourcePermitted
-        ? api(pagePath('/api/semantic/source/relations'))
-        : Promise.resolve({relations: []}),
-      api(pagePath('/api/semantic/derived-profiles')),
-      api(pagePath('/api/semantic/proposals')),
-    ]);
-    const nextAssets = catalogResult.assets || [];
-    const nextSources = sourceResult.relations || [];
-    setService(statusResult);
-    setAssets(nextAssets);
-    setCatalogCursor(nextCursor(catalogResult));
-    setSourceRelations(nextSources);
-    setSourceCursor(nextCursor(sourceResult));
-    setSourceId(current => (
-      nextSources.some(source => source.assetId === current)
-        ? current
-        : nextSources[0]?.assetId || ''
-    ));
-    setDerivedProfiles(derivedResult.derivedProfiles || []);
-    setDerivedCursor(nextCursor(derivedResult));
-    setDeliveryBlockers(derivedResult.deliveryBlockers || []);
-    setDeliveryBlockersMore(derivedResult.deliveryBlockersMore === true);
-    setProposals(proposalResult.proposals || []);
-    setProposalCursor(nextCursor(proposalResult));
-    setProposalReview(null);
-    setHistory(null);
-    setHistoryCursor(null);
-    setGeneratedDraft(null);
-    setCreatedProposal(null);
-    const nextId = nextAssets.some(asset => asset.id === preferredId)
-      ? preferredId
-      : nextAssets[0]?.id || '';
-    setSelectedId(nextId);
-    const next = nextAssets.find(asset => asset.id === nextId);
-    setGenerationFieldIds([]);
-    setGenerationMode('');
-    setContextOptions(emptyContextOptions());
-    setCuratedText('');
+  const [resourceState, setResourceState] = useState({});
+  const resourceRequests = useRef({});
+  const load = async (preferredId = selectedId, only = ['status', 'catalog', 'source/relations', 'derived-profiles', 'proposals']) => {
+    const publish = {
+      status: setService,
+      catalog: catalogResult => {
+        const nextAssets = catalogResult.assets || [];
+        setAssets(nextAssets);
+        setCatalogCursor(nextCursor(catalogResult));
+        setReview(null);
+        setHistory(null);
+        setHistoryCursor(null);
+        setGeneratedDraft(null);
+        setGenerationFieldIds([]);
+        setGenerationMode('');
+        setContextOptions(emptyContextOptions());
+        setCuratedText('');
+        setSelectedId(nextAssets.some(asset => asset.id === preferredId) ? preferredId : nextAssets[0]?.id || '');
+      },
+      'source/relations': sourceResult => {
+        const nextSources = sourceResult.relations || [];
+        setSourceRelations(nextSources);
+        setSourceCursor(nextCursor(sourceResult));
+        setSourceId(current => (
+          nextSources.some(source => source.assetId === current)
+            ? current
+            : nextSources[0]?.assetId || ''
+        ));
+      },
+      'derived-profiles': derivedResult => {
+        setDerivedProfiles(derivedResult.derivedProfiles || []);
+        setDerivedCursor(nextCursor(derivedResult));
+        setDeliveryBlockers(derivedResult.deliveryBlockers || []);
+        setDeliveryBlockersMore(derivedResult.deliveryBlockersMore === true);
+      },
+      proposals: proposalResult => {
+        setProposals(proposalResult.proposals || []);
+        setProposalCursor(nextCursor(proposalResult));
+      },
+    };
+    await Promise.all(only.map(async resource => {
+      const request = (resourceRequests.current[resource] || 0) + 1;
+      resourceRequests.current[resource] = request;
+      setResourceState(old => ({...old, [resource]: 'Loading…'}));
+      try {
+        const result = resource === 'source/relations' && !sourcePermitted
+          ? {relations: []}
+          : await api(resource === 'status' ? '/api/semantic/status' : pagePath(`/api/semantic/${resource}`));
+        if (resourceRequests.current[resource] !== request) return;
+        publish[resource](result);
+        setResourceState(old => ({...old, [resource]: ''}));
+      } catch (reason) {
+        if (resourceRequests.current[resource] === request) setResourceState(old => ({...old, [resource]: `Refresh failed: ${reason.message}. Previously loaded data is retained.`}));
+      }
+    }));
   };
 
   useEffect(() => {
     let active = true;
-    setBusy(true);
     load()
-      .catch(reason => active && setError(reason.message))
-      .finally(() => active && setBusy(false));
+      .catch(reason => active && setError(reason.message));
     return () => {
       active = false;
     };
@@ -362,7 +367,7 @@ export function SemanticCatalog({api, close, identity}) {
         throw new Error('The created semantic proposal was not returned.');
       }
       setReview(null);
-      await load(selected.id);
+      await load(selected.id, ['proposals']);
       const storedResult = await api(
         `/api/semantic/proposals/${encodeURIComponent(proposal.id)}`,
       );
@@ -395,7 +400,7 @@ export function SemanticCatalog({api, close, identity}) {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirmed: true}),
       });
       setNotice(`Archived semantic profile ${selected.id}.`);
-      await load();
+      await load('', ['catalog', 'source/relations', 'derived-profiles']);
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -435,7 +440,8 @@ export function SemanticCatalog({api, close, identity}) {
         setCreatedProposal(null);
         setWizardStep(1);
       }
-      await load(selectedId);
+      setProposalReview(null);
+      await load(selectedId, action === 'apply' ? ['catalog', 'proposals'] : ['proposals']);
       if (action === 'apply' && !advanced) {
         setSelectedId('');
         setSearch('');
@@ -489,7 +495,7 @@ export function SemanticCatalog({api, close, identity}) {
         },
       );
       setNotice(`Semantic delivery retry queued for derived_layers.${profile.name}.`);
-      await load(selectedId);
+      await load(selectedId, ['derived-profiles', 'catalog']);
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -582,7 +588,7 @@ export function SemanticCatalog({api, close, identity}) {
             : 'Already current'} `
         + `${source.schema}.${source.relation} from metadata only.`,
       );
-      await load(result.asset.id);
+      await load(result.asset.id, ['catalog', 'source/relations']);
     } catch (reason) {
       setError(reason.message);
     } finally {
@@ -807,6 +813,7 @@ export function SemanticCatalog({api, close, identity}) {
         </p>
       </details>}
       {error && <div className="expression-result error">{error}</div>}
+      {Object.entries(resourceState).filter(([,message]) => message).map(([resource,message]) => <p role="status" key={resource}>{resource}: {message}</p>)}
       {notice && <div className="expression-result success">{notice}</div>}
       {advanced && <section className="semantic-source">
         <h3>PostgreSQL semantic sources</h3>

@@ -305,6 +305,7 @@ export function FederatedSources({api, close}) {
         body: JSON.stringify(body),
       });
       const outcome = actionOutcome(action, result.alias, alias);
+      window.dispatchEvent(new Event('mapp-discovery-changed'));
       if (outcome === 'indeterminate') {
         setError(
           `The ${action} response did not establish what committed for ${alias}. `

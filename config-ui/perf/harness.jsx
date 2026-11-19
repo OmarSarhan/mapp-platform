@@ -1,0 +1,10 @@
+import React from 'react';
+import {createRoot} from 'react-dom/client';
+const count=Number(new URLSearchParams(location.search).get('layers')||100);
+const baseline=new URLSearchParams(location.search).has('baseline');
+const workspace={key:'fixture',dbs:'MAPP',locale:{name:'Default',layers:Object.fromEntries(Array.from({length:count},(_,i)=>[`layer${i}`,{name:`Layer ${i}`,format:'geojson',infoj:Array.from({length:20},(_,j)=>({field:`field${j}`,title:`Field ${j}`,type:'text'})),style:{default:{}}}]))},locales:Object.fromEntries(Array.from({length:5},(_,i)=>[`named${i}`,{name:`Named ${i}`}]))};
+window.requests={};
+window.fetch=async path=>{window.requests[path]=(window.requests[path]||0)+1;return {ok:true,status:200,json:async()=>path==='/api/workspace'?{workspace,revision:'fixture'}:path==='/api/catalog'?{tables:[],databases:['MAPP']}:path==='/api/icons'?{icons:[]}:path==='/api/plugins'?{plugins:{plugins:[]}}:{layers:{}}}};
+const {Dashboard}=await import(baseline?'/src/main.jsx?baseline':'/src/main.jsx');
+createRoot(document.getElementById('fixture')).render(<Dashboard/>);
+window.fixtureReady=true;

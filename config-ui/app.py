@@ -5202,7 +5202,7 @@ def discover() -> list[dict]:
     return tables
 
 
-def discover_catalog() -> list[dict]:
+def discover_catalog(profiles=None) -> list[dict]:
     """Return tables offered for layer discovery in the dashboard/API.
 
     Keep ``discover()`` complete because workspace validation must continue to
@@ -5211,7 +5211,7 @@ def discover_catalog() -> list[dict]:
     """
     ready_derived = {
         profile["name"]
-        for profile in derived_semantic_profiles()
+        for profile in (derived_semantic_profiles() if profiles is None else profiles)
         if profile["status"] == "ready"
     } if DERIVED else set()
     return [
@@ -7750,7 +7750,7 @@ class Handler(SimpleHTTPRequestHandler):
                 profiles = derived_semantic_profiles() if DERIVED else []
                 self._json(HTTPStatus.OK, {
                     "databases": sorted(DB_CONNECTIONS),
-                    "tables": discover_catalog(),
+                    "tables": discover_catalog(profiles),
                     "derivedProfiles": profiles,
                 })
             except Exception as exc:

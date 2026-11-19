@@ -167,6 +167,11 @@ export function renderedLocales(workspace) {
 }
 
 export function activeLocale(workspace) {
-  const first = renderedLocales(workspace)[0];
-  return first ? {key: first[0], value: first[1]} : {key: 'locale', value: undefined};
+  if (!workspace || typeof workspace !== 'object' || Array.isArray(workspace)) {
+    return {key: 'locale', value: undefined};
+  }
+  const base = workspace.locale;
+  return {key: 'locale', value: structuredClone(
+    base && typeof base === 'object' && !Array.isArray(base) ? base : {layers: {}}
+  )};
 }
