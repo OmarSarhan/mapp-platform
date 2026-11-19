@@ -149,7 +149,7 @@ const FILTER_OPTIONS_BY_INFO_TYPE={
 };
 const filterOptionsFor=entry=>entry?.fieldfx?['None']:FILTER_OPTIONS_BY_INFO_TYPE[entry?.type||'text']||['None'];
 const infoTypeForColumn=column=>/int/.test(column?.type||'')?'integer':/numeric|double|real|decimal/.test(column?.type||'')?'numeric':/bool/.test(column?.type||'')?'boolean':/timestamp/.test(column?.type||'')?'datetime':column?.type==='date'?'date':'text';
-const inferGeometry=(table,format='mvt')=>table?.columns.find(column=>column.geometryType&&(format!=='mvt'||column.srid===3857))||table?.columns.find(column=>column.geometryType);
+const inferGeometry=(table,format='mvt')=>table?.columns.find(column=>column.geometryType&&(format!=='mvt'||Number(column.srid)===3857))||table?.columns.find(column=>column.geometryType);
 const inferId=table=>table?.columns.find(column=>!column.geometryType&&column.primaryKey)||table?.columns.find(column=>!column.geometryType&&column.unique&&!column.nullable)||table?.columns.find(column=>!column.geometryType&&!column.nullable&&/^(id|object_id|objectid|gid|fid|key|.*_id)$/i.test(column.name))||table?.columns.find(column=>!column.geometryType&&!column.nullable)||table?.columns.find(column=>!column.geometryType);
 const standardInfoEntries=geom=>[{type:'geometry',display:true,field:geom,fieldfx:`ST_asGeoJSON(${geom})`},{type:'pin',label:'Location',display:true,field:'pin',fieldfx:`ARRAY[ST_X(ST_PointOnSurface(${geom})),ST_Y(ST_PointOnSurface(${geom}))]`}];
 const generatedLayer=(table,format='mvt')=>{const geom=inferGeometry(table,format),id=inferId(table);return{geom,id}};
@@ -159,13 +159,22 @@ export function reconcileDerivedWorkspace(workspace,derived,columns,baseline=wor
  const {added,removed,changed}=derived.columnChanges;
  const relation=`derived_layers.${derived.name}`,byName=new Map(columns.map(column=>[column.name,column]));
  const affected=new Set([...removed,...changed]),next=clone(workspace);
- const summary={layers:0,added:0,removed:0,skipped:[]};
+ const summary={layers:0,added:0,removed:0,skipped:[],localeConflicts:[]};
+ const namedLocales=renderedLocales(workspace).filter(([name])=>name!=='locale');
  // Named locales inherit default edits. Their raw overrides require focused review.
  for(const [key,layer] of Object.entries(next.locale?.layers||{})){
   if(layer?.table!==relation||Object.keys(layer.tables||{}).length)continue;
   const original=workspace.locale.layers[key];
   if(JSON.stringify(original)!==JSON.stringify(baseline?.locale?.layers?.[key])){
    summary.skipped.push(key);continue;
+  }
+  const conflicts=namedLocales.filter(([,locale])=>{
+   const effective=locale.layers?.[key];
+   return effective&&(effective.table!==relation||Object.keys(effective.tables||{}).length||
+    (effective.dbs||workspace.dbs)!==(layer.dbs||workspace.dbs));
+  });
+  if(conflicts.length){
+   summary.localeConflicts.push(...conflicts.map(([name])=>name+':'+key));continue;
   }
   const kept=(layer.infoj||[]).filter(entry=>entry?.fieldfx||!removed.includes(entry?.field));
   summary.removed+=(layer.infoj||[]).length-kept.length;
@@ -381,7 +390,13 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
   const profile=result?.semanticProfile;
   if(profile?.assetId&&Number.isInteger(profile.generation)){
    const seen=observedGenerations.current;
-   if((seen.get(profile.assetId)??-1)>=profile.generation)return;
+   const latest=seen.get(profile.assetId);
+   if(latest===profile.generation)return;
+   if(latest>profile.generation){
+    setOffers(current=>current.map(offer=>offer.result.semanticProfile?.assetId===profile.assetId&&
+     offer.firstGeneration>profile.generation?{...offer,gap:true,checkVersion:(offer.checkVersion||0)+1}:offer));
+    return;
+   }
    seen.set(profile.assetId,profile.generation);
   }
 
@@ -430,7 +445,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
    setStatus({kind:'error',message:'XYZ readiness could not be confirmed.',errors:next});
   }finally{endActivity('reloading')}
  };
- const addTable=t=>{if(namedReadOnly)return;const guessed=generatedLayer(t),geom=guessed.geom,id=guessed.id;if(!geom||!id)return;const kind=geometryKind({geom:geom.name},t),normal=kind==='point'?{icon:{type:'dot',fillColor:'#176b4d',scale:1}}:kind==='line'?{strokeColor:'#176b4d',strokeOpacity:1,strokeWidth:2}:{fillColor:'#176b4d',fillOpacity:.3,strokeColor:'#0f5138',strokeOpacity:1,strokeWidth:2},name=title(t.table),key=uniqueLayerKey(name,new Set(Object.keys(layers)));mutateLayers((x,l)=>l.layers[key]={name,display:true,format:'mvt',dbs:t.dbs,table:`${t.schema}.${t.table}`,geom:geom.name,srid:String(geom.srid),qID:id.name,_dashboard:{generated:{geom:true,qID:true,geometryInfo:true,pinInfo:true}},infoj:[...standardInfoEntries(geom.name),...t.columns.filter(c=>!c.geometryType).slice(0,8).map(c=>({type:/int/.test(c.type)?'integer':/numeric|double|real/.test(c.type)?'numeric':/bool/.test(c.type)?'boolean':'text',title:title(c.name),field:c.name,inline:true,display:true}))],style:{default:normal,highlight:kind==='point'?{highlightScale:1.4}:{strokeColor:'#e9b949',strokeWidth:3}}});setSelected(key);setSidebarMode('layers');setSidebarOpen(false)};
+ const addTable=t=>{if(namedReadOnly)return;const guessed=generatedLayer(t),geom=guessed.geom,id=guessed.id;if(!geom||Number(geom.srid)!==3857||!id)return;const kind=geometryKind({geom:geom.name},t),normal=kind==='point'?{icon:{type:'dot',fillColor:'#176b4d',scale:1}}:kind==='line'?{strokeColor:'#176b4d',strokeOpacity:1,strokeWidth:2}:{fillColor:'#176b4d',fillOpacity:.3,strokeColor:'#0f5138',strokeOpacity:1,strokeWidth:2},name=title(t.table),key=uniqueLayerKey(name,new Set(Object.keys(layers)));mutateLayers((x,l)=>l.layers[key]={name,display:true,format:'mvt',dbs:t.dbs,table:`${t.schema}.${t.table}`,geom:geom.name,srid:String(geom.srid),qID:id.name,_dashboard:{generated:{geom:true,qID:true,geometryInfo:true,pinInfo:true}},infoj:[...standardInfoEntries(geom.name),...t.columns.filter(c=>!c.geometryType).slice(0,8).map(c=>({type:/int/.test(c.type)?'integer':/numeric|double|real/.test(c.type)?'numeric':/bool/.test(c.type)?'boolean':'text',title:title(c.name),field:c.name,inline:true,display:true}))],style:{default:normal,highlight:kind==='point'?{highlightScale:1.4}:{strokeColor:'#e9b949',strokeWidth:3}}});setSelected(key);setSidebarMode('layers');setSidebarOpen(false)};
  if(!ws)return <div className="loading-shell" aria-live="polite" aria-atomic="true">{status?.kind==='error'?<div className="initial-load-error"><strong>{status.message}</strong>{status.errors?.length>0&&<ul>{status.errors.map((error,index)=><li key={index}>{error.path}: {error.message}</li>)}</ul>}<button disabled={busy} onClick={()=>load(true)}>Retry</button></div>:<p>Loading workspace…</p>}</div>;
  const layer=layers[selected],activityText=activity==='loading'?'Refreshing workspace…':activity==='validating'?'Validating…':saving?'Restarting XYZ…':reloading?'Reloading XYZ…':dirty?'Unsaved changes':'Saved';
  return <div className="app-shell">
@@ -499,7 +514,7 @@ function SourceCatalog({discovery,iconDiscovery,catalog,selected,onSelect,search
  const visible=catalog.filter(table=>(!database||table.dbs===database)&&(sourceKind==='all'||(table.schema==='derived_layers')===(sourceKind==='derived'))&&`${table.dbs}.${table.schema}.${table.table}`.toLowerCase().includes(search.toLowerCase()));
  const table=catalog.find(item=>`${item.dbs}.${item.schema}.${item.table}`===selected);
  const {geom,id}=generatedLayer(table);
- const unavailable=namedReadOnly?'Switch to the default locale to add a layer.':!geom?'A geometry column is required. Select a spatial relation.':!id?'A feature ID column is required. Select a relation with a non-geometry identifier.':'';
+ const unavailable=namedReadOnly?'Switch to the default locale to add a layer.':!geom?'A geometry column is required. Select a spatial relation.':Number(geom.srid)!==3857?'Adding a vector tile layer requires an EPSG:3857 geometry column. Select a relation with a projected geometry.':!id?'A feature ID column is required. Select a relation with a non-geometry identifier.':'';
  return <section className="source-catalog-page" aria-label="Source catalog">
   <div className="form-head"><div><span className="eyebrow">Data sources</span><h1>Source catalog</h1><p>Find a relation, inspect its columns, then add it to your workspace.</p></div>{discovery.data&&<span>{visible.length} of {catalog.length} tables</span>}</div>
   <div role="status">
@@ -731,6 +746,10 @@ function ReplacementReview({review,busy,cancel,confirm}){
   <p>Published maps can return different values or fail on their next database read as soon as this replacement commits, before any workspace save or reload. PostgreSQL can block the swap when a database object depends on the relation.</p>
   <KnownConsumers dependents={dependents}/>
   <p>Kind: {current.kind} → {proposed.kind}</p>
+  <dl>{[['Feature ID','idColumn'],['Geometry','geometryColumn'],['Source relations','sources'],['Description','description']].map(([label,key])=>{
+   const show=value=>Array.isArray(value)?value.join(', '):value||'None';
+   return <React.Fragment key={key}><dt>{label}</dt><dd>{show(current[key])} → {show(proposed[key])}</dd></React.Fragment>;
+  })}<dt>Map extent locale</dt><dd>{current.spatialScope?`${current.spatialScope.locale||'Default locale'} ${JSON.stringify(current.spatialScope.envelopes||[])}`:'No stored map extent'} → {proposed.spatialScope?.locale||'Default locale'}. The server resolves its current extent at replacement.</dd></dl>
   <h4>Previous SQL</h4><pre style={sqlStyle}>{current.query}</pre>
   <h4>Proposed SQL</h4><pre style={sqlStyle}>{proposed.query}</pre>
   <button type="button" disabled={busy} onClick={cancel}>Back to definition</button>

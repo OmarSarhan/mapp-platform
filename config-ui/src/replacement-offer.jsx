@@ -16,7 +16,7 @@ export function enqueueReplacement(offers, result, workspace) {
   if (previous && profile?.assetId) {
     if (previous.result.semanticProfile.generation >= profile.generation) return offers;
     const contiguous = previous.result.semanticProfile.generation + 1 === profile.generation;
-    gap = previous.gap || !contiguous;
+    gap = previous.gap || !contiguous || !completeChanges(previous.result.columnChanges);
     if (contiguous && completeChanges(previous.result.columnChanges) && completeChanges(result.columnChanges)) {
       const first = previous.result.columnChanges;
       const last = result.columnChanges;
@@ -43,11 +43,15 @@ export function enqueueReplacement(offers, result, workspace) {
   return [...others, {result, baseline, firstGeneration, gap}];
 }
 
-async function replacementMetadata(api, result) {
+async function replacementMetadata(api, result, accepting=false) {
   const expected = result.semanticProfile;
   if (!expected?.assetId || !Number.isInteger(expected.generation) || !completeChanges(result.columnChanges)) {
     return {message: 'The operation returned incomplete replacement metadata. Review the relation manually.'};
   }
+  const readAsset = async () => (await api(`/api/semantic/catalog/objects/${encodeURIComponent(expected.assetId)}`)).asset;
+  // At acceptance, read delivered fields first. A concurrent replacement
+  // between the reads must be visible to the final authoritative profile check.
+  const reviewedAsset = accepting ? await readAsset() : null;
   const {derivedProfile} = await api(`/api/semantic/derived-profiles/${encodeURIComponent(result.name)}`);
   if (!derivedProfile?.assetId || !Number.isInteger(derivedProfile.generation)) {
     throw new Error('The current generation could not be verified.');
@@ -59,7 +63,7 @@ async function replacementMetadata(api, result) {
     const repair = derivedProfile.status === 'repair_required' ? ' A semantic administrator can inspect and repair delivery.' : '';
     return {retry: true, message: `Waiting for ready metadata. Current profile status: ${derivedProfile.status}.${repair}`};
   }
-  const {asset} = await api(`/api/semantic/catalog/objects/${encodeURIComponent(expected.assetId)}`);
+  const asset = accepting ? reviewedAsset : await readAsset();
   const binding = asset?.generated?.binding;
   if (asset?.id !== expected.assetId || asset.generation !== expected.generation || asset.status !== 'ready' ||
       binding?.schema !== 'derived_layers' || binding.relation !== result.name || !Array.isArray(asset.generated.fields)) {
@@ -105,7 +109,7 @@ export function ReplacementOffer({api, offer, workspace, reconcile, apply, dismi
     setChecking(true);
     try {
       // The offer can sit open while another administrator replaces the relation.
-      const verified = await replacementMetadata(api, result);
+      const verified = await replacementMetadata(api, result, true);
       if (version.current !== started) return;
       if (verified.columns && proposal) apply(workspace, proposal);
       else { setMetadata(verified); if (verified.retry) setAttempt(n => n + 1); }
@@ -119,7 +123,7 @@ export function ReplacementOffer({api, offer, workspace, reconcile, apply, dismi
     <h3>Review workspace impact for derived_layers.{result.name}</h3>
     <p>The database replacement committed. {profile && <>Generation {profile.generation} · {profile.status} at completion.</>}</p>
     {firstGeneration < profile?.generation && <p>Includes outstanding changes since generation {firstGeneration}.</p>}
-    {offer.gap && <p>Intermediate generations were not observed. Review earlier changes manually.</p>}
+    {offer.gap && <p>The complete sequence of replacement changes could not be verified. Review earlier changes manually.</p>}
     {completeChanges(changes) && <p>Added: {changes.added.join(', ') || 'none'}. Removed: {changes.removed.join(', ') || 'none'}. Type changed: {changes.changed.join(', ') || 'none'}.</p>}
     <p>Values can have a new meaning even when columns match. Review feature IDs, filters, hover text and symbology, including zoom-dependent layers. Review named-locale overrides through the API or CLI.</p>
     {result.consumerLabels?.length > 0 && <p>Direct workspace consumers: {result.consumerLabels.join(', ')}.</p>}
@@ -128,7 +132,8 @@ export function ReplacementOffer({api, offer, workspace, reconcile, apply, dismi
     {metadata?.retry && <button type="button" onClick={() => setAttempt(n => n + 1)}>Check metadata again</button>}
     {proposal && <p>{proposal.summary.layers} default workspace layer(s) have suggested edits. {proposal.summary.added} information field(s) to add, {proposal.summary.removed} to remove. Review affected filters, hover and themes before saving.</p>}
     {!!proposal?.summary.skipped.length && <p>Edited locally since replacement, excluded from suggestions: {proposal.summary.skipped.join(', ')}.</p>}
-    {!!proposal?.summary.layers && <button type="button" disabled={busy || checking} onClick={accept}>Use suggested unsaved edits</button>}
+    {!!proposal?.summary.localeConflicts?.length && <p>Excluded because a named locale uses a different relation or zoom binding: {proposal.summary.localeConflicts.join(', ')}.</p>}
+    {!!proposal?.summary.layers && !offer.gap && <button type="button" disabled={busy || checking} onClick={accept}>Use suggested unsaved edits</button>}
     <button type="button" disabled={checking} onClick={dismiss}>Dismiss workspace review</button>
   </section>;
 }
