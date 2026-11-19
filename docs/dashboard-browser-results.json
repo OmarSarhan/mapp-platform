@@ -1,0 +1,232 @@
+{
+  "before100": {
+    "search": {
+      "ms": [
+        134.5,
+        217.3,
+        172.2,
+        111,
+        66.7
+      ],
+      "cloneCalls": [
+        22,
+        22,
+        22,
+        22,
+        22
+      ]
+    },
+    "locale": {
+      "ms": [
+        111.6,
+        121.8,
+        186.8,
+        73.3,
+        79.2
+      ],
+      "cloneCalls": [
+        44,
+        44,
+        44,
+        44,
+        44
+      ]
+    },
+    "edit": {
+      "ms": [
+        152.4,
+        98,
+        82.5,
+        85.6,
+        164.9
+      ],
+      "cloneCalls": [
+        23,
+        23,
+        23,
+        23,
+        23
+      ]
+    }
+  },
+  "after100": {
+    "search": {
+      "ms": [
+        25.2,
+        35.7,
+        33.1,
+        50.1,
+        33.4
+      ],
+      "cloneCalls": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "locale": {
+      "ms": [
+        65.5,
+        43.8,
+        43.6,
+        40,
+        47
+      ],
+      "cloneCalls": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "edit": {
+      "ms": [
+        97.1,
+        83,
+        141,
+        147.5,
+        161.9
+      ],
+      "cloneCalls": [
+        12,
+        12,
+        12,
+        12,
+        12
+      ]
+    },
+    "unsaved": true,
+    "requests": {
+      "/api/catalog": 1,
+      "/api/icons": 1,
+      "/api/plugins": 1,
+      "/api/workspace": 1,
+      "/api/derived-layers": 1,
+      "/api/layers?locale=locale": 4,
+      "/api/layers?locale=named0": 3
+    }
+  },
+  "before1000": {
+    "search": {
+      "ms": [
+        769.9,
+        503.8,
+        280.9,
+        399.9,
+        450.2
+      ],
+      "cloneCalls": [
+        44,
+        22,
+        22,
+        22,
+        22
+      ]
+    },
+    "locale": {
+      "ms": [
+        1378.3,
+        763.7,
+        900.5,
+        690.1,
+        640.7
+      ],
+      "cloneCalls": [
+        44,
+        44,
+        44,
+        44,
+        44
+      ]
+    },
+    "edit": {
+      "ms": [
+        663.2,
+        916.7,
+        485.3,
+        433.1,
+        498.3
+      ],
+      "cloneCalls": [
+        23,
+        45,
+        23,
+        23,
+        23
+      ]
+    },
+    "unsaved": true,
+    "requests": {
+      "/api/catalog": 2,
+      "/api/icons": 2,
+      "/api/workspace": 1,
+      "/api/plugins": 2,
+      "/api/derived-layers": 1,
+      "/api/layers?locale=locale": 4,
+      "/api/layers?locale=named0": 3
+    }
+  },
+  "after1000": {
+    "search": {
+      "ms": [
+        28.2,
+        97.8,
+        51.9,
+        80.7,
+        33.4
+      ],
+      "cloneCalls": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "locale": {
+      "ms": [
+        132.4,
+        95.6,
+        73.5,
+        65.3,
+        85.8
+      ],
+      "cloneCalls": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "edit": {
+      "ms": [
+        218.3,
+        376.7,
+        389.3,
+        266.9,
+        344.2
+      ],
+      "cloneCalls": [
+        12,
+        12,
+        12,
+        12,
+        12
+      ]
+    },
+    "unsaved": true,
+    "requests": {
+      "/api/catalog": 1,
+      "/api/icons": 1,
+      "/api/plugins": 1,
+      "/api/workspace": 1,
+      "/api/derived-layers": 1,
+      "/api/layers?locale=locale": 4,
+      "/api/layers?locale=named0": 3
+    }
+  }
+}

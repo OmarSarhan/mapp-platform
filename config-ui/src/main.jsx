@@ -349,27 +349,36 @@ function PrimaryNavigation({children}){
  return <nav ref={ref} className="primary-nav" aria-label="Platform areas">{children}</nav>;
 }
 
-function useDiscovery(path, collection) {
+export function useDiscovery(path, collection, enabled=true) {
  const [state,setState]=useState({data:null,loading:true,error:'',lastSuccess:null});
  const request=useRef(0),pending=useRef(false);
+ const invalidated=useRef(false),enabledRef=useRef(enabled);
+ const mounted=useRef(true);
+ useEffect(()=>{mounted.current=true;return()=>{mounted.current=false}},[]);
+ enabledRef.current=enabled;
  const refresh=async()=>{
   if(pending.current)return;
+  invalidated.current=false;
   pending.current=true;
   const id=++request.current;
   setState(old=>({...old,loading:true}));
   try{
    const data=await api(path);
-   if(!Array.isArray(data[collection]))throw new Error('Invalid discovery response.');
+   if(collection==='plugins' ? !data.plugins||typeof data.plugins!=='object' : !Array.isArray(data[collection]))throw new Error('Invalid discovery response.');
    if(request.current===id)setState({data,loading:false,error:'',lastSuccess:new Date()});
   }catch(error){
    if(request.current===id)setState(old=>({...old,loading:false,error:error.status?`Request failed (HTTP ${error.status}).`:'Discovery is unavailable.'}));
-  }finally{if(request.current===id)pending.current=false}
+  }finally{if(request.current===id){pending.current=false;if(mounted.current&&invalidated.current&&enabledRef.current&&!document.hidden){invalidated.current=false;refresh()}}}
  };
  useEffect(()=>{
-  refresh();
-  const timer=setInterval(refresh,10000);
-  return()=>{clearInterval(timer);request.current++;pending.current=false};
- },[path,collection]);
+  const automatic=()=>{if(enabled&&!document.hidden)refresh()};
+  const invalidate=()=>{if(pending.current)invalidated.current=true;else automatic()};
+  automatic();
+  const timer=setInterval(automatic,10000);
+  document.addEventListener('visibilitychange',automatic);
+  window.addEventListener('mapp-discovery-changed',invalidate);
+  return()=>{clearInterval(timer);document.removeEventListener('visibilitychange',automatic);window.removeEventListener('mapp-discovery-changed',invalidate)};
+ },[path,collection,enabled]);
  return {...state,refresh};
 }
 function IconDiscoveryNotice({discovery}){
@@ -377,17 +386,19 @@ function IconDiscoveryNotice({discovery}){
  return <p role="status">SVG icon discovery failed. {discovery.data?'Showing the last successful icon list. ':''}{discovery.error} <button type="button" disabled={discovery.loading} onClick={discovery.refresh}>Retry icon discovery</button></p>;
 }
 export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null,activeArea="workspace",openWorkspace=()=>{},children}){
- const [ws,setWorkspace]=useState(null),[rev,setRev]=useState(),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[offers,setOffers]=useState([]);
+ const [ws,setWorkspace]=useState(null),[rev,setRev]=useState(),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[offers,setOffers]=useState([]);
  const [boundaryData,setBoundaryData]=useState(null);
  const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving',reloading=activity==='reloading';
  const beginActivity=next=>{if(activityRef.current)return false;activityRef.current=next;setActivity(next);return true};
  const endActivity=completed=>{if(activityRef.current!==completed)return;activityRef.current=null;setActivity(null)};
- const localeOptions=renderedLocales(ws),fallbackLocale=activeLocale(ws),localeKey=localeOptions.some(([key])=>key===selectedLocale)?selectedLocale:fallbackLocale.key,loc=localeOptions.find(([key])=>key===localeKey)?.[1],layers=loc?.layers||{},namedReadOnly=localeKey!=='locale';
+ const localeOptions=useMemo(()=>renderedLocales(ws),[ws]);
+ const localeKey=localeOptions.some(([key])=>key===selectedLocale)?selectedLocale:'locale',loc=localeOptions.find(([key])=>key===localeKey)?.[1],layers=loc?.layers||{},namedReadOnly=localeKey!=='locale';
  const load=async(force=false)=>{if(activityRef.current||dirty&&!force&&!confirm('Discard unsaved changes?')||!beginActivity('loading'))return;if(!ws)setStatus(null);try{const x=await api('/api/workspace');setWs(x.workspace);setRev(x.revision);setSelectedLocale(activeLocale(x.workspace).key);setDirty(false);setSelected();setSelectedCatalog();setErrors([]);setStatus(null)}catch(e){const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus({kind:'error',message:'Unable to load configuration.',errors:next})}finally{endActivity('loading')}};
- const tableDiscovery=useDiscovery('/api/catalog','tables'),iconDiscovery=useDiscovery('/api/icons','icons');
+ const tableDiscovery=useDiscovery('/api/catalog','tables',activeArea==='workspace'),iconDiscovery=useDiscovery('/api/icons','icons',activeArea==='workspace');
  const catalog=tableDiscovery.data?.tables||[],databases=tableDiscovery.data?.databases||[],icons=iconDiscovery.data?.icons||[];
- const poll=async()=>{try{const pluginData=await api('/api/plugins');setPluginCatalogue(pluginData.plugins)}catch{}};
- useEffect(()=>{load(true);poll();const id=setInterval(poll,10000);return()=>clearInterval(id)},[]);
+ const pluginDiscovery=useDiscovery('/api/plugins','plugins',activeArea==='workspace');
+ const pluginCatalogue=pluginDiscovery.data?.plugins||null;
+ useEffect(()=>{load(true)},[]);
  const workspaceRef=useRef(null);
  const setWs=next=>{
   const value=typeof next==='function'?next(workspaceRef.current):next;
@@ -444,7 +455,11 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
  const mutateWorkspace=fn=>update(fn);
  const mutate=fn=>update(x=>{let locale;if(localeKey==='locale'){x.locale??={layers:{}};locale=x.locale}else{locale=x.locales&&Object.hasOwn(x.locales,localeKey)?x.locales[localeKey]:undefined}if(!locale)throw new Error(`Unknown locale: ${localeKey}`);fn(x,locale)});
  const mutateLayers=fn=>mutate((x,locale)=>{locale.layers??={};fn(x,locale)});
- const setLayer=layer=>mutateLayers((x,l)=>l.layers[selected]=layer), table=layerCatalogTable(layers[selected],catalog,ws?.dbs);
+ const setLayer=layer=>{
+  if(activityRef.current||namedReadOnly)return;
+  setWs(old=>({...old,locale:{...old.locale,layers:{...old.locale?.layers,[selected]:clone(layer)}}}));
+  setDirty(true);setErrors([]);setStatus(null);
+ }, table=layerCatalogTable(layers[selected],catalog,ws?.dbs);
  const renameLayer=displayName=>{const occupied=new Set([...(Object.keys(ws.locale?.layers||{})),...Object.values(ws.locales||{}).flatMap(locale=>Object.keys(locale.layers||{}))]);occupied.delete(selected);const nextKey=uniqueLayerKey(displayName,occupied,selected);if(nextKey===selected)return;mutateWorkspace(next=>{for(const locale of [next.locale,...Object.values(next.locales||{})]){if(!locale?.layers||!Object.hasOwn(locale.layers,selected))continue;locale.layers[nextKey]=locale.layers[selected];delete locale.layers[selected]}});setSelected(nextKey)};
  const validate=async()=>{if(!beginActivity('validating'))return;setErrors([]);setStatus({kind:'pending',message:'Validating workspace…'});try{const x=await api('/api/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:ws})});setErrors([]);setStatus({kind:'success',message:x.message||'Configuration is valid.'})}catch(e){const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus({kind:'error',message:'Configuration is not valid.',errors:next})}finally{endActivity('validating')}};
  const save=async()=>{if(!beginActivity('saving'))return;setErrors([]);setStatus(workspaceSaveStatus('restarting'));try{const x=await api('/api/workspace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:ws,revision:rev})});if(!confirmedWorkspaceReload(x))throw new ApiError('Workspace save returned without fingerprint-matched XYZ readiness.',{status:502,payload:x});setWs(x.workspace);setRev(x.revision);setDirty(false);setErrors([]);setStatus(workspaceSaveStatus('ready'))}catch(e){const saved=savedWorkspaceFromError(e);if(saved){setWs(saved.workspace);setRev(saved.revision);setDirty(saved.dirty)}const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus(workspaceSaveStatus(workspaceSaveFailurePhase(e),next))}finally{endActivity('saving')}};
@@ -497,6 +512,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
    {status&&<div className={`status-bar ${status.kind}`}><div><strong>{status.message}</strong>{status.errors?.length>0&&<ul>{status.errors.map((error,index)=><li key={index}>{error.path}: {error.message}</li>)}</ul>}</div><button aria-label="Dismiss status" onClick={()=>setStatus(null)}><X size={17} aria-hidden="true"/></button></div>}
   </div>
   <main className={`dashboard-main ${sidebarMode==='catalog'?'source-catalog-main':''}`} hidden={activeArea!=='workspace'} aria-busy={busy} inert={busy||activeArea!=='workspace'}>
+   {pluginDiscovery.error&&<p role="status">Plugin discovery failed. {pluginDiscovery.data?'Showing the last successful plugin list. ':''}{pluginDiscovery.error} <button disabled={pluginDiscovery.loading} onClick={pluginDiscovery.refresh}>Retry plugin discovery</button></p>}
    {sidebarMode==='catalog'?<SourceCatalog discovery={tableDiscovery} iconDiscovery={iconDiscovery} catalog={catalog} selected={selectedCatalog} onSelect={setSelectedCatalog} search={catSearch} setSearch={setCatSearch} addTable={addTable} namedReadOnly={namedReadOnly} openDerivedLayers={openDerivedLayers}/>:<>
    <button className={`sidebar-scrim ${sidebarOpen?'visible':''}`} aria-label="Close workspace navigator" onClick={()=>setSidebarOpen(false)}></button>
    <aside className={`workspace-sidebar ${sidebarOpen?'open':''}`}>
@@ -819,6 +835,7 @@ export function DerivedLayers({close,active=true,initialName=null,initialAction=
    const submitted=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,...(replacing?{confirmed:true}:{}),background:true})});
    const result=(await waitForOperation(submitted)).derivedLayer;
    setNotice(derivedLayerSuccess(result));
+   window.dispatchEvent(new Event('mapp-discovery-changed'));
    if(replacing){setDefinition(derivedLayerFormDefinition(result));setEditing(result.name);(onChanged||reportReplacement)(result)}
    else{setDefinition(blank);setEditing(null)}
    await load();
@@ -844,7 +861,7 @@ export function DerivedLayers({close,active=true,initialName=null,initialAction=
   submit({...definition,sources:definition.sources.split(',').map(value=>value.trim()).filter(Boolean)},false);
  };
  const edit=async item=>{setReview(null);setBusy(true);setError('');setNotice('');try{const current=(await readDerivedDefinition(item.name)).derivedLayer;setEditing(item.name);setDefinition(derivedLayerFormDefinition(current))}catch(err){setError(err.message)}finally{setBusy(false)}};
- const action=async(item,name)=>{if(!window.confirm(`${title(name)} derived_layers.${item.name}?`))return;setBusy(true);setError('');setNotice('');try{const submitted=await api(`/api/derived-layers/${item.name}/${name}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,...(name==='refresh'?{background:true}:{})})}),response=await waitForOperation(submitted);if(name==='refresh')setNotice(derivedLayerSuccess(response.derivedLayer));if(name==='drop'){setEditing(null);setDefinition(blank)}await load()}catch(err){setError(derivedLayerError(err,name));await offerView(err,{operation:name,item})}finally{setBusy(false)}};
+ const action=async(item,name)=>{if(!window.confirm(`${title(name)} derived_layers.${item.name}?`))return;setBusy(true);setError('');setNotice('');try{const submitted=await api(`/api/derived-layers/${item.name}/${name}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,...(name==='refresh'?{background:true}:{})})}),response=await waitForOperation(submitted);if(name==='refresh')setNotice(derivedLayerSuccess(response.derivedLayer));if(name==='drop'){setEditing(null);setDefinition(blank)}window.dispatchEvent(new Event('mapp-discovery-changed'));await load()}catch(err){setError(derivedLayerError(err,name));await offerView(err,{operation:name,item})}finally{setBusy(false)}};
 
  const chooseAction=(item,value)=>{if(value==='edit')edit(item);else if(value==='refresh')action(item,'refresh');else if(value==='convert')reviewReplacement(item.name);else if(value==='delete')action(item,'drop')};
  useEffect(()=>{if(!initialName)return;if(initialAction==='delete')action({name:initialName},'drop');else edit({name:initialName})},[initialName,initialAction,initialRequestKey]);
@@ -1100,22 +1117,38 @@ export function Security({close,hash}){
  const initialPreset=TOKEN_ACCESS_PRESETS.find(item=>item.id===FULL_TOKEN_PRESET_ID)||TOKEN_ACCESS_PRESETS[0];
  const [tokens,setTokens]=useState([]),[devices,setDevices]=useState([]),[audit,setAudit]=useState([]),[clients,setClients]=useState([]),[grants,setGrants]=useState([]),[approvals,setApprovals]=useState([]),[windows,setWindows]=useState([]),[mcpUrl,setMcpUrl]=useState(''),[name,setName]=useState('CLI operator'),[preset,setPreset]=useState(initialPreset.id),[scopes,setScopes]=useState(initialPreset.scopes),[expiryDays,setExpiryDays]=useState('30'),[extendedExpiryConfirmed,setExtendedExpiryConfirmed]=useState(false),[revealed,setRevealed]=useState(null),[copied,setCopied]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState('');
  const copiedTimer=useRef(null);
- const load=async()=>{const [t,d,a,c,g,p,w]=await Promise.all([api('/api/admin/tokens'),api('/api/admin/device-authorizations'),api('/api/admin/audit'),api('/api/admin/mcp-clients'),api('/api/admin/mcp-grants'),api('/api/admin/approvals'),api('/api/admin/approval-windows')]);setTokens(t.tokens);setDevices(d.authorizations);setAudit(a.events);setClients(c.clients);setMcpUrl(c.mcpUrl);setGrants(g.grants);setApprovals(p.approvals);setWindows(w.windows||[])};
+ const [resourceState,setResourceState]=useState({});
+ const resourceRequests=useRef({});
+ const resources={tokens:r=>setTokens(r.tokens),'device-authorizations':r=>setDevices(r.authorizations),audit:r=>setAudit(r.events),'mcp-clients':r=>{setClients(r.clients);setMcpUrl(r.mcpUrl)},'mcp-grants':r=>setGrants(r.grants),approvals:r=>setApprovals(r.approvals),'approval-windows':r=>setWindows(r.windows||[])};
+ const load=async(only=Object.keys(resources))=>Promise.all(only.map(resource=>{
+  const refresh=async()=>{
+   const request=(resourceRequests.current[resource]||0)+1;
+   resourceRequests.current[resource]=request;
+   setResourceState(old=>({...old,[resource]:'Loading…'}));
+   try{
+    const result=await api(`/api/admin/${resource}`);
+    if(resourceRequests.current[resource]!==request)return;
+    resources[resource](result);setResourceState(old=>({...old,[resource]:''}));
+   }catch(reason){if(resourceRequests.current[resource]===request)setResourceState(old=>({...old,[resource]:`Refresh failed: ${reason.message}. Previously loaded data is retained.`}))}
+  };
+  const pending=refresh();
+  return resource==='audit'?undefined:pending;
+ }));
  useEffect(()=>{load().catch(reason=>setError(reason.message))},[]);
  useEffect(()=>()=>clearTimeout(copiedTimer.current),[]);
  const choosePreset=id=>{const selected=TOKEN_ACCESS_PRESETS.find(item=>item.id===id);setPreset(selected?id:'custom');if(selected)setScopes(selected.scopes)};
  const toggleScope=(id,enabled)=>{setPreset('custom');setScopes(current=>{const narrow=current.includes('full')?ALL_NARROW_TOKEN_SCOPES:current;return enabled?[...new Set([...narrow,id])]:narrow.filter(scope=>scope!==id)})};
  const extendedExpiry=expiryDays==='never'||Number(expiryDays)>30;
- const create=async()=>{setBusy(true);setError('');try{const tokenRequest={name,scopes};tokenRequest.expires=expiryDays==='never'?null:new Date(Date.now()+Number(expiryDays)*86400000).toISOString();if(extendedExpiry)tokenRequest.extendedExpiryConfirmed=extendedExpiryConfirmed;const result=await api('/api/admin/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tokenRequest)});setRevealed(result.token);setCopied(false);await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const create=async()=>{setBusy(true);setError('');try{const tokenRequest={name,scopes};tokenRequest.expires=expiryDays==='never'?null:new Date(Date.now()+Number(expiryDays)*86400000).toISOString();if(extendedExpiry)tokenRequest.extendedExpiryConfirmed=extendedExpiryConfirmed;const result=await api('/api/admin/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tokenRequest)});setRevealed(result.token);setCopied(false);await load(["tokens","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const copyRevealed=async()=>{setError('');try{await navigator.clipboard.writeText(revealed);clearTimeout(copiedTimer.current);setCopied(true);copiedTimer.current=setTimeout(()=>setCopied(false),900)}catch{setCopied(false);setError('Could not copy the API token to the clipboard.')}};
- const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load();return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
- const openWindow=async request=>{setBusy(true);setError('');try{await api('/api/admin/approval-windows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const revokeWindow=async id=>{setBusy(true);setError('');try{await api(`/api/admin/approval-windows/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const decideApproval=async(reference,approved)=>{setBusy(true);setError('');try{await api(`/api/admin/approvals/${reference}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved})});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
- const revokeGrant=async grantId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-grants/${grantId}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load()}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const approve=async userCode=>{setBusy(true);setError('');try{await api('/api/admin/device-authorizations/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode})});await load(["device-authorizations","tokens","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const revoke=async id=>{setBusy(true);setError('');try{await api(`/api/admin/tokens/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load(["tokens","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const registerClient=async request=>{setBusy(true);setError('');try{const result=await api('/api/admin/mcp-clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load(["mcp-clients","audit"]);return result.clientId}catch(reason){setError(reason.message);return null}finally{setBusy(false)}};
+ const openWindow=async request=>{setBusy(true);setError('');try{await api('/api/admin/approval-windows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});await load(["approval-windows","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const revokeWindow=async id=>{setBusy(true);setError('');try{await api(`/api/admin/approval-windows/${id}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load(["approval-windows","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const decideApproval=async(reference,approved)=>{setBusy(true);setError('');try{await api(`/api/admin/approvals/${reference}/decide`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approved})});await load(["approvals","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const disableClient=async clientId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-clients/${clientId}/disable`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load(["mcp-clients","mcp-grants","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
+ const revokeGrant=async grantId=>{setBusy(true);setError('');try{await api(`/api/admin/mcp-grants/${grantId}/revoke`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});await load(["mcp-grants","audit"])}catch(reason){setError(reason.message)}finally{setBusy(false)}};
  const presetHelp=TOKEN_ACCESS_PRESETS.find(item=>item.id===preset)?.help||'Custom least-privilege scope selection.';
  const visibleScopes=scopes.includes('full')?ALL_NARROW_TOKEN_SCOPES:scopes;
  const selectedScopesLabel=scopes.includes('full')?'full (all bearer-token workspace and semantic scopes)':(scopes.join(', ')||'none');
@@ -1124,6 +1157,7 @@ export function Security({close,hash}){
  return <div className="management-page"><section className="panel security-panel access-panel" role="region" aria-labelledby="access-title">
   <div className="form-head security-header"><div><span className="eyebrow">Administration</span><h2 id="access-title">Access and audit</h2><p>Review agent requests, manage credentials, and follow the authorization trail.</p></div><button autoFocus className="icon-button" aria-label="Close" title="Close" onClick={close}><X size={19} aria-hidden="true"/></button></div>
   {error&&<div className="expression-result error">{error}</div>}
+  {Object.entries(resourceState).filter(([,message])=>message).map(([resource,message])=><p role="status" key={resource}>{resource}: {message}</p>)}
   <div className="security-layout">
    <nav className="security-nav" aria-label="Access and audit sections">
     <button {...sectionButton('requests')}><ShieldCheck size={18} aria-hidden="true"/><span>Requests<small>{approvals.length+pendingDevices.length} waiting</small></span>{approvals.length+pendingDevices.length>0&&<strong>{approvals.length+pendingDevices.length}</strong>}</button>
