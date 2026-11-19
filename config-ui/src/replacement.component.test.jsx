@@ -1,7 +1,7 @@
 import React from 'react';
 import {afterEach, expect, test, vi} from 'vitest';
 import {act, cleanup, fireEvent, render, screen, waitFor, within} from '@testing-library/react';
-import {Dashboard, Root} from './main.jsx';
+import {Dashboard, DerivedLayers, Root} from './main.jsx';
 
 const savedLayer = {
   name:'Roads', format:'mvt', table:'derived_layers.roads', geom:'geom', qID:'id',
@@ -48,6 +48,17 @@ function emit(replacement){
 const review = name => screen.getByRole('region',{name:`Replacement of ${name}`});
 const accept = panel => within(panel).queryByRole('button',{name:'Use suggested unsaved edits'});
 afterEach(()=>{cleanup();vi.useRealTimers();vi.unstubAllGlobals()});
+
+test.each(['drafts', 'capabilities'])('opens the definition of a relation named %s', async name=>{
+  const definition=result(name,1);
+  mockApi(path=>{
+    if(path==='/api/derived-layers')return {derivedLayers:[{name,kind:'view',sources:definition.sources}]};
+    if(path===`/api/derived-layers/${name}?definition=true`)return {derivedLayer:definition};
+  });
+  render(<DerivedLayers close={()=>{}}/>);
+  fireEvent.change(await screen.findByLabelText(`Edit or delete derived_layers.${name}`),{target:{value:'edit'}});
+  expect(await screen.findByDisplayValue(definition.query)).toBeTruthy();
+});
 
 test('reviews ordinary replacement before submitting, waits for its exact generation and offers only local edits', async()=>{
   const prefix='SELECT id, geom, /* '+ 'Shared calculation. '.repeat(10) +'*/ ';
