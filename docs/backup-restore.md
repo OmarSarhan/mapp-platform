@@ -47,9 +47,24 @@ physical-backup process.
 
 ## State backup
 
-For the strongest consistency, pause configuration and derived-layer writes
-while copying `var/workspace` and `var/control`. Stop `config-ui` first so it
-cannot commit another PostgreSQL outbox event.
+Fence public traffic and private clients. Drain configuration, browser and
+operator jobs, then stop config-ui, the renderers, browser runner and optional
+MCP services. Keep the database running for the dump. Take the live workspace,
+control files and referenced artifacts while those writers remain stopped.
+Record the release commit, image digests, PostgreSQL and extension versions,
+control migration ledger, `control.metadata` instance ID, current recovery
+epoch and semantic catalog revision in the protected backup manifest.
+
+Record the workspace byte hash and nanosecond modification time. The workspace
+revision includes both. For example, from the deployment root on Linux:
+
+```sh
+umask 077
+sha256sum var/workspace/workspace.json backups/mapp.dump
+python3 -c 'import os; print(os.stat("var/workspace/workspace.json").st_mtime_ns)'
+tar --format=pax --numeric-owner -cpf backups/state.tar var/workspace var/control
+sha256sum backups/state.tar
+```
 
 Take the PostgreSQL dump or coordinated external snapshot during the same
 write-quiesced interval. That dump is now also the only copy of the
@@ -75,10 +90,17 @@ not place it in the same unencrypted archive as public release files.
 
 ## Restore order
 
-1. Provision a clean host with the intended platform release.
+1. Provision a clean, isolated destination with the backup release and compatible
+   PostgreSQL major version, extensions, roles and grants. Keep all ingress and
+   other database clients fenced through the private readiness checks. Stop
+   automated restarts. Preserve the original backup for a fresh attempt.
 2. Restore `.env` from the approved secret store without committing it.
-3. Restore the PostgreSQL dump into a fresh compatible bundled volume, or have
-   the external operator restore the target PostGIS database and connection.
+3. Verify the archive checksums. On the isolated database service, restore
+   into an empty database with the required owners available. Use
+   `pg_restore --exit-on-error --single-transaction -d TARGET mapp.dump`
+   for a custom-format logical dump. Check schema/object owners, FDW mappings,
+   extensions and grants before running the control commands. A logical dump
+   of one database does not create cluster roles.
 4. Restore `var/workspace` and `var/control`, including durable operation
    records, with the configured host UID/GID and restrictive modes. The
    semantic catalog and the control schema — the administrator credential,
@@ -90,9 +112,31 @@ not place it in the same unencrypted archive as public release files.
    authorization component creates the socket. Do not restore stale
    `var/preview` scratch state; leave it absent so initialization seeds it from
    the restored live workspace.
-5. Invalidate every credential the restored database brought back:
+5. Before invoking the wrapper, compare the restored bytes, file modes,
+   ownership and workspace mtime with the manifest. Verify proposal, operation
+   and artifact references. Resolve mismatched files from a matching capture.
+   A rounded timestamp changes the revision even if the bytes match. Recreate
+   and review affected proposals before applying them.
+
+   Inspect the restored control ledger without starting application services:
+
+   ```sh
+   ./bin/mapp migrate-restored-control
+   ./bin/mapp migrate-restored-control --expect-instance "$BACKUP_INSTANCE_ID" --confirm
+   ```
+
+   The first command prints the observed identity, ledger and pending migrations
+   and exits 2 for review. Compare the identity and ledger to the manifest.
+   The confirmed command accepts initialized, contiguous ledgers known to this
+   release and runs the normal forward migrations in one transaction. Migration
+   11 also revokes legacy approval windows. Missing identity, ownership or ledger
+   evidence needs operator investigation. An unknown newer ledger requires the
+   matching release. Keep all credential issuers and consumers stopped.
+
+   Review the epoch and invalidate restored authority at a separate checkpoint:
 
    ```bash
+   ./bin/mapp advance-recovery-epoch
    ./bin/mapp advance-recovery-epoch --confirm
    ```
 
@@ -109,13 +153,18 @@ not place it in the same unencrypted archive as public release files.
    credential is usable until this has run. Run it without `--confirm` first to
    see what it would invalidate.
 
-   It refuses if the restored dump predates the migration that added the
-   mechanism; starting the stack once applies the forward ladder, after which
-   it succeeds.
+   The sweep requires this release's complete control ledger and sweep tables.
+   A failed transaction leaves the old epoch and revocations intact. If the
+   command loses its response or file audit fails after commit, keep traffic
+   fenced. Inspect the database epoch against the captured value, revocation
+   state and audit before deciding whether to retry. A second confirmed sweep
+   advances the epoch again. Recheck the restored administrator credential and
+   client registrations against subsequent password rotations or client
+   withdrawals before permitting sign-in or fresh consent.
 6. Restore Caddy data if retaining the existing certificate state is
    appropriate, or allow Caddy to obtain new certificates.
 7. Initialize or clear stale live and preview reload coordination
-   deliberately, then start the stack. Startup resumes ordinary pending and
+   deliberately, then start the stack privately. Startup resumes ordinary pending and
    retrying outbox delivery, but deliberately does not force recovery of a
    retained reset maintenance gate.
 8. If the restored PostgreSQL state contains a gate from an interrupted reset,
@@ -130,9 +179,14 @@ not place it in the same unencrypted archive as public release files.
    expires and makes abandoned work eligible again. A restored
    `repair_required` event does not self-requeue; correct its cause and use the
    confirmed administrator retry, which sends the same retained payload.
-10. Verify database health, current workspace revision, authentication, audit
-   readability, semantic schema/catalog revision, derived-profile readiness,
-   XYZ reload fingerprint, public map rendering, and a visual test.
+10. Verify old sessions and tokens are refused, then verify a fresh login,
+    scoped issuance and any enabled MCP consent. Check the control and semantic
+    ledgers, audit, restored source identity and grants, pending operation
+    outcomes, profile generations and catalog revision after replay. Request
+    a fresh XYZ reload, match the fingerprint to the restored workspace, then
+    render a representative layer, select a known feature and inspect visual
+    evidence over the private route. Record the outcome and any explicitly
+    accepted degraded coverage before opening traffic.
 
 Do not overwrite a healthy production deployment while testing a restore. Use
 an isolated host, DNS name, network, and database.

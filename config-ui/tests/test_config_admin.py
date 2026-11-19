@@ -82,7 +82,7 @@ class ConfigAdminTests(unittest.TestCase):
                     handled.append(command)
                     break
             else:
-                if command in ("init", "reset-password", "reset-demo",
+                if command in ("init", "migrate-restored-control", "reset-password", "reset-demo",
                                "revoke-tokens"):
                     handled.append(command)
         self.assertEqual(
@@ -324,7 +324,7 @@ class AdvanceRecoveryEpochCommandTests(ControlStoreTestCase):
             cs.rollback(connection, 4, accept_data_loss=True)
         with self.assertRaises(SystemExit) as caught:
             self.run_command("--confirm")
-        self.assertIn("migration 5", str(caught.exception))
+        self.assertIn("migrate-restored-control", str(caught.exception))
         self.assertIn("pre-restore credentials", str(caught.exception))
 
 

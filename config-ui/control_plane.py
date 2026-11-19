@@ -441,7 +441,7 @@ class ControlStore:
 
     def recovery_epoch(self) -> int:
         with self._db(migrate=False) as connection:
-            self._require_initialized(connection)
+            control_schema.restored_control_state(connection, require_current=True)
             row = connection.execute(
                 "SELECT control.current_recovery_epoch() AS epoch"
             ).fetchone()
@@ -495,24 +495,13 @@ class ControlStore:
         revoked: dict[str, int] = {}
         deleted: dict[str, int] = {}
         with self._db(migrate=False) as connection:
-            self._require_initialized(connection)
             connection.execute("BEGIN")
             try:
-                # The precondition is the function, not the row. If migration
-                # 5 has not run there is no mechanism at all and an advance
-                # would silently do nothing useful.
-                present = connection.execute(
-                    "SELECT 1 FROM pg_proc p"
-                    "  JOIN pg_namespace n ON n.oid = p.pronamespace"
-                    " WHERE n.nspname = %s AND p.proname = 'current_recovery_epoch'",
-                    (control_schema.SCHEMA,),
-                ).fetchone()
-                if present is None:
-                    raise RuntimeError(
-                        "The recovery epoch is not available; migration 5 has"
-                        " not been applied, so a restore cannot invalidate"
-                        " pre-restore credentials."
-                    )
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+                    (control_schema.MIGRATION_LOCK,),
+                )
+                control_schema.restored_control_state(connection, require_current=True)
                 # Upsert, not update. A missing row means zero -- which is what
                 # current_recovery_epoch() already reports -- and an absent row
                 # must not be able to brick the one control that matters at
