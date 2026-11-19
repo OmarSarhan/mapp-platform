@@ -201,6 +201,33 @@ not place it in the same unencrypted archive as public release files.
 Do not overwrite a healthy production deployment while testing a restore. Use
 an isolated host, DNS name, network, and database.
 
+## Rehearsed recovery boundary
+
+The November 2026 rehearsal used a fresh bundled volume, PostgreSQL 17.10,
+PostGIS 3.5.7, H3 4.2.3 and control ledger 11. A separate read-only PostgreSQL
+source supplied one synthetic polygon. Before capture, the dashboard published
+the source and a managed view, replaced that view, and separately saved the
+suggested workspace edit. Both sides of the restore ran in a private network
+namespace.
+
+The drill restored a custom-format dump with `pg_restore --create` and the
+matching PAX file archive, checked the manifest identity, ran
+`migrate-restored-control` and advanced the epoch. Four CLI tokens were
+revoked and two sessions removed. The API refused the old bearer and cookie
+and accepted fresh login and scoped token issuance. The workspace revision
+and a fresh XYZ reload fingerprint matched the manifest. The same derived
+asset was ready at generation 2. Browser validation activated the layer,
+opened feature 7 and retained the map and information-panel captures.
+
+In a negative rehearsal, restoring into a differently named empty database
+without its database-level ACLs left the semantic service without CONNECT.
+The destination stayed fenced. A separate PostgreSQL 18 control-only drill
+dumped and restored fixtures for every ledger from 1 through 11, checked a
+rounded workspace timestamp, and verified that migration preserved identity
+and the subsequent sweep invalidated restored credentials. Those fixtures
+exercise control-ledger compatibility. Qualify other complete release and
+PostgreSQL-major combinations separately.
+
 ## PostgreSQL upgrades
 
 Patch-image refreshes should still be preceded by a backup and restore test. A
