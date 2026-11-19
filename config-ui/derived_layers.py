@@ -4533,6 +4533,8 @@ class DerivedLayerStore:
             # joined definition and a typed journal row must serialize alike.
             if isinstance(value, str):
                 value = datetime.fromisoformat(value)
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                value = value.astimezone(timezone.utc)
             result[key] = DerivedLayerStore._json_timestamp(value)
         return result
 
