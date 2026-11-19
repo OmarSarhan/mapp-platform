@@ -109,7 +109,8 @@ class BaseImagePolicyTests(unittest.TestCase):
 
         self.assertIn("SEMANTIC_TEST_DATABASE_URL", workflow)
         self.assertRegex(workflow, r"services:\s")
-        self.assertRegex(workflow, r"image: postgres:\d+")
+        postgis = EXPECTED_BASES["docker/postgis/Dockerfile"][-1]
+        self.assertIn(f"image: {postgis}", workflow)
         # A skip is the failure this step exists to catch, so it must not be
         # allowed to report success.
         self.assertIn('grep -q "skipped=" /tmp/semantic-tests.log', workflow)
