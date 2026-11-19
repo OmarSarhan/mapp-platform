@@ -601,6 +601,49 @@ class SemanticServerTest(unittest.TestCase):
             legacy_oversized["error"]["code"],
         )
 
+    def test_binding_projection_across_count_byte_visibility_and_revision_boundaries(self):
+        page = "/v1/catalog?projection=bindings&limit=100"
+        for index in range(100):
+            event = self._federated_event(f"a{index:03}", "leeds", f"event-{index}")
+            event["generated"]["description"] = "profile metadata " * 60
+            self.store.apply_event(event)
+        self.assertEqual(100, len(self.request("GET", "/v1/catalog")[1]["assets"]))
+        self.store.apply_event(self._federated_event("z-target", "target", "target-event"))
+        status, legacy = self.request("GET", "/v1/catalog")
+        self.assertEqual((409, "pagination_required"), (status, legacy["error"]["code"]))
+        hidden = self._federated_event("hidden", "private", "hidden-event")
+        self.store.apply_event({**hidden, "visibility": "admin"})
+
+        status, first = self.request("GET", page)
+        self.assertEqual(200, status)
+        self.assertEqual(100, len(first["assets"]))
+        cursor = first["pagination"]["nextCursor"]
+        status, last = self.request("GET", page + "&cursor=" + cursor)
+        self.assertEqual(200, status)
+        self.assertEqual(first["catalogRevision"], last["catalogRevision"])
+        self.assertIsNone(last["pagination"]["nextCursor"])
+        self.assertEqual(["z-target"], [row["id"] for row in last["assets"]])
+        self.assertEqual({"binding": {"adapter": "postgresql", "schema": "target", "relation": "orders"}},
+                         last["assets"][0]["generated"])
+        self.assertNotIn("curated", last["assets"][0])
+        self.assertEqual(403, self.request("GET", page, scopes="semantic:admin")[0])
+        self.assertEqual(400, self.request("GET", page + "&cursor=" + cursor,
+                                          scopes="semantic:admin semantic:inspect")[0])
+        self.assertEqual(400, self.request("GET", "/v1/catalog?limit=100&cursor=" + cursor)[0])
+
+        with patch("server.MAX_PAGE_ITEMS_BYTES", 360):
+            self.assertEqual(413, self.request("GET", "/v1/catalog?limit=100")[0])
+            status, shortened = self.request("GET", page)
+            self.assertEqual(200, status)
+            self.assertLess(len(shortened["assets"]), 100)
+            self.assertIsNotNone(shortened["pagination"]["nextCursor"])
+        self.store.mark_source_state("target", available=False)
+        status, error = self.request("GET", page + "&cursor=" + cursor)
+        self.assertEqual((400, "pagination_invalid"), (status, error["error"]["code"]))
+        fresh = self.request("GET", page)[1]
+        last = self.request("GET", page + "&cursor=" + fresh["pagination"]["nextCursor"])[1]
+        self.assertEqual("unavailable", last["assets"][0]["sourceState"])
+
     def test_cursor_is_invalidated_by_revision_or_visibility_scope(self) -> None:
         for index in range(2):
             status, _created = self.request(
@@ -1206,12 +1249,14 @@ class SemanticServerTest(unittest.TestCase):
         def list_then_write(
             *,
             is_admin: bool,
+            bindings_only=False,
             connection=None,
             after_asset_id=None,
             fetch_limit=None,
         ):
             assets = original(
                 is_admin=is_admin,
+                bindings_only=bindings_only,
                 connection=connection,
                 after_asset_id=after_asset_id,
                 fetch_limit=fetch_limit,

@@ -110,6 +110,13 @@ DERIVED_LAYERS_LIST = {
     "scopes": ("inspect",),
 }
 
+DERIVED_LAYERS_SHOW = {
+    "operation_id": "derived-layers.show",
+    "method": "GET",
+    "path_template": "/api/derived-layers/{name}",
+    "scopes": ("inspect",),
+}
+
 DERIVED_LAYERS_DRAFTS = {
     "operation_id": "derived-layers.drafts",
     "method": "GET",
@@ -370,6 +377,13 @@ def _approval_message(operation_id: str, packet: dict) -> str:
         else ""
     )
     message = f"MAPP wants to run {operation_id}.{detail}{scale}"
+    if operation_id == "derived-layers.replace":
+        for change in packet["changes"]:
+            message += f"\n{change['path']}\nBefore: {change['was']}\nAfter: {change['becomes']}"
+        for key, label in (("workspaceLayers", "Known workspace layers"),
+                           ("derivedLayers", "Known derived layers")):
+            message += f"\n{label}: " + (", ".join(packet["dependents"][key]) or "None identified")
+        message += "\n" + packet["note"]
     review = ((packet or {}).get("evidence") or {}).get("review")
     if isinstance(review, dict):
         binding = review.get("binding") or {}
@@ -424,6 +438,7 @@ PROPOSALS_APPLY = {
     "method": "POST",
     "path_template": "/api/proposals/{proposalId}/apply",
     "scopes": ("apply",),
+    "prerequisite_scopes": (*PROPOSALS_SHOW["scopes"], *VISUAL_OPERATIONS_SHOW["scopes"]),
     # Applying writes the workspace and then waits on the tile service, whose
     # own wait is 30 seconds. The read default of 15 would report a working
     # apply as an unavailable configuration API, which is the failure the
@@ -471,6 +486,7 @@ DERIVED_LAYERS_CREATE = {
     "method": "POST",
     "path_template": "/api/derived-layers",
     "scopes": ("derive:manage", "semantic:inspect"),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
     "refusal_hints": {
         "derived_layer.plan_stale": (
@@ -486,6 +502,7 @@ DERIVED_LAYERS_REPLACE = {
     "method": "POST",
     "path_template": "/api/derived-layers/{name}/replace",
     "scopes": ("derive:manage", "semantic:inspect"),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
 }
 
@@ -494,6 +511,7 @@ DERIVED_LAYERS_DROP = {
     "method": "POST",
     "path_template": "/api/derived-layers/{name}/drop",
     "scopes": ("derive:manage",),
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 60.0,
     "refusal_hints": {
         "derived_layer.in_use": (
@@ -510,6 +528,7 @@ DERIVED_LAYERS_REFRESH = {
     "scopes": ("derive:manage",),
     # Recomputing a materialised relation is the longest-running thing on this
     # surface, and `background` exists precisely because it can exceed a wait.
+    "prerequisite_scopes": APPROVALS_CREATE["scopes"],
     "timeout": 120.0,
 }
 
@@ -819,6 +838,33 @@ def _proposal_summary(proposal):
     return summary
 
 
+def _sql_review(before: str, after: str) -> tuple[str, str]:
+    """Keep both ends of the changed region when it spans a long definition."""
+    limit = 480
+    if before == after:
+        excerpt = before if len(before) <= limit else before[:limit] + "…"
+        return excerpt, excerpt
+    common = min(len(before), len(after))
+    first = next((i for i, (a, b) in enumerate(zip(before, after)) if a != b),
+                 common)
+    suffix = 0
+    while suffix < common - first and before[-1 - suffix] == after[-1 - suffix]:
+        suffix += 1
+    start = max(0, first - 80)
+
+    def excerpt(value):
+        if len(value) <= limit:
+            return value
+        end = min(len(value), len(value) - suffix + 80)
+        if end - start > limit:
+            region = value[start:start + limit // 2] + "…" + value[end - limit // 2:end]
+        else:
+            region = value[start:end]
+        return ("…" if start else "") + region + ("…" if end < len(value) else "")
+
+    return excerpt(before), excerpt(after)
+
+
 def _change_preview(value):
     """What a changed value is, in a form that survives a conversation.
 
@@ -933,6 +979,17 @@ def _failure_diagnostics(payload):
     ):
         detail["sqlstate"] = technical["sqlstate"]
     return detail
+
+
+def _require_derived_polling(background):
+    if not background:
+        return
+    caller = CURRENT_CALLER.get()
+    if caller is None or not set(OPERATIONS_SHOW["scopes"]).issubset(caller.scopes):
+        raise ToolError(
+            "Background execution requires derive to poll operations_show. "
+            "Pass background=false to wait for a foreground result with the existing grant."
+        )
 
 
 def _derived_outcome(payload):
@@ -1344,7 +1401,7 @@ def build_runtime(
         be a visible `operation=None` rather than a silent default.
         """
         if operation is not None:
-            tool_scopes[name] = tuple(operation["scopes"])
+            tool_scopes[name] = (*operation["scopes"], *operation.get("prerequisite_scopes", ()))
         register = server.tool(name=name, description=description)
 
         def decorated(fn):
@@ -2024,7 +2081,7 @@ def build_runtime(
         ))
 
     @tool(
-        operation=DERIVED_LAYERS_LIST,
+        operation=DERIVED_LAYERS_SHOW,
         name="derived_layers_show",
         description=(
             "One managed derived relation in full: its recipe, source"
@@ -2033,29 +2090,17 @@ def build_runtime(
         ),
     )
     def derived_layers_show(name: str) -> dict:
-        """One entry from the same read.
-
-        There is no per-name route -- the configuration API serves the set and
-        the CLI filters client-side -- so this does the same, for the same
-        reason `layers_get` does: a bounded answer matters more to a model than
-        to a terminal.
-        """
-        payload = spend(
-            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
-        )
-        entries = payload.get("derivedLayers")
-        entries = entries if isinstance(entries, list) else []
-        for entry in entries:
-            if isinstance(entry, dict) and entry.get("name") == name:
-                return entry
-        known = [
-            entry.get("name") for entry in entries
-            if isinstance(entry, dict) and entry.get("name")
-        ]
-        raise ToolError(
-            f"No derived layer {name!r} on this instance."
-            + (f" Managed relations: {', '.join(sorted(known))}." if known else "")
-        )
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", name):
+            raise ToolError("Invalid derived-layer name.")
+        path = DERIVED_LAYERS_SHOW["path_template"].replace("{name}", name)
+        query = "definition=true" if name in {"drafts", "capabilities"} else ""
+        entry = spend(DERIVED_LAYERS_SHOW, path=path, query=query).get("derivedLayer")
+        if (
+            not isinstance(entry, dict) or entry.get("name") != name
+            or entry.get("kind") not in ("view", "materialized") or not isinstance(entry.get("query"), str)
+        ):
+            raise ToolError(f"Could not read the stored definition for {name!r}.")
+        return entry
 
     @tool(
         operation=DERIVED_LAYERS_PLAN,
@@ -2114,7 +2159,7 @@ def build_runtime(
             " derived_layers_plan so the create is refused if the sources"
             " moved since you looked. This writes to the database directly --"
             " there is no proposal and no review queue for creation. Background"
-            " execution is the default; poll operations_show. By default"
+            " execution requires derive to poll operations_show. Set background=false for foreground execution. By default"
             " the relation persists. Optional draft or"
             " draft_expires_in_hours explicitly"
             " authorizes automatic cleanup after proposal decline or expiry;"
@@ -2144,6 +2189,7 @@ def build_runtime(
         query, the sources, the columns -- because there is nothing else for
         the person to read.
         """
+        _require_derived_polling(background)
         body = _derived_definition(
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
@@ -2204,13 +2250,11 @@ def build_runtime(
         operation=DERIVED_LAYERS_REPLACE,
         name="derived_layers_replace",
         description=(
-            "Replace an existing derived relation's definition. Asks you to"
-            " approve first, showing what it is today and what it would"
-            " become. Anything reading the relation sees the new definition"
-            " once this completes. Background execution is the default; poll"
-            " operations_show. Set kind='materialized' to materialize an existing"
-            " view, or kind='view' to convert back, retaining its inspected SQL"
-            " and columns. Dependency and resource guards still apply."
+            "Replace an existing derived relation's definition. The approval packet"
+            " shows SQL excerpts and known consumers. On commit, published maps can"
+            " show changed values or fail on removed fields. Set kind='materialized'"
+            " or kind='view' to convert. Dependency and resource guards apply."
+            " Default background execution requires derive to poll operations_show. Set background=false to run in the foreground."
         ),
     )
     async def derived_layers_replace(
@@ -2224,40 +2268,52 @@ def build_runtime(
         description: str | None = None,
         background: bool = True,
     ) -> dict:
-        """Replacing is the quiet one, and the packet is why.
-
-        A drop announces itself: the platform refuses it while anything reads
-        the relation. A replace does not -- every layer reading it keeps
-        working and starts returning different numbers. So the packet carries
-        the current definition beside the proposed one, and the dependents,
-        because "what reads this" is the question a person should be asked
-        here and is not asked by the operation itself.
-        """
-        current = await io_call(_derived_entry, name)
+        """Review the inspected definition and known consumers before replacement."""
+        _require_derived_polling(background)
+        if kind is not None and kind not in ("view", "materialized"):
+            raise ToolError("Replacement kind must be view or materialized.")
+        current = await io_call(derived_layers_show, name)
         body = _derived_definition(
             name=name, query=query, sources=sources,
             id_column=id_column, geometry_column=geometry_column,
-            kind=kind or current.get("kind"), description=description,
+            kind=kind or current.get("kind"),
+            description=current.get("description") if description is None else description,
         )
+        stored_scope = current.get("spatialScope") or {}
+        locale = stored_scope.get("locale")
+        body["spatialScope"] = {"type": "workspace-map-extent"}
+        if locale:
+            body["spatialScope"]["locale"] = locale
         body["confirmed"] = True
         if background is not None:
             body["background"] = background
         dependents = await io_call(_derived_dependents, name)
+        was, becomes = _sql_review(current["query"], query)
+        note = (
+            "On commit, published maps can immediately read changed values or fail on removed fields, "
+            "before any workspace save. Database dependencies can block replacement. "
+            "Coverage is partial: these are known configured references. External consumers "
+            "and unavailable dependency metadata may be missing."
+        )
+        for group, names in dependents.items():
+            if len(names) > 12 or any(len(value) > 96 for value in names):
+                note += f" Showing up to 12 of {len(names)} {group} names, each up to 96 characters."
+            dependents[group] = [value if len(value) <= 96 else value[:95] + "…" for value in names[:12]]
+        if was != current["query"] or becomes != query:
+            if current["query"] != query:
+                note += " SQL excerpts show the first and last differences. Ellipses mark omitted text."
+            else:
+                note += " SQL is unchanged. The excerpts show part of the definition."
         packet = {
             "summary": f"Replace the definition of {name}.",
             "changeCount": 1,
             "changes": [{
                 "op": "replace", "path": f"derived_layers.{name}",
-                "was": _change_preview(current.get("query")),
-                "becomes": _change_preview(query),
+                "was": was,
+                "becomes": becomes,
             }],
             "dependents": dependents,
-            "note": (
-                "Everything listed under dependents keeps working and starts"
-                " returning different numbers."
-                if dependents["workspaceLayers"] or dependents["derivedLayers"]
-                else "Nothing else reads this relation."
-            ),
+            "note": note,
         }
         if body["kind"] != current.get("kind"):
             packet["summary"] = f"Convert {name} from {current.get('kind')} to {body['kind']}."
@@ -2266,11 +2322,35 @@ def build_runtime(
                 "was": current.get("kind"), "becomes": body["kind"],
             })
             packet["changeCount"] = len(packet["changes"])
-            packet["note"] = (
-                "Materialized relations store a snapshot and require explicit refresh. "
+            packet["note"] += (
+                " Materialized relations store a snapshot and require explicit refresh. "
                 "Ordinary views recompute on read. Database dependencies and the "
                 "normal query, storage and lifecycle guards can block conversion."
             )
+        packet["note"] += (
+            f" The server resolves the current map extent of {locale or 'the default locale'}"
+            " for the replacement."
+        )
+        prior_area = "No stored map extent"
+        if stored_scope:
+            prior_area = f"{locale or 'default locale'}: " + json.dumps(stored_scope.get("envelopes") or [])
+        packet["changes"].append({
+            "op": "review", "path": f"derived_layers.{name}.spatialScope",
+            "was": prior_area, "becomes": f"Current workspace map extent for {locale or 'default locale'}",
+        })
+        for key in ("idColumn", "geometryColumn", "sources", "description"):
+            before = current.get(key)
+            after = body.get(key)
+            if before == after:
+                continue
+            if key == "sources":
+                before, after = json.dumps(before or []), json.dumps(after or [])
+            before, after = _sql_review(before or "", after or "")
+            packet["changes"].append({
+                "op": "replace", "path": f"derived_layers.{name}.{key}",
+                "was": before, "becomes": after,
+            })
+        packet["changeCount"] = len(packet["changes"])
         target = DERIVED_LAYERS_REPLACE["path_template"].replace(
             "{name}", quote(name, safe="")
         )
@@ -2288,8 +2368,8 @@ def build_runtime(
         description=(
             "Recompute a materialised derived relation from its sources. The"
             " definition does not change; the numbers do. Asks you to approve"
-            " first. Background execution is the default; follow it with"
-            " operations_show."
+            " first. Default background execution requires derive to poll"
+            " operations_show. Set background=false to run in the foreground."
         ),
     )
     async def derived_layers_refresh(
@@ -2302,7 +2382,8 @@ def build_runtime(
         again, and an agent that could fire it unattended would be a way to
         spend the database's time.
         """
-        current = await io_call(_derived_entry, name)
+        _require_derived_polling(background)
+        current = await io_call(derived_layers_show, name)
         body = {"confirmed": True}
         if background is not None:
             body["background"] = background
@@ -2351,7 +2432,7 @@ def build_runtime(
         The platform refuses an in-use drop on its own; this does not rely on
         that, and the platform does not rely on this. Both, on purpose.
         """
-        current = await io_call(_derived_entry, name)
+        current = await io_call(derived_layers_show, name)
         dependents = await io_call(_derived_dependents, name)
         blocking = dependents["workspaceLayers"] + dependents["derivedLayers"]
         if blocking:
@@ -2435,29 +2516,6 @@ def build_runtime(
             }
         return body
 
-    def _derived_entry(name):
-        """The relation as it stands, so a change can be described against it.
-
-        Read rather than assumed. A packet that described the proposed state
-        alone would ask somebody to approve a change without showing them what
-        is being changed.
-        """
-        payload = spend(
-            DERIVED_LAYERS_LIST, path=DERIVED_LAYERS_LIST["path_template"]
-        )
-        entries = payload.get("derivedLayers")
-        for entry in entries if isinstance(entries, list) else []:
-            if isinstance(entry, dict) and entry.get("name") == name:
-                return entry
-        known = sorted(
-            entry.get("name") for entry in entries
-            if isinstance(entry, dict) and entry.get("name")
-        ) if isinstance(entries, list) else []
-        raise ToolError(
-            f"No derived layer {name!r} on this instance."
-            + (f" Managed relations: {', '.join(known)}." if known else "")
-        )
-
     def _derived_dependents(name):
         """What else reads this relation, from the platform's own graph.
 
@@ -2470,17 +2528,13 @@ def build_runtime(
         )
         rows = payload.get("dependencies")
         relation = f"derived_layers.{name}"
-        workspace_layers: list = []
-        derived_layers: list = []
+        workspace_layers = set()
+        derived_layers = set()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or row.get("relation") != relation:
                 continue
-            for found in row.get("workspaceLayers") or []:
-                if found not in workspace_layers:
-                    workspace_layers.append(found)
-            for found in row.get("derivedLayers") or []:
-                if found not in derived_layers:
-                    derived_layers.append(found)
+            workspace_layers.update(row.get("workspaceLayers") or [])
+            derived_layers.update(row.get("derivedLayers") or [])
         return {
             "workspaceLayers": sorted(workspace_layers),
             "derivedLayers": sorted(derived_layers),
@@ -3551,10 +3605,37 @@ def build_runtime(
             detail["databasePhase"] = diagnostics["databasePhase"][:100]
         derived = result.get("derivedLayer")
         if isinstance(derived, dict):
-            detail["result"]["derivedLayer"] = {
+            summary = {
                 key: derived[key] for key in ("name", "kind", "semanticProfile", "draft")
                 if key in derived
             }
+            omitted = {}
+
+            def impact_items(key, items):
+                if len(items) > 32:
+                    omitted[key] = len(items) - 32
+                return items[:32]
+
+            if isinstance(derived.get("columnChanges"), dict):
+                summary["columnChanges"] = {
+                    key: impact_items(key, derived["columnChanges"][key])
+                    for key in ("added", "removed", "changed")
+                    if isinstance(derived["columnChanges"].get(key), list)
+                }
+            for key in ("consumerLabels", "workspaceReferences"):
+                if isinstance(derived.get(key), list):
+                    summary[key] = [_change_preview(value) for value in impact_items(key, derived[key])]
+            if isinstance(derived.get("fieldReferences"), list):
+                summary["fieldReferences"] = [
+                    {key: _change_preview(row[key]) for key in ("path", "column", "consumer", "usage", "label")
+                     if key in row}
+                    for row in impact_items("fieldReferences", derived["fieldReferences"])
+                ]
+            if "requiresSecondOrderChanges" in derived:
+                summary["requiresSecondOrderChanges"] = derived["requiresSecondOrderChanges"]
+            if omitted:
+                summary["omittedCounts"] = omitted
+            detail["result"]["derivedLayer"] = summary
         if error:
             detail["error"] = {
                 **_failure_diagnostics(error),
@@ -4018,12 +4099,15 @@ def build_runtime(
         operation=SEMANTIC_CATALOG_LIST,
         name="semantic_catalog_list",
         description=(
-            "Every catalogued semantic asset: what the platform records about"
-            " what its data means. An index of identifier, name and summary;"
-            " semantic_catalog_show returns one asset's full meaning."
+            "A page of visible semantic assets with identifiers, names and summaries."
+            " Pass pagination.nextCursor to continue. semantic_catalog_show returns"
+            " one asset's full meaning."
         ),
     )
-    def semantic_catalog_list() -> dict:
+    def semantic_catalog_list(
+        limit: Annotated[int, Field(ge=1, le=100)] = 100,
+        cursor: Annotated[str, Field(max_length=2200)] | None = None,
+    ) -> dict:
         """What is described, as opposed to what exists.
 
         `layers_list` and `catalog_list` answer what the platform holds and what
@@ -4031,12 +4115,16 @@ def build_runtime(
         difference between an agent that can query a column and one that knows
         whether the column is worth querying.
         """
+        query = limit_query(limit=limit)
+        if cursor is not None:
+            query += "&cursor=" + quote(cursor, safe="")
         payload = spend(
-            SEMANTIC_CATALOG_LIST, path=SEMANTIC_CATALOG_LIST["path_template"]
+            SEMANTIC_CATALOG_LIST, path=SEMANTIC_CATALOG_LIST["path_template"], query=query,
         )
         assets = payload.get("assets")
         return {
             "catalogRevision": payload.get("catalogRevision"),
+            "pagination": payload.get("pagination"),
             "assets": [
                 _asset_summary(asset)
                 for asset in (assets if isinstance(assets, list) else [])

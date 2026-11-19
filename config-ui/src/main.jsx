@@ -33,6 +33,7 @@ import {
 } from './api.js';
 import {SemanticCatalog} from './semantic.jsx';
 import {FederatedSources} from './federation.jsx';
+import {enqueueReplacement, ReplacementOffer} from './replacement-offer.jsx';
 
 let csrfToken=sessionStorage.getItem('mapp-csrf')||'';
 const AUTH_REQUIRED_EVENT='mapp-auth-required';
@@ -124,11 +125,14 @@ function InfoLabel({label,help,generated=false}) { const text=help||HELP[label]|
 function Field({label,help,value,onChange,onBlur,type='text',options,min,max,step,readOnly,disabled=false,generated=false}) { return <label className={disabled?'field-disabled':''}><InfoLabel label={label} help={help} generated={generated}/>{options?<select aria-label={label} disabled={disabled} value={value??''} onChange={e=>onChange(e.target.value)} onBlur={onBlur}>{!options.includes(value)&&<option>{value}</option>}{options.map(x=><option key={x}>{x}</option>)}</select>:<input aria-label={label} disabled={disabled} type={type} value={value??''} min={min} max={max} step={step} readOnly={readOnly} onBlur={onBlur} onChange={e=>onChange(type==='number'?(e.target.value===''?'':Number(e.target.value)):e.target.value)}/>}</label> }
 function JsonObjectEditor({label,value,onChange,disabled=false,help}){const serialized=JSON.stringify(value||{},null,2),[draft,setDraft]=useState(serialized),[error,setError]=useState('');useEffect(()=>{setDraft(serialized);setError('')},[serialized]);const edit=text=>{setDraft(text);try{const parsed=JSON.parse(text);if(!parsed||Array.isArray(parsed)||typeof parsed!=='object')throw new Error('Enter a JSON object.');setError('');onChange(parsed)}catch(err){setError(err.message)}};return <label className={`full expression-editor ${disabled?'field-disabled':''}`}><InfoLabel label={label} help={help}/><textarea disabled={disabled} rows="9" spellCheck="false" value={draft} onChange={event=>edit(event.target.value)}/>{error&&<small className="validation-hint">{error}</small>}</label>}
 function Check({label,help,value,onChange,disabled=false}) { return <label className={`check ${disabled?'field-disabled':''}`}><input disabled={disabled} type="checkbox" checked={!!value} onChange={e=>onChange(e.target.checked)}/><span className="check-content"><InfoLabel label={label} help={help}/></span></label> }
+const IconCatalog=React.createContext(null);
+const ReportReplacement=React.createContext(result=>window.dispatchEvent(new CustomEvent('mapp-derived-layer-changed',{detail:result})));
 function SvgPicker({icons,value,onChange}) {
+ const discovery=React.useContext(IconCatalog);
  const [open,setOpen]=useState(false),[query,setQuery]=useState(''),selected=icons.find(icon=>icon.url===value);
  const matches=icons.filter(icon=>`${icon.name} ${icon.filename}`.toLowerCase().includes(query.trim().toLowerCase()));
  const choose=icon=>{onChange(icon.url);setQuery('');setOpen(false)};
- return <label className="svg-picker"><InfoLabel label="SVG icon"/><button type="button" className="svg-picker-trigger" aria-haspopup="listbox" aria-expanded={open} onClick={()=>setOpen(!open)}>{selected?<><img src={selected.url} alt=""/><span><strong>{selected.name}</strong><small>{selected.filename}</small></span></>:<span className="svg-placeholder">Choose an SVG icon</span>}<span className="svg-chevron">⌄</span></button>{open&&<div className="svg-picker-menu"><input autoFocus type="search" value={query} placeholder="Search SVG icons…" onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==='Escape')setOpen(false);if(event.key==='Enter'&&matches[0]){event.preventDefault();choose(matches[0])}}}/><div className="svg-picker-options" role="listbox">{matches.map(icon=><button type="button" role="option" aria-selected={icon.url===value} className={icon.url===value?'selected':''} key={icon.url} onClick={()=>choose(icon)}><img src={icon.url} alt=""/><span><strong>{icon.name}</strong><small>{icon.filename}</small></span>{icon.url===value&&<span className="svg-check">✓</span>}</button>)}{matches.length===0&&<p>No matching SVG icons.</p>}</div></div>}</label>
+ return <label className="svg-picker"><InfoLabel label="SVG icon"/><button type="button" className="svg-picker-trigger" aria-haspopup="listbox" aria-expanded={open} onClick={()=>setOpen(!open)}>{selected?<><img src={selected.url} alt=""/><span><strong>{selected.name}</strong><small>{selected.filename}</small></span></>:<span className="svg-placeholder">Choose an SVG icon</span>}<span className="svg-chevron">⌄</span></button>{open&&<div className="svg-picker-menu"><input autoFocus type="search" value={query} placeholder="Search SVG icons…" onChange={event=>setQuery(event.target.value)} onKeyDown={event=>{if(event.key==='Escape')setOpen(false);if(event.key==='Enter'&&matches[0]){event.preventDefault();choose(matches[0])}}}/><div className="svg-picker-options" role="listbox">{matches.map(icon=><button type="button" role="option" aria-selected={icon.url===value} className={icon.url===value?'selected':''} key={icon.url} onClick={()=>choose(icon)}><img src={icon.url} alt=""/><span><strong>{icon.name}</strong><small>{icon.filename}</small></span>{icon.url===value&&<span className="svg-check">✓</span>}</button>)}{matches.length===0&&<p>{discovery?.error?'No matching icons in the available list.':discovery?.loading&&!discovery.data?'Loading SVG icons…':icons.length?'No matching SVG icons.':'No SVG icons were found.'}</p>}</div></div>}</label>
 }
 const ICON_TYPES=['dot','target','triangle','square','diamond','semiCircle','circle','markerLetter','markerColor','Custom SVG'];
 const INFO_TYPES=['text','textarea','html','link','numeric','integer','boolean','date','datetime','time','json','dataview','pills','image','images','documents','geometry','pin'];
@@ -145,38 +149,63 @@ const FILTER_OPTIONS_BY_INFO_TYPE={
 };
 const filterOptionsFor=entry=>entry?.fieldfx?['None']:FILTER_OPTIONS_BY_INFO_TYPE[entry?.type||'text']||['None'];
 const infoTypeForColumn=column=>/int/.test(column?.type||'')?'integer':/numeric|double|real|decimal/.test(column?.type||'')?'numeric':/bool/.test(column?.type||'')?'boolean':/timestamp/.test(column?.type||'')?'datetime':column?.type==='date'?'date':'text';
-const inferGeometry=(table,format='mvt')=>table?.columns.find(column=>column.geometryType&&(format!=='mvt'||column.srid===3857))||table?.columns.find(column=>column.geometryType);
-const inferId=table=>table?.columns.find(column=>column.primaryKey)||table?.columns.find(column=>column.unique&&!column.nullable)||table?.columns.find(column=>!column.geometryType&&!column.nullable&&/^(id|object_id|objectid|gid|fid|key|.*_id)$/i.test(column.name))||table?.columns.find(column=>!column.geometryType&&!column.nullable)||table?.columns.find(column=>!column.geometryType);
+const inferGeometry=(table,format='mvt')=>table?.columns.find(column=>column.geometryType&&(format!=='mvt'||Number(column.srid)===3857))||table?.columns.find(column=>column.geometryType);
+const inferId=table=>table?.columns.find(column=>!column.geometryType&&column.primaryKey)||table?.columns.find(column=>!column.geometryType&&column.unique&&!column.nullable)||table?.columns.find(column=>!column.geometryType&&!column.nullable&&/^(id|object_id|objectid|gid|fid|key|.*_id)$/i.test(column.name))||table?.columns.find(column=>!column.geometryType&&!column.nullable)||table?.columns.find(column=>!column.geometryType);
 const standardInfoEntries=geom=>[{type:'geometry',display:true,field:geom,fieldfx:`ST_asGeoJSON(${geom})`},{type:'pin',label:'Location',display:true,field:'pin',fieldfx:`ARRAY[ST_X(ST_PointOnSurface(${geom})),ST_Y(ST_PointOnSurface(${geom}))]`}];
 const generatedLayer=(table,format='mvt')=>{const geom=inferGeometry(table,format),id=inferId(table);return{geom,id}};
 const layerKeyBase=name=>String(name||'Layer').normalize('NFKD').replace(/[^A-Za-z0-9\s_]/g,'').trim().replace(/\s+/g,'_')||'Layer';
 const uniqueLayerKey=(name,occupied,current)=>{const base=layerKeyBase(name);if(base===current||!occupied.has(base))return base;let suffix=1;while(occupied.has(`${base}_${suffix}`)&&`${base}_${suffix}`!==current)suffix++;return`${base}_${suffix}`};
-export function reconcileDerivedWorkspace(workspace,derived,tables){
- const changes=derived?.columnChanges||{},added=new Set(changes.added||[]),removed=new Set(changes.removed||[]),affected=new Set([...(changes.removed||[]),...(changes.changed||[])]),relation=`derived_layers.${derived?.name}`,table=tables.find(item=>`${item.schema}.${item.table}`===relation),columns=new Map((table?.columns||[]).map(column=>[column.name,column])),summary={layers:0,added:0,removed:0};
- if(!derived?.name||(!added.size&&!removed.size))return{workspace,summary};
- const next=clone(workspace),locales=[next.locale,...Object.values(next.locales||{})].filter(Boolean);
- for(const locale of locales)for(const layer of Object.values(locale.layers||{})){
-  if(layer?.table!==relation)continue;
-  summary.layers++;
-  const existing=layer.infoj||[],kept=[];
-  for(const entry of existing){
-   if(entry&&removed.has(entry.field)&&!entry.fieldfx){summary.removed++;continue}
-   kept.push(entry);
+export function reconcileDerivedWorkspace(workspace,derived,columns,baseline=workspace){
+ const {added,removed,changed}=derived.columnChanges;
+ const relation=`derived_layers.${derived.name}`,byName=new Map(columns.map(column=>[column.name,column]));
+ const affected=new Set([...removed,...changed]),next=clone(workspace);
+ const summary={layers:0,added:0,removed:0,skipped:[],localeConflicts:[]};
+ const namedLocales=renderedLocales(workspace).filter(([name])=>name!=='locale');
+ // Named locales inherit default edits. Their raw overrides require focused review.
+ for(const [key,layer] of Object.entries(next.locale?.layers||{})){
+  if(layer?.table!==relation||Object.keys(layer.tables||{}).length)continue;
+  const original=workspace.locale.layers[key];
+  if(JSON.stringify(original)!==JSON.stringify(baseline?.locale?.layers?.[key])){
+   summary.skipped.push(key);continue;
   }
-  const fields=new Set(kept.map(entry=>entry?.field).filter(Boolean));
+  const conflicts=namedLocales.filter(([,locale])=>{
+   const effective=locale.layers?.[key];
+   return effective&&(effective.table!==relation||Object.keys(effective.tables||{}).length||
+    (effective.dbs||workspace.dbs)!==(layer.dbs||workspace.dbs));
+  });
+  if(conflicts.length){
+   summary.localeConflicts.push(...conflicts.map(([name])=>name+':'+key));continue;
+  }
+  const kept=(layer.infoj||[]).filter(entry=>entry?.fieldfx||!removed.includes(entry?.field));
+  summary.removed+=(layer.infoj||[]).length-kept.length;
   for(const name of added){
-   const column=columns.get(name);
-   if(!column||column.geometryType||name===layer.qID||fields.has(name))continue;
+   const column=byName.get(name);
+   if(!column||column.geometryType||name===layer.qID||name===derived.idColumn||kept.some(entry=>entry?.field===name))continue;
+   const fieldConflicts=namedLocales.filter(([,locale])=>(locale.layers?.[key]?.infoj||[]).some(entry=>entry?.field===name));
+   if(fieldConflicts.length){
+    for(const [localeName] of fieldConflicts){
+     const conflict=localeName+':'+key;
+     if(!summary.localeConflicts.includes(conflict))summary.localeConflicts.push(conflict);
+    }
+    continue;
+   }
    kept.push({type:infoTypeForColumn(column),title:title(name),field:name,inline:true,display:true,_dashboard:{catalogField:true}});
-   fields.add(name);summary.added++;
+   summary.added++;
   }
-  layer.infoj=kept;
-  if(layer.filter&&typeof layer.filter==='object')for(const key of ['include','exclude'])if(Array.isArray(layer.filter[key]))layer.filter[key]=layer.filter[key].filter(field=>!removed.has(field));
-  if(layer.style?.hover&&typeof layer.style.hover==='object'&&removed.has(layer.style.hover.field))delete layer.style.hover;
-  const style=layer.style||{},theme=typeof style.theme==='string'?style.themes?.[style.theme]:style.theme,themeFields=theme&&typeof theme==='object'?[theme.field,...(theme.fields||[]),...(theme.categories||[]).map(category=>category?.field)].filter(Boolean):[],inspect=[...new Set(themeFields.filter(field=>affected.has(field)))];
-  if(inspect.length)layer._dashboard={...(layer._dashboard||{}),symbologyInspection:{fields:inspect,reason:'derived_schema_changed',relation}};
+  if(layer.infoj||kept.length)layer.infoj=kept;
+  for(const list of ['include','exclude'])if(Array.isArray(layer.filter?.[list]))layer.filter[list]=layer.filter[list].filter(field=>!removed.includes(field));
+  if(removed.includes(layer.style?.hover?.field))delete layer.style.hover;
+  const {theme}=effectiveTheme(layer.style||{});
+  const fields=[theme?.field,...(theme?.fields||[]),...(theme?.categories||[]).map(category=>category?.field)];
+  const inspect=[...new Set(fields.filter(field=>affected.has(field)))];
+  if(inspect.length){
+   const previous=layer._dashboard?.symbologyInspection;
+   const priorFields=previous?.relation===relation?previous.fields||[]:[];
+   layer._dashboard={...layer._dashboard,symbologyInspection:{fields:[...new Set([...priorFields,...inspect])],reason:'derived_schema_changed',relation}};
+  }
+  if(JSON.stringify(original)!==JSON.stringify(layer))summary.layers++;
  }
- return{workspace:next,summary};
+ return {workspace:summary.layers?next:workspace,summary};
 }
 function layerCatalogTable(layer,catalog,workspaceDb){
  const relations=[...new Set([layer?.table,...Object.values(layer?.tables||{})].filter(value=>typeof value==='string'&&value))];
@@ -320,20 +349,96 @@ function PrimaryNavigation({children}){
  return <nav ref={ref} className="primary-nav" aria-label="Platform areas">{children}</nav>;
 }
 
+function useDiscovery(path, collection) {
+ const [state,setState]=useState({data:null,loading:true,error:'',lastSuccess:null});
+ const request=useRef(0),pending=useRef(false);
+ const refresh=async()=>{
+  if(pending.current)return;
+  pending.current=true;
+  const id=++request.current;
+  setState(old=>({...old,loading:true}));
+  try{
+   const data=await api(path);
+   if(!Array.isArray(data[collection]))throw new Error('Invalid discovery response.');
+   if(request.current===id)setState({data,loading:false,error:'',lastSuccess:new Date()});
+  }catch(error){
+   if(request.current===id)setState(old=>({...old,loading:false,error:error.status?`Request failed (HTTP ${error.status}).`:'Discovery is unavailable.'}));
+  }finally{if(request.current===id)pending.current=false}
+ };
+ useEffect(()=>{
+  refresh();
+  const timer=setInterval(refresh,10000);
+  return()=>{clearInterval(timer);request.current++;pending.current=false};
+ },[path,collection]);
+ return {...state,refresh};
+}
+function IconDiscoveryNotice({discovery}){
+ if(!discovery.error)return null;
+ return <p role="status">SVG icon discovery failed. {discovery.data?'Showing the last successful icon list. ':''}{discovery.error} <button type="button" disabled={discovery.loading} onClick={discovery.refresh}>Retry icon discovery</button></p>;
+}
 export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFederation,onLogout=()=>{},derivedChange=null,activeArea="workspace",openWorkspace=()=>{},children}){
- const [ws,setWs]=useState(null),[rev,setRev]=useState(),[catalog,setCatalog]=useState([]),[databases,setDatabases]=useState([]),[icons,setIcons]=useState([]),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[derivedUpdate,setDerivedUpdate]=useState(null);
+ const [ws,setWorkspace]=useState(null),[rev,setRev]=useState(),[pluginCatalogue,setPluginCatalogue]=useState(null),[selected,setSelected]=useState(),[selectedCatalog,setSelectedCatalog]=useState(),[selectedLocale,setSelectedLocale]=useState(),[dirty,setDirty]=useState(false),[activity,setActivity]=useState(null),[errors,setErrors]=useState([]),[status,setStatus]=useState(null),[search,setSearch]=useState(''),[catSearch,setCatSearch]=useState(''),[sidebarMode,setSidebarMode]=useState('layers'),[sidebarOpen,setSidebarOpen]=useState(false),[offers,setOffers]=useState([]);
  const [boundaryData,setBoundaryData]=useState(null);
  const activityRef=useRef(null),busy=activity!==null,saving=activity==='saving',reloading=activity==='reloading';
  const beginActivity=next=>{if(activityRef.current)return false;activityRef.current=next;setActivity(next);return true};
  const endActivity=completed=>{if(activityRef.current!==completed)return;activityRef.current=null;setActivity(null)};
  const localeOptions=renderedLocales(ws),fallbackLocale=activeLocale(ws),localeKey=localeOptions.some(([key])=>key===selectedLocale)?selectedLocale:fallbackLocale.key,loc=localeOptions.find(([key])=>key===localeKey)?.[1],layers=loc?.layers||{},namedReadOnly=localeKey!=='locale';
  const load=async(force=false)=>{if(activityRef.current||dirty&&!force&&!confirm('Discard unsaved changes?')||!beginActivity('loading'))return;if(!ws)setStatus(null);try{const x=await api('/api/workspace');setWs(x.workspace);setRev(x.revision);setSelectedLocale(activeLocale(x.workspace).key);setDirty(false);setSelected();setSelectedCatalog();setErrors([]);setStatus(null)}catch(e){const next=e.details||[{path:'server',message:e.message}];setErrors(next);setStatus({kind:'error',message:'Unable to load configuration.',errors:next})}finally{endActivity('loading')}};
- const poll=async()=>{try{const [data,iconData]=await Promise.all([api('/api/catalog'),api('/api/icons')]);setCatalog(data.tables);setDatabases(data.databases);setIcons(iconData.icons)}catch{}try{const pluginData=await api('/api/plugins');setPluginCatalogue(pluginData.plugins)}catch{}};
+ const tableDiscovery=useDiscovery('/api/catalog','tables'),iconDiscovery=useDiscovery('/api/icons','icons');
+ const catalog=tableDiscovery.data?.tables||[],databases=tableDiscovery.data?.databases||[],icons=iconDiscovery.data?.icons||[];
+ const poll=async()=>{try{const pluginData=await api('/api/plugins');setPluginCatalogue(pluginData.plugins)}catch{}};
  useEffect(()=>{load(true);poll();const id=setInterval(poll,10000);return()=>clearInterval(id)},[]);
- useEffect(()=>{const receive=event=>setDerivedUpdate({derivedLayer:event.detail,nonce:Date.now()});window.addEventListener('mapp-derived-layer-changed',receive);return()=>window.removeEventListener('mapp-derived-layer-changed',receive)},[]);
- const currentDerivedChange=derivedChange||derivedUpdate;
- useEffect(()=>{let active=true;setBoundaryData(null);if(ws)api(`/api/layers?locale=${encodeURIComponent(localeKey)}`).then(result=>{if(active)setBoundaryData(result)}).catch(()=>{});return()=>{active=false}},[localeKey,rev,derivedUpdate]);
- useEffect(()=>{if(!currentDerivedChange?.derivedLayer)return;let active=true;(async()=>{try{const data=await api('/api/catalog');if(!active)return;setCatalog(data.tables);setDatabases(data.databases);setWs(old=>{const reconciled=reconcileDerivedWorkspace(old,currentDerivedChange.derivedLayer,data.tables);if(reconciled.summary.layers){setDirty(true);setErrors([]);setStatus({kind:'pending',message:`Updated ${reconciled.summary.layers} workspace layer(s): ${reconciled.summary.added} field(s) added and ${reconciled.summary.removed} removed. Review, then save and reload XYZ.`})}return reconciled.workspace})}catch(e){if(active)setStatus({kind:'error',message:'The derived layer changed, but the workspace catalog could not be refreshed.',errors:[{path:'catalog',message:e.message}]})}})();return()=>{active=false}},[currentDerivedChange]);
+ const workspaceRef=useRef(null);
+ const setWs=next=>{
+  const value=typeof next==='function'?next(workspaceRef.current):next;
+  workspaceRef.current=value;setWorkspace(value);
+ };
+ const observedGenerations=useRef(new Map());
+ const receiveReplacement=(result,baseline=workspaceRef.current)=>{
+  const profile=result?.semanticProfile;
+  if(profile?.assetId&&Number.isInteger(profile.generation)){
+   const histories=observedGenerations.current;
+   const history=histories.get(profile.assetId)||{generations:new Set(),latest:null,manualGeneration:null};
+   if(history.generations.has(profile.generation))return;
+   history.generations.add(profile.generation);
+   const latest=history.latest;
+   if(latest&&latest.semanticProfile.generation>profile.generation){
+    history.manualGeneration=latest.semanticProfile.generation;
+    setOffers(current=>{
+     const open=current.find(offer=>offer.result.semanticProfile?.assetId===profile.assetId);
+     const review={...(open||{result:latest,baseline,firstGeneration:latest.semanticProfile.generation}),
+      gap:true,lateResults:[...(open?.lateResults||[]),result],checkVersion:(open?.checkVersion||0)+1};
+     return open?current.map(offer=>offer===open?review:offer):[...current,review];
+    });
+    return;
+   }
+   history.latest=result;
+   histories.set(profile.assetId,history);
+  }
+
+  setOffers(previous=>enqueueReplacement(previous,result,baseline));
+ };
+ useEffect(()=>{
+  const receive=event=>receiveReplacement(event.detail);
+  window.addEventListener('mapp-derived-layer-changed',receive);
+  return()=>window.removeEventListener('mapp-derived-layer-changed',receive);
+ },[]);
+ const workspaceLoaded=!!ws;
+ useEffect(()=>{if(workspaceLoaded&&derivedChange?.derivedLayer)receiveReplacement(derivedChange.derivedLayer)},[derivedChange,workspaceLoaded]);
+ useEffect(()=>{let active=true;setBoundaryData(null);if(ws)api(`/api/layers?locale=${encodeURIComponent(localeKey)}`).then(result=>{if(active)setBoundaryData(result)}).catch(()=>{});return()=>{active=false}},[localeKey,rev,offers]);
+ const dismissOffer=offer=>setOffers(current=>current.filter(item=>item!==offer));
+ const applyOffer=(offer,reviewedWorkspace,proposal)=>{
+  const {assetId,generation}=offer.result.semanticProfile;
+  const history=observedGenerations.current.get(assetId);
+  if(history?.latest.semanticProfile.generation!==generation||history.manualGeneration===generation)return;
+  if(activityRef.current||workspaceRef.current!==reviewedWorkspace){
+   setStatus({kind:'pending',message:'The editor changed during verification. Review the current suggestions again.'});
+   return;
+  }
+  setWs(proposal.workspace);setDirty(true);setErrors([]);
+  setStatus({kind:'pending',message:'Suggested edits are in the workspace editor. Review them before saving.'});
+  dismissOffer(offer);
+ };
  useEffect(()=>{const fn=e=>{if(dirty){e.preventDefault();e.returnValue=''}};addEventListener('beforeunload',fn);return()=>removeEventListener('beforeunload',fn)},[dirty]);
  const update=fn=>{if(activityRef.current)return;setWs(old=>{const x=clone(old);fn(x);return x});setDirty(true);setErrors([]);setStatus(null)};
  const mutateWorkspace=fn=>update(fn);
@@ -357,7 +462,7 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
    setStatus({kind:'error',message:'XYZ readiness could not be confirmed.',errors:next});
   }finally{endActivity('reloading')}
  };
- const addTable=t=>{if(namedReadOnly)return;const guessed=generatedLayer(t),geom=guessed.geom,id=guessed.id;if(!geom||!id)return;const kind=geometryKind({geom:geom.name},t),normal=kind==='point'?{icon:{type:'dot',fillColor:'#176b4d',scale:1}}:kind==='line'?{strokeColor:'#176b4d',strokeOpacity:1,strokeWidth:2}:{fillColor:'#176b4d',fillOpacity:.3,strokeColor:'#0f5138',strokeOpacity:1,strokeWidth:2},name=title(t.table),key=uniqueLayerKey(name,new Set(Object.keys(layers)));mutateLayers((x,l)=>l.layers[key]={name,display:true,format:'mvt',dbs:t.dbs,table:`${t.schema}.${t.table}`,geom:geom.name,srid:String(geom.srid),qID:id.name,_dashboard:{generated:{geom:true,qID:true,geometryInfo:true,pinInfo:true}},infoj:[...standardInfoEntries(geom.name),...t.columns.filter(c=>!c.geometryType).slice(0,8).map(c=>({type:/int/.test(c.type)?'integer':/numeric|double|real/.test(c.type)?'numeric':/bool/.test(c.type)?'boolean':'text',title:title(c.name),field:c.name,inline:true,display:true}))],style:{default:normal,highlight:kind==='point'?{highlightScale:1.4}:{strokeColor:'#e9b949',strokeWidth:3}}});setSelected(key);setSidebarMode('layers');setSidebarOpen(false)};
+ const addTable=t=>{if(namedReadOnly)return;const guessed=generatedLayer(t),geom=guessed.geom,id=guessed.id;if(!geom||Number(geom.srid)!==3857||!id)return;const kind=geometryKind({geom:geom.name},t),normal=kind==='point'?{icon:{type:'dot',fillColor:'#176b4d',scale:1}}:kind==='line'?{strokeColor:'#176b4d',strokeOpacity:1,strokeWidth:2}:{fillColor:'#176b4d',fillOpacity:.3,strokeColor:'#0f5138',strokeOpacity:1,strokeWidth:2},name=title(t.table),key=uniqueLayerKey(name,new Set(Object.keys(layers)));mutateLayers((x,l)=>l.layers[key]={name,display:true,format:'mvt',dbs:t.dbs,table:`${t.schema}.${t.table}`,geom:geom.name,srid:String(geom.srid),qID:id.name,_dashboard:{generated:{geom:true,qID:true,geometryInfo:true,pinInfo:true}},infoj:[...standardInfoEntries(geom.name),...t.columns.filter(c=>!c.geometryType).slice(0,8).map(c=>({type:/int/.test(c.type)?'integer':/numeric|double|real/.test(c.type)?'numeric':/bool/.test(c.type)?'boolean':'text',title:title(c.name),field:c.name,inline:true,display:true}))],style:{default:normal,highlight:kind==='point'?{highlightScale:1.4}:{strokeColor:'#e9b949',strokeWidth:3}}});setSelected(key);setSidebarMode('layers');setSidebarOpen(false)};
  if(!ws)return <div className="loading-shell" aria-live="polite" aria-atomic="true">{status?.kind==='error'?<div className="initial-load-error"><strong>{status.message}</strong>{status.errors?.length>0&&<ul>{status.errors.map((error,index)=><li key={index}>{error.path}: {error.message}</li>)}</ul>}<button disabled={busy} onClick={()=>load(true)}>Retry</button></div>:<p>Loading workspace…</p>}</div>;
  const layer=layers[selected],activityText=activity==='loading'?'Refreshing workspace…':activity==='validating'?'Validating…':saving?'Restarting XYZ…':reloading?'Reloading XYZ…':dirty?'Unsaved changes':'Saved';
  return <div className="app-shell">
@@ -385,10 +490,14 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
    </div>
   </header>
   <div className="status-region dashboard-status" aria-live="polite" aria-atomic="true">
+   {offers.length>0&&<div style={{maxHeight:'38vh',overflowY:'auto'}}>{offers.map(offer=><ReplacementOffer
+    key={JSON.stringify([offer.result.name,offer.result.semanticProfile?.assetId,offer.result.semanticProfile?.generation])}
+    api={api} offer={offer} workspace={ws} reconcile={reconcileDerivedWorkspace} busy={busy}
+    dismiss={()=>dismissOffer(offer)} apply={(current,proposal)=>applyOffer(offer,current,proposal)}/>)}</div>}
    {status&&<div className={`status-bar ${status.kind}`}><div><strong>{status.message}</strong>{status.errors?.length>0&&<ul>{status.errors.map((error,index)=><li key={index}>{error.path}: {error.message}</li>)}</ul>}</div><button aria-label="Dismiss status" onClick={()=>setStatus(null)}><X size={17} aria-hidden="true"/></button></div>}
   </div>
   <main className={`dashboard-main ${sidebarMode==='catalog'?'source-catalog-main':''}`} hidden={activeArea!=='workspace'} aria-busy={busy} inert={busy||activeArea!=='workspace'}>
-   {sidebarMode==='catalog'?<SourceCatalog catalog={catalog} selected={selectedCatalog} onSelect={setSelectedCatalog} search={catSearch} setSearch={setCatSearch} addTable={addTable} namedReadOnly={namedReadOnly} openDerivedLayers={openDerivedLayers}/>:<>
+   {sidebarMode==='catalog'?<SourceCatalog discovery={tableDiscovery} iconDiscovery={iconDiscovery} catalog={catalog} selected={selectedCatalog} onSelect={setSelectedCatalog} search={catSearch} setSearch={setCatSearch} addTable={addTable} namedReadOnly={namedReadOnly} openDerivedLayers={openDerivedLayers}/>:<>
    <button className={`sidebar-scrim ${sidebarOpen?'visible':''}`} aria-label="Close workspace navigator" onClick={()=>setSidebarOpen(false)}></button>
    <aside className={`workspace-sidebar ${sidebarOpen?'open':''}`}>
     <div className="sidebar-context"><span className="eyebrow">Workspace</span><h2>{loc?.name||ws.key}</h2><p>{Object.keys(layers).length} configured layers · {localeKey==='locale'?'Default locale':localeKey}</p></div>
@@ -410,29 +519,38 @@ export function Dashboard({openSecurity,openDerivedLayers,openSemantic,openFeder
       <button disabled={!dirty||busy} className="save-button" onClick={save}><Save size={17} aria-hidden="true"/>{saving?'Restarting XYZ…':'Save & reload XYZ'}</button>
      </div>
     </div>
-    <div className="editor-scroll">{layer&&<BoundaryReport report={JSON.stringify(boundaryData?.layers?.[selected])===JSON.stringify(layer)?boundaryData?.boundaryReports?.[selected]:null}/>}{namedReadOnly&&<div className="status-bar locale-readonly"><div><strong>Effective named locale — read-only in the dashboard.</strong><p>XYZ composes this view from the default locale and its raw named override. Use config-cli or the API for focused JSON Pointer edits without flattening inheritance.</p></div></div>}{layer?(namedReadOnly?<EffectiveLayer layerKey={selected} layer={layer} table={table}/>:<Layer workspace={ws} localeKey={localeKey} layerKey={selected} layer={layer} table={table} catalog={catalog} databases={databases} icons={icons} plugins={pluginCatalogue} workspaceDb={ws.dbs} setLayer={setLayer} renameLayer={renameLayer} remove={()=>{mutateLayers((x,l)=>delete l.layers[selected]);setSelected()}}/>):<Workspace ws={ws} loc={loc} databases={databases} plugins={pluginCatalogue} mutate={mutate} mutateWorkspace={mutateWorkspace} localeReadOnly={namedReadOnly}/>}</div>
+    <div className="editor-scroll">{layer&&<IconDiscoveryNotice discovery={iconDiscovery}/>}{layer&&<BoundaryReport report={JSON.stringify(boundaryData?.layers?.[selected])===JSON.stringify(layer)?boundaryData?.boundaryReports?.[selected]:null}/>}{namedReadOnly&&<div className="status-bar locale-readonly"><div><strong>Effective named locale — read-only in the dashboard.</strong><p>XYZ composes this view from the default locale and its raw named override. Use config-cli or the API for focused JSON Pointer edits without flattening inheritance.</p></div></div>}{layer?(namedReadOnly?<EffectiveLayer layerKey={selected} layer={layer} table={table}/>:<IconCatalog.Provider value={iconDiscovery}><Layer workspace={ws} localeKey={localeKey} layerKey={selected} layer={layer} table={table} catalog={catalog} databases={databases} icons={icons} plugins={pluginCatalogue} workspaceDb={ws.dbs} setLayer={setLayer} renameLayer={renameLayer} remove={()=>{mutateLayers((x,l)=>delete l.layers[selected]);setSelected()}}/></IconCatalog.Provider>):<Workspace ws={ws} loc={loc} databases={databases} plugins={pluginCatalogue} mutate={mutate} mutateWorkspace={mutateWorkspace} localeReadOnly={namedReadOnly}/>}</div>
    </section>
   </>}
   </main>
-  {children}
+  <ReportReplacement.Provider value={result=>receiveReplacement(result,ws)}>{children}</ReportReplacement.Provider>
  </div>
 }
-function SourceCatalog({catalog,selected,onSelect,search,setSearch,addTable,namedReadOnly,openDerivedLayers}){
+function SourceCatalog({discovery,iconDiscovery,catalog,selected,onSelect,search,setSearch,addTable,namedReadOnly,openDerivedLayers}){
  const [database,setDatabase]=useState(''),[sourceKind,setSourceKind]=useState('all');
  const visible=catalog.filter(table=>(!database||table.dbs===database)&&(sourceKind==='all'||(table.schema==='derived_layers')===(sourceKind==='derived'))&&`${table.dbs}.${table.schema}.${table.table}`.toLowerCase().includes(search.toLowerCase()));
  const table=catalog.find(item=>`${item.dbs}.${item.schema}.${item.table}`===selected);
- const spatial=table?.columns.some(column=>column.geometryType);
+ const {geom,id}=generatedLayer(table);
+ const unavailable=namedReadOnly?'Switch to the default locale to add a layer.':!geom?'A geometry column is required. Select a spatial relation.':Number(geom.srid)!==3857?'Adding a vector tile layer requires an EPSG:3857 geometry column. Select a relation with a projected geometry.':!id?'A feature ID column is required. Select a relation with a non-geometry identifier.':'';
  return <section className="source-catalog-page" aria-label="Source catalog">
-  <div className="form-head"><div><span className="eyebrow">Data sources</span><h1>Source catalog</h1><p>Find a relation, inspect its columns, then add it to your workspace.</p></div><span>{visible.length} of {catalog.length} tables</span></div>
+  <div className="form-head"><div><span className="eyebrow">Data sources</span><h1>Source catalog</h1><p>Find a relation, inspect its columns, then add it to your workspace.</p></div>{discovery.data&&<span>{visible.length} of {catalog.length} tables</span>}</div>
+  <div role="status">
+   {discovery.loading&&<p>{discovery.data?'Refreshing table catalog…':'Loading table catalog…'}</p>}
+   {discovery.error&&<p>Table discovery failed. {discovery.error} {discovery.lastSuccess&&<>Showing last successful table discovery from {discovery.lastSuccess.toLocaleTimeString()}.</>}</p>}
+   {discovery.lastSuccess&&!discovery.error&&<p>Last successful table discovery at {discovery.lastSuccess.toLocaleTimeString()}.</p>}
+   <button type="button" disabled={discovery.loading} onClick={discovery.refresh}>{discovery.error?'Retry':'Refresh'} table discovery</button>
+  </div>
+  <IconDiscoveryNotice discovery={iconDiscovery}/>
   <div className="catalog-toolbar">
    <SearchField label="Filter database tables" placeholder="Search database, schema or table" value={search} onChange={event=>setSearch(event.target.value)}/>
    <label><span>Database</span><select value={database} onChange={event=>setDatabase(event.target.value)}><option value="">All databases</option>{[...new Set(catalog.map(table=>table.dbs))].sort().map(name=><option key={name}>{name}</option>)}</select></label>
    <label><span>Relations</span><select value={sourceKind} onChange={event=>setSourceKind(event.target.value)}><option value="all">All relations</option><option value="source">Source relations</option><option value="derived">Derived relations</option></select></label>
   </div>
   <div className="catalog-browser">
-   <div className="catalog-list" aria-label="Database tables">{visible.map(item=>{const key=`${item.dbs}.${item.schema}.${item.table}`;return <button aria-pressed={selected===key} className={`catalog-item ${selected===key?'active':''}`} key={key} onClick={()=>onSelect(key)}><strong>{item.schema}.{item.table}</strong><small>{item.dbs} · {item.columns.length} columns · {item.columns.filter(column=>column.geometryType).map(column=>column.geometryType).join(', ')||'No geometry'}</small></button>})}{!visible.length&&<p>No relations match these filters.</p>}</div>
+   <div className="catalog-list" aria-label="Database tables">{visible.map(item=>{const key=`${item.dbs}.${item.schema}.${item.table}`;return <button aria-pressed={selected===key} className={`catalog-item ${selected===key?'active':''}`} key={key} onClick={()=>onSelect(key)}><strong>{item.schema}.{item.table}</strong><small>{item.dbs} · {item.columns.length} columns · {item.columns.filter(column=>column.geometryType).map(column=>column.geometryType).join(', ')||'No geometry'}</small></button>})}{!visible.length&&discovery.data&&!discovery.error&&<p>{catalog.length?'No relations match these filters.':'No readable spatial relations were found. Check the map reader’s access to the spatial relation, then refresh table discovery.'}</p>}</div>
    <section className="catalog-detail" aria-label="Selected source">{table?<>
-    <div className="form-head"><div><span className="eyebrow">{table.dbs}</span><h2>{table.schema}.{table.table}</h2></div><button disabled={namedReadOnly||!spatial} title={namedReadOnly?'Switch to the default locale to add a layer.':!spatial?'A geometry column is required.':undefined} onClick={()=>addTable(table)}>Add selected table as layer</button></div>
+    <div className="form-head"><div><span className="eyebrow">{table.dbs}</span><h2>{table.schema}.{table.table}</h2></div><button disabled={!!unavailable} title={unavailable||undefined} onClick={()=>addTable(table)}>Add selected table as layer</button></div>
+    {unavailable?<p>{unavailable}</p>:<p>Geometry: <code>{geom.name}</code>. Suggested feature ID: <code>{id.name}</code>. Check that this column identifies one feature.</p>}
     {table.schema==='derived_layers'&&<button onClick={()=>openDerivedLayers?.({name:table.table,action:'edit'})}>Edit derived definition</button>}
     <p className="muted">Column metadata only. Adding a layer creates an unsaved workspace edit.</p>
     <table className="source-columns"><thead><tr><th>Column</th><th>Type</th><th>Geometry / SRID</th></tr></thead><tbody>{table.columns.map(column=><tr key={column.name}><th scope="row">{column.name}</th><td>{column.type}</td><td>{column.geometryType?`${column.geometryType} · EPSG:${column.srid}`:'—'}</td></tr>)}</tbody></table>
@@ -629,10 +747,48 @@ export function derivedLayerFormDefinition(current){
   spatialScope:derivedSpatialScopeRequest(current),
  };
 }
-export function DerivedLayers({close,active=true,initialName=null,initialAction='create',initialRequestKey=0,onChanged=result=>window.dispatchEvent(new CustomEvent('mapp-derived-layer-changed',{detail:result}))}){
+function KnownConsumers({dependents}){
+ return <div><h4>Known consumers</h4>
+  <p>Coverage is partial. The platform checks configured workspace table and zoom references and declared managed sources. Other readers may exist.</p>
+  {[['workspaceLayers','Workspace layers'],['derivedLayers','Derived layers']].map(([key,label])=><div key={key}><strong>{label}</strong>{dependents[key]?.length?<ul>{dependents[key].map(name=><li key={name}>{name}</li>)}</ul>:<p>None reported in this read.</p>}</div>)}
+ </div>;
+}
+function ReplacementReview({review,busy,cancel,confirm}){
+ const {current,proposed,dependents}=review;
+ const panel=useRef(null);
+ useEffect(()=>{panel.current?.focus()},[review]);
+ const sqlStyle={whiteSpace:'pre-wrap',overflowWrap:'anywhere',maxHeight:'18rem',overflow:'auto'};
+ return <section aria-label="Review derived replacement" className="subpanel" tabIndex={-1} ref={panel}>
+  <h3>Replace derived_layers.{current.name} in place?</h3>
+  <p>Published maps can return different values or fail on their next database read as soon as this replacement commits, before any workspace save or reload. PostgreSQL can block the swap when a database object depends on the relation.</p>
+  <KnownConsumers dependents={dependents}/>
+  <p>Kind: {current.kind} → {proposed.kind}</p>
+  <dl>{[['Feature ID','idColumn'],['Geometry','geometryColumn'],['Source relations','sources'],['Description','description']].map(([label,key])=>{
+   const show=value=>Array.isArray(value)?value.join(', '):value||'None';
+   return <React.Fragment key={key}><dt>{label}</dt><dd>{show(current[key])} → {show(proposed[key])}</dd></React.Fragment>;
+  })}<dt>Map extent locale</dt><dd>{current.spatialScope?`${current.spatialScope.locale||'Default locale'} ${JSON.stringify(current.spatialScope.envelopes||[])}`:'No stored map extent'} → {proposed.spatialScope?.locale||'Default locale'}. The server resolves its current extent at replacement.</dd></dl>
+  <h4>Previous SQL</h4><pre style={sqlStyle}>{current.query}</pre>
+  <h4>Proposed SQL</h4><pre style={sqlStyle}>{proposed.query}</pre>
+  <button type="button" disabled={busy} onClick={cancel}>Back to definition</button>
+  <button type="button" disabled={busy} onClick={confirm}>Confirm in-place replacement</button>
+ </section>;
+}
+function readDerivedDefinition(name){
+ const query=name==='drafts'||name==='capabilities'?'?definition=true':'';
+ return api(`/api/derived-layers/${encodeURIComponent(name)}${query}`);
+}
+async function knownConsumers(name){
+ const {dependencies}=await api('/api/dependencies');
+ if(!Array.isArray(dependencies))throw new Error('Consumer information is unavailable. Retry the review.');
+ const matching=dependencies.filter(row=>row.relation===`derived_layers.${name}`);
+ return Object.fromEntries(['workspaceLayers','derivedLayers'].map(key=>[key,[...new Set(matching.flatMap(row=>row[key]))].sort()]));
+}
+export function DerivedLayers({close,active=true,initialName=null,initialAction='create',initialRequestKey=0,onChanged}){
+ const reportReplacement=React.useContext(ReportReplacement);
  const blank={name:'',kind:'view',sources:'',idColumn:'',geometryColumn:'',description:'',query:'',spatialScope:{type:'workspace-map-extent'}};
  const [items,setItems]=useState([]),[capabilities,setCapabilities]=useState(null),[definition,setDefinition]=useState(blank),[editing,setEditing]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
  const [draftStatus,setDraftStatus]=useState(null),[draftError,setDraftError]=useState(''),[derivedSearch,setDerivedSearch]=useState('');
+ const [review,setReview]=useState(null);
  useEffect(()=>{if(!active)return;let mounted=true;const refresh=async()=>{try{const data=await api('/api/derived-layers/drafts');if(mounted){setDraftStatus(data);setDraftError('')}}catch(error){if(mounted)setDraftError(error.message)}};refresh();const timer=setInterval(refresh,60000);return()=>{mounted=false;clearInterval(timer)}},[active]);
  const load=async()=>{setError('');try{const [list,caps]=await Promise.all([api('/api/derived-layers'),api('/api/derived-layers/capabilities')]);setItems(list.derivedLayers||[]);setCapabilities(caps)}catch(err){setError(err.message)}};
  useEffect(()=>{if(active)load()},[active]);
@@ -648,7 +804,7 @@ export function DerivedLayers({close,active=true,initialName=null,initialAction=
    return;
   }
   try{
-   const current=(await api(`/api/derived-layers/${item.name}`)).derivedLayer;
+   const current=(await readDerivedDefinition(item.name)).derivedLayer;
    setEditing(current.name);
    setDefinition({...derivedLayerFormDefinition(current),kind:'view'});
    setNotice(`Loaded derived_layers.${current.name} as an ordinary-view draft. Review it and select Save derived layer to convert it; the existing materialized layer is unchanged.`);
@@ -656,14 +812,44 @@ export function DerivedLayers({close,active=true,initialName=null,initialAction=
    setNotice(`The refresh was blocked and derived_layers.${item.name} is unchanged, but its conversion draft could not be loaded. Open Edit definition and choose view to review the conversion manually.`);
   }
  };
- const save=async event=>{event.preventDefault();setBusy(true);setError('');setNotice('Creating the database relation in the background. You can leave this request running while PostgreSQL completes it.');try{const replacing=!!editing,payload={...definition,sources:definition.sources.split(',').map(value=>value.trim()).filter(Boolean)},submitted=replacing?await api(`/api/derived-layers/${editing}/replace`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,confirmed:true,background:true})}):await api('/api/derived-layers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,background:true})}),response=await waitForOperation(submitted),result=response.derivedLayer;setNotice(derivedLayerSuccess(result));if(replacing){setDefinition(derivedLayerFormDefinition(result));setEditing(result.name);onChanged(result)}else{setDefinition(blank);setEditing(null)}await load()}catch(err){const operation=editing?'replace':'create';setNotice('');setError(derivedLayerError(err,operation));await offerView(err,{operation})}finally{setBusy(false)}};
- const edit=async item=>{setBusy(true);setError('');setNotice('');try{const current=(await api(`/api/derived-layers/${item.name}`)).derivedLayer;setEditing(item.name);setDefinition(derivedLayerFormDefinition(current))}catch(err){setError(err.message)}finally{setBusy(false)}};
+ const submit=async(payload,replacing)=>{
+  setBusy(true);setReview(null);setError('');setNotice('Submitting the database operation…');
+  try{
+   const path=replacing?`/api/derived-layers/${payload.name}/replace`:'/api/derived-layers';
+   const submitted=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,...(replacing?{confirmed:true}:{}),background:true})});
+   const result=(await waitForOperation(submitted)).derivedLayer;
+   setNotice(derivedLayerSuccess(result));
+   if(replacing){setDefinition(derivedLayerFormDefinition(result));setEditing(result.name);(onChanged||reportReplacement)(result)}
+   else{setDefinition(blank);setEditing(null)}
+   await load();
+  }catch(err){
+   const operation=replacing?'replace':'create';
+   setNotice('');setError(derivedLayerError(err,operation));await offerView(err,{operation});
+  }finally{setBusy(false)}
+ };
+ const reviewReplacement=async(name,form)=>{
+  setBusy(true);setReview(null);setNotice('');setError('');
+  try{
+   const [{derivedLayer:current},dependents]=await Promise.all([readDerivedDefinition(name),knownConsumers(name)]);
+   if(current?.name!==name||typeof current.query!=='string'||!current.query.trim())throw new Error('The previous definition could not be read. Retry the review.');
+   const proposedForm=form||{...derivedLayerFormDefinition(current),kind:current.kind==='materialized'?'view':'materialized'};
+   const proposed={...proposedForm,sources:proposedForm.sources.split(',').map(value=>value.trim()).filter(Boolean)};
+   setEditing(name);setDefinition(proposedForm);setReview({current,proposed,dependents});
+  }catch(err){setError(`Unable to review replacement. ${err.message}`)}finally{setBusy(false)}
+ };
+ const save=event=>{
+  event.preventDefault();
+  if(busy||review)return;
+  if(editing){reviewReplacement(editing,definition);return}
+  submit({...definition,sources:definition.sources.split(',').map(value=>value.trim()).filter(Boolean)},false);
+ };
+ const edit=async item=>{setReview(null);setBusy(true);setError('');setNotice('');try{const current=(await readDerivedDefinition(item.name)).derivedLayer;setEditing(item.name);setDefinition(derivedLayerFormDefinition(current))}catch(err){setError(err.message)}finally{setBusy(false)}};
  const action=async(item,name)=>{if(!window.confirm(`${title(name)} derived_layers.${item.name}?`))return;setBusy(true);setError('');setNotice('');try{const submitted=await api(`/api/derived-layers/${item.name}/${name}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,...(name==='refresh'?{background:true}:{})})}),response=await waitForOperation(submitted);if(name==='refresh')setNotice(derivedLayerSuccess(response.derivedLayer));if(name==='drop'){setEditing(null);setDefinition(blank)}await load()}catch(err){setError(derivedLayerError(err,name));await offerView(err,{operation:name,item})}finally{setBusy(false)}};
- const convert=async item=>{const kind=item.kind==='materialized'?'view':'materialized';if(!window.confirm(`Atomically convert derived_layers.${item.name} to ${kind}? The conversion will be blocked if another PostgreSQL object depends on it.`))return;setBusy(true);setError('');setNotice('');let current;try{current=(await api(`/api/derived-layers/${item.name}`)).derivedLayer;const payload={name:current.name,kind,query:current.query,sources:current.sources,idColumn:current.idColumn,geometryColumn:current.geometryColumn,description:current.description||'',spatialScope:derivedSpatialScopeRequest(current),confirmed:true,background:true},submitted=await api(`/api/derived-layers/${item.name}/replace`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=(await waitForOperation(submitted)).derivedLayer;setEditing(result.name);setDefinition(derivedLayerFormDefinition(result));setNotice(derivedLayerSuccess(result));onChanged(result);await load()}catch(err){if(current&&err.payload?.code==='derived_layer.materialization_too_large'){setDefinition({...derivedLayerFormDefinition(current),kind});setEditing(current.name)}setError(derivedLayerError(err,'convert'));await offerView(err,{operation:'convert',item})}finally{setBusy(false)}};
- const chooseAction=(item,value)=>{if(value==='edit')edit(item);else if(value==='refresh')action(item,'refresh');else if(value==='convert')convert(item);else if(value==='delete')action(item,'drop')};
+
+ const chooseAction=(item,value)=>{if(value==='edit')edit(item);else if(value==='refresh')action(item,'refresh');else if(value==='convert')reviewReplacement(item.name);else if(value==='delete')action(item,'drop')};
  useEffect(()=>{if(!initialName)return;if(initialAction==='delete')action({name:initialName},'drop');else edit({name:initialName})},[initialName,initialAction,initialRequestKey]);
  useEffect(()=>{if(!editing)return;const actions=document.querySelector('.derived-layer-form .form-head');if(!actions)return;const button=document.createElement('button');button.type='button';button.className='danger derived-edit-delete';button.textContent='Delete derived layer';button.disabled=busy;button.addEventListener('click',()=>action({name:editing},'drop'));actions.append(button);return()=>button.remove()},[editing,busy]);
- return <div className="management-page"><section className="panel security-panel derived-layer-panel" aria-label="Derived layers"><div className="form-head"><div><h2>Derived layers</h2><p>Managed read-only views in <code>derived_layers</code>. Add the resulting relation to the workspace separately.</p></div><button onClick={close}>Close</button></div>{capabilities&&<p className="muted">PostGIS {capabilities.extensions?.postgis||'unavailable'} · H3 {capabilities.h3Available?(capabilities.extensions?.h3||'available'):'unavailable'} · ordinary views update dynamically; materialized views refresh only on request.</p>}{error&&<div className="expression-result error">{error}</div>}{notice&&<div className="expression-result">{notice}</div>}<DraftCleanupStatus status={draftStatus} error={draftError}/><div className="derived-browser"><div className="derived-layer-list"><SearchField label="Find derived relation" placeholder="Find a derived relation" value={derivedSearch} onChange={event=>setDerivedSearch(event.target.value)}/>{items.filter(item=>item.name.toLowerCase().includes(derivedSearch.toLowerCase())).map(item=><div className="token-row" key={item.name}><span><strong>derived_layers.{item.name}</strong><small>{item.kind} · {item.sources.join(', ')}{item.refreshedAt?` · refreshed ${item.refreshedAt}`:''}</small><DerivedDraftStatus draft={draftStatus?.drafts?.find(draft=>draft.assetId===item.semanticProfile?.assetId&&draft.generation===item.semanticProfile?.generation)||item.draft}/></span><label className="derived-action-select"><span>Edit or delete</span><select disabled={busy} value="" aria-label={`Edit or delete derived_layers.${item.name}`} onChange={event=>chooseAction(item,event.target.value)}><option value="" disabled>Choose action…</option><option value="edit">Edit definition</option>{item.kind==='materialized'&&<option value="refresh">Refresh data</option>}<option value="convert">Convert to {item.kind==='materialized'?'view':'materialized'}</option><option value="delete">Delete derived layer</option></select></label></div>)}</div><form className="derived-layer-form" onSubmit={save}><div className="form-head"><h3>{editing?`Edit derived_layers.${editing}`:'Create derived relation'}</h3>{editing&&<button type="button" onClick={()=>{setEditing(null);setDefinition(blank);setError('')}}>Cancel edit</button>}</div><div className="grid"><Field label="Name" disabled={!!editing} value={definition.name} onChange={value=>setDefinition({...definition,name:value})}/><Field label="Kind" value={definition.kind} options={['view','materialized']} onChange={value=>setDefinition({...definition,kind:value})}/><Field label="ID column" value={definition.idColumn} onChange={value=>setDefinition({...definition,idColumn:value})}/><Field label="Geometry column" value={definition.geometryColumn} onChange={value=>setDefinition({...definition,geometryColumn:value})}/><label className="full"><InfoLabel label="Source relations"/><input value={definition.sources} onChange={event=>setDefinition({...definition,sources:event.target.value})} placeholder="leeds.definitive_paths, reference.h3_cells"/></label><label className="full"><span className="field-label">Description</span><input value={definition.description} onChange={event=>setDefinition({...definition,description:event.target.value})}/></label><label className="full expression-editor"><span className="field-label">One read-only SELECT</span><textarea rows="12" spellCheck="false" value={definition.query} onChange={event=>setDefinition({...definition,query:event.target.value})} placeholder="SELECT … FROM schema.table_a JOIN schema.table_b ON …"/></label></div><p className="muted">The server retains final output intersecting the workspace map area at one zoom level out (z−1). Aggregates and window calculations still use the complete query input unless your SQL intentionally limits its source rows.</p><p className="muted">Every source must be schema-qualified and declared above. Edits that would break a PostgreSQL dependency are blocked; affected dashboard/CLI consumers and second-order changes are reported.</p><button disabled={busy}>{busy?'Saving…':editing?'Save derived layer':'Create derived relation'}</button></form></div></section></div>
+ return <div className="management-page"><section className="panel security-panel derived-layer-panel" aria-label="Derived layers"><div className="form-head"><div><h2>Derived layers</h2><p>Managed read-only views in <code>derived_layers</code>. Add the resulting relation to the workspace separately.</p></div><button onClick={close}>Close</button></div>{capabilities&&<p className="muted">PostGIS {capabilities.extensions?.postgis||'unavailable'} · H3 {capabilities.h3Available?(capabilities.extensions?.h3||'available'):'unavailable'} · ordinary views update dynamically; materialized views refresh only on request.</p>}{error&&<div className="expression-result error">{error}</div>}{notice&&<div className="expression-result">{notice}</div>}{review&&<ReplacementReview review={review} busy={busy} cancel={()=>setReview(null)} confirm={()=>submit(review.proposed,true)}/>}<DraftCleanupStatus status={draftStatus} error={draftError}/><div className="derived-browser"><div className="derived-layer-list"><SearchField label="Find derived relation" placeholder="Find a derived relation" value={derivedSearch} onChange={event=>setDerivedSearch(event.target.value)}/>{items.filter(item=>item.name.toLowerCase().includes(derivedSearch.toLowerCase())).map(item=><div className="token-row" key={item.name}><span><strong>derived_layers.{item.name}</strong><small>{item.kind} · {item.sources.join(', ')}{item.refreshedAt?` · refreshed ${item.refreshedAt}`:''}</small><DerivedDraftStatus draft={draftStatus?.drafts?.find(draft=>draft.assetId===item.semanticProfile?.assetId&&draft.generation===item.semanticProfile?.generation)||item.draft}/></span><label className="derived-action-select"><span>Edit or delete</span><select disabled={busy||!!review} value="" aria-label={`Edit or delete derived_layers.${item.name}`} onChange={event=>chooseAction(item,event.target.value)}><option value="" disabled>Choose action…</option><option value="edit">Edit definition</option>{item.kind==='materialized'&&<option value="refresh">Refresh data</option>}<option value="convert">Convert to {item.kind==='materialized'?'view':'materialized'}</option><option value="delete">Delete derived layer</option></select></label></div>)}</div><form className="derived-layer-form" onSubmit={save}><fieldset disabled={busy||!!review} style={{display:'contents'}}><div className="form-head"><h3>{editing?`Edit derived_layers.${editing}`:'Create derived relation'}</h3>{editing&&<button type="button" onClick={()=>{setEditing(null);setDefinition(blank);setError('')}}>Cancel edit</button>}</div><div className="grid"><Field label="Name" disabled={!!editing} value={definition.name} onChange={value=>setDefinition({...definition,name:value})}/><Field label="Kind" value={definition.kind} options={['view','materialized']} onChange={value=>setDefinition({...definition,kind:value})}/><Field label="ID column" value={definition.idColumn} onChange={value=>setDefinition({...definition,idColumn:value})}/><Field label="Geometry column" value={definition.geometryColumn} onChange={value=>setDefinition({...definition,geometryColumn:value})}/><label className="full"><InfoLabel label="Source relations"/><input value={definition.sources} onChange={event=>setDefinition({...definition,sources:event.target.value})} placeholder="leeds.definitive_paths, reference.h3_cells"/></label><label className="full"><span className="field-label">Description</span><input value={definition.description} onChange={event=>setDefinition({...definition,description:event.target.value})}/></label><label className="full expression-editor"><span className="field-label">One read-only SELECT</span><textarea rows="12" spellCheck="false" value={definition.query} onChange={event=>setDefinition({...definition,query:event.target.value})} placeholder="SELECT … FROM schema.table_a JOIN schema.table_b ON …"/></label></div><p className="muted">The server retains final output intersecting the workspace map area at one zoom level out (z−1). Aggregates and window calculations still use the complete query input unless your SQL intentionally limits its source rows.</p><p className="muted">Every source must be schema-qualified and declared above. {editing&&'Save derived layer opens a review of the current SQL, proposed SQL and known consumers before confirmation.'}</p><button disabled={busy}>{busy?'Please wait…':editing?'Save derived layer':'Create derived relation'}</button></fieldset></form></div></section></div>
 }
 export const TOKEN_SCOPE_OPTIONS=[
  {id:'inspect',group:'Workspace',label:'Inspect workspace',help:'Read workspace, catalog, and derived-layer configuration.'},
@@ -707,18 +893,18 @@ export const MCP_SCOPE_OPTIONS=[
  {id:'propose',label:'Agent may propose workspace changes',help:'Needed by proposals_check and proposals_create. Adds to the review queue; it applies nothing, and a person still decides. Not in the analysis presets: reading an instance and proposing to it are separate things to grant.'},
  {id:'semantic:propose',label:'Agent may propose semantic changes',help:'The same for curated meaning: needed by semantic_proposals_check. Proposes, never applies.'},
  {id:'visual',label:'Render review evidence',help:'Needed by the proposal preview tools. Renders a proposed change through a real browser and attaches the result to the proposal, so a person can see what it would look like before applying it. Renders only; it applies nothing.'},
- {id:'derive:manage',label:'Agent may build and remove derived layers',help:'Needed by derived_layers_create, _replace, _refresh and _drop. These act on the database directly -- there is no proposal to review first, which is why each one asks you before it happens. Dropping is refused outright while any layer still reads the relation, and the approval names what would break. The widest thing on this list: grant it to an agent you would let run DDL.'},
+ {id:'derive:manage',label:'Agent may build and remove derived layers',help:'Needed by derived_layers_create, _replace, _refresh and _drop. These change the database directly. Eligible operations can use standing approval for this client. Otherwise each request needs individual approval. Database dependency guards still apply.'},
  {id:'apply',label:'Agent may apply a reviewed proposal',help:'Needed by proposals_apply. Writes the proposed change to the workspace and reloads the map. Every apply asks you first, in this session, showing what it would change -- but it is the irreversible half of the loop, so grant it only to an agent you would let edit the workspace.'},
- {id:'semantic:apply',label:'Agent may apply a semantic proposal',help:'The same for curated meaning: needed by semantic_proposals_apply. Asks you first, and writes when you agree.'},
- {id:'reload',label:'Agent may reload the map',help:'Needed by xyz_reload. Tells the tile service to pick up the workspace already on disk; it writes nothing and applies nothing. Useful when an apply committed but the reload was not observed. Asks you first, which is what stops repeated reloads costing the tile service anything.'},
+ {id:'semantic:apply',label:'Agent may apply a semantic proposal',help:'The same for curated meaning: needed by semantic_proposals_apply. Eligible requests can use standing approval.'},
+ {id:'reload',label:'Agent may reload the map',help:'Needed by xyz_reload. Tells the tile service to pick up the workspace already on disk; it writes nothing and applies nothing. Useful when an apply committed but the reload was not observed. Eligible requests can use standing approval.'},
  {id:'semantic:source',label:'Read source relations',help:'Needed by semantic_source_relations. Lists the tables and views available to model, including ones no layer uses -- the database inventory rather than the configured workspace. Reads no rows from them. Left out of the presets so it is granted deliberately.'},
 ];
 export const MCP_CLIENT_PRESETS=[
  {id:'analysis',label:'Read-only analysis (recommended)',scopes:['mcp:connect','inspect','derive','semantic:inspect'],help:'What the shipped tools need to read this instance: its layers, their data, and the meaning recorded for them. Deliberately excludes federation:observe, which discloses the third-party databases behind the platform rather than the platform itself.'},
  {id:'analysis-federated',label:'Read-only analysis, including sources',scopes:['mcp:connect','inspect','derive','semantic:inspect','federation:observe'],help:'The same, plus the federated source registry. Choose this when an agent needs to answer where data came from, not only what it says.'},
  {id:'authoring',label:'Read and propose',scopes:['mcp:connect','inspect','derive','semantic:inspect','propose','semantic:propose','visual'],help:'Everything the analysis preset reads, plus the ability to add to the review queue and render evidence for it. An agent with this can draft a change, have it checked and show you what it would look like -- but not apply it. Applying is a separate scope and a separate decision.'},
- {id:'authoring-apply',label:'Author and apply',scopes:['mcp:connect','inspect','derive','semantic:inspect','propose','semantic:propose','visual','apply','semantic:apply','reload'],help:'Everything in Author, plus the ability to apply a reviewed proposal and reload the map. Every apply asks you first, in the session you are working in, and shows what it would change. Grant this to an agent you would let edit the workspace.'},
- {id:'authoring-derive',label:'Author, apply and build derived layers',scopes:['mcp:connect','inspect','derive','semantic:inspect','propose','semantic:propose','visual','apply','semantic:apply','reload','derive:manage'],help:'Everything in Author and apply, plus building and removing the derived relations layers read. The widest preset offered. Every derived-layer change asks you first, and a drop that would break a layer is refused rather than approved.'},
+ {id:'authoring-apply',label:'Author and apply',scopes:['mcp:connect','inspect','derive','semantic:inspect','propose','semantic:propose','visual','apply','semantic:apply','reload'],help:'Everything in Author, plus the ability to apply a reviewed proposal and reload the map. Map proposal apply always requires individual approval. Eligible semantic apply and reload requests can use standing approval. Grant this to an agent you would let edit the workspace.'},
+ {id:'authoring-derive',label:'Author, apply and build derived layers',scopes:['mcp:connect','inspect','derive','semantic:inspect','propose','semantic:propose','visual','apply','semantic:apply','reload','derive:manage'],help:'Everything in Author and apply, plus building and removing the derived relations layers read. The widest preset offered. Eligible derived changes can use standing approval. Map proposal apply always requires individual approval. Dependency guards still apply.'},
  {id:'discovery',label:'Connect and list only',scopes:['mcp:connect','inspect'],help:'Connects and lists tools, but every tool refuses. Useful to hand someone a connection before deciding what they may read.'},
 ];
 //: Pinned rather than chosen by the client, because redirect URIs are matched
@@ -787,7 +973,7 @@ export function ApprovalChange({change}){
   if(typeof value==='object')return <span className="muted">{value.type==='list'?`list of ${value.items}`:`object · ${(value.keys||[]).join(', ')}`}</span>;
   return <code>{String(value)}</code>;
  };
- return <li><code>{change.op}</code> <code>{change.path}</code><div className="approval-change">{show(change.was)} → {show(change.becomes)}</div></li>;
+ return <li><code>{change.op}</code> <code>{change.path}</code><div className="approval-change" style={{whiteSpace:'pre-wrap'}}><div>Previous: {show(change.was)}</div><div>Proposed: {show(change.becomes)}</div></div></li>;
 }
 
 export function ApprovalDetail({approval,busy,decide}){
@@ -804,13 +990,15 @@ export function ApprovalDetail({approval,busy,decide}){
   {packet.summary&&<p className="approval-summary">{packet.summary}</p>}
   {review?.binding&&<p className="approval-binding">Proposal <code>{review.binding.proposalId}</code> · preview <code>{review.binding.evidenceOperationId}</code><br/>Candidate <code>{review.binding.candidateHash}</code></p>}
   {changes.length>0&&<><h5>Changes ({packet.changeCount??changes.length})</h5><ul className="approval-changes">{changes.map((change,index)=><ApprovalChange key={index} change={change}/>)}</ul>{packet.changeCount>changes.length&&<p className="muted">Showing {changes.length} of {packet.changeCount}. The rest are in the proposal.</p>}</>}
+  {packet.dependents&&<KnownConsumers dependents={packet.dependents}/>}
+  {packet.note&&<p>{packet.note}</p>}
   {evidence&&<><h5>Evidence</h5>
    <p className={evidence.passed?'approval-evidence-pass':'approval-evidence-fail'}>Visual check {evidence.passed?'passed':`failed at ${evidence.failedStage||'an unnamed stage'}`}.</p>
    {Array.isArray(evidence.failedChecks)&&evidence.failedChecks.length>0&&<ul className="approval-changes">{evidence.failedChecks.map((check,index)=><li key={index}><code>{check.check}</code> <span className="muted">({check.side})</span></li>)}</ul>}
    {review?<div className="approval-review-captures">{review.captures.map(capture=><div key={`${capture.side}-${capture.kind}`}><strong>{capture.side} · {capture.kind}</strong>{capture.status==='captured'?<a href={capture.download?.url||capture.download?.path} target="_blank" rel="noreferrer">Download {capture.side} {capture.kind} PNG ({capture.width} × {capture.height})</a>:<span>{capture.status}</span>}</div>)}<p>Links expire after one hour. Ask the agent to poll the preview again to renew them.</p></div>:evidence.artifacts&&<div className="approval-artifacts">{Object.entries(evidence.artifacts).filter(([,href])=>href).map(([name,href])=><a key={name} href={`/api/artifacts/${href}`} target="_blank" rel="noreferrer">{name}</a>)}</div>}
    {incomplete&&<label className="check"><input type="checkbox" checked={acknowledged} onChange={event=>setAcknowledged(event.target.checked)}/><span>I have reviewed and accept the incomplete captures or failed checks. Missing candidate captures: {(review.missingCandidateCaptures||[]).join(', ')||'none'}.</span></label>}
   </>}
-  {!changes.length&&!evidence&&<p className="muted">This request carried no summary. Approving it grants the operation named above and nothing else, but you are deciding on less than you should be — ask the agent to include a packet.</p>}
+  {!packet.summary&&!changes.length&&!evidence&&!packet.dependents&&!packet.note&&<p className="muted">This request carried no summary. Approving it grants the operation named above and nothing else, but you are deciding on less than you should be — ask the agent to include a packet.</p>}
   <div className="approval-actions">
    <button className="danger" disabled={busy} onClick={()=>decide(approval.reference,false)}>Decline</button>
    {confirming

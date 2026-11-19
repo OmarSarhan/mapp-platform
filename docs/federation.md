@@ -9,6 +9,21 @@ What it deliberately does not do: it does not replicate, it does not write to
 the source, and it does not make the source's schema authoritative. A source is
 approved once, verified continuously, and can be withdrawn.
 
+## Publish the first layer
+
+After provisioning, open **Sources** in the dashboard's default locale and wait
+for table discovery. A failed refresh can leave a last-known list on screen.
+Retry discovery before choosing a relation. Icons load independently. Choose
+a readable spatial table with an EPSG:3857 geometry column for vector tiles and a stable, unique feature
+identifier, then add it to the workspace. Check the suggested ID, geometry,
+style and feature information. Select **Save & reload XYZ**, wait for the
+matching reload and select a known feature on the published map.
+
+A direct map of a provisioned source can use its database columns immediately.
+Planning a managed calculation also requires ready semantic profiles for its
+declared relation sources. Inspect federation coverage and sync the permitted
+source metadata when a profile is missing.
+
 ## Before you start
 
 Federation needs a **host database** with a role that can create foreign

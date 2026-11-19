@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
-from functools import wraps
+from functools import partial, wraps
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
@@ -457,6 +457,13 @@ def _operations_by_route(schemas):
 
 
 OPERATIONS_BY_ROUTE = _operations_by_route(ACTION_SCHEMAS)
+
+
+def explicit_derived_definition(path: str, query: str) -> bool:
+    # These fixed GET resources also happen to be legal relation names.
+    return query == "definition=true" and path in {
+        "/api/derived-layers/capabilities", "/api/derived-layers/drafts",
+    }
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
 try:
@@ -2128,6 +2135,7 @@ def run_derived_background(
     name: str | None = None,
     cancellation: DerivedLayerCancellation | None = None,
     expected_plan_fingerprint: str | None = None,
+    semantic_admin: bool = False,
 ) -> None:
     """Complete a derived-layer database operation after HTTP has returned."""
     failure_phase = (
@@ -2149,14 +2157,12 @@ def run_derived_background(
                     status=HTTPStatus.SERVICE_UNAVAILABLE,
                     payload={"code": "semantic.not_configured"},
                 )
-            semantic_catalog = SEMANTIC.request(
-                "/v1/catalog",
-                actor=actor,
-                scopes=["semantic:inspect"],
-            )
-            if cancellation is not None:
-                cancellation.checkpoint()
-            require_semantic_derived_sources(payload, semantic_catalog)
+            scopes = ["semantic:inspect"]
+            if semantic_admin:
+                scopes.append("semantic:admin")
+            require_semantic_derived_sources(payload, semantic_source_bindings(
+                partial(SEMANTIC.request, actor=actor, scopes=scopes), cancellation,
+            ))
             if cancellation is not None:
                 cancellation.checkpoint()
         if action == "create":
@@ -2769,6 +2775,7 @@ def run_reserved_derived_background(
     name: str | None,
     cancellation: DerivedLayerCancellation,
     expected_plan_fingerprint: str | None = None,
+    semantic_admin: bool = False,
 ) -> None:
     global DERIVED_BACKGROUND_ACTIVE_JOBS
     global DERIVED_BACKGROUND_EXECUTING_JOB
@@ -2847,6 +2854,7 @@ def run_reserved_derived_background(
             name,
             cancellation,
             expected_plan_fingerprint,
+            semantic_admin,
         )
     finally:
         with DERIVED_BACKGROUND_JOB_CONDITION:
@@ -3695,16 +3703,52 @@ def derived_operation_failed_error(
        indeterminate=not state_unchanged)
 
 
-def require_semantic_derived_sources(
-    payload: dict,
-    catalog: dict,
-) -> None:
+def semantic_source_bindings(read, cancellation=None):
+    """Stream compact binding pages from one visibility- and revision-bound read."""
+    base = "/v1/catalog?projection=bindings&limit=100"
+    path = base
+    revision = None
+    seen = set()
+    for _ in range(20):
+        if cancellation:
+            cancellation.checkpoint()
+        page = read(path)
+        if cancellation:
+            cancellation.checkpoint()
+        assets = page.get("assets")
+        current = page.get("catalogRevision")
+        pagination = page.get("pagination")
+        if (
+            type(current) is not int or current < 0
+            or (revision is not None and revision != current)
+            or not isinstance(assets, list) or len(assets) > 100
+            or not isinstance(pagination, dict) or pagination.get("limit") != 100
+            or "nextCursor" not in pagination
+        ):
+            raise SemanticClientError(
+                "Invalid or inconsistent semantic binding page.", status=HTTPStatus.BAD_GATEWAY,
+            )
+        revision = current
+        cursor = pagination["nextCursor"]
+        if cursor is not None and (
+            not assets or not isinstance(cursor, str) or not 0 < len(cursor) <= 2200 or cursor in seen
+        ):
+            raise SemanticClientError(
+                "Invalid semantic binding continuation.", status=HTTPStatus.BAD_GATEWAY,
+            )
+        yield from assets
+        if cursor is None:
+            return
+        seen.add(cursor)
+        path = base + "&cursor=" + quote(cursor, safe="")
+    raise SemanticClientError("Semantic source lookup exceeded its 20-page limit.",
+                              status=HTTPStatus.CONFLICT)
+
+
+def require_semantic_derived_sources(payload: dict, assets) -> None:
     """Require every declared relation source to have a ready semantic profile."""
     definition = validate_definition(payload)
-    assets = catalog.get("assets")
-    if not isinstance(assets, list):
-        raise DerivedLayerError("Semantic catalog returned invalid source profiles.")
-    profiled_sources = set()
+    missing = set(definition["sources"])
     for asset in assets:
         if not isinstance(asset, dict) or asset.get("status") != "ready":
             continue
@@ -3724,12 +3768,13 @@ def require_semantic_derived_sources(
         schema = binding.get("schema")
         relation = binding.get("relation")
         if isinstance(schema, str) and isinstance(relation, str):
-            profiled_sources.add(f"{schema}.{relation}")
-    missing = sorted(set(definition["sources"]) - profiled_sources)
+            missing.discard(f"{schema}.{relation}")
+            if not missing:
+                return
     if missing:
         raise DerivedLayerError(
             "Derived-layer sources need ready semantic profiles: "
-            + ", ".join(missing)
+            + ", ".join(sorted(missing))
             + ". Synchronize each source with `semantic source sync` before "
             "creating or replacing a derived layer."
         )
@@ -3920,19 +3965,12 @@ def archive_excluded_semantic_sources(actor: str) -> list[dict]:
             status=HTTPStatus.SERVICE_UNAVAILABLE,
             payload={"code": "semantic.not_configured"},
         )
-    catalog = SEMANTIC.request(
-        "/v1/catalog",
-        actor=actor,
-        scopes=["semantic:inspect"],
+    # Finish the snapshot before archiving. Each archive changes its revision
+    # and would invalidate an outstanding cursor.
+    assets = semantic_source_bindings(
+        partial(SEMANTIC.request, actor=actor, scopes=["semantic:inspect"])
     )
-    assets = catalog.get("assets")
-    if not isinstance(assets, list):
-        raise SemanticClientError(
-            "Semantic service returned an invalid catalog.",
-            status=HTTPStatus.BAD_GATEWAY,
-            payload={"code": "semantic.invalid_response"},
-        )
-    archived = []
+    matches = []
     for asset in assets:
         generated = asset.get("generated") if isinstance(asset, dict) else None
         binding = generated.get("binding") if isinstance(generated, dict) else None
@@ -3955,6 +3993,9 @@ def archive_excluded_semantic_sources(actor: str) -> list[dict]:
                 status=HTTPStatus.BAD_GATEWAY,
                 payload={"code": "semantic.invalid_response"},
             )
+        matches.append((asset_id, generation, binding))
+    archived = []
+    for asset_id, generation, binding in matches:
         event = {
             "eventId": str(uuid.uuid4()),
             "assetId": asset_id,
@@ -3985,6 +4026,7 @@ def start_derived_background(
     remote: str,
     name: str | None = None,
     expected_plan_fingerprint: str | None = None,
+    semantic_admin: bool = False,
 ) -> dict:
     global DERIVED_BACKGROUND_ACTIVE_JOBS
     reserve_derived_background_job()
@@ -4028,7 +4070,7 @@ def start_derived_background(
             target=run_reserved_derived_background,
             args=(
                 operation["id"], action, payload, actor, remote, name,
-                cancellation, expected_plan_fingerprint,
+                cancellation, expected_plan_fingerprint, semantic_admin,
             ),
             name=f"derived-{action}-{operation['id'][:8]}",
             daemon=True,
@@ -6692,7 +6734,7 @@ class Handler(SimpleHTTPRequestHandler):
         self._authentication = {"actor": subject, "scopes": scopes}
         return subject
 
-    def _resolve_operation(self, method: str, path: str):
+    def _resolve_operation(self, method: str, path: str, query: str = ""):
         """Which allowlisted operation *is* this request, from the request alone.
 
         Deliberately not taken from the token. If the token named its own
@@ -6704,9 +6746,18 @@ class Handler(SimpleHTTPRequestHandler):
         or more than one does.
         """
         matches = []
+        named = method == "GET" and explicit_derived_definition(path, query)
         for (candidate_method, template), names in OPERATIONS_BY_ROUTE.items():
             if candidate_method != method:
                 continue
+            if named and template == path:
+                continue
+            if template == "/api/derived-layers/{name}":
+                # do_GET serves fixed subresources before the per-name read.
+                if ((method, path) in OPERATIONS_BY_ROUTE and not named) or not re.fullmatch(
+                    r"/api/derived-layers/[a-z][a-z0-9_]{0,62}", path,
+                ):
+                    continue
             try:
                 execution_envelope.path_parameters(template, path)
             except execution_envelope.EnvelopeError:
@@ -6734,7 +6785,7 @@ class Handler(SimpleHTTPRequestHandler):
         """
         parsed = urlparse(self.path)
         method = (self.command or "").upper()
-        resolved = self._resolve_operation(method, parsed.path)
+        resolved = self._resolve_operation(method, parsed.path, parsed.query)
         if resolved is None:
             self._json(HTTPStatus.FORBIDDEN, {
                 "error": "This route does not accept an exchanged credential.",
@@ -7201,12 +7252,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "xyzVersion": os.environ.get("XYZ_VERSION", "v4.23.4"),
             })
             return
+        named_definition = explicit_derived_definition(path, urlparse(self.path).query)
         if path.startswith("/api/") and path not in {
             "/api/auth/login",
             "/api/auth/device",
             "/api/auth/device/token",
         }:
-            self._authorization_scope = self._required_scope(path, "GET")
+            self._authorization_scope = "inspect" if named_definition else self._required_scope(path, "GET")
             actor = self._authorized()
             if not actor:
                 return
@@ -7707,7 +7759,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.OK, {
                 "backgroundJobs": derived_background_capacity(),
             })
-        elif path == "/api/derived-layers/drafts":
+        elif path == "/api/derived-layers/drafts" and not named_definition:
             try:
                 drafts = DERIVED.list_drafts(limit=100, include_terminal=True) if DERIVED else []
                 self._json(HTTPStatus.OK, {
@@ -7721,7 +7773,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "error": "Draft lifecycle records are unavailable.",
                     "code": "derived_layer.drafts_unavailable",
                 })
-        elif path == "/api/derived-layers/capabilities":
+        elif path == "/api/derived-layers/capabilities" and not named_definition:
             try:
                 result = (
                     DERIVED.capabilities()
@@ -9374,7 +9426,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 require_semantic_derived_sources(
                     resolved_create_request,
-                    self._semantic_request(actor, "/v1/catalog"),
+                    semantic_source_bindings(partial(self._semantic_request, actor)),
                 )
                 probes = enrich_derived_plan_probes(
                     DERIVED.preflight_definition(resolved_create_request)
@@ -9403,6 +9455,8 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return
             if request_path == "/api/derived-layers":
+                if not self._scope_granted(actor, "semantic:inspect"):
+                    return
                 derived_failure_phase = "preflight"
                 if not DERIVED:
                     raise DerivedLayerError(
@@ -9426,7 +9480,7 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = resolve_derived_spatial_scope(payload)
                 require_semantic_derived_sources(
                     payload,
-                    self._semantic_request(actor, "/v1/catalog"),
+                    semantic_source_bindings(partial(self._semantic_request, actor)),
                 )
                 probes = DERIVED.preflight_definition(payload)
                 if expected_plan_fingerprint is not None:
@@ -9470,6 +9524,7 @@ class Handler(SimpleHTTPRequestHandler):
                         expected_plan_fingerprint=(
                             expected_plan_fingerprint
                         ),
+                        semantic_admin="semantic:admin" in self._semantic_scopes(actor),
                     )
                     derived_failure_phase = "request-response"
                     self._json(HTTPStatus.ACCEPTED, {
@@ -9521,12 +9576,14 @@ class Handler(SimpleHTTPRequestHandler):
                 background = payload.pop("background", False)
                 replacement = None
                 if action == "replace":
+                    if not self._scope_granted(actor, "semantic:inspect"):
+                        return
                     replacement = {**payload}
                     replacement.pop("confirmed", None)
                     replacement = resolve_derived_spatial_scope(replacement)
                     require_semantic_derived_sources(
                         replacement,
-                        self._semantic_request(actor, "/v1/catalog"),
+                        semantic_source_bindings(partial(self._semantic_request, actor)),
                     )
                     DERIVED.preflight_definition(replacement)
                 elif action == "refresh":
@@ -9538,6 +9595,7 @@ class Handler(SimpleHTTPRequestHandler):
                         actor,
                         self._remote(),
                         name,
+                        semantic_admin="semantic:admin" in self._semantic_scopes(actor),
                     )
                     derived_failure_phase = "request-response"
                     self._json(HTTPStatus.ACCEPTED, {

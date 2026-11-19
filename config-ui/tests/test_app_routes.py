@@ -1499,6 +1499,31 @@ class DerivedFailureStateTests(unittest.TestCase):
 
 
 class DerivedSemanticSourcePolicyTests(unittest.TestCase):
+    def test_binding_pages_follow_byte_shortened_page_and_reject_revision_drift(self):
+        first = {"assets": self.catalog()["assets"], "catalogRevision": 8,
+                 "pagination": {"limit": 100, "nextCursor": "opaque.abc"}}
+        last = {**first, "pagination": {"limit": 100, "nextCursor": None}}
+        read = Mock(side_effect=[first, last])
+        self.assertEqual(first["assets"] * 2, list(app.semantic_source_bindings(read)))
+        self.assertEqual("/v1/catalog?projection=bindings&limit=100&cursor=opaque.abc",
+                         read.call_args.args[0])
+        with self.assertRaises(app.SemanticClientError):
+            list(app.semantic_source_bindings(Mock(side_effect=[
+                first, {**last, "catalogRevision": 9},
+            ])))
+
+    def test_unresolved_binding_stops_at_page_budget_or_repeated_cursor(self):
+        pages = [
+            {"catalogRevision": 11, "assets": [{"status": "ready", "generated": {}}],
+             "pagination": {"limit": 100, "nextCursor": f"opaque.{i}"}}
+            for i in range(21)
+        ]
+        for sequence, calls in ((pages, 20), ([pages[0], pages[0]], 2)):
+            read = Mock(side_effect=sequence)
+            with self.assertRaises(app.SemanticClientError):
+                app.require_semantic_derived_sources(self.payload(), app.semantic_source_bindings(read))
+            self.assertEqual(calls, read.call_count)
+
     @staticmethod
     def payload():
         return {
@@ -1523,23 +1548,40 @@ class DerivedSemanticSourcePolicyTests(unittest.TestCase):
         }]}
 
     def test_allows_declared_sources_with_ready_semantic_profiles(self):
-        app.require_semantic_derived_sources(self.payload(), self.catalog())
+        app.require_semantic_derived_sources(self.payload(), self.catalog()["assets"])
 
     def test_rejects_declared_sources_without_semantic_profiles(self):
         with self.assertRaisesRegex(
             app.DerivedLayerError,
             "leeds.roads.*semantic source sync",
         ):
-            app.require_semantic_derived_sources(self.payload(), {"assets": []})
+            app.require_semantic_derived_sources(self.payload(), [])
 
     def test_rejects_archived_semantic_source_profiles(self):
         with self.assertRaisesRegex(app.DerivedLayerError, "leeds.roads"):
             app.require_semantic_derived_sources(
-                self.payload(), self.catalog(status="archived")
+                self.payload(), self.catalog(status="archived")["assets"]
             )
 
 
 class ExcludedSemanticSourceArchivalTests(unittest.TestCase):
+    def test_revision_drift_refuses_before_archiving_first_matching_asset(self):
+        first = {"catalogRevision": 10, "pagination": {"limit": 100, "nextCursor": "cursor"},
+                 "assets": [{"id": "asset:roads", "status": "ready", "generation": 3,
+                             "generated": {"binding": {"adapter": "postgresql", "alias": "MAPP",
+                                                       "schema": "leeds", "relation": "roads"}}}]}
+        semantic = Mock()
+        semantic.request.side_effect = [
+            first, {**first, "catalogRevision": 11, "pagination": {"limit": 100, "nextCursor": None}},
+        ]
+        with patch.object(app, "SEMANTIC", semantic), patch.object(
+            app, "SEMANTIC_SOURCE_EXCLUSIONS", parse_exclusions("MAPP:leeds.roads")
+        ), self.assertRaises(app.SemanticClientError):
+            app.archive_excluded_semantic_sources("admin")
+        self.assertEqual(2, semantic.request.call_count)
+        for call in semantic.request.call_args_list:
+            self.assertNotEqual("/v1/events", call.args[0])
+
     def test_archives_only_ready_assets_matching_configured_exclusions(self):
         asset = {
             "id": "asset:census-datasets",
@@ -1554,7 +1596,7 @@ class ExcludedSemanticSourceArchivalTests(unittest.TestCase):
         }
         semantic = Mock()
         semantic.request.side_effect = [
-            {"assets": [asset]},
+            {"assets": [asset], "catalogRevision": 7, "pagination": {"limit": 100, "nextCursor": None}},
             {
                 "catalogRevision": 8,
                 "event": {
@@ -2775,7 +2817,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         handler.path = path
         handler._host_allowed = lambda: True
         handler._authorized = lambda state_change=False: "token:test"
-        handler._authentication = {"scopes": ["inspect", "derive"]}
+        handler._authentication = {"scopes": ["inspect", "derive:manage", "semantic:inspect"]}
         handler._payload = lambda: {**(payload or {})}
         handler._remote = lambda: "127.0.0.1"
         handler._json = lambda status, body: responses.append((status, body))
@@ -2797,7 +2839,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
 
     @staticmethod
     def catalog():
-        return {"assets": [{
+        return {"catalogRevision": 8, "pagination": {"limit": 100, "nextCursor": None}, "assets": [{
             "status": "ready",
             "generated": {"binding": {
                 "adapter": "postgresql",
@@ -3099,7 +3141,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             self.h3_recipe(),
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value={
             "asset": self.h3_catalog()["assets"][0],
         })
@@ -3189,7 +3230,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers/plan",
             request,
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value=self.catalog())
         probes = {
             "queryPlanProbe": {"method": "postgresql-explain"},
@@ -3243,7 +3283,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         )
         self.assertEqual(request["query"], resolved["query"])
         handler._semantic_request.assert_called_once_with(
-            "token:test", "/v1/catalog"
+            "token:test", "/v1/catalog?projection=bindings&limit=100"
         )
         derived.create.assert_not_called()
 
@@ -3252,7 +3292,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers/plan",
             self.definition(background=True),
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value=self.catalog())
         derived = Mock()
 
@@ -3279,7 +3318,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers",
             request,
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value=self.catalog())
         derived = Mock()
         derived.preflight_definition.return_value = {
@@ -3336,7 +3374,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers",
             {**definition, "planFingerprint": fingerprint},
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value=self.catalog())
         derived = Mock()
         derived.preflight_definition.return_value = probes
@@ -3490,6 +3527,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             self.h3_recipe(),
         )
         handler._semantic_request = Mock()
+        handler._authentication["scopes"].remove("semantic:inspect")
 
         with patch.object(app, "DERIVED", Mock()):
             handler.do_POST()
@@ -3498,6 +3536,19 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         self.assertEqual("semantic:inspect", responses[0][1]["requiredScope"])
         handler._semantic_request.assert_not_called()
 
+    def test_generic_plan_create_and_replace_require_semantic_inspect_before_lookup(self):
+        for path in ("/api/derived-layers/plan", "/api/derived-layers",
+                     "/api/derived-layers/roads_visible/replace"):
+            with self.subTest(path=path):
+                handler, responses = self.handler(path, self.definition(confirmed=True))
+                handler._authentication["scopes"] = ["derive:manage"]
+                handler._semantic_request = Mock()
+                with patch.object(app, "DERIVED", Mock()):
+                    handler.do_POST()
+                self.assertEqual(HTTPStatus.FORBIDDEN, responses[0][0])
+                self.assertEqual("semantic:inspect", responses[0][1]["requiredScope"])
+                handler._semantic_request.assert_not_called()
+
     def test_area_weighted_h3_recipe_reports_missing_semantic_source_without_mutation(self):
         request = self.h3_recipe()
         request["source"]["assetId"] = "missing-asset"
@@ -3505,7 +3556,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             request,
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(return_value={
             "asset": self.h3_catalog()["assets"][0],
         })
@@ -3531,7 +3581,6 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers/recipes/area-weighted-h3/plan",
             self.h3_recipe(),
         )
-        handler._authentication["scopes"].append("semantic:inspect")
         handler._semantic_request = Mock(side_effect=app.SemanticClientError(
             "asset not found",
             status=HTTPStatus.NOT_FOUND,
@@ -3913,7 +3962,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
             "/api/derived-layers",
             self.definition(),
         )
-        handler._semantic_request = Mock(return_value={"assets": []})
+        handler._semantic_request = Mock(return_value={**self.catalog(), "assets": []})
         derived = Mock()
         with patch.object(
             app,
@@ -4160,6 +4209,11 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
         derived.create.assert_not_called()
 
     def test_background_create_and_replace_receive_resolved_scope(self):
+        workspace = self.workspace()
+        default_extent = {"west": 1, "east": 2, "south": 3, "north": 4}
+        named_extent = {"west": -8, "east": -7, "south": 50, "north": 51}
+        workspace["locale"]["extent"] = default_extent
+        workspace["locales"]["city-centre"]["extent"] = named_extent
         cases = (
             (
                 "/api/derived-layers",
@@ -4175,7 +4229,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 self.definition(
                     confirmed=True,
                     background=True,
-                    spatialScope={"type": "workspace-map-extent"},
+                    spatialScope={"type": "workspace-map-extent", "locale": "city-centre"},
                 ),
                 "replace",
                 "roads_visible",
@@ -4188,7 +4242,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 with patch.object(
                     app,
                     "read_workspace",
-                    return_value=(b"{}", self.workspace(), "revision"),
+                    return_value=(b"{}", workspace, "revision"),
                 ), patch.object(app, "DERIVED", Mock()), patch.object(
                     app,
                     "start_derived_background",
@@ -4200,7 +4254,7 @@ class DerivedMapExtentRouteTests(unittest.TestCase):
                 args = start.call_args.args
                 self.assertEqual(action, args[0])
                 self.assertEqual("workspace-map-extent", args[1]["spatialScope"]["type"])
-                self.assertIn("envelopes", args[1]["spatialScope"])
+                self.assertEqual([named_extent if name else default_extent], args[1]["spatialScope"]["envelopes"])
                 if name is not None:
                     self.assertEqual(name, args[4])
 
@@ -4284,15 +4338,19 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
     def setUp(self):
         super().setUp()
         self.semantic = Mock()
-        self.semantic.request.return_value = {"assets": []}
+        self.semantic.request.return_value = {
+            "assets": [], "catalogRevision": 1, "pagination": {"limit": 100, "nextCursor": None},
+        }
         semantic_patcher = patch.object(app, "SEMANTIC", self.semantic)
         semantic_patcher.start()
         self.addCleanup(semantic_patcher.stop)
+        self.check_profiles = app.require_semantic_derived_sources
         profiles_patcher = patch.object(
             app,
             "require_semantic_derived_sources",
         )
         self.require_profiles = profiles_patcher.start()
+        self.require_profiles.side_effect = lambda payload, assets: list(assets)
         self.addCleanup(profiles_patcher.stop)
 
     @staticmethod
@@ -4667,12 +4725,7 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
                 control.initialize("correct horse battery staple", "instance")
                 derived = Mock()
                 self.require_profiles.reset_mock()
-                self.require_profiles.side_effect = app.DerivedLayerError(
-                    "Derived-layer sources need ready semantic profiles: "
-                    "leeds.safe_places. Synchronize each source with "
-                    "`semantic source sync` before creating or replacing a "
-                    "derived layer."
-                )
+                self.require_profiles.side_effect = self.check_profiles
                 payload = {
                     "name": "safe_places",
                     "kind": "view",
@@ -4724,7 +4777,7 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
                 derived.create.assert_not_called()
                 derived.replace.assert_not_called()
                 self.semantic.request.assert_called_with(
-                    "/v1/catalog",
+                    "/v1/catalog?projection=bindings&limit=100",
                     actor="admin",
                     scopes=["semantic:inspect"],
                 )
@@ -4794,7 +4847,7 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
                 self.assertEqual("preflight", error["failurePhase"])
                 self.assertTrue(error["stateUnchanged"])
                 self.assertNotIn("rolledBack", error)
-                self.require_profiles.assert_not_called()
+                self.require_profiles.assert_called_once()
                 derived.create.assert_not_called()
                 derived.replace.assert_not_called()
                 self.semantic.request.reset_mock(side_effect=True)
@@ -5099,6 +5152,37 @@ class DerivedBackgroundOperationTests(ControlStoreTestCase):
             status="succeeded",
             result={"derivedLayer": derived.create.return_value},
         )
+
+    def test_replacement_completion_retains_exact_generation_and_consumer_fields(self):
+        definition = DerivedSemanticSourcePolicyTests.payload()
+        name = definition["name"]
+        ready = DerivedSemanticSourcePolicyTests.catalog()["assets"]
+        self.require_profiles.side_effect = self.check_profiles
+        self.semantic.request.side_effect = [
+            {"catalogRevision": 101, "assets": [{"status": "ready", "generated": {}}],
+             "pagination": {"limit": 100, "nextCursor": "opaque.cursor"}},
+            {"catalogRevision": 101, "assets": ready, "pagination": {"limit": 100, "nextCursor": None}},
+        ]
+        profile = {"assetId": "asset-7", "generation": 2, "status": "registering", "revision": None}
+        changes = {"added": ["rate"], "removed": [], "changed": ["id"]}
+        workspace = {"locale": {"layers": {"Roads": {"table": f"derived_layers.{name}", "qID": "id"}}}}
+        with patch.object(app, "CONTROL") as control, patch.object(app, "DERIVED") as derived, patch.object(
+            app, "read_workspace", return_value=(b"{}", workspace, "revision"),
+        ), patch.object(app, "schedule_semantic_outbox"):
+            derived.replace.return_value = {**definition, "semanticProfile": profile, "columnChanges": changes}
+            app.run_derived_background("a" * 32, "replace", definition, "token:admin-scope",
+                                       "local", name, semantic_admin=True)
+        for call in self.semantic.request.call_args_list:
+            self.assertEqual(["semantic:inspect", "semantic:admin"], call.kwargs["scopes"])
+        terminal = control.finish_operation.call_args.kwargs
+        self.assertEqual("succeeded", terminal["status"])
+        result = terminal["result"]["derivedLayer"]
+        self.assertEqual(profile, result["semanticProfile"])
+        self.assertEqual(changes, result["columnChanges"])
+        self.assertEqual(["locale.layers.Roads"], result["workspaceReferences"])
+        self.assertEqual(["Roads (default map)"], result["consumerLabels"])
+        self.assertEqual("id", result["fieldReferences"][0]["column"])
+        self.assertTrue(result["requiresSecondOrderChanges"])
 
     def test_confirmed_database_rollback_records_cancelled(self):
         derived = Mock()
@@ -9737,12 +9821,12 @@ class DegradedSourceAuthorizationTests(unittest.TestCase):
         }):
             # Healthy: the source counts, so planning proceeds.
             app.require_semantic_derived_sources(
-                payload, {"assets": [self.asset()]}
+                payload, [self.asset()]
             )
             # Degraded: it must not, and the error must name the source.
             with self.assertRaises(app.DerivedLayerError) as raised:
                 app.require_semantic_derived_sources(
-                    payload, {"assets": [self.asset("unavailable")]}
+                    payload, [self.asset("unavailable")]
                 )
         self.assertIn("source_leeds_ext.orders", str(raised.exception))
 

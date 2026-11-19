@@ -653,6 +653,7 @@ class SemanticStore:
         self,
         *,
         is_admin: bool,
+        bindings_only: bool = False,
         connection: StoreConnection | None = None,
         after_asset_id: str | None = None,
         fetch_limit: int | None = None,
@@ -664,6 +665,7 @@ class SemanticStore:
             with self._reader_connection() as own_connection:
                 return self.list_assets(
                     is_admin=is_admin,
+                    bindings_only=bindings_only,
                     connection=own_connection,
                     after_asset_id=after_asset_id,
                     fetch_limit=fetch_limit,
@@ -675,14 +677,27 @@ class SemanticStore:
         if after_asset_id is not None:
             clauses.append("asset_id > %s")
             values.append(after_asset_id)
+        columns = "*"
+        if bindings_only:
+            # Keep large field inventories, curation and unrelated metadata
+            # out of both the result set and the paginated HTTP response.
+            columns = """asset_id AS id, generation, status, source_state AS "sourceState",
+                jsonb_build_object('binding', jsonb_strip_nulls(jsonb_build_object(
+                    'adapter', generated_json::jsonb #> '{binding,adapter}',
+                    'alias', generated_json::jsonb #> '{binding,alias}',
+                    'schema', generated_json::jsonb #> '{binding,schema}',
+                    'relation', generated_json::jsonb #> '{binding,relation}'
+                ))) AS generated"""
         statement = (
-            f"SELECT * FROM assets WHERE {' AND '.join(clauses)} "
+            f"SELECT {columns} FROM assets WHERE {' AND '.join(clauses)} "
             "ORDER BY asset_id"
         )
         if fetch_limit is not None:
             statement += " LIMIT %s"
             values.append(fetch_limit)
         rows = connection.execute(statement, values).fetchall()
+        if bindings_only:
+            return rows
         return [self._asset_from_row(row) for row in rows]
 
     def search_assets(

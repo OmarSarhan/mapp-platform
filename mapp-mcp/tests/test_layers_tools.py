@@ -647,6 +647,7 @@ class StatisticsQueryTests(unittest.TestCase):
 
 CATALOGUE = {
     "catalogRevision": 53,
+    "pagination": {"limit": 100, "nextCursor": None},
     "assets": [
         {"id": "asset-1", "curated": {
             "displayName": "Census OA Population",
@@ -722,6 +723,17 @@ class SemanticCatalogTests(ToolTestCase):
         # The meaning itself is semantic_catalog_show's job.
         self.assertNotIn("fields", first)
         self.assertNotIn("caveats", first)
+
+    def test_opaque_catalog_continuation_is_returned_and_bound_to_the_next_read(self):
+        self.as_caller(caller())
+        pagination = {"limit": 100, "nextCursor": "opaque.signature"}
+        exchange = FakeExchange()
+        catalog = self.tool("semantic_catalog_list", {**CATALOGUE, "pagination": pagination}, exchange)
+        first = catalog()
+        self.assertEqual(pagination, first["pagination"])
+        catalog(cursor=first["pagination"]["nextCursor"])
+        self.assertEqual(["limit=100", "limit=100&cursor=opaque.signature"],
+                         [call["query"] for call in exchange.calls])
 
     def test_a_long_description_is_truncated_in_the_index(self) -> None:
         """These run to paragraphs; the point of an index is that it fits."""
@@ -884,18 +896,29 @@ class DerivedLayerTests(ToolTestCase):
 
     def test_show_returns_one_entry(self) -> None:
         self.as_caller(caller())
-        entry = self.tool("derived_layers_show")(name="census_oa_population_quintiles")
-        self.assertEqual(["source_ops.census_oa"], entry["sources"])
+        name = "census_oa_population_quintiles"
+        stored = {"name": name, "kind": "view", "sources": ["source_ops.census_oa"], "query": "SELECT 1"}
+        exchange = FakeExchange()
+        entry = self.tool("derived_layers_show", {"derivedLayer": stored}, exchange)(name=name)
+        self.assertEqual(stored, entry)
+        self.assertEqual("inspect", exchange.calls[0]["scope"])
 
-    def test_an_unknown_name_lists_the_managed_relations(self) -> None:
-        """The alternatives are already in hand; making the agent call again to
-        learn them wastes a turn and a credential."""
+    def test_definition_named_like_a_fixed_route_binds_its_query(self):
+        self.as_caller(caller())
+        for name in ("capabilities", "drafts"):
+            with self.subTest(name=name):
+                exchange = FakeExchange()
+                stored = {"name": name, "kind": "view", "query": "SELECT 1"}
+                self.assertEqual(stored, self.tool("derived_layers_show", {"derivedLayer": stored}, exchange)(name=name))
+                self.assertEqual("derived-layers.show", exchange.calls[0]["operation_id"])
+                self.assertEqual("definition=true", exchange.calls[0]["query"])
+
+    def test_a_collection_response_cannot_substitute_for_one_definition(self) -> None:
         self.as_caller(caller())
         with self.assertRaises(ToolError) as caught:
             self.tool("derived_layers_show")(name="nope")
         message = str(caught.exception)
-        self.assertIn("census_oa_population_quintiles", message)
-        self.assertIn("definitive_paths_length_costs", message)
+        self.assertIn("nope", message)
 
     def test_it_costs_only_the_discovery_scope(self) -> None:
         """Reading how a relation was built is configuration, not data."""
@@ -1697,6 +1720,24 @@ class ContractAndProgressToolTests(ToolTestCase):
         self.assertEqual("visual.failed", detail["error"]["code"])
         self.assertEqual("object", detail["error"]["diagnosis"]["type"])
 
+    def test_replacement_poll_preserves_generation_and_bounded_impact(self):
+        self.as_caller(caller())
+        profile = {"assetId": "asset-7", "generation": 2, "status": "registering", "revision": None}
+        derived = {"name": "roads", "kind": "view", "semanticProfile": profile,
+                   "columnChanges": {"added": ["count"], "removed": [], "changed": ["rate"]},
+                   "fieldReferences": [{"column": "rate", "usage": "hover text"}],
+                   "workspaceReferences": ["locale.layers.roads"],
+                   "consumerLabels": ["Map roads"] * 33, "requiresSecondOrderChanges": True,
+                   "query": "private definition"}
+        operation = {"kind": "derived-layer.replace", "status": "succeeded", "result": {"derivedLayer": derived}}
+        detail = self.tool("operations_show", {"operation": operation})(operation_id="op-1")
+        returned = detail["result"]["derivedLayer"]
+        for key in ("semanticProfile", "columnChanges", "fieldReferences", "workspaceReferences", "requiresSecondOrderChanges"):
+            self.assertEqual(derived[key], returned[key])
+        self.assertEqual(32, len(returned["consumerLabels"]))
+        self.assertEqual({"consumerLabels": 1}, returned["omittedCounts"])
+        self.assertNotIn("private definition", str(detail))
+
     def test_an_operation_costs_derive_not_inspect(self) -> None:
         """The route admits any credential and then demands the scope the
         operation's kind would have cost. An exchanged credential carries only
@@ -2012,6 +2053,19 @@ class ToolVisibilityTests(ToolTestCase):
         # Needs derive; needs semantic:inspect; needs federation:observe.
         for hidden in ("layers_values", "semantic_status", "federation_list"):
             self.assertNotIn(hidden, listed)
+
+    def test_map_apply_discovery_requires_all_three_prerequisites(self):
+        scopes = {"inspect", "visual", "apply"}
+        for absent in scopes:
+            self.assertNotIn("proposals_apply", self.listed("mcp:connect " + " ".join(scopes - {absent})))
+        self.assertIn("proposals_apply", self.listed("mcp:connect inspect visual apply"))
+
+    def test_derived_mutation_discovery_requires_inspection_for_review_and_approval(self):
+        mutations = {f"derived_layers_{verb}" for verb in ("create", "replace", "refresh", "drop")}
+        narrow = "mcp:connect derive:manage semantic:inspect"
+        self.assertTrue(mutations.isdisjoint(self.listed(narrow)))
+        self.assertTrue(mutations.issubset(self.listed(narrow + " inspect")))
+        self.assertIn("derived_layers_plan", self.listed(narrow))
 
     def test_each_scope_adds_exactly_the_tools_that_need_it(self) -> None:
         base = set(self.listed("mcp:connect inspect"))

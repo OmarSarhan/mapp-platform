@@ -520,13 +520,16 @@ class SemanticHandler(BaseHTTPRequestHandler):
         scopes = self._require_any_scope(READ_SCOPES)
         is_admin = "semantic:admin" in scopes
         if path == "/v1/catalog":
-            limit, cursor, paginated = self._pagination_parameters(query)
+            limit, cursor, paginated = self._pagination_parameters(query, allowed={"projection"})
+            projection = self._one_query(query, "projection")
+            if projection is not None and (projection != "bindings" or not paginated):
+                raise SemanticError("invalid_request", "Use projection=bindings with pagination.")
             with self.server.store.read_snapshot() as (
                 connection,
                 revision,
             ):
                 scope = self._pagination_scope(
-                    "catalog-v1", revision, is_admin
+                    "catalog-bindings-v1" if projection else "catalog-v1", revision, is_admin
                 )
                 after = (
                     self._string_position(self._decode_cursor(cursor, scope))
@@ -535,6 +538,7 @@ class SemanticHandler(BaseHTTPRequestHandler):
                 )
                 assets = self.server.store.list_assets(
                     is_admin=is_admin,
+                    bindings_only=projection == "bindings",
                     connection=connection,
                     after_asset_id=after,
                     fetch_limit=(

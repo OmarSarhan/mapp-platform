@@ -12,6 +12,7 @@ left waiting.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -1219,7 +1220,10 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         def get(self, **kwargs):
             self.calls.append({"method": "GET", **kwargs})
             if kwargs["path"] == "/api/derived-layers":
-                return {"derivedLayers": [self.outer.ENTRY]}
+                return {"derivedLayers": [{key: value for key, value in self.outer.ENTRY.items()
+                                           if key != "query"}]}
+            if kwargs["path"] == "/api/derived-layers/census_h3":
+                return {"derivedLayer": self.outer.ENTRY}
             if kwargs["path"] == "/api/dependencies":
                 return {"dependencies": self.dependents}
             return {}
@@ -1245,7 +1249,7 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 APPROVALS_CREATE["path_template"]
             )[0]["body"]["packet"]
 
-    def build(self, name, api):
+    def build(self, name, api, scopes="mcp:connect inspect derive semantic:inspect derive:manage"):
         server = build_runtime(
             resource=ProtectedResource(
                 origin="http://mcp.localhost", issuer="http://mcp.localhost"
@@ -1255,8 +1259,7 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         token = CURRENT_CALLER.set(Authenticated(
             {"sub": "oauth:grant",
-             "scope": "mcp:connect inspect derive semantic:inspect"
-                      " derive:manage",
+             "scope": scopes,
              "aud": "http://mcp.localhost/mcp"},
             "mapp_a_live",
         ))
@@ -1320,21 +1323,12 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"confirmed": True}, dropped[0]["body"])
         self.assertEqual(RECEIPT, dropped[0]["receipt"])
 
-    async def test_a_name_is_encoded_never_interpreted(self) -> None:
-        """Named exactly. No pattern, and nothing the path could reinterpret."""
+    async def test_invalid_definition_name_stops_before_inspection(self) -> None:
         api = self.Api(self, dependents=self.reading())
-        api.get = lambda **kw: (
-            {"derivedLayers": [{**self.ENTRY, "name": "a/b"}]}
-            if kw["path"] == "/api/derived-layers"
-            else {"dependencies": []}
-        )
         drop = self.build("derived_layers_drop", api)
-        await drop(self.agreeing(), "a/b")
-        self.assertTrue(
-            any(c["path"] == "/api/derived-layers/a%2Fb/drop"
-                for c in api.calls),
-            [c["path"] for c in api.calls],
-        )
+        with self.assertRaisesRegex(ToolError, "Invalid derived-layer name"):
+            await drop(self.agreeing(), "a/b")
+        self.assertEqual([], api.calls)
 
     async def test_dropping_something_that_is_not_there_says_what_is(
         self,
@@ -1343,7 +1337,24 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         drop = self.build("derived_layers_drop", api)
         with self.assertRaises(ToolError) as raised:
             await drop(self.agreeing(), "no_such_thing")
-        self.assertIn("census_h3", str(raised.exception))
+        self.assertIn("no_such_thing", str(raised.exception))
+
+    async def test_minimum_grant_requires_foreground_before_approval_or_dispatch(self):
+        for verb in ("create", "replace", "refresh"):
+            with self.subTest(verb=verb):
+                api = self.Api(self)
+                arguments = ["census_h3"]
+                if verb != "refresh":
+                    arguments.extend(["SELECT 1", ["source_census.oa"], "id", "geom"])
+                fn = self.build("derived_layers_" + verb, api, scopes="mcp:connect inspect derive:manage semantic:inspect")
+                ctx = self.agreeing()
+                with self.assertRaisesRegex(ToolError, "background=false"):
+                    await fn(ctx, *arguments)
+                self.assertEqual([], ctx.asked)
+                self.assertEqual([], api.calls)
+                await fn(ctx, *arguments, background=False)
+                self.assertTrue(ctx.asked)
+                self.assertIs(False, api.calls[-1]["body"]["background"])
 
     async def test_a_replace_shows_what_it_is_today(self) -> None:
         """A replace is the quiet one: everything reading the relation keeps
@@ -1361,7 +1372,31 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("SELECT 2", packet["changes"][0]["becomes"])
         self.assertEqual(["locale:Census_OA_Population"],
                          packet["dependents"]["workspaceLayers"])
-        self.assertIn("different numbers", packet["note"])
+        self.assertIn("immediately", packet["note"])
+
+    async def test_same_sql_preserves_named_extent_and_shows_definition_changes(self):
+        extents = {"locale": {"west": 2, "east": 3, "south": 0, "north": 1},
+                  "west": {"west": -8, "east": -7, "south": 50, "north": 51}}
+        self.ENTRY = {**self.ENTRY, "idColumn": "id", "geometryColumn": "geom",
+                      "description": "Regional labels",
+                      "spatialScope": {"type": "workspace-map-extent", "locale": "west",
+                                       "envelopes": [extents["west"]]}}
+        api = self.Api(self)
+        ctx = self.agreeing()
+        await self.build("derived_layers_replace", api)(
+            ctx, "census_h3", self.ENTRY["query"], ["source_census.labels"], "label_id", "label_geom",
+        )
+        body = api.posted_to("/api/derived-layers/census_h3/replace")[0]["body"]
+        self.assertEqual({"type": "workspace-map-extent", "locale": "west"}, body["spatialScope"])
+        self.assertEqual(self.ENTRY["spatialScope"]["envelopes"], [extents[body["spatialScope"]["locale"]]])
+        self.assertEqual("Regional labels", body["description"])
+        changes = {item["path"].rsplit(".", 1)[-1]: item for item in api.packet()["changes"]}
+        self.assertIn('"west": -8', changes["spatialScope"]["was"])
+        self.assertIn("west", changes["spatialScope"]["becomes"])
+        for key, old, new in (("geometryColumn", "geom", "label_geom"), ("idColumn", "id", "label_id")):
+            self.assertEqual((old, new), (changes[key]["was"], changes[key]["becomes"]))
+        for value in ("label_geom", "label_id", "source_census.labels", "extent of west"):
+            self.assertIn(value, ctx.asked[0][1])
 
     async def test_a_replace_with_no_dependents_says_so(self) -> None:
         api = self.Api(self, dependents=self.reading())
@@ -1370,7 +1405,38 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.agreeing(), "census_h3", "SELECT 2",
             ["source_census.oa"], "oa_id", "geom_3857",
         )
-        self.assertIn("Nothing else reads", api.packet()["note"])
+        self.assertIn("Coverage is partial", api.packet()["note"])
+
+    async def test_late_sql_change_and_known_consumers_reach_native_review(self):
+        prefix = "SELECT " + "a, " * 5000
+        shared = " + 0" * 2000
+        self.ENTRY = {**self.ENTRY, "query": prefix + "sum(population)" + shared + " AS total"}
+        proposed = prefix + "avg(population)" + shared + " AS rate"
+        names = ["locale:houses", *[f"locale:zoom_map_{i}" for i in range(80)]]
+        api = self.Api(self, dependents=self.reading(workspace=names, derived=["overlay"]))
+        ctx = self.agreeing()
+        await self.build("derived_layers_replace", api)(
+            ctx, "census_h3", proposed,
+            ["source_census.oa"], "oa_id", "geom_3857", kind="view",
+        )
+        packet = api.packet()
+        self.assertIn("sum(population)", packet["changes"][1]["was"])
+        self.assertIn("avg(population)", packet["changes"][1]["becomes"])
+        self.assertLess(len(json.dumps(packet).encode()), 5000)
+        message = ctx.asked[0][1]
+        for text in ("sum(population)", "avg(population)", "AS total", "AS rate", "locale:houses", "overlay",
+                     "partial", "immediately", "can block", "12 of 81", "explicit refresh"):
+            self.assertIn(text, message)
+        self.assertFalse(any(c["path"] == "/api/derived-layers" for c in api.calls))
+        self.assertEqual(proposed, api.posted_to("/api/derived-layers/census_h3/replace")[0]["body"]["query"])
+
+    async def test_invalid_conversion_kind_never_enters_an_approval_packet(self):
+        api = self.Api(self)
+        replace = self.build("derived_layers_replace", api)
+        with self.assertRaisesRegex(ToolError, "kind must be"):
+            await replace(self.agreeing(), "census_h3", "SELECT 2", ["source_census.oa"],
+                          "oa_id", "geom_3857", kind="x" * 5000)
+        self.assertEqual([], api.calls)
 
     async def test_replace_exposes_materialization_conversion_in_approval(self) -> None:
         for target_kind in ("view", "materialized"):
@@ -1380,8 +1446,8 @@ class DerivedLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 original_get = api.get
                 def get(**kwargs):
                     result = original_get(**kwargs)
-                    if kwargs["path"] == "/api/derived-layers":
-                        result["derivedLayers"] = [{**entry, "kind": "view"} for entry in result["derivedLayers"]]
+                    if kwargs["path"] == "/api/derived-layers/census_h3":
+                        result["derivedLayer"] = {**result["derivedLayer"], "kind": "view"}
                     return result
                 api.get = get
             replace = self.build("derived_layers_replace", api)

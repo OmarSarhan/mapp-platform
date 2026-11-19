@@ -1,4 +1,5 @@
 import React from 'react';
+import {renderedLocales} from './api.js';
 import {afterEach, describe, expect, test, vi} from 'vitest';
 import {
   cleanup,
@@ -19,6 +20,7 @@ import {
   ApprovalDetail,
   referencedApproval,
   ApprovalWindows,
+  McpClients,
   McpGrants,
   Security,
   TOKEN_ACCESS_PRESETS,
@@ -788,6 +790,50 @@ describe('Dashboard managed save lifecycle', () => {
     expect(await screen.findByRole('button', {name: 'Bus Stops'})).toBeTruthy();
   });
 
+  test('discovers tables independently of icons and distinguishes stale, empty and failed reads', async () => {
+    let finish;
+    const first = new Promise(resolve => { finish = resolve; });
+    const row = {dbs: 'MAPP', schema: 'roads', table: 'lines', columns: [
+      {name: 'geom', geometryType: 'LineString', srid: 3857},
+    ]};
+    const tables = vi.fn().mockReturnValueOnce(first)
+      .mockResolvedValueOnce(response({error: 'reader unavailable'}, 502))
+      .mockResolvedValueOnce(response({tables: [row, {...row,table:'wgs84',columns:[{name:'id',primaryKey:true},{name:'geom',geometryType:'Point',srid:4326}]}, {...row,table:'labels',columns:[{name:'id',type:'integer'}]}], databases: ['MAPP']}))
+      .mockResolvedValueOnce(response({error: 'reader unavailable'}, 502))
+      .mockResolvedValueOnce(response({tables: [], databases: ['MAPP']}));
+    const fallback = standardFetch(() => response({}));
+    vi.stubGlobal('fetch', vi.fn((path, options) => {
+      if (path === '/api/catalog') return tables();
+      if (path === '/api/icons') return Promise.resolve(response({error: 'icons offline'}, 502));
+      return fallback(path, options);
+    }));
+    render(<Dashboard/>);
+    fireEvent.click(await screen.findByRole('button', {name: 'Source catalog'}));
+    expect(screen.getByText(/Loading table catalog/)).toBeTruthy();
+    expect(screen.queryByText(/No relations match/)).toBeNull();
+    expect(screen.getByRole('button', {name: 'Retry icon discovery'})).toBeTruthy();
+    finish(response({error: 'reader unavailable'}, 502));
+    await screen.findByText(/Table discovery failed/);
+    fireEvent.click(screen.getByRole('button', {name: 'Retry table discovery'}));
+    await screen.findByText(/Table discovery failed/);
+    fireEvent.click(screen.getByRole('button', {name: 'Retry table discovery'}));
+    fireEvent.click(await screen.findByRole('button', {name: /roads\.labels/}));
+    expect(screen.getByText(/A geometry column is required/)).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', {name: /roads\.lines/}));
+    expect(screen.getByText(/feature ID column is required/i)).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', {name: /roads\.wgs84/}));
+    expect(screen.getByText(/requires an EPSG:3857 geometry column/)).toBeTruthy();
+    expect(screen.getByRole('button', {name: 'Add selected table as layer'}).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', {name: 'Refresh table discovery'}));
+    await screen.findByText(/Showing last successful table discovery/);
+    expect(screen.getByRole('button', {name: /roads\.lines/})).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', {name: 'Retry table discovery'}));
+    await screen.findByText(/No readable spatial relations/);
+    expect(screen.queryByRole('button', {name: /roads\.lines/})).toBeNull();
+  });
+
   test('explains that advanced configuration is optional and links to its guide', async () => {
     vi.stubGlobal('fetch', standardFetch(() => response({})));
     render(<Dashboard openSecurity={() => {}}/>);
@@ -895,7 +941,7 @@ describe('Dashboard managed save lifecycle', () => {
     const result = reconcileDerivedWorkspace(source, {
       name: 'summary',
       columnChanges: {added: ['new_count'], removed: ['old_name'], changed: []},
-    }, tables);
+    }, tables[0].columns);
     const layer = result.workspace.locale.layers.Summary;
     expect(layer.infoj.map(entry => entry.title)).toEqual([
       undefined, 'Calculated', 'Kept', 'New Count',
@@ -912,8 +958,29 @@ describe('Dashboard managed save lifecycle', () => {
       reason: 'derived_schema_changed',
       relation: 'derived_layers.summary',
     });
-    expect(result.summary).toEqual({layers: 1, added: 1, removed: 1});
+    expect(result.summary).toEqual({layers: 1, added: 1, removed: 1, skipped: [], localeConflicts: []});
     expect(source.locale.layers.Summary.infoj).toHaveLength(4);
+  });
+
+  test('leaves inherited field collisions for manual review while adding safe fields', () => {
+    const calculated = {field: 'total', type: 'numeric', fieldfx: 'length_m * 2'};
+    const source = {
+      ...workspace,
+      locale: {...workspace.locale, layers: {Summary: {
+        table: 'derived_layers.summary', qID: 'id', infoj: [],
+      }}},
+      locales: {west: {layers: {Summary: {infoj: [calculated]}}}},
+    };
+    const result = reconcileDerivedWorkspace(source, {
+      name: 'summary', columnChanges: {added: ['total', 'safe'], removed: [], changed: []},
+    }, [{name: 'total', type: 'integer'}, {name: 'safe', type: 'integer'}]);
+    expect(result.workspace.locale.layers.Summary.infoj.map(entry => entry.field)).toEqual(['safe']);
+    expect(result.workspace.locales.west.layers.Summary.infoj).toEqual([calculated]);
+    expect(result.summary.localeConflicts).toEqual(['west:Summary']);
+    expect(result.summary.added).toBe(1);
+    const west = renderedLocales(result.workspace).find(([name]) => name === 'west')[1];
+    expect(west.layers.Summary.infoj.map(entry => entry.field)).toEqual(['safe', 'total']);
+    expect(source.locale.layers.Summary.infoj).toEqual([]);
   });
 
   test('refreshes the derived-layer form after converting its kind', async () => {
@@ -964,6 +1031,9 @@ describe('Dashboard managed save lifecycle', () => {
       if (path === '/api/derived-layers/hex_summary' && !options.method) {
         return response({derivedLayer: materialized});
       }
+      if (path === '/api/dependencies') return response({dependencies: [
+        {relation: 'derived_layers.hex_summary', workspaceLayers: ['locale:Hex'], derivedLayers: ['hex_totals']},
+      ]});
       if (
         path === '/api/derived-layers/hex_summary/replace'
         && options.method === 'POST'
@@ -980,7 +1050,12 @@ describe('Dashboard managed save lifecycle', () => {
       name: 'Edit or delete derived_layers.hex_summary',
     });
     fireEvent.change(actions, {target: {value: 'convert'}});
-
+    const review = await screen.findByRole('region', {name: 'Review derived replacement'});
+    expect(within(review).getByText('locale:Hex')).toBeTruthy();
+    expect(within(review).getByText('hex_totals')).toBeTruthy();
+    expect(within(review).getByText(/materialized → view/)).toBeTruthy();
+    expect(replacementPayload).toBeUndefined();
+    fireEvent.click(within(review).getByRole('button', {name: 'Confirm in-place replacement'}));
     await screen.findByRole('heading', {
       name: 'Edit derived_layers.hex_summary',
     });
@@ -2470,6 +2545,12 @@ describe('MCP agent client administration', () => {
     }
   });
 
+  test('the derive preset explains standing approval and individual map apply', () => {
+    render(<McpClients clients={[]} busy={false}/>);
+    fireEvent.change(screen.getByLabelText('MCP client access level'), {target:{value:'authoring-derive'}});
+    expect(screen.getByText(/Eligible derived changes can use standing approval\. Map proposal apply always requires individual approval/)).toBeTruthy();
+  });
+
   test('the federated preset is the recommended one plus source visibility', () => {
     // Separate presets rather than one wider default. federation:observe
     // discloses which third-party databases sit behind the platform, which is a
@@ -2780,6 +2861,19 @@ describe('Standing approvals', () => {
 });
 
 describe('Agent approvals', () => {
+  test('shows both SQL excerpts, partial consumer coverage and the packet note', () => {
+    const packet = {
+      summary: 'Replace roads.', changes: [{op:'replace',path:'derived_layers.roads.query',
+        was:'… count(*)',becomes:'… sum(population)'}],
+      dependents: {workspaceLayers:['cy:Zoom roads'],derivedLayers:['road_totals']},
+      note: 'Published consumers read the new definition on their next query.',
+    };
+    render(<ApprovalDetail approval={{...WAITING, packet}} busy={false} decide={vi.fn()}/>);
+    for (const text of ['… count(*)','… sum(population)','cy:Zoom roads','road_totals',packet.note]) {
+      expect(screen.getByText(text)).toBeTruthy();
+    }
+    expect(screen.getByText(/Coverage is partial/)).toBeTruthy();
+  });
   test('nothing is decided from the list alone', () => {
     // A row names an operation. Approving on that much is how approval
     // fatigue starts, and the threat model already carries it unmitigated.
