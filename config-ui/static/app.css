@@ -257,6 +257,7 @@ input:focus,select:focus,textarea:focus{outline:2px solid #3165d440;border-color
 .layer-editor>.form-head{border-bottom:0}
 .layer-section>summary{background:var(--paper)}
 .layer-section[open]>summary{background:var(--paper)}
+.boundary-report pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .info-tip{width:28px;height:28px;margin:-6px;color:var(--muted);filter:none}
 .info-tip::before{content:none}
 .generated-badge,.semantic-state,.approval-risk,.federation-status{border-radius:2px}
