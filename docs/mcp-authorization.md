@@ -89,7 +89,7 @@ outright. A permissive redirect URI is a working way to have authorization
 codes delivered somewhere else, and the server matches them with no prefix or
 wildcard allowance, so the validation belongs here.
 
-The scopes are *not* checked against a vocabulary at registration. The
+The issuer accepts 14 scopes. The scopes are *not* checked against a vocabulary at registration. The
 authorization server decides what it will issue and derives that from the
 operation allowlist; restating the vocabulary in a third place is a drift this
 platform has already been bitten by. A scope the server will not issue produces
@@ -786,7 +786,7 @@ sign-in is what makes P19's 90-day floor and purge-under-pressure required.
 
 Phase 0 stops deliberately short in several places:
 
-- the operation allowlist covers 53 of the platform's 69 actions, and adding
+- the operation allowlist covers 57 of the platform's 73 actions, and adding
   one is a deliberate act in three places. It was 38 when Phase 0 closed;
 - a refused authorization is not recorded in the audit trail. A failed operator
   sign-in is (`auth.login_failed`), as are the client and grant lifecycle

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from http import HTTPStatus
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import app
@@ -26,6 +28,7 @@ class VisualOperationRoutesTests(unittest.TestCase):
         self.assertEqual("visual.operations.show", resolved[0])
 
     def test_visual_only_reader_can_poll_running_and_finished_previews(self):
+        root = Path(self.enterContext(TemporaryDirectory()))
         for kind in ("visual.test", "proposal.visual-test", "proposal.screenshot"):
             for status in ("running", "succeeded", "failed", "indeterminate"):
                 with self.subTest(kind=kind, status=status):
@@ -34,15 +37,28 @@ class VisualOperationRoutesTests(unittest.TestCase):
                     operation = {
                         "id": "a" * 32, "kind": kind, "status": status,
                         "stage": "candidate-page-readiness",
+                        "target": {"proposalId": "proposal-1", "candidateHash": "b" * 64,
+                                   "originalRevision": "revision-1"},
                         "result": {"visual": {"artifacts": {
                             "afterMap": "run/after-map.png"}}},
                     }
                     control = MagicMock()
+                    control.root = root
                     control.read_operation.return_value = operation
                     with patch.object(app, "CONTROL", control):
                         handler.do_GET()
-                    self.assertEqual((HTTPStatus.OK, {"operation": operation}),
-                                     responses[0])
+                    code, response = responses[0]
+                    self.assertEqual(HTTPStatus.OK, code)
+                    if kind.startswith("proposal.") and status in ("succeeded", "failed"):
+                        review = response.pop("review")
+                        binding = dict(review["binding"])
+                        self.assertRegex(binding.pop("evidenceFingerprint"), r"^[0-9a-f]{64}$")
+                        self.assertEqual({**operation["target"], "evidenceOperationId": operation["id"]}, binding)
+                        self.assertEqual(["map", "legend", "popup"], review["missingCandidateCaptures"])
+                        self.assertFalse(review["eligible"])
+                        self.assertFalse(review["complete"])
+                        self.assertTrue(all("download" not in item for item in review["captures"]))
+                    self.assertEqual({"operation": operation}, response)
 
     def test_visual_endpoint_cannot_read_derived_or_apply_operations(self):
         for kind in ("derived-layer.create", "proposal.apply", "xyz.reload"):
