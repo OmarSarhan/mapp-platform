@@ -134,6 +134,32 @@ class TokenBTestCase(unittest.TestCase):
 
 
 class AuthenticationTests(TokenBTestCase):
+    def test_named_definition_checks_inspect_and_redeems_only_the_named_read(self):
+        for name, query in (("roads", ""), ("drafts", "?definition=true"), ("capabilities", "?definition=true")):
+            for scope in ("derive", "inspect"):
+                with self.subTest(scope=scope, name=name):
+                    self.check_named_definition(name, query, scope)
+
+    def check_named_definition(self, name, query, scope):
+        stored = {"name": name, "kind": "view", "query": "SELECT 1"}
+        tokens = StubTokens(record={"active": True, "scope": scope, "sub": GRANT,
+                                    "aud": CONFIG_RESOURCE, "client_id": "mcp-1"})
+        handler = self.build(method="GET", path=f"/api/derived-layers/{name}{query}",
+                             body=b"", tokens=tokens, receipt=None)
+        handler._host_allowed = lambda: True
+        with unittest.mock.patch.object(app, "DERIVED") as store:
+            store.get.return_value = stored
+            handler.do_GET()
+            if scope == "derive":
+                self.assertEqual(403, self.responses[0][0])
+                self.assertEqual([], tokens.redeemed)
+                store.get.assert_not_called()
+            else:
+                self.assertEqual([(200, {"derivedLayer": stored})], self.responses)
+                self.assertEqual("derived-layers.show", tokens.redeemed[0][1])
+                store.get.assert_called_once_with(name)
+            store.list.assert_not_called()
+
     def test_a_valid_token_authenticates_as_its_grant(self) -> None:
         """P3: the actor is the grant, so the audit trail resolves to a consent."""
         handler = self.build()

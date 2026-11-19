@@ -259,11 +259,11 @@ class ThreatModelClaimTests(unittest.TestCase):
                 self.assertFalse(requires_approval(name))
 
     def test_operation_and_read_counts_match_the_document(self) -> None:
-        self.assertIn("57 allowlisted", THREAT_MODEL)
-        self.assertIn("Forty-two are reads", THREAT_MODEL)
-        self.assertEqual(57, len(operations.OPERATIONS))
+        self.assertIn("58 allowlisted", THREAT_MODEL)
+        self.assertIn("Forty-three are reads", THREAT_MODEL)
+        self.assertEqual(58, len(operations.OPERATIONS))
         self.assertEqual(
-            42,
+            43,
             sum(
                 not operation.mutating
                 for operation in operations.OPERATIONS.values()

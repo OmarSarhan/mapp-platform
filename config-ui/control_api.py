@@ -1077,6 +1077,13 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
         "risk": "inspect",
         "scope": "inspect",
     },
+    "derived-layers.show": {
+        "method": "GET",
+        "pathTemplate": "/api/derived-layers/{name}",
+        "risk": "inspect",
+        "scope": "inspect",
+        "description": "Read one managed definition including SQL. For relations named drafts or capabilities use ?definition=true.",
+    },
     "derived-layers.map-extent": {
         "method": "GET",
         "path": "/api/derived-layers/map-extent",

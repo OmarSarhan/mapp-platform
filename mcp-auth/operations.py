@@ -114,6 +114,13 @@ OPERATIONS: dict[str, Operation] = {
         required_scopes=("inspect",),
         mutating=False,
     ),
+    "derived-layers.show": Operation(
+        operation_id="derived-layers.show",
+        method="GET",
+        path_template="/api/derived-layers/{name}",
+        required_scopes=("inspect",),
+        mutating=False,
+    ),
     "derived-layers.drafts": Operation(
         operation_id="derived-layers.drafts",
         method="GET",
