@@ -90,7 +90,7 @@ def advance_recovery_epoch_command(args, store) -> bool:
         return False
     if not args.confirm:
         try:
-            epoch = store.recovery_epoch()
+            epoch = store.recovery_epoch(expected_instance=args.expect_instance)
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from None
         print(f"Current recovery epoch: {epoch}.")
@@ -117,11 +117,10 @@ def advance_recovery_epoch_command(args, store) -> bool:
         )
         raise SystemExit(2)
     try:
-        result = store.advance_recovery_epoch(reason=args.reason or "operator")
+        result = store.advance_recovery_epoch(
+            reason=args.reason or "operator", expected_instance=args.expect_instance,
+        )
     except RuntimeError as exc:
-        # Now reachable: the store no longer migrates before checking. This is
-        # the refusal docs/backup-restore.md documents for a dump that predates
-        # the mechanism, so it must read as guidance rather than a traceback.
         raise SystemExit(str(exc)) from None
     print(f"Recovery epoch is now {result['epoch']}.")
     for table, count in sorted(result["revoked"].items()):

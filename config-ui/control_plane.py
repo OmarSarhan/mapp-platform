@@ -439,15 +439,19 @@ class ControlStore:
 
     # -- recovery epoch --------------------------------------------------
 
-    def recovery_epoch(self) -> int:
+    def recovery_epoch(self, *, expected_instance: str | None = None) -> int:
         with self._db(migrate=False) as connection:
-            control_schema.restored_control_state(connection, require_current=True)
+            control_schema.restored_control_state(
+                connection, expected_instance=expected_instance, require_current=True,
+            )
             row = connection.execute(
                 "SELECT control.current_recovery_epoch() AS epoch"
             ).fetchone()
             return int(row["epoch"])
 
-    def advance_recovery_epoch(self, *, reason: str = "restore") -> dict:
+    def advance_recovery_epoch(
+        self, *, reason: str = "restore", expected_instance: str | None = None,
+    ) -> dict:
         """Invalidate every credential minted before now. Returns what it did.
 
         The control for the one hole a database restore opens: a snapshot
@@ -501,7 +505,9 @@ class ControlStore:
                     "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
                     (control_schema.MIGRATION_LOCK,),
                 )
-                control_schema.restored_control_state(connection, require_current=True)
+                control_schema.restored_control_state(
+                    connection, expected_instance=expected_instance, require_current=True,
+                )
                 # Upsert, not update. A missing row means zero -- which is what
                 # current_recovery_epoch() already reports -- and an absent row
                 # must not be able to brick the one control that matters at

@@ -136,8 +136,8 @@ not place it in the same unencrypted archive as public release files.
    Review the epoch and invalidate restored authority at a separate checkpoint:
 
    ```bash
-   ./bin/mapp advance-recovery-epoch
-   ./bin/mapp advance-recovery-epoch --confirm
+   ./bin/mapp advance-recovery-epoch --expect-instance "$BACKUP_INSTANCE_ID"
+   ./bin/mapp advance-recovery-epoch --confirm --expect-instance "$BACKUP_INSTANCE_ID"
    ```
 
    A snapshot contains every credential that was valid when it was taken,

@@ -286,6 +286,11 @@ class AdvanceRecoveryEpochCommandTests(ControlStoreTestCase):
         self.assertIn("oauth_grants", output)
         self.assertEqual(1, self.store.recovery_epoch())
 
+    def test_wrong_manifest_instance_refuses_the_sweep(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "manifest"):
+            self.run_command("--confirm", "--expect-instance", "wrong")
+        self.assertEqual(0, self.store.recovery_epoch())
+
     def test_it_says_so_when_nothing_was_live(self) -> None:
         """A restore of an idle snapshot is a normal case, not a silent no-op."""
         handled, output = self.run_command("--confirm")
