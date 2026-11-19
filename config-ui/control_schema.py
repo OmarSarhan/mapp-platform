@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
+import json
 import os
 from typing import Iterator
 
@@ -111,6 +113,52 @@ def transaction(connection: psycopg.Connection) -> Iterator[psycopg.Connection]:
         raise
 
 
+# The restore path accepts the release-owned schema that the ledger claims.
+# These signatures are generated from the migration ladder in a clean database.
+# Scope the catalogue reads to our tables and omit physical order and OIDs,
+# which change across dump/restore. PostgreSQL 18 exposes NOT NULL as a named
+# constraint too; attnotnull already describes it on all supported versions.
+RESTORE_SCHEMA_SIGNATURES = {
+    1: "1c8ef42eab75d1d09ebea4b8ff127b6b43a3b095b82393b07040dc13cab06014",
+    2: "0c6e0d3070323a11650a1d37a28b63e5ec1fabbc80df8ef792018c5c62d04e64",
+    3: "7d923f04e89050a7d32fcc2fd5ea2050ea5183161b2bd9070b31130301a4a14a",
+    4: "b987378a74580068509142928c7cced2e58aa17d60d64c2bbee5b211dc5cdefb",
+    5: "681fb55aa2750bdc6071d384753c13e18d5aeed81a59452be11f8a9b3c4d7774",
+    6: "122ee7cde2330de26bd16fa535ddf66bb051b7e39d133a61751cc193deadfde9",
+    7: "375daf9f0892ab7a912530f7ba4149b6fada41b7cffe26711548e7f0dce9db6e",
+    8: "bc8e7503d93c842694fec5abcd818c97594353d134c562779f1cf188e2de3e7a",
+    9: "b3e36d982799ee3bba8d9f10b072aee3d6a2af91a8dbc7ba5ff334d4614f8f70",
+    10: "b8c42d797020d4a31ab9aa05695c370b97b2070a465fe496e1f57f78d83e1adb",
+    11: "dbda094623b4c05f8b0146c8706c1acc33e307077a20cc0697ffbe98b04c8514",
+}
+
+
+def _restore_schema_signature(connection):
+    definitions = connection.execute("""
+        WITH owned AS (
+            SELECT oid, relname FROM pg_class
+            WHERE relnamespace = 'control'::regnamespace AND relkind = 'r'
+              AND relname = ANY(%s)
+        )
+        SELECT t.relname, 'column' AS kind, a.attname AS name,
+               concat_ws('|', format_type(a.atttypid, a.atttypmod), a.attnotnull,
+                         pg_get_expr(d.adbin, d.adrelid)) AS definition
+        FROM owned t JOIN pg_attribute a ON a.attrelid = t.oid
+        LEFT JOIN pg_attrdef d ON d.adrelid = t.oid AND d.adnum = a.attnum
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        UNION ALL
+        SELECT t.relname, 'constraint', c.conname, pg_get_constraintdef(c.oid)
+        FROM owned t JOIN pg_constraint c ON c.conrelid = t.oid
+        WHERE c.contype <> 'n'
+        UNION ALL
+        SELECT t.relname, 'index', i.relname, pg_get_indexdef(i.oid)
+        FROM owned t JOIN pg_index x ON x.indrelid = t.oid
+        JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indisvalid AND x.indisready
+    """, (list(TABLES_IN_DELETE_ORDER) + ["schema_migrations"],))
+    records = sorted(tuple(row.values()) for row in definitions)
+    return hashlib.sha256(json.dumps(records, separators=(",", ":")).encode()).hexdigest()
+
+
 def restored_control_state(connection, *, expected_instance=None, require_current=False):
     """Inspect an initialized restore without bootstrapping identity or the ledger."""
     owner = connection.execute(
@@ -126,6 +174,10 @@ def restored_control_state(connection, *, expected_instance=None, require_curren
     known = sorted(MIGRATIONS)
     if not applied or applied != known[:len(applied)]:
         raise RuntimeError(f"Unsupported restored control migration ledger: {applied}.")
+    if _restore_schema_signature(connection) != RESTORE_SCHEMA_SIGNATURES[applied[-1]]:
+        raise RuntimeError(
+            f"Restored control columns, constraints or indexes do not match ledger version {applied[-1]}."
+        )
     identity = connection.execute(
         "SELECT value FROM control.metadata WHERE key = 'instance_id'"
         " AND EXISTS (SELECT 1 FROM control.admin_credential WHERE id = 1 AND encoded <> '')"

@@ -163,7 +163,7 @@ not place it in the same unencrypted archive as public release files.
    credential is usable until this has run. Run it without `--confirm` first to
    see what it would invalidate.
 
-   The sweep requires this release's complete control ledger and sweep tables.
+   The sweep requires this release's complete control ledger. Inspection compares the restored control tables’ columns, constraints and indexes with the recorded schema for that ledger. A mismatch requires investigation before migration or invalidation. The comparison covers release-owned tables, including their index definitions.
    A failed transaction leaves the old epoch and revocations intact. If the
    command loses its response or file audit fails after commit, keep traffic
    fenced. Inspect the database epoch against the captured value, revocation

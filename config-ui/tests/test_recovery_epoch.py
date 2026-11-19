@@ -454,6 +454,36 @@ class AtomicityTests(RecoveryEpochTestCase):
                                  cs.migrate(connection, restored_instance="instance"))
                 self.assertEqual(0, self.store.recovery_epoch())
 
+    def test_version_ten_objects_with_version_eleven_ledger_refuse_migration_and_sweep(self):
+        with self.store._db(migrate=False) as connection:
+            cs.rollback(connection, 10, accept_data_loss=True)
+            connection.execute("INSERT INTO control.schema_migrations(version) VALUES (11)")
+            try:
+                for operation in (
+                    lambda: cs.restored_control_state(connection),
+                    lambda: cs.migrate(connection, restored_instance="instance"),
+                    self.store.advance_recovery_epoch,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "do not match ledger version 11"):
+                        operation()
+                self.assertEqual(0, connection.execute(
+                    "SELECT control.current_recovery_epoch() AS epoch"
+                ).fetchone()["epoch"])
+            finally:
+                connection.execute("DELETE FROM control.schema_migrations WHERE version = 11")
+                cs.migrate(connection)
+
+    def test_missing_window_constraint_or_index_refuses_restore(self):
+        with self.store._db(migrate=False) as connection:
+            for change in (
+                "ALTER TABLE control.approval_windows DROP CONSTRAINT window_scope_shape",
+                "DROP INDEX control.approval_window_client_live_idx",
+            ):
+                with self.subTest(change=change):
+                    with self.assertRaisesRegex(RuntimeError, "do not match ledger"), cs.transaction(connection):
+                        connection.execute(change)
+                        cs.restored_control_state(connection, require_current=True)
+
     def test_interrupted_restore_migration_preserves_the_old_ledger_and_identity(self) -> None:
         with self.store._db(migrate=False) as connection:
             cs.rollback(connection, 5, accept_data_loss=True)
