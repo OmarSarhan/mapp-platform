@@ -473,6 +473,21 @@ class AtomicityTests(RecoveryEpochTestCase):
                 connection.execute("DELETE FROM control.schema_migrations WHERE version = 11")
                 cs.migrate(connection)
 
+    def test_restore_signature_is_independent_of_session_sql_rendering(self):
+        with self.store._db(migrate=False) as connection, cs.transaction(connection):
+            for setting in ("off", "on"):
+                with self.subTest(quote_all_identifiers=setting):
+                    connection.execute("SELECT set_config('quote_all_identifiers', %s, true)", (setting,))
+                    identity, versions = cs.restored_control_state(connection, require_current=True)
+                    self.assertEqual(("instance", max(cs.MIGRATIONS)), (identity, versions[-1]))
+                    self.assertEqual(setting, connection.execute(
+                        "SHOW quote_all_identifiers"
+                    ).fetchone()["quote_all_identifiers"])
+            # A valid inspection did not roll back the enclosing transaction.
+            self.assertEqual(0, connection.execute(
+                "SELECT control.current_recovery_epoch() AS epoch"
+            ).fetchone()["epoch"])
+
     def test_missing_window_constraint_or_index_refuses_restore(self):
         with self.store._db(migrate=False) as connection:
             for change in (
