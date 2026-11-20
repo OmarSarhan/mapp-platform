@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import secrets
-from control_connections import CONTROL_CONNECTIONS
+from control_connections import CONTROL_CONNECTIONS, rollback_after_error
 
 import psycopg
 from psycopg import sql
@@ -234,7 +234,7 @@ class SqlStore:
                 )
                 connection.execute("COMMIT")
             except BaseException:
-                connection.execute("ROLLBACK")
+                rollback_after_error(connection)
                 raise
 
     def rotate_refresh_token(
@@ -487,7 +487,7 @@ class SqlStore:
                 # the read. Refuse rather than guess.
                 return {"outcome": "unknown", "family_id": state["family_id"]}
             except BaseException:
-                connection.execute("ROLLBACK")
+                rollback_after_error(connection)
                 raise
 
     def revoke_refresh_family(self, family_id: str, reason: str = "") -> bool:

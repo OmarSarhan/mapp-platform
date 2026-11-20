@@ -1,11 +1,14 @@
 """Process-wide admission for configured ``DBS_*`` reader connections."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import partial
 import threading
 import time
 from typing import Any, Callable, Iterator
-from control_connections import AdmissionTimeout, admission_slot, checked_io, current_request, remaining_time
+from control_connections import (
+    AdmissionTimeout, acquisition, admission_slot, checked_io, current_request,
+    discard_connection, remaining_time,
+)
 
 
 # Live and preview XYZ can occupy forty sessions using the same runtime role.
@@ -54,14 +57,24 @@ def dbs_connection(
     with admission_slot(_DBS_CONNECTION_SLOTS, acquisition_remaining()) as slot:
         _DBS_CONNECTION_STATE.active = True
         try:
-            raw = slot.connect(partial(connect, *args, **kwargs), acquisition_remaining)
+            with acquisition():
+                raw = slot.connect(partial(connect, *args, **kwargs), acquisition_remaining)
+            admitted = False
+
+            def command_remaining():
+                return remaining() if admitted else acquisition_remaining()
+
             try:
-                with checked_io(raw, remaining), raw as connection:
-                    acquisition_remaining()
-                    yield connection
+                with ExitStack() as stack:
+                    with acquisition():
+                        lease = stack.enter_context(checked_io(raw, command_remaining, request))
+                        connection = stack.enter_context(raw)
+                        acquisition_remaining()
+                    admitted = True
+                    yield connection if lease is raw else lease
             finally:
                 # Driver __exit__ can itself raise while committing.
                 if not getattr(raw, "closed", True):
-                    raw.close()
+                    discard_connection(raw)
         finally:
             _DBS_CONNECTION_STATE.active = False

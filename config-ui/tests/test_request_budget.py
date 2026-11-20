@@ -7,6 +7,32 @@ from control_connections import AdmissionTimeout, current_request, remaining_tim
 
 
 class RequestBudgetTests(unittest.TestCase):
+    def test_finish_joins_late_registration_already_aborting(self):
+        entered, release, finishing = (threading.Event() for _ in range(3))
+        with request_scope(5) as request, ThreadPoolExecutor(2) as executor:
+            request.cancel("fixture")
+
+            def abort():
+                entered.set()
+                self.assertTrue(release.wait(2))
+
+            def finish():
+                finishing.set()
+                request.finish()
+
+            registered = executor.submit(request.arm, abort)
+            self.assertTrue(entered.wait(1))
+            joined = executor.submit(finish)
+            try:
+                self.assertTrue(finishing.wait(1))
+                with self.assertRaises(TimeoutError):
+                    joined.result(.05)
+            finally:
+                release.set()
+            joined.result(1)
+            with self.assertRaises(AdmissionTimeout):
+                registered.result(1)
+
     def test_disarm_joins_and_one_blocked_abort_cannot_delay_a_sibling(self):
         entered, finish, sibling, detached = (threading.Event() for _ in range(4))
 

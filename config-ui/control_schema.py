@@ -41,6 +41,7 @@ from typing import Iterator
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
+from control_connections import rollback_after_error
 
 SCHEMA = "control"
 
@@ -109,7 +110,7 @@ def transaction(connection: psycopg.Connection) -> Iterator[psycopg.Connection]:
         yield connection
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback_after_error(connection)
         raise
 
 
@@ -264,7 +265,7 @@ def migrate(connection: psycopg.Connection, *, restored_instance: str | None = N
             restored_control_state(connection, expected_instance=restored_instance, require_current=True)
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback_after_error(connection)
         raise
     return applied
 
@@ -1479,7 +1480,7 @@ def rollback(
             undone.append(version)
         connection.execute("COMMIT")
     except BaseException:
-        connection.execute("ROLLBACK")
+        rollback_after_error(connection)
         raise
     return undone
 

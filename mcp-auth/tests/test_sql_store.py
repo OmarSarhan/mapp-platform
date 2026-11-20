@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "config-ui"))
@@ -84,6 +85,30 @@ class SqlStoreContractTests(unittest.TestCase):
         )
 
     # -- clients ---------------------------------------------------------
+
+    def test_refresh_transactions_keep_pre_submission_refusal(self):
+        from control_connections import CommandNotSubmitted, ControlConnections, request_scope
+
+        pool = ControlConnections()
+        self.addCleanup(pool.close)
+        for rotate in (False, True):
+            with self.subTest(rotate=rotate), request_scope(5) as request:
+                class CancelAfterBegin(psycopg.Connection):
+                    def execute(self, query, *args, **kwargs):
+                        result = super().execute(query, *args, **kwargs)
+                        if query == "BEGIN":
+                            request.cancel("fixture")
+                        return result
+
+                lease = pool.connection(DATABASE_URL, connect=CancelAfterBegin.connect)
+                with patch.object(self.store, "_connect", return_value=lease), self.assertRaises(CommandNotSubmitted):
+                    if rotate:
+                        self.store.rotate_refresh_token("fixture-old", "fixture-new")
+                    else:
+                        self.store.start_refresh_family("fixture-new", family_id="fixture-family",
+                                                       grant_id="oauth:grant-1", client_id="mcp-client", scope="")
+                with psycopg.connect(DATABASE_URL) as observer:
+                    self.assertEqual((0,), observer.execute("SELECT count(*) FROM control.oauth_refresh_families").fetchone())
 
     def test_joined_introspection_observes_revocation_and_disabled_client(self):
         import introspection
