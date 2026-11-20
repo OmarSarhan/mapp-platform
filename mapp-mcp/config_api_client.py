@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from request_http import urlopen
+from request_scope import RequestStopped
 from typing import Any
 
 
@@ -133,11 +134,24 @@ class ConfigApiClient:
             method=method,
         )
         try:
-            with urlopen(request, timeout=deadline, read_error_body=True) as response:
-                if TRACE.get() is not None:
-                    trace("platform.response", requestId=request_id, status=response.status)
-                data = response.read()
-            return json.loads(data.decode("utf-8"))
+            response_data = None
+            try:
+                with urlopen(request, timeout=deadline, read_error_body=True) as response:
+                    if TRACE.get() is not None:
+                        trace("platform.response", requestId=request_id, status=response.status)
+                    response_data = response.read()
+            except RequestStopped:
+                # A complete framed reply is evidence even if local cleanup
+                # crosses the deadline. Partial reads never assign this value.
+                if response_data is None:
+                    raise
+            payload = json.loads(response_data.decode("utf-8"))
+            if method == "POST" and path == "/api/proposals":
+                proposal = payload.get("proposal") if isinstance(payload, dict) else None
+                proposal_id = proposal.get("id") if isinstance(proposal, dict) else None
+                if not isinstance(proposal_id, str) or not proposal_id.strip():
+                    raise ValueError("Proposal creation returned no usable acknowledgement.")
+            return payload
         except urllib.error.HTTPError as exc:
             if TRACE.get() is not None:
                 trace("platform.response", requestId=request_id, status=exc.code)

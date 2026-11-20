@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import socket
@@ -12,6 +13,7 @@ import urllib.request
 import anyio
 import request_http
 import runtime
+import config_api_client
 
 from app import build_app
 from authentication import Authenticated, CURRENT_CALLER
@@ -437,6 +439,71 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(error["indeterminate"])
         self.assertFalse(error["retryable"])
         self.assertTrue(error["requestId"])
+
+    async def test_complete_proposal_reply_survives_cleanup_expiry_and_rejects_missing_id(self):
+        cases = [(201, b'{"proposal":{"id":"p-ack"}}', True)]
+        cases += [(status, body, False) for status in (200, 201)
+                  for body in (b'{}', b'null', b'{"proposal":{"id":""}}')]
+        received = []
+        current = None
+
+        async def handle(reader, writer):
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = next(int(line.split(b":")[1]) for line in head.lower().splitlines()
+                          if line.startswith(b"content-length:"))
+            await reader.readexactly(length)
+            received.append(head.split()[1])
+            status, body, _ = current
+            writer.write(f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        original = config_api_client.urlopen
+
+        @contextmanager
+        def delayed_exit(*args, **kwargs):
+            with original(*args, **kwargs) as response:
+                yield response
+                if current[2]:
+                    # The client has copied the complete framed body; the real
+                    # HTTP context still performs its final deadline check.
+                    time.sleep(CURRENT_REQUEST.get().remaining() + .02)
+
+        async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+            api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+            sdk = build_runtime_app(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                                    exchange=FakeExchange(), config_api=api)
+            sdk.tool_timeouts["proposals_create"] = .3
+            app, _ = build_app(inner=sdk, introspection=StubIntrospection({
+                TOKEN: active(scopes="mcp:connect inspect propose")}))
+
+            async def named(scope, receive, send):
+                scope["headers"].append((b"mcp-name", b"proposals_create"))
+                await app(scope, receive, send)
+
+            async with sdk.router.lifespan_context(sdk):
+                for index, current in enumerate(cases, 1):
+                    with self.subTest(status=current[0], body=current[1]), patch.object(
+                        config_api_client, "urlopen", delayed_exit
+                    ):
+                        _, _, body = await Session(named).request({"jsonrpc": "2.0", "id": index,
+                            "method": "tools/call", "params": {"_meta": MODERN_META,
+                            "name": "proposals_create", "arguments": {"operations": [],
+                            "revision": "fixture", "check_fingerprint": "fixture"}}},
+                            version=MODERN_VERSION, method_header="tools/call")
+                        result = rpc_result(body)["result"]
+                        detail = result["structuredContent"]
+                        self.assertEqual([b"/api/proposals"] * index, received)
+                        if current[2]:
+                            self.assertFalse(result["isError"])
+                            self.assertEqual("p-ack", detail["proposalId"])
+                            self.assertTrue(detail["acknowledged"])
+                        else:
+                            self.assertTrue(result["isError"])
+                            self.assertTrue(detail["error"]["indeterminate"])
+                            self.assertFalse(detail["error"]["retryable"])
+                            self.assertTrue(detail["error"]["requestId"])
 
     async def test_human_confirmation_outlives_preparation_budget(self):
         api = FakeConfigApi()
