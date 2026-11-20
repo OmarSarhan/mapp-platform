@@ -10,7 +10,7 @@ services:
       - backend
     read_only: true
     tmpfs:
-      - /tmp:size=256m,mode=1777
+      - /tmp:size=256m,mode=1777,exec
     security_opt:
       - no-new-privileges:true
     cap_drop:

@@ -91,6 +91,8 @@ class CheckEnvironmentTests(unittest.TestCase):
             # on that import path fails the isolated root with an ImportError
             # rather than anything that names the real cause.
             "config-ui/control_schema.py",
+            "config-ui/control_connections.py",
+            "config-ui/mutation_admission.py",
             "instance/workspace.seed.json",
         ):
             shutil.copy2(ROOT / relative, root / relative)
