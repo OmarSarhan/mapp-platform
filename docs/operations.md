@@ -37,6 +37,17 @@ source table/geometry mappings remain in Advanced layer JSON.
 ./bin/mapp down        # remove containers and networks, preserving named volumes
 ```
 
+The test launcher requires `MAPP_CODEX_TEST_BINARY` pointing to an executable
+compatible with the Alpine test container, plus the adjacent standalone CLI's
+`docs/agent-workflow.md`. If the CLI lives elsewhere, set
+`MAPP_CONFIG_CLI_WORKFLOW` to that file. The launcher mounts both read-only and
+checks the workflow's existing pinned digest; it does not download or vendor
+the CLI. Missing fixtures fail before builds rather than silently skipping.
+Test-only images reuse Authlib and psycopg from the already pinned service
+images. The test overlay also supplies the descriptor limit required by the
+high-fd regression and isolates configuration tests from a live semantic URL.
+These settings do not change production service images or limits.
+
 Use `./bin/mapp config` after Compose or environment changes. Use
 `./bin/mapp verify` for the mode-aware runtime checks. External deployments
 also require layer-specific visual acceptance for their own workspace.
@@ -126,8 +137,16 @@ timeout continue independently of that advisory sample.
 The final publication replaces the live workspace with the complete saved
 ten-layer workspace, including its tile-retry plugin configuration. It is not
 a merge with local layers or styles. The command submits the replacement
-through the normal revision-bound proposal check, create, approved apply, and
-exact-fingerprint XYZ reload path, then reads the workspace back. Proposal
+through the normal revision-bound proposal check and creation, then renders
+a retained candidate preview with its legend and clicked-feature evidence.
+Review the printed focused diff and image links. In an interactive terminal,
+type `APPLY <proposal-id>` to approve that exact proposal and preview. Failed,
+incomplete or mismatched previews cannot be confirmed by this command.
+Non-interactive runs stop before applying: review and apply the retained
+proposal through the configuration UI or standalone CLI, then rerun the demo.
+There is no unattended approval flag. Already-matching workspaces need no new
+proposal approval. After approval, the command submits the retained binding
+and checks the exact-fingerprint XYZ reload and workspace readback. Proposal
 application records its recoverable `applying` state before commit; if the
 client loses the response, reconcile the proposal, workspace fingerprint, and
 XYZ status rather than assuming the replacement failed. A rerun is idempotent

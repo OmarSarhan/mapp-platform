@@ -68,6 +68,7 @@ token, record = store.create_token(
         "inspect",
         "propose",
         "apply",
+        "visual",
         "reload",
         "derive",
         # The demo creates derived layers, which has needed the narrower scope
@@ -123,14 +124,16 @@ PY
   fi
 }
 
-api() { # method path [json-body]
+api() { # method path [json-body] [timeout-seconds]
   local method="$1" path="$2" body="${3:-}"
+  local timeout_args=()
+  if [[ -n "${4:-}" ]]; then timeout_args=(--max-time "$4"); fi
   if [ -n "${body}" ]; then
-    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body "${timeout_args[@]}" -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
       --data-binary "${body}" "${BASE}${path}"
   else
-    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body "${timeout_args[@]}" -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" "${BASE}${path}"
   fi
 }
@@ -1232,20 +1235,101 @@ else:
 PY
 }
 
+workspace_approval_request() { # proposal response, terminal preview, request output
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+proposal = json.load(open(sys.argv[1], encoding="utf-8"))["proposal"]
+response = json.load(open(sys.argv[2], encoding="utf-8"))
+review = response.get("review") or {}
+binding = review.get("binding") or {}
+expected = {
+    "proposalId": proposal["id"],
+    "candidateHash": proposal["candidateHash"],
+    "originalRevision": proposal["originalRevision"],
+}
+if proposal.get("status") != "pending" or any(
+    binding.get(key) != value for key, value in expected.items()
+):
+    raise SystemExit("Preview does not match the pending demo proposal; refusing application.")
+if any(review.get(key) is not True for key in
+       ("complete", "eligible", "renderPassed", "checksPassed")):
+    raise SystemExit("Demo preview is incomplete or failed; inspect it before proceeding.")
+fields = ("candidateHash", "originalRevision", "evidenceOperationId", "evidenceFingerprint")
+if any(not isinstance(binding.get(key), str) or not binding[key] for key in fields):
+    raise SystemExit("Demo preview omitted its exact approval binding.")
+captures = review.get("captures") or []
+if not any(capture.get("side") == "candidate" and capture.get("kind") == "map"
+           and capture.get("status") == "captured" for capture in captures):
+    raise SystemExit("Demo preview omitted its captured candidate map.")
+for capture in captures:
+    if capture.get("status") == "captured":
+        download = capture.get("download") or {}
+        if not (download.get("url") or download.get("path")):
+            raise SystemExit("Demo preview omitted an image download link.")
+print("Proposal:", proposal["id"])
+print("Focused diff:")
+print(json.dumps(proposal.get("diff"), indent=2))
+print("Retained preview (review these images before confirming):")
+for capture in captures:
+    if capture.get("status") == "captured":
+        download = capture.get("download") or {}
+        print(capture["side"], capture["kind"], download.get("url") or download.get("path"))
+    else:
+        print(capture.get("side"), capture.get("kind"), capture.get("status"))
+with open(sys.argv[3], "w", encoding="utf-8") as output:
+    json.dump({"approved": True, **{key: binding[key] for key in fields}}, output)
+PY
+}
+
+prepare_workspace_approval() { # proposal-id
+  local identifier="$1" preview operation_id status attempt confirmation
+  api GET "/api/proposals/${identifier}" "" 30 > "${WORK_DIR}/review-proposal.json"
+  preview="$(api POST "/api/proposals/${identifier}/screenshot" \
+    '{"layer":"Census_OA_Population","background":true,"framing":"feature","viewMode":"focus","panels":["styling"]}' 30)"
+  operation_id="$(printf '%s' "${preview}" | jqp "print((d.get('operation') or {}).get('id') or '')")"
+  [[ "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || fail "Demo preview omitted its operation ID."
+  printf 'Waiting for retained demo preview %s...\n' "${operation_id}"
+  status=""
+  for attempt in $(seq 1 300); do
+    api GET "/api/visual-operations/${operation_id}" "" 30 > "${WORK_DIR}/review-preview.json"
+    status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["operation"]["status"])' \
+      "${WORK_DIR}/review-preview.json")"
+    case "${status}" in
+      succeeded|failed) break ;;
+      queued|running) sleep 2 ;;
+      *) fail "Unexpected demo preview status: ${status}" ;;
+    esac
+  done
+  [[ "${status}" == "succeeded" ]] || fail \
+    "Demo preview did not succeed. Inspect operation ${operation_id}; no workspace was applied."
+  workspace_approval_request "${WORK_DIR}/review-proposal.json" \
+    "${WORK_DIR}/review-preview.json" "${WORK_DIR}/workspace-approval.json"
+  if [[ ! -t 0 ]]; then
+    fail "Demo proposal ${identifier} awaits explicit review and approval. Use the configuration UI or standalone CLI to review/apply it, then rerun ./bin/mapp demo. No workspace was applied."
+  fi
+  printf 'After reviewing the diff and preview, type APPLY %s to publish this exact demo: ' "${identifier}"
+  read -r confirmation || fail "Demo approval cancelled; no workspace was applied."
+  [[ "${confirmation}" == "APPLY ${identifier}" ]] || fail \
+    "Demo approval declined; no workspace was applied."
+}
+
 apply_saved_workspace_proposal() { # proposal-id saved-workspace
   local identifier="$1" saved_workspace="$2"
   local http_status payload_file state current_workspace
+  prepare_workspace_approval "${identifier}"
   payload_file="${WORK_DIR}/workspace-apply.json"
-  if ! http_status="$(curl -sS -X POST \
+  if ! http_status="$(curl -sS --max-time 120 -X POST \
     -H "Host: ${CONFIG_HOST}" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H 'Content-Type: application/json' \
-    --data-binary '{"approved":true}' \
+    --data-binary "@${WORK_DIR}/workspace-approval.json" \
     --output "${payload_file}" \
     --write-out '%{http_code}' \
     "${BASE}/api/proposals/${identifier}/apply")"
   then
-    fail "could not apply the saved demo workspace proposal"
+    fail "Demo apply response unavailable; the write may have committed. Inspect proposal ${identifier} and reload status before retrying."
   fi
   state="$(workspace_apply_state \
     "${saved_workspace}" "${http_status}" "${payload_file}")"
