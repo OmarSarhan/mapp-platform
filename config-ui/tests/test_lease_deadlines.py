@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -192,7 +193,9 @@ class LeaseDeadlineTests(unittest.TestCase):
             with self.subTest(mode=mode), self.rows() as insert:
                 reader = mode == "reader_exit"
                 lease = rd.dbs_connection(psycopg.connect, self.dsn) if reader else self.pool.connection(self.dsn)
-                with self.assertRaises(cc.CommandNotSubmitted), cc.request_scope(.10), lease as conn:
+                with self.assertRaises(cc.CommandNotSubmitted), cc.request_scope(5) as request, lease as conn:
+                    # This case tests command/commit expiry, not connector speed.
+                    request.deadline = time.monotonic() + .10
                     if mode == "transaction_exit":
                         with conn.transaction():
                             conn.execute(insert)
@@ -319,8 +322,6 @@ class LeaseDeadlineTests(unittest.TestCase):
         # of the COMMIT reply until the observer has seen its durable effect.
         with psycopg.connect(self.dsn, autocommit=True) as observer:
             host, port = observer.info.host, observer.info.port
-            if not os.path.isabs(host):
-                self.skipTest("requires a PostgreSQL Unix socket")
             table = sql.Identifier("control", "lease_" + uuid4().hex)
             observer.execute(sql.SQL("CREATE TABLE {} (n int)").format(table))
             self.addCleanup(self.drop_table, table)
@@ -342,10 +343,15 @@ class LeaseDeadlineTests(unittest.TestCase):
 
                 def bridge(executor):
                     client, _ = listener.accept()
-                    with client, socket.socket(socket.AF_UNIX) as server:
-                        client.settimeout(4)
+                    if os.path.isabs(host):
+                        server = socket.socket(socket.AF_UNIX)
                         server.settimeout(4)
                         server.connect(os.path.join(host, name))
+                    else:
+                        server = socket.create_connection((host, port), timeout=4)
+                    with client, server:
+                        client.settimeout(4)
+                        server.settimeout(4)
                         writer = executor.submit(forward, client, server)
                         try:
                             forward(server, client, True)
@@ -421,6 +427,53 @@ class LeaseDeadlineTests(unittest.TestCase):
                             conn.execute("SELECT pg_sleep(.5)")
                         else:
                             req.cancel("fixture")
+
+    def test_lease_transaction_preserves_primary_exception_during_unwind(self):
+        for active in (False, True):
+            expected = cc.CommandInterrupted if active else ValueError
+            with self.subTest(active=active), self.rows() as insert, self.assertRaises(expected):
+                with cc.request_scope(.15) as request, self.pool.connection(self.dsn) as conn:
+                    with conn.transaction():
+                        conn.execute(insert)
+                        if active:
+                            conn.execute("SET statement_timeout=0")
+                            conn.execute("SELECT pg_sleep(.5)")
+                        else:
+                            request.cancel("fixture unwind")
+                            raise ValueError("original borrower failure")
+
+    def test_direct_cancel_latches_while_parameter_adapter_holds_driver(self):
+        adapting, resume, cancelling = (threading.Event() for _ in range(3))
+        with self.rows() as insert, self.pool.connection(self.dsn) as conn, ThreadPoolExecutor(2) as executor:
+            def dump(value):
+                adapting.set()
+                self.assertTrue(resume.wait(2))
+                return str(value)
+
+            def cancel():
+                def entered(frame, event, arg):
+                    if event == "call" and frame.f_code is conn.cancel_safe.__code__:
+                        cancelling.set()
+                    return None
+                sys.settrace(entered)
+                try:
+                    conn.cancel_safe()
+                finally:
+                    sys.settrace(None)
+
+            command = executor.submit(conn.execute, insert + sql.SQL(" RETURNING %s::jsonb"),
+                                      (Jsonb(1, dumps=dump),))
+            try:
+                self.assertTrue(adapting.wait(1))
+                abort = executor.submit(cancel)
+                self.assertTrue(cancelling.wait(1))
+                with self.assertRaises(TimeoutError):
+                    abort.result(.05)
+            finally:
+                resume.set()
+            with self.assertRaises(cc.CommandNotSubmitted):
+                command.result(1)
+            abort.result(1)
 
     def test_late_and_bound_cancel_cannot_interrupt_reused_backend(self):
         with self.pool.connection(self.dsn) as previous:

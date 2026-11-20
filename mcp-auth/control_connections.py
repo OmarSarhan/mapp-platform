@@ -319,8 +319,23 @@ class _Lease:
 
     @contextmanager
     def transaction(self, *args, **kwargs):
-        with self._active_connection().transaction(*args, **kwargs):
+        transaction = self._active_connection().transaction(*args, **kwargs)
+        transaction.__enter__()
+        try:
             yield
+        except BaseException as exc:
+            try:
+                suppressed = transaction.__exit__(type(exc), exc, exc.__traceback__)
+            except Exception:
+                # The deadline guard can refuse rollback before the driver's
+                # own cleanup handler starts. Evict without erasing the cause.
+                with suppress(Exception):
+                    self.close()
+                suppressed = False
+            if not suppressed:
+                raise
+        else:
+            transaction.__exit__(None, None, None)
 
 
 def discard_connection(connection, close=None):
@@ -375,11 +390,15 @@ def checked_io(connection, remaining, request=None):
     original_cancel = connection.cancel_safe
     original_close = connection.close
     cancel_lock = threading.RLock()
+    cancel_requested = threading.Event()
     armed = True
     evict = False
 
     def cancel_safe(*, timeout=0.25):
         nonlocal evict
+        # Parameter adaptation holds the driver lock. Latch before waiting so
+        # the post-adaptation gate can refuse the still-unsubmitted command.
+        cancel_requested.set()
         with cancel_lock:
             if armed and not evict:
                 evict = True
@@ -406,7 +425,7 @@ def checked_io(connection, remaining, request=None):
 
     def before_send():
         # Called inside the serialized driver step, after parameter adaptation.
-        if not armed or evict:
+        if not armed or evict or cancel_requested.is_set():
             raise CommandNotSubmitted("Database command refused before submission.")
         try:
             remaining()
@@ -431,7 +450,7 @@ def checked_io(connection, remaining, request=None):
                     # waiting for readiness. Serialize it with a wire abort.
                     with cancel_lock:
                         remaining()
-                        if not armed or evict:
+                        if not armed or evict or cancel_requested.is_set():
                             if not started:
                                 raise CommandNotSubmitted("Database command refused before submission.")
                             raise CommandInterrupted("Database connection was interrupted.")
