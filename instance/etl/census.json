@@ -3,8 +3,8 @@
   "target_table": "census_2021_england_oa",
   "geometry": {
     "key": "census_2021_oa_geometry",
-    "description": "ONS Census 2021 England output-area generalised clipped boundaries, version 2.",
-    "source_url": "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Output_Areas_2021_EW_BGC_V2/FeatureServer/0",
+    "description": "ONS Census 2021 England output-area generalised clipped boundaries, version 2, from the public rural-urban classification release; only OA codes and geometry are imported.",
+    "source_url": "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/OA_2021_EW_BGC_V2_RUC/FeatureServer/0",
     "target_table": "census_2021_england_oa",
     "where": "OA21CD LIKE 'E%'",
     "object_id_field": "FID",
@@ -16,7 +16,7 @@
       {"source": "OA21CD", "target": "oa21cd", "type": "text"}
     ]
   },
-  "geometry_sha256": "db07dd3f8f6846177cbbd5be6955cd2665ddb1ef498c2a8ceff5b5c11274d0b4",
+  "geometry_sha256": "f37f647557234c421b298013ab1fe2062dfb6573a6ff4e4a3e72b28e7038885f",
   "expected_england_oa_count": 178605,
   "max_geometry_repairs": 64,
   "http_timeout_seconds": 60,

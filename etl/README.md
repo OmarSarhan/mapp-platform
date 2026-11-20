@@ -31,9 +31,17 @@ Census Day, 21 March 2021. Its official sources are:
 - [Nomis Census 2021 bulk topic
   summaries](https://www.nomisweb.co.uk/census/2021/bulk), using the reviewed
   per-topic ZIP archives and their embedded metadata
-- the ONS [Output Areas (December 2021) Boundaries EW BGC
-  (V2)](https://geoportal.statistics.gov.uk/datasets/ons::output-areas-december-2021-boundaries-ew-bgc-v2/about),
+- the public ONS [Output Areas (December 2021) Boundaries EW BGC
+  (V2) and Rural Urban Classification](https://www.arcgis.com/home/item.html?id=ba871c7913184894b9c8dece9a542dfc),
   filtered to England and joined by `OA21CD`
+
+The former standalone `Output_Areas_2021_EW_BGC_V2` service began returning
+ArcGIS 499 `Token Required`. The reviewed replacement is
+`OA_2021_EW_BGC_V2_RUC`; it serves public boundaries without a token. Only OA
+codes and geometry are imported, not its additional rural/urban attributes.
+Its complete metadata and feature scan have their own manifest pin; this is
+an explicit source revision, not a claim that the old and new service bytes
+are identical.
 
 The reviewed manifest contains 47 topic summaries with 467 numeric measures.
 Every topic is filtered to codes matching `^E\d{8}$` and must contain the same
@@ -111,8 +119,8 @@ additionally requires exact OA-code set equality across all 47 topics and the
 geometry, plus non-empty valid published polygons. A changed hash, header, row
 count, duplicate, missing or extra code, malformed value, or geometry mismatch
 fails closed; it is not silently accepted as a publisher update. The manifest
-caps permitted source-polygon validity repairs at 64. The currently pinned
-official geometry requires 32 repairs; the loader records the observed count
+caps permitted source-polygon validity repairs at 64. The previous standalone
+geometry required 32 repairs; the loader records the observed count
 rather than treating that source characteristic as an unreported
 normalization.
 

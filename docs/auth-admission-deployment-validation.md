@@ -97,3 +97,34 @@ Required follow-up is the launcher fixture repair and an approved, available
 Census source followed by the full demo/browser rerun. The independently
 service-blocked OMA-114 review remains unresolved; this deployment exercise
 did not replace or retry it. No merge or production deployment was performed.
+
+## Authorized source revision and extended test window
+
+The user subsequently authorized exactly one additional hour, with fixed
+teardown at **20:46 UTC**, and replacing the unavailable Census endpoint with
+the official public ONS `OA_2021_EW_BGC_V2_RUC` service. The controller updated
+both independent expiry mechanisms; this report does not imply deletion.
+
+The replacement is ArcGIS item `ba871c7913184894b9c8dece9a542dfc`, owned by
+`ONSGeography_data`, with public access and an Open Government Licence v3
+description. It supplies 2021 output-area boundaries joined to rural/urban
+classification. The loader imports only OA codes and geometry. This is an
+explicit source revision, not proof of byte identity with the former service.
+
+A complete read-only audit on the disposable VM took 246.752 seconds. It
+observed 178605 rows and unique England codes, identical start/end counts,
+and unchanged metadata across the scan. The canonical metadata-and-feature
+SHA-256 was
+`f37f647557234c421b298013ab1fe2062dfb6573a6ff4e4a3e72b28e7038885f`.
+Both manifests now pin that result. The closed URL allowlist and verifier
+expectation changed together; the 47 topic pins, 467 measures, row count and
+64-repair ceiling did not change.
+
+The rebuilt ETL image ran `test_census_config`, `test_census_main`,
+`test_census_pipeline`, `test_census_database`, `test_arcgis` and `test_nomis`
+against an isolated PostGIS test database: **92 passed, zero skips**. The
+first run had one fixture error because the `leeds` schema was absent;
+creating that schema in the scratch database and rerunning resolved it.
+Evidence is in `ons-source-provenance.json`, `ons-source-audit.txt` and
+`ons-etl-tests.txt`. Full demo reconciliation and browser checks against this
+revision are still pending; these source checks alone do not pass the gate.

@@ -19,7 +19,7 @@ NOMIS_URL_TEMPLATE = (
 NOMIS_OA_MEMBER_TEMPLATE = "census2021-{slug}-oa.csv"
 ONS_GEOMETRY_URL = (
     "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-    "Output_Areas_2021_EW_BGC_V2/FeatureServer/0"
+    "OA_2021_EW_BGC_V2_RUC/FeatureServer/0"
 )
 
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
