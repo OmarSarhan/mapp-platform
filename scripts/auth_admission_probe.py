@@ -22,7 +22,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_REF = "47d373770b92dd929b82fe3bbc26b18ce07abc22"
-for directory in ("config-ui", "mcp-auth", "mapp-mcp"):
+for directory in ("config-ui", "mcp-auth", "mapp-mcp", "scripts"):
     sys.path.append(str(ROOT / directory))
 
 
@@ -33,6 +33,11 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="load the three original modules from the verified OMA-76 baseline")
     args = parser.parse_args()
     dsn = os.environ["CONTROL_TEST_DATABASE_URL"]
+    from benchmark_target import RefusedDestructiveRun, guard_scratch_database
+    try:
+        guard_scratch_database(dsn, require_fresh=True)
+    except RefusedDestructiveRun as exc:
+        raise SystemExit(str(exc)) from exc
     os.environ["CONTROL_DATABASE_URL"] = dsn
     os.environ["AUTHLIB_INSECURE_TRANSPORT"] = "1"
     import psycopg
@@ -53,8 +58,6 @@ def main():
 
     with control_schema.connect(dsn) as conn:
         control_schema.migrate(conn)
-        if conn.execute("SELECT count(*) AS n FROM control.oauth_clients").fetchone()["n"]:
-            raise SystemExit("Refusing a nonempty fixture database; create a fresh disposable database.")
 
     counts = {"connections": 0, "statements": 0}
     lock = threading.Lock()

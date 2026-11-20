@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import secrets
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE_URL = os.getenv("CONTROL_TEST_DATABASE_URL", "")
@@ -68,6 +71,74 @@ class BenchmarkImportTests(unittest.TestCase):
             f'CONNECTION LIMIT {benchmark.DEPLOYED_CONNECTION_LIMIT};',
             roles.replace('ALTER ROLE :"control_db_user" ', ""),
         )
+
+
+@unittest.skipUnless(
+    DATABASE_URL and psycopg is not None, "requires disposable PostgreSQL",
+)
+class TargetPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self.benchmark = load_benchmark()
+        admin = psycopg.connect(DATABASE_URL, autocommit=True)
+        self.addCleanup(admin.close)
+        name = "mapp_preflight_test_" + secrets.token_hex(12)
+        identifier = psycopg.sql.Identifier(name)
+        try:
+            admin.execute(psycopg.sql.SQL("CREATE DATABASE {} TEMPLATE template0 ENCODING 'UTF8'").format(identifier))
+        except psycopg.errors.InsufficientPrivilege:
+            self.skipTest("isolated preflight fixture needs a test login with CREATEDB")
+        self.addCleanup(admin.execute, psycopg.sql.SQL("DROP DATABASE {}").format(identifier))
+        self.dsn = psycopg.conninfo.make_conninfo(DATABASE_URL, dbname=name)
+        self.conn = self.benchmark.cs.connect(self.dsn)
+        self.addCleanup(self.conn.close)
+        self.conn.execute("CREATE SCHEMA control")
+
+    def snapshot(self):
+        cs = self.benchmark.cs
+        rows = {}
+        for table in cs.all_tables(self.conn):
+            select = psycopg.sql.SQL("SELECT * FROM control.{} ORDER BY 1").format(psycopg.sql.Identifier(table))
+            rows[table] = self.conn.execute(select).fetchall()
+        return cs._restore_schema_signature(self.conn), rows
+
+    def assert_entrypoints_refuse(self):
+        import auth_admission_probe as probe
+
+        before = self.snapshot()
+        with (
+            mock.patch.dict(os.environ, CONTROL_TEST_DATABASE_URL=self.dsn, CONTROL_BENCHMARK_DATABASE_URL=self.dsn),
+            mock.patch.object(self.benchmark.cs, "migrate", side_effect=AssertionError("migration before refusal")),
+        ):
+            with mock.patch.object(sys, "argv", ["probe", "--disposable"]):
+                with self.assertRaisesRegex(SystemExit, "empty control schema"):
+                    probe.main()
+            self.assertEqual(before, self.snapshot())
+            with mock.patch.object(sys, "argv", ["benchmark"]), mock.patch("sys.stderr"):
+                self.assertEqual(2, self.benchmark.main())
+            self.assertEqual(before, self.snapshot())
+
+    def test_initialized_admin_without_oauth_clients(self):
+        self.benchmark.cs.migrate(self.conn)
+        self.conn.execute("INSERT INTO control.admin_credential(id, encoded) VALUES(1, 'sentinel')")
+        self.conn.execute("INSERT INTO control.metadata VALUES('instance_id', 'sentinel')")
+        self.assertEqual([], self.conn.execute("SELECT FROM control.oauth_clients").fetchall())
+        self.assert_entrypoints_refuse()
+
+    def test_populated_partial_schema_without_admin(self):
+        self.benchmark.cs.migrate(self.conn)
+        self.benchmark.cs.rollback(self.conn, 1, accept_data_loss=True)
+        self.conn.execute("INSERT INTO control.metadata VALUES('sentinel', 'keep')")
+        self.assert_entrypoints_refuse()
+
+    def test_fresh_probe_and_repeatable_empty_benchmark(self):
+        from benchmark_target import guard_scratch_database
+        guard_scratch_database(self.dsn, require_fresh=True)
+        self.benchmark.guard_scratch_database(self.dsn)
+        self.benchmark.cs.migrate(self.conn)
+        self.benchmark.guard_scratch_database(self.dsn)
+        self.conn.execute("INSERT INTO control.metadata VALUES('sentinel', 'keep')")
+        with self.assertRaises(self.benchmark.RefusedDestructiveRun):
+            self.benchmark.guard_scratch_database(self.dsn)
 
 
 @unittest.skipUnless(

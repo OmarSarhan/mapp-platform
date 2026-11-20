@@ -443,33 +443,42 @@ class AtomicityTests(RecoveryEpochTestCase):
 
     def test_later_but_incomplete_ledgers_need_offline_migration(self) -> None:
         for old in (5, 9, 10):
-            with self.subTest(old=old), self.store._db(migrate=False) as connection:
-                cs.rollback(connection, old, accept_data_loss=True)
-                for read_or_sweep in (self.store.recovery_epoch, self.store.advance_recovery_epoch):
-                    with self.assertRaisesRegex(RuntimeError, "migrate-restored-control"):
-                        read_or_sweep()
-                with self.assertRaisesRegex(RuntimeError, "manifest"):
-                    cs.migrate(connection, restored_instance="another-instance")
-                self.assertEqual(list(range(old + 1, max(cs.MIGRATIONS) + 1)),
-                                 cs.migrate(connection, restored_instance="instance"))
+            with self.subTest(old=old):
+                with self.store._db(migrate=False) as connection:
+                    cs.rollback(connection, old, accept_data_loss=True)
+                try:
+                    for read_or_sweep in (self.store.recovery_epoch, self.store.advance_recovery_epoch):
+                        with self.assertRaisesRegex(RuntimeError, "migrate-restored-control"):
+                            read_or_sweep()
+                    with self.store._db(migrate=False) as connection:
+                        with self.assertRaisesRegex(RuntimeError, "manifest"):
+                            cs.migrate(connection, restored_instance="another-instance")
+                finally:
+                    with self.store._db(migrate=False) as connection:
+                        applied = cs.migrate(connection, restored_instance="instance")
+                self.assertEqual(list(range(old + 1, max(cs.MIGRATIONS) + 1)), applied)
                 self.assertEqual(0, self.store.recovery_epoch())
 
     def test_version_ten_objects_with_version_eleven_ledger_refuse_migration_and_sweep(self):
         with self.store._db(migrate=False) as connection:
             cs.rollback(connection, 10, accept_data_loss=True)
-            connection.execute("INSERT INTO control.schema_migrations(version) VALUES (11)")
-            try:
+        try:
+            with self.store._db(migrate=False) as connection:
+                connection.execute("INSERT INTO control.schema_migrations(version) VALUES (11)")
                 for operation in (
                     lambda: cs.restored_control_state(connection),
                     lambda: cs.migrate(connection, restored_instance="instance"),
-                    self.store.advance_recovery_epoch,
                 ):
                     with self.assertRaisesRegex(RuntimeError, "do not match ledger version 11"):
                         operation()
+            with self.assertRaisesRegex(RuntimeError, "do not match ledger version 11"):
+                self.store.advance_recovery_epoch()
+            with self.store._db(migrate=False) as connection:
                 self.assertEqual(0, connection.execute(
                     "SELECT control.current_recovery_epoch() AS epoch"
                 ).fetchone()["epoch"])
-            finally:
+        finally:
+            with self.store._db(migrate=False) as connection:
                 connection.execute("DELETE FROM control.schema_migrations WHERE version = 11")
                 cs.migrate(connection)
 
@@ -520,18 +529,17 @@ class AtomicityTests(RecoveryEpochTestCase):
 
     def test_missing_or_future_ledger_and_missing_identity_refuse_migration(self) -> None:
         with self.store._db(migrate=False) as connection:
-            for change in (
-                "INSERT INTO control.schema_migrations(version) VALUES (999)",
-                "DELETE FROM control.schema_migrations WHERE version = 3",
-                "DELETE FROM control.admin_credential",
-                "DELETE FROM control.metadata WHERE key = 'instance_id'",
+            for change, refusal in (
+                ("INSERT INTO control.schema_migrations(version) VALUES (999)", "Unsupported restored control migration ledger"),
+                ("DELETE FROM control.schema_migrations WHERE version = 3", "Unsupported restored control migration ledger"),
+                ("DELETE FROM control.admin_credential", "instance ID or administrator credential is missing"),
+                ("DELETE FROM control.metadata WHERE key = 'instance_id'", "instance ID or administrator credential is missing"),
             ):
-                with self.subTest(change=change):
-                    # Each alteration is private to this transaction.
-                    with self.assertRaises(RuntimeError), cs.transaction(connection):
-                        connection.execute(change)
+                with self.subTest(change=change), connection.transaction(force_rollback=True):
+                    connection.execute(change)
+                    with self.assertRaisesRegex(RuntimeError, refusal):
                         cs.restored_control_state(connection, require_current=True)
-            self.assertEqual(0, self.store.recovery_epoch())
+        self.assertEqual(0, self.store.recovery_epoch())
 
 
 if __name__ == "__main__":

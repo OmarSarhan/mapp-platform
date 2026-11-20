@@ -16,10 +16,9 @@ Usage:
     CONTROL_BENCHMARK_DATABASE_URL=postgresql://... \\
         python scripts/control_plane_benchmark.py [--json]
 
-The database must have an empty ``control`` schema that may be truncated. The
-schema is created by a superuser in the packaged image, never by its owning
-role, so this assumes it already exists -- the same assumption the test
-fixtures make.
+Use an exclusively disposable database with an empty ``control`` schema.
+A repeat run also accepts the current migrated schema with only its ledger
+and migration-seeded metadata. The preflight runs before the first migration.
 """
 
 from __future__ import annotations
@@ -35,12 +34,14 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "mcp-auth"))
 sys.path.insert(0, str(ROOT / "config-ui"))
 
 import psycopg  # noqa: E402
 
 import control_schema as cs  # noqa: E402
+from benchmark_target import RefusedDestructiveRun, guard_scratch_database  # noqa: E402
 from models import Client, Grant, PendingAuthorization  # noqa: E402
 from sql_store import (  # noqa: E402
     MAX_PENDING_PER_SOURCE,
@@ -68,38 +69,6 @@ TABLES = tuple(
     for table in cs.TABLES_IN_DELETE_ORDER
     if table not in ("admin_credential", "metadata")
 )
-
-
-class RefusedDestructiveRun(RuntimeError):
-    """The target looks like a real platform, not a scratch database."""
-
-
-def guard_scratch_database(dsn: str, *, force: bool = False) -> None:
-    """Refuse to run against an initialized platform unless forced.
-
-    Everything below deletes every row from six control tables and creates a
-    LOGIN role with a known password. Pointed at a live database that destroys
-    every grant, token and OAuth client the platform holds -- and the DSN comes
-    from an environment variable, which is exactly how that mistake gets made.
-
-    An initialized platform has an admin_credential row; a scratch database
-    does not. That is the cheapest reliable signal, and it is the one thing a
-    benchmark must not be casual about.
-    """
-    if force:
-        return
-    with psycopg.connect(dsn, autocommit=True) as connection:
-        initialized = connection.execute(
-            "SELECT count(*) FROM control.admin_credential"
-        ).fetchone()[0]
-    if initialized:
-        raise RefusedDestructiveRun(
-            "The target database holds an administrator credential, so it is an"
-            " initialized platform rather than a scratch database. This"
-            " benchmark deletes every row from six control tables. Point"
-            " CONTROL_BENCHMARK_DATABASE_URL at a scratch database, or pass"
-            " --force-destructive if you are certain."
-        )
 
 
 def truncate(dsn: str) -> None:
@@ -464,17 +433,14 @@ def main() -> int:
         )
         return 2
 
-    connection = cs.connect(dsn)
-    try:
-        cs.migrate(connection)
-    finally:
-        connection.close()
-
     try:
         guard_scratch_database(dsn, force=arguments.force_destructive)
     except RefusedDestructiveRun as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    with cs.connect(dsn) as connection:
+        cs.migrate(connection)
 
     results = [
         replay_contention(dsn, presenters=arguments.presenters, trials=arguments.trials),

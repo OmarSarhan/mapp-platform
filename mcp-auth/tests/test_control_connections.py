@@ -1,12 +1,15 @@
 import os
 import multiprocessing
+import secrets
 import socket
+from contextlib import ExitStack
 from pathlib import Path
 import threading
 import time
 import unittest
 
 import psycopg
+from psycopg import sql
 
 from control_connections import AdmissionTimeout, CAPACITY, ControlConnections, request_scope
 
@@ -125,21 +128,44 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(0, self.pool.created)
 
     def test_two_service_processes_leave_two_diagnostic_connections(self):
+        # The launcher owns the scratch database as bootstrap. A standalone
+        # run can instead supply an already limited test login.
+        dsn = self.dsn
+        if os.getenv("CONTROL_CAPACITY_TEST_CREATE_ROLE") == "1":
+            admin = psycopg.connect(dsn, autocommit=True)
+            self.addCleanup(admin.close)
+            name = "mapp_capacity_test_" + secrets.token_hex(12)
+            password = secrets.token_urlsafe(32)
+            admin.execute(sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER CONNECTION LIMIT 8 PASSWORD {}")
+                          .format(sql.Identifier(name), sql.Literal(password)))
+            self.addCleanup(admin.execute, sql.SQL("DROP ROLE {}").format(sql.Identifier(name)))
+            dsn = psycopg.conninfo.make_conninfo(dsn, user=name, password=password)
+
+        with psycopg.connect(dsn) as check:
+            role, superuser, login, limit = check.execute(
+                "SELECT rolname, rolsuper, rolcanlogin, rolconnlimit FROM pg_roles WHERE rolname = current_user"
+            ).fetchone()
+            self.assertEqual((False, True, 8), (superuser, login, limit))
         context = multiprocessing.get_context("spawn")
         ready, release = context.Queue(), context.Event()
-        processes = [context.Process(target=hold_process, args=(self.dsn, ready, release)) for _ in range(2)]
-        for process in processes:
-            process.start()
-        diagnostics = []
+        processes = []
         try:
+            for _ in range(2):
+                process = context.Process(target=hold_process, args=(dsn, ready, release))
+                process.start()
+                processes.append(process)
             pids = {ready.get(timeout=10) for _ in range(2 * CAPACITY)}
             self.assertEqual(6, len(pids))
-            diagnostics = [psycopg.connect(self.dsn) for _ in range(2)]
-            with self.assertRaises(psycopg.OperationalError):
-                psycopg.connect(self.dsn).close()
+            with ExitStack() as diagnostics:
+                first = diagnostics.enter_context(psycopg.connect(dsn))
+                diagnostics.enter_context(psycopg.connect(dsn))
+                with self.assertRaises(psycopg.OperationalError) as caught:
+                    psycopg.connect(dsn).close()
+                self.assertIn(f'too many connections for role "{role}"', str(caught.exception))
+                first.close()
+                with psycopg.connect(dsn) as replacement:
+                    self.assertEqual((1,), replacement.execute("SELECT 1").fetchone())
         finally:
-            for conn in diagnostics:
-                conn.close()
             release.set()
             for process in processes:
                 process.join(10)
