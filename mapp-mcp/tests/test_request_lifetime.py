@@ -441,9 +441,17 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(error["requestId"])
 
     async def test_complete_proposal_reply_survives_cleanup_expiry_and_rejects_missing_id(self):
-        cases = [(201, b'{"proposal":{"id":"p-ack"}}', True)]
-        cases += [(status, body, False) for status in (200, 201)
+        cases = [(201, b'{"proposal":{"id":"p-ack"}}', True, None)]
+        cases += [(status, body, False, None) for status in (200, 201)
                   for body in (b'{}', b'null', b'{"proposal":{"id":""}}')]
+        acknowledgement = b'{"proposal":{"id":"p-unframed"}}'
+        chunk = f"{len(acknowledgement):x}\r\n".encode() + acknowledgement + b"\r\n0\r\n"
+        cases += [(201, body, False, headers) for body, headers in (
+            (acknowledgement, b"Connection: close"),
+            (chunk, b"Transfer-Encoding: chunked"),
+            (chunk + b"\r\n", b"Transfer-Encoding: chunked"),
+            (acknowledgement, b"Content-Length: 40\r\nContent-Length: 40"),
+        )]
         received = []
         current = None
 
@@ -453,9 +461,12 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
                           if line.startswith(b"content-length:"))
             await reader.readexactly(length)
             received.append(head.split()[1])
-            status, body, _ = current
-            writer.write(f"HTTP/1.1 {status} OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+            status, body, _, framing = current
+            framing = framing if framing is not None else f"Content-Length: {len(body)}".encode()
+            writer.write(f"HTTP/1.1 {status} OK\r\n".encode() + framing + b"\r\n\r\n" + body)
             await writer.drain()
+            if current[3] is not None:
+                await reader.read()  # The client must refuse before peer EOF.
             writer.close()
             await writer.wait_closed()
 
@@ -474,7 +485,7 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
             api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
             sdk = build_runtime_app(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
                                     exchange=FakeExchange(), config_api=api)
-            sdk.tool_timeouts["proposals_create"] = .3
+            sdk.tool_timeouts["proposals_create"] = .6
             app, _ = build_app(inner=sdk, introspection=StubIntrospection({
                 TOKEN: active(scopes="mcp:connect inspect propose")}))
 

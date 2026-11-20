@@ -135,18 +135,30 @@ class ConfigApiClient:
         )
         try:
             response_data = None
+            proposal_create = method == "POST" and path == "/api/proposals"
             try:
                 with urlopen(request, timeout=deadline, read_error_body=True) as response:
                     if TRACE.get() is not None:
                         trace("platform.response", requestId=request_id, status=response.status)
+                    if proposal_create:
+                        # The config JSON writer supplies one Content-Length.
+                        # EOF caused by our own cancellation cannot prove that
+                        # a close-delimited or chunked acknowledgement finished.
+                        lengths = response.headers.get_all("Content-Length", [])
+                        if (response.headers.get_all("Transfer-Encoding", []) or len(lengths) != 1
+                                or not lengths[0].strip().isascii() or not lengths[0].strip().isdigit()):
+                            raise ValueError("Proposal acknowledgement requires explicit framing.")
+                        expected_length = int(lengths[0])
                     response_data = response.read()
+                    if proposal_create and len(response_data) != expected_length:
+                        raise ValueError("Proposal acknowledgement is incomplete.")
             except RequestStopped:
                 # A complete framed reply is evidence even if local cleanup
                 # crosses the deadline. Partial reads never assign this value.
                 if response_data is None:
                     raise
             payload = json.loads(response_data.decode("utf-8"))
-            if method == "POST" and path == "/api/proposals":
+            if proposal_create:
                 proposal = payload.get("proposal") if isinstance(payload, dict) else None
                 proposal_id = proposal.get("id") if isinstance(proposal, dict) else None
                 if not isinstance(proposal_id, str) or not proposal_id.strip():
