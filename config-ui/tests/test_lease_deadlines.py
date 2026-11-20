@@ -386,7 +386,9 @@ class LeaseDeadlineTests(unittest.TestCase):
         for cancel in (False, True):
             for prepared in (False, True):
                 with self.subTest(cancel=cancel, prepared=prepared), self.rows() as insert:
-                    with cc.request_scope(5 if cancel else .15) as request, self.pool.connection(self.dsn) as conn:
+                    with cc.request_scope(5) as request, self.pool.connection(self.dsn) as conn:
+                        if not cancel:
+                            request.deadline = time.monotonic() + .15
                         def dump(value):
                             if cancel:
                                 request.cancel("fixture")
@@ -474,6 +476,35 @@ class LeaseDeadlineTests(unittest.TestCase):
             with self.assertRaises(cc.CommandNotSubmitted):
                 command.result(1)
             abort.result(1)
+
+    def test_caught_inner_failure_cannot_acknowledge_rolled_back_outer_write(self):
+        for direct in (False, True):
+            with self.subTest(direct=direct), self.rows() as insert:
+                with cc.request_scope(5) as request, self.pool.connection(self.dsn) as conn:
+                    with self.assertRaises(cc.CommandNotSubmitted):
+                        with conn.transaction():
+                            conn.execute(insert)
+                            try:
+                                with conn.transaction():
+                                    if direct:
+                                        conn.cancel_safe()
+                                    else:
+                                        request.cancel("inner unwind")
+                                    raise ValueError("caught inner failure")
+                            except ValueError:
+                                pass
+
+    def test_out_of_order_transaction_exit_preserves_driver_error(self):
+        with self.pool.connection(self.dsn) as conn:
+            outer = conn.transaction()
+            inner = conn.transaction()
+            outer.__enter__()
+            inner.__enter__()
+            error = ValueError("outer failure")
+            with self.assertRaises(psycopg.transaction.OutOfOrderTransactionNesting):
+                outer.__exit__(type(error), error, None)
+            with self.assertRaises(psycopg.transaction.OutOfOrderTransactionNesting):
+                inner.__exit__(None, None, None)
 
     def test_late_and_bound_cancel_cannot_interrupt_reused_backend(self):
         with self.pool.connection(self.dsn) as previous:

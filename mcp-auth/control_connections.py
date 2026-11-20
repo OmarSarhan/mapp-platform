@@ -326,6 +326,9 @@ class _Lease:
         except BaseException as exc:
             try:
                 suppressed = transaction.__exit__(type(exc), exc, exc.__traceback__)
+            except psycopg.transaction.OutOfOrderTransactionNesting:
+                # Preserve the driver's structural error even during unwind.
+                raise
             except Exception:
                 # The deadline guard can refuse rollback before the driver's
                 # own cleanup handler starts. Evict without erasing the cause.
@@ -335,7 +338,12 @@ class _Lease:
             if not suppressed:
                 raise
         else:
+            closed_before_commit = self.closed
             transaction.__exit__(None, None, None)
+            if closed_before_commit:
+                # psycopg skips transaction exit on a closed connection. An
+                # inner rollback failure must not turn that into outer success.
+                raise CommandNotSubmitted("Transaction commit refused: the lease was closed.")
 
 
 def discard_connection(connection, close=None):
