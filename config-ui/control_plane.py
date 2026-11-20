@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import control_schema
+from control_connections import AdmissionTimeout, CommandNotSubmitted, remaining_time
 
 
 UTC = dt.timezone.utc
@@ -280,17 +281,30 @@ class ControlStore:
         Recovery likewise needs to inspect the restored ledger before any
         forward migration or invalidation.
         """
-        from control_connections import CONTROL_CONNECTIONS, remaining_time
+        from control_connections import CONTROL_CONNECTIONS
         dsn = control_schema.control_dsn()
         if not dsn:
             raise control_schema.ControlSchemaUnavailable("Control database is not configured.")
-        with CONTROL_CONNECTIONS.connection(dsn) as connection:
-            if migrate:
-                with self._db_lock:
-                    remaining_time()
+        # A cold checkout shares one bound through connect, the local mutex,
+        # the migration transaction and subsequent SQL on this lease.
+        deadline = None
+        if migrate and not self._migrated:
+            timeout = remaining_time(control_schema.MIGRATION_TIMEOUT_MS / 1000)
+            deadline = time.monotonic() + timeout
+        with CONTROL_CONNECTIONS.connection(dsn, deadline=deadline) as connection:
+            if deadline is not None:
+                while True:
+                    # Poll for peer closure even if the migrator stays busy.
+                    timeout = remaining_time(deadline - time.monotonic())
+                    if self._db_lock.acquire(timeout=min(.025, timeout)):
+                        break
+                try:
+                    remaining_time(deadline - time.monotonic())
                     if not self._migrated:
-                        control_schema.migrate(connection)
+                        control_schema.migrate(connection, deadline=deadline)
                         self._migrated = True
+                finally:
+                    self._db_lock.release()
             remaining_time()
             yield connection
 
@@ -1013,7 +1027,12 @@ class ControlStore:
     def login(self, password: str, remote: str) -> tuple[str, str] | None:
         with self._db() as connection:
             encoded = self._require_initialized(connection)
-            if not verify_password(password, encoded):
+            verified = verify_password(password, encoded)
+            try:
+                remaining_time()
+            except AdmissionTimeout as exc:
+                raise CommandNotSubmitted("Login expired before session creation.") from exc
+            if not verified:
                 self.audit("auth.login_failed", actor="admin", remote=remote)
                 return None
             session = secrets.token_urlsafe(32)

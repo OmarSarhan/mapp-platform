@@ -35,13 +35,15 @@ import contextlib
 import datetime as dt
 import hashlib
 import json
+import math
 import os
+import time
 from typing import Iterator
 
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
-from control_connections import rollback_after_error
+from control_connections import remaining_time, rollback_after_error
 
 SCHEMA = "control"
 
@@ -210,7 +212,10 @@ def restored_control_state(connection, *, expected_instance=None, require_curren
     return instance, applied
 
 
-def migrate(connection: psycopg.Connection, *, restored_instance: str | None = None) -> list[int]:
+def migrate(
+    connection: psycopg.Connection, *, restored_instance: str | None = None,
+    deadline: float | None = None,
+) -> list[int]:
     """Apply every unapplied migration. Returns the versions applied.
 
     One advisory lock and one transaction for the whole ladder: PostgreSQL DDL
@@ -223,9 +228,12 @@ def migrate(connection: psycopg.Connection, *, restored_instance: str | None = N
         # set_config, not SET LOCAL: the latter takes no parameter placeholder.
         # `true` scopes it to this transaction, so the timeout does not leak on
         # to a pooled connection's later work.
+        timeout = MIGRATION_TIMEOUT_MS / 1000
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
         connection.execute(
             "SELECT set_config('statement_timeout', %s, true)",
-            (str(MIGRATION_TIMEOUT_MS),),
+            (str(math.ceil(1000 * remaining_time(timeout))),),
         )
         connection.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))", (MIGRATION_LOCK,)
