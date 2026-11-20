@@ -47,6 +47,9 @@ Test-only images reuse Authlib and psycopg from the already pinned service
 images. The test overlay also supplies the descriptor limit required by the
 high-fd regression and isolates configuration tests from a live semantic URL.
 These settings do not change production service images or limits.
+The external client runs with loopback networking only, selected read-only
+source mounts and a temporary home. It receives no deployment client secret,
+live runtime socket, `.env` or `var` mount.
 
 Use `./bin/mapp config` after Compose or environment changes. Use
 `./bin/mapp verify` for the mode-aware runtime checks. External deployments
@@ -151,6 +154,11 @@ application records its recoverable `applying` state before commit; if the
 client loses the response, reconcile the proposal, workspace fingerprint, and
 XYZ status rather than assuming the replacement failed. A rerun is idempotent
 when the saved workspace and definitions already match.
+
+On a drifted workspace whose feature information already matches the demo,
+the current screenshot planner may omit an original-side popup required by
+the review. The command refuses that incomplete bundle; it does not waive
+the missing evidence. This case still needs a preview-planner repair.
 
 The full demo workspace is versioned at
 `docker/demo-sources/workspace-demo.json`. It remains separate from

@@ -351,7 +351,7 @@ class DemoLayersLifecycleTests(unittest.TestCase):
                 }),
             )
             self.assertNotEqual(0, uncommitted.returncode)
-            self.assertIn("did not commit", uncommitted.stderr)
+            self.assertIn("did not establish", uncommitted.stderr)
 
         apply_start = self.source.index("apply_saved_workspace_proposal()")
         apply_end = self.source.index(

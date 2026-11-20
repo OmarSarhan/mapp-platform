@@ -1196,12 +1196,20 @@ try:
     http_status = int(sys.argv[2])
 except ValueError as exc:
     raise SystemExit("workspace apply returned an invalid HTTP status") from exc
-response = json.load(open(sys.argv[3], encoding="utf-8"))
+try:
+    response = json.load(open(sys.argv[3], encoding="utf-8"))
+except (ValueError, OSError):
+    raise SystemExit("workspace apply outcome unconfirmed: response was not usable JSON")
+if not isinstance(response, dict):
+    raise SystemExit("workspace apply outcome unconfirmed: response was not an object")
+operation = response.get("operation") or {}
+if isinstance(operation, dict) and re.fullmatch(r"[0-9a-f]{32}", str(operation.get("id", ""))):
+    print("Inspect operation " + operation["id"], file=sys.stderr)
 proposal = response.get("proposal")
 reload = response.get("reload")
 if http_status not in {200, 504}:
     raise SystemExit(
-        "workspace apply refused: %s %s"
+        "workspace apply outcome unresolved: %s %s"
         % (response.get("code") or http_status, str(response.get("error") or "")[:240])
     )
 if (
@@ -1210,7 +1218,7 @@ if (
     or proposal.get("candidate") != saved
     or not isinstance(reload, dict)
 ):
-    raise SystemExit("workspace apply did not commit the saved demo")
+    raise SystemExit("workspace apply response did not establish whether the saved demo committed")
 fingerprint = proposal.get("appliedFingerprint")
 reload_status = reload.get("status")
 if (
@@ -1235,8 +1243,8 @@ else:
 PY
 }
 
-workspace_approval_request() { # proposal response, terminal preview, request output
-  python3 - "$1" "$2" "$3" <<'PY'
+workspace_approval_request() { # proposal response, terminal preview, request output, operation ID
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json
 import sys
 
@@ -1244,6 +1252,9 @@ proposal = json.load(open(sys.argv[1], encoding="utf-8"))["proposal"]
 response = json.load(open(sys.argv[2], encoding="utf-8"))
 review = response.get("review") or {}
 binding = review.get("binding") or {}
+if (response.get("operation", {}).get("id") != sys.argv[4]
+        or binding.get("evidenceOperationId") != sys.argv[4]):
+    raise SystemExit("Preview operation identity changed; refusing application.")
 expected = {
     "proposalId": proposal["id"],
     "candidateHash": proposal["candidateHash"],
@@ -1270,7 +1281,22 @@ for capture in captures:
             raise SystemExit("Demo preview omitted an image download link.")
 print("Proposal:", proposal["id"])
 print("Focused diff:")
-print(json.dumps(proposal.get("diff"), indent=2))
+def changes(before, after, path=""):
+    if before == after:
+        return []
+    if isinstance(before, dict) and isinstance(after, dict):
+        result = []
+        for key in sorted(before.keys() | after.keys()):
+            child = path + "/" + key.replace("~", "~0").replace("/", "~1")
+            if key not in before:
+                result.append({"path": child, "new": after[key]})
+            elif key not in after:
+                result.append({"path": child, "old": before[key]})
+            else:
+                result.extend(changes(before[key], after[key], child))
+        return result
+    return [{"path": path, "old": before, "new": after}]
+print(json.dumps(changes(proposal["original"], proposal["candidate"]), indent=2))
 print("Retained preview (review these images before confirming):")
 for capture in captures:
     if capture.get("status") == "captured":
@@ -1305,12 +1331,12 @@ prepare_workspace_approval() { # proposal-id
   [[ "${status}" == "succeeded" ]] || fail \
     "Demo preview did not succeed. Inspect operation ${operation_id}; no workspace was applied."
   workspace_approval_request "${WORK_DIR}/review-proposal.json" \
-    "${WORK_DIR}/review-preview.json" "${WORK_DIR}/workspace-approval.json"
+    "${WORK_DIR}/review-preview.json" "${WORK_DIR}/workspace-approval.json" "${operation_id}"
   if [[ ! -t 0 ]]; then
     fail "Demo proposal ${identifier} awaits explicit review and approval. Use the configuration UI or standalone CLI to review/apply it, then rerun ./bin/mapp demo. No workspace was applied."
   fi
   printf 'After reviewing the diff and preview, type APPLY %s to publish this exact demo: ' "${identifier}"
-  read -r confirmation || fail "Demo approval cancelled; no workspace was applied."
+  IFS= read -r confirmation || fail "Demo approval cancelled; no workspace was applied."
   [[ "${confirmation}" == "APPLY ${identifier}" ]] || fail \
     "Demo approval declined; no workspace was applied."
 }
@@ -1331,8 +1357,10 @@ apply_saved_workspace_proposal() { # proposal-id saved-workspace
   then
     fail "Demo apply response unavailable; the write may have committed. Inspect proposal ${identifier} and reload status before retrying."
   fi
-  state="$(workspace_apply_state \
-    "${saved_workspace}" "${http_status}" "${payload_file}")"
+  if ! state="$(workspace_apply_state \
+    "${saved_workspace}" "${http_status}" "${payload_file}")"; then
+    fail "Inspect proposal ${identifier}, workspace and reload status before retrying; an unsuccessful reply does not establish that publication was refused. No apply was replayed."
+  fi
   if [ "${state}" = "ready" ]; then
     printf '  workspace applied and XYZ reloaded\n'
     return 0
