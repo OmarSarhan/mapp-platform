@@ -1063,9 +1063,13 @@ case "${1:-}" in
       --env PYTHONPATH=/app \
       --env PYTHONDONTWRITEBYTECODE=1 \
       --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
-      --entrypoint python \
-      mcp-auth \
-      -m unittest discover -s /workspace/mcp-auth/tests -v 2>&1 \
+      --env CONTROL_CAPACITY_TEST_CREATE_ROLE=1 \
+      --entrypoint sh \
+      mcp-auth -ec '
+        python -m unittest discover -s /workspace/mcp-auth/tests -v
+        cd /workspace/scripts/tests
+        python -m unittest -v test_control_plane_benchmark.TargetPreflightTests
+      ' 2>&1 \
       | tee "${mcp_auth_log}"; then
       rm -f "${mcp_auth_log}"
       exit 1
