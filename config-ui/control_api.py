@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from mutation_admission import mutation_state, request_flock, request_lock
+from control_connections import current_request, remaining_time
 from derived_drafts import lifecycle_lock, normalize_bindings
 from plugin_registry import catalogue as external_plugin_catalogue, composed_schema
 from federation_schema import (
@@ -2665,6 +2667,7 @@ def proposal_create(
     }
     with lifecycle_lock(store.root):
         path = store.proposals / proposal_id
+        mutation_state().begin()
         path.mkdir(mode=0o700)
         proposal_path = path / "proposal.json"
         _atomic_text(
@@ -2727,9 +2730,11 @@ def proposal_read(store, proposal_id: str) -> dict:
     )
 
 
-def proposal_write(store, proposal: dict) -> None:
+def proposal_write(store, proposal: dict, *, settle_publication=False) -> None:
     path = store.proposals / proposal["id"] / "proposal.json"
     with lifecycle_lock(store.root):
+        if not settle_publication:
+            mutation_state().begin()
         _atomic_text(
             path,
             json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
@@ -2808,7 +2813,7 @@ def _reload_generation(path: Path) -> int | None:
     return generation if generation >= 0 else None
 
 
-def request_reload(expected_fingerprint: str | None = None) -> dict:
+def request_reload(expected_fingerprint: str | None = None, *, before_publish=None) -> dict:
     if expected_fingerprint is not None and (
         not isinstance(expected_fingerprint, str)
         or not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint)
@@ -2816,7 +2821,7 @@ def request_reload(expected_fingerprint: str | None = None) -> dict:
         raise ValueError(
             "Workspace fingerprint must be a lowercase SHA-256 digest."
         )
-    with RELOAD_LOCK:
+    with request_lock(RELOAD_LOCK):
         RELOAD_DIR.mkdir(parents=True, exist_ok=True)
         lock_path = RELOAD_DIR / ".request.lock"
         descriptor = os.open(
@@ -2825,7 +2830,7 @@ def request_reload(expected_fingerprint: str | None = None) -> dict:
             0o600,
         )
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            request_flock(descriptor, fcntl.LOCK_EX)
             request_path = RELOAD_DIR / "requested"
             requested = _reload_generation(request_path)
             applied = _reload_generation(RELOAD_DIR / "applied")
@@ -2833,6 +2838,10 @@ def request_reload(expected_fingerprint: str | None = None) -> dict:
                 requested if requested is not None else 0,
                 applied if applied is not None else 0,
             ) + 1
+            if before_publish is not None:
+                before_publish(generation)
+            state = mutation_state()
+            state.begin()
             _atomic_text(
                 RELOAD_DIR / "expected-workspace",
                 (expected_fingerprint or "") + "\n",
@@ -2840,6 +2849,7 @@ def request_reload(expected_fingerprint: str | None = None) -> dict:
             # Publish the generation last so the supervisor cannot observe a
             # new request before the associated metadata is complete.
             _atomic_text(request_path, f"{generation}\n")
+            state.published["requestedGeneration"] = generation
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
@@ -2883,16 +2893,27 @@ def reload_timeout(value: Any = 30) -> float:
 def wait_reload(generation: int, fingerprint: str | None = None, timeout: float = 30) -> dict:
     timeout = reload_timeout(timeout)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = reload_status()
-        if (
-            status["appliedGeneration"] >= generation
-            and status["healthy"]
-            and (not fingerprint or status["workspaceFingerprint"] == fingerprint)
-        ):
-            return {**status, "completed": True}
-        time.sleep(.25)
-    return {**reload_status(), "completed": False, "timeoutSeconds": timeout}
+    wake = threading.Event()
+    budget = current_request()
+    disarm = budget.arm(wake.set) if budget else None
+    try:
+        while True:
+            remaining_time()
+            status = reload_status()
+            remaining_time()
+            if (
+                status["appliedGeneration"] >= generation
+                and status["healthy"]
+                and (not fingerprint or status["workspaceFingerprint"] == fingerprint)
+            ):
+                return {**status, "completed": True}
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return {**status, "completed": False, "timeoutSeconds": timeout}
+            wake.wait(min(left, remaining_time(.25)))
+    finally:
+        if disarm:
+            disarm()
 
 
 def _visual_override(payload: dict) -> dict:

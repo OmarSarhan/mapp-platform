@@ -107,7 +107,8 @@ class TokenBTestCase(unittest.TestCase):
         self.tokens = tokens if tokens is not None else StubTokens()
         self.redeemed_receipts: list = []
 
-        def redeem_receipt(value, *, request_digest):
+        def redeem_receipt(value, *, request_digest, state, connection):
+            state.receipt = "consumed" if receipt_spends else "refused"
             self.redeemed_receipts.append((value, request_digest))
             return (
                 {"operation_id": "proposals.apply", "grant_id": GRANT,
@@ -117,6 +118,8 @@ class TokenBTestCase(unittest.TestCase):
             )
 
         self._patches = [
+            unittest.mock.patch.object(app.CONTROL, "eligible_receipt",
+                                       return_value="a" * 64 if receipt_spends else None),
             unittest.mock.patch.object(
                 app.CONTROL, "redeem_receipt", redeem_receipt
             ),
@@ -201,7 +204,8 @@ class AuthenticationTests(TokenBTestCase):
         handler = self.build(
             tokens=StubTokens(record=McpTokenClientError("unavailable"))
         )
-        self.assertIsNone(handler._authorized(required_scope="apply"))
+        with self.assertRaises(app.AdmissionTimeout):
+            handler._authorized(required_scope="apply")
 
     def test_an_unconfigured_component_refuses_every_exchanged_token(self) -> None:
         """A credential nothing can check authorises whatever it claims."""
@@ -264,7 +268,7 @@ class BindingTests(TokenBTestCase):
 
     def test_a_refused_binding_refuses_the_request(self) -> None:
         handler = self.build(
-            tokens=StubTokens(redeem_error=McpTokenClientError("no", refused=True))
+            tokens=StubTokens(redeem_error=McpTokenClientError("no", refused=True, status=400, error="invalid_grant"))
         )
         self.assertIsNone(handler._authorized(required_scope="apply"))
         status, payload = self.responses[0]
@@ -434,10 +438,44 @@ class ApprovalReceiptTests(TokenBTestCase):
         and the thing done cannot differ."""
         handler = self.build()
         handler._authorized(required_scope="apply")
+        self.assertEqual([], self.redeemed_receipts)
+        handler._effects.begin()
         self.assertEqual(1, len(self.redeemed_receipts))
         value, digest = self.redeemed_receipts[0]
         self.assertEqual("receipt-value", value)
         self.assertEqual(self.tokens.redeemed[0][2], digest)
+
+    def test_broker_outcomes_never_dispatch_or_consume_a_receipt(self):
+        cases = (
+            (app.RedemptionConfirmedExpired("expired"), "spent"),
+            (app.RedemptionConfirmedExpired("expired", single_use=False), "redeemed"),
+            (app.RedemptionUnconfirmed("lost reply"), "unconfirmed"),
+            (McpTokenClientError("connect"), "not_submitted"),
+            (McpTokenClientError("broker client", refused=True, status=401, error="invalid_client"), "refused"),
+        )
+        for error, expected in cases:
+            with self.subTest(expected=expected):
+                handler = self.build(tokens=StubTokens(redeem_error=error))
+                with self.assertRaises(app.AdmissionTimeout):
+                    handler._authorized(required_scope="apply")
+                self.assertEqual(expected, handler._effects.token_b)
+                self.assertFalse(handler._effects.target_started)
+                self.assertEqual([], self.redeemed_receipts)
+
+    def test_unsubmitted_command_preserves_any_earlier_target_effect(self):
+        import control_connections as cc
+        from mutation_admission import mutation_state, target_command
+
+        with cc.request_scope():
+            conn = unittest.mock.Mock()
+            conn.execute.side_effect = cc.CommandNotSubmitted("current command refused")
+            for earlier in (False, True):
+                state = mutation_state()
+                state.target_started = earlier
+                with self.assertRaises(cc.CommandNotSubmitted):
+                    target_command(conn, "fixture", ())
+                self.assertEqual(earlier, state.target_started)
+                self.assertEqual(not earlier, state.retryable)
 
     def test_a_read_needs_no_receipt(self) -> None:
         """Requiring one everywhere would make every read need a person."""
@@ -795,9 +833,20 @@ class FailClosedGuardTests(TokenBTestCase):
     def test_a_redeemed_request_passes_through(self) -> None:
         handler = self.make()
         handler._exchanged_token_redeemed = True
+        handler._effects = app.mutation_state()
+        handler._effects.receipt = "consumed"
         handler._json(HTTPStatus.OK, {"applied": True})
         self.assertEqual([HTTPStatus.OK], self.written)
         self.assertTrue(json.loads(handler.wfile.getvalue().decode())["applied"])
+
+    def test_b_redemption_without_the_winning_receipt_cannot_return_protected_results(self):
+        handler = self.make()
+        handler._exchanged_token_redeemed = True
+        handler._effects = app.mutation_state()
+        handler._effects.receipt = "pending"
+        handler._json(HTTPStatus.OK, {"applied": True})
+        self.assertEqual([HTTPStatus.FORBIDDEN], self.written)
+        self.assertNotIn("applied", json.loads(handler.wfile.getvalue()))
 
     def test_a_request_with_no_exchanged_token_passes_through(self) -> None:
         handler = self.make()
@@ -869,7 +918,7 @@ class RequestStateTests(unittest.TestCase):
             responses = []
             handler._json = lambda status, body, **kw: responses.append((status, body, kw))
             def dispatch(current):
-                current._mutation_admitted = admitted
+                current._effects.target_started = admitted
                 raise AdmissionTimeout("fixture overload")
             with unittest.mock.patch.object(app.SimpleHTTPRequestHandler, "handle_one_request", dispatch):
                 handler.handle_one_request()
@@ -877,7 +926,7 @@ class RequestStateTests(unittest.TestCase):
             self.assertEqual(503, status)
             self.assertEqual(not admitted, body["retryable"])
             self.assertEqual(admitted, body["indeterminate"])
-            self.assertEqual("1", extra["headers"]["Retry-After"])
+            self.assertEqual({} if admitted else {"Retry-After": "1"}, extra["headers"])
 
 
 class RealComponentLoopTests(unittest.TestCase):

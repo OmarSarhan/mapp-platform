@@ -26,6 +26,13 @@ includes `databaseTiming.queueSeconds` and `databaseTiming.databaseSeconds`
 for local control database leases; remote service time remains part of total
 request latency. This does not change durable background-job deadlines.
 
+For approved mutations the API distinguishes token redemption, receipt
+consumption and target publication. An interrupted request with a consumed
+receipt can have an unstarted target. That outcome requires inspection and
+fresh explicit approval. The public approval reference identifies the durable
+spend and, for direct reload and apply, the operation to inspect after a
+lost reply. [Mutation admission and recovery](approved-mutation-admission.md)
+
 ## MCP client standing approvals
 
 These dashboard-only routes require an administrator session; POST requests

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import control_schema
+from mutation_admission import mutation_state, request_lock, request_flock, target_command
 from control_connections import AdmissionTimeout, CommandNotSubmitted, remaining_time
 
 
@@ -197,11 +198,12 @@ class ControlStore:
 
     @contextlib.contextmanager
     def _locked(self):
-        with self.lock:
+        with request_lock(self.lock):
             if self._process_lock_depth == 0:
-                fcntl.flock(self._process_lock_fd, fcntl.LOCK_EX)
+                request_flock(self._process_lock_fd, fcntl.LOCK_EX)
             self._process_lock_depth += 1
             try:
+                remaining_time()
                 yield
             finally:
                 self._process_lock_depth -= 1
@@ -1038,7 +1040,7 @@ class ControlStore:
             session = secrets.token_urlsafe(32)
             csrf = secrets.token_urlsafe(24)
             current = now()
-            connection.execute(
+            target_command(connection,
                 "INSERT INTO control.sessions"
                 "(session_hash, csrf_hash, created_at, last_used_at, remote)"
                 " VALUES(%s,%s,%s,%s,%s)",
@@ -1110,7 +1112,7 @@ class ControlStore:
         if not session:
             return
         with self._db() as connection:
-            connection.execute(
+            target_command(connection,
                 "DELETE FROM control.sessions WHERE session_hash = %s",
                 (token_hash(session),),
             )
@@ -1121,7 +1123,7 @@ class ControlStore:
             if not verify_password(current, encoded):
                 return False
             require_password(replacement)
-            connection.execute(
+            target_command(connection,
                 "UPDATE control.admin_credential"
                 "   SET encoded = %s, updated_at = now() WHERE id = 1",
                 (password_hash(replacement),),
@@ -1241,7 +1243,7 @@ class ControlStore:
                 # Expired rows are dropped first, exactly as the JSON store
                 # rebuilt its list from the live records, so an abandoned
                 # request never permanently occupies a queue slot.
-                connection.execute(
+                target_command(connection,
                     "DELETE FROM control.device_authorizations WHERE expires_at <= %s",
                     (current,),
                 )
@@ -1381,7 +1383,7 @@ class ControlStore:
         The UPDATE serializes uses with turn-off; no SKIP LOCKED means parallel
         requests do not spuriously fall back to asking for approval.
         """
-        row = connection.execute(
+        row = target_command(connection,
             "UPDATE control.approval_windows w SET consumed = consumed + 1"
             " WHERE client_bound AND client_id = %s AND instance = %s"
             " AND revoked_at IS NULL AND EXISTS ("
@@ -1470,7 +1472,7 @@ class ControlStore:
                 connection, grant_id=grant_id, client_id=client_id,
                 instance=instance, scopes=scopes,
             )
-            connection.execute(
+            target_command(connection,
                 "INSERT INTO control.approvals"
                 " (id_hash, grant_id, client_id, instance, operation_id, tool,"
                 "  request_digest, risk, scopes, packet, created_at,"
@@ -1546,7 +1548,8 @@ class ControlStore:
                 "SELECT id_hash AS reference, grant_id, client_id, instance,"
                 "       operation_id, tool, request_digest, risk, scopes,"
                 "       packet, status, created_at, expires_at, decided_at,"
-                "       decided_by"
+                "       decided_by, (SELECT detail FROM control.audit_event"
+                " WHERE event_id = 'receipt:' || id_hash) AS recovery"
                 "  FROM control.approvals"
                 " WHERE id_hash = %s AND revoked_at IS NULL",
                 (reference,),
@@ -1588,7 +1591,7 @@ class ControlStore:
         """
         with self._db() as connection:
             self._require_initialized(connection)
-            row = connection.execute(
+            row = target_command(connection,
                 "UPDATE control.approvals"
                 "   SET status = %s, decided_at = %s, decided_by = %s"
                 " WHERE id_hash = %s AND status = 'pending'"
@@ -1643,7 +1646,7 @@ class ControlStore:
         receipt = secrets.token_urlsafe(32)
         with self._db() as connection:
             self._require_initialized(connection)
-            row = connection.execute(
+            row = target_command(connection,
                 "UPDATE control.approvals"
                 "   SET receipt_hash = %s"
                 " WHERE id_hash = %s AND status = 'approved'"
@@ -1654,7 +1657,22 @@ class ControlStore:
             )
         return receipt if row.rowcount else None
 
-    def redeem_receipt(self, receipt: str, *, request_digest: str) -> dict | None:
+    _eligible_receipt = (
+        " WHERE receipt_hash = %s AND status = 'approved'"
+        " AND request_digest = %s AND revoked_at IS NULL"
+        " AND decided_at > clock_timestamp() - %s"
+    )
+
+    def eligible_receipt(self, receipt: str, *, request_digest: str) -> str | None:
+        """Read-only preflight. The conditional UPDATE repeats every predicate."""
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT id_hash FROM control.approvals" + self._eligible_receipt,
+                (token_hash(receipt), request_digest, self.RECEIPT_LIFETIME),
+            ).fetchone()
+        return row["id_hash"] if row else None
+
+    def redeem_receipt(self, receipt: str, *, request_digest: str, state=None, connection=None) -> dict | None:
         """Spend a receipt against the one request it was issued for.
 
         The conditional UPDATE is the read. A receipt that was already spent
@@ -1667,19 +1685,41 @@ class ControlStore:
         person saw does not match the row and is refused by the same statement
         that would otherwise spend it.
         """
-        with self._db() as connection:
+        lease = self._db() if connection is None else contextlib.nullcontext(connection)
+        with lease as connection:
             self._require_initialized(connection)
-            row = connection.execute(
-                "UPDATE control.approvals"
-                "   SET status = 'consumed', consumed_at = %s"
-                " WHERE receipt_hash = %s AND status = 'approved'"
-                "   AND request_digest = %s AND revoked_at IS NULL"
-                "   AND decided_at > %s"
-                " RETURNING operation_id, grant_id, client_id, decided_by,"
-                "           request_digest",
-                (now(), token_hash(receipt), request_digest,
-                 now() - self.RECEIPT_LIFETIME),
-            ).fetchone()
+            remaining_time()
+            if state is not None:
+                state.receipt = "unconfirmed"
+            try:
+                cursor = connection.execute(
+                    # A competing row lock can outlive the remaining receipt
+                    # lifetime. Check server time again on the locked version.
+                    "WITH eligible AS MATERIALIZED ("
+                    " SELECT id_hash, decided_at FROM control.approvals" + self._eligible_receipt
+                    + " FOR UPDATE"
+                    "), spent AS ("
+                    " UPDATE control.approvals a SET status = 'consumed', consumed_at = clock_timestamp()"
+                    " FROM eligible WHERE a.id_hash = eligible.id_hash"
+                    " AND eligible.decided_at > clock_timestamp() - %s"
+                    " RETURNING a.id_hash, a.operation_id, a.grant_id, a.client_id, a.decided_by, a.request_digest"
+                    "), recorded AS ("
+                    " INSERT INTO control.audit_event(event_id, event, actor, client_id, grant_id, detail)"
+                    " SELECT 'receipt:' || id_hash, 'approval.consumed', grant_id, client_id, grant_id,"
+                    "        %s::jsonb FROM spent"
+                    ") SELECT operation_id, grant_id, client_id, decided_by, request_digest FROM spent",
+                    (token_hash(receipt), request_digest, self.RECEIPT_LIFETIME, self.RECEIPT_LIFETIME,
+                     json.dumps(state.recovery if state is not None else {})),
+                )
+            except CommandNotSubmitted:
+                if state is not None:
+                    state.receipt = "pending"
+                raise
+            row = cursor.fetchone()
+            # This UPDATE is autocommit. Record the acknowledgement before
+            # lease cleanup or the independent filesystem audit can fail.
+            if state is not None:
+                state.receipt = "consumed" if row else "refused"
         if row is None:
             return None
         self.audit(
@@ -1777,7 +1817,7 @@ class ControlStore:
                 expires_at = current + dt.timedelta(seconds=DEVICE_TOKEN_SECONDS)
                 # Consume first, conditionally: if this returns nothing another
                 # poll already took it, and no token is minted.
-                consumed = connection.execute(
+                consumed = target_command(connection,
                     "UPDATE control.device_authorizations"
                     "   SET status = 'consumed', consumed_at = %s, token_id = %s"
                     " WHERE id_hash = %s AND status = 'approved' AND expires_at > %s"
@@ -1825,7 +1865,8 @@ class ControlStore:
         )
         return {"status": "authorized", "token": raw, "record": record}
 
-    def create_operation(self, kind: str, actor: str, target: dict | None = None) -> dict:
+    def create_operation(self, kind: str, actor: str, target: dict | None = None, *,
+                         admission_record=False) -> dict:
         operation = {
             "id": secrets.token_hex(16),
             "kind": kind,
@@ -1838,7 +1879,11 @@ class ControlStore:
             "result": None,
             "error": None,
         }
-        with self._locked():
+        state = mutation_state()
+        # Keep the existing DB-before-control-file lock order, including when
+        # the receipt acknowledgement is followed by a nested file audit.
+        lease = self._db() if state.receipt == "pending" else contextlib.nullcontext()
+        with lease as connection, self._locked():
             existing = sorted(
                 (
                     path for path in self.operations.glob("*.json")
@@ -1858,9 +1903,22 @@ class ControlStore:
                 }:
                     removable.append(path)
             excess = max(0, len(existing) - 499)
+            if admission_record:
+                reference = state.recovery.get("approvalReference")
+                if reference:
+                    operation["id"] = reference[:32]
+                    operation["target"]["approvalReference"] = reference
+                state.recovery.update(operation["target"], operationId=operation["id"])
+                state.admit(connection)
+            else:
+                state.recovery["operationId"] = operation["id"]
+                state.begin(connection)
             for stale in removable[:excess]:
                 stale.unlink()
+            remaining_time()
             _atomic_json(self.operations / f"{operation['id']}.json", operation)
+            if admission_record:
+                state.admission_record_id = operation["id"]
         return operation
 
     def finish_operation(
@@ -2003,7 +2061,7 @@ class ControlStore:
     def revoke_token(self, token_id: str) -> bool:
         with self._db() as connection:
             self._require_initialized(connection)
-            row = connection.execute(
+            row = target_command(connection,
                 "UPDATE control.tokens SET revoked_at = %s"
                 " WHERE token_id = %s AND revoked_at IS NULL"
                 " RETURNING token_id",
