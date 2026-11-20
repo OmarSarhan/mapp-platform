@@ -37,7 +37,7 @@ class Response:
             return None
 
 
-def call(app, *, method="POST", path="/mcp", headers=None, body=b"", chunks=None):
+def call(app, *, method="POST", path="/mcp", headers=None, body=b"", chunks=None, disconnect=None):
     """One request. ``chunks`` sends the body in pieces, as a real client may."""
     raw = [
         (name.lower().encode("latin-1"), value.encode("latin-1"))
@@ -51,9 +51,13 @@ def call(app, *, method="POST", path="/mcp", headers=None, body=b"", chunks=None
         for index, piece in enumerate(pieces)
     ]
     messages = []
+    disconnected = disconnect if disconnect is not None else asyncio.Event()
 
     async def receive():
-        return queue.pop(0) if queue else {"type": "http.disconnect"}
+        if queue:
+            return queue.pop(0)
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
 
     async def send(message):
         messages.append(message)

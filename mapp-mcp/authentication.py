@@ -20,12 +20,12 @@ something to repair rather than something to obtain.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import json
 import logging
 
 from introspection_client import IntrospectionUnavailable
+from request_scope import CURRENT_REQUEST, run_worker
 
 LOGGER = logging.getLogger("mapp_mcp.authentication")
 
@@ -125,7 +125,7 @@ class BearerAuthentication:
             # worker thread. Doing it inline would stall the event loop for the
             # whole timeout whenever the authorizer is slow -- one unavailable
             # dependency becoming an unresponsive server.
-            record = await asyncio.to_thread(self._introspection.introspect, token)
+            record = await run_worker(self._introspection.introspect, token)
         except IntrospectionUnavailable as exc:
             # Fails closed, but as a 503: the credential was never judged, and
             # calling it invalid would tell the client to go and get another one
@@ -164,6 +164,9 @@ class BearerAuthentication:
         # runs in its own context, so a value from another one cannot be read
         # here, and clearing it would only matter if that were false.
         CURRENT_CALLER.set(caller)
+        request = CURRENT_REQUEST.get()
+        if request is not None:
+            request.remaining()
         await self._app(scope, receive, send)
 
     async def _refuse(self, send, status, message, *, error="", scope="") -> None:

@@ -47,8 +47,8 @@ def build_app(
         runtime = inner
     else:
         # Imported here rather than at module scope: the guard, the metadata
-        # surface and the authentication middleware are stdlib-only and their
-        # tests run without the SDK installed. Importing it at the top would
+        # surface and the authentication middleware can run without the SDK.
+        # Importing it at the top would
         # make 28 packages a prerequisite for testing code that does not use
         # them.
         from config_api_client import ConfigApiClient
@@ -89,4 +89,5 @@ def build_app(
     authenticated = BearerAuthentication(
         runtime, introspection=introspection, resource=resource
     )
-    return MetadataApp(resource, ProtocolEraGuard(authenticated)), resource
+    guard = ProtocolEraGuard(authenticated, tool_timeouts=getattr(runtime, "tool_timeouts", None))
+    return MetadataApp(resource, guard), resource
