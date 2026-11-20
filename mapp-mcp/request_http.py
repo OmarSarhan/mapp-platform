@@ -1,6 +1,7 @@
 """Keep urllib's handlers and TLS policy; own the socket through the last byte."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from functools import partial
 import http.client
@@ -9,9 +10,17 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from request_scope import CURRENT_REQUEST
+
+
+# getaddrinfo cannot be interrupted. Refuse saturation before submitting to
+# the executor, and count the job until the resolver itself exits.
+_RESOLVER_LIMIT = 8
+_RESOLVERS = ThreadPoolExecutor(_RESOLVER_LIMIT, thread_name_prefix="mapp-dns")
+_RESOLVER_SLOTS = threading.BoundedSemaphore(_RESOLVER_LIMIT)
 
 
 class _Hop:
@@ -46,7 +55,20 @@ class _Hop:
     async def connect(self, address):
         loop = self.request.loop
         with self.request.active(self.remaining()):
-            addresses = await loop.getaddrinfo(*address, type=socket.SOCK_STREAM)
+            if not _RESOLVER_SLOTS.acquire(blocking=False):
+                raise OSError("Downstream name resolution is at capacity.")
+            try:
+                lookup = _RESOLVERS.submit(socket.getaddrinfo, *address, type=socket.SOCK_STREAM)
+            except BaseException:
+                _RESOLVER_SLOTS.release()
+                raise
+            lookup.add_done_callback(lambda _: _RESOLVER_SLOTS.release())
+            # Cancelling the HTTP waiter must never cancel a queued executor
+            # future and return its slot while its work item is still queued.
+            resolved = asyncio.wrap_future(lookup)
+            resolved.add_done_callback(lambda done: done.exception())
+            await asyncio.wait([resolved])
+            addresses = resolved.result()
             last_error = OSError("No address resolved for the downstream service.")
             for family, kind, proto, _, sockaddr in addresses:
                 self.remaining()
@@ -97,6 +119,13 @@ class _OwnedHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
         return super().do_open(partial(cls, hop=self.hop), req, **options)
 
 
+class _HTTPRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() not in {"http", "https"}:
+            raise urllib.error.HTTPError(req.full_url, code, "Unsupported redirect scheme", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @contextmanager
 def urlopen(req, *, timeout, read_error_body=False):
     request = CURRENT_REQUEST.get()
@@ -110,7 +139,7 @@ def urlopen(req, *, timeout, read_error_body=False):
     with request.own_hop(hop):
         timer.start()
         try:
-            opener = urllib.request.build_opener(_OwnedHandler(hop))
+            opener = urllib.request.build_opener(_OwnedHandler(hop), _HTTPRedirects())
             try:
                 response = opener.open(req, timeout=hop.remaining())
             except urllib.error.HTTPError as exc:

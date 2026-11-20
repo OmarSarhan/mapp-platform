@@ -4,12 +4,14 @@ Run from the repo root with the MCP and psycopg dependencies installed.
 Requires a local postgres fixture admin and an oma118 login capped at eight.
 Creates and drops one uniquely named database. No deployment DSNs are read.
 """
+import argparse
 import concurrent.futures
 import http.client
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import sys
@@ -24,6 +26,11 @@ from psycopg import sql
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "2026-07-28"
 SOCKET = "/tmp/oma118-pg"
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
 
 
 def service_env(service, env):
@@ -54,7 +61,7 @@ def oauth(env, pipe, tokens):
 
         class CountRoutes(original):
             def do_POST(self):
-                observed.append(self.path)
+                observed.append((self.path, threading.current_thread()))
                 super().do_POST()
 
         httpd.RequestHandlerClass = CountRoutes
@@ -68,23 +75,29 @@ def oauth(env, pipe, tokens):
                 def holder():
                     with pool.connection(env["CONTROL_DATABASE_URL"]):
                         ready.wait(5)
-                        assert release.wait(10)
+                        require(release.wait(10), "fixture lease release timed out")
 
                 leases = [workers.submit(holder) for _ in range(3)]
                 ready.wait(5)
                 observed.clear()
                 pipe.send("held")
                 for expected in (1, 0):
-                    assert pipe.recv() == "observe"
+                    require(recv(pipe) == "observe", "expected observe")
                     until = time.monotonic() + 0.5
                     while pool._waiters != expected and time.monotonic() < until:
                         time.sleep(0.002)
-                    pipe.send((pool._waiters, list(observed)))
-                assert pipe.recv() == "release"
+                    snapshot = observed.copy()
+                    if expected == 1:
+                        require(len(snapshot) == 1, "expected exactly one OAuth POST")
+                        handler = snapshot[0][1]
+                    pipe.send((pool._waiters, [path for path, _ in snapshot]))
+                require(recv(pipe) == "release", "expected release")
                 release.set()
                 for lease in leases:
                     lease.result()
-                pipe.send("released")
+                handler.join(2)
+                require(not handler.is_alive(), "observed OAuth handler did not exit")
+                pipe.send("released and joined")
 
 
 def config(env, pipe, dispatches):
@@ -123,7 +136,10 @@ def runtime(env, drained):
         async def observed(scope, receive, send):
             if scope["type"] != "http":
                 return await app(scope, receive, send)
-            drained.clear()
+            tag = dict(scope["headers"]).get(b"x-fixture-drain")
+            if tag is None:
+                return await app(scope, receive, send)
+            barrier = drained[tag]
             try:
                 await app(scope, receive, send)
             finally:
@@ -132,7 +148,7 @@ def runtime(env, drained):
                 limiter = anyio.to_thread.current_default_thread_limiter()
                 while limiter.borrowed_tokens or limiter.statistics().tasks_waiting:
                     await asyncio.sleep(.002)
-                drained.set()
+                barrier.set()
 
         return observed, resource
 
@@ -140,7 +156,7 @@ def runtime(env, drained):
     server.main()
 
 
-def call(path, token):
+def call(path, token, tag=None):
     sock = socket.socket(socket.AF_UNIX)
     sock.settimeout(5)
     sock.connect(path)
@@ -152,7 +168,8 @@ def call(path, token):
     conn.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                  "params": params}), {"Mcp-Protocol-Version": VERSION, "Mcp-Method": "tools/call",
                  "Mcp-Name": params["name"], "Content-Type": "application/json",
-                 "Accept": "application/json, text/event-stream", "Authorization": "Bearer " + token})
+                 "Accept": "application/json, text/event-stream", "Authorization": "Bearer " + token,
+                 **({"X-Fixture-Drain": tag} if tag else {})})
     return conn
 
 
@@ -163,13 +180,14 @@ def healthy(path, token):
         body = response.read().decode()
         frames = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
         result = (frames or [json.loads(body)])[-1]["result"]
-        assert response.status == 200 and not result.get("isError") and "actions" in json.dumps(result)
+        require(response.status == 200 and not result.get("isError") and "actions" in json.dumps(result),
+                "healthy RPC failed")
     finally:
         conn.close()
 
 
 def recv(pipe):
-    assert pipe.poll(10), "fixture service did not answer"
+    require(pipe.poll(10), "fixture service did not answer")
     return pipe.recv()
 
 
@@ -187,7 +205,8 @@ def exercise(directory, dsn):
     processes = []
     tokens = ["mapp_a_" + secrets.token_urlsafe(32) for _ in range(2)]
     dispatches = ctx.Value("i", 0)
-    drained = ctx.Event()
+    endpoints = ("exchange", "introspect")
+    drained = {name.encode(): ctx.Event() for name in endpoints}
 
     def start(fn, *args):
         proc = ctx.Process(target=fn, args=(env, *args))
@@ -210,14 +229,14 @@ def exercise(directory, dsn):
         while not Path(path).exists() and time.monotonic() < until:
             time.sleep(0.01)
         healthy(path, tokens[0])
-        for token, endpoint in zip(tokens, ("exchange", "introspect"), strict=True):
+        for token, endpoint in zip(tokens, endpoints, strict=True):
             before = count_tokens(), dispatches.value, workspace.read_bytes()
             auth.send("hold")
-            assert recv(auth) == "held"
-            conn = call(path, token)
+            require(recv(auth) == "held", "leases were not held")
+            conn = call(path, token, endpoint)
             try:
                 auth.send("observe")
-                assert recv(auth) == (1, ["/internal/oauth/" + endpoint])
+                require(recv(auth) == (1, ["/internal/oauth/" + endpoint]), "wrong OAuth waiter")
             finally:
                 conn.close()
             started = time.monotonic()
@@ -225,13 +244,13 @@ def exercise(directory, dsn):
             waiters, _ = recv(auth)
             elapsed = time.monotonic() - started
             auth.send("release")
-            assert recv(auth) == "released"
-            assert drained.wait(2), "MCP request or admitted worker did not drain"
+            require(recv(auth) == "released and joined", "OAuth handler did not drain")
+            require(drained[endpoint.encode()].wait(2), "MCP request or admitted worker did not drain")
             after = count_tokens(), dispatches.value, workspace.read_bytes()
             healthy(path, token)
             print(f"{endpoint} waiters={waiters} elapsed={elapsed:.3f}s tokens={before[0]}->{after[0]} "
-                  f"dispatches={before[1]}->{after[1]} fresh=ok", flush=True)
-            assert elapsed < 0.6 and waiters == 0 and before == after
+                  f"dispatches={before[1]}->{after[1]} handler=joined request=drained fresh=ok", flush=True)
+            require(elapsed < 0.6 and waiters == 0 and before == after, "disconnect invariant failed")
     finally:
         for proc in reversed(processes):
             proc.terminate()
@@ -242,16 +261,29 @@ def exercise(directory, dsn):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--socket-dir", default=SOCKET)
+    parser.add_argument("--role", default="oma118")
+    args = parser.parse_args()
+    directory = str(Path(args.socket_dir).resolve())
+    require(directory == SOCKET or re.fullmatch(r"/tmp/oma118-repair-pg-[A-Za-z0-9]+", directory),
+            "expected a private OMA-118 fixture socket directory")
+    require(re.fullmatch(r"oma118(?:_[a-f0-9]{16})?", args.role), "expected a fixture role")
     db = "oma118_" + secrets.token_hex(8)
-    address = dict(host=SOCKET, port=55478)
+    address = dict(host=directory, port=55478)
     with psycopg.connect(**address, dbname="postgres", user="postgres", autocommit=True) as admin:
-        assert admin.execute("SHOW listen_addresses").fetchone() == ("",)
-        assert admin.execute("SELECT rolsuper, rolconnlimit FROM pg_roles WHERE rolname='oma118'").fetchone() == (False, 8)
-        admin.execute(sql.SQL("CREATE DATABASE {} OWNER oma118 TEMPLATE template0 ENCODING 'UTF8'").format(sql.Identifier(db)))
+        require(admin.execute("SHOW listen_addresses").fetchone() == ("",), "fixture must be Unix-only")
+        require(admin.execute("SHOW unix_socket_directories").fetchone() == (directory,) and
+                admin.execute("SHOW port").fetchone() == ("55478",), "unexpected fixture endpoint")
+        role = admin.execute("SELECT rolsuper, rolcanlogin, rolconnlimit FROM pg_roles WHERE rolname=%s",
+                             (args.role,)).fetchone()
+        require(role == (False, True, 8), "expected a capped fixture login")
+        admin.execute(sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template0 ENCODING 'UTF8'").format(
+            sql.Identifier(db), sql.Identifier(args.role)))
         try:
-            dsn = psycopg.conninfo.make_conninfo(**address, dbname=db, user="oma118")
+            dsn = psycopg.conninfo.make_conninfo(**address, dbname=db, user=args.role)
             with psycopg.connect(dsn) as conn:
-                conn.execute("CREATE SCHEMA control AUTHORIZATION oma118")
+                conn.execute(sql.SQL("CREATE SCHEMA control AUTHORIZATION {}").format(sql.Identifier(args.role)))
             sys.path.insert(0, str(ROOT / "config-ui"))
             import control_schema
             with control_schema.connect(dsn) as conn:
