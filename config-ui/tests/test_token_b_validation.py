@@ -33,7 +33,7 @@ from pathlib import Path
 import app
 import canonical
 import execution_envelope
-from mcp_token_client import McpTokenClient, McpTokenClientError
+from mcp_token_client import McpTokenClient, McpTokenClientError, RedemptionUnconfirmed
 
 CONFIG_RESOURCE = "http://config.localhost/api"
 MCP_RESOURCE = "http://mcp.localhost/mcp"
@@ -996,6 +996,19 @@ class RealComponentLoopTests(unittest.TestCase):
         with self.assertRaises(McpTokenClientError) as caught:
             self.client.redeem("mapp_b_loop3", "proposals.apply", digest)
         self.assertTrue(caught.exception.refused)
+
+    def test_spent_token_with_lost_acknowledgement_is_indeterminate(self):
+        digest = self.envelope_digest()
+        self.mint("mapp_b_lost", digest)
+        # Suppress only the actual response writer, after the real endpoint
+        # has spent the token. Its HTTP/1.0 handler then closes the connection.
+        with unittest.mock.patch.object(self.auth_server.MappResponse, "write_to",
+                                        autospec=True) as writer:
+            with self.assertRaises(RedemptionUnconfirmed):
+                self.client.redeem("mapp_b_lost", "proposals.apply", digest)
+        writer.assert_called_once()
+        self.assertEqual(200, writer.call_args.args[0].status)
+        self.assertIsNotNone(self.store.exchanged_binding("mapp_b_lost")["consumed_at"])
 
     def test_a_different_proposal_is_refused(self) -> None:
         """One token, one request. This is the binding, end to end."""

@@ -20,14 +20,26 @@ never a pass.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import Future, wait
+from contextlib import closing, contextmanager, ExitStack, suppress
+import errno
+import http.client
 import json
-import urllib.error
+import selectors
+import socket
+import threading
 import urllib.parse
-import urllib.request
 from typing import Any
+
+from control_connections import AdmissionTimeout, RequestBudget, current_request, remaining_time
 
 MAX_RESPONSE_BYTES = 64 * 1024
 DEFAULT_TIMEOUT = 5.0
+_POLL = 0.025
+# libc resolution can outlive the request. Only start a resolver with a
+# reserved slot, and let that worker release the slot when libc returns.
+_DNS_LIMIT = 8
+_DNS_SLOTS = threading.BoundedSemaphore(_DNS_LIMIT)
 
 
 class McpTokenClientError(RuntimeError):
@@ -52,9 +64,77 @@ class McpTokenClientError(RuntimeError):
         self.refused = refused
 
 
-class _RejectRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, newurl):
-        return None
+class RedemptionUnconfirmed(RuntimeError):
+    """The one-shot POST may have spent its token. No replay or target dispatch."""
+
+
+def _resolve(host, port, remaining):
+    remaining()
+    future = Future()
+
+    def resolve():
+        try:
+            future.set_result(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            _DNS_SLOTS.release()
+
+    if not _DNS_SLOTS.acquire(blocking=False):
+        raise OSError("Authorization component name resolution is at capacity.")
+    try:
+        threading.Thread(target=resolve, name="oauth-dns", daemon=True).start()
+    except BaseException:
+        _DNS_SLOTS.release()
+        raise
+    while not future.done():
+        wait([future], timeout=min(_POLL, remaining()))
+    remaining()
+    return future.result()
+
+
+@contextmanager
+def _connection(host, port, hop, remaining):
+    last_error = OSError("No address for the authorization component.")
+    for family, kind, proto, _, address in _resolve(host, port, remaining):
+        remaining()
+        try:
+            sock = socket.socket(family, kind, proto)
+        except OSError as exc:
+            last_error = exc
+            continue
+        with sock, ExitStack() as ownership:
+            def abort():
+                with suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
+
+            ownership.callback(hop.arm(abort))
+            remaining()
+            try:
+                sock.setblocking(False)
+                error = sock.connect_ex(address)
+                if error in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EINTR):
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(sock, selectors.EVENT_WRITE)
+                        while not selector.select(min(_POLL, remaining())):
+                            pass
+                    error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if error:
+                    raise OSError(error, "Authorization component connect failed.")
+            except AdmissionTimeout:
+                raise
+            except OSError as exc:
+                remaining()
+                last_error = exc
+                continue
+            sock.settimeout(remaining())
+            # HTTPConnection may close its own fd at response headers and hand
+            # reading to HTTPResponse. Keep our shutdown handle through the body.
+            with closing(http.client.HTTPConnection(host, port)) as conn:
+                conn.sock = sock.dup()
+                yield conn
+            return
+    raise last_error
 
 
 class McpTokenClient:
@@ -90,6 +170,8 @@ class McpTokenClient:
                 "The configuration-API resource identifier is required."
             )
         self.endpoint = endpoint.rstrip("/")
+        self._host = parsed.hostname
+        self._port = parsed.port if parsed.port is not None else 80
         self.resource = resource
         self.timeout = timeout
         # Percent-encoded per RFC 6749 s2.3.1 before being joined, so a colon
@@ -102,75 +184,86 @@ class McpTokenClient:
             credentials.encode("utf-8")
         ).decode("ascii")
         self._secret = client_secret
-        self.opener = urllib.request.build_opener(_RejectRedirects())
 
     def _post(self, path: str, fields: dict[str, str]) -> dict[str, Any]:
-        from control_connections import remaining_time
-        timeout = remaining_time(self.timeout)
+        parent = current_request()
+        hop = RequestBudget(remaining_time(self.timeout), None)
+
+        def remaining():
+            return remaining_time(hop.remaining())
+
         body = urllib.parse.urlencode(fields).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint + path,
-            data=body,
-            headers={
-                "Accept": "application/json",
-                "Authorization": self._authorization,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Content-Length": str(len(body)),
-                "X-Mapp-Timeout-Seconds": str(timeout),
-            },
-            method="POST",
-        )
+        redeem = path == "/internal/oauth/redeem"
+        submitted = False
         try:
-            with self.opener.open(request, timeout=timeout) as response:
-                return self._decode(response)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 503:
-                from control_connections import AdmissionTimeout
-                exc.close()
-                raise AdmissionTimeout("Authorization database is busy; retry later.") from None
-            payload = {}
-            try:
-                payload = self._decode(exc)
-            except McpTokenClientError:
-                pass
-            error = str(payload.get("error") or "")
-            raise McpTokenClientError(
-                self._scrub(
-                    str(
-                        payload.get("error_description")
-                        or error
-                        or "The authorization component refused the request."
+            with ExitStack() as scope:
+                if parent is not None:
+                    scope.callback(parent.arm(lambda: hop.cancel("Request cancelled.")))
+                conn = scope.enter_context(_connection(self._host, self._port, hop, remaining))
+                headers = {
+                    "Accept": "application/json",
+                    "Authorization": self._authorization,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Mapp-Timeout-Seconds": str(remaining()),
+                }
+                submitted = True
+                conn.request("POST", path, body, headers)
+                with conn.getresponse() as response:
+                    if response.status == 503 and not redeem:
+                        raise AdmissionTimeout("Authorization database is busy.")
+                    payload = self._decode(response, framed=redeem)
+                    remaining()
+                    if 200 <= response.status < 300:
+                        return payload
+                    error = self._scrub(str(payload.get("error") or ""), fields["token"])
+                    refused = 400 <= response.status < 500 and bool(error)
+                    message = (payload.get("error_description") or error
+                               or "Authorization component request failed.")
+                    raise McpTokenClientError(
+                        self._scrub(str(message), fields["token"]),
+                        status=response.status, error=error or None, refused=refused,
                     )
-                ),
-                status=exc.code,
-                error=error or None,
-                refused=True,
-            ) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (McpTokenClientError, OSError, http.client.HTTPException) as exc:
+            if isinstance(exc, McpTokenClientError) and exc.refused:
+                raise
+            if submitted and redeem:
+                raise RedemptionUnconfirmed("Authorization token redemption was not confirmed.") from None
+            remaining()
+            if isinstance(exc, (McpTokenClientError, AdmissionTimeout)):
+                raise
             raise McpTokenClientError(
-                f"The authorization component is unavailable: {self._scrub(str(exc))}"
+                f"The authorization component is unavailable: {self._scrub(str(exc), fields['token'])}"
             ) from None
 
-    def _scrub(self, text: str) -> str:
-        # The secret is never in a response, but an exception string can carry
-        # a request URL, and a future caller could put one in a field. Cheap.
-        return text.replace(self._secret, "[redacted]")
+    def _scrub(self, text: str, token: str) -> str:
+        for value in (self._authorization.removeprefix("Basic "), token, self._secret):
+            if value:
+                text = text.replace(value, "[redacted]")
+        return text
 
-    def _decode(self, response) -> dict[str, Any]:
-        headers = getattr(response, "headers", None)
-        value = headers.get("Content-Type") if headers is not None else None
+    def _decode(self, response, *, framed: bool) -> dict[str, Any]:
+        headers = response.headers
+        value = headers.get("Content-Type")
         if str(value or "").split(";", 1)[0].strip().lower() != "application/json":
             raise McpTokenClientError(
                 "The authorization component response was not JSON."
             )
+        if framed:
+            # The control listener writes one computed length. A parseable
+            # prefix of a truncated acknowledgement cannot confirm a spend.
+            lengths = headers.get_all("Content-Length") or []
+            if headers.get("Transfer-Encoding") is not None or len(lengths) != 1:
+                raise McpTokenClientError("Incomplete authorization component response.")
         raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
             raise McpTokenClientError(
                 "The authorization component response is too large."
             )
+        if framed and lengths[0].strip(" \t").lstrip("0") != str(len(raw)):
+            raise McpTokenClientError("Incomplete authorization component response.")
         try:
             decoded = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
             raise McpTokenClientError(
                 "The authorization component returned invalid JSON."
             ) from exc
@@ -212,8 +305,5 @@ class McpTokenClient:
             },
         )
         if payload.get("redeemed") is not True:
-            raise McpTokenClientError(
-                "The authorization component did not confirm redemption.",
-                refused=True,
-            )
+            raise RedemptionUnconfirmed("Authorization token redemption was not confirmed.")
         return payload
