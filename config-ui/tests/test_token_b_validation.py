@@ -862,6 +862,23 @@ class RequestStateTests(unittest.TestCase):
         self.assertIsNone(handler._exchanged_token)
         self.assertFalse(handler._exchanged_token_redeemed)
 
+    def test_overload_does_not_invite_repeating_an_admitted_write(self):
+        from control_connections import AdmissionTimeout
+        for admitted in (False, True):
+            handler = object.__new__(app.Handler)
+            responses = []
+            handler._json = lambda status, body, **kw: responses.append((status, body, kw))
+            def dispatch(current):
+                current._mutation_admitted = admitted
+                raise AdmissionTimeout("fixture overload")
+            with unittest.mock.patch.object(app.SimpleHTTPRequestHandler, "handle_one_request", dispatch):
+                handler.handle_one_request()
+            status, body, extra = responses[0]
+            self.assertEqual(503, status)
+            self.assertEqual(not admitted, body["retryable"])
+            self.assertEqual(admitted, body["indeterminate"])
+            self.assertEqual("1", extra["headers"]["Retry-After"])
+
 
 class RealComponentLoopTests(unittest.TestCase):
     """The whole binding against the real component, over real HTTP.

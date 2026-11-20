@@ -449,19 +449,19 @@ class SemanticGenerationRouteTests(unittest.TestCase):
                 )
                 self._attempt_lock = threading.Lock()
                 self.attempts = 0
+                self._attempted_threads = set()
                 self.all_attempted = threading.Event()
 
-            def __enter__(self):
+            def acquire(self, *, timeout):
                 with self._attempt_lock:
-                    self.attempts += 1
+                    self._attempted_threads.add(threading.get_ident())
+                    self.attempts = len(self._attempted_threads)
                     if self.attempts == worker_count:
                         self.all_attempted.set()
-                self._slots.acquire()
-                return self
+                return self._slots.acquire(timeout=timeout)
 
-            def __exit__(self, *_args):
+            def release(self):
                 self._slots.release()
-                return False
 
         admission = ObservedAdmissionQueue()
 

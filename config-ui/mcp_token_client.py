@@ -105,6 +105,8 @@ class McpTokenClient:
         self.opener = urllib.request.build_opener(_RejectRedirects())
 
     def _post(self, path: str, fields: dict[str, str]) -> dict[str, Any]:
+        from control_connections import remaining_time
+        timeout = remaining_time(self.timeout)
         body = urllib.parse.urlencode(fields).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint + path,
@@ -114,13 +116,18 @@ class McpTokenClient:
                 "Authorization": self._authorization,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(body)),
+                "X-Mapp-Timeout-Seconds": str(timeout),
             },
             method="POST",
         )
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 return self._decode(response)
         except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                from control_connections import AdmissionTimeout
+                exc.close()
+                raise AdmissionTimeout("Authorization database is busy; retry later.") from None
             payload = {}
             try:
                 payload = self._decode(exc)

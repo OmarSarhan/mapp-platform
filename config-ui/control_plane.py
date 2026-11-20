@@ -264,15 +264,10 @@ class ControlStore:
 
     @contextlib.contextmanager
     def _db(self, *, migrate: bool = True):
-        """A connection to the control schema, closed when the call ends.
+        """Lease one of the process's three shared control connections.
 
-        One connection per operation rather than one held per store. Holding
-        one open is tempting -- these are short statements -- but a store is
-        constructed per process and per test, and a held connection is only
-        released when the object is collected, which exhausted the role's
-        CONNECTION LIMIT of 8 as soon as more than a handful existed at once.
-        Connecting per call keeps that limit meaningful; the cost is a few
-        milliseconds on a dashboard request.
+        The lease resets session state before returning to the pool. Stores
+        share the same budget rather than reserving connections individually.
 
         ``migrate=False`` is for the operations that are *about* the schema
         version. Migrating on first use is right for ordinary work -- the store
@@ -285,16 +280,19 @@ class ControlStore:
         Recovery likewise needs to inspect the restored ledger before any
         forward migration or invalidation.
         """
-        connection = control_schema.connect()
-        try:
+        from control_connections import CONTROL_CONNECTIONS, remaining_time
+        dsn = control_schema.control_dsn()
+        if not dsn:
+            raise control_schema.ControlSchemaUnavailable("Control database is not configured.")
+        with CONTROL_CONNECTIONS.connection(dsn) as connection:
             if migrate:
                 with self._db_lock:
+                    remaining_time()
                     if not self._migrated:
                         control_schema.migrate(connection)
                         self._migrated = True
+            remaining_time()
             yield connection
-        finally:
-            connection.close()
 
     def _require_initialized(self, connection) -> str:
         row = connection.execute(

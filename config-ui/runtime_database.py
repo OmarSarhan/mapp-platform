@@ -3,12 +3,14 @@
 from contextlib import contextmanager
 import threading
 from typing import Any, Callable, Iterator
+from control_connections import admission_slot
 
 
 # Live and preview XYZ can occupy forty sessions using the same runtime role.
 # Admit at most eight configuration-service sessions so the database role can
 # reserve two further reader sessions for probes and operator diagnostics.
 MAX_CONCURRENT_DBS_CONNECTIONS = 8
+DBS_ADMISSION_TIMEOUT_SECONDS = 5.0
 _DBS_CONNECTION_SLOTS = threading.BoundedSemaphore(
     MAX_CONCURRENT_DBS_CONNECTIONS
 )
@@ -37,7 +39,7 @@ def dbs_connection(
         raise RuntimeError(
             "Nested DBS_* connections must reuse the admitted connection."
         )
-    with _DBS_CONNECTION_SLOTS:
+    with admission_slot(_DBS_CONNECTION_SLOTS, DBS_ADMISSION_TIMEOUT_SECONDS):
         _DBS_CONNECTION_STATE.active = True
         try:
             with connect(*args, **kwargs) as connection:

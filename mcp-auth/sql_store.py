@@ -20,10 +20,10 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import secrets
+from control_connections import CONTROL_CONNECTIONS
 
 import psycopg
 from psycopg import sql
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from models import AuthorizationCode
@@ -35,7 +35,6 @@ from models import Session
 from models import Token
 
 SCHEMA = "control"
-CONNECT_TIMEOUT_SECONDS = 10
 
 #: Live parked requests permitted per source. Matches StubStore: a global cap
 #: alone lets one unauthenticated caller lock everyone out of /oauth/authorize.
@@ -101,34 +100,13 @@ def _check_audit_detail(detail: dict) -> None:
 
 
 class SqlStore:
-    """Backed by the `control` schema. One short-lived connection per call.
-
-    Pooling is deliberately absent: the authorization endpoints are low rate
-    and each call is a single statement, so a pool would add a failure mode
-    (a connection left mid-transaction) for no measurable gain. The role's
-    CONNECTION LIMIT is the backstop.
-    """
+    """Control schema operations share the process's bounded connection pool."""
 
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
 
-    def _connect(self) -> psycopg.Connection:
-        connection = psycopg.connect(
-            self._dsn,
-            autocommit=True,
-            row_factory=dict_row,
-            connect_timeout=CONNECT_TIMEOUT_SECONDS,
-        )
-        try:
-            connection.execute(
-                sql.SQL("SET SESSION search_path = pg_catalog, {s}").format(
-                    s=sql.Identifier(SCHEMA)
-                )
-            )
-        except BaseException:
-            connection.close()
-            raise
-        return connection
+    def _connect(self):
+        return CONTROL_CONNECTIONS.connection(self._dsn, connect=psycopg.connect)
 
     # -- clients ---------------------------------------------------------
 
@@ -866,6 +844,10 @@ class SqlStore:
                 "SELECT * FROM control.oauth_tokens WHERE token_hash = %s",
                 (token_digest(raw_token),),
             ).fetchone()
+        return self._token_from_row(row)
+
+    @staticmethod
+    def _token_from_row(row) -> Token | None:
         if row is None:
             return None
         issued = row["issued_at"]
@@ -879,6 +861,31 @@ class SqlStore:
             revoked=row["revoked_at"] is not None or row["consumed_at"] is not None,
             audience=row["audience"],
         )
+
+    def introspection_state(self, raw_token: str):
+        """Resolve token, grant and grant client in one authoritative snapshot."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT t.*, g.grant_id AS live_grant_id,"
+                " g.client_id AS grant_client_id, g.subject AS grant_subject,"
+                " g.scopes AS grant_scopes, g.revoked_at AS grant_revoked_at,"
+                " c.client_id AS active_client_id"
+                " FROM control.oauth_tokens t"
+                " LEFT JOIN control.oauth_grants g ON g.grant_id = t.subject"
+                " LEFT JOIN control.oauth_clients c ON c.client_id = g.client_id"
+                " AND c.disabled_at IS NULL WHERE t.token_hash = %s",
+                (token_digest(raw_token),),
+            ).fetchone()
+        if row is None:
+            return None, None, False
+        grant = None
+        if row["live_grant_id"] is not None:
+            grant = Grant(
+                grant_id=row["live_grant_id"], client_id=row["grant_client_id"],
+                subject=row["grant_subject"], scopes=tuple(row["grant_scopes"]),
+                revoked_at=_epoch(row["grant_revoked_at"]),
+            )
+        return self._token_from_row(row), grant, row["active_client_id"] is not None
 
     def save_exchanged_token(
         self,

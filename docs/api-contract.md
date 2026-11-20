@@ -12,6 +12,20 @@ the separately released `mapp-config-cli`. The platform is authoritative for
 workspace structure, rules, validation, revision handling, proposals, reloads,
 and visual evidence.
 
+## Database admission
+
+Database admission overload returns HTTP 503 with `code: database.busy`,
+`retryable: true`, and `Retry-After: 1` before a mutation is admitted. A write
+already admitted reports `retryable: false` and `indeterminate: true`; inspect
+its operation and target state before retrying. OAuth overload uses
+`error: temporarily_unavailable`. These responses do not authorize a mutation;
+retry with fresh request-bound credentials. The optional internal
+`X-Mapp-Timeout-Seconds` header shortens the server's request budget (maximum
+120 seconds). Admission waits consume that budget. JSON response metadata
+includes `databaseTiming.queueSeconds` and `databaseTiming.databaseSeconds`
+for local control database leases; remote service time remains part of total
+request latency. This does not change durable background-job deadlines.
+
 ## MCP client standing approvals
 
 These dashboard-only routes require an administrator session; POST requests

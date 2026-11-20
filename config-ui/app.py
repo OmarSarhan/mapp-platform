@@ -99,6 +99,7 @@ from gemini_client import (
 from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
 from runtime_database import dbs_connection
+from control_connections import AdmissionTimeout, request_scope, request_metrics, remaining_time
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, iso, parse_time
 from control_api import (
@@ -6526,7 +6527,17 @@ class Handler(SimpleHTTPRequestHandler):
         self._raw_body = None
         self._exchanged_token = None
         self._exchanged_token_redeemed = False
-        return super().handle_one_request()
+        self._mutation_admitted = False
+        try:
+            return super().handle_one_request()
+        except AdmissionTimeout:
+            self.close_connection = True
+            admitted = getattr(self, "_mutation_admitted", False)
+            self._json(503, {"code": "database.busy",
+                       "error": ("Inspect operation state before retrying this write."
+                                 if admitted else "Database admission expired; retry later."),
+                       "retryable": not admitted,
+                       "indeterminate": admitted}, headers={"Retry-After": "1"})
 
     def _json(self, status, payload, *, headers=None):
         if (
@@ -6575,6 +6586,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not isinstance(meta, dict):
             meta = {}
         meta["requestId"] = getattr(self, "_request_id", secrets.token_hex(16))
+        meta["databaseTiming"] = request_metrics()
         operation = payload.get("operation")
         if isinstance(operation, dict) and isinstance(operation.get("id"), str):
             meta["operationId"] = operation["id"]
@@ -6686,6 +6698,8 @@ class Handler(SimpleHTTPRequestHandler):
             # only caller of _actor and the only gate both routers use, which
             # is what makes this one line cover every authenticated path.
             return None
+        remaining_time()
+        self._mutation_admitted = state_change
         return actor
 
     def _actor_from_exchanged_token(self, presented: str):
@@ -7213,6 +7227,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        with request_scope(getattr(self, "headers", {}).get("X-Mapp-Timeout-Seconds", "120"), getattr(self, "connection", None)):
+            return self._do_GET()
+
+    def _do_GET(self):
         supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
         self._request_id = (
             supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
@@ -8480,6 +8498,10 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        with request_scope(getattr(self, "headers", {}).get("X-Mapp-Timeout-Seconds", "120"), getattr(self, "connection", None)):
+            return self._do_POST()
+
+    def _do_POST(self):
         supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
         self._request_id = (
             supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)

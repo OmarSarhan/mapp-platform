@@ -995,7 +995,8 @@ def postgres_generation_context(
     # path. Blocking here provides one process-wide admission queue for every
     # API caller, before any source connection is opened and before Gemini is
     # invoked by the route.
-    with _GENERATION_CONTEXT_READ_SLOTS:
+    from control_connections import admission_slot
+    with admission_slot(_GENERATION_CONTEXT_READ_SLOTS):
         return _read_postgres_generation_context(
             connection_url,
             schema=schema,

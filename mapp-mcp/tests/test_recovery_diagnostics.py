@@ -1,6 +1,8 @@
 """Recovery must distinguish a refused request from an unknown write outcome."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from config_api_client import ConfigApiRefused, ConfigApiUnavailable
 from mcp.server.mcpserver.exceptions import ToolError
@@ -8,6 +10,21 @@ from test_layers_tools import FakeConfigApi, FakeExchange, ToolTestCase, caller
 
 
 class RecoveryDiagnosticsTests(ToolTestCase):
+    def test_exchange_time_consumes_the_operation_deadline(self):
+        self.as_caller(caller())
+        api = FakeConfigApi(answer={"derivedProfiles": []})
+        fn = self.build_named("semantic_derived_profiles_list", config_api=api)
+        ticks = iter((100.0, 105.0))
+        with patch("runtime.time", SimpleNamespace(monotonic=lambda: next(ticks))):
+            fn()
+        self.assertEqual(20.0, api.calls[0]["timeout"])
+        api.calls.clear()
+        ticks = iter((100.0, 126.0))
+        with patch("runtime.time", SimpleNamespace(monotonic=lambda: next(ticks))):
+            with self.assertRaisesRegex(ToolError, "deadline expired"):
+                fn()
+        self.assertEqual([], api.calls)
+
     def test_transport_failure_does_not_invite_duplicate_writes(self):
         for name, kwargs, retryable in (
             ("semantic_derived_profiles_list", {}, True),
@@ -83,4 +100,5 @@ class RecoveryDiagnosticsTests(ToolTestCase):
         self.assertEqual("next", detail["pagination"]["nextCursor"])
         self.assertEqual("limit=10&cursor=a%2Bb%2Fc%3D", api.calls[0]["query"])
         self.assertEqual(api.calls[0]["query"], exchange.calls[0]["query"])
-        self.assertEqual(25, api.calls[0]["timeout"])
+        self.assertGreater(api.calls[0]["timeout"], 0)
+        self.assertLessEqual(api.calls[0]["timeout"], 25)

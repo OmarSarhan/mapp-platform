@@ -117,6 +117,7 @@ class ConfigApiClient:
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
             "X-Request-ID": request_id,
+            "X-Mapp-Timeout-Seconds": str(deadline),
         }
         if receipt is not None:
             headers[self.APPROVAL_RECEIPT_HEADER] = receipt

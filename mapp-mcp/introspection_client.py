@@ -88,6 +88,7 @@ class IntrospectionClient:
                 "Authorization": self._authorization,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(body)),
+                "X-Mapp-Timeout-Seconds": str(self.timeout),
             },
             method="POST",
         )

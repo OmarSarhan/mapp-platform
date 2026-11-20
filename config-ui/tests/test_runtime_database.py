@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from runtime_database import (
@@ -10,6 +11,36 @@ from runtime_database import (
 
 
 class RuntimeDatabaseAdmissionTests(unittest.TestCase):
+    def test_expired_waiter_never_connects_and_capacity_recovers(self) -> None:
+        slots = threading.BoundedSemaphore(1)
+        calls = []
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        def connect():
+            calls.append(True)
+            return Connection()
+
+        with patch("runtime_database._DBS_CONNECTION_SLOTS", slots), patch(
+            "runtime_database.DBS_ADMISSION_TIMEOUT_SECONDS", 0.01
+        ):
+            slots.acquire()
+            try:
+                with self.assertRaisesRegex(TimeoutError, "admission timed out"):
+                    with dbs_connection(connect):
+                        self.fail("Expired work executed")
+                self.assertEqual([], calls)
+            finally:
+                slots.release()
+            with dbs_connection(connect):
+                pass
+            self.assertEqual([True], calls)
+
     def test_connect_callable_never_observes_more_than_eight_sessions(self) -> None:
         active = 0
         maximum = 0

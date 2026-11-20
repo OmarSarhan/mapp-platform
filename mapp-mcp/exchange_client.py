@@ -96,7 +96,7 @@ class ExchangeClient:
             return cached[1]
         request = urllib.request.Request(
             self.config_api_endpoint + "/api/public/identity",
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "X-Mapp-Timeout-Seconds": str(self.timeout)},
             method="GET",
         )
         try:
@@ -210,6 +210,7 @@ class ExchangeClient:
                 "Authorization": self._authorization,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(body)),
+                "X-Mapp-Timeout-Seconds": str(self.timeout),
             },
             method="POST",
         )
@@ -224,7 +225,7 @@ class ExchangeClient:
             except (ValueError, UnicodeDecodeError, OSError):
                 detail = {}
             error = str(detail.get("error") or "")
-            if exc.code in (401, 403):
+            if exc.code in (401, 403, 503):
                 raise ExchangeUnavailable(
                     self._scrub(
                         f"the broker refused this component: HTTP {exc.code} {error}"

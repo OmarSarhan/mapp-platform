@@ -429,6 +429,20 @@ class ControlListenerTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(body["active"])
 
+    def test_database_overload_is_retryable_and_recovers(self) -> None:
+        from control_connections import AdmissionTimeout
+        original = self.store.introspection_state
+        def busy(_token):
+            raise AdmissionTimeout("fixture saturation")
+        self.store.introspection_state = busy
+        status, body = self.post("/internal/oauth/introspect", {"token": "mapp_a_live"})
+        self.assertEqual(503, status)
+        self.assertEqual("temporarily_unavailable", body["error"])
+        self.store.introspection_state = original
+        status, body = self.post("/internal/oauth/introspect", {"token": "mapp_a_live"})
+        self.assertEqual(200, status)
+        self.assertTrue(body["active"])
+
     def test_introspection_refuses_an_unauthenticated_caller(self) -> None:
         """Before interpreting the body.
 
@@ -524,7 +538,7 @@ class OracleTests(IntrospectionTestCase):
 
         def __getattr__(self, name):
             attribute = getattr(self._inner, name)
-            if name not in ("query_token", "query_grant", "query_client"):
+            if name != "introspection_state":
                 return attribute
 
             def record(*args, **kwargs):
@@ -567,7 +581,7 @@ class OracleTests(IntrospectionTestCase):
             )
             counts[token] = counting.calls
         self.assertEqual(
-            {token: ["query_token", "query_grant", "query_client"]
+            {token: ["introspection_state"]
              for token in counts},
             counts,
         )

@@ -280,10 +280,14 @@ database decides a race rather than a process-local lock; and a consumed record
 is marked rather than deleted, so a replay arrives at a row that says when it
 was spent instead of looking merely unrecognised.
 
-The store opens one short-lived connection per call and does not pool, which
-makes the `mapp_control` role's `CONNECTION LIMIT` of 8 the backstop — and,
-since `config-ui` shares that role and also does not pool, a shared ceiling on
-concurrent control-plane operations rather than headroom. See
+OAuth and config API each share three reusable control connections across all
+stores in their single deployed process. Two of the role's eight connections
+remain available for diagnostics and administration. Leases roll back and
+discard session state before reuse; failed resets close the connection.
+Admission accepts at most twelve waiting callers per service and waits at most
+two seconds, bounded further by the request deadline. Overload returns HTTP 503
+with `Retry-After: 1`. Introspection joins token, grant and grant-owning client
+in one authoritative statement; no new authentication cache is introduced. See
 [external PostgreSQL](external-postgresql.md#control-plane).
 
 ### The operator credential

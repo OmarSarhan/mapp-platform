@@ -29,6 +29,7 @@ import binascii
 import contextlib
 import json
 import secrets
+import time
 from functools import partial
 import re
 from pathlib import Path
@@ -1473,6 +1474,7 @@ def build_runtime(
         and agreed with the code while the property was false.
         """
         trace("platform.dispatch", operationId=operation["operation_id"])
+        started = time.monotonic()
         caller = CURRENT_CALLER.get()
         if caller is None:
             # Unreachable through the middleware, which refuses before dispatch.
@@ -1508,12 +1510,18 @@ def build_runtime(
             # Deliberately not the underlying text: it describes this
             # component's plumbing, and an agent cannot act on it.
             raise DiagnosticToolError(
-                "The authorization component is unavailable; try again.", code="auth.exchange_unavailable"
+                "The authorization component is unavailable; try again.",
+                code="auth.exchange_unavailable", diagnostics={"retryable": True},
             ) from None
         try:
             # Credentials are redeemed on admission; their lifetime does not
             # need to cover execution. Long mutations use durable jobs.
-            deadline = operation.get("timeout")
+            deadline = float(operation.get("timeout", 15.0)) - (time.monotonic() - started)
+            if deadline <= 0:
+                raise DiagnosticToolError(
+                    "The operation deadline expired before platform admission; retry later.",
+                    code="operation.deadline_expired",
+                )
             if operation["method"] == "GET":
                 return config_api.get(
                     path=path, query=query, token=token_b, timeout=deadline,
