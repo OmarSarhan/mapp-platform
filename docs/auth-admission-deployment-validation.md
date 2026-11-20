@@ -202,3 +202,108 @@ running containers. Raw private fixture logs/responses were removed after
 retaining sanitized results. Evidence remained below 32 MiB total and 8 MiB
 per file. Fixture volumes remain only until the controller deletes the VM;
 this is service cleanup, not confirmation of VM deletion.
+
+## Fresh-start approval and launcher repair
+
+The user subsequently extended the same disposable VM to 21:30 UTC. A second
+isolated project, `mapp-approval-check`, initialized its own basemap-only
+workspace and databases. It did not reuse the previously approved workspace.
+The repaired `./bin/mapp demo --no-semantics` loaded the public sources,
+reconciled four derived relations, and stopped at its explicit approval prompt.
+The retained preview was complete and eligible, including the candidate map,
+legend and clicked-feature popup. The original absent layer correctly had no
+applicable legend or popup.
+
+The user approved proposal `1795207456-e8eefb22c57d-c4632a` with preview
+`812aca896c9f70624de79abe11543d4e`. Submitting that exact confirmation completed
+the demo with exit 0 and an acknowledged workspace apply and XYZ reload.
+`./bin/mapp verify` exited 0. A fresh browser session rendered population
+polygons; clicking one returned output area `E00057226`, population `314`.
+Observed tile and feature requests returned 200 with no console errors.
+The owned browser tab and SSH tunnel were closed after capturing evidence.
+
+The helper checks all preview operation IDs and the original revision and
+candidate hash before prompting. It shows changed JSON paths, preserves
+boolean/number distinctions, requires exact confirmation text, and submits
+once. Uncertain HTTP or transport replies direct the operator to the proposal,
+available operation reference, workspace and reload state without replay.
+The fixed candidate equals the versioned ten-layer workspace.
+The updated `layers.sh` reconciliation also completed against the approved
+fixture: it recognized the exact saved workspace, requested no new proposal
+approval, and completed its fingerprint-bound reload. Both demo API tokens
+were independently observed revoked. This was a reconciliation rerun, not
+another source-data download.
+
+Independent focused reviews found and drove repairs to the launcher fixture
+isolation, Dockerfile inventory, script database coverage, preview identity,
+diff presentation and apply-outcome reporting. The external client now runs
+without deployment credentials, live sockets, `.env` or `var`, and with no
+external networking. Script tests use test-only pinned service dependencies;
+their database-backed checks receive the disposable test database and skips
+fail that stage. The isolated initialization fixture includes the newly
+required admission modules. Production service images are unchanged.
+
+Verification exposed additional fixture dependencies rather than runtime
+regressions: the script image needed executable temporary fixtures and the
+`openssl` CLI, and the reset-warning test needed a Docker availability stub.
+That stub permits only `docker compose version` and asserts that no reset
+command was reached before confirmation. The external client test also
+tolerates a child exiting between its cleanup timeout and kill attempt.
+
+The final launcher command uses the existing Alpine-compatible client binary
+and the pinned standalone CLI workflow as explicit read-only fixtures:
+
+```sh
+MAPP_CODEX_TEST_BINARY=/srv/oma125/private/codex \
+MAPP_CONFIG_CLI_WORKFLOW=/srv/oma125/private/cli-workflow.md \
+COMPOSE_PARALLEL_LIMIT=1 ./bin/mapp test
+```
+
+The client and CLI source are not vendored or installed into production
+images. A hash manifest matches all ten changed source/test files on the
+guest to local commit `36750af`.
+
+An existing preview-planner limitation remains for drifted workspaces whose
+feature information already matches the demo: original popup evidence may
+be omitted, so the helper refuses the incomplete review. Neither review
+changed the approved-mutation backend. These focused reviews do not replace
+the separately service-blocked OMA-114 independent review.
+
+Sanitized fresh-run evidence uses the `clean-preview`, `clean-live`, and
+`approval-*` filenames in the retained OMA-125 evidence directory. Final
+launcher evidence is `launcher-results.json` and `gate-source-manifest.json`.
+OMA-76 remains NOT READY while its independent mutation review is outstanding.
+
+The standard launcher completed with exit 0 on `36750af`:
+
+| Stage | Actual result |
+| --- | --- |
+| Config | 1,343 passed, zero skips |
+| OAuth | 516 passed, zero skips |
+| Database preflight | 3 passed, zero skips |
+| MCP, including real client and CLI fixtures | 482 passed, zero skips |
+| Semantic service | 64 passed, zero skips |
+| Compose isolation | 24 passed, zero skips |
+| Deployment scripts with disposable PostgreSQL | 215 passed, zero skips |
+| ETL discovery | 126 run: 117 passed, 9 explicit opt-in skips |
+| Frontend | 161 passed across 7 files; build passed |
+| Runtime dependency audit | Zero vulnerabilities with `--omit=dev` |
+| Egress and Compose model checks | Passed |
+
+The nine ETL skips are six optional PostGIS cases and three optional live-source
+cases; the earlier real PostGIS/source validation remains separate evidence.
+`npm ci` reported three development dependency advisories (two moderate, one
+high); the runtime-only audit found none. Cancellation fixtures emitted handler
+and thread diagnostics while the suites passed. This is not a claim that the
+entire launcher has zero skips or that development dependency advisories were
+remediated. One existing verifier-loop fixture also logged a missing `deferred`
+key in its mocked summary while its test passed; no claim of a diagnostic-free
+run is made. The final local focused run passed 51 tests, and shell syntax and
+Git whitespace checks passed.
+
+Both disposable Compose projects were stopped successfully. `docker ps -q`
+returned no running containers. The launcher scratch databases
+`mapp_control_test` and `mapp_semantic_test` were dropped. Owned raw logs,
+copied client binary and workflow fixture were removed after sanitized result
+collection. Fixture volumes remain for the controller's fixed 21:30 UTC VM
+deletion. Neither deletion itself nor a change to its safeguards is claimed.
