@@ -13,6 +13,7 @@ they hold at scale; scale is what the script is for.
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 import secrets
 import sys
@@ -200,14 +201,30 @@ class BenchmarkInvariantTests(unittest.TestCase):
         self.assertNotIn("metadata", self.benchmark.TABLES)
 
     def test_simultaneous_presentations_yield_one_winner(self) -> None:
-        result = self.benchmark.replay_contention(
-            DATABASE_URL, presenters=4, trials=2
-        )
+        spend = self.benchmark.SqlStore.consume_exchanged_token
+        calls = itertools.count()
+
+        def refuse_one(store, *args):
+            if next(calls) == 0:
+                raise self.benchmark.AdmissionTimeout()
+            return spend(store, *args)
+
+        with mock.patch.object(self.benchmark.SqlStore, "consume_exchanged_token", refuse_one):
+            result = self.benchmark.replay_contention(DATABASE_URL, presenters=4, trials=2)
         self.assertEqual([1], result["winners_per_trial"])
+        self.assertEqual(2, result["post_burst_replay_losses"])
+        self.assertEqual(8, result["attempted"])
+        self.assertEqual(7, result["admitted"])
+        self.assertEqual(2, result["success"])
+        self.assertEqual(5, result["replay_loss"])
+        self.assertEqual(1, result["refused"])
+        self.assertEqual(0, result["error"])
 
     def test_a_flood_denies_only_the_flooder(self) -> None:
         result = self.benchmark.approval_admission(DATABASE_URL)
         self.assertEqual(result["per_source_cap"], result["admitted"])
+        self.assertEqual(result["per_source_cap"] + 10, result["attempted"])
+        self.assertEqual(10, result["refused"])
         self.assertTrue(result["other_source_still_admitted"])
 
     def test_distinct_tokens_each_spend_once(self) -> None:
@@ -215,25 +232,107 @@ class BenchmarkInvariantTests(unittest.TestCase):
             DATABASE_URL, workers=4, tokens=8
         )
         self.assertEqual(0, result["failures"])
+        self.assertEqual(8, result["success"])
 
     def test_cleanup_removes_no_live_record(self) -> None:
-        result = self.benchmark.cleanup_under_load(
-            DATABASE_URL, writers=2, sweeps=2
-        )
-        self.assertGreaterEqual(result["live_survivors"], 100)
+        save = self.benchmark.SqlStore.save_pending
+
+        def refuse_one(store, pending):
+            if pending.request_id == "live-1":
+                raise self.benchmark.AdmissionTimeout()
+            return save(store, pending)
+
+        with mock.patch.object(self.benchmark.SqlStore, "save_pending", refuse_one):
+            result = self.benchmark.cleanup_under_load(DATABASE_URL, writers=2, sweeps=2)
+        self.assertEqual(4, result["attempted"])
+        self.assertEqual(3, result["admitted"])
+        self.assertEqual(1, result["refused"])
+        self.assertEqual(["live-0"], result["admitted_writer_ids"])
+        self.assertEqual(["live-1"], result["refused_writer_ids"])
+        self.assertEqual(101, result["live_survivors"])
+        self.assertEqual(0, result["expired_remaining"])
+        self.assertTrue(result["fresh_write_recovered"])
+
+    def test_follow_up_sweep_recovers_after_burst_refusals(self) -> None:
+        sweep = self.benchmark.SqlStore.sweep_expired
+        calls = itertools.count()
+
+        def refuse_burst(store):
+            # The two explicit sweeps and the two writers' opportunistic sweeps.
+            if next(calls) < 4:
+                raise self.benchmark.AdmissionTimeout()
+            return sweep(store)
+
+        with mock.patch.object(self.benchmark.SqlStore, "sweep_expired", refuse_burst):
+            result = self.benchmark.cleanup_under_load(DATABASE_URL, writers=2, sweeps=2)
+        self.assertEqual(4, result["refused"])
+        self.assertEqual(0, result["admitted"])
+        self.assertEqual(100, result["follow_up_removed"])
+        self.assertEqual(100, result["live_survivors"])
+        self.assertTrue(result["fresh_write_recovered"])
+
+    def test_same_number_of_wrong_live_ids_fails(self) -> None:
+        save = self.benchmark.SqlStore.save_pending
+
+        def substitute_id(store, pending):
+            result = save(store, pending)
+            if pending.request_id == "live-1":
+                with psycopg.connect(DATABASE_URL) as conn:
+                    conn.execute("UPDATE control.oauth_pending_authorizations"
+                                 " SET request_id = 'wrong-id' WHERE request_id = 'live-1'")
+            return result
+
+        with (
+            mock.patch.object(self.benchmark.SqlStore, "save_pending", substitute_id),
+            self.assertRaisesRegex(AssertionError, "unexpected live IDs"),
+        ):
+            self.benchmark.cleanup_under_load(DATABASE_URL, writers=2, sweeps=2)
+
+    def test_untyped_timeout_is_an_error(self) -> None:
+        with (
+            mock.patch.object(self.benchmark.SqlStore, "save_pending", side_effect=TimeoutError),
+            self.assertRaisesRegex(AssertionError, "TimeoutError.*'error': 2"),
+        ):
+            self.benchmark.cleanup_under_load(DATABASE_URL, writers=2, sweeps=2)
 
     def test_the_connection_ceiling_refuses_and_recovers(self) -> None:
-        """Measured against a role capped the way the deployed one is.
-
-        A connection-per-operation store turns a burst past the cap into
-        refusals rather than queuing, and the refusal is PostgreSQL's. Worth
-        pinning because the alternative reading -- that the budget is headroom
-        above two pools -- was in a comment for a while and was wrong.
-        """
-        result = self.benchmark.connection_ceiling(DATABASE_URL, limit=3)
+        """A pre-existing role with the legacy fixture name survives unchanged."""
+        with psycopg.connect(DATABASE_URL, autocommit=True) as admin:
+            lookup = "SELECT oid, rolcanlogin, rolconnlimit FROM pg_roles WHERE rolname = 'bench_capped'"
+            before = admin.execute(lookup).fetchone()
+            if before is None:
+                admin.execute("CREATE ROLE bench_capped NOLOGIN")
+            sentinel = admin.execute(lookup).fetchone()
+            try:
+                result = self.benchmark.connection_ceiling(DATABASE_URL, limit=3)
+                self.assertEqual(sentinel, admin.execute(lookup).fetchone())
+            finally:
+                if before is None and admin.execute(lookup).fetchone() == sentinel:
+                    admin.execute("DROP ROLE bench_capped")
         self.assertEqual(3, result["connections_opened"])
+        self.assertEqual(4, result["attempted"])
+        self.assertEqual(1, result["refused"])
         self.assertIn("too many connections", result["refusal"])
         self.assertTrue(result["recovers_after_release"])
+
+    def test_capped_role_name_collision_preserves_the_existing_role(self) -> None:
+        suffix = secrets.token_hex(12)
+        role = "bench_capped_" + suffix
+        ident = psycopg.sql.Identifier(role)
+        with psycopg.connect(DATABASE_URL, autocommit=True) as admin:
+            admin.execute(psycopg.sql.SQL("CREATE ROLE {} NOLOGIN").format(ident))
+            lookup = "SELECT oid FROM pg_roles WHERE rolname = %s"
+            sentinel = admin.execute(lookup, (role,)).fetchone()
+            try:
+                with (
+                    mock.patch.object(self.benchmark.secrets, "token_hex", return_value=suffix),
+                    self.assertRaises(psycopg.errors.DuplicateObject),
+                ):
+                    self.benchmark.connection_ceiling(DATABASE_URL)
+                self.assertEqual(sentinel, admin.execute(lookup, (role,)).fetchone())
+            finally:
+                if admin.execute(lookup, (role,)).fetchone() == sentinel:
+                    admin.execute(psycopg.sql.SQL("DROP ROLE {}").format(ident))
 
 
 if __name__ == "__main__":
