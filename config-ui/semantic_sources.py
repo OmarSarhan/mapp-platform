@@ -23,7 +23,7 @@ from control_connections import (
     acquisition, admission_slot, checked_io, current_request, discard_connection,
     remaining_time,
 )
-from runtime_database import dbs_connection
+from runtime_database import dbs_connection, DBS_ADMISSION_TIMEOUT_SECONDS
 
 
 # No default: the packaged database holds no source data, and a federated
@@ -963,10 +963,9 @@ def _estimated_row_count(row: Any) -> int | None:
 
 
 @contextmanager
-def _derived_generation_connection(slot, connection_url):
+def _derived_generation_connection(slot, connection_url, deadline):
     # Derived reads have their own role. Keep a late opener charged to the
     # generation slot until it closes, without occupying a DBS_* reader slot.
-    deadline = time.monotonic() + remaining_time(5)
     with acquisition():
         raw = slot.connect(
             partial(psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row),
@@ -974,6 +973,7 @@ def _derived_generation_connection(slot, connection_url):
         )
     try:
         with checked_io(raw, remaining_time, current_request()) as lease, raw:
+            remaining_time(deadline - time.monotonic())
             yield lease
     finally:
         if not raw.closed:
@@ -1020,13 +1020,16 @@ def postgres_generation_context(
     # Both configured source assets and managed derived assets use this read
     # path. Blocking here provides one process-wide admission queue for every
     # API caller, before any source connection is opened and before Gemini is
-    # invoked by the route.
-    with admission_slot(_GENERATION_CONTEXT_READ_SLOTS) as slot:
+    # invoked by the route. Its two-second queue wait counts toward the
+    # five-second acquisition limit for either connection path.
+    deadline = time.monotonic() + remaining_time(DBS_ADMISSION_TIMEOUT_SECONDS)
+    with admission_slot(_GENERATION_CONTEXT_READ_SLOTS, min(2.0, deadline - time.monotonic())) as slot:
         connection_scope = (
-            _derived_generation_connection(slot, connection_url)
+            _derived_generation_connection(slot, connection_url, deadline)
             if connection_context is None
             else connection_context(
                 psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row,
+                acquisition_deadline=deadline, generation_slot=slot,
             )
         )
         return _read_postgres_generation_context(

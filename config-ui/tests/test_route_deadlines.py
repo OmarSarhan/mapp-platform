@@ -1,7 +1,7 @@
 """Route budget regressions. CONTROL_TEST_DATABASE_URL must be disposable."""
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import closing
+from contextlib import ExitStack, closing
 import http.client
 from http.server import ThreadingHTTPServer
 import json
@@ -23,6 +23,7 @@ import control_connections as cc
 from control_fixture import DATABASE_URL, requires_control_database, reset_control_schema
 import control_plane
 import control_schema
+import runtime_database
 import semantic_sources
 from test_control_schema import reset_schema
 
@@ -229,6 +230,74 @@ class RouteDeadlineTests(unittest.TestCase):
             self.assertTrue(slots.acquire(timeout=.1))
             slots.release()
             self.assertEqual([], borrower_sql)
+
+    def test_three_late_configured_connectors_hold_both_slots_through_close(self):
+        opened, closing = threading.Semaphore(0), threading.Semaphore(0)
+        finish_open, finish_close = threading.Event(), threading.Event()
+        requests, borrower_cursors = [], []
+        reader_slots = threading.BoundedSemaphore(8)
+        sources = semantic_sources.PostgresSemanticSources(
+            {"fixture": DATABASE_URL}, semantic_sources.parse_allowlist("fixture:control.unused"),
+        )
+
+        class Tracked(psycopg.Connection):
+            def cursor(self, *args, **kwargs):
+                borrower_cursors.append(True)
+                return super().cursor(*args, **kwargs)
+
+            def close(self):
+                closing.release()
+                finish_close.wait(3)
+                super().close()
+
+        def connect(*args, **kwargs):
+            raw = Tracked.connect(*args, **kwargs)
+            opened.release()
+            finish_open.wait(3)
+            return raw
+
+        def read(seconds):
+            with cc.request_scope(seconds) as request:
+                requests.append(request)
+                sources.generation_context("fixture", schema="control", relation="unused",
+                                           fields=[], target_kind="table", statistics=True)
+
+        with (ThreadPoolExecutor(3) as workers,
+              patch.object(runtime_database, "_DBS_CONNECTION_SLOTS", reader_slots),
+              patch.object(psycopg, "connect", side_effect=connect) as opener):
+            callers = [workers.submit(read, 5) for _ in range(3)]
+            try:
+                for _ in callers:
+                    self.assertTrue(opened.acquire(timeout=1))
+                for request in requests:
+                    request.cancel("test cancellation with opener held")
+                for caller in callers:
+                    self.assertIsInstance(caller.exception(1), cc.AdmissionTimeout)
+                for phase in ("opening", "closing"):
+                    if phase == "closing":
+                        finish_open.set()
+                        for _ in callers:
+                            self.assertTrue(closing.acquire(timeout=1))
+                    with ExitStack() as spare:
+                        for _ in range(5):
+                            self.assertTrue(reader_slots.acquire(blocking=False))
+                            spare.callback(reader_slots.release)
+                        self.assertFalse(reader_slots.acquire(blocking=False))
+                    with self.assertRaises(cc.AdmissionTimeout):
+                        read(.05)
+                    self.assertEqual(3, opener.call_count)
+            finally:
+                finish_open.set()
+                finish_close.set()
+            with ExitStack() as recovered:
+                for _ in range(8):
+                    self.assertTrue(reader_slots.acquire(timeout=1))
+                    recovered.callback(reader_slots.release)
+                slots = semantic_sources._GENERATION_CONTEXT_READ_SLOTS
+                for _ in range(3):
+                    self.assertTrue(slots.acquire(timeout=1))
+                    recovered.callback(slots.release)
+            self.assertEqual([], borrower_cursors)
 
     def test_login_rechecks_after_password_verification(self):
         reset_control_schema()

@@ -9,6 +9,7 @@ from types import MethodType
 from unittest.mock import Mock, patch
 
 import app
+from control_connections import current_request
 import semantic_sources
 from control_plane import TOKEN_SCOPES
 
@@ -116,9 +117,29 @@ class SemanticGenerationRouteTests(unittest.TestCase):
         }
         handler._payload = lambda: payload
         handler._remote = lambda: "127.0.0.1"
-        handler._json = lambda status, body: responses.append((status, body))
+        handler._json = lambda status, body, **kwargs: responses.append((status, body))
         handler.send_error = lambda status: responses.append((status, {}))
         return handler, responses
+
+    def test_expiry_after_context_read_refuses_provider_dispatch(self):
+        handler, responses = self.handler(
+            {"assetId": "asset:roads", "target": {"kind": "table"},
+             "contextOptions": {"statistics": True}},
+            scopes=["semantic:inspect", "semantic:generate", "semantic:data"],
+        )
+        handler._semantic_request = Mock(return_value={"asset": asset()})
+
+        def late_context(*args):
+            current_request().deadline = 0
+            return {"statistics": {"columnCount": 1}}
+
+        with (
+            patch.object(app, "semantic_generation_optional_context", late_context),
+            patch.object(app, "GEMINI") as gemini,
+        ):
+            handler.do_POST()
+        gemini.generate.assert_not_called()
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, responses[0][0])
 
     def test_table_generation_returns_review_only_targeted_operations(self):
         handler, responses = self.handler({
