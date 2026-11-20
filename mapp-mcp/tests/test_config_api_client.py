@@ -168,14 +168,22 @@ class ConfigApiClientTests(unittest.TestCase):
 
         self.assertEqual(Handler.body, raised.exception.body)
 
-    def test_a_body_that_is_not_an_object_is_not_carried(self):
+    def test_unstructured_server_error_leaves_outcome_unknown(self):
         Handler.status = 500
         Handler.body = ["not", "an", "object"]
 
-        with self.assertRaises(ConfigApiRefused) as raised:
+        with self.assertRaises(ConfigApiUnavailable) as raised:
             self.client.get(path="/api/x", query="", token="t")
 
-        self.assertIsNone(raised.exception.body)
+        self.assertEqual("upstream_unavailable", raised.exception.reason)
+        self.assertEqual(Handler.seen[0]["requestId"], raised.exception.request_id)
+
+    def test_gateway_timeout_cannot_acknowledge_an_approved_apply(self):
+        Handler.status = 504
+        Handler.body = {"error": "Upstream timed out", "code": "gateway_timeout"}
+        with self.assertRaises(ConfigApiUnavailable):
+            self.client.post(path="/api/proposals/p/apply", query="", token="t", body={}, receipt="fixture")
+        self.assertEqual(1, len(Handler.seen))
 
     def test_a_per_call_timeout_overrides_the_default(self):
         """The default is tuned for a read. A browser render measured 20.8 and

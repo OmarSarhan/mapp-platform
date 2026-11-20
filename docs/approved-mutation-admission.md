@@ -1,7 +1,8 @@
 # Approved mutation admission
 
 OMA-114 is a local implementation checkpoint on parent `3ad47cf`.
-**OMA-76 remains NOT READY.** OMA-120 owns the final HTTP and MCP mapping.
+**OMA-76 remains NOT READY.** OMA-120 implements the HTTP and MCP mapping
+on parent `a69a414`. OMA-114's independent review was service-blocked before findings.
 
 Config authenticates the caller, checks scope and audience, rebuilds the
 exact request digest and redeems token B at ingress. An eligible receipt
@@ -95,7 +96,63 @@ These tests use a fixture supervisor acknowledgement and synthetic retained
 preview evidence. Deployed XYZ, browser rendering, upstream MCP wire
 translation and production resource behavior remain separate gates.
 
-### Local verification
+## OMA-120 wire regression
+
+Run `config-ui/tests/wire_admission_outcomes.py SOCKET_DIRECTORY` with Python
+and the service dependencies. It accepts a private socket-only PostgreSQL 18
+cluster in a unique `/tmp/oma120-*` directory on port 55485 with an
+`oma120` login limited to eight connections. It creates and drops a disposable
+database and runs the mutation regression above before exercising real config
+and OAuth HTTP handlers and the Unix-socket MCP server.
+
+The fixture holds three control leases for identity and eight reader leases
+for catalog and authenticated SQL test. Each request has a 250 ms budget and
+200 ms of scheduler tolerance. It validates the complete response and timing
+while the holders still own the leases and requires a fresh 200 after release.
+Catalog discovery uses fixture-only PostGIS type signatures with no spatial rows.
+A table lock exercises OAuth SQL cancellation. Injected exchange and redemption
+500s preserve unavailability. A later acknowledged redemption reports its known
+spend even when the config deadline expires during reply processing.
+
+The approved reload cases compare MCP results with the receipt event,
+operation file and published generation. Refusal of a later command preserves
+an earlier receipt spend or generation publication. Expiry during audit of a
+terminal success preserves the acknowledged operation. Separate MCP regressions
+expire local handling after a complete framed reply and after receipt claim.
+The caller can inspect the public approval reference without access to the
+one-time receipt. These cases exercise manual recovery without replay.
+
+### OMA-120 local evidence
+
+The saturated identity GET on the parent closed with
+`http.client.RemoteDisconnected`. On the implementation, identity, catalog
+and SQL test returned complete JSON 503s in 251, 252 and 252 ms respectively.
+Each returned the supplied request ID in the header and body. Local queue
+times were 250, 247 and 247 ms. All three recovered with 200.
+
+Verification used PostgreSQL 18.6, Python 3.14.4 and psycopg 3.3.4. These
+commands ran at the repository root with the existing virtual environment.
+The config suite used a separately created disposable database on the same
+private cluster. Temporary state and service logs used the fixture directory.
+
+```sh
+py=/tmp/oma76-venv/bin/python
+"$py" config-ui/tests/wire_admission_outcomes.py /tmp/oma120-ruPOILHl
+PYTHONPATH=config-ui:config-ui/tests "$py" -m unittest test_app_routes test_approvals test_control_plane test_draft_routes test_reload test_token_b_validation test_mcp_token_client_deadlines test_route_deadlines test_lease_deadlines test_derived_layers test_federation_store
+PYTHONPATH=mcp-auth:mcp-auth/tests "$py" -m unittest test_introspection test_exchange test_redeem test_control_capabilities test_wire_authorization test_authorization_flow
+PYTHONPATH=mapp-mcp:mapp-mcp/tests "$py" -m unittest discover -v -s mapp-mcp/tests
+PYTHONPATH=mapp-mcp:mapp-mcp/tests "$py" -m unittest test_config_api_client test_recovery_diagnostics test_exchange_client test_request_lifetime test_approval_gate test_layers_tools
+git diff --cached --check
+```
+
+The wire regression passed. The config module run passed 730 tests and the
+OAuth run passed 170. MCP discovery ran 482 with 479 passing and three
+skips for external Codex-client and sibling CLI fixtures. The focused MCP
+rerun passed 346. The config suite emitted psycopg resource warnings at
+interpreter exit. The cluster reported zero fixture-role sessions before
+cleanup. The fixture database, role, cluster directory and raw logs were removed.
+
+## OMA-114 local verification
 
 PostgreSQL 18.6, Python 3.14.4 and psycopg 3.3.4 ran with private filesystem
 paths and fixture-only control DSNs. The following commands ran at the

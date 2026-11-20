@@ -6551,12 +6551,8 @@ class Handler(SimpleHTTPRequestHandler):
         self._raw_body = None
         self._exchanged_token = None
         self._exchanged_token_redeemed = False
-        self._effects = mutation_state()
-        try:
-            return super().handle_one_request()
-        except AdmissionTimeout:
-            self.close_connection = True
-            self._admission_error()
+        self._effects = None
+        return super().handle_one_request()
 
     def _admission_error(self):
         state = self._effects
@@ -6565,13 +6561,22 @@ class Handler(SimpleHTTPRequestHandler):
             # callback or application work can run on the cleanup allowance.
             try:
                 with request_scope(.025):
-                    CONTROL.finish_operation(
+                    operation = CONTROL.finish_operation(
                         state.admission_record_id,
                         status="indeterminate" if state.target_started or state.published else "failed",
                         error={"code": "operation.interrupted", "mutation": state.facts()},
                     )
             except OSError:
                 LOGGER.warning("Interrupted operation requires inspection: %s", state.admission_record_id)
+            else:
+                # A later audit wait can expire after the terminal operation
+                # was acknowledged. finish_operation preserves that record.
+                if operation["status"] == "succeeded":
+                    LOGGER.warning("Request interrupted after terminal success: %s", operation["id"])
+                    self._json(HTTPStatus.OK, {
+                        **(operation["result"] or {}), "operation": operation, "mutation": state.facts(),
+                    })
+                    return
         self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
             "code": "database.busy", "error": "Request admission interrupted.",
             "retryable": state.retryable, "indeterminate": state.target_started,
@@ -7301,8 +7306,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        with request_scope(getattr(self, "headers", {}).get("X-Mapp-Timeout-Seconds", "120"), getattr(self, "connection", None)):
-            return self._do_GET()
+        return self._dispatch_request(self._do_GET)
 
     def _do_GET(self):
         supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
@@ -7511,6 +7515,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticClientError as exc:
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 timed_out = getattr(exc, "sqlstate", None) in {"57014", "55P03"}
                 self._json(
@@ -7605,6 +7611,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticSourceError as exc:
                 self._semantic_source_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7649,6 +7657,8 @@ class Handler(SimpleHTTPRequestHandler):
                     raise RuntimeError("No DBS_* database connections are configured.")
                 read_workspace()
                 self._json(HTTPStatus.OK, {"status": "ok"})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         elif path == "/api/workspace":
@@ -7666,6 +7676,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "semanticWarnings": annotated(semantic_warnings),
                     },
                 )
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif layer_statistics_path := re.fullmatch(
@@ -7750,6 +7762,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "layer.statistics_invalid",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
                     "error": "Layer statistics are unavailable.",
@@ -7809,6 +7823,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "layer.values_invalid",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
                     "error": "Layer value aggregation is unavailable.",
@@ -7835,6 +7851,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "locale.not_found",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif path == "/api/catalog":
@@ -7845,6 +7863,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "tables": discover_catalog(profiles),
                     "derivedProfiles": profiles,
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
         elif path == "/api/derived-layers/background-jobs":
@@ -7860,6 +7880,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
                     "cleanup": draft_cleanup_status(),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
                     "error": "Draft lifecycle records are unavailable.",
@@ -7910,6 +7932,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 result["backgroundJobs"] = derived_background_capacity()
                 self._json(HTTPStatus.OK, result)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7948,6 +7972,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "derived_layer.map_extent_unavailable",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception:
                 self._json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -7969,6 +7995,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "Derived-layer database management is not configured."
                     )
                 self._json(HTTPStatus.OK, {"derivedLayers": DERIVED.list()})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8005,6 +8033,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "derived_layer.not_found",
                     "name": name,
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8059,6 +8089,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # make a contract-driven client retry a mode that will
                 # never become available and lose the actionable code.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 unavailable = {
                     "error": "The federation alias registry is unavailable.",
@@ -8070,6 +8102,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # bare refusal above is the whole story anyway.
                 try:
                     unavailable["host"] = FEDERATION.host_capability()
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error:
                     pass
                 self._json(HTTPStatus.BAD_GATEWAY, unavailable)
@@ -8095,6 +8129,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # ValueError, and a deployment with no federation credential
                 # is a permanent fact rather than a transient outage.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8147,6 +8183,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # own status/code rather than being folded into a generic
                 # 502 registry_unavailable.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8572,14 +8610,21 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        return self._dispatch_request(self._do_POST)
+
+    def _dispatch_request(self, route):
         with request_scope(getattr(self, "headers", {}).get("X-Mapp-Timeout-Seconds", "120"), getattr(self, "connection", None)):
             self._effects = mutation_state()
             try:
-                return self._do_POST()
+                return route()
             except ReceiptRefused:
                 self._json(HTTPStatus.FORBIDDEN, {
                     "error": "No approval covers this request.", "code": "approval.receipt_invalid",
                 })
+            except psycopg.errors.QueryCanceled:
+                # Control SQL has a server-side statement budget as well as
+                # the local lease timer. Either can win on identity or auth.
+                self._admission_error()
             except MUTATION_ADMISSION_ERRORS:
                 self._admission_error()
 
@@ -9165,6 +9210,8 @@ class Handler(SimpleHTTPRequestHandler):
                         details=details,
                     )
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 if audit_details is not None:
                     CONTROL.audit(
@@ -9251,6 +9298,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticClientError as exc:
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -9844,6 +9893,8 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     mutation_state().begin()
                     result = FEDERATION.register(payload, actor)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9878,6 +9929,8 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     mutation_state().begin()
                     group = FEDERATION.define_group(payload, actor)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9913,6 +9966,8 @@ class Handler(SimpleHTTPRequestHandler):
                     group = FEDERATION.delete_group(
                         federation_group_delete_path.group(1)
                     )
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9948,6 +10003,8 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     mutation_state().begin()
                     record = FEDERATION.set_alias_groups(alias_name, groups)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -10288,6 +10345,8 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     return
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -11089,6 +11148,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "operation": operation,
                     })
                     return
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except TimeoutError as exc:
                     operation = finish_visual_operation(
                         operation["id"],
@@ -11587,6 +11648,8 @@ class Handler(SimpleHTTPRequestHandler):
                                 "operation": operation,
                             },
                         )
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except TimeoutError as exc:
                     diagnostics = {"exceptionType": type(exc).__name__}
                     response_payload = {
@@ -11825,6 +11888,8 @@ class Handler(SimpleHTTPRequestHandler):
                         locales=locales,
                     )
                     self._json(HTTPStatus.OK, result)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Expression test failed.", "errors": annotated([{"path": "fieldfx", "message": str(exc)}])})
                 return
@@ -12181,6 +12246,8 @@ class Handler(SimpleHTTPRequestHandler):
                         int(payload.get("index")),
                     )
                     self._json(HTTPStatus.OK, result)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
                         "error": "Expression test failed.",

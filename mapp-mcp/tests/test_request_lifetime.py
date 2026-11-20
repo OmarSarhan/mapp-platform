@@ -517,6 +517,102 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
                             self.assertFalse(detail["error"]["retryable"])
                             self.assertTrue(detail["error"]["requestId"])
 
+    async def test_approved_reply_survives_local_expiry_at_http_cleanup(self):
+        reference = "a" * 64
+        recovery = {"approvalReference": reference, "operationId": reference[:32]}
+        received = []
+        for status, payload in (
+            (200, {"requestedGeneration": 9, "operation": {"id": reference[:32]}}),
+            (503, {"code": "database.busy", "indeterminate": True, "retryable": False,
+                   "mutation": {"receipt": "consumed", "tokenB": "spent", "targetStarted": True,
+                                "published": {"requestedGeneration": 9}, "recovery": recovery}}),
+        ):
+            async def respond(reader, writer):
+                head = await reader.readuntil(b"\r\n\r\n")
+                size = next(int(line.split(b":")[1]) for line in head.lower().splitlines()
+                            if line.startswith(b"content-length:"))
+                await reader.readexactly(size)
+                received.append(head.split()[1])
+                data = json.dumps(payload).encode()
+                writer.write(f"HTTP/1.1 {status} Reply\r\nContent-Length: {len(data)}\r\n\r\n".encode() + data)
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            async with await asyncio.start_server(respond, "127.0.0.1", 0) as server:
+                api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+                post = api.post
+
+                def approved(**kwargs):
+                    if kwargs["path"] == "/api/approvals":
+                        return {"handle": "fixture", "reference": reference, "decided": True}
+                    if kwargs["path"] == "/api/approvals/claim":
+                        return {"status": "approved", "receipt": RECEIPT}
+                    return post(**kwargs)
+
+                original = config_api_client.urlopen
+                @contextmanager
+                def delayed_exit(*args, **kwargs):
+                    with original(*args, **kwargs) as response:
+                        yield response
+                        time.sleep(CURRENT_REQUEST.get().remaining() + .02)
+
+                length = request_http.framed_length
+                def delayed_error_length(headers):
+                    # request_http has read the framed error into memory.
+                    time.sleep(CURRENT_REQUEST.get().remaining() + .02)
+                    return length(headers)
+
+                sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                                    exchange=FakeExchange(), config_api=api)
+                sdk.tool_timeouts["xyz_reload"] = .3
+                request = CURRENT_REQUEST.set(RequestScope())
+                caller = CURRENT_CALLER.set(Authenticated(active(scopes="mcp:connect inspect reload"), TOKEN))
+                try:
+                    with patch.object(api, "post", approved), patch.object(config_api_client, "urlopen", delayed_exit), patch.object(
+                            request_http, "framed_length", delayed_error_length):
+                        result = await sdk.call_tool("xyz_reload", {})
+                finally:
+                    CURRENT_CALLER.reset(caller)
+                    CURRENT_REQUEST.reset(request)
+                if status == 200:
+                    self.assertFalse(result.is_error)
+                    self.assertEqual(payload, result.structured_content)
+                else:
+                    error = result.structured_content["error"]
+                    self.assertEqual(payload["mutation"], error["mutation"])
+                    self.assertFalse(error["retryable"])
+                    self.assertTrue(error["indeterminate"])
+        self.assertEqual([b"/api/xyz/reload"] * 2, received)
+
+    async def test_expired_approval_handoff_keeps_public_acknowledgement(self):
+        api = FakeConfigApi()
+        post = api.post
+        def expire_after_claim(**kwargs):
+            result = post(**kwargs)
+            if kwargs["path"] == "/api/approvals":
+                result["decided"] = True
+            if kwargs["path"] == "/api/approvals/claim":
+                CURRENT_REQUEST.get().deadline = time.monotonic() - 1
+            return result
+
+        sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                            exchange=FakeExchange(), config_api=api)
+        request = CURRENT_REQUEST.set(RequestScope())
+        caller = CURRENT_CALLER.set(Authenticated(active(scopes="mcp:connect inspect reload"), TOKEN))
+        try:
+            with patch.object(api, "post", expire_after_claim):
+                result = await sdk.call_tool("xyz_reload", {})
+        finally:
+            CURRENT_CALLER.reset(caller)
+            CURRENT_REQUEST.reset(request)
+        error = result.structured_content["error"]
+        self.assertEqual("a" * 64, error["approvalReference"])
+        self.assertTrue(error["receiptClaimed"])
+        self.assertFalse(error["retryable"])
+        self.assertNotIn(RECEIPT, json.dumps(error))
+        self.assertEqual([], api.posted_to("/api/xyz/reload"))
+
     async def test_human_confirmation_outlives_preparation_budget(self):
         api = FakeConfigApi()
         sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),

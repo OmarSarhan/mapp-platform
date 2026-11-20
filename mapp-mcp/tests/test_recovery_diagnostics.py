@@ -58,6 +58,10 @@ class RecoveryDiagnosticsTests(ToolTestCase):
                 "expectedPlanFingerprint": "sha256:old",
                 "actualPlanFingerprint": "sha256:new",
                 "technicalDetail": {"sqlstate": "57014", "query": "PRIVATE SQL"},
+                "mutation": {"tokenB": "spent", "receipt": "consumed", "targetStarted": True,
+                             "published": {"workspaceRevision": "c" * 64},
+                             "recovery": {"approvalReference": "a" * 64, "operationId": "b" * 32,
+                                          "proposalId": "public-id", "handle": "PRIVATE HANDLE"}},
                 "query": "PRIVATE SQL",
             },
         ))
@@ -70,6 +74,10 @@ class RecoveryDiagnosticsTests(ToolTestCase):
         self.assertTrue(detail["rolledBack"])
         self.assertEqual("sha256:new", detail["actualPlanFingerprint"])
         self.assertEqual("57014", detail["sqlstate"])
+        self.assertEqual("c" * 64, detail["mutation"]["published"]["workspaceRevision"])
+        self.assertEqual({"approvalReference": "a" * 64, "operationId": "b" * 32, "proposalId": "public-id"},
+                         detail["mutation"]["recovery"])
+        self.assertNotIn("PRIVATE HANDLE", message)
         self.assertNotIn("PRIVATE SQL", message)
 
     def test_poll_retains_failure_phase_and_draft_identity(self):

@@ -372,13 +372,13 @@ class RouteDeadlineTests(unittest.TestCase):
                     self.assertEqual([cc.CommandNotSubmitted], errors)
                     new_token.assert_not_called()
                     if not disconnect:
-                        try:
-                            response = client.getresponse()
-                        except http.client.RemoteDisconnected:
-                            pass  # OMA-120 owns the wire translation.
-                        else:
-                            self.assertGreaterEqual(response.status, 500)
-                            self.assertIsNone(response.getheader("Set-Cookie"))
+                        response = client.getresponse()
+                        self.assertEqual(503, response.status)
+                        self.assertIsNone(response.getheader("Set-Cookie"))
+                        self.assertEqual("1", response.getheader("Retry-After"))
+                        body = json.loads(response.read())
+                        self.assertEqual("database.busy", body["code"])
+                        self.assertFalse(body["mutation"]["targetStarted"])
                 self.assertEqual(0, self.observer.execute("SELECT count(*) FROM control.sessions").fetchone()[0])
                 self.assertEqual(max(control_schema.MIGRATIONS), self.observer.execute(
                     "SELECT max(version) FROM control.schema_migrations"

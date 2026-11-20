@@ -952,6 +952,39 @@ def _nearest_actions(wanted, actions):
     return " Did you mean " + " or ".join(repr(name) for name in near) + "?"
 
 
+def _mutation_diagnostics(mutation):
+    """Only public identifiers and observed progress may cross this boundary."""
+    facts = {}
+    for key, choices in (
+        ("tokenB", ("not_submitted", "refused", "unconfirmed", "spent", "redeemed")),
+        ("receipt", ("not_required", "unchecked", "pending", "refused", "unconfirmed", "consumed")),
+    ):
+        if mutation.get(key) in choices:
+            facts[key] = mutation[key]
+    if type(mutation.get("targetStarted")) is bool:
+        facts["targetStarted"] = mutation["targetStarted"]
+    for group, fields in (
+        ("published", {"workspaceRevision": 64, "requestedGeneration": None}),
+        ("recovery", {"approvalReference": 64, "requestId": 32, "operationId": 32, "originalRevision": 64,
+                      "candidateHash": 64, "workspaceFingerprint": 64, "plannedGeneration": None}),
+    ):
+        values = mutation.get(group)
+        if not isinstance(values, dict):
+            continue
+        facts[group] = public = {}
+        for key, length in fields.items():
+            value = values.get(key)
+            if length is None:
+                if type(value) is int and value >= 0:
+                    public[key] = value
+            elif isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value):
+                public[key] = value
+        if group == "recovery" and isinstance(proposal := values.get("proposalId"), str):
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", proposal):
+                public["proposalId"] = proposal
+    return facts
+
+
 def _failure_diagnostics(payload):
     """Keep bounded recovery facts, never SQL, credentials or raw exceptions."""
     if not isinstance(payload, dict):
@@ -977,6 +1010,12 @@ def _failure_diagnostics(payload):
         r"[a-f0-9]{32}", str(meta.get("requestId", ""))
     ):
         detail["requestId"] = meta["requestId"]
+    if isinstance(meta, dict) and isinstance(timing := meta.get("databaseTiming"), dict):
+        detail["databaseTiming"] = {key: timing[key] for key in ("queueSeconds", "databaseSeconds")
+                                    if type(timing.get(key)) in (float, int) and 0 <= timing[key] < float("inf")}
+    mutation = payload.get("mutation")
+    if isinstance(mutation, dict):
+        detail["mutation"] = _mutation_diagnostics(mutation)
     technical = payload.get("technicalDetail") or {}
     if isinstance(technical, dict) and re.fullmatch(
         r"[0-9A-Z]{5}", str(technical.get("sqlstate", ""))
@@ -1528,8 +1567,8 @@ def build_runtime(
             # Deliberately not the underlying text: it describes this
             # component's plumbing, and an agent cannot act on it.
             raise DiagnosticToolError(
-                "The authorization component is unavailable; try again.",
-                code="auth.exchange_unavailable", diagnostics={"retryable": True},
+                "The authorization component is unavailable. The target request was not sent.",
+                code="auth.exchange_unavailable", diagnostics={"retryable": receipt is None, "indeterminate": False},
             ) from None
         try:
             # Credentials are redeemed on admission; their lifetime does not
@@ -1548,10 +1587,20 @@ def build_runtime(
                     receipt=receipt,
                 )
             # The same body object that was digested, not a rebuild of it.
-            return config_api.post(
+            result = config_api.post(
                 path=path, query=query, token=token_b, body=body,
                 timeout=deadline, receipt=receipt,
             )
+            # A worker can expire before handing a claimed receipt or create
+            # response back to the gate. Keep only the public acknowledgement.
+            current = TRACE.get()
+            if current is not None and operation is APPROVALS_CREATE:
+                reference = result.get("reference")
+                if isinstance(reference, str) and re.fullmatch(r"[a-f0-9]{64}", reference):
+                    current["approvalReference"] = reference
+            if current is not None and operation is APPROVALS_CLAIM and result.get("receipt"):
+                current["receiptClaimed"] = True
+            return result
         except ConfigApiRefused as refusal:
             # Some operations answer a non-2xx with the result rather than an
             # error. A browser validation that fails its checks returns 422
@@ -1559,9 +1608,8 @@ def build_runtime(
             # what a reviewer needs; reducing it to its message would throw the
             # evidence away. Declared per operation so this is never a guess
             # about what a status means.
-            if refusal.status in operation.get("result_statuses", ()) and (
-                refusal.body is not None
-            ):
+            if (refusal.status in operation.get("result_statuses", ()) and refusal.body is not None
+                    and (refusal.status != 504 or isinstance(refusal.body.get("operation"), dict))):
                 return refusal.body
             # The field-level entries, where the platform sent any. For a
             # validation refusal these are the answer: the top-level message
@@ -1571,8 +1619,10 @@ def build_runtime(
             diagnostics = _failure_diagnostics(refusal.body)
             if refusal.request_id:
                 diagnostics.setdefault("requestId", refusal.request_id)
+            message = ("The platform reported interrupted admission" if refusal.code == "database.busy"
+                       else "The platform refused this request")
             raise DiagnosticToolError(
-                f"The platform refused this request: {refusal}"
+                f"{message}: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
                 + _refusal_detail(refusal.errors)
                 + (f" {hint}" if hint else "")
@@ -1605,9 +1655,20 @@ def build_runtime(
                 code=diagnostics['code'], diagnostics=diagnostics,
             ) from None
 
-    async def async_spend(operation, **kwargs):
+    async def async_spend(operation, *, format_result=None, **kwargs):
+        # Capture the terminal result in the worker before its exit budget
+        # check. Internal approval claim responses must never reach this path.
+        def execute():
+            result = format_result(spend(operation, **kwargs))
+            current = TRACE.get()
+            if current is not None:
+                current["approvedResult"] = result
+            return result
+
         with child_operation(operation.get("timeout", 15.0)):
-            return await io_call(spend, operation, **kwargs)
+            if format_result is None:
+                return await io_call(spend, operation, **kwargs)
+            return await io_call(execute)
 
     async def approval_gate(
         ctx, operation, *, path, query="", body=None, tool_name, packet,
@@ -1661,6 +1722,8 @@ def build_runtime(
         remembered = _remembered_approval(caller, digest)
         if remembered is not None:
             handle, approval_url = remembered
+            if current is not None and (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)):
+                current["approvalReference"] = match.group(1)
             # Asked already. The only question left is whether it has been
             # answered, so ask that before asking the person anything again --
             # a second prompt for a decision already made is how a two-call
@@ -1707,9 +1770,8 @@ def build_runtime(
                 return await _claim(handle)
             _remember_approval(caller, digest, handle, approval_url)
 
-        if TRACE.get() is not None:
-            # Reference is a public dashboard identifier, never a receipt/handle.
-            TRACE.get()["approvalReference"] = (match.group(1) if (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)) else None)
+        if current is not None and (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)):
+            current["approvalReference"] = match.group(1)
         message = _approval_message(operation["operation_id"], packet)
         modes = _elicitation_modes(ctx)
         mode = _approval_mode(modes, approval_url)
@@ -2270,11 +2332,11 @@ def build_runtime(
             path=DERIVED_LAYERS_CREATE["path_template"], body=body,
             tool_name="derived_layers_create", packet=packet,
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_CREATE,
+        return await async_spend(
+            DERIVED_LAYERS_CREATE, format_result=_derived_outcome,
             path=DERIVED_LAYERS_CREATE["path_template"],
             body=body, receipt=receipt,
-        ))
+        )
 
     @tool(
         operation=DERIVED_LAYERS_REPLACE,
@@ -2388,9 +2450,9 @@ def build_runtime(
             ctx, DERIVED_LAYERS_REPLACE, path=target, body=body,
             tool_name="derived_layers_replace", packet=packet,
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_REPLACE, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_REPLACE, format_result=_derived_outcome, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=DERIVED_LAYERS_REFRESH,
@@ -2433,9 +2495,9 @@ def build_runtime(
                 "sources": current.get("sources") or [],
             },
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_REFRESH, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_REFRESH, format_result=_derived_outcome, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=DERIVED_LAYERS_DROP,
@@ -2498,9 +2560,9 @@ def build_runtime(
                 "dependents": dependents,
             },
         )
-        return _without_meta(await async_spend(
-            DERIVED_LAYERS_DROP, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_DROP, format_result=_without_meta, path=target, body=body, receipt=receipt,
+        )
 
     def _derived_definition(
         *, name, query, sources, id_column, geometry_column, kind, description,
@@ -3343,9 +3405,9 @@ def build_runtime(
         if TRACE.get() is not None:
             TRACE.get()["phase"] = "apply"
         trace("apply.requested")
-        return _applied(await async_spend(
-            PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            PROPOSALS_APPLY, format_result=_applied, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=SEMANTIC_PROPOSALS_APPLY,
@@ -3372,9 +3434,9 @@ def build_runtime(
             ctx, SEMANTIC_PROPOSALS_APPLY, path=target, body=body,
             tool_name="semantic_proposals_apply", packet=packet,
         )
-        return _without_meta(await async_spend(
-            SEMANTIC_PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            SEMANTIC_PROPOSALS_APPLY, format_result=_without_meta, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=XYZ_RELOAD,
@@ -3407,10 +3469,10 @@ def build_runtime(
             tool_name="xyz_reload",
             packet={"summary": "Reload the map from the workspace on disk."},
         )
-        return _without_meta(await async_spend(
-            XYZ_RELOAD, path=XYZ_RELOAD["path_template"], body=body,
+        return await async_spend(
+            XYZ_RELOAD, format_result=_without_meta, path=XYZ_RELOAD["path_template"], body=body,
             receipt=receipt,
-        ))
+        )
 
     def _apply_packet(proposal_id, evidence_operation_id):
         """What the person deciding is shown, read from the platform.
@@ -3548,6 +3610,8 @@ def build_runtime(
         operation = payload.get("operation")
         if isinstance(operation, dict) and operation.get("id"):
             applied["operationId"] = operation["id"]
+        if isinstance(payload.get("mutation"), dict):
+            applied["mutation"] = _mutation_diagnostics(payload["mutation"])
         return applied
 
     @tool(
@@ -4405,17 +4469,27 @@ def build_runtime(
             trace("tool.completed")
             return result
         except (RequestStopped, ToolError) as exc:
+            if "approvedResult" in TRACE.get():
+                result = TRACE.get()["approvedResult"]
+                return CallToolResult(structuredContent=result,
+                    content=[TextContent(type="text", text=json.dumps(result))])
             proposal_id = TRACE.get().get("proposalId")
             if name == "proposals_create" and proposal_id:
                 detail = {"proposalId": proposal_id, "acknowledged": True,
                           "nextStep": "Read proposals_show for the created proposal."}
                 return CallToolResult(structuredContent=detail,
                     content=[TextContent(type="text", text=json.dumps(detail))])
-            if isinstance(exc, RequestStopped):
-                raise ToolError(str(exc)) from None
             cause = exc
-            while cause is not None and not isinstance(cause, DiagnosticToolError):
+            while cause is not None and not isinstance(cause, (DiagnosticToolError, RequestStopped)):
                 cause = cause.__cause__
+            if isinstance(cause, RequestStopped):
+                current = TRACE.get()
+                if not current.get("approvalReference"):
+                    raise ToolError(str(cause)) from None
+                diagnostics = {"retryable": False}
+                if current.get("receiptClaimed"):
+                    diagnostics["receiptClaimed"] = True
+                cause = DiagnosticToolError(str(cause), code="operation.deadline_expired", diagnostics=diagnostics)
             if isinstance(cause, DiagnosticToolError):
                 trace("tool.refused", code=cause.detail['code'])
                 return CallToolResult(isError=True, structuredContent={"error": cause.detail},

@@ -14,12 +14,16 @@ and visual evidence.
 
 ## Database admission
 
-Database admission overload returns HTTP 503 with `code: database.busy`,
-`retryable: true`, and `Retry-After: 1` before a mutation is admitted. A write
-already admitted reports `retryable: false` and `indeterminate: true`; inspect
-its operation and target state before retrying. OAuth overload uses
-`error: temporarily_unavailable`. These responses do not authorize a mutation;
-retry with fresh request-bound credentials. The optional internal
+Config GET and POST return JSON HTTP 503 with `code: database.busy` for
+interrupted admission. A proven pre-effect refusal with surviving authority
+includes `retryable: true`, `indeterminate: false` and `Retry-After: 1`.
+Retry requires a fresh exact request and, when applicable, a fresh token B.
+An acknowledged receipt spend followed by refusal before target submission
+returns both flags false. A possibly committed target returns
+`retryable: false` and `indeterminate: true`. Inspect the public references
+and observed publication in `mutation` before deciding what to do.
+`X-Request-ID` matches `meta.requestId`. OAuth overload uses
+`error: temporarily_unavailable`. The optional internal
 `X-Mapp-Timeout-Seconds` header shortens the server's request budget (maximum
 120 seconds). Admission waits consume that budget. JSON response metadata
 includes `databaseTiming.queueSeconds` and `databaseTiming.databaseSeconds`

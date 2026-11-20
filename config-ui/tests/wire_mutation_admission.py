@@ -28,21 +28,22 @@ from psycopg import sql
 
 
 @contextmanager
-def fixture_database(directory):
+def fixture_database(directory, *, fixture="oma114"):
     directory = Path(directory).resolve()
-    assert re.fullmatch(r"/tmp/oma114-[a-zA-Z0-9]+", str(directory))
-    conninfo = f"host={directory} port=55484"
+    port = {"oma114": 55484, "oma120": 55485}[fixture]
+    assert re.fullmatch(rf"/tmp/{fixture}-[a-zA-Z0-9]+", str(directory))
+    conninfo = f"host={directory} port={port}"
     name = "mutation_" + secrets.token_hex(8)
     with psycopg.connect(conninfo, user="postgres", dbname="postgres", autocommit=True) as db:
         assert db.info.server_version // 10000 == 18
         assert db.execute("SHOW listen_addresses").fetchone() == ("",)
         assert Path(db.execute("SHOW data_directory").fetchone()[0]).parent == directory
-        assert db.execute("SELECT rolconnlimit, rolsuper FROM pg_roles WHERE rolname='oma114'").fetchone() == (8, False)
+        assert db.execute("SELECT rolconnlimit, rolsuper FROM pg_roles WHERE rolname=%s", (fixture,)).fetchone() == (8, False)
         db.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
         try:
             with psycopg.connect(conninfo, user="postgres", dbname=name) as owner:
-                owner.execute("CREATE SCHEMA control AUTHORIZATION oma114")
-            yield f"{conninfo} user=oma114 dbname={name}"
+                owner.execute(sql.SQL("CREATE SCHEMA control AUTHORIZATION {}").format(sql.Identifier(fixture)))
+            yield f"{conninfo} user={fixture} dbname={name}"
         finally:
             db.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
@@ -60,7 +61,7 @@ def serving(server):
             assert not thread.is_alive()
 
 
-def run(root, dsn):
+def run(root, dsn, *, check_wire=None):
     os.environ.clear()
     os.environ.update(CONTROL_DATABASE_URL=dsn, CONTROL_DIR=str(root / "control"),
                       WORKSPACE_PATH=str(root / "workspace.json"), RELOAD_DIR=str(root / "reload"),
@@ -190,13 +191,15 @@ def run(root, dsn):
                     started_disconnect = time.monotonic()
                     conn.close()
                 else:
-                    status, _ = finish(conn)
-                    assert status == 503, status
+                    status, body = finish(conn)
+                    assert status == 503 and body["retryable"] and not body["indeterminate"], status
                 facts = reports.get(timeout=1)
                 elapsed = time.monotonic() - (started_disconnect if disconnect else start)
                 assert elapsed < (.2 if disconnect else .65), ("waiter overrun", elapsed)
                 assert oauth.exchanged_binding(token)["consumed_at"] is not None
                 assert facts.token_b == "spent" and facts.receipt == "pending" and not facts.target_started
+                if not disconnect:
+                    assert body["mutation"] == facts.facts()
                 assert store.read_approval_by_reference(reference)["status"] == "approved"
                 assert snapshot() == before
             assert snapshot() == before
@@ -339,7 +342,8 @@ def run(root, dsn):
 
         audit = store.audit
         with patch.object(store, "audit", cancel_after_spend):
-            status, _, facts = request(apply, exchange(apply), receipt)
+            status, body, facts = request(apply, exchange(apply), receipt)
+        assert body["mutation"] == facts.facts() and not body["retryable"] and not body["indeterminate"]
         assert (status, facts.receipt, facts.target_started, facts.retryable) == (503, "consumed", False, False), (
             status, facts.receipt, facts.target_started, facts.retryable)
         recovery = store.read_approval_by_reference(ref)["recovery"]
@@ -444,11 +448,15 @@ def run(root, dsn):
         facts = reports.get(timeout=1)
         assert time.monotonic() - start < .55
         assert status == 503 and body["indeterminate"] and not body["retryable"]
+        assert body["mutation"] == facts.facts()
         assert facts.published == {"requestedGeneration": 3}
         assert store.read_operation(ref[:32])["status"] == "indeterminate"
         assert request(long_reload, exchange(long_reload), receipt)[0] == 403
         assert snapshot()[1] == b"3\n"
         print("direct reload expired after publication: known generation and indeterminate operation retained")
+
+        if check_wire:
+            check_wire(app, store, oauth, ex, cli, token_a, client_secret, config_port, auth_port, dsn, root)
 
 
 if __name__ == "__main__":

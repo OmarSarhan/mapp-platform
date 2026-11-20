@@ -917,11 +917,11 @@ class RequestStateTests(unittest.TestCase):
             handler = object.__new__(app.Handler)
             responses = []
             handler._json = lambda status, body, **kw: responses.append((status, body, kw))
-            def dispatch(current):
-                current._effects.target_started = admitted
+            def dispatch():
+                handler._effects.target_started = admitted
                 raise AdmissionTimeout("fixture overload")
-            with unittest.mock.patch.object(app.SimpleHTTPRequestHandler, "handle_one_request", dispatch):
-                handler.handle_one_request()
+            with unittest.mock.patch.object(handler, "_do_POST", dispatch):
+                handler.do_POST()
             status, body, extra = responses[0]
             self.assertEqual(503, status)
             self.assertEqual(not admitted, body["retryable"])
