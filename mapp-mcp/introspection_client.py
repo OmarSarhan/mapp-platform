@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from request_http import urlopen
 from typing import Any
 
 #: P6 allows a short positive cache. Bounded hard: a revoked grant has to stop
@@ -93,7 +94,7 @@ class IntrospectionClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout) as response:
                 return self._decode(response)
         except urllib.error.HTTPError as exc:
             # A 401 here is *this component's* credential being wrong, not the

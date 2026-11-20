@@ -21,6 +21,7 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+from request_http import urlopen
 from typing import Any
 
 
@@ -132,7 +133,7 @@ class ConfigApiClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=deadline) as response:
+            with urlopen(request, timeout=deadline, read_error_body=True) as response:
                 if TRACE.get() is not None:
                     trace("platform.response", requestId=request_id, status=response.status)
                 return json.loads(response.read().decode("utf-8"))

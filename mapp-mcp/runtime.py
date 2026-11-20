@@ -30,7 +30,8 @@ import contextlib
 import json
 import secrets
 import time
-from functools import partial
+from functools import wraps
+from inspect import iscoroutinefunction
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -42,6 +43,8 @@ import anyio
 import era_guard
 from approval_diagnostics import ApprovalError, DiagnosticToolError, TRACE, trace
 from authentication import CURRENT_CALLER
+from request_scope import CURRENT_REQUEST, RequestStopped, checked, child_operation, human_wait
+from request_scope import run_worker as io_call
 from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
 from config_api_client import ConfigApiUnavailable
@@ -1392,6 +1395,8 @@ def build_runtime(
     #: and the call check read the same value. Restating it would be a second
     #: place to forget.
     tool_scopes: dict[str, tuple[str, ...]] = {}
+    tool_timeouts = {}
+    sync_tools = set()
 
     def tool(*, name, description, operation):
         """Register a tool and record the scopes it needs.
@@ -1406,7 +1411,17 @@ def build_runtime(
         register = server.tool(name=name, description=description)
 
         def decorated(fn):
-            registered = register(fn)
+            tool_timeouts[name] = (operation or {}).get("timeout", 15.0)
+            if iscoroutinefunction(fn):
+                registered = register(fn)
+            else:
+                sync_tools.add(name)
+
+                @wraps(fn)
+                def at_worker_entry(*args, **kwargs):
+                    return checked(fn, *args, **kwargs)
+
+                registered = register(at_worker_entry)
             if name in {"derived_layers_plan", "derived_layers_create"}:
                 # The SDK's generated Pydantic model normally ignores extra
                 # arguments. On a derived create that silently turned a
@@ -1475,6 +1490,9 @@ def build_runtime(
         """
         trace("platform.dispatch", operationId=operation["operation_id"])
         started = time.monotonic()
+        request = CURRENT_REQUEST.get()
+        if request is not None:
+            request.remaining()
         caller = CURRENT_CALLER.get()
         if caller is None:
             # Unreachable through the middleware, which refuses before dispatch.
@@ -1517,6 +1535,8 @@ def build_runtime(
             # Credentials are redeemed on admission; their lifetime does not
             # need to cover execution. Long mutations use durable jobs.
             deadline = float(operation.get("timeout", 15.0)) - (time.monotonic() - started)
+            if request is not None:
+                deadline = request.remaining(deadline)
             if deadline <= 0:
                 raise DiagnosticToolError(
                     "The operation deadline expired before platform admission; retry later.",
@@ -1585,13 +1605,9 @@ def build_runtime(
                 code=diagnostics['code'], diagnostics=diagnostics,
             ) from None
 
-    async def io_call(fn, *args, **kwargs):
-        # AnyIO preserves CURRENT_CALLER and uses a bounded worker pool. Keep
-        # cancellation shielded while a submitted write finishes its I/O.
-        return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
-
     async def async_spend(operation, **kwargs):
-        return await io_call(spend, operation, **kwargs)
+        with child_operation(operation.get("timeout", 15.0)):
+            return await io_call(spend, operation, **kwargs)
 
     async def approval_gate(
         ctx, operation, *, path, query="", body=None, tool_name, packet,
@@ -1617,7 +1633,8 @@ def build_runtime(
         wrong design here.
         """
         caller = CURRENT_CALLER.get()
-        digest = exchange.request_digest(
+        digest = await io_call(
+            exchange.request_digest,
             operation_id=operation["operation_id"],
             method=operation["method"],
             path_template=operation["path_template"],
@@ -1711,7 +1728,7 @@ def build_runtime(
                 "This needs your approval before it can happen. " + str((packet or {}).get("summary") or "")[:500],
                 approval_url=approval_url)
         try:
-            with anyio.fail_after(APPROVAL_WAIT_SECONDS):
+            with human_wait(operation.get("timeout", 15.0)), anyio.fail_after(APPROVAL_WAIT_SECONDS):
                 if mode == "url":
                     outcome = await ctx.elicit_url(
                         message=message + " Open the approval page to see the change and decide.",
@@ -1758,7 +1775,8 @@ def build_runtime(
                 _forget_approval(caller, digest)
                 raise ApprovalError("approval.elicitation_declined", "The client returned decline for opening the approval page. The approval request was closed; nothing was applied. This does not establish who declined.", action=action)
             try:
-                receipt = await _await_decision(ctx, handle, approval_url)
+                with human_wait(operation.get("timeout", 15.0)):
+                    receipt = await _await_decision(ctx, handle, approval_url)
             except ApprovalError as exc:
                 if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
                     _forget_approval(caller, digest)
@@ -4366,9 +4384,17 @@ def build_runtime(
         token = TRACE.set({"correlationId": secrets.token_hex(16), "tool": name, "phase": "tool"})
         trace("tool.started")
         try:
-            result = await sdk_call_tool(name, arguments, context)
+            request = CURRENT_REQUEST.get()
+            if request is not None:
+                request.tighten(tool_timeouts.get(name, 15.0))
+            # The SDK queues synchronous registrations on its AnyIO limiter.
+            # Cancel there while queued, then check again inside the worker.
+            with request.active() if request and name in sync_tools else contextlib.nullcontext():
+                result = await sdk_call_tool(name, arguments, context)
             trace("tool.completed")
             return result
+        except RequestStopped as exc:
+            raise ToolError(str(exc)) from None
         except ToolError as exc:
             cause = exc
             while cause is not None and not isinstance(cause, DiagnosticToolError):
@@ -4390,6 +4416,7 @@ def build_runtime(
     # Exposed so tests can derive what a given grant should see from the same
     # values the filter uses, rather than restating a list that drifts.
     server.tool_scopes = tool_scopes
+    server.tool_timeouts = tool_timeouts
     # Exposed for the same reason and no other: the gate is deliberately not a
     # tool -- nothing the model can invoke reaches it -- so a test has no way
     # in through the tool surface. Wave 6's first mutating tool is what calls
@@ -4434,7 +4461,7 @@ def build_runtime_app(
     # is in the request rather than a cookie only because this server refuses
     # cookies at all.
     host = urlsplit(resource.origin).hostname or "localhost"
-    return server.streamable_http_app(
+    app = server.streamable_http_app(
         streamable_http_path=RPC_PATH,
         # Session state, which this server refused until Phase 1 wave 7.
         #
@@ -4471,3 +4498,5 @@ def build_runtime_app(
             allowed_origins=[resource.origin, f"{resource.origin}:*"],
         ),
     )
+    app.tool_timeouts = server.tool_timeouts
+    return app
