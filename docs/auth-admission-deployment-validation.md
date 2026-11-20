@@ -127,4 +127,78 @@ first run had one fixture error because the `leeds` schema was absent;
 creating that schema in the scratch database and rerunning resolved it.
 Evidence is in `ons-source-provenance.json`, `ons-source-audit.txt` and
 `ons-etl-tests.txt`. Full demo reconciliation and browser checks against this
-revision are still pending; these source checks alone do not pass the gate.
+revision are reported below; these source checks alone do not pass the gate.
+
+### Full load, preview-bound approval and live browser
+
+The new `demo --no-semantics` load passed the geometry hash, all 47 topic
+archives and complete OA-code reconciliation. It published 178605 rows and
+467 measures, with two geometry repairs within the demo's configured extent.
+All four saved derived relations were created and became semantically ready.
+Workspace publication then failed with `proposal.preview_required`: the
+demo helper sends only `approved: true`, while the current API also requires
+exact retained preview bindings. The helper was not changed to bypass this
+requirement. This clean-start demo invocation remains a failed gate.
+
+Prepared a proposal-bound comparison in isolated XYZ. The initial viewport
+capture had no legend or popup; a separate feature-framed capture with the
+styling panel produced complete evidence, with `renderPassed`, `checksPassed`
+and `review.complete` true. The user explicitly approved proposal
+`1795204645-e8eefb22c57d-0275d1` with preview operation
+`47133bb9f67f48dd7e6f5750e28313c2` on the disposable VM only. After rechecking
+that exact retained binding, the API apply returned HTTP 200, status `applied`,
+and healthy completed reload generation 1. The short-lived apply token was
+revoked immediately. No incomplete-preview acknowledgement was used.
+
+API readback exactly matched `docker/demo-sources/workspace-demo.json`, with
+ten layers. `./bin/mapp verify` then passed without the previous missing-MVT
+skip. Actual browser checks through a private SSH tunnel rendered population
+polygons, H3 country-of-birth cells, derived path-length styling, a
+country-of-birth polygon layer and source bus-stop icons. The corresponding
+MVT requests returned HTTP 200, with no observed browser console errors.
+Clicking a bus stop opened Y11 Calverley Street / stop 23462 / Headingley.
+Screenshots and the network/interaction ledger are retained as
+`ons-live-*.png` and `ons-live-browser.json`; exact workspace readback and
+apply/reload results are in `ons-workspace-readback.json` and
+`ons-approved-apply.json`. The browser tab and SSH tunnel were closed.
+
+These checks establish the deployed runtime after an explicitly approved
+manual completion. They do not repair the clean-start demo helper or the
+literal test launcher's fixture failures. Default and repeated no-key
+`./bin/mapp demo` invocations both subsequently exited 0. Each reloaded the
+public sources, matched the three view definitions, refreshed the H3
+materialized relation, read back the saved ten-layer workspace and completed
+a fingerprint-bound XYZ reload. The repeated run's SSH connection closed
+before completion; its original process continued on the VM, and its durable
+exit marker and final log confirmed success without restarting it.
+
+A further complete `--no-semantics` invocation against this approved fixture
+also exited 0, followed by a successful final `./bin/mapp verify`. All four
+loads against the new pin finished with 178605 rows, 47 topics and two repairs.
+Final workspace readback still exactly matched the ten-layer fixture. Both
+default runs explicitly reported no `GEMINI_APIKEY` and skipped descriptions;
+keyed generation remains unrun.
+
+| Extended-window gate | Result |
+| --- | --- |
+| Full public ONS source audit and closed manifest pin | Passed |
+| Focused ETL suite with real PostGIS | 92 passed, zero skips |
+| Clean-start `demo --no-semantics` | Failed at required preview binding after source/derived success |
+| Complete preview, explicit approval, exact-bound apply and reload | Passed |
+| Default no-key demo and full repeat after approved setup | Both passed |
+| Full `demo --no-semantics` rerun after approved setup | Passed |
+| Final verifier, ten-layer readback and actual browser checks | Passed |
+| Literal test launcher / fresh demo helper / independent mutation review | Still unresolved; overall NOT READY |
+
+The successful seeded-state runs do not erase the clean-start failure. No
+approval, resource, revision or source-integrity guard was weakened, and no
+production workspace was changed. Teardown confirmation remains owned by
+the controller; the fixed deadline is 20:46 UTC.
+
+Extended-window cleanup completed: final workspace equality passed, the
+remaining preview token was revoked, the isolated ETL test database was
+dropped, and `./bin/mapp down` exited 0. `docker ps -q` then returned no
+running containers. Raw private fixture logs/responses were removed after
+retaining sanitized results. Evidence remained below 32 MiB total and 8 MiB
+per file. Fixture volumes remain only until the controller deletes the VM;
+this is service cleanup, not confirmation of VM deletion.
