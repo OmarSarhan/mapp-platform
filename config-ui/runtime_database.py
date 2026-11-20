@@ -1,9 +1,11 @@
 """Process-wide admission for configured ``DBS_*`` reader connections."""
 
 from contextlib import contextmanager
+from functools import partial
 import threading
+import time
 from typing import Any, Callable, Iterator
-from control_connections import admission_slot
+from control_connections import AdmissionTimeout, admission_slot, checked_io, current_request, remaining_time
 
 
 # Live and preview XYZ can occupy forty sessions using the same runtime role.
@@ -39,10 +41,27 @@ def dbs_connection(
         raise RuntimeError(
             "Nested DBS_* connections must reuse the admitted connection."
         )
-    with admission_slot(_DBS_CONNECTION_SLOTS, DBS_ADMISSION_TIMEOUT_SECONDS):
+    request = current_request()
+    remaining = request.remaining if request else remaining_time
+    deadline = time.monotonic() + remaining(DBS_ADMISSION_TIMEOUT_SECONDS)
+
+    def acquisition_remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise AdmissionTimeout("Database reader admission timed out; retry later.")
+        return remaining(seconds)
+
+    with admission_slot(_DBS_CONNECTION_SLOTS, acquisition_remaining()) as slot:
         _DBS_CONNECTION_STATE.active = True
         try:
-            with connect(*args, **kwargs) as connection:
-                yield connection
+            raw = slot.connect(partial(connect, *args, **kwargs), acquisition_remaining)
+            try:
+                with checked_io(raw, remaining), raw as connection:
+                    acquisition_remaining()
+                    yield connection
+            finally:
+                # Driver __exit__ can itself raise while committing.
+                if not getattr(raw, "closed", True):
+                    raw.close()
         finally:
             _DBS_CONNECTION_STATE.active = False
