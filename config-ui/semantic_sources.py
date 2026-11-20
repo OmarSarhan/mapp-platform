@@ -966,18 +966,25 @@ def _estimated_row_count(row: Any) -> int | None:
 def _derived_generation_connection(slot, connection_url, deadline):
     # Derived reads have their own role. Keep a late opener charged to the
     # generation slot until it closes, without occupying a DBS_* reader slot.
-    with acquisition():
-        raw = slot.connect(
-            partial(psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row),
-            lambda: remaining_time(deadline - time.monotonic()),
-        )
+    request = current_request()
+    execution_started = time.monotonic()
+    raw = None
     try:
+        with acquisition():
+            raw = slot.connect(
+                partial(psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row),
+                lambda: remaining_time(deadline - time.monotonic()),
+            )
         with checked_io(raw, remaining_time, current_request()) as lease, raw:
             remaining_time(deadline - time.monotonic())
             yield lease
     finally:
-        if not raw.closed:
-            discard_connection(raw)
+        try:
+            if raw is not None and not raw.closed:
+                discard_connection(raw)
+        finally:
+            if request is not None:
+                request.database_seconds += time.monotonic() - execution_started
 
 
 def postgres_generation_context(

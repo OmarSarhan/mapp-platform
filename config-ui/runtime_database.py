@@ -62,6 +62,7 @@ def dbs_connection(
 
     with admission_slot(_DBS_CONNECTION_SLOTS, acquisition_remaining()) as slot:
         _DBS_CONNECTION_STATE.active = True
+        execution_started = time.monotonic()
         try:
             if generation_slot is not None:
                 # The connector invokes this callback only on late handoff,
@@ -93,6 +94,8 @@ def dbs_connection(
                 if not getattr(raw, "closed", True):
                     discard_connection(raw)
         finally:
+            if request is not None:
+                request.database_seconds += time.monotonic() - execution_started
             if generation_slot is not None and slot.transferred:
                 generation_slot.transferred = True
             _DBS_CONNECTION_STATE.active = False

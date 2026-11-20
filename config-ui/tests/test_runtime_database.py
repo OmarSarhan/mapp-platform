@@ -11,6 +11,38 @@ from runtime_database import (
 
 
 class RuntimeDatabaseAdmissionTests(unittest.TestCase):
+    def test_reader_and_derived_lease_time_is_recorded_on_success_and_error(self):
+        from control_connections import request_scope
+        from semantic_sources import _derived_generation_connection
+
+        class Connection:
+            closed = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+        class Slot:
+            def connect(self, *_):
+                return Connection()
+
+        for derived in (False, True):
+            for fail in (False, True):
+                with self.subTest(derived=derived, fail=fail), request_scope(2) as request:
+                    scope = (_derived_generation_connection(Slot(), "fixture", time.monotonic() + 1)
+                             if derived else dbs_connection(Connection))
+                    try:
+                        with scope:
+                            time.sleep(.02)
+                            if fail:
+                                raise ValueError("fixture")
+                    except ValueError:
+                        self.assertTrue(fail)
+                    self.assertGreaterEqual(request.database_seconds, .02)
+                    self.assertLess(request.queue_seconds, .02)
+
     def test_expired_waiter_never_connects_and_capacity_recovers(self) -> None:
         slots = threading.BoundedSemaphore(1)
         calls = []
