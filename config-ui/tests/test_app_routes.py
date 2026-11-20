@@ -7138,17 +7138,16 @@ class ReloadRouteTests(unittest.TestCase):
             patch.object(
                 app,
                 "request_reload",
-                return_value={
-                    "requestedGeneration": 7,
-                    "expectedWorkspaceFingerprint": fingerprint,
-                },
+                side_effect=lambda fp, *, before_publish: (
+                    before_publish(7) or {"requestedGeneration": 7, "expectedWorkspaceFingerprint": fp}
+                ),
             ) as request_reload,
             patch.object(app, "wait_reload", return_value=status) as wait_reload,
             patch.object(app.CONTROL, "audit"),
         ):
             handler.do_POST()
 
-        request_reload.assert_called_once_with(fingerprint)
+        self.assertEqual((fingerprint,), request_reload.call_args.args)
         wait_reload.assert_called_once_with(7, fingerprint, 30.0)
         self.assertEqual(HTTPStatus.OK, responses[0][0])
         self.assertEqual(fingerprint, responses[0][1]["status"]["workspaceFingerprint"])
@@ -7219,7 +7218,7 @@ class ReloadRouteTests(unittest.TestCase):
             patch.object(
                 app,
                 "request_reload",
-                return_value={"requestedGeneration": 8},
+                side_effect=lambda fp, *, before_publish: before_publish(8) or {"requestedGeneration": 8},
             ),
             patch.object(app, "wait_reload", side_effect=OSError("mailbox failed")),
             patch.object(
@@ -7507,6 +7506,10 @@ class ApplyRouteTests(unittest.TestCase):
                 "error": error,
             }
 
+        def interrupted_apply(*args, before_apply, **kwargs):
+            before_apply()
+            raise OSError("reload channel failed")
+
         with (
             patch.object(app, "proposal_read", return_value=self.proposal()),
             patch.object(app, "validate_candidate", return_value=[]),
@@ -7515,7 +7518,7 @@ class ApplyRouteTests(unittest.TestCase):
             patch.object(
                 app,
                 "apply_proposal_and_reload",
-                side_effect=OSError("reload channel failed"),
+                side_effect=interrupted_apply,
             ),
             patch.object(
                 app.CONTROL,
@@ -10853,6 +10856,7 @@ class ActorRedactionTests(unittest.TestCase):
         handler.command = "GET"
         handler._exchanged_token = "mapp_b_something"
         handler._exchanged_token_redeemed = True
+        handler._effects = app.mutation_state()
         handler._request_id = "r"
         handler.send_response = lambda *a, **k: None
         handler.send_header = lambda *a, **k: None

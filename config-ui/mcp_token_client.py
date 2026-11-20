@@ -69,7 +69,11 @@ class RedemptionUnconfirmed(RuntimeError):
 
 
 class RedemptionConfirmedExpired(RuntimeError):
-    """The broker confirmed the spend, but no target may now be dispatched."""
+    """The broker acknowledged redemption before the final budget check."""
+
+    def __init__(self, message, *, single_use=True):
+        super().__init__(message)
+        self.single_use = single_use
 
 
 def _resolve(host, port, remaining):
@@ -222,7 +226,8 @@ class McpTokenClient:
                         except AdmissionTimeout:
                             if redeem and payload.get("redeemed") is True:
                                 raise RedemptionConfirmedExpired(
-                                    "Authorization token was redeemed; request expired before target dispatch."
+                                    "Authorization token was redeemed; request expired before target dispatch.",
+                                    single_use=payload.get("single_use") is not False,
                                 ) from None
                             raise
                         return payload

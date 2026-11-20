@@ -14,6 +14,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from mutation_admission import mutation_state, request_lock
 from federation_capability import (
     _database_default_collation_identity,
     detect_capability,
@@ -66,13 +67,14 @@ class FederationAliasStore:
                 cur.execute("SET SESSION search_path = pg_catalog, public")
             if self._initialized:
                 return connection
-            with self._initialization_lock:
+            with request_lock(self._initialization_lock):
                 if not self._initialized:
                     with connection.cursor() as cur:
                         cur.execute(
                             "SELECT pg_advisory_xact_lock(hashtext(%s))",
                             (f"{SCHEMA}:schema",),
                         )
+                        mutation_state().admit()
                         self._initialize(cur)
                     connection.commit()
                     self._initialized = True
@@ -645,6 +647,7 @@ class FederationAliasStore:
             local_default_collation = (
                 _database_default_collation_identity(cur)
             )
+            mutation_state().begin()
             (
                 observation,
                 observed_at,
@@ -702,6 +705,7 @@ class FederationAliasStore:
                     or accepted_fingerprint == incoming_fingerprint
                 ),
             }
+        mutation_state().begin()
         cur.execute(
             sql.SQL("""
                 INSERT INTO {}._observations
