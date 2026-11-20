@@ -1,3 +1,4 @@
+import fcntl
 import socket
 import threading
 import unittest
@@ -7,6 +8,34 @@ from control_connections import AdmissionTimeout, current_request, remaining_tim
 
 
 class RequestBudgetTests(unittest.TestCase):
+    def test_high_connected_fd_is_admitted_and_input_is_preserved(self):
+        left, right = socket.socketpair()
+        with left, right, socket.socket(fileno=fcntl.fcntl(left, fcntl.F_DUPFD_CLOEXEC, 1100)) as high:
+            with request_scope(2, high):
+                self.assertGreaterEqual(high.fileno(), 1100)
+                self.assertGreater(remaining_time(), 0)
+                right.sendall(b"x")
+                self.assertGreater(remaining_time(), 0)
+                self.assertEqual(high.recv(1), b"x")
+
+    def test_inconclusive_probe_does_not_latch_and_eof_still_does(self):
+        class Peer(socket.socket):
+            fail_probe = True
+
+            def fileno(self):
+                if self.fail_probe:
+                    self.fail_probe = False
+                    raise OSError("transient observation failure")
+                return super().fileno()
+
+        left, right = socket.socketpair()
+        with Peer(fileno=left.detach()) as peer, right, request_scope(2, peer):
+            self.assertGreater(remaining_time(), 0)
+            self.assertFalse(peer.fail_probe)
+            right.close()
+            with self.assertRaisesRegex(AdmissionTimeout, "disconnected"):
+                remaining_time()
+
     def test_finish_joins_late_registration_already_aborting(self):
         entered, release, finishing = (threading.Event() for _ in range(3))
         with request_scope(5) as request, ThreadPoolExecutor(2) as executor:

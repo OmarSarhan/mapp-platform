@@ -2,16 +2,18 @@ import os
 import multiprocessing
 import secrets
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 import threading
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 import psycopg
 from psycopg import sql
 
-from control_connections import AdmissionTimeout, CAPACITY, ControlConnections, request_scope
+from control_connections import AcquisitionError, AdmissionTimeout, CAPACITY, ControlConnections, request_scope
 
 
 def hold_process(dsn, ready, release):
@@ -44,11 +46,115 @@ class ConnectionTests(unittest.TestCase):
     def tearDown(self):
         self.pool.close()
 
+    def terminate_idle_fixture(self, connect=psycopg.connect):
+        with self.pool.connection(self.dsn, connect=connect) as conn:
+            pid = conn.info.backend_pid
+        with psycopg.connect(self.dsn) as observer:
+            terminated = observer.execute(
+                "SELECT pg_terminate_backend(pid, 1000) FROM pg_stat_activity "
+                "WHERE pid=%s AND state='idle' AND usename=current_user AND datname=current_database()",
+                (pid,),
+            ).fetchone()
+            self.assertEqual((True,), terminated)
+        return pid
+
+    def test_terminated_idle_backend_replaced_in_same_checkout(self):
+        old = self.terminate_idle_fixture()
+        entries = []
+        with self.pool.connection(self.dsn) as conn:
+            entries.append(conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"])
+        self.assertEqual(1, len(entries))
+        self.assertNotEqual(old, entries[0])
+        self.assertEqual(2, self.pool.created)
+        with self.pool.connection(self.dsn) as conn:
+            self.assertEqual(entries[0], conn.info.backend_pid)
+
+    def test_failed_replacement_attempted_once_and_all_slots_recover(self):
+        self.terminate_idle_fixture()
+        attempts = []
+
+        def fail(*args, **kwargs):
+            attempts.append(1)
+            raise psycopg.OperationalError("fixture replacement failed")
+
+        with self.assertRaises(AcquisitionError), self.pool.connection(self.dsn, connect=fail):
+            self.fail("failed replacement yielded")
+        self.assertEqual([1], attempts)
+
+        together = threading.Barrier(CAPACITY)
+
+        def fresh():
+            with self.pool.connection(self.dsn) as conn:
+                together.wait(timeout=2)
+                return conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"]
+
+        with ThreadPoolExecutor(CAPACITY) as executor:
+            futures = [executor.submit(fresh) for _ in range(CAPACITY)]
+            self.assertEqual(CAPACITY, len({f.result(3) for f in futures}))
+
+    def test_expired_replacement_stays_counted_until_closed_without_sql(self):
+        self.terminate_idle_fixture()
+        opening, release, closed = (threading.Event() for _ in range(3))
+        commands = []
+
+        class Tracked(psycopg.Connection):
+            def execute(self, query, *args, **kwargs):
+                commands.append(query)
+                return super().execute(query, *args, **kwargs)
+
+            def close(self):
+                super().close()
+                closed.set()
+
+        def delayed(*args, **kwargs):
+            opening.set()
+            self.assertTrue(release.wait(3))
+            return Tracked.connect(*args, **kwargs)
+
+        def checkout():
+            with self.pool.connection(self.dsn, connect=delayed, deadline=time.monotonic() + .15):
+                self.fail("expired replacement yielded")
+
+        with ThreadPoolExecutor(1) as executor:
+            result = executor.submit(checkout)
+            try:
+                self.assertTrue(opening.wait(1))
+                with self.assertRaises(AdmissionTimeout):
+                    result.result(.5)
+                self.assertEqual(1, self.pool._active)
+            finally:
+                release.set()
+        self.assertTrue(closed.wait(1))
+        self.assertEqual([], commands)
+        with self.pool.connection(self.dsn) as conn:
+            self.assertEqual(1, conn.execute("SELECT 1 AS n").fetchone()["n"])
+
+    def test_stale_cleanup_can_exhaust_acquisition_budget_before_fresh_connect(self):
+        delayed = threading.Event()
+
+        class SlowClose(psycopg.Connection):
+            def close(self):
+                super().close()
+                if self.broken and not delayed.is_set():
+                    delayed.set()
+                    time.sleep(.12)
+
+        self.terminate_idle_fixture(SlowClose.connect)
+        fresh = Mock(side_effect=AssertionError("expired checkout started a fresh connector"))
+        with patch("control_connections.QUEUE_TIMEOUT", .1), self.assertRaises(AdmissionTimeout):
+            with self.pool.connection(self.dsn, connect=fresh):
+                self.fail("expired setup yielded")
+        self.assertTrue(delayed.is_set())
+        fresh.assert_not_called()
+        with self.pool.connection(self.dsn) as conn:
+            self.assertEqual(1, conn.execute("SELECT 1 AS n").fetchone()["n"])
+
     def test_reset_and_failed_transaction(self):
         with self.pool.connection(self.dsn) as conn:
             pid = conn.info.backend_pid
             conn.execute("SET application_name = 'dirty'")
             conn.execute("CREATE TEMP TABLE dirty(value integer)")
+            conn.execute("PREPARE dirty_plan AS SELECT 1")
             conn.execute("SELECT pg_advisory_lock(7654321)")
             conn.read_only = False
             conn.execute("BEGIN")
@@ -59,6 +165,7 @@ class ConnectionTests(unittest.TestCase):
             self.assertIsNone(conn.read_only)
             self.assertEqual("", conn.execute("SHOW application_name").fetchone()["application_name"])
             self.assertIsNone(conn.execute("SELECT to_regclass('pg_temp.dirty') AS relation").fetchone()["relation"])
+            self.assertIsNone(conn.execute("SELECT name FROM pg_prepared_statements WHERE name='dirty_plan'").fetchone())
             self.assertEqual(0, conn.execute("SELECT count(*) AS n FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory'").fetchone()["n"])
             self.assertEqual("pg_catalog, control", conn.execute("SHOW search_path").fetchone()["search_path"])
         self.assertEqual(1, self.pool.created)

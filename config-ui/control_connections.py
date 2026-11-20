@@ -6,7 +6,7 @@ either service requires repartitioning this budget, not increasing the limit.
 """
 
 from concurrent.futures import Future, wait
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from functools import partial
 from types import SimpleNamespace
@@ -42,6 +42,22 @@ class CommandInterrupted(psycopg.OperationalError):
     """A command may have been submitted. Its effects require reconciliation."""
 
 
+def _peer_disconnected(peer):
+    try:
+        poller = select.poll()
+        poller.register(peer, select.POLLIN)
+        if not any(events & (select.POLLIN | select.POLLHUP | select.POLLERR)
+                   for _, events in poller.poll(0)):
+            return False
+        try:
+            return peer.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+        except (ConnectionResetError, ConnectionAbortedError):
+            return True
+    except (OSError, ValueError):
+        # Inconclusive observation. The next budget check probes again.
+        return False
+
+
 class RequestBudget:
     def __init__(self, seconds, peer):
         self.deadline = time.monotonic() + max(0, min(seconds, 120.0))
@@ -60,15 +76,8 @@ class RequestBudget:
 
     def remaining(self, cap=120.0):
         with self._condition:
-            if self._reason is None and self.peer is not None:
-                try:
-                    readable, _, _ = select.select([self.peer], [], [], 0)
-                    if readable and self.peer.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b"":
-                        self.cancel("Request disconnected.")
-                except BlockingIOError:
-                    pass
-                except (OSError, ValueError):
-                    self.cancel("Request disconnected.")
+            if self._reason is None and self.peer is not None and _peer_disconnected(self.peer):
+                self.cancel("Request disconnected.")
             seconds = self.deadline - time.monotonic()
             if seconds <= 0:
                 self.cancel("Database operation deadline expired.")
@@ -633,21 +642,35 @@ class ControlConnections:
         def command_remaining():
             return remaining() if admitted else acquisition_remaining()
 
+        def setup(stack):
+            lease = stack.enter_context(checked_io(connection, command_remaining, state))
+            acquisition_remaining()
+            connection.execute("SET SESSION search_path = pg_catalog, control")
+            connection.execute("SELECT set_config('statement_timeout', %s, false)",
+                               (str(max(1, int(min(10, remaining()) * 1000))),))
+            acquisition_remaining()
+            return lease
+
         try:
-            with acquisition():
-                if connection is None:
-                    opener = partial(connect, dsn, autocommit=True, row_factory=dict_row,
-                                     connect_timeout=2, prepare_threshold=None)
-                    connection = slot.connect(opener, acquisition_remaining)
-                    with self._condition:
-                        self.created += 1
-            with checked_io(connection, command_remaining, state) as lease:
+            with ExitStack() as stack:
                 with acquisition():
-                    acquisition_remaining()
-                    connection.execute("SET SESSION search_path = pg_catalog, control")
-                    connection.execute("SELECT set_config('statement_timeout', %s, false)",
-                                       (str(max(1, int(min(10, remaining()) * 1000))),))
-                    acquisition_remaining()
+                    if connection is not None:
+                        try:
+                            lease = setup(stack)
+                        except psycopg.OperationalError:
+                            if not getattr(connection, "broken", False):
+                                raise
+                            # Disarm the old guard before closing or replacing its backend.
+                            stack.close()
+                            discard_connection(connection)
+                            connection = None
+                    if connection is None:
+                        opener = partial(connect, dsn, autocommit=True, row_factory=dict_row,
+                                         connect_timeout=2, prepare_threshold=None)
+                        connection = slot.connect(opener, acquisition_remaining)
+                        with self._condition:
+                            self.created += 1
+                        lease = setup(stack)
                 admitted = True
                 yield lease
         finally:
