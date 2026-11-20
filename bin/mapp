@@ -1098,8 +1098,14 @@ case "${1:-}" in
     # rendered page. The skip guard applies for the same reason as the others:
     # a suite that quietly stops running is worse than one that fails.
     mapp_mcp_log="$(mktemp)"
-    if ! "${test_compose[@]}" run --rm --build --no-deps \
-      --volume "${ROOT_DIR}:/workspace:ro" \
+    run_with_buildkit_lease_retry "${test_compose[@]}" build mapp-mcp
+    if ! docker run --rm --network none --read-only \
+      --tmpfs /tmp:size=256m,mode=1777 \
+      --security-opt no-new-privileges:true --cap-drop ALL \
+      --volume "${ROOT_DIR}/mapp-mcp:/workspace/mapp-mcp:ro" \
+      --volume "${ROOT_DIR}/mcp-auth:/workspace/mcp-auth:ro" \
+      --volume "${ROOT_DIR}/config-ui:/workspace/config-ui:ro" \
+      --volume "${ROOT_DIR}/compose.yaml:/workspace/compose.yaml:ro" \
       --volume "${codex_test_binary}:/opt/mapp-test-codex:ro" \
       --volume "${cli_test_workflow}:/mapp-config-cli/docs/agent-workflow.md:ro" \
       --env PYTHONPATH=/app:/workspace/mapp-mcp/tests \
@@ -1107,7 +1113,7 @@ case "${1:-}" in
       --env MAPP_CODEX_TEST_BINARY=/opt/mapp-test-codex \
       --env CODEX_HOME=/tmp/mapp-test-codex-home \
       --entrypoint sh \
-      mapp-mcp \
+      mapp-mcp-tests:local \
       -ec 'mkdir -p "$CODEX_HOME"; python -m unittest discover -s /workspace/mapp-mcp/tests -v' 2>&1 \
       | tee "${mapp_mcp_log}"; then
       rm -f "${mapp_mcp_log}"
@@ -1144,8 +1150,16 @@ case "${1:-}" in
       --env PYTHONPATH=/app/src \
       mapp-leeds-etl:local \
       python -m unittest discover -s /workspace/etl/tests -v
-    PYTHONPATH="${ROOT_DIR}" \
-      python3 -m unittest discover -s "${ROOT_DIR}/scripts/tests" -v
+    # Compose rendering needs the host CLI; runtime-importing script tests use
+    # the pinned service dependencies, not whatever Python packages the host has.
+    PYTHONPATH="${ROOT_DIR}/scripts/tests" \
+      python3 -m unittest test_compose_isolation -v
+    run_with_buildkit_lease_retry docker build --file "${ROOT_DIR}/docker/tests/Dockerfile" \
+      --target scripts-tests --tag mapp-scripts-tests:local "${ROOT_DIR}"
+    docker run --rm --network none --read-only --tmpfs /tmp:size=256m,mode=1777 \
+      --volume "${ROOT_DIR}:/workspace:ro" --workdir /workspace \
+      --env PYTHONPATH=/workspace:/workspace/scripts/tests \
+      mapp-scripts-tests:local python -c 'import pathlib, unittest; names = [p.stem for p in sorted(pathlib.Path("scripts/tests").glob("test_*.py")) if p.stem != "test_compose_isolation"]; result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names)); raise SystemExit(not result.wasSuccessful())'
     docker run --rm \
       --volume "${ROOT_DIR}:/source:ro" \
       --workdir /tmp \

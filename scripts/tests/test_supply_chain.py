@@ -9,6 +9,12 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_BASES = {
+    # Test-only stages reuse the service images built immediately beforehand.
+    "docker/tests/Dockerfile": (
+        "mapp-mcp-auth:local", "mapp-config-ui:local", "config", "mapp-mcp:local",
+        "node:22.23.1-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e",
+        "mcp-tests",
+    ),
     ".devcontainer/Dockerfile": (
         "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm@sha256:"
         "7876580dc67fd460fd962f004cbeb480027e9bbc0657096f1087db11f9eaff39",
@@ -82,6 +88,10 @@ class BaseImagePolicyTests(unittest.TestCase):
             )
             self.assertEqual(actual, expected, relative_path)
             for reference in actual:
+                if relative_path == "docker/tests/Dockerfile" and reference in {
+                    "mapp-mcp-auth:local", "mapp-config-ui:local", "config", "mapp-mcp:local", "mcp-tests",
+                }:
+                    continue  # Exact local-stage references, built by the launcher.
                 self.assertRegex(reference, r"^[^@$\s]+@sha256:[0-9a-f]{64}$")
 
     def test_external_dockerfile_frontend_is_digest_pinned(self) -> None:
@@ -213,7 +223,7 @@ class SupplyChainWorkflowTests(unittest.TestCase):
 
     def test_every_final_image_is_built(self) -> None:
         dockerfiles = [entry["dockerfile"] for entry in self.matrix["include"]]
-        expected = set(EXPECTED_BASES) - {".devcontainer/Dockerfile"}
+        expected = set(EXPECTED_BASES) - {".devcontainer/Dockerfile", "docker/tests/Dockerfile"}
         self.assertEqual(set(dockerfiles), expected)
         self.assertEqual(len(dockerfiles), len(expected))
 

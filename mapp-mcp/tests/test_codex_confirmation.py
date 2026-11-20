@@ -128,7 +128,10 @@ class CodexConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await asyncio.wait_for(process.wait(), 5)
                 except TimeoutError:
-                    process.kill()
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass  # The child exited between the timeout and kill.
                     await process.wait()
             http.should_exit = True
             await asyncio.to_thread(worker.join, 5)
