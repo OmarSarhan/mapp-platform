@@ -465,12 +465,26 @@ class CheckEnvironmentTests(unittest.TestCase):
             root = self.isolated_mapp_root(directory)
             initialized = self.run_isolated_init(root)
             self.assertEqual(0, initialized.returncode, initialized.stderr)
+            # Only the availability preflight may run before confirmation.
+            # Keep this warning test independent of a host Docker installation
+            # and fail closed if it reaches an actual reset command.
+            docker = root / "bin/docker"
+            calls = root / "docker-calls"
+            docker.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_CALLS"\n'
+                '[ "$*" = "compose version" ] || exit 91\n',
+                encoding="utf-8",
+            )
+            docker.chmod(0o700)
             result = subprocess.run(
                 [root / "bin/mapp", "reset-system"],
-                env={**os.environ, "MAPP_ENV_FILE": str(root / ".env")},
+                env={**os.environ, "MAPP_ENV_FILE": str(root / ".env"),
+                     "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+                     "DOCKER_CALLS": str(calls)},
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(["compose version"], calls.read_text().splitlines())
 
         self.assertEqual(2, result.returncode)
         warning = result.stderr.lower()
