@@ -26,13 +26,18 @@ function makeBadge(layer) {
 }
 
 async function refresh(layer, badge, state) {
+  if (state.active) {
+    state.pending = true;
+    return;
+  }
   if (!layer.tableCurrent?.() || !layer.L?.getVisible?.()) {
     badge.hidden = true;
     return;
   }
 
   badge.hidden = false;
-  const request = ++state.request;
+  const request = state.request;
+  state.active = true;
   badge.textContent = '(…)';
 
   try {
@@ -48,6 +53,12 @@ async function refresh(layer, badge, state) {
     badge.textContent = '(–)';
     badge.setAttribute('aria-label', `${layer.name}: viewport count unavailable`);
     console.warn(`Viewport count failed for layer [${layer.key}].`, error);
+  } finally {
+    state.active = false;
+    if (state.pending) {
+      state.pending = false;
+      refresh(layer, badge, state);
+    }
   }
 }
 
@@ -58,11 +69,13 @@ function viewportLayerCount(layer) {
   layer.filter.viewport = true;
 
   const badge = makeBadge(layer);
-  const state = {request: 0, timer: null};
+  const state = {request: 0, timer: null, active: false, pending: false};
   const delay = Number.isFinite(layer.viewport_layer_count?.debounce)
     ? Math.max(0, layer.viewport_layer_count.debounce)
     : 250;
   const schedule = () => {
+    state.request++;
+    state.pending = false;
     clearTimeout(state.timer);
     state.timer = setTimeout(() => refresh(layer, badge, state), delay);
   };
@@ -74,6 +87,7 @@ function viewportLayerCount(layer) {
   layer.showCallbacks.push(schedule);
   layer.hideCallbacks.push(() => {
     state.request++;
+    state.pending = false;
     clearTimeout(state.timer);
     badge.hidden = true;
   });
