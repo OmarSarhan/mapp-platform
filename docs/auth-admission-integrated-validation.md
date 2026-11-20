@@ -83,3 +83,22 @@ Outstanding acceptance limits:
 
 No merge, push, deployment or production-readiness claim follows from this
 checkpoint. OMA-76 and its parent must remain open.
+
+## Remaining-gate follow-up
+
+The parent subsequently ran all 482 MCP tests with zero failures, errors or
+skips, including both real Codex client tests. The source-drift test used the
+current GitHub CLI workflow file, verified against Git blob
+`bc3ca233067641044e49b2bc079b8e546fdcf13a`, in a temporary file. Only the test's
+`CLI_WORKFLOW` path was redirected; the expected digest and assertion were
+unchanged. The first fixture write added a newline, which was corrected after
+blob verification; the exact-byte test then passed. No CLI code was vendored
+and no checkout was created. The test log is `/tmp/oma76-final-mcp-results.txt`.
+This closes the missing-source test coverage gap, but does not establish that
+the Docker launcher ran. The isolated Codex home was removed after the run.
+
+Deployment preflight found only 944 MB free on the host filesystem and no
+required MAPP images. Full image/demo provisioning remains blocked on storage
+or a larger disposable test environment. No unrelated Docker images, volumes
+or data were removed. The independent mutation-review service restriction
+also remains unresolved.
