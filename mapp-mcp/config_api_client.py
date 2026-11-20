@@ -145,10 +145,11 @@ class ConfigApiClient:
                         # EOF caused by our own cancellation cannot prove that
                         # a close-delimited or chunked acknowledgement finished.
                         lengths = response.headers.get_all("Content-Length", [])
+                        length = lengths[0].strip(" \t") if len(lengths) == 1 else ""
                         if (response.headers.get_all("Transfer-Encoding", []) or len(lengths) != 1
-                                or not lengths[0].strip().isascii() or not lengths[0].strip().isdigit()):
+                                or not length.isascii() or not length.isdigit()):
                             raise ValueError("Proposal acknowledgement requires explicit framing.")
-                        expected_length = int(lengths[0])
+                        expected_length = int(length)
                     response_data = response.read()
                     if proposal_create and len(response_data) != expected_length:
                         raise ValueError("Proposal acknowledgement is incomplete.")

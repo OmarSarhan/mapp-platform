@@ -451,6 +451,7 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
             (chunk, b"Transfer-Encoding: chunked"),
             (chunk + b"\r\n", b"Transfer-Encoding: chunked"),
             (acknowledgement, b"Content-Length: 40\r\nContent-Length: 40"),
+            (acknowledgement, b"Content-Length: \xa0" + str(len(acknowledgement)).encode()),
         )]
         received = []
         current = None
