@@ -9,6 +9,8 @@ from http import HTTPStatus
 from unittest.mock import patch
 
 import psycopg
+import control_connections
+import runtime_database
 import semantic_sources
 
 from semantic_sources import (
@@ -113,6 +115,43 @@ class FakeConnection:
 
 
 class GenerationContextAdmissionTests(unittest.TestCase):
+    def test_generation_queue_and_connect_share_one_acquisition_deadline(self):
+        sources = PostgresSemanticSources({"fixture": "reader"}, parse_allowlist("fixture:maps.roads"))
+        options = dict(schema="maps", relation="roads", fields=[], target_kind="table", statistics=True)
+        for path, read in (
+            ("configured", lambda: sources.generation_context("fixture", **options)),
+            ("derived", lambda: postgres_generation_context("reader", **options)),
+        ):
+            with (
+                self.subTest(path=path),
+                patch.object(semantic_sources, "time") as clock,
+                patch.object(runtime_database, "time", clock),
+            ):
+                clock.monotonic.return_value = 0
+                closed = threading.Event()
+
+                class Queued(threading.BoundedSemaphore):
+                    def acquire(self, **kwargs):
+                        clock.monotonic.return_value = 1.5
+                        return super().acquire(**kwargs)
+
+                class Connection:
+                    def close(self):
+                        closed.set()
+
+                def connect(*args, **kwargs):
+                    # Each stage fits alone. Together they take 5.5 seconds.
+                    clock.monotonic.return_value += 4
+                    return Connection()
+
+                with (
+                    patch.object(semantic_sources, "_GENERATION_CONTEXT_READ_SLOTS", Queued(3)),
+                    patch.object(psycopg, "connect", connect),
+                    self.assertRaises(control_connections.AdmissionTimeout),
+                ):
+                    read()
+                self.assertTrue(closed.wait(1))
+
     def test_context_read_error_releases_its_admission_slot(self):
         slots = threading.BoundedSemaphore(
             MAX_CONCURRENT_GENERATION_CONTEXT_READS

@@ -26,6 +26,8 @@ _DBS_CONNECTION_STATE = threading.local()
 def dbs_connection(
     connect: Callable[..., Any],
     *args: Any,
+    acquisition_deadline: float | None = None,
+    generation_slot=None,
     **kwargs: Any,
 ) -> Iterator[Any]:
     """Open one ``DBS_*`` connection within the shared admission bound.
@@ -33,7 +35,9 @@ def dbs_connection(
     The caller supplies its module-local ``psycopg.connect`` function so tests
     can keep patching that established seam.  Acquire before connecting and
     release only after the connection context closes; failed connects release
-    the slot through normal context-manager unwinding.
+    the slot through normal context-manager unwinding. Generation reads pass
+    the deadline and slot from their outer queue so a late connector owns
+    both permits through close.
 
     Callers must not open a second admitted connection while holding the first;
     pass an existing connection down instead.  Every current call site is
@@ -47,6 +51,8 @@ def dbs_connection(
     request = current_request()
     remaining = request.remaining if request else remaining_time
     deadline = time.monotonic() + remaining(DBS_ADMISSION_TIMEOUT_SECONDS)
+    if acquisition_deadline is not None:
+        deadline = min(deadline, acquisition_deadline)
 
     def acquisition_remaining():
         seconds = deadline - time.monotonic()
@@ -57,6 +63,16 @@ def dbs_connection(
     with admission_slot(_DBS_CONNECTION_SLOTS, acquisition_remaining()) as slot:
         _DBS_CONNECTION_STATE.active = True
         try:
+            if generation_slot is not None:
+                # The connector invokes this callback only on late handoff,
+                # after it has discarded its connection.
+                release_reader = slot.release
+
+                def release_late_slots():
+                    release_reader()
+                    generation_slot.release()
+
+                slot.release = release_late_slots
             with acquisition():
                 raw = slot.connect(partial(connect, *args, **kwargs), acquisition_remaining)
             admitted = False
@@ -77,4 +93,6 @@ def dbs_connection(
                 if not getattr(raw, "closed", True):
                     discard_connection(raw)
         finally:
+            if generation_slot is not None and slot.transferred:
+                generation_slot.transferred = True
             _DBS_CONNECTION_STATE.active = False

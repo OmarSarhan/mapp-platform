@@ -8831,6 +8831,7 @@ class Handler(SimpleHTTPRequestHandler):
                             else {}
                         ),
                     }
+                remaining_time()
                 profile = GEMINI.generate(
                     context,
                     target_kind=target["kind"],
