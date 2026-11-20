@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -12,8 +13,10 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 import control_connections as cc
+import control_schema
 import runtime_database as rd
 
 
@@ -43,6 +46,38 @@ class LeaseDeadlineTests(unittest.TestCase):
             for reader in (False, True):
                 with self.subTest(reader=reader):
                     self.check_late_connector(reader)
+
+    def test_late_failed_openers_hold_capacity_until_completion(self):
+        for reader in (False, True):
+            entered, release = threading.Event(), threading.Event()
+
+            def fail(*args, **kwargs):
+                entered.set()
+                self.assertTrue(release.wait(2))
+                raise psycopg.OperationalError("late test opener")
+
+            def lease(opener):
+                return (rd.dbs_connection(opener, self.dsn) if reader
+                        else self.pool.connection(self.dsn, connect=opener))
+
+            def caller():
+                with cc.request_scope(.05), lease(fail):
+                    self.fail("failed opener yielded")
+
+            with self.subTest(reader=reader), patch.object(cc, "CAPACITY", 1), patch.object(
+                rd, "_DBS_CONNECTION_SLOTS", threading.BoundedSemaphore(1)
+            ), ThreadPoolExecutor(1) as executor:
+                result = executor.submit(caller)
+                try:
+                    self.assertTrue(entered.wait(1))
+                    with self.assertRaises(cc.AdmissionTimeout):
+                        result.result(.4)
+                    with cc.request_scope(.04), self.assertRaises(cc.AdmissionTimeout), lease(psycopg.connect):
+                        self.fail("slot released before late failure")
+                finally:
+                    release.set()
+                with lease(psycopg.connect) as healthy:
+                    healthy.execute("SELECT 1")
 
     def check_late_connector(self, reader):
         entered, release, closed = (threading.Event() for _ in range(3))
@@ -199,7 +234,7 @@ class LeaseDeadlineTests(unittest.TestCase):
         with self.rows() as insert, cc.request_scope(5) as request, ThreadPoolExecutor(1) as executor:
             with self.pool.connection(self.dsn, connect=PausedDriver.connect) as conn:
                 future = executor.submit(cancel, request)
-                conn.pause = True
+                PausedDriver.pause = True
                 with self.assertRaises(cc.CommandNotSubmitted):
                     conn.execute(insert)
                 future.result(timeout=1)
@@ -240,7 +275,7 @@ class LeaseDeadlineTests(unittest.TestCase):
             with self.pool.connection(self.dsn, connect=PausedReply.connect, cancelled=request) as conn:
                 conn.execute("BEGIN")
                 conn.execute(sql.SQL("INSERT INTO {} VALUES (2, 1)").format(table))
-                conn.pause = True
+                PausedReply.pause = True
                 conn.commit()
 
         cancelled = threading.Event()
@@ -276,6 +311,226 @@ class LeaseDeadlineTests(unittest.TestCase):
                 request.cancel("peer closed")
                 with self.assertRaises(cc.CommandNotSubmitted):
                     conn.execute(insert)
+            with self.assertRaises(cc.AdmissionTimeout), self.pool.connection(self.dsn):
+                self.fail("cancelled scope acquired a second lease")
+
+    def test_transport_loss_after_observed_commit(self):
+        # The bridge forwards one client session. Withhold the first byte
+        # of the COMMIT reply until the observer has seen its durable effect.
+        with psycopg.connect(self.dsn, autocommit=True) as observer:
+            host, port = observer.info.host, observer.info.port
+            if not os.path.isabs(host):
+                self.skipTest("requires a PostgreSQL Unix socket")
+            table = sql.Identifier("control", "lease_" + uuid4().hex)
+            observer.execute(sql.SQL("CREATE TABLE {} (n int)").format(table))
+            self.addCleanup(self.drop_table, table)
+            commit, held, release = (threading.Event() for _ in range(3))
+            name = f".s.PGSQL.{port}"
+            with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(os.path.join(directory, name))
+                listener.settimeout(4)
+                listener.listen(1)
+
+                def forward(source, target, server_reply=False):
+                    while chunk := source.recv(65536):
+                        if server_reply and commit.is_set():
+                            held.set()
+                            self.assertTrue(release.wait(3))
+                            target.shutdown(socket.SHUT_RDWR)
+                            return
+                        target.sendall(chunk)
+
+                def bridge(executor):
+                    client, _ = listener.accept()
+                    with client, socket.socket(socket.AF_UNIX) as server:
+                        client.settimeout(4)
+                        server.settimeout(4)
+                        server.connect(os.path.join(host, name))
+                        writer = executor.submit(forward, client, server)
+                        try:
+                            forward(server, client, True)
+                        finally:
+                            client.shutdown(socket.SHUT_RDWR)
+                        writer.result(2)
+
+                def borrower():
+                    dsn = psycopg.conninfo.make_conninfo(self.dsn, host=directory)
+                    with self.pool.connection(dsn) as conn, control_schema.transaction(conn):
+                        conn.execute(sql.SQL("INSERT INTO {} VALUES (1)").format(table))
+                        commit.set()
+
+                with ThreadPoolExecutor(3) as executor:
+                    proxy = executor.submit(bridge, executor)
+                    result = executor.submit(borrower)
+                    try:
+                        self.assertTrue(held.wait(2))
+                        self.assertEqual((1,), observer.execute(
+                            sql.SQL("SELECT count(*) FROM {}").format(table)).fetchone())
+                    finally:
+                        release.set()
+                    with self.assertRaises(cc.CommandInterrupted):
+                        result.result(2)
+                    proxy.result(2)
+
+    def drop_table(self, table):
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP TABLE {}").format(table))
+
+    def test_json_adapter_cannot_submit_after_cancellation_or_deadline(self):
+        for cancel in (False, True):
+            for prepared in (False, True):
+                with self.subTest(cancel=cancel, prepared=prepared), self.rows() as insert:
+                    with cc.request_scope(5 if cancel else .15) as request, self.pool.connection(self.dsn) as conn:
+                        def dump(value):
+                            if cancel:
+                                request.cancel("fixture")
+                            else:
+                                time.sleep(max(0, request.deadline - time.monotonic()) + .01)
+                            return str(value)
+
+                        # A RETURNING expression is adapted before PostgreSQL
+                        # executes the INSERT. The observer checks the table.
+                        with conn.cursor() as cur, self.assertRaises(cc.CommandNotSubmitted):
+                            execute = cur.execute if prepared else conn.execute
+                            execute(insert + sql.SQL(" RETURNING %s::jsonb"),
+                                    (Jsonb(1, dumps=dump),), prepare=prepared)
+
+    def test_stream_rejected_before_insert(self):
+        with self.rows() as insert, self.pool.connection(self.dsn) as conn, conn.cursor() as cursor:
+            with self.assertRaises(psycopg.NotSupportedError):
+                next(cursor.stream(insert + sql.SQL(" RETURNING n")))
+
+    def test_local_dumper_failure_preserves_original_error(self):
+        def fail(_):
+            raise OSError("fixture dumper")
+
+        with self.rows() as insert, self.pool.connection(self.dsn) as conn:
+            with self.assertRaisesRegex(OSError, "fixture dumper"):
+                conn.execute(insert + sql.SQL(" RETURNING %s::jsonb"), (Jsonb(1, dumps=fail),))
+            conn.execute("SELECT 1")
+
+    def test_transaction_helper_preserves_refused_and_interrupted_errors(self):
+        for active in (False, True):
+            error = cc.CommandInterrupted if active else cc.CommandNotSubmitted
+            with self.subTest(active=active), self.rows() as insert, self.assertRaises(error):
+                with cc.request_scope(.15) as req, self.pool.connection(self.dsn) as conn:
+                    with control_schema.transaction(conn):
+                        conn.execute(insert)
+                        if active:
+                            conn.execute("SET statement_timeout=0")
+                            conn.execute("SELECT pg_sleep(.5)")
+                        else:
+                            req.cancel("fixture")
+
+    def test_late_and_bound_cancel_cannot_interrupt_reused_backend(self):
+        with self.pool.connection(self.dsn) as previous:
+            pid = previous.info.backend_pid
+            cursor = previous.execute("SELECT 1")
+            callbacks = [previous.cancel, lambda: previous.cancel(), lambda: cursor.connection.cancel_safe()]
+        with self.pool.connection(self.dsn) as current, psycopg.connect(self.dsn, autocommit=True) as observer:
+            self.assertEqual(pid, current.info.backend_pid)
+            with ThreadPoolExecutor(1) as executor:
+                running = executor.submit(current.execute, "SELECT pg_sleep(.2), 1 AS n")
+                deadline = time.monotonic() + 1
+                while observer.execute("SELECT wait_event FROM pg_stat_activity WHERE pid=%s", (pid,)).fetchone() != ("PgSleep",):
+                    self.assertLess(time.monotonic(), deadline)
+                for callback in callbacks:
+                    callback()
+                self.assertEqual(1, running.result(1).fetchone()["n"])
+
+    def test_explicit_wire_abort_before_command_evicts_and_refuses_send(self):
+        with self.rows() as insert, self.pool.connection(self.dsn) as conn:
+            pid = conn.info.backend_pid
+            conn.cancel_safe()
+            with self.assertRaises(cc.CommandNotSubmitted):
+                conn.execute(insert)
+        with self.pool.connection(self.dsn) as healthy:
+            self.assertNotEqual(pid, healthy.info.backend_pid)
+            healthy.execute("SELECT 1")
+
+    def test_interruption_closes_suspended_driver_generator(self):
+        finalized = threading.Event()
+        # Instrument the driver's generator at its source, leaving the normal
+        # borrower execute and interrupt paths intact.
+        execute = psycopg.Cursor._execute_gen
+
+        def tracking(cursor, query, *args, **kwargs):
+            try:
+                return (yield from execute(cursor, query, *args, **kwargs))
+            finally:
+                if query == "SELECT pg_sleep(.5)":
+                    finalized.set()
+
+        with patch.object(psycopg.Cursor, "_execute_gen", tracking):
+            with cc.request_scope(.15), self.pool.connection(self.dsn) as conn:
+                conn.execute("SET statement_timeout=0")
+                try:
+                    conn.execute("SELECT pg_sleep(.5)")
+                except cc.CommandInterrupted as retained:
+                    self.assertIsNotNone(retained.__traceback__)
+                    self.assertTrue(finalized.is_set())
+                else:
+                    self.fail("expected an active wait to be interrupted")
+
+    def test_setup_refused_before_or_during_send(self):
+        for active in (False, True):
+            class PausedSetup(psycopg.Connection):
+                def execute(self, query, *args, **kwargs):
+                    if query == "SET SESSION search_path = pg_catalog, control":
+                        if active:
+                            return super().execute("SELECT pg_sleep(.5)")
+                        cc.current_request().cancel("setup")
+                    return super().execute(query, *args, **kwargs)
+
+            with self.subTest(active=active), cc.request_scope(.15), self.assertRaises(cc.AdmissionTimeout):
+                with self.pool.connection(self.dsn, connect=PausedSetup.connect):
+                    self.fail("borrower entered")
+        with self.pool.connection(self.dsn) as healthy:
+            self.assertEqual(1, healthy.execute("SELECT 1 AS n").fetchone()["n"])
+
+    def test_close_fault_after_setup_or_reset_failure_releases_slot(self):
+        for setup in (False, True):
+            fail_at = "SET SESSION search_path = pg_catalog, control" if setup else "DISCARD ALL"
+            closed = threading.Event()
+
+            class Broken(psycopg.Connection):
+                def execute(self, query, *args, **kwargs):
+                    if query == fail_at:
+                        raise psycopg.OperationalError("injected")
+                    return super().execute(query, *args, **kwargs)
+
+                def close(self):
+                    super().close()
+                    closed.set()
+                    raise OSError("injected after close")
+
+            with self.subTest(setup=setup), patch.object(cc, "CAPACITY", 1):
+                pool = cc.ControlConnections()
+                self.addCleanup(pool.close)
+                if setup:
+                    with self.assertRaises(cc.AcquisitionError), pool.connection(self.dsn, connect=Broken.connect):
+                        self.fail("borrower entered")
+                else:
+                    with pool.connection(self.dsn, connect=Broken.connect) as conn:
+                        conn.execute("SELECT 1")
+                self.assertTrue(closed.is_set())
+                with pool.connection(self.dsn) as healthy:
+                    self.assertEqual(1, healthy.execute("SELECT 1 AS n").fetchone()["n"])
+
+    def test_reader_setup_failure_and_close_fault_release_slot(self):
+        class Broken(psycopg.Connection):
+            def __enter__(self):
+                raise psycopg.OperationalError("reader setup failed")
+
+            def close(self):
+                super().close()
+                raise OSError("injected after close")
+
+        with patch.object(rd, "_DBS_CONNECTION_SLOTS", threading.BoundedSemaphore(1)):
+            with self.assertRaises(cc.AcquisitionError), rd.dbs_connection(Broken.connect, self.dsn):
+                self.fail("reader borrower entered")
+            with rd.dbs_connection(psycopg.connect, self.dsn) as healthy:
+                self.assertEqual((1,), healthy.execute("SELECT 1").fetchone())
 
     def test_delayed_wire_cancel_cannot_reach_next_borrower(self):
         cancel_entered, allow_cancel, executing = (threading.Event() for _ in range(3))
@@ -350,4 +605,38 @@ class LeaseDeadlineTests(unittest.TestCase):
                 stale_callback()
                 self.assertEqual(1, len(attempts))
                 self.assertNotEqual(attempts[0], healthy.info.backend_pid)
+                healthy.execute("SELECT 1")
+
+    def test_lease_joins_budget_registration_before_idle_backend_reuse(self):
+        aborting, leaving, release = (threading.Event() for _ in range(3))
+
+        def borrower():
+            with cc.request_scope(5) as req:
+                arm = req.arm
+
+                def observe(abort):
+                    def held():
+                        abort()
+                        aborting.set()
+                        self.assertTrue(release.wait(2))
+                    return arm(held)
+
+                with patch.object(req, "arm", observe), self.pool.connection(self.dsn) as conn:
+                    pid = conn.info.backend_pid
+                    req.cancel("idle")
+                    self.assertTrue(aborting.wait(1))
+                    leaving.set()
+                return pid
+
+        with patch.object(cc, "CAPACITY", 1), ThreadPoolExecutor(1) as executor:
+            owner = executor.submit(borrower)
+            try:
+                self.assertTrue(leaving.wait(1))
+                with cc.request_scope(.05), self.assertRaises(cc.AdmissionTimeout), self.pool.connection(self.dsn):
+                    self.fail("acquired while registered abort was still running")
+            finally:
+                release.set()
+            pid = owner.result(1)
+            with self.pool.connection(self.dsn) as healthy:
+                self.assertEqual(pid, healthy.info.backend_pid)
                 healthy.execute("SELECT 1")
