@@ -1,12 +1,39 @@
 # OMA-117 proposed request and mutation contract
 
-**Proposed for parent review. OMA-76 is NOT READY.** This specification concerns
+**Accepted as the implementation starting contract, subject to the decisions
+below and executable acceptance. OMA-76 is NOT READY.** This specification concerns
 implementation `f3d8a921` (original baseline `47d37377`). The independent review
 observed the OAuth token count rise from one to two after origin disconnect.
 A reload with a 400 ms budget spent its receipt before lock release and then
 published generation one. A chained SQL insert completed at 245 ms on a 180 ms
 budget. These are baseline observations. The state transitions and acceptance
 checks below are work orders.
+
+## Integration checkpoint decisions
+
+- Do not require a shared monotonic clock across services or transmit a raw
+  monotonic timestamp as a portable deadline. Preserve local monotonic bounds,
+  decreasing relative hop budgets and active sender-side cancellation. The
+  receiver must stop waiting work when cancellation or its local expiry is
+  observed. Submission racing an unobserved upstream disconnect remains
+  indeterminate; do not claim a globally simultaneous cutoff across hosts.
+  Test delayed delivery explicitly. Any stricter distributed-clock protocol
+  requires a separately reviewed deployment contract, not a silent assumption.
+- Preserve existing human approval/elicitation lifetime and polling policy.
+  OMA-80 is out of scope. Define bounded operational scopes around actual I/O
+  and the approved execution phase without introducing cumulative human-wait
+  accounting or changing approval lifetime. Ordinary hops, retries and polls
+  cannot silently replenish an already running operation's budget.
+- Evict a connection whenever wire cancellation was attempted. Prove bounded
+  connector ownership and cancellation/disarm behavior before expanding the
+  lease implementation. No cancellation callback may reach a later borrower.
+- Keep receipt movement and the mandatory effect gate atomic. Prefer existing
+  authorized recovery records; establish whether they cover the DB/file crash
+  gap before proposing any persistence/schema change. Do not introduce a
+  migration merely because the proposed correlation design is convenient.
+- The following detailed proposal is subordinate to these decisions. The first
+  implementation checkpoint must report feasibility evidence and objections;
+  acceptance of this document is not acceptance of untested runtime behavior.
 
 ## One operational budget
 
