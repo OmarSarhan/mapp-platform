@@ -118,6 +118,50 @@ class TokenClientDeadlineTests(unittest.TestCase):
         self.assertEqual((400, "invalid_grant"), (caught.exception.status, caught.exception.error))
         self.assertEqual("[redacted] [redacted] Basic [redacted]", str(caught.exception))
 
+    def test_introspection_rejects_a_parseable_truncated_active_response(self):
+        def truncated(handler):
+            body = b'{"active":true}'
+            handler.wfile.write(b'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n'
+                                b'Content-Length: 16\r\n\r\n' + body)
+
+        self.reply = truncated
+        with self.assertRaises(client.McpTokenClientError) as caught:
+            self.tokens.introspect("token")
+        self.assertFalse(caught.exception.refused)
+        self.assertEqual(1, len(self.budgets))
+
+    def test_complete_redemption_evidence_survives_expiry_after_decode(self):
+        decode = self.tokens._decode
+        for success in (True, False):
+            with self.subTest(success=success):
+                def reply(handler):
+                    body = json.dumps({"redeemed": True} if success else
+                                      {"error": "invalid_grant"}).encode()
+                    handler.send_response(200 if success else 400)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(body)))
+                    handler.end_headers()
+                    handler.wfile.write(body)
+
+                self.reply = reply
+                with request_scope(2) as budget:
+                    def expire_after_decode(*args, **kwargs):
+                        payload = decode(*args, **kwargs)
+                        budget.deadline = time.monotonic() - 1
+                        return payload
+
+                    expected = (client.RedemptionConfirmedExpired if success else
+                                client.McpTokenClientError)
+                    before = len(self.budgets)
+                    with patch.object(self.tokens, "_decode", expire_after_decode):
+                        with self.assertRaises(expected) as caught:
+                            self.redeem()
+                    if not success:
+                        self.assertTrue(caught.exception.refused)
+                        self.assertEqual(caught.exception.error, "invalid_grant")
+                        self.assertEqual(caught.exception.status, 400)
+                    self.assertEqual(before + 1, len(self.budgets))
+
     def test_resolution_time_is_deducted_at_send_across_two_calls(self):
         lookup = socket.getaddrinfo
 

@@ -68,6 +68,10 @@ class RedemptionUnconfirmed(RuntimeError):
     """The one-shot POST may have spent its token. No replay or target dispatch."""
 
 
+class RedemptionConfirmedExpired(RuntimeError):
+    """The broker confirmed the spend, but no target may now be dispatched."""
+
+
 def _resolve(host, port, remaining):
     remaining()
     future = Future()
@@ -211,9 +215,16 @@ class McpTokenClient:
                 with conn.getresponse() as response:
                     if response.status == 503 and not redeem:
                         raise AdmissionTimeout("Authorization database is busy.")
-                    payload = self._decode(response, framed=redeem)
-                    remaining()
+                    payload = self._decode(response, framed=True)
                     if 200 <= response.status < 300:
+                        try:
+                            remaining()
+                        except AdmissionTimeout:
+                            if redeem and payload.get("redeemed") is True:
+                                raise RedemptionConfirmedExpired(
+                                    "Authorization token was redeemed; request expired before target dispatch."
+                                ) from None
+                            raise
                         return payload
                     error = self._scrub(str(payload.get("error") or ""), fields["token"])
                     refused = 400 <= response.status < 500 and bool(error)
