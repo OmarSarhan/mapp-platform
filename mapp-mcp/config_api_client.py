@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from approval_diagnostics import TRACE, trace
 
+import http.client
 import json
 import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
-from request_http import urlopen
+from request_http import framed_length, urlopen
 from request_scope import RequestStopped
 from typing import Any
 
@@ -136,29 +137,31 @@ class ConfigApiClient:
         try:
             response_data = None
             proposal_create = method == "POST" and path == "/api/proposals"
+            acknowledgement = proposal_create or receipt is not None or path in {
+                "/api/approvals", "/api/approvals/confirm", "/api/approvals/claim",
+            }
             try:
                 with urlopen(request, timeout=deadline, read_error_body=True) as response:
                     if TRACE.get() is not None:
                         trace("platform.response", requestId=request_id, status=response.status)
-                    if proposal_create:
+                    if acknowledgement:
                         # The config JSON writer supplies one Content-Length.
                         # EOF caused by our own cancellation cannot prove that
                         # a close-delimited or chunked acknowledgement finished.
-                        lengths = response.headers.get_all("Content-Length", [])
-                        length = lengths[0].strip(" \t") if len(lengths) == 1 else ""
-                        if (response.headers.get_all("Transfer-Encoding", []) or len(lengths) != 1
-                                or not length.isascii() or not length.isdigit()):
-                            raise ValueError("Proposal acknowledgement requires explicit framing.")
-                        expected_length = int(length)
+                        expected_length = framed_length(response.headers)
+                        if expected_length is None:
+                            raise ValueError("Config acknowledgement requires explicit framing.")
                     response_data = response.read()
-                    if proposal_create and len(response_data) != expected_length:
-                        raise ValueError("Proposal acknowledgement is incomplete.")
+                    if acknowledgement and len(response_data) != expected_length:
+                        raise ValueError("Config acknowledgement is incomplete.")
             except RequestStopped:
                 # A complete framed reply is evidence even if local cleanup
                 # crosses the deadline. Partial reads never assign this value.
-                if response_data is None:
+                if response_data is None or not acknowledgement:
                     raise
             payload = json.loads(response_data.decode("utf-8"))
+            if acknowledgement and not isinstance(payload, dict):
+                raise ValueError("Config acknowledgement requires a JSON object.")
             if proposal_create:
                 proposal = payload.get("proposal") if isinstance(payload, dict) else None
                 proposal_id = proposal.get("id") if isinstance(proposal, dict) else None
@@ -169,8 +172,20 @@ class ConfigApiClient:
             if TRACE.get() is not None:
                 trace("platform.response", requestId=request_id, status=exc.code)
             try:
-                detail = json.loads(exc.read().decode("utf-8"))
-            except (ValueError, UnicodeDecodeError, OSError):
+                with exc:
+                    raw = exc.read()
+                    if acknowledgement and framed_length(exc.headers) != len(raw):
+                        raise ConfigApiUnavailable(
+                            "The configuration API did not return a complete acknowledgement.",
+                            reason="invalid_response", request_id=request_id, timeout=deadline,
+                        )
+                    detail = json.loads(raw.decode("utf-8"))
+            except (http.client.HTTPException, OSError):
+                raise ConfigApiUnavailable(
+                    "The configuration API response was interrupted.",
+                    reason="invalid_response", request_id=request_id, timeout=deadline,
+                ) from None
+            except ValueError:
                 detail = {}
             if not isinstance(detail, dict):
                 # A JSON array or scalar parses cleanly and then has no `.get`,
@@ -179,6 +194,16 @@ class ConfigApiClient:
                 # today looks like this; a proxy or gateway in front of it
                 # might.
                 detail = {}
+            # Apply and reload can return a 504 carrying their recorded
+            # operation. A gateway's own 504 supplies no such acknowledgement.
+            outcome_fields = ("mutation", "operation", "failurePhase", "stateUnchanged", "indeterminate")
+            if exc.code >= 500 and not any(key in detail for key in outcome_fields) and (
+                not detail.get("code") or (exc.code == 504 and receipt is not None)
+            ):
+                raise ConfigApiUnavailable(
+                    "The configuration API did not confirm an outcome.",
+                    reason="upstream_unavailable", request_id=request_id, timeout=deadline,
+                ) from None
             raise ConfigApiRefused(
                 str(detail.get("error") or f"HTTP {exc.code}"),
                 status=exc.code,
@@ -187,7 +212,7 @@ class ConfigApiClient:
                 body=detail or None,
                 request_id=request_id,
             ) from None
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as exc:
             cause = getattr(exc, "reason", exc)
             reason = (
                 "request_timeout" if isinstance(cause, TimeoutError)

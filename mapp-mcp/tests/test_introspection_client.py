@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from introspection_client import INACTIVE  # noqa: E402
 from introspection_client import IntrospectionClient  # noqa: E402
+from introspection_client import IntrospectionUnavailable  # noqa: E402
 from introspection_client import MAX_CACHE_SECONDS  # noqa: E402
 
 
@@ -44,6 +45,12 @@ class RecordingClient(IntrospectionClient):
 
 
 class NormalisationTests(unittest.TestCase):
+    def test_missing_active_is_unavailable_and_uncached(self):
+        client = RecordingClient([{"error": "server_error"}, {"active": True}])
+        with self.assertRaises(IntrospectionUnavailable):
+            client.introspect("fixture")
+        self.assertTrue(client.introspect("fixture")["active"])
+
     def test_an_inactive_answer_carries_nothing_forward(self) -> None:
         """A record that says inactive must not also hand over its claims.
 

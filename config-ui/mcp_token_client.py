@@ -301,7 +301,9 @@ class McpTokenClient:
             "/internal/oauth/introspect",
             {"token": token, "resource": self.resource},
         )
-        if payload.get("active") is not True:
+        if type(payload.get("active")) is not bool:
+            raise McpTokenClientError("Authorization component did not report credential status.")
+        if not payload["active"]:
             return {"active": False}
         return payload
 

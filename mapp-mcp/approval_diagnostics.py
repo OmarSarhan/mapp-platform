@@ -27,6 +27,8 @@ class DiagnosticToolError(ToolError):
                        'correlationId': current.get('correlationId') or secrets.token_hex(16),
                        'phase': current.get('phase', 'tool'),
                        'applyAttempted': current.get('phase') == 'apply'}
+        if current.get('approvalReference'):
+            self.detail.setdefault('approvalReference', current['approvalReference'])
         super().__init__(message)
 
 

@@ -221,17 +221,16 @@ class ExchangeClient:
         except urllib.error.HTTPError as exc:
             # A refusal carries an OAuth error code and is about the request; a
             # 401 or 403 is about *this component's* credential and is not.
+            if exc.code >= 500 or exc.code in (401, 403, 429):
+                exc.close()
+                raise ExchangeUnavailable(f"the broker is unavailable: HTTP {exc.code}") from None
             try:
                 detail = json.loads(exc.read().decode("utf-8"))
             except (ValueError, UnicodeDecodeError, OSError):
                 detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
             error = str(detail.get("error") or "")
-            if exc.code in (401, 403, 503):
-                raise ExchangeUnavailable(
-                    self._scrub(
-                        f"the broker refused this component: HTTP {exc.code} {error}"
-                    )
-                ) from None
             raise ExchangeRefused(
                 self._scrub(
                     str(detail.get("error_description") or error or "refused")

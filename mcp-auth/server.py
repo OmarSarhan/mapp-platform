@@ -35,7 +35,10 @@ from authlib.oauth2.rfc6749.errors import OAuth2Error
 
 import exchange
 import introspection
-from control_connections import AdmissionTimeout, request_scope
+from psycopg.errors import QueryCanceled
+from control_connections import (
+    AcquisitionError, AdmissionTimeout, CommandInterrupted, CommandNotSubmitted, request_scope,
+)
 import operations
 import pages
 from authlib_adapter import FormError
@@ -257,7 +260,7 @@ class AuthHandler(BaseHTTPRequestHandler):
             return
         try:
             route(self)
-        except AdmissionTimeout:
+        except (AdmissionTimeout, AcquisitionError, CommandInterrupted, CommandNotSubmitted, QueryCanceled):
             MappResponse(
                 503, json.dumps({"error": "temporarily_unavailable"}),
                 JSON_HEADERS + [("Retry-After", "1")],

@@ -72,6 +72,8 @@ class IntrospectionClient:
         if cached is not None and cached[0] > now:
             return cached[1]
         payload = self._post({"token": token, "resource": self.resource})
+        if type(payload.get("active")) is not bool:
+            raise IntrospectionUnavailable("introspection did not report credential status")
         record = payload if payload.get("active") is True else INACTIVE
         if self._cache_seconds > 0:
             # Only the answer is cached, never the credential: the key is the

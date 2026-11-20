@@ -126,6 +126,15 @@ class _HTTPRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def framed_length(headers):
+    """Only an unambiguous byte count proves completion across local abort."""
+    lengths = headers.get_all("Content-Length", [])
+    if headers.get_all("Transfer-Encoding", []) or len(lengths) != 1:
+        return None
+    length = lengths[0].strip(" \t")
+    return int(length) if length.isascii() and length.isdigit() else None
+
+
 @contextmanager
 def urlopen(req, *, timeout, read_error_body=False):
     request = CURRENT_REQUEST.get()
@@ -146,12 +155,16 @@ def urlopen(req, *, timeout, read_error_body=False):
                 # Clients decode the refusal outside this context. Drain it
                 # while cancellation still owns the wire.
                 with exc:
-                    detail = BytesIO(exc.read() if read_error_body else b"")
-                hop.remaining()
-                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.headers, detail) from None
+                    detail = exc.read() if read_error_body else b""
+                if not read_error_body or framed_length(exc.headers) != len(detail):
+                    hop.remaining()
+                raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.headers, BytesIO(detail)) from None
             with response:
                 yield response
                 hop.remaining()
+        except urllib.error.HTTPError:
+            # The authoritative response above already completed its wire check.
+            raise
         except OSError:
             hop.remaining()
             raise
