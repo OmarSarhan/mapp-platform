@@ -1154,12 +1154,11 @@ case "${1:-}" in
     # the pinned service dependencies, not whatever Python packages the host has.
     PYTHONPATH="${ROOT_DIR}/scripts/tests" \
       python3 -m unittest test_compose_isolation -v
-    run_with_buildkit_lease_retry docker build --file "${ROOT_DIR}/docker/tests/Dockerfile" \
-      --target scripts-tests --tag mapp-scripts-tests:local "${ROOT_DIR}"
-    docker run --rm --network none --read-only --tmpfs /tmp:size=256m,mode=1777 \
+    "${test_compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" --workdir /workspace \
       --env PYTHONPATH=/workspace:/workspace/scripts/tests \
-      mapp-scripts-tests:local python -c 'import pathlib, unittest; names = [p.stem for p in sorted(pathlib.Path("scripts/tests").glob("test_*.py")) if p.stem != "test_compose_isolation"]; result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names)); raise SystemExit(not result.wasSuccessful())'
+      --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
+      scripts-tests python -c 'import pathlib, unittest; names = [p.stem for p in sorted(pathlib.Path("scripts/tests").glob("test_*.py")) if p.stem != "test_compose_isolation"]; result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names)); raise SystemExit(not result.wasSuccessful() or bool(result.skipped))'
     docker run --rm \
       --volume "${ROOT_DIR}:/source:ro" \
       --workdir /tmp \

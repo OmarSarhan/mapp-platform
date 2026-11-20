@@ -1215,7 +1215,7 @@ if http_status not in {200, 504}:
 if (
     not isinstance(proposal, dict)
     or proposal.get("status") != "applied"
-    or proposal.get("candidate") != saved
+    or json.dumps(proposal.get("candidate"), sort_keys=True) != json.dumps(saved, sort_keys=True)
     or not isinstance(reload, dict)
 ):
     raise SystemExit("workspace apply response did not establish whether the saved demo committed")
@@ -1282,7 +1282,7 @@ for capture in captures:
 print("Proposal:", proposal["id"])
 print("Focused diff:")
 def changes(before, after, path=""):
-    if before == after:
+    if json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True):
         return []
     if isinstance(before, dict) and isinstance(after, dict):
         result = []
@@ -1375,7 +1375,7 @@ import sys
 
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
   ensure_saved_workspace_xyz
 }
@@ -1541,7 +1541,7 @@ import json
 import sys
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
 then
   printf '  workspace already matches the saved demo\n'
@@ -1626,7 +1626,7 @@ import json
 import sys
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
 
 printf '\nDemo rebuilt: four derived relations and the saved ten-layer workspace are ready.\n'

@@ -14,8 +14,8 @@ FUNCTIONS = SOURCE[SOURCE.index("workspace_approval_request()"):
                    SOURCE.index('\nstep "Reconciling the saved workspace\'s derived layers"')]
 PROPOSAL = {"id": "fixture-proposal", "status": "pending",
             "candidateHash": "candidate", "originalRevision": "original",
-            "original": {"title": "old", "unchanged": {"kept": True}},
-            "candidate": {"title": "new", "unchanged": {"kept": True}},
+            "original": {"title": "old", "opacitySlider": 1, "unchanged": {"kept": True}},
+            "candidate": {"title": "new", "opacitySlider": True, "unchanged": {"kept": True}},
             "diff": [{"op": "add", "path": "/locale/layers/example"}]}
 BINDING = {"proposalId": PROPOSAL["id"], "candidateHash": "candidate",
            "originalRevision": "original", "evidenceOperationId": "a" * 32,
@@ -108,6 +108,7 @@ workspace_apply_state() { if [[ "$UNRESOLVED" == 1 ]]; then return 1; fi; echo r
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("Focused diff:", result.stdout)
         self.assertIn('"path": "/title"', result.stdout)
+        self.assertIn('"path": "/opacitySlider"', result.stdout)
         self.assertNotIn('"unchanged"', result.stdout)
         self.assertEqual({"approved": True, **{key: value for key, value in BINDING.items()
                                                if key != "proposalId"}}, submitted)
