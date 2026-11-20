@@ -359,14 +359,19 @@ class LeaseDeadlineTests(unittest.TestCase):
                             client.shutdown(socket.SHUT_RDWR)
                         writer.result(2)
 
+                entries = []
+                dsn = psycopg.conninfo.make_conninfo(self.dsn, host=directory)
+
                 def borrower():
-                    dsn = psycopg.conninfo.make_conninfo(self.dsn, host=directory)
                     with self.pool.connection(dsn) as conn, control_schema.transaction(conn):
+                        entries.append(conn.info.backend_pid)
                         conn.execute(sql.SQL("INSERT INTO {} VALUES (1)").format(table))
                         commit.set()
 
                 with ThreadPoolExecutor(3) as executor:
                     proxy = executor.submit(bridge, executor)
+                    with self.pool.connection(dsn) as warm:
+                        pid = warm.info.backend_pid
                     result = executor.submit(borrower)
                     try:
                         self.assertTrue(held.wait(2))
@@ -377,6 +382,11 @@ class LeaseDeadlineTests(unittest.TestCase):
                     with self.assertRaises(cc.CommandInterrupted):
                         result.result(2)
                     proxy.result(2)
+                self.assertEqual([pid], entries)
+                self.assertEqual(1, self.pool.created)
+                with self.pool.connection(self.dsn) as fresh:
+                    self.assertNotEqual(pid, fresh.info.backend_pid)
+                    self.assertEqual(1, fresh.execute("SELECT 1 AS n").fetchone()["n"])
 
     def drop_table(self, table):
         with psycopg.connect(self.dsn, autocommit=True) as conn:
