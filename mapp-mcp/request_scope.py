@@ -88,6 +88,23 @@ class RequestScope:
         finally:
             self.deadline = min(self.caller_deadline, time.monotonic() + operation_seconds)
 
+    async def wait_for_worker(self, dispatch, *args):
+        """Keep the AnyIO permit owner alive across native task cancellation."""
+        import anyio
+
+        async def admitted():
+            with self.active():
+                return await dispatch(*args)
+
+        owner = asyncio.create_task(admitted())
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            self.close()  # withdraw a waiter, or shut down the admitted socket
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(asyncio.gather(owner, return_exceptions=True))
+            raise
+
 
 def human_wait(operation_seconds):
     # Keep origin cancellation and an explicit caller limit live through the
@@ -122,5 +139,4 @@ async def run_worker(fn, *args, **kwargs):
     request = CURRENT_REQUEST.get()
     if request is None:
         return await anyio.to_thread.run_sync(work)
-    with request.active():
-        return await anyio.to_thread.run_sync(work)
+    return await request.wait_for_worker(anyio.to_thread.run_sync, work)

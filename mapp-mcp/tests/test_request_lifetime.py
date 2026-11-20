@@ -1,10 +1,17 @@
 import asyncio
 import json
+from pathlib import Path
+import socket
+import threading
 import time
 import unittest
 from unittest.mock import patch
+import urllib.error
+import urllib.request
 
 import anyio
+import request_http
+import runtime
 
 from app import build_app
 from authentication import Authenticated, CURRENT_CALLER
@@ -15,7 +22,7 @@ from exchange_client import ExchangeClient
 from introspection_client import IntrospectionClient
 from protected_resource import ProtectedResource
 from runtime import XYZ_RELOAD, build_runtime, build_runtime_app
-from request_scope import CURRENT_REQUEST, RequestScope, run_worker
+from request_scope import CURRENT_REQUEST, RequestScope, RequestStopped, run_worker
 from test_legacy_session import MODERN_META, ORIGIN, TOKEN, Session, composed, rpc_result
 from test_legacy_session import FakeExchange
 from test_approval_gate import Answer, Capability, Confirmation, FakeConfigApi, FakeContext, RECEIPT
@@ -280,28 +287,65 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
                 request.close()
                 CURRENT_REQUEST.reset(token)
 
-    async def test_cancel_while_resolving_never_connects(self):
-        request = RequestScope()
-        token = CURRENT_REQUEST.set(request)
-        self.addCleanup(CURRENT_REQUEST.reset, token)
-        resolving = asyncio.Event()
-        release = asyncio.Event()
-        resolve = request.loop.getaddrinfo
+    async def test_resolver_admission_survives_serial_expiry_and_origin_close(self):
+        release = threading.Event()
+        entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        resolve = socket.getaddrinfo
+        requests = []
+        jobs = []
 
-        async def delayed(*args, **kwargs):
-            resolving.set()
-            await release.wait()
-            return await resolve(*args, **kwargs)
+        def delayed(*args, **kwargs):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise RuntimeError("resolver fixture timed out")
+            return resolve(*args, **kwargs)
 
-        api = ConfigApiClient(endpoint="http://127.0.0.1:1")
-        with patch.object(request.loop, "getaddrinfo", delayed), patch.object(request.loop, "sock_connect") as connect:
-            pending = asyncio.create_task(run_worker(api.get, path="/", query="", token="fixture"))
-            await asyncio.wait_for(resolving.wait(), 1)
-            request.close()
-            with self.assertRaises(ConfigApiUnavailable):
-                await asyncio.wait_for(pending, .5)
-            release.set()
-            connect.assert_not_called()
+        submit = request_http._RESOLVERS.submit
+
+        def record_submit(*args, **kwargs):
+            job = submit(*args, **kwargs)
+            jobs.append(job)
+            return job
+
+        async def handle(reader, writer):
+            requests.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+            api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+            with (patch.object(socket, "getaddrinfo", delayed),
+                  patch.object(request_http._RESOLVERS, "submit", record_submit)):
+                try:
+                    for i in range(request_http._RESOLVER_LIMIT + 4):
+                        request = RequestScope()
+                        token = CURRENT_REQUEST.set(request)
+                        try:
+                            pending = asyncio.create_task(run_worker(api.get, path="/", query="",
+                                token="fixture", timeout=1 if i == 0 else .12))
+                            if i == 0:
+                                await asyncio.wait_for(entered.wait(), 1)
+                                request.close()
+                            with self.assertRaises(ConfigApiUnavailable):
+                                await asyncio.wait_for(pending, .5)
+                            self.assertFalse(request._hops)
+                        finally:
+                            CURRENT_REQUEST.reset(token)
+                    self.assertEqual(request_http._RESOLVER_LIMIT, len(jobs))
+                    self.assertTrue(all(job.running() for job in jobs))
+                    self.assertFalse(requests)
+                finally:
+                    release.set()
+                    await asyncio.gather(*(asyncio.wrap_future(job) for job in jobs))
+                token = CURRENT_REQUEST.set(RequestScope())
+                try:
+                    await run_worker(api.get, path="/fresh", query="", token="fixture")
+                finally:
+                    CURRENT_REQUEST.reset(token)
+                self.assertEqual([b"/fresh"], [head.split()[1] for head in requests])
 
     async def test_delayed_http_delivery_still_closes_on_sender_budget(self):
         # Delay the receiver's observation of the headers. Starting its local
@@ -331,30 +375,65 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 CURRENT_REQUEST.reset(token)
 
-    async def test_submitted_write_timeout_keeps_indeterminate_diagnostics(self):
+    async def test_proposal_ack_and_missing_ack_through_modern_mcp(self):
         received = []
 
         async def handler(reader, writer):
             header = await reader.readuntil(b"\r\n\r\n")
+            length = next(int(line.split(b":")[1]) for line in header.lower().splitlines()
+                          if line.startswith(b"content-length:"))
+            await reader.readexactly(length)
             received.append(header.split()[1])
-            await reader.read()
+            if len(received) == 1:
+                body = b'{"proposal":{"id":"p-created"}}'
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode()
+                             + b"\r\n\r\n" + body)
+                await writer.drain()
+            else:
+                await reader.read()
             writer.close()
             await writer.wait_closed()
 
+        summarize = runtime._proposal_summary
+        format_expired = threading.Event()
+
+        def delayed(proposal):
+            self.assertEqual("p-created", proposal["id"])
+            time.sleep(CURRENT_REQUEST.get().remaining() + .02)
+            format_expired.set()
+            return summarize(proposal)
+
         async with await asyncio.start_server(handler, "127.0.0.1", 0) as server:
             api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
-            sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
-                                exchange=FakeExchange(), config_api=api)
-            caller = CURRENT_CALLER.set(Authenticated(active(scopes="mcp:connect inspect propose"), TOKEN))
-            request = CURRENT_REQUEST.set(RequestScope(".15"))
-            try:
-                result = await sdk.call_tool("proposals_create", {
-                    "operations": [], "revision": "fixture", "check_fingerprint": "fixture"})
-            finally:
-                CURRENT_REQUEST.reset(request)
-                CURRENT_CALLER.reset(caller)
-        self.assertEqual([b"/api/proposals"], received)
-        error = result.structured_content["error"]
+            sdk = build_runtime_app(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                                    exchange=FakeExchange(), config_api=api)
+            sdk.tool_timeouts["proposals_create"] = .3
+            app, _ = build_app(inner=sdk, introspection=StubIntrospection({
+                TOKEN: active(scopes="mcp:connect inspect propose")}))
+
+            async def with_name(scope, receive, send):
+                scope["headers"].append((b"mcp-name", b"proposals_create"))
+                await app(scope, receive, send)
+
+            async with sdk.router.lifespan_context(sdk):
+                client = Session(with_name)
+                for count in (1, 2):
+                    with patch.object(runtime, "_proposal_summary", delayed):
+                        _, _, body = await client.request({"jsonrpc": "2.0", "id": count,
+                            "method": "tools/call", "params": {"_meta": MODERN_META, "name": "proposals_create",
+                            "arguments": {"operations": [], "revision": "fixture", "check_fingerprint": "fixture"}}},
+                            version=MODERN_VERSION, method_header="tools/call")
+                    self.assertEqual([b"/api/proposals"] * count, received)
+                    result = rpc_result(body)["result"]
+                    detail = result["structuredContent"]
+                    if count == 1:
+                        self.assertTrue(format_expired.is_set())
+                        self.assertFalse(result["isError"])
+                        self.assertEqual("p-created", detail["proposalId"])
+                        self.assertTrue(detail["acknowledged"])
+                    else:
+                        self.assertTrue(result["isError"])
+        error = detail["error"]
         self.assertTrue(error["indeterminate"])
         self.assertFalse(error["retryable"])
         self.assertTrue(error["requestId"])
@@ -381,3 +460,202 @@ class RequestLifetimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(RECEIPT, receipt)
         self.assertGreater(request.remaining(), 0)
         self.assertLessEqual(request.remaining(), operation["timeout"])
+
+    async def test_claim_waiter_expires_before_worker_release(self):
+        caller = CURRENT_CALLER.set(Authenticated(active(scopes="mcp:connect inspect reload"), TOKEN))
+        self.addCleanup(CURRENT_CALLER.reset, caller)
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        self.addCleanup(setattr, limiter, "total_tokens", limiter.total_tokens)
+        limiter.total_tokens = 1
+        for path in ("standing", "form", "remembered"):
+            with self.subTest(path=path):
+                api = FakeConfigApi()
+                exchange = FakeExchange()
+                sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                                    exchange=exchange, config_api=api)
+                if path == "remembered":
+                    sdk.remembered_approvals[(CURRENT_CALLER.get().grant_id, exchange.request_digest())] = (
+                        "fixture", api.approval_url)
+                holder = object()
+                token = CURRENT_REQUEST.set(RequestScope())
+
+                async def occupy_before_claim(fn, *args, **kwargs):
+                    result = await run_worker(fn, *args, **kwargs)
+                    preceding = kwargs.get("path")
+                    if path == "standing" and preceding == "/api/approvals":
+                        result["decided"] = True
+                    if ((path == "standing" and preceding == "/api/approvals") or
+                        (path == "form" and preceding == "/api/approvals/confirm") or
+                        (path == "remembered" and fn == exchange.request_digest)):
+                        limiter.acquire_on_behalf_of_nowait(holder)
+                    return result
+
+                ctx = FakeContext(elicitation=Capability(form={}), form=Answer("accept", Confirmation(True)))
+                with patch.dict(runtime.APPROVALS_CLAIM, timeout=.12), patch.object(runtime, "io_call", occupy_before_claim):
+                    pending = asyncio.create_task(sdk.approval_gate(ctx, XYZ_RELOAD,
+                        path=XYZ_RELOAD["path_template"], tool_name="xyz_reload", packet={}))
+                    try:
+                        async with asyncio.timeout(1):
+                            while not limiter.statistics().tasks_waiting:
+                                await asyncio.sleep(.001)
+                            with self.assertRaises(RequestStopped):
+                                await asyncio.shield(pending)
+                        self.assertEqual((holder,), limiter.statistics().borrowers)
+                        self.assertEqual(0, limiter.statistics().tasks_waiting)
+                    finally:
+                        if holder in limiter.statistics().borrowers:
+                            limiter.release_on_behalf_of(holder)
+                        await asyncio.gather(pending, return_exceptions=True)
+                        CURRENT_REQUEST.reset(token)
+                self.assertEqual([], api.posted_to("/api/approvals/claim"))
+
+    async def test_guidance_worker_expires_before_file_read(self):
+        _, sdk, _, _ = composed()
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        self.addCleanup(setattr, limiter, "total_tokens", limiter.total_tokens)
+        limiter.total_tokens = 1
+        holder = object()
+
+        async def after_auth(scope, receive, send):
+            limiter.acquire_on_behalf_of_nowait(holder)
+            await sdk(scope, receive, send)
+
+        app, _ = build_app(inner=after_auth, introspection=StubIntrospection({TOKEN: active()}))
+
+        async def limited(scope, receive, send):
+            scope["headers"].extend([(b"x-mapp-timeout-seconds", b".2"),
+                                     (b"mcp-name", b"mapp://guidance/workflow")])
+            await app(scope, receive, send)
+
+        async with sdk.router.lifespan_context(sdk):
+            with patch.object(Path, "read_text", autospec=True) as read:
+                pending = asyncio.create_task(Session(limited).request({"jsonrpc": "2.0", "id": 2,
+                    "method": "resources/read", "params": {"_meta": MODERN_META, "uri": "mapp://guidance/workflow"}},
+                    version=MODERN_VERSION, method_header="resources/read"))
+                try:
+                    async with asyncio.timeout(1):
+                        while not limiter.statistics().tasks_waiting:
+                            await asyncio.sleep(.001)
+                        _, _, body = await asyncio.shield(pending)
+                    self.assertIn("error", rpc_result(body))
+                    self.assertEqual(0, limiter.statistics().tasks_waiting)
+                finally:
+                    if holder in limiter.statistics().borrowers:
+                        limiter.release_on_behalf_of(holder)
+                    await asyncio.gather(pending, return_exceptions=True)
+                read.assert_not_called()
+
+    async def test_url_completion_cannot_hand_off_receipt_after_expiry_or_close(self):
+        caller = CURRENT_CALLER.set(Authenticated(active(scopes="mcp:connect inspect reload"), TOKEN))
+        self.addCleanup(CURRENT_CALLER.reset, caller)
+        for close in (False, True):
+            with self.subTest(close=close):
+                api = FakeConfigApi()
+                sdk = build_runtime(resource=ProtectedResource(origin=ORIGIN, issuer=ORIGIN),
+                                    exchange=FakeExchange(), config_api=api)
+                request = RequestScope()
+                token = CURRENT_REQUEST.set(request)
+                entered = asyncio.Event()
+                ctx = FakeContext(elicitation=Capability(url={}), url=Answer("accept"))
+
+                async def notify(digest):
+                    entered.set()
+                    await asyncio.Future()
+
+                ctx.session.send_elicit_complete = notify
+                try:
+                    pending = asyncio.create_task(sdk.approval_gate(ctx, dict(XYZ_RELOAD, timeout=.12),
+                        path=XYZ_RELOAD["path_template"], tool_name="xyz_reload", packet={}))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    if close:
+                        request.close()
+                    with self.assertRaises(RequestStopped):
+                        await asyncio.wait_for(pending, .4)
+                    self.assertEqual(1, len(api.posted_to("/api/approvals/claim")))
+                finally:
+                    CURRENT_REQUEST.reset(token)
+
+    async def test_native_cancel_retains_worker_until_socket_and_worker_exit(self):
+        requests = []
+        received, eof = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+
+        async def handle(reader, writer):
+            requests.append((await reader.readuntil(b"\r\n\r\n")).split()[1])
+            if requests[-1] == b"/held":
+                received.set()
+                if await reader.read() == b"":
+                    eof.set()
+            else:
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+            api = ConfigApiClient(endpoint=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+
+            def held():
+                try:
+                    api.get(path="/held", query="", token="fixture")
+                    api.post(path="/late", query="", token="fixture", body={})
+                finally:
+                    if not release.wait(2):
+                        raise RuntimeError("worker fixture timed out")
+
+            request = RequestScope()
+            token = CURRENT_REQUEST.set(request)
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            self.addCleanup(setattr, limiter, "total_tokens", limiter.total_tokens)
+            limiter.total_tokens = 1
+            task = asyncio.create_task(run_worker(held))
+            try:
+                await asyncio.wait_for(received.wait(), 1)
+                task.cancel()
+                await asyncio.wait_for(eof.wait(), .5)
+                self.assertEqual(1, limiter.borrowed_tokens)
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                CURRENT_REQUEST.reset(token)
+            self.assertTrue(task.cancelled())
+            self.assertFalse(request._hops)
+            self.assertEqual(0, limiter.borrowed_tokens)
+            token = CURRENT_REQUEST.set(RequestScope())
+            try:
+                await run_worker(api.get, path="/fresh", query="", token="fixture")
+            finally:
+                CURRENT_REQUEST.reset(token)
+            self.assertEqual([b"/held", b"/fresh"], requests)
+
+    async def test_scoped_ftp_redirect_stops_before_target(self):
+        received = []
+
+        async def handle(reader, writer):
+            received.append((await reader.readuntil(b"\r\n\r\n")).split()[1])
+            writer.write(b"HTTP/1.1 302 Found\r\nLocation: ftp://127.0.0.1/fixture\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(handle, "127.0.0.1", 0) as server:
+            request = RequestScope()
+            token = CURRENT_REQUEST.set(request)
+            try:
+                def post():
+                    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/start"
+                    with request_http.urlopen(urllib.request.Request(url, data=b""), timeout=1):
+                        self.fail("unexpected redirect success")
+
+                with patch.object(urllib.request.FTPHandler, "ftp_open") as target:
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        await run_worker(post)
+                    caught.exception.close()
+                    self.assertEqual(302, caught.exception.code)
+                    target.assert_not_called()
+                self.assertEqual([b"/start"], received)
+                self.assertFalse(request._hops)
+                self.assertEqual(0, anyio.to_thread.current_default_thread_limiter().borrowed_tokens)
+            finally:
+                CURRENT_REQUEST.reset(token)

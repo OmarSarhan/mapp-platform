@@ -136,7 +136,8 @@ class ConfigApiClient:
             with urlopen(request, timeout=deadline, read_error_body=True) as response:
                 if TRACE.get() is not None:
                     trace("platform.response", requestId=request_id, status=response.status)
-                return json.loads(response.read().decode("utf-8"))
+                data = response.read()
+            return json.loads(data.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if TRACE.get() is not None:
                 trace("platform.response", requestId=request_id, status=exc.code)

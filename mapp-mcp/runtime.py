@@ -1362,8 +1362,8 @@ def _serve_guidance(server, document):
         description=document["description"],
         mime_type="text/markdown",
     )
-    def read() -> str:
-        return path.read_text(encoding="utf-8")
+    async def read() -> str:
+        return await io_call(path.read_text, encoding="utf-8")
 
     return read
 
@@ -1666,7 +1666,7 @@ def build_runtime(
             # a second prompt for a decision already made is how a two-call
             # flow turns into an endless one.
             try:
-                settled = await io_call(_settled_decision, handle)
+                settled = await _settled_decision(handle)
             except ApprovalError as exc:
                 if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
                     _forget_approval(caller, digest)
@@ -1704,7 +1704,7 @@ def build_runtime(
                 # Not remembered either, because there is nothing to come back
                 # for -- the two-call flow exists to carry a handle across a
                 # decision somebody has yet to make.
-                return await io_call(_claim, handle)
+                return await _claim(handle)
             _remember_approval(caller, digest, handle, approval_url)
 
         if TRACE.get() is not None:
@@ -1782,8 +1782,12 @@ def build_runtime(
                     _forget_approval(caller, digest)
                 raise
             _forget_approval(caller, digest)
-            with contextlib.suppress(Exception):
-                await ctx.session.send_elicit_complete(digest)
+            request = CURRENT_REQUEST.get()
+            with request.active() if request else contextlib.nullcontext():
+                with contextlib.suppress(Exception):
+                    await ctx.session.send_elicit_complete(digest)
+            if request is not None:
+                request.remaining()
             return receipt
         accepted = action == "accept" and approve is True
         await async_spend(APPROVALS_CONFIRM, path=APPROVALS_CONFIRM["path_template"],
@@ -1791,7 +1795,7 @@ def build_runtime(
         _forget_approval(caller, digest)
         if not accepted:
             raise ApprovalError("approval.declined", "The confirmation was declined by the client; nothing was applied.", action=action)
-        return await io_call(_claim, handle)
+        return await _claim(handle)
 
     #: Approvals this process has asked for and not yet spent, keyed by the
     #: grant and the exact request. Small and short-lived: an entry is dropped
@@ -1825,14 +1829,14 @@ def build_runtime(
     def _forget_approval(caller, digest):
         remembered_approvals.pop(_approval_key(caller, digest), None)
 
-    def _settled_decision(handle):
+    async def _settled_decision(handle):
         """The receipt, if somebody has now decided. None while they have not.
 
         Distinguishes "not answered yet" from every other outcome, because
         only the first should send the person back to the page. A declined or
         expired request is finished and says so.
         """
-        claimed = spend(
+        claimed = await async_spend(
             APPROVALS_CLAIM,
             path=APPROVALS_CLAIM["path_template"],
             body={"handle": handle},
@@ -1855,13 +1859,13 @@ def build_runtime(
             )
         return receipt
 
-    def _claim(handle):
+    async def _claim(handle):
         """Collect the receipt a decision produced, once.
 
         The platform mints it on the first claim and never again, so this is
         called exactly once per decision and its result is not re-fetchable.
         """
-        claimed = spend(
+        claimed = await async_spend(
             APPROVALS_CLAIM,
             path=APPROVALS_CLAIM["path_template"],
             body={"handle": handle},
@@ -2952,6 +2956,11 @@ def build_runtime(
         )
         proposal = payload.get("proposal")
         proposal = proposal if isinstance(proposal, dict) else {}
+        # Retain the acknowledgement across local formatting, worker expiry
+        # and SDK output conversion. This dict belongs to this one tool call.
+        current = TRACE.get()
+        if current is not None and isinstance(proposal.get("id"), str):
+            current["proposalId"] = proposal["id"]
         diff = proposal.get("diff")
         warnings = proposal.get("warnings")
         detail = dict(_proposal_summary(proposal))
@@ -4389,13 +4398,21 @@ def build_runtime(
                 request.tighten(tool_timeouts.get(name, 15.0))
             # The SDK queues synchronous registrations on its AnyIO limiter.
             # Cancel there while queued, then check again inside the worker.
-            with request.active() if request and name in sync_tools else contextlib.nullcontext():
+            if request and name in sync_tools:
+                result = await request.wait_for_worker(sdk_call_tool, name, arguments, context)
+            else:
                 result = await sdk_call_tool(name, arguments, context)
             trace("tool.completed")
             return result
-        except RequestStopped as exc:
-            raise ToolError(str(exc)) from None
-        except ToolError as exc:
+        except (RequestStopped, ToolError) as exc:
+            proposal_id = TRACE.get().get("proposalId")
+            if name == "proposals_create" and proposal_id:
+                detail = {"proposalId": proposal_id, "acknowledged": True,
+                          "nextStep": "Read proposals_show for the created proposal."}
+                return CallToolResult(structuredContent=detail,
+                    content=[TextContent(type="text", text=json.dumps(detail))])
+            if isinstance(exc, RequestStopped):
+                raise ToolError(str(exc)) from None
             cause = exc
             while cause is not None and not isinstance(cause, DiagnosticToolError):
                 cause = cause.__cause__
