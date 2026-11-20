@@ -11,6 +11,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import socket
@@ -46,7 +47,7 @@ def oauth(env, pipe, tokens):
     from models import Client, Grant, Token
 
     store = server.build_store()
-    scopes = ("mcp:connect", "inspect")
+    scopes = ("mcp:connect", "inspect", "reload")
     store.add_client(Client("fixture", "fixture", (), scopes))
     store.add_client(Client("runtime", "fixture", (), (), token_endpoint_auth_method="client_secret_basic",
                             client_secret=env["MAPP_MCP_CLIENT_SECRET"], capabilities=("introspect", "exchange")))
@@ -103,15 +104,30 @@ def oauth(env, pipe, tokens):
 def config(env, pipe, dispatches):
     service_env("config-ui", env)
     from http.server import ThreadingHTTPServer
-    from control_plane import ControlStore
+    from control_plane import ControlStore, now
 
     password = secrets.token_urlsafe(32)
     ControlStore(Path(env["CONTROL_DIR"])).initialize(password, "fixture")
     import app
     app.CONTROL.initialize(password, "fixture")
+    app.CONTROL.open_approval_window(client_id="fixture", instance=app.CONTROL.instance_id(),
+                                     created_by="fixture", session_created_at=now())
+    handler_ready = queue.Queue()
+    proceed = threading.Event()
+    redeem = app.MCP_TOKENS.redeem
+
+    def gated_redeem(token, operation_id, request_digest):
+        if operation_id == "xyz.reload":
+            handler_ready.put(threading.current_thread())
+            require(proceed.wait(5), "config redemption gate timed out")
+        return redeem(token, operation_id, request_digest)
+
+    app.MCP_TOKENS.redeem = gated_redeem
 
     class CountTarget(app.Handler):
         def do_GET(self):
+            if self.headers.get("X-Fixture-Drain") == "direct":
+                handler_ready.put(threading.current_thread())
             if self.path == "/api/capabilities":
                 with dispatches.get_lock():
                     dispatches.value += 1
@@ -119,7 +135,22 @@ def config(env, pipe, dispatches):
 
     with ThreadingHTTPServer(("127.0.0.1", 0), CountTarget) as httpd:
         pipe.send(httpd.server_port)
-        httpd.serve_forever()
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        require(pipe.recv() == "await reload", "expected reload")
+        handler = handler_ready.get(timeout=5)
+        pipe.send("redeem ready")
+        require(recv(pipe) == "proceed", "expected proceed")
+        proceed.set()
+        require(recv(pipe) == "join", "expected join")
+        handler.join(2)
+        require(not handler.is_alive(), "observed config handler did not exit")
+        pipe.send("config joined")
+        require(recv(pipe) == "join direct", "expected direct config request")
+        handler = handler_ready.get(timeout=2)
+        handler.join(2)
+        require(not handler.is_alive(), "direct config handler did not exit")
+        pipe.send("config joined")
+        pipe.recv()  # continue serving fresh requests until fixture shutdown
 
 
 def runtime(env, drained):
@@ -156,13 +187,13 @@ def runtime(env, drained):
     server.main()
 
 
-def call(path, token, tag=None):
+def call(path, token, tag=None, name="capabilities_list"):
     sock = socket.socket(socket.AF_UNIX)
     sock.settimeout(5)
     sock.connect(path)
     conn = http.client.HTTPConnection("mcp.localhost")
     conn.sock = sock
-    params = {"name": "capabilities_list", "arguments": {}, "_meta": {
+    params = {"name": name, "arguments": {}, "_meta": {
         "io.modelcontextprotocol/protocolVersion": VERSION,
         "io.modelcontextprotocol/clientCapabilities": {}}}
     conn.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -206,7 +237,7 @@ def exercise(directory, dsn):
     tokens = ["mapp_a_" + secrets.token_urlsafe(32) for _ in range(2)]
     dispatches = ctx.Value("i", 0)
     endpoints = ("exchange", "introspect")
-    drained = {name.encode(): ctx.Event() for name in endpoints}
+    drained = {name.encode(): ctx.Event() for name in (*endpoints, "redeem")}
 
     def start(fn, *args):
         proc = ctx.Process(target=fn, args=(env, *args))
@@ -217,13 +248,25 @@ def exercise(directory, dsn):
         with psycopg.connect(dsn) as conn:
             return conn.execute("SELECT count(*) FROM control.oauth_tokens WHERE operation_id IS NOT NULL").fetchone()[0]
 
+    def reload_state():
+        with psycopg.connect(dsn) as observer:
+            tokens = observer.execute(
+                "SELECT single_use, consumed_at IS NOT NULL FROM control.oauth_tokens"
+                " WHERE operation_id = 'xyz.reload' AND revoked_at IS NULL AND expires_at > now()").fetchall()
+            receipts = observer.execute(
+                "SELECT status, receipt_hash IS NOT NULL, consumed_at IS NOT NULL FROM control.approvals"
+                " WHERE operation_id = 'xyz.reload' AND revoked_at IS NULL").fetchall()
+        return (tokens, receipts, list(Path(env["CONTROL_DIR"], "operations").glob("*.json")),
+                list(Path(env["RELOAD_DIR"]).glob("*")), workspace.read_bytes(), count_tokens())
+
     try:
         auth, child = ctx.Pipe()
         start(oauth, child, tokens)
         env["MCP_AUTH_URL"] = f"http://127.0.0.1:{recv(auth)}"
         config_pipe, child = ctx.Pipe()
         start(config, child, dispatches)
-        env["MCP_CONFIG_API_URL"] = f"http://127.0.0.1:{recv(config_pipe)}"
+        config_port = recv(config_pipe)
+        env["MCP_CONFIG_API_URL"] = f"http://127.0.0.1:{config_port}"
         start(runtime, drained)
         until = time.monotonic() + 10
         while not Path(path).exists() and time.monotonic() < until:
@@ -251,6 +294,57 @@ def exercise(directory, dsn):
             print(f"{endpoint} waiters={waiters} elapsed={elapsed:.3f}s tokens={before[0]}->{after[0]} "
                   f"dispatches={before[1]}->{after[1]} handler=joined request=drained fresh=ok", flush=True)
             require(elapsed < 0.6 and waiters == 0 and before == after, "disconnect invariant failed")
+
+        conn = call(path, tokens[0], "redeem", "xyz_reload")
+        try:
+            config_pipe.send("await reload")
+            require(recv(config_pipe) == "redeem ready", "config did not reach reload redemption")
+            before = reload_state()
+            require(before[:4] == ([(True, False)], [("approved", True, False)], [], []),
+                    "expected one unspent token B, one claimed receipt and no target effect")
+            auth.send("hold")
+            require(recv(auth) == "held", "leases were not held")
+            config_pipe.send("proceed")
+            auth.send("observe")
+            require(recv(auth) == (1, ["/internal/oauth/redeem"]), "wrong redemption waiter")
+        finally:
+            conn.close()
+        started = time.monotonic()
+        auth.send("observe")
+        waiters, routes = recv(auth)
+        elapsed = time.monotonic() - started
+        auth.send("release")
+        require(recv(auth) == "released and joined", "redemption handler did not drain")
+        config_pipe.send("join")
+        require(recv(config_pipe) == "config joined", "config did not drain")
+        require(drained[b"redeem"].wait(2), "reload RPC did not drain")
+        after = reload_state()
+        healthy(path, tokens[0])
+        print(f"redeem waiters={waiters} elapsed={elapsed:.3f}s tokensB(single_use,spent)={after[0]} "
+              f"receipts={after[1]} operations={len(after[2])} reloadFiles={len(after[3])} "
+              f"minted={before[5]}->{after[5]} "
+              "handlers=joined request=drained fresh=ok", flush=True)
+        require(routes == ["/internal/oauth/redeem"] and elapsed < 0.6 and waiters == 0
+                and before == after, "config-to-OAuth disconnect invariant failed")
+
+        auth.send("hold")
+        require(recv(auth) == "held", "leases were not held")
+        conn = http.client.HTTPConnection("127.0.0.1", config_port, timeout=5)
+        try:
+            conn.request("GET", "/api/capabilities", headers={
+                "Authorization": "Bearer mapp_b_" + secrets.token_urlsafe(32), "X-Fixture-Drain": "direct"})
+            auth.send("observe")
+            require(recv(auth) == (1, ["/internal/oauth/introspect"]), "wrong direct config waiter")
+        finally:
+            conn.close()
+        auth.send("observe")
+        require(recv(auth) == (0, ["/internal/oauth/introspect"]), "direct peer left OAuth queued")
+        auth.send("release")
+        require(recv(auth) == "released and joined", "direct OAuth handler did not drain")
+        config_pipe.send("join direct")
+        require(recv(config_pipe) == "config joined", "direct config handler did not drain")
+        healthy(path, tokens[0])
+        print("direct config waiters=0 handlers=joined fresh=ok", flush=True)
     finally:
         for proc in reversed(processes):
             proc.terminate()
