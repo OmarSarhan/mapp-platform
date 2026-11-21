@@ -2,7 +2,7 @@
   "id": "viewport-layer-count",
   "name": "Viewport layer count",
   "version": "1.0.0",
-  "xyzVersion": ">=4.23.0 <5.0.0",
+  "xyzVersion": "=5.0.9",
   "entry": "index.mjs",
   "registrationKey": "viewport_layer_count",
   "scope": ["layer"],

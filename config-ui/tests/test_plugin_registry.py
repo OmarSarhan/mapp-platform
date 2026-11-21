@@ -12,7 +12,7 @@ def manifest(**overrides):
         "id": "sample-plugin",
         "name": "Sample plugin",
         "version": "1.0.0",
-        "xyzVersion": ">=4.23.0 <5.0.0",
+        "xyzVersion": ">=5.0.9 <6.0.0",
         "entry": "index.mjs",
         "registrationKey": "sample_plugin",
         "scope": ["layer"],
@@ -68,7 +68,7 @@ class PluginRegistryTests(unittest.TestCase):
     def test_rejects_incompatible_open_or_escaping_plugins(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            value = manifest(xyzVersion=">=5.0.0", entry="../escape.mjs")
+            value = manifest(xyzVersion=">=6.0.0", entry="../escape.mjs")
             value["configurationSchema"]["additionalProperties"] = True
             self.make_plugin(root, value)
             with patch.object(plugin_registry, "PLUGIN_ROOT", root):

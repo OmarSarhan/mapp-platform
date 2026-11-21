@@ -372,7 +372,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(pool_match, "the pinned XYZ pool size is not declared")
         self.assertIn(
-            'grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," mod/utils/dbs.js',
+            'grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," apps/xyz/mod/utils/dbs.js',
             dockerfile,
             "the image build does not verify its upstream pool-size assumption",
         )
@@ -387,7 +387,7 @@ class DatabaseAccessContractTests(unittest.TestCase):
         )
         self.assertEqual(
             1,
-            supervisor.count('spawn("node", ["express.js"]'),
+            supervisor.count('spawn("node", ["apps/xyz/server.js"]'),
             "one XYZ service can start more than one upstream pool process",
         )
 

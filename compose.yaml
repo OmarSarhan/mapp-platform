@@ -2,14 +2,14 @@ name: ${COMPOSE_PROJECT_NAME:-mapp-explore}
 
 services:
   xyz:
-    image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
+    image: mapp-xyz:${XYZ_IMAGE_TAG:-v5.0.9-209f43e}
     build: &xyz-build
       context: ./docker/xyz
       dockerfile: Dockerfile
       args:
         NODE_IMAGE: ${NODE_IMAGE:-node:22.23.1-bookworm-slim}
-        XYZ_REF: ${XYZ_REF:-v4.23.4}
-        XYZ_COMMIT: ${XYZ_COMMIT:-a6f03c07dd7aaae2e9ab04087143ee0400e15cb9}
+        XYZ_REF: ${XYZ_REF:-v5.0.9}
+        XYZ_COMMIT: ${XYZ_COMMIT:-209f43eb2e7587f6d1e7b93296bae19922c56034}
     restart: unless-stopped
     init: true
     user: "${CONFIG_UID:-1000}:${CONFIG_GID:-1000}"
@@ -38,7 +38,7 @@ services:
       - backend
 
   xyz-preview:
-    image: mapp-xyz:${XYZ_IMAGE_TAG:-v4.23.4-a6f03c0}
+    image: mapp-xyz:${XYZ_IMAGE_TAG:-v5.0.9-209f43e}
     # The same build as xyz, by anchor, so the two cannot drift. Not
     # redundant: without a build section compose resolves this image by
     # *pulling* it, and mapp-xyz is published nowhere. On a machine that had
@@ -272,8 +272,8 @@ services:
       ARTIFACT_DOWNLOAD_ORIGIN: ${ARTIFACT_DOWNLOAD_ORIGIN:-${MCP_SITE:-http://localhost:8181}}
       WORKSPACE_SCHEMA_PATH: /app/schema/workspace.schema.json
       RELOAD_DIR: /reload
-      XYZ_VERSION: ${XYZ_REF:-v4.23.4}
-      XYZ_COMMIT: ${XYZ_COMMIT:-a6f03c07dd7aaae2e9ab04087143ee0400e15cb9}
+      XYZ_VERSION: ${XYZ_REF:-v5.0.9}
+      XYZ_COMMIT: ${XYZ_COMMIT:-209f43eb2e7587f6d1e7b93296bae19922c56034}
       CONFIG_ALLOWED_HOSTS: ${CONFIG_ALLOWED_HOSTS:-localhost,127.0.0.1,config.localhost,config-ui}
       CONFIG_SECURE_COOKIES: ${CONFIG_SECURE_COOKIES:-false}
       BROWSER_RUNNER_URL: http://browser-runner:8080/run

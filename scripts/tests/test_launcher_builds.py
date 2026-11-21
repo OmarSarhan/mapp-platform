@@ -199,7 +199,7 @@ class ComposeImageOriginTests(unittest.TestCase):
     some *other* service built it. `xyz-preview` shipped that way: it reuses
     `xyz`'s image by tag, so a fresh machine running `./bin/mapp all` got
 
-        Image mapp-xyz:v4.23.4-a6f03c0 Error pull access denied for mapp-xyz
+        Image mapp-xyz:v5.0.9-209f43e Error pull access denied for mapp-xyz
 
     while the same command on a warm machine printed `Built` and passed.
 

@@ -2,8 +2,9 @@
 
 The machine-readable schema is
 [`config-ui/schema/workspace.schema.json`](../config-ui/schema/workspace.schema.json).
-It describes the workspace surface used by this project against the pinned
-GEOLYTIX XYZ v4.23.4 commit.
+It describes the conservative workspace surface originally audited against
+GEOLYTIX XYZ v4.23.4, retained for the pinned v5.0.9 runtime. See
+[the v5 compatibility and verification notes](xyz-runtime-upgrade.md).
 
 The contract is closed at workspace, locale, layer, gazetteer, and bundled
 plugin boundaries. Unadvertised properties are rejected with their JSON path
@@ -883,7 +884,8 @@ The pinned workspace/cache path keeps top-level `workspace.locale` as the
 default and composes it into named `workspace.locales` entries except a key
 literally called `locale`. This uses XYZ's merge helper, not a generic deep
 merge: nested objects merge, while arrays concatenate unless all source items
-are already present, in which case the source replaces the target.
+are already present, in which case the source replaces the target. In the
+v5.0.9 runtime, an empty source array retains the inherited target array.
 If `workspace.locale` is absent, the cache path synthesizes
 `{layers: {}}`; default selection still resolves that empty locale rather than
 auto-selecting a sole named entry.

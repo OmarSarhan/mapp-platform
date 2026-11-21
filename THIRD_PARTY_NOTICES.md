@@ -5,8 +5,8 @@ terms of the components and data sources below.
 
 ## GEOLYTIX XYZ
 
-The XYZ container builds GEOLYTIX XYZ v4.23.4 at commit
-`a6f03c07dd7aaae2e9ab04087143ee0400e15cb9` from
+The XYZ container builds GEOLYTIX XYZ v5.0.9 at commit
+`209f43eb2e7587f6d1e7b93296bae19922c56034` from
 <https://github.com/GEOLYTIX/xyz>.
 
 Copyright (c) 2024 GEOLYTIX

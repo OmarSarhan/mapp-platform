@@ -128,7 +128,7 @@ class ControlApiTests(ControlStoreTestCase):
     def test_plugin_manifest_describes_loader_dispatch_and_exact_registry(self):
         payload = plugin_manifest()
         keys = {item["key"] for item in payload["bundled"]}
-        self.assertEqual("v4.23.4", payload["xyzVersion"])
+        self.assertEqual("v5.0.9", payload["xyzVersion"])
         self.assertEqual(64, len(payload["fingerprint"]))
         external = {item["id"]: item for item in payload["external"]}
         self.assertTrue(external["viewport-layer-count"]["available"])
@@ -1211,6 +1211,9 @@ class ControlApiTests(ControlStoreTestCase):
             select_locale(workspace, "")
 
     def test_locale_merge_matches_xyz_array_rules(self):
+        self.assertEqual({"controls": ["zoom"]}, deep_merge(
+            {"controls": ["zoom"]}, {"controls": []},
+        ))
         merged = deep_merge(
             {
                 "controls": ["zoom", "scale"],

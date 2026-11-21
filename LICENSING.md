@@ -15,7 +15,7 @@ XYZ source and configured sample-data sources.
 ## Known third-party elements
 
 - The XYZ image is built from the upstream GEOLYTIX XYZ repository at the
-  pinned v4.23.4 commit. That source revision contains an MIT licence. Preserve
+  pinned v5.0.9 commit. That source revision contains an MIT licence. Preserve
   its licence text and copyright notice in image notices and distributions.
 - PostgreSQL/PostGIS, Caddy, Playwright, React, Vite, Python packages, Node
   packages, and base images carry their own terms.
@@ -48,7 +48,7 @@ XYZ source and configured sample-data sources.
 | `instance/etl/layers.json` Leeds sample sources | Leeds City Council ArcGIS services; records are fetched at runtime and are not versioned here | Publisher terms; owner-classified open test data | Preserve source URL and Leeds attribution; Smoke Control Orders additionally reports `Leeds City Council; Ordnance Survey Crown copyright (C)` | Manifest and live source metadata reviewed 2026-08-04 |
 | `instance/etl/census.json` Census 2021 statistics | Office for National Statistics through Nomis | Open Government Licence v3.0 | Source: Office for National Statistics licensed under the Open Government Licence v3.0 | Source terms reviewed 2026-07-26 |
 | `instance/etl/census.json` OA21 BGC V2 boundaries | Office for National Statistics; contains Ordnance Survey data | Product-specified OGL/third-party rights | Retain the ONS and OS attribution supplied with the product, including its authoritative copyright year | Source terms reviewed 2026-07-26; attribution year unresolved, display/redistribution blocked |
-| GEOLYTIX XYZ | Upstream repository, pinned v4.23.4 commit | MIT at the pinned commit | Preserve upstream copyright and MIT notice | Commit terms and repository notice reviewed 2026-08-04 |
+| GEOLYTIX XYZ | Upstream repository, pinned v5.0.9 commit | MIT at the pinned commit | Preserve upstream copyright and MIT notice | Upstream LICENSE checked at the pinned commit 2026-11-21 |
 | Other runtime dependencies | Dependency manifests/images | Generate notices inventory | Per dependency | Pending |
 
 Generated screenshots and ETL outputs are not relicensed by the project MIT

@@ -21,9 +21,9 @@ def _default_plugin_root() -> Path:
 
 
 PLUGIN_ROOT = Path(os.environ.get("PLUGIN_DIR", str(_default_plugin_root())))
-XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4").removeprefix("v")
+XYZ_VERSION = os.environ.get("XYZ_VERSION", "v5.0.9").removeprefix("v")
 XYZ_COMMIT = os.environ.get(
-    "XYZ_COMMIT", "a6f03c07dd7aaae2e9ab04087143ee0400e15cb9"
+    "XYZ_COMMIT", "209f43eb2e7587f6d1e7b93296bae19922c56034"
 )
 ID = re.compile(r"^[a-z][a-z0-9-]*$")
 KEY = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")

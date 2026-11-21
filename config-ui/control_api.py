@@ -50,7 +50,7 @@ RULES_VERSION = "1.6"
 FIXED_FILTER_NUMBER_RE = re.compile(
     r"^[+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?$"
 )
-XYZ_VERSION = os.environ.get("XYZ_VERSION", "v4.23.4")
+XYZ_VERSION = os.environ.get("XYZ_VERSION", "v5.0.9")
 MODULE_ROOT = Path(__file__).parent
 LOCAL_RUNTIME = Path(tempfile.gettempdir()) / "mapp-config"
 SCHEMA_PATH = Path(
@@ -104,7 +104,7 @@ DERIVED_ERROR_PRESENTATION = {
 
 RULES = [
     {"id": "workspace.structure", "category": "schema", "description": "Workspace values must satisfy the supported XYZ structure.", "remediation": "Inspect the workspace schema and correct the reported path."},
-    {"id": "workspace.mvt_srid", "category": "schema", "description": "XYZ v4.23.4 requires the exact string SRID for MVT layers and skips numeric values.", "remediation": 'Set the workspace layer property to "srid": "3857", not "srid": 3857. Database geometry metadata may still report SRIDs as numbers.'},
+    {"id": "workspace.mvt_srid", "category": "schema", "description": "XYZ v5.0.9 requires the exact string SRID for MVT layers and skips numeric values.", "remediation": 'Set the workspace layer property to "srid": "3857", not "srid": 3857. Database geometry metadata may still report SRIDs as numbers.'},
     {"id": "workspace.layer_order", "category": "schema", "description": "Layer group values create navigation drawers only; map drawing order is controlled by zIndex, where higher values render above lower values.", "remediation": "Set each layer's zIndex explicitly, or use promoteDisplay when a layer should move above currently displayed layers whenever it is shown."},
     {"id": "workspace.layer_key", "category": "schema", "description": "Layer keys are machine identifiers used in workspace paths and browser activation; display wording belongs in layer.name.", "remediation": "Prefer a stable key containing only ASCII letters, numbers, and underscores. Keep spaces, punctuation, and translated wording in layer.name."},
     {"id": "workspace.layer_group_colour", "category": "schema", "description": "XYZ styles a layer-group drawer with the first grouped layer's groupClassList. This is a deployed stylesheet class list, not a literal colour property.", "remediation": "Inspect every member of the exact group and use the same verified deployed class list on each one. Do not invent groupColor/groupColour or put a hex colour in groupClassList."},
@@ -3077,6 +3077,8 @@ def deep_merge(base: Any, override: Any) -> Any:
     for key, value in override.items():
         current = merged.get(key)
         if isinstance(current, list) and isinstance(value, list):
+            if not value:
+                continue
             if all(_xyz_array_includes(current, item) for item in value):
                 merged[key] = copy.deepcopy(value)
             else:

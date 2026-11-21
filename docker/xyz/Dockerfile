@@ -3,8 +3,8 @@
 FROM node:22.23.1-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS build
 
 ARG XYZ_REPOSITORY=https://github.com/GEOLYTIX/xyz.git
-ARG XYZ_REF=v4.23.4
-ARG XYZ_COMMIT=a6f03c07dd7aaae2e9ab04087143ee0400e15cb9
+ARG XYZ_REF=v5.0.9
+ARG XYZ_COMMIT=209f43eb2e7587f6d1e7b93296bae19922c56034
 ARG XYZ_DB_POOL_CONNECTIONS=20
 
 RUN apk add --no-cache \
@@ -20,23 +20,23 @@ RUN set -eux; \
     git clone --branch "${XYZ_REF}" --depth 1 "${XYZ_REPOSITORY}" xyz; \
     cd xyz; \
     test "$(git rev-parse HEAD)" = "${XYZ_COMMIT}"; \
-    grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," mod/utils/dbs.js
+    grep -F "max: ${XYZ_DB_POOL_CONNECTIONS}," apps/xyz/mod/utils/dbs.js
 
 WORKDIR /app/xyz
 
-# Upstream declares pnpm 10.10.0 but has no dependency lock. Express is a
-# runtime import listed under devDependencies, so the complete set is needed.
+# Use the upstream monorepo package manager and browser build. Upstream
+# does not ship a lockfile, so dependency resolution remains unfrozen.
 RUN corepack enable \
-    && corepack prepare pnpm@10.10.0 --activate \
+    && corepack prepare pnpm@11.3.0 --activate \
     && pnpm install --no-frozen-lockfile \
-    && pnpm run _build \
+    && pnpm --filter @geolytix/mapp build \
     && pnpm store prune \
     && rm -rf .git /root/.cache /root/.local/share/pnpm/store
 
 FROM node:22.23.1-alpine3.23@sha256:8516dce0483394d5708d4b2ee6cacb79fb1d617ea4e2787c2120bcca92ce372e AS runtime
 
-ARG XYZ_REF=v4.23.4
-ARG XYZ_COMMIT=a6f03c07dd7aaae2e9ab04087143ee0400e15cb9
+ARG XYZ_REF=v5.0.9
+ARG XYZ_COMMIT=209f43eb2e7587f6d1e7b93296bae19922c56034
 
 RUN apk add --no-cache ca-certificates \
     && rm -rf \

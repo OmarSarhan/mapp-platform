@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "workspace.schema.json",
-  "title": "GEOLYTIX XYZ v4.23.4 workspace",
+  "title": "GEOLYTIX XYZ v5.0.9 workspace (audited subset)",
   "description": "Closed capability contract for the audited workspace surface of the pinned GEOLYTIX XYZ framework. Unsupported properties are rejected, not silently removed.",
   "type": "object",
   "anyOf": [

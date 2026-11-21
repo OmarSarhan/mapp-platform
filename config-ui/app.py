@@ -7345,7 +7345,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "instanceId": CONTROL.instance_id(),
                 "authentication": "bearer-or-session",
                 "contractVersion": CONTRACT_VERSION,
-                "xyzVersion": os.environ.get("XYZ_VERSION", "v4.23.4"),
+                "xyzVersion": os.environ.get("XYZ_VERSION", "v5.0.9"),
             })
             return
         named_definition = explicit_derived_definition(path, urlparse(self.path).query)

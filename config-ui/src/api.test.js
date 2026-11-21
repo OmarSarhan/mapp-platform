@@ -182,6 +182,10 @@ test('activeLocale identifies the locale currently rendered by the dashboard', (
 
 test('mergeLocale matches XYZ array composition rules', () => {
   assert.deepEqual(
+    mergeLocale({controls: ['zoom']}, {controls: []}),
+    {controls: ['zoom']},
+  );
+  assert.deepEqual(
     mergeLocale(
       {controls: ['zoom', 'scale'], infoj: [{field: 'name'}]},
       {controls: ['scale'], infoj: [{field: 'name'}]},

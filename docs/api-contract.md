@@ -76,7 +76,9 @@ After bearer or dashboard-session authentication:
 - `GET /api/examples` returns server-owned examples.
 - `GET /api/layers?locale=KEY` returns the server-composed effective layer map
   and exact workspace revision. Omitting `locale` selects the top-level XYZ
-  default; the CLI does not reproduce XYZ merge rules locally. Clients must
+  default; the CLI does not reproduce XYZ merge rules locally. XYZ v5.0.9
+  preserves inherited arrays when an override supplies an empty array.
+  Clients must
   require the advertised `layers effective` capability before using this
   endpoint so they fail closed against an older independently released server.
 

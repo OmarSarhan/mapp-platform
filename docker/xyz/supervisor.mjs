@@ -93,7 +93,7 @@ async function start(generation) {
   targetGeneration = generation;
   await write("healthy", "false");
   if (stopping) return;
-  const instance = spawn("node", ["express.js"], {
+  const instance = spawn("node", ["apps/xyz/server.js"], {
     stdio: "inherit",
     env: process.env,
   });

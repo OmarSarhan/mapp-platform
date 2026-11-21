@@ -120,6 +120,7 @@ export function mergeLocale(base, override) {
   const merged = structuredClone(base);
   for (const [key, value] of Object.entries(override)) {
     if (Array.isArray(merged[key]) && Array.isArray(value)) {
+      if (!value.length) continue;
       // Match XYZ mod/utils/merge.js: a source array replaces the target when
       // all of its entries are already present, otherwise it is appended.
       merged[key] = value.every(item => merged[key].includes(item))

@@ -2,7 +2,7 @@
   "id": "tile-retry",
   "name": "Tile request retry",
   "version": "1.0.0",
-  "xyzVersion": ">=4.23.0 <5.0.0",
+  "xyzVersion": "=5.0.9",
   "entry": "index.mjs",
   "registrationKey": "tile_retry",
   "scope": ["locale"],
