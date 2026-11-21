@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Iterator, Mapping
 
@@ -15,7 +18,12 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
-from runtime_database import dbs_connection
+from control_connections import (
+    AcquisitionError, AdmissionTimeout, CommandInterrupted, CommandNotSubmitted,
+    acquisition, admission_slot, checked_io, current_request, discard_connection,
+    remaining_time,
+)
+from runtime_database import dbs_connection, DBS_ADMISSION_TIMEOUT_SECONDS
 
 
 # No default: the packaged database holds no source data, and a federated
@@ -420,8 +428,8 @@ class PostgresSemanticSources:
         cursor.execute(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
         )
-        cursor.execute("SET LOCAL statement_timeout = '5000ms'")
-        cursor.execute("SET LOCAL lock_timeout = '2000ms'")
+        cursor.execute(f"SET LOCAL statement_timeout = {math.ceil(1000 * remaining_time(5))}")
+        cursor.execute(f"SET LOCAL lock_timeout = {math.ceil(1000 * remaining_time(2))}")
 
     def _connection_url(self, alias: str) -> str:
         url = self.connections.get(alias)
@@ -954,6 +962,31 @@ def _estimated_row_count(row: Any) -> int | None:
     return None
 
 
+@contextmanager
+def _derived_generation_connection(slot, connection_url, deadline):
+    # Derived reads have their own role. Keep a late opener charged to the
+    # generation slot until it closes, without occupying a DBS_* reader slot.
+    request = current_request()
+    execution_started = time.monotonic()
+    raw = None
+    try:
+        with acquisition():
+            raw = slot.connect(
+                partial(psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row),
+                lambda: remaining_time(deadline - time.monotonic()),
+            )
+        with checked_io(raw, remaining_time, current_request()) as lease, raw:
+            remaining_time(deadline - time.monotonic())
+            yield lease
+    finally:
+        try:
+            if raw is not None and not raw.closed:
+                discard_connection(raw)
+        finally:
+            if request is not None:
+                request.database_seconds += time.monotonic() - execution_started
+
+
 def postgres_generation_context(
     connection_url: str,
     *,
@@ -994,10 +1027,20 @@ def postgres_generation_context(
     # Both configured source assets and managed derived assets use this read
     # path. Blocking here provides one process-wide admission queue for every
     # API caller, before any source connection is opened and before Gemini is
-    # invoked by the route.
-    with _GENERATION_CONTEXT_READ_SLOTS:
+    # invoked by the route. Its two-second queue wait counts toward the
+    # five-second acquisition limit for either connection path.
+    deadline = time.monotonic() + remaining_time(DBS_ADMISSION_TIMEOUT_SECONDS)
+    with admission_slot(_GENERATION_CONTEXT_READ_SLOTS, min(2.0, deadline - time.monotonic())) as slot:
+        connection_scope = (
+            _derived_generation_connection(slot, connection_url, deadline)
+            if connection_context is None
+            else connection_context(
+                psycopg.connect, connection_url, connect_timeout=5, row_factory=dict_row,
+                acquisition_deadline=deadline, generation_slot=slot,
+            )
+        )
         return _read_postgres_generation_context(
-            connection_url,
+            connection_scope,
             schema=schema,
             relation=relation,
             fields=fields,
@@ -1006,12 +1049,11 @@ def postgres_generation_context(
             sample_rows=sample_rows,
             statistics=statistics,
             sample_seed=sample_seed,
-            connection_context=connection_context,
         )
 
 
 def _read_postgres_generation_context(
-    connection_url: str,
+    connection_scope,
     *,
     schema: str,
     relation: str,
@@ -1021,25 +1063,10 @@ def _read_postgres_generation_context(
     sample_rows: bool,
     statistics: bool,
     sample_seed: float,
-    connection_context,
 ) -> dict[str, Any]:
     relation_identifier = sql.Identifier(schema, relation)
     context: dict[str, Any] = {}
     try:
-        connection_scope = (
-            connection_context(
-                psycopg.connect,
-                connection_url,
-                connect_timeout=5,
-                row_factory=dict_row,
-            )
-            if connection_context is not None
-            else psycopg.connect(
-                connection_url,
-                connect_timeout=5,
-                row_factory=dict_row,
-            )
-        )
         with connection_scope as connection:
             with connection.cursor() as cursor:
                 PostgresSemanticSources._begin_read_only(cursor)
@@ -1209,12 +1236,19 @@ def _read_postgres_generation_context(
                             else None
                         )
                         context["statistics"] = values
-    except SemanticSourceError:
+    except (AcquisitionError, CommandInterrupted, CommandNotSubmitted):
         raise
     except psycopg.Error as exc:
+        if isinstance(exc, (psycopg.errors.LockNotAvailable, psycopg.errors.QueryCanceled)):
+            # The transaction's capped server timeout can beat the lease poll.
+            try:
+                remaining_time()
+            except AdmissionTimeout:
+                raise CommandInterrupted("Generation read interrupted.") from exc
         raise SemanticSourceError(
             "Optional generation context could not be read.",
             status=HTTPStatus.UNPROCESSABLE_ENTITY,
             code="semantic.generation_context_unavailable",
         ) from exc
+    remaining_time()
     return context

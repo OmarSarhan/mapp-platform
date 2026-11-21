@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from request_http import urlopen
 from typing import Any
 
 import canonical
@@ -96,11 +97,11 @@ class ExchangeClient:
             return cached[1]
         request = urllib.request.Request(
             self.config_api_endpoint + "/api/public/identity",
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "X-Mapp-Timeout-Seconds": str(self.timeout)},
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise ExchangeUnavailable(
@@ -210,26 +211,26 @@ class ExchangeClient:
                 "Authorization": self._authorization,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(body)),
+                "X-Mapp-Timeout-Seconds": str(self.timeout),
             },
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout, read_error_body=True) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             # A refusal carries an OAuth error code and is about the request; a
             # 401 or 403 is about *this component's* credential and is not.
+            if exc.code >= 500 or exc.code in (401, 403, 429):
+                exc.close()
+                raise ExchangeUnavailable(f"the broker is unavailable: HTTP {exc.code}") from None
             try:
                 detail = json.loads(exc.read().decode("utf-8"))
             except (ValueError, UnicodeDecodeError, OSError):
                 detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
             error = str(detail.get("error") or "")
-            if exc.code in (401, 403):
-                raise ExchangeUnavailable(
-                    self._scrub(
-                        f"the broker refused this component: HTTP {exc.code} {error}"
-                    )
-                ) from None
             raise ExchangeRefused(
                 self._scrub(
                     str(detail.get("error_description") or error or "refused")

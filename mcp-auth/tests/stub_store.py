@@ -51,6 +51,12 @@ def _equal(expected: str, supplied: str) -> bool:
 
 
 class StubStore:
+    def introspection_state(self, raw_token):
+        record = self.query_token(raw_token)
+        grant = self.query_grant(record.subject if record is not None else "")
+        client = self.query_client(grant.client_id if grant is not None else "")
+        return record, grant, client is not None
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._clients: dict[str, Client] = {}

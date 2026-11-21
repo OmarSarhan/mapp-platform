@@ -12,6 +12,31 @@ the separately released `mapp-config-cli`. The platform is authoritative for
 workspace structure, rules, validation, revision handling, proposals, reloads,
 and visual evidence.
 
+## Database admission
+
+Config GET and POST return JSON HTTP 503 with `code: database.busy` for
+interrupted admission. A proven pre-effect refusal with surviving authority
+includes `retryable: true`, `indeterminate: false` and `Retry-After: 1`.
+Retry requires a fresh exact request and, when applicable, a fresh token B.
+An acknowledged receipt spend followed by refusal before target submission
+returns both flags false. A possibly committed target returns
+`retryable: false` and `indeterminate: true`. Inspect the public references
+and observed publication in `mutation` before deciding what to do.
+`X-Request-ID` matches `meta.requestId`. OAuth overload uses
+`error: temporarily_unavailable`. The optional internal
+`X-Mapp-Timeout-Seconds` header shortens the server's request budget (maximum
+120 seconds). Admission waits consume that budget. JSON response metadata
+includes `databaseTiming.queueSeconds` and `databaseTiming.databaseSeconds`
+for local control database leases; remote service time remains part of total
+request latency. This does not change durable background-job deadlines.
+
+For approved mutations the API distinguishes token redemption, receipt
+consumption and target publication. An interrupted request with a consumed
+receipt can have an unstarted target. That outcome requires inspection and
+fresh explicit approval. The public approval reference identifies the durable
+spend and, for direct reload and apply, the operation to inspect after a
+lost reply. [Mutation admission and recovery](approved-mutation-admission.md)
+
 ## MCP client standing approvals
 
 These dashboard-only routes require an administrator session; POST requests

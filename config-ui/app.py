@@ -73,7 +73,10 @@ from svg_icons import safe_svg
 from semantic_client import SemanticClient, SemanticClientError
 import canonical
 import execution_envelope
-from mcp_token_client import McpTokenClient, McpTokenClientError
+from mcp_token_client import (
+    McpTokenClient, McpTokenClientError, RedemptionConfirmedExpired, RedemptionUnconfirmed,
+)
+from mutation_admission import ReceiptRefused, mutation_state, request_lock
 from semantic_sources import (
     DEFAULT_ALLOWLIST as DEFAULT_SEMANTIC_SOURCE_ALLOWLIST,
     GENERATION_SAMPLE_MAX_BYTES,
@@ -99,6 +102,10 @@ from gemini_client import (
 from workspace_schema import expression_function_names, validate_workspace
 from relation_identity import parse_relation
 from runtime_database import dbs_connection
+from control_connections import (
+    AcquisitionError, AdmissionTimeout, CommandInterrupted, CommandNotSubmitted,
+    request_scope, request_metrics, remaining_time,
+)
 from plugin_registry import catalogue as plugin_catalogue, plugin_usage, validate_workspace_plugins
 from control_plane import ControlStore, iso, parse_time
 from control_api import (
@@ -223,11 +230,14 @@ if not 30 <= VISUAL_BACKGROUND_TIMEOUT_SECONDS <= 600:
     raise RuntimeError(
         "VISUAL_BACKGROUND_TIMEOUT_SECONDS must be between 30 and 600."
     )
+MUTATION_ADMISSION_ERRORS = (
+    ReceiptRefused, AdmissionTimeout, AcquisitionError, CommandNotSubmitted, CommandInterrupted,
+)
 SAVE_LOCK = threading.Lock()
 DRAFT_CLEANUP_WAKE = threading.Event()
 DRAFT_CLEANUP_STATUS_LOCK = threading.Lock()
 DRAFT_CLEANUP_STATUS = {"lastCompletedAt": None, "lastError": None, "outcomes": {}}
-SAVE_RELOAD_LOCK = threading.Lock()
+SAVE_RELOAD_LOCK = threading.RLock()
 PREVIEW_LOCK = threading.RLock()
 DERIVED_BACKGROUND_JOB_LOCK = threading.Lock()
 DERIVED_BACKGROUND_JOB_CONDITION = threading.Condition(
@@ -2731,7 +2741,7 @@ def derived_background_capacity() -> dict:
 
 def reserve_derived_background_job() -> None:
     global DERIVED_BACKGROUND_ACTIVE_JOBS
-    with DERIVED_BACKGROUND_JOB_LOCK:
+    with request_lock(DERIVED_BACKGROUND_JOB_LOCK):
         if DERIVED_BACKGROUND_ACTIVE_JOBS >= DERIVED_MAX_BACKGROUND_JOBS:
             raise DerivedLayerBackgroundCapacityError(
                 DERIVED_BACKGROUND_ACTIVE_JOBS,
@@ -4004,6 +4014,7 @@ def archive_excluded_semantic_sources(actor: str) -> list[dict]:
             "actor": actor,
         }
         event["payloadHash"] = semantic_event_payload_hash(event)
+        mutation_state().begin()
         response = SEMANTIC.request(
             "/v1/events",
             method="POST",
@@ -4066,6 +4077,7 @@ def start_derived_background(
             )
             if isinstance(updated_operation, dict):
                 operation = updated_operation
+        remaining_time()
         threading.Thread(
             target=run_reserved_derived_background,
             args=(
@@ -4164,12 +4176,14 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
             allow_nan=False,
         ) + "\n"
     ).encode()
-    with SAVE_LOCK:
+    with request_lock(SAVE_LOCK):
         _, _, current_revision = read_workspace()
         if not isinstance(expected, str) or expected != current_revision:
             raise FileExistsError("Workspace changed on disk. Reload before saving.")
+        state = mutation_state()
         publication_intent = draft_lifecycle().prepare_publication(candidate) if DERIVED is not None else None
         backup = WORKSPACE.with_suffix(WORKSPACE.suffix + ".bak")
+        state.begin()
         shutil.copyfile(WORKSPACE, backup)
         fd, temporary = tempfile.mkstemp(prefix=".workspace-", suffix=".json", dir=WORKSPACE.parent)
         try:
@@ -4182,7 +4196,9 @@ def save_workspace(candidate: dict, expected: str) -> tuple[bytes, str]:
                     encoded,
                     os.fstat(stream.fileno()).st_mtime_ns,
                 )
+            remaining_time()
             os.replace(temporary, WORKSPACE)
+            state.published["workspaceRevision"] = next_revision
             directory = os.open(
                 WORKSPACE.parent,
                 os.O_RDONLY | os.O_DIRECTORY,
@@ -4211,7 +4227,7 @@ def save_and_reload(
     # Keep a saved generation paired with its reload request and completion
     # check. Otherwise a concurrent save could replace the workspace between
     # the write and the supervisor fingerprinting it.
-    with SAVE_RELOAD_LOCK:
+    with request_lock(SAVE_RELOAD_LOCK):
         encoded, next_revision = save_workspace(candidate, expected)
         sync_layer_dependency_guard(candidate)
         fingerprint = workspace_fingerprint(encoded)
@@ -4379,7 +4395,7 @@ def schedule_live_preview_sync(encoded: bytes | None = None) -> None:
     """Coalesce preview refreshes so the newest committed workspace wins."""
     if encoded is None:
         encoded, _, _ = read_workspace()
-    with PREVIEW_SYNC_LOCK:
+    with request_lock(PREVIEW_SYNC_LOCK):
         PREVIEW_SYNC_STATE["pending"] = bytes(encoded)
         if PREVIEW_SYNC_STATE["running"]:
             return
@@ -4989,6 +5005,7 @@ def apply_proposal_and_reload(
     *,
     actor: str,
     timeout: float = 30,
+    before_apply=None,
 ) -> tuple[dict, dict]:
     """Apply a revision-bound proposal with recoverable on-disk transitions.
 
@@ -4997,7 +5014,7 @@ def apply_proposal_and_reload(
     applied, a repeated approved apply request can recognize the exact
     candidate hash, finish the proposal record, and request XYZ reload again.
     """
-    with SAVE_RELOAD_LOCK:
+    with request_lock(SAVE_RELOAD_LOCK):
         raw, current_workspace, current_revision = read_workspace()
         candidate = proposal["candidate"]
         candidate_hash = proposal["candidateHash"]
@@ -5010,6 +5027,8 @@ def apply_proposal_and_reload(
                 )
             if proposal.get("draftRelations"):
                 draft_lifecycle().validate_publication(proposal)
+            if before_apply is not None:
+                before_apply()
             proposal["status"] = "applying"
             proposal["applyingStarted"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
@@ -5018,11 +5037,15 @@ def apply_proposal_and_reload(
             proposal["applyingActor"] = actor
             proposal_write(store, proposal)
         elif proposal["status"] == "applying":
+            if before_apply is not None:
+                before_apply()
+            mutation_state().admit()
             if workspace_hash(current_workspace) == candidate_hash:
                 # The prior process committed the candidate but did not finish
                 # recording the proposal transition.
                 encoded = raw
                 next_revision = current_revision
+                mutation_state().published["workspaceRevision"] = current_revision
                 recovered = True
             elif current_revision != proposal["originalRevision"]:
                 proposal["status"] = "conflicted"
@@ -5098,7 +5121,8 @@ def apply_proposal_and_reload(
             proposal["requestedGeneration"] = reload_result[
                 "requestedGeneration"
             ]
-        proposal_write(store, proposal)
+        proposal_write(store, proposal, settle_publication=True)
+        remaining_time()
         schedule_live_preview_sync(encoded)
 
         generation = reload_result.get("requestedGeneration")
@@ -5118,7 +5142,8 @@ def apply_proposal_and_reload(
 
 
 def discover_icons() -> list[dict[str, str]]:
-    SVG_DIR.mkdir(parents=True, exist_ok=True)
+    if not SVG_DIR.exists():
+        return []
     return [
         {
             "name": path.stem.replace("_", " ").replace("-", " ").title(),
@@ -6526,12 +6551,44 @@ class Handler(SimpleHTTPRequestHandler):
         self._raw_body = None
         self._exchanged_token = None
         self._exchanged_token_redeemed = False
+        self._effects = None
         return super().handle_one_request()
 
+    def _admission_error(self):
+        state = self._effects
+        if state.admission_record_id is not None:
+            # Settle only this acknowledged bookkeeping write. No target
+            # callback or application work can run on the cleanup allowance.
+            try:
+                with request_scope(.025):
+                    operation = CONTROL.finish_operation(
+                        state.admission_record_id,
+                        status="indeterminate" if state.target_started or state.published else "failed",
+                        error={"code": "operation.interrupted", "mutation": state.facts()},
+                    )
+            except OSError:
+                LOGGER.warning("Interrupted operation requires inspection: %s", state.admission_record_id)
+            else:
+                # A later audit wait can expire after the terminal operation
+                # was acknowledged. finish_operation preserves that record.
+                if operation["status"] == "succeeded":
+                    LOGGER.warning("Request interrupted after terminal success: %s", operation["id"])
+                    self._json(HTTPStatus.OK, {
+                        **(operation["result"] or {}), "operation": operation, "mutation": state.facts(),
+                    })
+                    return
+        self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
+            "code": "database.busy", "error": "Request admission interrupted.",
+            "retryable": state.retryable, "indeterminate": state.target_started,
+            "mutation": state.facts(),
+        }, headers={"Retry-After": "1"} if state.retryable else {})
+
     def _json(self, status, payload, *, headers=None):
+        effects = getattr(self, "_effects", None)
+        receipt_pending = effects is not None and effects.receipt not in {"not_required", "consumed"}
         if (
             self._exchanged_token is not None
-            and not self._exchanged_token_redeemed
+            and (not self._exchanged_token_redeemed or effects is None or receipt_pending)
             and 200 <= int(status) < 300
         ):
             # Fail closed. _json answers 239 of this service's call sites,
@@ -6546,12 +6603,9 @@ class Handler(SimpleHTTPRequestHandler):
             # paths, so _resolve_operation refuses them before dispatch. That
             # is what test_raw_response_paths_are_unreachable pins.
             #
-            # It is a backstop, not the gate: redemption happens in
-            # _authorized before any handler dispatches, because by the time a
-            # response is being written a mutation has already been applied.
-            # If this ever fires, the binding check was skipped somewhere and
-            # the right response is a refusal -- but the effect is already
-            # done, which is why the real gate is upstream.
+            # The effect paths enforce admission before writing. This also
+            # prevents a future early-success branch from returning protected
+            # results while an approval is still pending.
             LOGGER.error(
                 "exchanged token reached a success response without redemption:"
                 " %s %s",
@@ -6571,10 +6625,18 @@ class Handler(SimpleHTTPRequestHandler):
             # set of responses rather than arbitrary workspace content.
             payload = redact_actor_credentials(payload)
         payload = dict(payload)
+        if effects and effects.receipt == "pending" and int(status) >= 400 and payload.get("code") != "database.busy":
+            # A private preflight may have read workspace or database data.
+            # Only the refusal can leave the service before the winning UPDATE.
+            payload = {key: payload[key] for key in ("code", "ruleId") if key in payload}
+            payload["error"] = "Approved request failed preflight."
+        if effects and effects.receipt in {"unconfirmed", "consumed"} and int(status) >= 400:
+            payload.update(retryable=False, mutation=effects.facts())
         meta = payload.get("meta")
         if not isinstance(meta, dict):
             meta = {}
         meta["requestId"] = getattr(self, "_request_id", secrets.token_hex(16))
+        meta["databaseTiming"] = request_metrics()
         operation = payload.get("operation")
         if isinstance(operation, dict) and isinstance(operation.get("id"), str):
             meta["operationId"] = operation["id"]
@@ -6686,6 +6748,7 @@ class Handler(SimpleHTTPRequestHandler):
             # only caller of _actor and the only gate both routers use, which
             # is what makes this one line cover every authenticated path.
             return None
+        remaining_time()
         return actor
 
     def _actor_from_exchanged_token(self, presented: str):
@@ -6707,10 +6770,10 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             record = MCP_TOKENS.introspect(presented)
         except McpTokenClientError as exc:
-            # Unreachable or refusing, it is the same answer. Never log the
-            # token; the exception text is already scrubbed of the secret.
+            # Inactive tokens have a successful introspection reply. A failed
+            # control call says nothing about the presented credential.
             LOGGER.warning("exchanged token introspection failed: %s", exc)
-            return None
+            raise AdmissionTimeout("Token introspection unavailable.") from exc
         if record.get("active") is not True:
             return None
         # Audience, checked here as well as by the component. A token A carries
@@ -6853,8 +6916,22 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return False
         try:
-            MCP_TOKENS.redeem(self._exchanged_token, operation_id, request_digest)
+            self._effects = state = mutation_state()
+            if needs_approval:
+                state.receipt = "unchecked"
+            redemption = MCP_TOKENS.redeem(self._exchanged_token, operation_id, request_digest)
+            state.token_b = "redeemed" if redemption.get("single_use") is False else "spent"
+        except RedemptionConfirmedExpired as exc:
+            state.token_b = "spent" if exc.single_use else "redeemed"
+            raise AdmissionTimeout("Request expired after token redemption.") from exc
+        except RedemptionUnconfirmed as exc:
+            state.token_b = "unconfirmed"
+            raise AdmissionTimeout("Token redemption was not acknowledged.") from exc
         except McpTokenClientError as exc:
+            if exc.refused:
+                state.token_b = "refused"
+            if not (exc.refused and exc.status == 400 and exc.error == "invalid_grant"):
+                raise AdmissionTimeout("Token redemption unavailable.") from exc
             LOGGER.warning(
                 "exchanged token redemption refused for %s: %s", operation_id, exc
             )
@@ -6864,14 +6941,11 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return False
         if needs_approval:
-            # Against the same digest, computed once above. The receipt is
-            # bound to the request a person saw described, so a receipt minted
-            # for one apply cannot be spent on another -- and the binding is
-            # in the UPDATE's predicate, so the read and the spend cannot
-            # disagree under concurrency.
-            if CONTROL.redeem_receipt(
-                receipt, request_digest=request_digest
-            ) is None:
+            # Eligibility permits private preflight only. A later revocation
+            # or competing spend still wins at the conditional UPDATE.
+            reference = CONTROL.eligible_receipt(receipt, request_digest=request_digest)
+            if reference is None:
+                state.receipt = "refused"
                 CONTROL.audit(
                     "approval.receipt_refused",
                     actor=str(self._authentication.get("sub") or "unknown")
@@ -6884,6 +6958,25 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "approval.receipt_invalid",
                 })
                 return False
+
+            def spend(connection):
+                if CONTROL.redeem_receipt(
+                    receipt, request_digest=request_digest, state=state, connection=connection,
+                ) is None:
+                    raise ReceiptRefused()
+
+            state.require_receipt(reference, spend)
+            if operation_id in {"xyz.reload", "proposals.apply"}:
+                state.recovery["operationId"] = reference[:32]
+            if getattr(self, "_request_id", None):
+                state.recovery["requestId"] = self._request_id
+            # Delay only paths whose actual effect sites enforce the pending gate.
+            if operation_id not in {
+                "xyz.reload", "proposals.apply", "derived-layers.create", "derived-layers.refresh",
+                "derived-layers.replace", "derived-layers.drop", "federation.aliases.observe",
+                "semantic.proposals.apply",
+            }:
+                state.admit()
         self._exchanged_token_redeemed = True
         return True
 
@@ -7213,6 +7306,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        return self._dispatch_request(self._do_GET)
+
+    def _do_GET(self):
         supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
         self._request_id = (
             supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
@@ -7419,6 +7515,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticClientError as exc:
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 timed_out = getattr(exc, "sqlstate", None) in {"57014", "55P03"}
                 self._json(
@@ -7513,6 +7611,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticSourceError as exc:
                 self._semantic_source_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7557,6 +7657,8 @@ class Handler(SimpleHTTPRequestHandler):
                     raise RuntimeError("No DBS_* database connections are configured.")
                 read_workspace()
                 self._json(HTTPStatus.OK, {"status": "ok"})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
         elif path == "/api/workspace":
@@ -7574,6 +7676,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "semanticWarnings": annotated(semantic_warnings),
                     },
                 )
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif layer_statistics_path := re.fullmatch(
@@ -7658,6 +7762,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "layer.statistics_invalid",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
                     "error": "Layer statistics are unavailable.",
@@ -7717,6 +7823,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "layer.values_invalid",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 self._json(HTTPStatus.BAD_GATEWAY, {
                     "error": "Layer value aggregation is unavailable.",
@@ -7743,6 +7851,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "locale.not_found",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
         elif path == "/api/catalog":
@@ -7753,6 +7863,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "tables": discover_catalog(profiles),
                     "derivedProfiles": profiles,
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception as exc:
                 self._json(HTTPStatus.BAD_GATEWAY, {"error": f"Database discovery failed: {exc}"})
         elif path == "/api/derived-layers/background-jobs":
@@ -7768,6 +7880,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "cleanupIntervalSeconds": CLEANUP_INTERVAL_SECONDS,
                     "cleanup": draft_cleanup_status(),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {
                     "error": "Draft lifecycle records are unavailable.",
@@ -7818,6 +7932,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 result["backgroundJobs"] = derived_background_capacity()
                 self._json(HTTPStatus.OK, result)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7856,6 +7972,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "derived_layer.map_extent_unavailable",
                     **getattr(exc, "details", {}),
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except Exception:
                 self._json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -7877,6 +7995,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "Derived-layer database management is not configured."
                     )
                 self._json(HTTPStatus.OK, {"derivedLayers": DERIVED.list()})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7913,6 +8033,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "code": "derived_layer.not_found",
                     "name": name,
                 })
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except (DerivedLayerError, psycopg.Error) as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -7967,6 +8089,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # make a contract-driven client retry a mode that will
                 # never become available and lose the actionable code.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 unavailable = {
                     "error": "The federation alias registry is unavailable.",
@@ -7978,6 +8102,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # bare refusal above is the whole story anyway.
                 try:
                     unavailable["host"] = FEDERATION.host_capability()
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error:
                     pass
                 self._json(HTTPStatus.BAD_GATEWAY, unavailable)
@@ -8003,6 +8129,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # ValueError, and a deployment with no federation credential
                 # is a permanent fact rather than a transient outage.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8055,6 +8183,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # own status/code rather than being folded into a generic
                 # 502 registry_unavailable.
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -8480,6 +8610,25 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self):
+        return self._dispatch_request(self._do_POST)
+
+    def _dispatch_request(self, route):
+        with request_scope(getattr(self, "headers", {}).get("X-Mapp-Timeout-Seconds", "120"), getattr(self, "connection", None)):
+            self._effects = mutation_state()
+            try:
+                return route()
+            except ReceiptRefused:
+                self._json(HTTPStatus.FORBIDDEN, {
+                    "error": "No approval covers this request.", "code": "approval.receipt_invalid",
+                })
+            except psycopg.errors.QueryCanceled:
+                # Control SQL has a server-side statement budget as well as
+                # the local lease timer. Either can win on identity or auth.
+                self._admission_error()
+            except MUTATION_ADMISSION_ERRORS:
+                self._admission_error()
+
+    def _do_POST(self):
         supplied_id = getattr(self, "headers", {}).get("X-Request-ID", "")
         self._request_id = (
             supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id)
@@ -8554,7 +8703,7 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/workspace", "/api/mutate", "/api/proposals", "/api/proposals/check",
             "/api/visual-plan", "/api/visual-test",
         } or request_path.startswith("/api/proposals/")
-        if guarded and DERIVED is not None:
+        if guarded and (DERIVED is not None or request_path.endswith("/apply")):
             with lifecycle_lock(CONTROL.root):
                 return self._post_authorized(actor, request_path)
         return self._post_authorized(actor, request_path)
@@ -8591,6 +8740,7 @@ class Handler(SimpleHTTPRequestHandler):
                 }:
                     self._json(HTTPStatus.OK, {"operation": operation})
                     return
+                mutation_state().begin()
                 if not request_derived_background_cancellation(operation_id):
                     operation = CONTROL.read_operation(operation_id)
                     if operation.get("status") in {
@@ -8726,6 +8876,7 @@ class Handler(SimpleHTTPRequestHandler):
                             else {}
                         ),
                     }
+                remaining_time()
                 profile = GEMINI.generate(
                     context,
                     target_kind=target["kind"],
@@ -8866,6 +9017,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "actor": actor,
                 }
                 event["payloadHash"] = semantic_event_payload_hash(event)
+                mutation_state().begin()
                 archived = SEMANTIC.request(
                     "/v1/events", method="POST", payload=event,
                     actor=actor, scopes=["semantic:admin"],
@@ -8975,6 +9127,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "actor": actor,
                         }
                         event["payloadHash"] = semantic_event_payload_hash(event)
+                        mutation_state().begin()
                         response = SEMANTIC.request(
                             "/v1/events",
                             method="POST",
@@ -9057,6 +9210,8 @@ class Handler(SimpleHTTPRequestHandler):
                         details=details,
                     )
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error:
                 if audit_details is not None:
                     CONTROL.audit(
@@ -9108,6 +9263,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "Derived-layer database management is not configured."
                     )
                 catalog_revision = current_semantic_revision(actor)
+                mutation_state().begin()
                 profile = DERIVED.repair_semantic_profile(
                     semantic_repair_path.group(1)
                 )
@@ -9142,6 +9298,8 @@ class Handler(SimpleHTTPRequestHandler):
                 )
             except SemanticClientError as exc:
                 self._semantic_error(exc)
+            except MUTATION_ADMISSION_ERRORS:
+                raise
             except psycopg.Error as exc:
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
@@ -9172,6 +9330,8 @@ class Handler(SimpleHTTPRequestHandler):
                         })
                         return
                     payload.pop("confirmed", None)
+                if request_path == "/api/semantic/proposals" or internal.endswith(("/apply", "/decline")):
+                    mutation_state().begin()
                 result = self._semantic_request(
                     actor,
                     internal,
@@ -9731,7 +9891,10 @@ class Handler(SimpleHTTPRequestHandler):
                 # of falling through to the generic 422 psycopg.Error
                 # handler with no federation-specific code at all.
                 try:
+                    mutation_state().begin()
                     result = FEDERATION.register(payload, actor)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9764,7 +9927,10 @@ class Handler(SimpleHTTPRequestHandler):
                 # the outer chain routes correctly, and only a raw local
                 # database failure needs a federation-specific translation.
                 try:
+                    mutation_state().begin()
                     group = FEDERATION.define_group(payload, actor)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9796,9 +9962,12 @@ class Handler(SimpleHTTPRequestHandler):
                         code="federation.invalid_request",
                     )
                 try:
+                    mutation_state().begin()
                     group = FEDERATION.delete_group(
                         federation_group_delete_path.group(1)
                     )
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9832,7 +10001,10 @@ class Handler(SimpleHTTPRequestHandler):
                 alias_name = federation_alias_groups_path.group(1)
                 groups = validate_group_membership(payload)
                 try:
+                    mutation_state().begin()
                     record = FEDERATION.set_alias_groups(alias_name, groups)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -9966,6 +10138,7 @@ class Handler(SimpleHTTPRequestHandler):
                                     FEDERATION.alias_reconciliation(alias_name)
                                 )
                                 with reconciliation:
+                                    mutation_state().begin()
                                     mirrored = (
                                         reconcile_semantic_source_state(
                                             alias_name, available=False
@@ -10121,6 +10294,7 @@ class Handler(SimpleHTTPRequestHandler):
                                     code="federation.invalid_request",
                                 )
                             provision_flags[parameter] = value is True
+                        mutation_state().begin()
                         result = FEDERATION.provision(
                             alias_name,
                             connection_url,
@@ -10171,6 +10345,8 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     return
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except psycopg.Error as exc:
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -10210,6 +10386,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "Token scopes must be a non-empty array."
                     )
                 expires = requested_token_expiry(payload)
+                mutation_state().begin()
                 raw, token = CONTROL.create_token(
                     payload.get("name", "CLI token"),
                     expires,
@@ -10221,6 +10398,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if actor != "admin":
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
                     return
+                mutation_state().begin()
                 approved = CONTROL.approve_device_authorization(payload.get("userCode", ""))
                 self._json(
                     HTTPStatus.OK if approved else HTTPStatus.NOT_FOUND,
@@ -10252,6 +10430,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "Client request contains unsupported properties: "
                         + ", ".join(unexpected)
                     )
+                mutation_state().begin()
                 client_id = CONTROL.register_oauth_client(
                     name=payload.get("name", ""),
                     redirect_uris=payload.get("redirectUris") or [],
@@ -10275,6 +10454,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "Revocation request contains unsupported properties: "
                         + ", ".join(unexpected)
                     )
+                mutation_state().begin()
                 revoked = CONTROL.revoke_oauth_grant(
                     grant_id,
                     reason=str(payload.get("reason") or ""),
@@ -10311,6 +10491,7 @@ class Handler(SimpleHTTPRequestHandler):
                                          + ", ".join(unexpected))
                     if not isinstance(payload.get("clientId"), str):
                         raise ValueError("clientId must name an MCP agent client.")
+                    mutation_state().begin()
                     opened = CONTROL.open_approval_window(
                         client_id=payload["clientId"],
                         instance=CONTROL.instance_id(),
@@ -10331,6 +10512,7 @@ class Handler(SimpleHTTPRequestHandler):
                                {"error": "Administrator session required."})
                     return
                 window_id = approval_window_revoke_path.group(1)
+                mutation_state().begin()
                 closed = CONTROL.revoke_approval_window(
                     window_id, str(payload.get("reason") or "closed by operator")
                 )
@@ -10344,6 +10526,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.FORBIDDEN, {"error": "Administrator session required."})
                     return
                 client_id = mcp_client_disable_path.group(1)
+                mutation_state().begin()
                 disabled = CONTROL.disable_oauth_client(client_id, actor="admin")
                 self._json(
                     HTTPStatus.OK if disabled else HTTPStatus.NOT_FOUND,
@@ -10965,6 +11148,8 @@ class Handler(SimpleHTTPRequestHandler):
                         "operation": operation,
                     })
                     return
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except TimeoutError as exc:
                     operation = finish_visual_operation(
                         operation["id"],
@@ -11113,7 +11298,7 @@ class Handler(SimpleHTTPRequestHandler):
                     })
                     return
                 timeout = reload_timeout(payload.get("timeout", 30))
-                with SAVE_RELOAD_LOCK:
+                with request_lock(SAVE_RELOAD_LOCK):
                     supplied_fingerprint = payload.get("workspaceFingerprint")
                     if supplied_fingerprint is not None and (
                         not isinstance(supplied_fingerprint, str)
@@ -11134,19 +11319,29 @@ class Handler(SimpleHTTPRequestHandler):
                             "currentWorkspaceFingerprint": fingerprint,
                         })
                         return
-                    operation = CONTROL.create_operation(
-                        "xyz.reload",
-                        actor,
-                        {"workspaceFingerprint": fingerprint},
-                    )
+                    operation = None
+
+                    def record_reload(generation):
+                        nonlocal operation
+                        operation = CONTROL.create_operation(
+                            "xyz.reload", actor,
+                            {"workspaceFingerprint": fingerprint, "plannedGeneration": generation,
+                             "requestId": self._request_id},
+                            admission_record=True,
+                        )
+
                     try:
-                        result = request_reload(fingerprint)
+                        result = request_reload(fingerprint, before_publish=record_reload)
                         result["status"] = wait_reload(
                             result["requestedGeneration"],
                             fingerprint,
                             timeout,
                         )
+                    except MUTATION_ADMISSION_ERRORS:
+                        raise
                     except Exception as exc:
+                        if operation is None:
+                            raise
                         operation = CONTROL.finish_operation(
                             operation["id"],
                             status="indeterminate",
@@ -11453,6 +11648,8 @@ class Handler(SimpleHTTPRequestHandler):
                                 "operation": operation,
                             },
                         )
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except TimeoutError as exc:
                     diagnostics = {"exceptionType": type(exc).__name__}
                     response_payload = {
@@ -11691,6 +11888,8 @@ class Handler(SimpleHTTPRequestHandler):
                         locales=locales,
                     )
                     self._json(HTTPStatus.OK, result)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "Expression test failed.", "errors": annotated([{"path": "fieldfx", "message": str(exc)}])})
                 return
@@ -11841,7 +12040,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "code": "proposal.approval_required",
                     })
                     return
-                with PROPOSAL_LOCK:
+                with request_lock(PROPOSAL_LOCK), request_lock(SAVE_RELOAD_LOCK):
                     proposal = proposal_read(
                         CONTROL,
                         proposal_action_path.group(1),
@@ -11858,6 +12057,10 @@ class Handler(SimpleHTTPRequestHandler):
                             "ruleId": "proposal.integrity",
                         })
                         return
+                    self._effects.recovery.update(
+                        proposalId=proposal["id"], originalRevision=proposal["originalRevision"],
+                        candidateHash=proposal["candidateHash"],
+                    )
                     current_plugin_fingerprint = plugin_catalogue()["fingerprint"]
                     if proposal.get("pluginCatalogueFingerprint") != current_plugin_fingerprint:
                         self._json(HTTPStatus.CONFLICT, {
@@ -11918,27 +12121,29 @@ class Handler(SimpleHTTPRequestHandler):
                         except (ProposalReviewError, FileNotFoundError) as exc:
                             self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": getattr(exc, "code", "proposal.preview_required")})
                             return
-                    operation = CONTROL.create_operation(
-                        "proposal.apply",
-                        actor,
-                        {
-                            "proposalId": proposal["id"],
-                            "candidateHash": proposal["candidateHash"],
-                        },
-                    )
+                    operation = None
+
+                    def record_apply():
+                        nonlocal operation
+                        operation = CONTROL.create_operation(
+                            "proposal.apply", actor,
+                            {"proposalId": proposal["id"], "originalRevision": proposal["originalRevision"],
+                             "candidateHash": proposal["candidateHash"], "requestId": self._request_id},
+                            admission_record=True,
+                        )
                     try:
                         proposal, reload_result = apply_proposal_and_reload(
                             CONTROL,
                             proposal,
-                            actor=actor,
+                            actor=actor, before_apply=record_apply,
                         )
                         completed = reload_completed(reload_result)
                     except FileExistsError as exc:
-                        operation = CONTROL.finish_operation(
-                            operation["id"],
-                            status="failed",
-                            error={"code": "proposal.revision", "message": str(exc)},
-                        )
+                        if operation is not None:
+                            operation = CONTROL.finish_operation(
+                                operation["id"], status="failed",
+                                error={"code": "proposal.revision", "message": str(exc)},
+                            )
                         _, _, current_revision = read_workspace()
                         self._json(HTTPStatus.CONFLICT, {
                             "error": str(exc),
@@ -11948,7 +12153,11 @@ class Handler(SimpleHTTPRequestHandler):
                             "operation": operation,
                         })
                         return
+                    except MUTATION_ADMISSION_ERRORS:
+                        raise
                     except Exception as exc:
+                        if operation is None:
+                            raise
                         operation = CONTROL.finish_operation(
                             operation["id"],
                             status="indeterminate",
@@ -12012,7 +12221,7 @@ class Handler(SimpleHTTPRequestHandler):
                 proposal_action_path
                 and proposal_action_path.group(2) == "decline"
             ):
-                with PROPOSAL_LOCK:
+                with request_lock(PROPOSAL_LOCK):
                     proposal = proposal_read(
                         CONTROL,
                         proposal_action_path.group(1),
@@ -12037,6 +12246,8 @@ class Handler(SimpleHTTPRequestHandler):
                         int(payload.get("index")),
                     )
                     self._json(HTTPStatus.OK, result)
+                except MUTATION_ADMISSION_ERRORS:
+                    raise
                 except (TypeError, ValueError, psycopg.Error) as exc:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
                         "error": "Expression test failed.",
@@ -12098,6 +12309,8 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                 },
             )
+        except MUTATION_ADMISSION_ERRORS:
+            raise
         except DraftLifecycleError as exc:
             self._json(HTTPStatus.CONFLICT, {
                 "error": str(exc), "code": "derived_draft.lifecycle_conflict",

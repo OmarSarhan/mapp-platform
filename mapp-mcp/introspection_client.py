@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from request_http import urlopen
 from typing import Any
 
 #: P6 allows a short positive cache. Bounded hard: a revoked grant has to stop
@@ -71,6 +72,8 @@ class IntrospectionClient:
         if cached is not None and cached[0] > now:
             return cached[1]
         payload = self._post({"token": token, "resource": self.resource})
+        if type(payload.get("active")) is not bool:
+            raise IntrospectionUnavailable("introspection did not report credential status")
         record = payload if payload.get("active") is True else INACTIVE
         if self._cache_seconds > 0:
             # Only the answer is cached, never the credential: the key is the
@@ -88,11 +91,12 @@ class IntrospectionClient:
                 "Authorization": self._authorization,
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Content-Length": str(len(body)),
+                "X-Mapp-Timeout-Seconds": str(self.timeout),
             },
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout) as response:
                 return self._decode(response)
         except urllib.error.HTTPError as exc:
             # A 401 here is *this component's* credential being wrong, not the

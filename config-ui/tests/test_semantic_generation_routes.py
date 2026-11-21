@@ -9,6 +9,7 @@ from types import MethodType
 from unittest.mock import Mock, patch
 
 import app
+from control_connections import current_request
 import semantic_sources
 from control_plane import TOKEN_SCOPES
 
@@ -116,9 +117,29 @@ class SemanticGenerationRouteTests(unittest.TestCase):
         }
         handler._payload = lambda: payload
         handler._remote = lambda: "127.0.0.1"
-        handler._json = lambda status, body: responses.append((status, body))
+        handler._json = lambda status, body, **kwargs: responses.append((status, body))
         handler.send_error = lambda status: responses.append((status, {}))
         return handler, responses
+
+    def test_expiry_after_context_read_refuses_provider_dispatch(self):
+        handler, responses = self.handler(
+            {"assetId": "asset:roads", "target": {"kind": "table"},
+             "contextOptions": {"statistics": True}},
+            scopes=["semantic:inspect", "semantic:generate", "semantic:data"],
+        )
+        handler._semantic_request = Mock(return_value={"asset": asset()})
+
+        def late_context(*args):
+            current_request().deadline = 0
+            return {"statistics": {"columnCount": 1}}
+
+        with (
+            patch.object(app, "semantic_generation_optional_context", late_context),
+            patch.object(app, "GEMINI") as gemini,
+        ):
+            handler.do_POST()
+        gemini.generate.assert_not_called()
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, responses[0][0])
 
     def test_table_generation_returns_review_only_targeted_operations(self):
         handler, responses = self.handler({
@@ -449,19 +470,19 @@ class SemanticGenerationRouteTests(unittest.TestCase):
                 )
                 self._attempt_lock = threading.Lock()
                 self.attempts = 0
+                self._attempted_threads = set()
                 self.all_attempted = threading.Event()
 
-            def __enter__(self):
+            def acquire(self, *, timeout):
                 with self._attempt_lock:
-                    self.attempts += 1
+                    self._attempted_threads.add(threading.get_ident())
+                    self.attempts = len(self._attempted_threads)
                     if self.attempts == worker_count:
                         self.all_attempted.set()
-                self._slots.acquire()
-                return self
+                return self._slots.acquire(timeout=timeout)
 
-            def __exit__(self, *_args):
+            def release(self):
                 self._slots.release()
-                return False
 
         admission = ObservedAdmissionQueue()
 

@@ -16,31 +16,36 @@ Usage:
     CONTROL_BENCHMARK_DATABASE_URL=postgresql://... \\
         python scripts/control_plane_benchmark.py [--json]
 
-The database must have an empty ``control`` schema that may be truncated. The
-schema is created by a superuser in the packaged image, never by its owning
-role, so this assumes it already exists -- the same assumption the test
-fixtures make.
+Use an exclusively disposable database with an empty ``control`` schema.
+A repeat run also accepts the current migrated schema with only its ledger
+and migration-seeded metadata. The preflight runs before the first migration.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import concurrent.futures
 import datetime as dt
 import json
 import os
+import secrets
 import statistics
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "mcp-auth"))
 sys.path.insert(0, str(ROOT / "config-ui"))
 
 import psycopg  # noqa: E402
 
 import control_schema as cs  # noqa: E402
+from benchmark_target import RefusedDestructiveRun, guard_scratch_database  # noqa: E402
+from control_connections import AdmissionTimeout  # noqa: E402
 from models import Client, Grant, PendingAuthorization  # noqa: E402
 from sql_store import (  # noqa: E402
     MAX_PENDING_PER_SOURCE,
@@ -48,10 +53,7 @@ from sql_store import (  # noqa: E402
     SqlStore,
 )
 
-#: Matches the deployed limit in docker/postgis/init/10-roles.sh. Neither
-#: consumer pools, so this is a ceiling on concurrent control-plane operations
-#: rather than headroom above two pools -- which is exactly why saturating it
-#: is worth measuring rather than assuming.
+#: Matches the deployed PostgreSQL role limit, shared across service pools.
 DEPLOYED_CONNECTION_LIMIT = 8
 
 #: The benchmark's working set: the schema's delete order minus the credential
@@ -68,38 +70,6 @@ TABLES = tuple(
     for table in cs.TABLES_IN_DELETE_ORDER
     if table not in ("admin_credential", "metadata")
 )
-
-
-class RefusedDestructiveRun(RuntimeError):
-    """The target looks like a real platform, not a scratch database."""
-
-
-def guard_scratch_database(dsn: str, *, force: bool = False) -> None:
-    """Refuse to run against an initialized platform unless forced.
-
-    Everything below deletes every row from six control tables and creates a
-    LOGIN role with a known password. Pointed at a live database that destroys
-    every grant, token and OAuth client the platform holds -- and the DSN comes
-    from an environment variable, which is exactly how that mistake gets made.
-
-    An initialized platform has an admin_credential row; a scratch database
-    does not. That is the cheapest reliable signal, and it is the one thing a
-    benchmark must not be casual about.
-    """
-    if force:
-        return
-    with psycopg.connect(dsn, autocommit=True) as connection:
-        initialized = connection.execute(
-            "SELECT count(*) FROM control.admin_credential"
-        ).fetchone()[0]
-    if initialized:
-        raise RefusedDestructiveRun(
-            "The target database holds an administrator credential, so it is an"
-            " initialized platform rather than a scratch database. This"
-            " benchmark deletes every row from six control tables. Point"
-            " CONTROL_BENCHMARK_DATABASE_URL at a scratch database, or pass"
-            " --force-destructive if you are certain."
-        )
 
 
 def truncate(dsn: str) -> None:
@@ -145,14 +115,34 @@ def mint_exchanged(store: SqlStore, raw: str, digest: str) -> None:
     )
 
 
-def timed(callable_, *args):
+class Attempt(NamedTuple):
+    outcome: str
+    ms: float
+    value: object
+
+
+def measure(callable_, *args, spend=False) -> Attempt:
     start = time.perf_counter()
     try:
-        result = callable_(*args)
-        error = None
-    except Exception as exc:  # noqa: BLE001 - the failure mode is the measurement
-        result, error = None, f"{type(exc).__name__}: {exc}"
-    return (time.perf_counter() - start) * 1000.0, result, error
+        value = callable_(*args)
+        outcome = "replay_loss" if spend and value is None else "success"
+    except AdmissionTimeout:
+        outcome, value = "refused", None
+    except Exception as exc:
+        # Diagnostics may include SQL parameters or connection details.
+        outcome, value = "error", type(exc).__name__
+    return Attempt(outcome, (time.perf_counter() - start) * 1000.0, value)
+
+
+def counts(attempts):
+    outcomes = Counter(attempt.outcome for attempt in attempts)
+    totals = {key: outcomes[key] for key in ("success", "replay_loss", "refused", "error")}
+    totals["attempted"] = len(attempts)
+    totals["admitted"] = totals["success"] + totals["replay_loss"]
+    if totals["error"]:
+        types = sorted({attempt.value for attempt in attempts if attempt.outcome == "error"})
+        raise AssertionError(f"unexpected benchmark errors {types}, counts {totals}")
+    return totals
 
 
 def replay_contention(dsn: str, *, presenters: int, trials: int) -> dict:
@@ -163,7 +153,7 @@ def replay_contention(dsn: str, *, presenters: int, trials: int) -> dict:
     """
     store = SqlStore(dsn)
     digest = "mapp-jcs-v1:" + "a" * 64
-    winners, elapsed = [], []
+    winners, elapsed, attempts = [], [], []
     for trial in range(trials):
         truncate(dsn)
         seed(store)
@@ -173,20 +163,25 @@ def replay_contention(dsn: str, *, presenters: int, trials: int) -> dict:
         with concurrent.futures.ThreadPoolExecutor(presenters) as pool:
             results = list(
                 pool.map(
-                    lambda _: store.consume_exchanged_token(
-                        raw, "proposals.apply", digest
+                    lambda _: measure(
+                        store.consume_exchanged_token, raw, "proposals.apply", digest, spend=True
                     ),
                     range(presenters),
                 )
             )
         elapsed.append((time.perf_counter() - start) * 1000.0)
-        winners.append(sum(1 for item in results if item is not None))
+        winners.append(counts(results)["success"])
+        attempts.extend(results)
+        replay = store.consume_exchanged_token(raw, "proposals.apply", digest)
+        assert replay is None, f"spent token won again after trial {trial}"
     assert set(winners) == {1}, f"expected exactly one winner per trial, got {winners}"
     return {
         "scenario": "replay",
         "presenters": presenters,
         "trials": trials,
         "winners_per_trial": sorted(set(winners)),
+        **counts(attempts),
+        "post_burst_replay_losses": trials,
         "median_ms": round(statistics.median(elapsed), 1),
         "max_ms": round(max(elapsed), 1),
         "invariant": "exactly one winner per trial",
@@ -201,25 +196,22 @@ def exchange_throughput(dsn: str, *, workers: int, tokens: int) -> dict:
     seed(store)
     for index in range(tokens):
         mint_exchanged(store, f"mapp_b_flow_{index}", digest)
-    latencies, failures = [], []
     start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-        for ms, result, error in pool.map(
-            lambda index: timed(
+        attempts = list(pool.map(
+            lambda index: measure(
                 store.consume_exchanged_token,
                 f"mapp_b_flow_{index}",
                 "proposals.apply",
                 digest,
+                spend=True,
             ),
             range(tokens),
-        ):
-            latencies.append(ms)
-            if error is not None:
-                failures.append(error)
-            elif result is None:
-                failures.append("unspendable")
+        ))
     wall = time.perf_counter() - start
-    assert not failures, f"every distinct token must spend once: {failures[:3]}"
+    totals = counts(attempts)
+    assert totals["success"] == tokens, f"every distinct token must spend once: {totals}"
+    latencies = [attempt.ms for attempt in attempts]
     return {
         "scenario": "exchange-throughput",
         "workers": workers,
@@ -228,7 +220,8 @@ def exchange_throughput(dsn: str, *, workers: int, tokens: int) -> dict:
         "spends_per_second": round(tokens / wall, 1),
         "median_ms": round(statistics.median(latencies), 1),
         "p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95) - 1], 1),
-        "failures": len(failures),
+        **totals,
+        "failures": tokens - totals["success"],
         "invariant": "every distinct token spends exactly once",
     }
 
@@ -281,8 +274,11 @@ def approval_admission(dsn: str, *, source: str = "203.0.113.9") -> dict:
     return {
         "scenario": "approval-admission",
         "per_source_cap": MAX_PENDING_PER_SOURCE,
+        "attempted": accepted + refused,
         "admitted": accepted,
         "refused": refused,
+        "success": accepted,
+        "error": 0,
         "other_source_still_admitted": True,
         "invariant": "a flood denies only the flooder, and refuses rather than errors",
     }
@@ -314,129 +310,108 @@ def cleanup_under_load(dsn: str, *, writers: int, sweeps: int) -> dict:
                 " '{apply}','c','203.0.113.200',%s)",
                 (f"sweep-{index}", expires),
             )
-    errors, removed = [], []
 
-    def sweep(_):
-        ms, result, error = timed(store.sweep_expired)
-        if error:
-            errors.append(error)
-        else:
-            removed.append(result)
-        return ms
-
-    def write(index):
-        ms, _, error = timed(
-            store.save_pending,
-            PendingAuthorization(
-                request_id=f"live-{index}",
-                query="response_type=code",
-                client_id="bench-client",
-                redirect_uri="http://127.0.0.1:9/cb",
-                scopes=("apply",),
-                csrf="z" * 32,
-                source=f"198.51.100.{index}",
-            ),
+    def pending(request_id, source):
+        return PendingAuthorization(
+            request_id=request_id,
+            query="response_type=code",
+            client_id="bench-client",
+            redirect_uri="http://127.0.0.1:9/cb",
+            scopes=("apply",),
+            csrf="z" * 32,
+            source=source,
         )
-        if error:
-            errors.append(error)
-        return ms
 
     with concurrent.futures.ThreadPoolExecutor(writers + sweeps) as pool:
-        jobs = [pool.submit(sweep, n) for n in range(sweeps)]
-        jobs += [pool.submit(write, n) for n in range(writers)]
-        latencies = [job.result() for job in jobs]
+        sweep_jobs = [pool.submit(measure, store.sweep_expired) for _ in range(sweeps)]
+        write_jobs = {}
+        for index in range(writers):
+            record = pending(f"live-{index}", f"198.51.100.{index}")
+            write_jobs[record.request_id] = pool.submit(measure, store.save_pending, record)
+        sweep_results = [job.result() for job in sweep_jobs]
+        writes = {key: job.result() for key, job in write_jobs.items()}
+    attempts = [*sweep_results, *writes.values()]
+    totals = counts(attempts)
+    admitted = {key for key, attempt in writes.items() if attempt.outcome == "success"}
+    refused = writes.keys() - admitted
+    expected = {f"sweep-{n}" for n in range(0, 200, 2)} | admitted
     with psycopg.connect(dsn, autocommit=True) as connection:
-        # A plain psycopg connection yields tuples; control_schema.connect is
-        # the one that installs a dict row factory.
-        survivors = connection.execute(
-            "SELECT count(*) FROM control.oauth_pending_authorizations"
-            " WHERE expires_at > now()"
-        ).fetchone()[0]
-    assert not errors, f"cleanup and admission must not error: {errors[:3]}"
-    assert survivors >= 100 + writers, (
-        f"a sweep removed live records: {survivors} survivors"
-    )
+        query = "SELECT request_id, expires_at > now() FROM control.oauth_pending_authorizations"
+        rows = connection.execute(query).fetchall()
+        assert {key for key, live in rows if live} == expected, "unexpected live IDs after burst"
+        assert refused.isdisjoint(key for key, _ in rows), "a refused write persisted"
+        follow_up = store.sweep_expired()
+        survivors = dict(connection.execute(query).fetchall())
+        expired_remaining = sum(not live for live in survivors.values())
+        assert survivors.keys() == expected, "follow-up sweep left unexpected IDs"
+        assert expired_remaining == 0, "expired rows remained after follow-up sweep"
+        store.save_pending(pending("fresh-write", "192.0.2.1"))
+        assert store.query_pending("fresh-write") is not None, "fresh write missing after saturation"
     return {
         "scenario": "cleanup-under-load",
         "concurrent_writers": writers,
         "concurrent_sweeps": sweeps,
         "expired_seeded": 100,
-        "removed_total": sum(removed),
-        "live_survivors": survivors,
-        "max_ms": round(max(latencies), 1),
+        **totals,
+        "writer_counts": counts(writes.values()),
+        "sweep_counts": counts(sweep_results),
+        "admitted_writer_ids": sorted(admitted),
+        "refused_writer_ids": sorted(refused),
+        "removed_total": sum(r.value for r in sweep_results if r.outcome == "success"),
+        "follow_up_removed": follow_up,
+        "live_survivors": len(survivors),
+        "expired_remaining": expired_remaining,
+        "fresh_write_recovered": True,
+        "max_ms": round(max(attempt.ms for attempt in attempts), 1),
         "invariant": "no deadlock, and no live record removed",
     }
 
 
 def connection_ceiling(dsn: str, *, limit: int = DEPLOYED_CONNECTION_LIMIT) -> dict:
-    """What happens at and above the role's CONNECTION LIMIT.
-
-    The deployed role is capped at 8 and neither consumer pools, so this is a
-    ceiling on concurrent operations. The audit that found the budget was
-    justified by pools that do not exist left the question of what the ninth
-    caller sees; this answers it. A connection-per-operation store turns a
-    burst into refusals, not queuing, and the failure is PostgreSQL's rather
-    than the application's -- so it is worth knowing exactly what it says.
-    """
-    admin = psycopg.connect(dsn, autocommit=True)
-    try:
-        if admin.execute(
-            "SELECT 1 FROM pg_roles WHERE rolname = 'bench_capped'"
-        ).fetchone():
-            admin.execute(
-                "REVOKE ALL ON ALL TABLES IN SCHEMA control FROM bench_capped"
-            )
-            admin.execute("REVOKE ALL ON SCHEMA control FROM bench_capped")
-            admin.execute("DROP ROLE bench_capped")
-        admin.execute(
-            f"CREATE ROLE bench_capped LOGIN PASSWORD 'capped'"
-            f" CONNECTION LIMIT {limit}"
-        )
-        admin.execute("GRANT USAGE ON SCHEMA control TO bench_capped")
-        admin.execute(
-            "GRANT SELECT ON ALL TABLES IN SCHEMA control TO bench_capped"
-        )
-        parsed = psycopg.conninfo.conninfo_to_dict(dsn)
-        capped = psycopg.conninfo.make_conninfo(
-            **{**parsed, "user": "bench_capped", "password": "capped"}
-        )
-        held, refusal = [], None
+    """Measure PostgreSQL's role ceiling independently of service pool admission."""
+    role = "bench_capped_" + secrets.token_hex(12)
+    ident = psycopg.sql.Identifier(role)
+    password = secrets.token_urlsafe(32)
+    capped = psycopg.conninfo.make_conninfo(dsn, user=role, password=password)
+    held = []
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        verifier = admin.pgconn.encrypt_password(password.encode(), role.encode(), b"scram-sha-256")
+        admin.execute(psycopg.sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} CONNECTION LIMIT {}").format(
+            ident, psycopg.sql.Literal(verifier.decode()), psycopg.sql.Literal(limit)
+        ))
+        # A failed CREATE (including a name collision) never enters cleanup.
         try:
-            for _ in range(limit + 4):
+            for _ in range(limit):
                 held.append(psycopg.connect(capped))
-        except psycopg.OperationalError as exc:
-            refusal = str(exc).strip().splitlines()[0]
-        finally:
             opened = len(held)
+            try:
+                held.append(psycopg.connect(capped))
+            except psycopg.OperationalError as exc:
+                # libpq startup errors can lack a SQLSTATE. Require the
+                # role-specific server diagnostic and omit connection details.
+                refusal = "too many connections for role"
+                if f'{refusal} "{role}"' not in str(exc):
+                    raise
+            else:
+                raise AssertionError("connection above the role limit was admitted")
+            held.pop().close()
+            with psycopg.connect(capped):
+                pass
+        finally:
             for connection in held:
                 connection.close()
-        # And the ceiling recovers the moment a connection is returned.
-        recovered = False
-        try:
-            probe = psycopg.connect(capped)
-            probe.close()
-            recovered = True
-        except psycopg.OperationalError:
-            pass
-    finally:
-        # Grants must go before the role: PostgreSQL refuses to drop a role
-        # that still owns privileges, and leaving one behind would make a
-        # second run fail on CREATE ROLE instead of measuring anything.
-        admin.execute(
-            "REVOKE ALL ON ALL TABLES IN SCHEMA control FROM bench_capped"
-        )
-        admin.execute("REVOKE ALL ON SCHEMA control FROM bench_capped")
-        admin.execute("DROP ROLE IF EXISTS bench_capped")
-        admin.close()
-    assert opened == limit, f"expected {limit} connections, opened {opened}"
-    assert refusal is not None, "the ceiling must refuse rather than queue"
-    assert recovered, "the ceiling must recover when a connection is released"
+            admin.execute(psycopg.sql.SQL("DROP ROLE {}").format(ident))
     return {
         "scenario": "connection-ceiling",
         "role_limit": limit,
         "connections_opened": opened,
+        "attempted": opened + 1,
+        "admitted": opened,
+        "refused": 1,
+        "success": opened,
+        "error": 0,
         "refusal": refusal,
-        "recovers_after_release": recovered,
+        "recovers_after_release": True,
         "invariant": "refuses at the cap, and recovers when one is released",
     }
 
@@ -464,17 +439,14 @@ def main() -> int:
         )
         return 2
 
-    connection = cs.connect(dsn)
-    try:
-        cs.migrate(connection)
-    finally:
-        connection.close()
-
     try:
         guard_scratch_database(dsn, force=arguments.force_destructive)
     except RefusedDestructiveRun as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    with cs.connect(dsn) as connection:
+        cs.migrate(connection)
 
     results = [
         replay_contention(dsn, presenters=arguments.presenters, trials=arguments.trials),

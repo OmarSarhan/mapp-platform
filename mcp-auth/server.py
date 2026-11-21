@@ -35,6 +35,10 @@ from authlib.oauth2.rfc6749.errors import OAuth2Error
 
 import exchange
 import introspection
+from psycopg.errors import QueryCanceled
+from control_connections import (
+    AcquisitionError, AdmissionTimeout, CommandInterrupted, CommandNotSubmitted, request_scope,
+)
 import operations
 import pages
 from authlib_adapter import FormError
@@ -198,7 +202,8 @@ class AuthHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         self.body_consumed = False
         try:
-            self._route(method)
+            with request_scope(self.headers.get("X-Mapp-Timeout-Seconds", "10"), self.connection):
+                self._route(method)
         finally:
             self._close_if_body_unread()
 
@@ -255,6 +260,11 @@ class AuthHandler(BaseHTTPRequestHandler):
             return
         try:
             route(self)
+        except (AdmissionTimeout, AcquisitionError, CommandInterrupted, CommandNotSubmitted, QueryCanceled):
+            MappResponse(
+                503, json.dumps({"error": "temporarily_unavailable"}),
+                JSON_HEADERS + [("Retry-After", "1")],
+            ).write_to(self)
         except PendingLimitReached:
             # A refusal to park a new request is a capacity condition, not a
             # server fault: say so, and say when to come back.

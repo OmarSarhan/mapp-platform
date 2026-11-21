@@ -50,7 +50,7 @@ class CensusConfigTests(unittest.TestCase):
         self.assertEqual(config.max_geometry_repairs, 64)
         self.assertEqual(
             config.geometry_sha256,
-            "db07dd3f8f6846177cbbd5be6955cd2665ddb1ef498c2a8ceff5b5c11274d0b4",
+            "f37f647557234c421b298013ab1fe2062dfb6573a6ff4e4a3e72b28e7038885f",
         )
         self.assertEqual(
             tuple(
@@ -178,6 +178,14 @@ class CensusConfigTests(unittest.TestCase):
 
     def test_target_count_and_geometry_are_pinned(self) -> None:
         cases = (
+            (
+                lambda raw: raw["geometry"].__setitem__(
+                    "source_url",
+                    "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+                    "Output_Areas_2021_EW_BGC_V2/FeatureServer/0",
+                ),
+                "reviewed ONS OA 2021 source: source_url",
+            ),
             (
                 lambda raw: raw.__setitem__(
                     "expected_england_oa_count",

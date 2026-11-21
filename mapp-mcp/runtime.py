@@ -29,7 +29,9 @@ import binascii
 import contextlib
 import json
 import secrets
-from functools import partial
+import time
+from functools import wraps
+from inspect import iscoroutinefunction
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -41,6 +43,8 @@ import anyio
 import era_guard
 from approval_diagnostics import ApprovalError, DiagnosticToolError, TRACE, trace
 from authentication import CURRENT_CALLER
+from request_scope import CURRENT_REQUEST, RequestStopped, checked, child_operation, human_wait
+from request_scope import run_worker as io_call
 from config_api_client import ConfigApiClient
 from config_api_client import ConfigApiRefused
 from config_api_client import ConfigApiUnavailable
@@ -948,6 +952,39 @@ def _nearest_actions(wanted, actions):
     return " Did you mean " + " or ".join(repr(name) for name in near) + "?"
 
 
+def _mutation_diagnostics(mutation):
+    """Only public identifiers and observed progress may cross this boundary."""
+    facts = {}
+    for key, choices in (
+        ("tokenB", ("not_submitted", "refused", "unconfirmed", "spent", "redeemed")),
+        ("receipt", ("not_required", "unchecked", "pending", "refused", "unconfirmed", "consumed")),
+    ):
+        if mutation.get(key) in choices:
+            facts[key] = mutation[key]
+    if type(mutation.get("targetStarted")) is bool:
+        facts["targetStarted"] = mutation["targetStarted"]
+    for group, fields in (
+        ("published", {"workspaceRevision": 64, "requestedGeneration": None}),
+        ("recovery", {"approvalReference": 64, "requestId": 32, "operationId": 32, "originalRevision": 64,
+                      "candidateHash": 64, "workspaceFingerprint": 64, "plannedGeneration": None}),
+    ):
+        values = mutation.get(group)
+        if not isinstance(values, dict):
+            continue
+        facts[group] = public = {}
+        for key, length in fields.items():
+            value = values.get(key)
+            if length is None:
+                if type(value) is int and value >= 0:
+                    public[key] = value
+            elif isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value):
+                public[key] = value
+        if group == "recovery" and isinstance(proposal := values.get("proposalId"), str):
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", proposal):
+                public["proposalId"] = proposal
+    return facts
+
+
 def _failure_diagnostics(payload):
     """Keep bounded recovery facts, never SQL, credentials or raw exceptions."""
     if not isinstance(payload, dict):
@@ -973,6 +1010,12 @@ def _failure_diagnostics(payload):
         r"[a-f0-9]{32}", str(meta.get("requestId", ""))
     ):
         detail["requestId"] = meta["requestId"]
+    if isinstance(meta, dict) and isinstance(timing := meta.get("databaseTiming"), dict):
+        detail["databaseTiming"] = {key: timing[key] for key in ("queueSeconds", "databaseSeconds")
+                                    if type(timing.get(key)) in (float, int) and 0 <= timing[key] < float("inf")}
+    mutation = payload.get("mutation")
+    if isinstance(mutation, dict):
+        detail["mutation"] = _mutation_diagnostics(mutation)
     technical = payload.get("technicalDetail") or {}
     if isinstance(technical, dict) and re.fullmatch(
         r"[0-9A-Z]{5}", str(technical.get("sqlstate", ""))
@@ -1358,8 +1401,8 @@ def _serve_guidance(server, document):
         description=document["description"],
         mime_type="text/markdown",
     )
-    def read() -> str:
-        return path.read_text(encoding="utf-8")
+    async def read() -> str:
+        return await io_call(path.read_text, encoding="utf-8")
 
     return read
 
@@ -1391,6 +1434,8 @@ def build_runtime(
     #: and the call check read the same value. Restating it would be a second
     #: place to forget.
     tool_scopes: dict[str, tuple[str, ...]] = {}
+    tool_timeouts = {}
+    sync_tools = set()
 
     def tool(*, name, description, operation):
         """Register a tool and record the scopes it needs.
@@ -1405,7 +1450,17 @@ def build_runtime(
         register = server.tool(name=name, description=description)
 
         def decorated(fn):
-            registered = register(fn)
+            tool_timeouts[name] = (operation or {}).get("timeout", 15.0)
+            if iscoroutinefunction(fn):
+                registered = register(fn)
+            else:
+                sync_tools.add(name)
+
+                @wraps(fn)
+                def at_worker_entry(*args, **kwargs):
+                    return checked(fn, *args, **kwargs)
+
+                registered = register(at_worker_entry)
             if name in {"derived_layers_plan", "derived_layers_create"}:
                 # The SDK's generated Pydantic model normally ignores extra
                 # arguments. On a derived create that silently turned a
@@ -1473,6 +1528,10 @@ def build_runtime(
         and agreed with the code while the property was false.
         """
         trace("platform.dispatch", operationId=operation["operation_id"])
+        started = time.monotonic()
+        request = CURRENT_REQUEST.get()
+        if request is not None:
+            request.remaining()
         caller = CURRENT_CALLER.get()
         if caller is None:
             # Unreachable through the middleware, which refuses before dispatch.
@@ -1508,22 +1567,40 @@ def build_runtime(
             # Deliberately not the underlying text: it describes this
             # component's plumbing, and an agent cannot act on it.
             raise DiagnosticToolError(
-                "The authorization component is unavailable; try again.", code="auth.exchange_unavailable"
+                "The authorization component is unavailable. The target request was not sent.",
+                code="auth.exchange_unavailable", diagnostics={"retryable": receipt is None, "indeterminate": False},
             ) from None
         try:
             # Credentials are redeemed on admission; their lifetime does not
             # need to cover execution. Long mutations use durable jobs.
-            deadline = operation.get("timeout")
+            deadline = float(operation.get("timeout", 15.0)) - (time.monotonic() - started)
+            if request is not None:
+                deadline = request.remaining(deadline)
+            if deadline <= 0:
+                raise DiagnosticToolError(
+                    "The operation deadline expired before platform admission; retry later.",
+                    code="operation.deadline_expired",
+                )
             if operation["method"] == "GET":
                 return config_api.get(
                     path=path, query=query, token=token_b, timeout=deadline,
                     receipt=receipt,
                 )
             # The same body object that was digested, not a rebuild of it.
-            return config_api.post(
+            result = config_api.post(
                 path=path, query=query, token=token_b, body=body,
                 timeout=deadline, receipt=receipt,
             )
+            # A worker can expire before handing a claimed receipt or create
+            # response back to the gate. Keep only the public acknowledgement.
+            current = TRACE.get()
+            if current is not None and operation is APPROVALS_CREATE:
+                reference = result.get("reference")
+                if isinstance(reference, str) and re.fullmatch(r"[a-f0-9]{64}", reference):
+                    current["approvalReference"] = reference
+            if current is not None and operation is APPROVALS_CLAIM and result.get("receipt"):
+                current["receiptClaimed"] = True
+            return result
         except ConfigApiRefused as refusal:
             # Some operations answer a non-2xx with the result rather than an
             # error. A browser validation that fails its checks returns 422
@@ -1531,9 +1608,8 @@ def build_runtime(
             # what a reviewer needs; reducing it to its message would throw the
             # evidence away. Declared per operation so this is never a guess
             # about what a status means.
-            if refusal.status in operation.get("result_statuses", ()) and (
-                refusal.body is not None
-            ):
+            if (refusal.status in operation.get("result_statuses", ()) and refusal.body is not None
+                    and (refusal.status != 504 or isinstance(refusal.body.get("operation"), dict))):
                 return refusal.body
             # The field-level entries, where the platform sent any. For a
             # validation refusal these are the answer: the top-level message
@@ -1543,8 +1619,10 @@ def build_runtime(
             diagnostics = _failure_diagnostics(refusal.body)
             if refusal.request_id:
                 diagnostics.setdefault("requestId", refusal.request_id)
+            message = ("The platform reported interrupted admission" if refusal.code == "database.busy"
+                       else "The platform refused this request")
             raise DiagnosticToolError(
-                f"The platform refused this request: {refusal}"
+                f"{message}: {refusal}"
                 + (f" ({refusal.code})" if refusal.code else "")
                 + _refusal_detail(refusal.errors)
                 + (f" {hint}" if hint else "")
@@ -1577,13 +1655,20 @@ def build_runtime(
                 code=diagnostics['code'], diagnostics=diagnostics,
             ) from None
 
-    async def io_call(fn, *args, **kwargs):
-        # AnyIO preserves CURRENT_CALLER and uses a bounded worker pool. Keep
-        # cancellation shielded while a submitted write finishes its I/O.
-        return await anyio.to_thread.run_sync(partial(fn, *args, **kwargs))
+    async def async_spend(operation, *, format_result=None, **kwargs):
+        # Capture the terminal result in the worker before its exit budget
+        # check. Internal approval claim responses must never reach this path.
+        def execute():
+            result = format_result(spend(operation, **kwargs))
+            current = TRACE.get()
+            if current is not None:
+                current["approvedResult"] = result
+            return result
 
-    async def async_spend(operation, **kwargs):
-        return await io_call(spend, operation, **kwargs)
+        with child_operation(operation.get("timeout", 15.0)):
+            if format_result is None:
+                return await io_call(spend, operation, **kwargs)
+            return await io_call(execute)
 
     async def approval_gate(
         ctx, operation, *, path, query="", body=None, tool_name, packet,
@@ -1609,7 +1694,8 @@ def build_runtime(
         wrong design here.
         """
         caller = CURRENT_CALLER.get()
-        digest = exchange.request_digest(
+        digest = await io_call(
+            exchange.request_digest,
             operation_id=operation["operation_id"],
             method=operation["method"],
             path_template=operation["path_template"],
@@ -1636,12 +1722,14 @@ def build_runtime(
         remembered = _remembered_approval(caller, digest)
         if remembered is not None:
             handle, approval_url = remembered
+            if current is not None and (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)):
+                current["approvalReference"] = match.group(1)
             # Asked already. The only question left is whether it has been
             # answered, so ask that before asking the person anything again --
             # a second prompt for a decision already made is how a two-call
             # flow turns into an endless one.
             try:
-                settled = await io_call(_settled_decision, handle)
+                settled = await _settled_decision(handle)
             except ApprovalError as exc:
                 if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
                     _forget_approval(caller, digest)
@@ -1679,12 +1767,11 @@ def build_runtime(
                 # Not remembered either, because there is nothing to come back
                 # for -- the two-call flow exists to carry a handle across a
                 # decision somebody has yet to make.
-                return await io_call(_claim, handle)
+                return await _claim(handle)
             _remember_approval(caller, digest, handle, approval_url)
 
-        if TRACE.get() is not None:
-            # Reference is a public dashboard identifier, never a receipt/handle.
-            TRACE.get()["approvalReference"] = (match.group(1) if (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)) else None)
+        if current is not None and (match := re.search(r"#approvals/([a-f0-9]{64})$", approval_url)):
+            current["approvalReference"] = match.group(1)
         message = _approval_message(operation["operation_id"], packet)
         modes = _elicitation_modes(ctx)
         mode = _approval_mode(modes, approval_url)
@@ -1703,7 +1790,7 @@ def build_runtime(
                 "This needs your approval before it can happen. " + str((packet or {}).get("summary") or "")[:500],
                 approval_url=approval_url)
         try:
-            with anyio.fail_after(APPROVAL_WAIT_SECONDS):
+            with human_wait(operation.get("timeout", 15.0)), anyio.fail_after(APPROVAL_WAIT_SECONDS):
                 if mode == "url":
                     outcome = await ctx.elicit_url(
                         message=message + " Open the approval page to see the change and decide.",
@@ -1750,14 +1837,19 @@ def build_runtime(
                 _forget_approval(caller, digest)
                 raise ApprovalError("approval.elicitation_declined", "The client returned decline for opening the approval page. The approval request was closed; nothing was applied. This does not establish who declined.", action=action)
             try:
-                receipt = await _await_decision(ctx, handle, approval_url)
+                with human_wait(operation.get("timeout", 15.0)):
+                    receipt = await _await_decision(ctx, handle, approval_url)
             except ApprovalError as exc:
                 if exc.detail['code'] in {"approval.declined", "approval.expired", "approval.receipt_missing"}:
                     _forget_approval(caller, digest)
                 raise
             _forget_approval(caller, digest)
-            with contextlib.suppress(Exception):
-                await ctx.session.send_elicit_complete(digest)
+            request = CURRENT_REQUEST.get()
+            with request.active() if request else contextlib.nullcontext():
+                with contextlib.suppress(Exception):
+                    await ctx.session.send_elicit_complete(digest)
+            if request is not None:
+                request.remaining()
             return receipt
         accepted = action == "accept" and approve is True
         await async_spend(APPROVALS_CONFIRM, path=APPROVALS_CONFIRM["path_template"],
@@ -1765,7 +1857,7 @@ def build_runtime(
         _forget_approval(caller, digest)
         if not accepted:
             raise ApprovalError("approval.declined", "The confirmation was declined by the client; nothing was applied.", action=action)
-        return await io_call(_claim, handle)
+        return await _claim(handle)
 
     #: Approvals this process has asked for and not yet spent, keyed by the
     #: grant and the exact request. Small and short-lived: an entry is dropped
@@ -1799,14 +1891,14 @@ def build_runtime(
     def _forget_approval(caller, digest):
         remembered_approvals.pop(_approval_key(caller, digest), None)
 
-    def _settled_decision(handle):
+    async def _settled_decision(handle):
         """The receipt, if somebody has now decided. None while they have not.
 
         Distinguishes "not answered yet" from every other outcome, because
         only the first should send the person back to the page. A declined or
         expired request is finished and says so.
         """
-        claimed = spend(
+        claimed = await async_spend(
             APPROVALS_CLAIM,
             path=APPROVALS_CLAIM["path_template"],
             body={"handle": handle},
@@ -1829,13 +1921,13 @@ def build_runtime(
             )
         return receipt
 
-    def _claim(handle):
+    async def _claim(handle):
         """Collect the receipt a decision produced, once.
 
         The platform mints it on the first claim and never again, so this is
         called exactly once per decision and its result is not re-fetchable.
         """
-        claimed = spend(
+        claimed = await async_spend(
             APPROVALS_CLAIM,
             path=APPROVALS_CLAIM["path_template"],
             body={"handle": handle},
@@ -2240,11 +2332,11 @@ def build_runtime(
             path=DERIVED_LAYERS_CREATE["path_template"], body=body,
             tool_name="derived_layers_create", packet=packet,
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_CREATE,
+        return await async_spend(
+            DERIVED_LAYERS_CREATE, format_result=_derived_outcome,
             path=DERIVED_LAYERS_CREATE["path_template"],
             body=body, receipt=receipt,
-        ))
+        )
 
     @tool(
         operation=DERIVED_LAYERS_REPLACE,
@@ -2358,9 +2450,9 @@ def build_runtime(
             ctx, DERIVED_LAYERS_REPLACE, path=target, body=body,
             tool_name="derived_layers_replace", packet=packet,
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_REPLACE, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_REPLACE, format_result=_derived_outcome, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=DERIVED_LAYERS_REFRESH,
@@ -2403,9 +2495,9 @@ def build_runtime(
                 "sources": current.get("sources") or [],
             },
         )
-        return _derived_outcome(await async_spend(
-            DERIVED_LAYERS_REFRESH, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_REFRESH, format_result=_derived_outcome, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=DERIVED_LAYERS_DROP,
@@ -2468,9 +2560,9 @@ def build_runtime(
                 "dependents": dependents,
             },
         )
-        return _without_meta(await async_spend(
-            DERIVED_LAYERS_DROP, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            DERIVED_LAYERS_DROP, format_result=_without_meta, path=target, body=body, receipt=receipt,
+        )
 
     def _derived_definition(
         *, name, query, sources, id_column, geometry_column, kind, description,
@@ -2926,6 +3018,11 @@ def build_runtime(
         )
         proposal = payload.get("proposal")
         proposal = proposal if isinstance(proposal, dict) else {}
+        # Retain the acknowledgement across local formatting, worker expiry
+        # and SDK output conversion. This dict belongs to this one tool call.
+        current = TRACE.get()
+        if current is not None and isinstance(proposal.get("id"), str):
+            current["proposalId"] = proposal["id"]
         diff = proposal.get("diff")
         warnings = proposal.get("warnings")
         detail = dict(_proposal_summary(proposal))
@@ -3308,9 +3405,9 @@ def build_runtime(
         if TRACE.get() is not None:
             TRACE.get()["phase"] = "apply"
         trace("apply.requested")
-        return _applied(await async_spend(
-            PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            PROPOSALS_APPLY, format_result=_applied, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=SEMANTIC_PROPOSALS_APPLY,
@@ -3337,9 +3434,9 @@ def build_runtime(
             ctx, SEMANTIC_PROPOSALS_APPLY, path=target, body=body,
             tool_name="semantic_proposals_apply", packet=packet,
         )
-        return _without_meta(await async_spend(
-            SEMANTIC_PROPOSALS_APPLY, path=target, body=body, receipt=receipt,
-        ))
+        return await async_spend(
+            SEMANTIC_PROPOSALS_APPLY, format_result=_without_meta, path=target, body=body, receipt=receipt,
+        )
 
     @tool(
         operation=XYZ_RELOAD,
@@ -3372,10 +3469,10 @@ def build_runtime(
             tool_name="xyz_reload",
             packet={"summary": "Reload the map from the workspace on disk."},
         )
-        return _without_meta(await async_spend(
-            XYZ_RELOAD, path=XYZ_RELOAD["path_template"], body=body,
+        return await async_spend(
+            XYZ_RELOAD, format_result=_without_meta, path=XYZ_RELOAD["path_template"], body=body,
             receipt=receipt,
-        ))
+        )
 
     def _apply_packet(proposal_id, evidence_operation_id):
         """What the person deciding is shown, read from the platform.
@@ -3513,6 +3610,8 @@ def build_runtime(
         operation = payload.get("operation")
         if isinstance(operation, dict) and operation.get("id"):
             applied["operationId"] = operation["id"]
+        if isinstance(payload.get("mutation"), dict):
+            applied["mutation"] = _mutation_diagnostics(payload["mutation"])
         return applied
 
     @tool(
@@ -4358,13 +4457,39 @@ def build_runtime(
         token = TRACE.set({"correlationId": secrets.token_hex(16), "tool": name, "phase": "tool"})
         trace("tool.started")
         try:
-            result = await sdk_call_tool(name, arguments, context)
+            request = CURRENT_REQUEST.get()
+            if request is not None:
+                request.tighten(tool_timeouts.get(name, 15.0))
+            # The SDK queues synchronous registrations on its AnyIO limiter.
+            # Cancel there while queued, then check again inside the worker.
+            if request and name in sync_tools:
+                result = await request.wait_for_worker(sdk_call_tool, name, arguments, context)
+            else:
+                result = await sdk_call_tool(name, arguments, context)
             trace("tool.completed")
             return result
-        except ToolError as exc:
+        except (RequestStopped, ToolError) as exc:
+            if "approvedResult" in TRACE.get():
+                result = TRACE.get()["approvedResult"]
+                return CallToolResult(structuredContent=result,
+                    content=[TextContent(type="text", text=json.dumps(result))])
+            proposal_id = TRACE.get().get("proposalId")
+            if name == "proposals_create" and proposal_id:
+                detail = {"proposalId": proposal_id, "acknowledged": True,
+                          "nextStep": "Read proposals_show for the created proposal."}
+                return CallToolResult(structuredContent=detail,
+                    content=[TextContent(type="text", text=json.dumps(detail))])
             cause = exc
-            while cause is not None and not isinstance(cause, DiagnosticToolError):
+            while cause is not None and not isinstance(cause, (DiagnosticToolError, RequestStopped)):
                 cause = cause.__cause__
+            if isinstance(cause, RequestStopped):
+                current = TRACE.get()
+                if not current.get("approvalReference"):
+                    raise ToolError(str(cause)) from None
+                diagnostics = {"retryable": False}
+                if current.get("receiptClaimed"):
+                    diagnostics["receiptClaimed"] = True
+                cause = DiagnosticToolError(str(cause), code="operation.deadline_expired", diagnostics=diagnostics)
             if isinstance(cause, DiagnosticToolError):
                 trace("tool.refused", code=cause.detail['code'])
                 return CallToolResult(isError=True, structuredContent={"error": cause.detail},
@@ -4382,6 +4507,7 @@ def build_runtime(
     # Exposed so tests can derive what a given grant should see from the same
     # values the filter uses, rather than restating a list that drifts.
     server.tool_scopes = tool_scopes
+    server.tool_timeouts = tool_timeouts
     # Exposed for the same reason and no other: the gate is deliberately not a
     # tool -- nothing the model can invoke reaches it -- so a test has no way
     # in through the tool surface. Wave 6's first mutating tool is what calls
@@ -4426,7 +4552,7 @@ def build_runtime_app(
     # is in the request rather than a cookie only because this server refuses
     # cookies at all.
     host = urlsplit(resource.origin).hostname or "localhost"
-    return server.streamable_http_app(
+    app = server.streamable_http_app(
         streamable_http_path=RPC_PATH,
         # Session state, which this server refused until Phase 1 wave 7.
         #
@@ -4463,3 +4589,5 @@ def build_runtime_app(
             allowed_origins=[resource.origin, f"{resource.origin}:*"],
         ),
     )
+    app.tool_timeouts = server.tool_timeouts
+    return app

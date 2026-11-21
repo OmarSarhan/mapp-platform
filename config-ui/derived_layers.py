@@ -19,6 +19,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from mutation_admission import mutation_state, request_lock
 from relation_identity import parse_relation
 
 from derived_query_guard import (
@@ -1606,13 +1607,14 @@ class DerivedLayerStore:
                 cur.execute("SET SESSION search_path = pg_catalog, public")
             if self._initialized:
                 return connection
-            with self._initialization_lock:
+            with request_lock(self._initialization_lock):
                 if not self._initialized:
                     with connection.cursor() as cur:
                         cur.execute(
                             "SELECT pg_advisory_xact_lock(hashtext(%s))",
                             (f"{SCHEMA}:schema",),
                         )
+                        mutation_state().admit()
                         self._initialize(cur)
                     connection.commit()
                     self._initialized = True
@@ -4764,6 +4766,7 @@ class DerivedLayerStore:
             target = sql.Identifier(SCHEMA, definition["name"])
             if cancellation is not None:
                 cancellation.report_progress("definition-create")
+            mutation_state().begin()
             if definition["kind"] == "view":
                 cur.execute(
                     sql.SQL(
@@ -4940,6 +4943,7 @@ class DerivedLayerStore:
             output = self._validate_output_metadata(cur, definition)
             if cancellation is not None:
                 cancellation.report_progress("materializing-output")
+            mutation_state().begin()
             cur.execute(
                 sql.SQL("REFRESH MATERIALIZED VIEW {}").format(
                     sql.Identifier(SCHEMA, name)
@@ -5028,6 +5032,7 @@ class DerivedLayerStore:
             query = self._executable_query(definition)
             if cancellation is not None:
                 cancellation.report_progress("definition-create")
+            mutation_state().begin()
             if definition["kind"] == "view":
                 cur.execute(
                     sql.SQL(
@@ -5216,6 +5221,7 @@ class DerivedLayerStore:
         if dependents:
             raise DerivedLayerDependencyError(name, dependents)
         fields = self._semantic_fields(cur, name)
+        mutation_state().begin()
         cur.execute(sql.SQL("""
             UPDATE {}._definitions
             SET semantic_generation = semantic_generation + 1,

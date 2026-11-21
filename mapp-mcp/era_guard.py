@@ -68,8 +68,12 @@ leaves DELETE to the inner app, which already declines session termination.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from typing import Any
+
+from request_scope import CURRENT_REQUEST, RequestScope, RequestStopped
 
 #: The per-request-envelope era: no handshake, a revision on every request.
 MODERN_VERSION = "2026-07-28"
@@ -121,9 +125,10 @@ MAX_BODY_BYTES = 512 * 1024
 class ProtocolEraGuard:
     """Wraps an inner ASGI app and admits only the modern era to the RPC path."""
 
-    def __init__(self, app, *, rpc_path: str = "/mcp") -> None:
+    def __init__(self, app, *, rpc_path: str = "/mcp", tool_timeouts=None) -> None:
         self._app = app
         self._rpc_path = rpc_path
+        self._tool_timeouts = tool_timeouts or {}
 
     async def __call__(self, scope, receive, send) -> None:
         if scope.get("type") != "http":
@@ -157,6 +162,29 @@ class ProtocolEraGuard:
             return
 
         headers = _headers(scope)
+        request = RequestScope(headers.get(b"x-mapp-timeout-seconds"))
+        token = CURRENT_REQUEST.set(request)
+        started = False
+
+        async def respond(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                request.close()
+            await send(message)
+
+        try:
+            await self._post(scope, receive, respond, headers, request)
+        except RequestStopped:
+            if not started and not request.closed:
+                await _reject(send, INVALID_REQUEST, "Request deadline expired.",
+                              reason="deadline-expired", status=503)
+        finally:
+            request.close()
+            CURRENT_REQUEST.reset(token)
+
+    async def _post(self, scope, receive, send, headers, request):
         declared = headers.get(VERSION_HEADER)
         version = None
         if declared is not None and declared.strip():
@@ -184,7 +212,10 @@ class ProtocolEraGuard:
         # A declared revision that is served still does not settle the request:
         # only the body says whether this is a handshake, and only the body
         # carries the revision a handshake is actually asking for.
-        body, replay = await _buffer(receive)
+        with request.active():
+            body = await _buffer(receive, request)
+        if body is None:  # real disconnect before the final body chunk
+            return
         if body is _TOO_LARGE:
             await _reject(
                 send,
@@ -193,7 +224,11 @@ class ProtocolEraGuard:
                 reason="body-too-large",
             )
             return
-        offered = _initialize_offer(body)
+        try:
+            payload = json.loads(body or b"null")
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        offered = _initialize_offer(payload)
 
         if offered is _BATCHED:
             # The handshake is a single request by construction. Batched, it is
@@ -248,7 +283,38 @@ class ProtocolEraGuard:
                 supported=list(SERVED_VERSIONS),
             )
             return
-        await self._app(scope, replay, send)
+        if isinstance(payload, dict) and payload.get("method") == "tools/call":
+            params = payload.get("params")
+            name = params.get("name") if isinstance(params, dict) else None
+            if isinstance(name, str):
+                request.tighten(self._tool_timeouts.get(name, 15.0))
+
+        disconnected = asyncio.Event()
+        sent = False
+
+        async def replay():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def watch():
+            while not request.closed:
+                if (await receive())["type"] == "http.disconnect":
+                    if not request.closed:  # a completed response also wakes receive on uvicorn
+                        disconnected.set()
+                        request.close()
+                    return
+
+        watcher = asyncio.create_task(watch())
+        try:
+            await self._app(scope, replay, send)
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
 
 
 class _Sentinel:
@@ -289,55 +355,26 @@ def _well_formed(version: str) -> bool:
     )
 
 
-async def _buffer(receive):
-    """Read the body, then hand back a ``receive`` that replays it.
-
-    The guard has to decode the body to see the method, and the inner app still
-    needs to read it afterwards, so it is buffered once and replayed rather than
-    consumed.
-    """
+async def _buffer(receive, request):
+    """Read one bounded body. Discard an incomplete body on peer closure."""
     chunks: list[bytes] = []
     total = 0
     more = True
     while more:
+        request.remaining()
         message = await receive()
         if message.get("type") != "http.request":
-            # A disconnect: hand back what we have and let the inner app see it.
-            chunks.append(b"")
-            break
+            return None
         chunk = message.get("body", b"")
         total += len(chunk)
         if total > MAX_BODY_BYTES:
-            return _TOO_LARGE, None
+            return _TOO_LARGE
         chunks.append(chunk)
         more = message.get("more_body", False)
-    body = b"".join(chunks)
-
-    sent = False
-
-    async def replay():
-        """The buffered body once, then the real stream underneath.
-
-        Returning ``http.disconnect`` on the second call looks harmless -- the
-        body is finished, so what else is there to say -- and it is not. A
-        streaming application keeps reading to notice the client going away, so
-        a fabricated disconnect tells it the caller left and it abandons the
-        response without sending one. The symptom is "ASGI callable returned
-        without starting response" and no traceback, because nothing raised.
-
-        Delegating instead means the disconnect arrives when it actually
-        happens.
-        """
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return await receive()
-
-    return body, replay
+    return b"".join(chunks)
 
 
-def _initialize_offer(body: bytes):
+def _initialize_offer(payload):
     """What revision this payload's ``initialize`` asks for, if it is one.
 
     Three answers, because the caller has three things to do about them:
@@ -350,10 +387,6 @@ def _initialize_offer(body: bytes):
     An undecodable body is not an initialize: it is the inner app's parse error
     to report, and swallowing it here would answer the wrong question.
     """
-    try:
-        payload: Any = json.loads(body or b"null")
-    except (ValueError, UnicodeDecodeError):
-        return _NOT_INITIALIZE
     if isinstance(payload, list):
         return (
             _BATCHED

@@ -68,6 +68,7 @@ token, record = store.create_token(
         "inspect",
         "propose",
         "apply",
+        "visual",
         "reload",
         "derive",
         # The demo creates derived layers, which has needed the narrower scope
@@ -123,14 +124,16 @@ PY
   fi
 }
 
-api() { # method path [json-body]
+api() { # method path [json-body] [timeout-seconds]
   local method="$1" path="$2" body="${3:-}"
+  local timeout_args=()
+  if [[ -n "${4:-}" ]]; then timeout_args=(--max-time "$4"); fi
   if [ -n "${body}" ]; then
-    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body "${timeout_args[@]}" -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
       --data-binary "${body}" "${BASE}${path}"
   else
-    curl -sS --fail-with-body -X "${method}" -H "Host: ${CONFIG_HOST}" \
+    curl -sS --fail-with-body "${timeout_args[@]}" -X "${method}" -H "Host: ${CONFIG_HOST}" \
       -H "Authorization: Bearer ${TOKEN}" "${BASE}${path}"
   fi
 }
@@ -1193,21 +1196,29 @@ try:
     http_status = int(sys.argv[2])
 except ValueError as exc:
     raise SystemExit("workspace apply returned an invalid HTTP status") from exc
-response = json.load(open(sys.argv[3], encoding="utf-8"))
+try:
+    response = json.load(open(sys.argv[3], encoding="utf-8"))
+except (ValueError, OSError):
+    raise SystemExit("workspace apply outcome unconfirmed: response was not usable JSON")
+if not isinstance(response, dict):
+    raise SystemExit("workspace apply outcome unconfirmed: response was not an object")
+operation = response.get("operation") or {}
+if isinstance(operation, dict) and re.fullmatch(r"[0-9a-f]{32}", str(operation.get("id", ""))):
+    print("Inspect operation " + operation["id"], file=sys.stderr)
 proposal = response.get("proposal")
 reload = response.get("reload")
 if http_status not in {200, 504}:
     raise SystemExit(
-        "workspace apply refused: %s %s"
+        "workspace apply outcome unresolved: %s %s"
         % (response.get("code") or http_status, str(response.get("error") or "")[:240])
     )
 if (
     not isinstance(proposal, dict)
     or proposal.get("status") != "applied"
-    or proposal.get("candidate") != saved
+    or json.dumps(proposal.get("candidate"), sort_keys=True) != json.dumps(saved, sort_keys=True)
     or not isinstance(reload, dict)
 ):
-    raise SystemExit("workspace apply did not commit the saved demo")
+    raise SystemExit("workspace apply response did not establish whether the saved demo committed")
 fingerprint = proposal.get("appliedFingerprint")
 reload_status = reload.get("status")
 if (
@@ -1232,23 +1243,124 @@ else:
 PY
 }
 
+workspace_approval_request() { # proposal response, terminal preview, request output, operation ID
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json
+import sys
+
+proposal = json.load(open(sys.argv[1], encoding="utf-8"))["proposal"]
+response = json.load(open(sys.argv[2], encoding="utf-8"))
+review = response.get("review") or {}
+binding = review.get("binding") or {}
+if (response.get("operation", {}).get("id") != sys.argv[4]
+        or binding.get("evidenceOperationId") != sys.argv[4]):
+    raise SystemExit("Preview operation identity changed; refusing application.")
+expected = {
+    "proposalId": proposal["id"],
+    "candidateHash": proposal["candidateHash"],
+    "originalRevision": proposal["originalRevision"],
+}
+if proposal.get("status") != "pending" or any(
+    binding.get(key) != value for key, value in expected.items()
+):
+    raise SystemExit("Preview does not match the pending demo proposal; refusing application.")
+if any(review.get(key) is not True for key in
+       ("complete", "eligible", "renderPassed", "checksPassed")):
+    raise SystemExit("Demo preview is incomplete or failed; inspect it before proceeding.")
+fields = ("candidateHash", "originalRevision", "evidenceOperationId", "evidenceFingerprint")
+if any(not isinstance(binding.get(key), str) or not binding[key] for key in fields):
+    raise SystemExit("Demo preview omitted its exact approval binding.")
+captures = review.get("captures") or []
+if not any(capture.get("side") == "candidate" and capture.get("kind") == "map"
+           and capture.get("status") == "captured" for capture in captures):
+    raise SystemExit("Demo preview omitted its captured candidate map.")
+for capture in captures:
+    if capture.get("status") == "captured":
+        download = capture.get("download") or {}
+        if not (download.get("url") or download.get("path")):
+            raise SystemExit("Demo preview omitted an image download link.")
+print("Proposal:", proposal["id"])
+print("Focused diff:")
+def changes(before, after, path=""):
+    if json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True):
+        return []
+    if isinstance(before, dict) and isinstance(after, dict):
+        result = []
+        for key in sorted(before.keys() | after.keys()):
+            child = path + "/" + key.replace("~", "~0").replace("/", "~1")
+            if key not in before:
+                result.append({"path": child, "new": after[key]})
+            elif key not in after:
+                result.append({"path": child, "old": before[key]})
+            else:
+                result.extend(changes(before[key], after[key], child))
+        return result
+    return [{"path": path, "old": before, "new": after}]
+print(json.dumps(changes(proposal["original"], proposal["candidate"]), indent=2))
+print("Retained preview (review these images before confirming):")
+for capture in captures:
+    if capture.get("status") == "captured":
+        download = capture.get("download") or {}
+        print(capture["side"], capture["kind"], download.get("url") or download.get("path"))
+    else:
+        print(capture.get("side"), capture.get("kind"), capture.get("status"))
+with open(sys.argv[3], "w", encoding="utf-8") as output:
+    json.dump({"approved": True, **{key: binding[key] for key in fields}}, output)
+PY
+}
+
+prepare_workspace_approval() { # proposal-id
+  local identifier="$1" preview operation_id status attempt confirmation
+  api GET "/api/proposals/${identifier}" "" 30 > "${WORK_DIR}/review-proposal.json"
+  preview="$(api POST "/api/proposals/${identifier}/screenshot" \
+    '{"layer":"Census_OA_Population","background":true,"framing":"feature","viewMode":"focus","panels":["styling"]}' 30)"
+  operation_id="$(printf '%s' "${preview}" | jqp "print((d.get('operation') or {}).get('id') or '')")"
+  [[ "${operation_id}" =~ ^[a-f0-9]{32}$ ]] || fail "Demo preview omitted its operation ID."
+  printf 'Waiting for retained demo preview %s...\n' "${operation_id}"
+  status=""
+  for attempt in $(seq 1 300); do
+    api GET "/api/visual-operations/${operation_id}" "" 30 > "${WORK_DIR}/review-preview.json"
+    status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["operation"]["status"])' \
+      "${WORK_DIR}/review-preview.json")"
+    case "${status}" in
+      succeeded|failed) break ;;
+      queued|running) sleep 2 ;;
+      *) fail "Unexpected demo preview status: ${status}" ;;
+    esac
+  done
+  [[ "${status}" == "succeeded" ]] || fail \
+    "Demo preview did not succeed. Inspect operation ${operation_id}; no workspace was applied."
+  workspace_approval_request "${WORK_DIR}/review-proposal.json" \
+    "${WORK_DIR}/review-preview.json" "${WORK_DIR}/workspace-approval.json" "${operation_id}"
+  if [[ ! -t 0 ]]; then
+    fail "Demo proposal ${identifier} awaits explicit review and approval. Use the configuration UI or standalone CLI to review/apply it, then rerun ./bin/mapp demo. No workspace was applied."
+  fi
+  printf 'After reviewing the diff and preview, type APPLY %s to publish this exact demo: ' "${identifier}"
+  IFS= read -r confirmation || fail "Demo approval cancelled; no workspace was applied."
+  [[ "${confirmation}" == "APPLY ${identifier}" ]] || fail \
+    "Demo approval declined; no workspace was applied."
+}
+
 apply_saved_workspace_proposal() { # proposal-id saved-workspace
   local identifier="$1" saved_workspace="$2"
   local http_status payload_file state current_workspace
+  prepare_workspace_approval "${identifier}"
   payload_file="${WORK_DIR}/workspace-apply.json"
-  if ! http_status="$(curl -sS -X POST \
+  if ! http_status="$(curl -sS --max-time 120 -X POST \
     -H "Host: ${CONFIG_HOST}" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H 'Content-Type: application/json' \
-    --data-binary '{"approved":true}' \
+    --data-binary "@${WORK_DIR}/workspace-approval.json" \
     --output "${payload_file}" \
     --write-out '%{http_code}' \
     "${BASE}/api/proposals/${identifier}/apply")"
   then
-    fail "could not apply the saved demo workspace proposal"
+    fail "Demo apply response unavailable; the write may have committed. Inspect proposal ${identifier} and reload status before retrying."
   fi
-  state="$(workspace_apply_state \
-    "${saved_workspace}" "${http_status}" "${payload_file}")"
+  if ! state="$(workspace_apply_state \
+    "${saved_workspace}" "${http_status}" "${payload_file}")"; then
+    fail "Inspect proposal ${identifier}, workspace and reload status before retrying; an unsuccessful reply does not establish that publication was refused. No apply was replayed."
+  fi
   if [ "${state}" = "ready" ]; then
     printf '  workspace applied and XYZ reloaded\n'
     return 0
@@ -1263,7 +1375,7 @@ import sys
 
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
   ensure_saved_workspace_xyz
 }
@@ -1429,7 +1541,7 @@ import json
 import sys
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
 then
   printf '  workspace already matches the saved demo\n'
@@ -1514,7 +1626,7 @@ import json
 import sys
 saved = json.load(open(sys.argv[1], encoding="utf-8"))
 current = json.loads(sys.argv[2]).get("workspace")
-raise SystemExit(0 if current == saved else 1)
+raise SystemExit(0 if json.dumps(current, sort_keys=True) == json.dumps(saved, sort_keys=True) else 1)
 PY
 
 printf '\nDemo rebuilt: four derived relations and the saved ten-layer workspace are ready.\n'

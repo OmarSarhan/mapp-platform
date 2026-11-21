@@ -496,19 +496,20 @@ class ReceiveDelegationTests(unittest.TestCase):
     """
 
     def test_a_later_read_reaches_the_real_receive(self) -> None:
+        import asyncio
+
         seen = []
+        disconnect = asyncio.Event()
 
         class Streaming:
             async def __call__(self, scope, receive, send):
                 seen.append(await receive())
-                # What a streaming app does while it works: watch for the
-                # client leaving rather than assume it has.
-                seen.append(await receive())
-                await send({
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-length", b"0")],
-                })
+                later = asyncio.create_task(receive())
+                await asyncio.sleep(0)
+                seen.append(later.done())
+                disconnect.set()
+                seen.append(await asyncio.wait_for(later, 1))
+                await send({"type": "http.response.start", "status": 200})
                 await send({"type": "http.response.body", "body": b""})
 
         app, _ = build_app(
@@ -518,41 +519,12 @@ class ReceiveDelegationTests(unittest.TestCase):
             introspection=StubIntrospection({TOKEN: active()}),
         )
 
-        # Driven directly rather than through the harness, because the harness
-        # answers http.disconnect once its queue empties -- the very value the
-        # bug fabricates, so a test using it cannot tell the two apart. This
-        # receive yields a marker no guard could invent.
-        import asyncio
-
         body = b'{"method":"tools/list"}'
-        queue = [
-            {"type": "http.request", "body": body, "more_body": False},
-            {"type": "http.request", "body": b"", "more_body": False, "marker": True},
-        ]
-        messages = []
-
-        async def receive():
-            return queue.pop(0) if queue else {"type": "http.disconnect"}
-
-        async def send(message):
-            messages.append(message)
-
-        scope = {
-            "type": "http", "method": "POST", "path": "/mcp",
-            "headers": [
-                (name.lower().encode(), value.encode())
-                for name, value in MODERN.items()
-            ],
-        }
-        asyncio.run(app(scope, receive, send))
-
-        start = next(m for m in messages if m["type"] == "http.response.start")
-        self.assertEqual(200, start["status"], "the runtime abandoned the response")
+        response = call(app, headers=MODERN, chunks=[body[:5], body[5:]], disconnect=disconnect)
+        self.assertEqual(200, response.status)
         self.assertEqual(body, seen[0]["body"])
-        self.assertTrue(
-            seen[1].get("marker"),
-            "the guard answered its own disconnect instead of the real stream",
-        )
+        self.assertFalse(seen[1], "receive fabricated an early disconnect")
+        self.assertEqual({"type": "http.disconnect"}, seen[2])
 
 
 class PassThroughTests(unittest.TestCase):

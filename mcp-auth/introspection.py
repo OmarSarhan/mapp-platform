@@ -90,21 +90,15 @@ def introspect(*, datalist, store) -> dict:
     # because only a live one reached the line that raised.
     resource = _single(datalist, "resource")
 
-    # The three lookups are unconditional, so an unknown token, a revoked grant
-    # and a live token all cost the same three round trips. Short-circuiting
-    # made the outcome readable from the response time alone -- measured at
-    # roughly 1:2:3 against a real database, which is not a subtle signal.
-    # Equal *round trips*, not constant time; a single joined statement would
-    # be better still and is the obvious follow-up.
-    record = store.query_token(raw)
-    grant = store.query_grant(record.subject if record is not None else "")
+    # Every outcome uses one joined authoritative lookup. This keeps inactive
+    # results on the same statement path without caching revocable authority.
+    record, grant, client_active = store.introspection_state(raw)
     # The grant's client, not the token's. For a token B, record.client_id is
     # the broker that performed the exchange, so checking that one applied the
     # "active client" rule to token A and to the exchange but never to token B:
     # disabling a client left its already-issued token B active for the whole
-    # sixty seconds. query_client already excludes disabled clients, so this
+    # sixty seconds. The join excludes disabled clients, so this
     # covers "unknown" and "disabled" without asking twice.
-    client = store.query_client(grant.client_id if grant is not None else "")
 
     if record is None or record.is_expired() or record.is_revoked():
         return dict(INACTIVE)
@@ -112,7 +106,7 @@ def introspect(*, datalist, store) -> dict:
         # Fails closed for a token with no resolvable grant, which includes any
         # row written before grants existed.
         return dict(INACTIVE)
-    if client is None:
+    if not client_active:
         return dict(INACTIVE)
     if resource is not None and resource != record.audience:
         # Exact equality. A prefix test would introspect a token for

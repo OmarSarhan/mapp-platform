@@ -1070,7 +1070,7 @@ SELECT
       AND variable_count = 467
       AND geometry_repairs BETWEEN 0 AND 64
       AND geometry_source_url =
-        'https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Output_Areas_2021_EW_BGC_V2/FeatureServer/0'
+        'https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/OA_2021_EW_BGC_V2_RUC/FeatureServer/0'
       AND geometry_source_sha256 = expected_geometry_sha256
       AND source_metadata #>> '{geometry,sha256}' =
         expected_geometry_sha256

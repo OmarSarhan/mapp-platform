@@ -1014,7 +1014,18 @@ case "${1:-}" in
     "${ROOT_DIR}/scripts/federation-e2e.sh"
     ;;
   test)
-    run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service mcp-auth
+    # These external conformance fixtures are deliberately not vendored into
+    # this server. Refuse before starting services rather than later skipping.
+    codex_test_binary="${MAPP_CODEX_TEST_BINARY:-}"
+    cli_test_workflow="${MAPP_CONFIG_CLI_WORKFLOW:-${ROOT_DIR}/../mapp-config-cli/docs/agent-workflow.md}"
+    if [[ ! -f "${codex_test_binary}" || ! -x "${codex_test_binary}" || ! -f "${cli_test_workflow}" ]]; then
+      printf 'Tests require MAPP_CODEX_TEST_BINARY (an Alpine-compatible executable) and the adjacent CLI workflow, or MAPP_CONFIG_CLI_WORKFLOW pointing to that source file.\n' >&2
+      exit 2
+    fi
+    codex_test_binary="$(realpath "${codex_test_binary}")"
+    cli_test_workflow="$(realpath "${cli_test_workflow}")"
+    test_compose=("${compose[@]}" --file "${ROOT_DIR}/compose.test.yaml")
+    run_with_buildkit_lease_retry "${compose[@]}" build config-ui semantic-service mcp-auth mapp-mcp
     run_with_buildkit_lease_retry docker build --tag mapp-leeds-etl:local "${ROOT_DIR}/etl"
     # The configuration suite now needs a database for the same reason the
     # semantic one does: the administrator credential, API tokens and device
@@ -1033,7 +1044,7 @@ case "${1:-}" in
         --set ON_ERROR_STOP=1 --command "CREATE SCHEMA control"' >/dev/null
     control_test_url="postgresql://$(dotenv_value POSTGRES_USER):$(dotenv_value POSTGRES_PASSWORD)@db:5432/mapp_control_test?sslmode=disable"
     config_ui_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --build --no-deps \
+    if ! "${test_compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
       --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
@@ -1058,14 +1069,18 @@ case "${1:-}" in
     # statements, so a run without a database reports the double's behaviour
     # as the system's. This suite ran in no target at all until now.
     mcp_auth_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --build --no-deps \
+    if ! "${test_compose[@]}" run --rm --build --no-deps \
       --volume "${ROOT_DIR}:/workspace:ro" \
       --env PYTHONPATH=/app \
       --env PYTHONDONTWRITEBYTECODE=1 \
       --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
-      --entrypoint python \
-      mcp-auth \
-      -m unittest discover -s /workspace/mcp-auth/tests -v 2>&1 \
+      --env CONTROL_CAPACITY_TEST_CREATE_ROLE=1 \
+      --entrypoint sh \
+      mcp-auth -ec '
+        python -m unittest discover -s /workspace/mcp-auth/tests -v
+        cd /workspace/scripts/tests
+        python -m unittest -v test_control_plane_benchmark.TargetPreflightTests
+      ' 2>&1 \
       | tee "${mcp_auth_log}"; then
       rm -f "${mcp_auth_log}"
       exit 1
@@ -1083,13 +1098,23 @@ case "${1:-}" in
     # rendered page. The skip guard applies for the same reason as the others:
     # a suite that quietly stops running is worse than one that fails.
     mapp_mcp_log="$(mktemp)"
-    if ! "${compose[@]}" run --rm --build --no-deps \
-      --volume "${ROOT_DIR}:/workspace:ro" \
+    run_with_buildkit_lease_retry "${test_compose[@]}" build mapp-mcp
+    if ! docker run --rm --network none --read-only \
+      --tmpfs /tmp:size=256m,mode=1777 \
+      --security-opt no-new-privileges:true --cap-drop ALL \
+      --volume "${ROOT_DIR}/mapp-mcp:/workspace/mapp-mcp:ro" \
+      --volume "${ROOT_DIR}/mcp-auth:/workspace/mcp-auth:ro" \
+      --volume "${ROOT_DIR}/config-ui:/workspace/config-ui:ro" \
+      --volume "${ROOT_DIR}/compose.yaml:/workspace/compose.yaml:ro" \
+      --volume "${codex_test_binary}:/opt/mapp-test-codex:ro" \
+      --volume "${cli_test_workflow}:/mapp-config-cli/docs/agent-workflow.md:ro" \
       --env PYTHONPATH=/app:/workspace/mapp-mcp/tests \
       --env PYTHONDONTWRITEBYTECODE=1 \
-      --entrypoint python \
-      mapp-mcp \
-      -m unittest discover -s /workspace/mapp-mcp/tests -v 2>&1 \
+      --env MAPP_CODEX_TEST_BINARY=/opt/mapp-test-codex \
+      --env CODEX_HOME=/tmp/mapp-test-codex-home \
+      --entrypoint sh \
+      mapp-mcp-tests:local \
+      -ec 'mkdir -p "$CODEX_HOME"; python -m unittest discover -s /workspace/mapp-mcp/tests -v' 2>&1 \
       | tee "${mapp_mcp_log}"; then
       rm -f "${mapp_mcp_log}"
       exit 1
@@ -1125,8 +1150,15 @@ case "${1:-}" in
       --env PYTHONPATH=/app/src \
       mapp-leeds-etl:local \
       python -m unittest discover -s /workspace/etl/tests -v
-    PYTHONPATH="${ROOT_DIR}" \
-      python3 -m unittest discover -s "${ROOT_DIR}/scripts/tests" -v
+    # Compose rendering needs the host CLI; runtime-importing script tests use
+    # the pinned service dependencies, not whatever Python packages the host has.
+    PYTHONPATH="${ROOT_DIR}/scripts/tests" \
+      python3 -m unittest test_compose_isolation -v
+    "${test_compose[@]}" run --rm --build --no-deps \
+      --volume "${ROOT_DIR}:/workspace:ro" --workdir /workspace \
+      --env PYTHONPATH=/workspace:/workspace/scripts/tests \
+      --env "CONTROL_TEST_DATABASE_URL=${control_test_url}" \
+      scripts-tests python -c 'import pathlib, unittest; names = [p.stem for p in sorted(pathlib.Path("scripts/tests").glob("test_*.py")) if p.stem != "test_compose_isolation"]; result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names)); raise SystemExit(not result.wasSuccessful() or bool(result.skipped))'
     docker run --rm \
       --volume "${ROOT_DIR}:/source:ro" \
       --workdir /tmp \

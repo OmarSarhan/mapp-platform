@@ -1,0 +1,312 @@
+{
+  "baselineCommit": "47d373770b92dd929b82fe3bbc26b18ce07abc22",
+  "environment": {
+    "postgresql": "18.6",
+    "python": "3.14",
+    "psycopg": "3.3.4"
+  },
+  "scope": "Isolated registered capabilities tool with real OAuth/config HTTP handlers; not deployed MCP transport.",
+  "before": [
+    {
+      "path": "cold",
+      "calls": [
+        {
+          "seconds": 0.1495618720073253,
+          "error": null
+        }
+      ],
+      "connections": 19,
+      "statements": 41,
+      "queueSeconds": 0.0
+    },
+    {
+      "path": "warm",
+      "calls": [
+        {
+          "seconds": 0.0997280990704894,
+          "error": null
+        }
+      ],
+      "connections": 14,
+      "statements": 30,
+      "queueSeconds": 0.0
+    },
+    {
+      "path": "concurrent",
+      "calls": [
+        {
+          "seconds": 0.22145448485389352,
+          "error": null
+        },
+        {
+          "seconds": 0.27385823312215507,
+          "error": null
+        },
+        {
+          "seconds": 0.2695945769082755,
+          "error": null
+        },
+        {
+          "seconds": 0.2745118970051408,
+          "error": null
+        },
+        {
+          "seconds": 0.18940065894275904,
+          "error": "DiagnosticToolError"
+        },
+        {
+          "seconds": 0.23610673402436078,
+          "error": null
+        },
+        {
+          "seconds": 0.25690830615349114,
+          "error": null
+        },
+        {
+          "seconds": 0.27774518402293324,
+          "error": null
+        }
+      ],
+      "connections": 106,
+      "statements": 226,
+      "queueSeconds": 0.0
+    }
+  ],
+  "after8": [
+    {
+      "path": "cold",
+      "calls": [
+        {
+          "seconds": 0.04587002703920007,
+          "error": null
+        }
+      ],
+      "connections": 2,
+      "statements": 63,
+      "queueSeconds": 0.00011333613656461239
+    },
+    {
+      "path": "warm",
+      "calls": [
+        {
+          "seconds": 0.020645194919779897,
+          "error": null
+        }
+      ],
+      "connections": 0,
+      "statements": 50,
+      "queueSeconds": 7.501034997403622e-05
+    },
+    {
+      "path": "concurrent",
+      "calls": [
+        {
+          "seconds": 0.1273205920588225,
+          "error": null
+        },
+        {
+          "seconds": 0.10591769707389176,
+          "error": null
+        },
+        {
+          "seconds": 0.13354856404475868,
+          "error": null
+        },
+        {
+          "seconds": 0.16461561294272542,
+          "error": null
+        },
+        {
+          "seconds": 0.15521926805377007,
+          "error": null
+        },
+        {
+          "seconds": 0.13474835501983762,
+          "error": null
+        },
+        {
+          "seconds": 0.13951993803493679,
+          "error": null
+        },
+        {
+          "seconds": 0.1244083649944514,
+          "error": null
+        }
+      ],
+      "connections": 4,
+      "statements": 400,
+      "queueSeconds": 0.27363576041534543
+    }
+  ],
+  "after32": [
+    {
+      "path": "cold",
+      "calls": [
+        {
+          "seconds": 0.11177489487454295,
+          "error": null
+        }
+      ],
+      "connections": 2,
+      "statements": 63,
+      "queueSeconds": 0.0005795361939817667,
+      "databaseSeconds": 0.062365981517359614
+    },
+    {
+      "path": "warm",
+      "calls": [
+        {
+          "seconds": 0.02756817708723247,
+          "error": null
+        }
+      ],
+      "connections": 0,
+      "statements": 50,
+      "queueSeconds": 0.00023602182045578957,
+      "databaseSeconds": 0.012555335182696581
+    },
+    {
+      "path": "concurrent",
+      "calls": [
+        {
+          "seconds": 0.3945983429439366,
+          "error": null
+        },
+        {
+          "seconds": 0.3430923130363226,
+          "error": null
+        },
+        {
+          "seconds": 1.2200063930358738,
+          "error": null
+        },
+        {
+          "seconds": 0.4125646539032459,
+          "error": null
+        },
+        {
+          "seconds": 0.3174041099846363,
+          "error": null
+        },
+        {
+          "seconds": 0.283881630981341,
+          "error": null
+        },
+        {
+          "seconds": 0.4094076519832015,
+          "error": null
+        },
+        {
+          "seconds": 0.4054494360461831,
+          "error": null
+        },
+        {
+          "seconds": 0.3554211240261793,
+          "error": null
+        },
+        {
+          "seconds": 0.31017204793170094,
+          "error": null
+        },
+        {
+          "seconds": 1.043818036094308,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 1.0424160391557962,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 1.0387315549887717,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 1.0405011801049113,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 1.1194105029571801,
+          "error": null
+        },
+        {
+          "seconds": 0.3066893869545311,
+          "error": null
+        },
+        {
+          "seconds": 1.1215070399921387,
+          "error": null
+        },
+        {
+          "seconds": 0.3890207689255476,
+          "error": null
+        },
+        {
+          "seconds": 1.0200946689583361,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 1.2534035618882626,
+          "error": null
+        },
+        {
+          "seconds": 1.1946010480169207,
+          "error": null
+        },
+        {
+          "seconds": 1.1608375019859523,
+          "error": null
+        },
+        {
+          "seconds": 1.1206967290490866,
+          "error": null
+        },
+        {
+          "seconds": 1.198312554974109,
+          "error": null
+        },
+        {
+          "seconds": 1.160876024980098,
+          "error": null
+        },
+        {
+          "seconds": 1.204637821065262,
+          "error": null
+        },
+        {
+          "seconds": 1.1993713090196252,
+          "error": null
+        },
+        {
+          "seconds": 0.3368351859971881,
+          "error": null
+        },
+        {
+          "seconds": 0.0541638049762696,
+          "error": "DiagnosticToolError",
+          "code": "auth.exchange_unavailable"
+        },
+        {
+          "seconds": 0.2306128880009055,
+          "error": null
+        },
+        {
+          "seconds": 0.3189161950722337,
+          "error": null
+        },
+        {
+          "seconds": 1.185894403140992,
+          "error": null
+        }
+      ],
+      "connections": 4,
+      "statements": 1308,
+      "queueSeconds": 2.3952046202030033,
+      "databaseSeconds": 2.1283984151668847
+    }
+  ]
+}

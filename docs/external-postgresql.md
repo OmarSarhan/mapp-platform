@@ -186,16 +186,13 @@ no other role is granted anything on `control`. The tables inside are created
 and migrated by the configuration service on first start; the MCP
 authorization component expects them to exist and does not migrate.
 
-`CONNECTION LIMIT 8` matches the packaged provisioning script and is a ceiling,
-not headroom. Two services share this one role — the configuration service and
-the MCP authorization component — and **neither pools**: each opens a
-connection per operation and closes it, precisely so the limit stays meaningful
-rather than being consumed by held-open connections. Eight is therefore the
-maximum number of concurrent control-plane operations across both services, and
-the ninth fails to connect. Raising it without pooling only moves the number.
-The authorization component serves on an unbounded-thread HTTP server, so a
-burst of authorization requests can reach that ceiling; that is a known Phase 0
-limitation of the component rather than a property of this database.
+`CONNECTION LIMIT 8` matches the packaged provisioning script. The single
+configuration-service process and single OAuth process each share a pool of
+three connections, leaving two sessions for diagnostics and administration.
+Keep this process topology: adding workers or replicas requires repartitioning
+the aggregate budget first. Do not raise the database role limit to accommodate
+unbounded application admission. Each pool allows twelve waiting callers and
+a two-second admission wait, further limited by the request deadline.
 
 Set the connection URI alongside the others:
 

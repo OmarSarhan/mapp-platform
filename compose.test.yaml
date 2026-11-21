@@ -1,0 +1,40 @@
+# Used only by `bin/mapp test`, after building the normal service images.
+services:
+  scripts-tests:
+    image: mapp-scripts-tests:local
+    build:
+      context: .
+      dockerfile: docker/tests/Dockerfile
+      target: scripts-tests
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777,exec
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+  mcp-auth:
+    ulimits:
+      nofile:
+        soft: 2048
+        hard: 2048
+  config-ui:
+    image: mapp-config-ui-tests:local
+    build:
+      context: .
+      dockerfile: docker/tests/Dockerfile
+      target: config-tests
+    environment:
+      SEMANTIC_SERVICE_URL: ""
+    ulimits:
+      nofile:
+        soft: 2048
+        hard: 2048
+  mapp-mcp:
+    image: mapp-mcp-tests:local
+    build:
+      context: .
+      dockerfile: docker/tests/Dockerfile
+      target: mcp-tests

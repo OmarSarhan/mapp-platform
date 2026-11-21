@@ -22,6 +22,8 @@ import threading
 import time
 import uuid
 
+from mutation_admission import mutation_state, request_flock
+
 
 MAX_PROPOSALS = 1000
 MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -61,7 +63,10 @@ def lifecycle_lock(root: Path, *, exclusive: bool = False):
     try:
         os.fchmod(fd, 0o600)
         try:
-            fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if exclusive else fcntl.LOCK_SH)
+            if exclusive:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                request_flock(fd, fcntl.LOCK_SH)
         except BlockingIOError as exc:
             raise DraftCleanupBusy("Publication or preview is active.") from exc
         held[key] = exclusive
@@ -250,6 +255,7 @@ class DraftLifecycle:
             return None
         bindings = normalize_bindings(bindings)
         directory = self.control.root / "draft-publications"
+        mutation_state().begin()
         directory.mkdir(mode=0o700, exist_ok=True)
         path = directory / f"{uuid.uuid4().hex}.json"
         record = {"state": "intent", "draftRelations": bindings}
