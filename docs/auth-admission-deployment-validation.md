@@ -1,5 +1,24 @@
 # OMA-125 disposable deployment gate
 
+## Current review status — 2026-11-21
+
+The later clean-start demo, exact approved apply, reload, live browser checks
+and standard packaged test launcher passed, as recorded in the follow-up
+sections below. The opening failure report is historical. The user waived
+the outstanding OMA-114 independent-review gate; this is not independent
+acceptance (see `approved-mutation-admission.md`). The modified-workspace
+popup-evidence limitation is tracked separately in
+[OMA-126](https://linear.app/omar-sarhan/issue/OMA-126/complete-demo-preview-evidence-on-already-modified-workspaces)
+and is not an OMA-76 blocker. Incomplete previews still refuse apply.
+
+The disposable VM and its task-owned infrastructure were deleted on
+2026-11-20, with cleanup confirmed at 21:31:02 UTC. Sanitized evidence was
+retained on the controller. No merge or production deployment is authorized
+by these results. Historical readiness and scheduled-expiry statements below
+describe their respective checkpoints and are superseded by this note.
+
+## Initial gate report
+
 **Gate failed; OMA-76 remains NOT READY.** Tests ran on 2026-11-20 against
 the committed archive `f459a2de844acb75d41fd46069e5f7bd2056d619` without
 application source changes. The controller verified all 367 Git blob hashes
