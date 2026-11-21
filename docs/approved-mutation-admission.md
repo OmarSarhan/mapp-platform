@@ -1,5 +1,23 @@
 # Approved mutation admission
 
+## Independent-review waiver — 2026-11-21
+
+The user explicitly waived the outstanding OMA-114 independent-review gate
+after being told that the review had been service-blocked and that a waiver
+would accept the risk of proceeding without independent sign-off. This gate
+is now **waived by the user**, not passed. The blocked review produced no
+findings or acceptance, and the service-access restriction is unchanged.
+
+The existing implementation and test evidence remain applicable. Both
+maintained wire fixtures were rerun successfully on `3daaf7e` on 2026-11-21;
+the acceptance ledger records incomplete expiry/disconnect cross-product
+coverage and the limits of simulated handler loss and fixture preview evidence.
+The waiver accepts the absence of independent review; it does not establish
+untested behavior or waive other requirements, known defects, or deployment
+checks. It does not authorize merge or deployment or by itself declare OMA-76
+ready. Earlier statements below that this review remains a blocking gate are
+historical and superseded by this waiver.
+
 OMA-114 is a local implementation checkpoint on parent `3ad47cf`.
 **OMA-76 remains NOT READY.** OMA-120 implements the HTTP and MCP mapping
 on parent `a69a414`. OMA-114's independent review was service-blocked before findings.
