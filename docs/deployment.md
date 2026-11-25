@@ -307,41 +307,44 @@ Source availability can change independently; treat a non-zero ETL exit as a
 failed refresh and inspect the recorded run before retrying.
 
 Externally managed PostGIS data is attached as a **federated source** rather
-than by repointing `DBS_MAPP`: MAPP always runs its own database for derived
-layers, the federation registry and the control plane, and reaches source data
-over `postgres_fdw`. See [Federated PostgreSQL sources](federation.md) for
-the register, observe and provision sequence.
+than by repointing `DBS_MAPP`: `bin/mapp` always includes the packaged
+PostgreSQL service (`compose.bundled-db.yaml`) for derived layers, the
+federation registry, the `semantic` catalog, and the `control` schema, and
+reaches external source data over `postgres_fdw`. See
+[Federated PostgreSQL sources](federation.md) for the register, observe, and
+provision sequence, and [External PostgreSQL preparation](external-postgresql.md)
+for preparing the source database role, privileges, and TLS configuration.
 
-A source server must:
+A federated source server must:
 
-- be reachable from containers on the Compose backend network; do not use
-  `localhost`, which would mean the individual application container;
+- be reachable from the packaged PostgreSQL container (over the Compose backend
+  or approved network path; do not use `localhost`, which refers to the container
+  itself);
 - have PostGIS installed;
-- grant the URI role `CONNECT` on the database, `USAGE` on every mapped schema,
-  and `SELECT` on the relations used by the workspace; and
+- grant the federated read-only source role `CONNECT` on the database, `USAGE`
+  on every mapped schema, and `SELECT` on the relations used by the workspace;
+  and
 - expose geometry columns, SRIDs, primary/feature identifiers, and calculated
   fields compatible with the configured workspace layers.
 
 Percent-encode URI-reserved characters in database usernames and passwords.
-Choose an appropriate PostgreSQL `sslmode`; production external connections
-should normally validate TLS rather than use the bundled default of `disable`.
-The example explicitly points both database clients at the system CA bundle
-present in both application images. This is needed because Node `pg` and
-libpq/psycopg do not otherwise use the same default root-certificate path. A
-private CA or client certificate needs a reviewed read-only mount at the same
-absolute path in both `xyz` and `config-ui`, plus matching PostgreSQL URI
-parameters; do not weaken verification to work around missing trust material.
+Choose an appropriate PostgreSQL `sslmode` for external source connections;
+production source connections should validate TLS (using the trusted CA bundle
+or reviewed read-only CA material where the `postgres_fdw` client runs) rather
+than disabling verification to work around missing trust material.
 
 Keep `.env` mode `0600`, outside version control, logs, screenshots, and support
 messages.
 
-Changing `DBS_MAPP` changes the database, not the layer definitions. Before the
-first initialization, edit `instance/workspace.seed.json` for the external
-schemas, tables, geometry columns, and identifiers. For an existing instance,
-the authoritative configuration is `var/workspace/workspace.json`; update it
+The legacy direct-runtime external-database mode (repointing `DBS_MAPP` away
+from the packaged database and mounting source-DB TLS material directly into
+`xyz` and `config-ui`) is **superseded** by the packaged platform DB +
+federation architecture above. Before first initialization, adjust
+`instance/workspace.seed.json` only for the initial seed; on an existing
+instance, `var/workspace/workspace.json` is authoritative and must be updated
 through the dashboard or a revision-bound `config-cli` proposal. The ArcGIS ETL
-manifest remains separate under `instance/etl/layers.json` and is irrelevant to
-normal external-database operation.
+manifest under `instance/etl/layers.json` applies only to the optional demo
+sources.
 
 For production, do not rely on the local defaults. Read
 [Deployment](deployment.md), [Security](security.md), and

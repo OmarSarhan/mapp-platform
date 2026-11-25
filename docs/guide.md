@@ -65,9 +65,11 @@ cd mapp-platform
 ```
 
 `init` writes a private `.env` and generates every secret in it. `--demo` adds
-two throwaway source databases to the deployment — this is the one flag that
-makes the platform stand up databases of its own, and it exists so you have
-something real to look at.
+two disposable source databases (`ops-db` and `census-db`) in addition to the
+packaged platform database (which is always included), so you have real open
+data to explore. Disk and cold-run time expectations depend on building the
+images and loading those optional demo/ETL datasets rather than applying
+universally to every first run.
 
 The demo publishes a versioned, saved ten-layer workspace. It keeps the small
 `instance/workspace.seed.json` baseline separate because that seed must remain
@@ -383,20 +385,28 @@ Read: [`workspace-schema.md`](workspace-schema.md)
 ./bin/mapp verify
 ```
 
-The single most useful command. It checks service health, every database
-identity and its privileges, the catalogue, tiles, and the gateway guards — and
-it connects through each service's actual credentials rather than trusting the
-names in `.env`. Run it after any change you are unsure about.
+Run against a reviewed running deployment. It checks service health, every
+database identity and its privileges, the catalogue, tiles, and the gateway
+guards — connecting through each service's actual credentials rather than
+trusting `.env` names (optional MCP services are verified only when
+`MAPP_MCP=1` is enabled). For static non-mutating checks before starting
+containers, use `./bin/mapp doctor` and `./bin/mapp config`.
 
-### Test
+### Test (dedicated development checkout only)
 
 ```sh
 ./bin/mapp test
 ```
 
-Unit and contract suites for the platform, the semantic service, the ETL and
-the deployment helpers, plus the frontend. It provisions its own scratch
-database, so it needs Docker but not a running deployment.
+Runs Dockerized unit, contract, and frontend checks (`config-ui`,
+`semantic-service`, `etl`, `scripts/tests`, and `npm ci`/build/audit). **This
+command is NOT automatically isolated from the selected deployment's database
+server:** it uses the active checkout's `ROOT_DIR`, `.env`, and
+`compose.bundled-db.yaml` overlay to build images, run
+`docker compose up --detach --build --wait db` on that database server, and
+drop/recreate `mapp_control_test` and `mapp_semantic_test` on that server. Run
+`./bin/mapp test` **only** from a dedicated development checkout with its own
+`.env`, unique Compose project/volume identities, and non-production data.
 
 ### Backup
 
@@ -483,11 +493,9 @@ Read: [`security.md`](security.md)
 | [`security.md`](security.md) | Roles, isolation, secrets, the trust boundary |
 | [`backup-restore.md`](backup-restore.md) | What to back up and how to restore it |
 | [`supply-chain.md`](supply-chain.md) | Pinned images, package remediation, XYZ framework policy |
-| [`mcp-authorization.md`](mcp-authorization.md) | The Phase 0 MCP authorization component: its origin, endpoints, state and limits |
+| [`mcp-authorization.md`](mcp-authorization.md) | Opt-in (`MAPP_MCP=1`) OAuth 2.1 MCP authorization component: client registration, consent, endpoints, and unproven-production limits |
 | [`mcp-getting-started.md`](mcp-getting-started.md) | Connect Claude Code, Codex CLI, or the Codex VS Code extension, then choose permissions and approvals |
-| [`adr/0001-mcp-authorization-and-topology.md`](adr/0001-mcp-authorization-and-topology.md) | The authorization ADR: what the decisions became when they were built, and what Phase 0 changed |
 | [`mcp-threat-model.md`](mcp-threat-model.md) | Assets, trust boundaries and the eight abuse cases, with what is and is not mitigated |
-| [`mcp-phase0-evidence.md`](mcp-phase0-evidence.md) | Phase 0 evidence: measured capacity, gate status and the go/no-go recommendation |
 | [`api-contract.md`](api-contract.md) | Every route, its scope and its shape |
 
 ---

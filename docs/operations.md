@@ -31,8 +31,7 @@ source table/geometry mappings remain in Advanced layer JSON.
 ./bin/mapp serve       # start long-running services
 ./bin/mapp ps          # show service state
 ./bin/mapp logs        # follow recent service logs
-./bin/mapp doctor      # compare .env key names with the example
-./bin/mapp test        # run Dockerized component/frontend checks and Compose validation
+./bin/mapp doctor      # static check: compare .env key names with .env.example
 ./bin/mapp stop        # stop without removing containers or data
 ./bin/mapp down        # remove containers and networks, preserving named volumes
 ```
@@ -51,12 +50,25 @@ The external client runs with loopback networking only, selected read-only
 source mounts and a temporary home. It receives no deployment client secret,
 live runtime socket, `.env` or `var` mount.
 
-Use `./bin/mapp config` after Compose or environment changes. Use
-`./bin/mapp verify` for the mode-aware runtime checks. External deployments
-also require layer-specific visual acceptance for their own workspace.
+Use `./bin/mapp config` (static Compose validation) after Compose or
+environment changes. Use `./bin/mapp verify` against a reviewed running stack
+for mode-aware runtime checks (optional MCP services are verified only when
+`MAPP_MCP=1` is enabled). External source deployments also require
+layer-specific visual acceptance for their own workspace.
 If verification finds stale or unresolved container environment values, run
 `./bin/mapp up --force-recreate` to replace the runtime containers while
 preserving named volumes, then verify again.
+
+> **Do not run `./bin/mapp test` against a production deployment.**
+> `./bin/mapp test` is **not** automatically isolated from the selected
+> checkout's database server: it uses the active `ROOT_DIR`, `.env`, and
+> `compose.bundled-db.yaml` overlay to build images (`config-ui`,
+> `semantic-service`, `mcp-auth`, `mapp-leeds-etl:local`), start/build the
+> selected `db` container (`up --detach --build --wait db`), drop and recreate
+> `mapp_control_test` and `mapp_semantic_test` on that database server, and run
+> `npm ci`/build/audit plus container checks. Run `./bin/mapp test` only from a
+> dedicated development checkout with its own `.env`, unique Compose
+> project/volume identities, and non-production data.
 
 Every deployment includes the packaged PostGIS service. `DBS_MAPP` supplies
 the database clients' shared connection to it. The semantic service now holds
@@ -64,13 +76,19 @@ two credentials of its own: `SEMANTIC_READER_DATABASE_URL` for every catalog
 read and `SEMANTIC_DATABASE_URL` for every catalog write. Both reach only the
 `semantic` schema of that same database, which is where the catalog lives.
 
-The MCP authorization component runs as `mcp-auth` and is required by
-`./bin/mapp verify` like any other runtime service. It publishes no host port:
-Caddy reaches it over a Unix socket for four public paths on the MCP origin,
-and the configuration service reaches its internal endpoints on the
-`mcp-control` network. It is a Phase 0 spike and cannot yet complete an
-authorization, because nothing registers an OAuth client — see
-[MCP authorization](mcp-authorization.md).
+The MCP surface (`mcp-auth` and `mapp-mcp`) is **opt-in**, gated by
+`MAPP_MCP=1` (in the shell or `.env`, enabling Compose `--profile mcp` and MCP
+checks in `./bin/mapp verify`). Without `MAPP_MCP=1`, neither MCP service is
+built, started, or required by `verify`. When enabled, `mcp-auth` publishes no
+host port: Caddy reaches it over a Unix socket for public OAuth paths on the
+MCP origin, and `config-ui` reaches its internal endpoints on the `mcp-control`
+network. Phase 1 OAuth 2.1 client registration and consent are implemented
+through the dashboard (**Access and audit → MCP agent clients**) and
+`./bin/mapp mcp-client-register`; see [MCP authorization](mcp-authorization.md)
+and [MCP getting started](mcp-getting-started.md). Note that implemented
+Phase 1 support has **not** yet been validated in production and should be
+treated as designed-but-unproven for production readiness until verified by an
+observed deployment check.
 
 Live deployments keep `MAPP_ENVIRONMENT=production` in `.env`. Caddy is their
 only published application endpoint: TCP 80 is redirect/ACME traffic and

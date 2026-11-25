@@ -7,7 +7,7 @@ images and the versioned `instance` directory are not sufficient.
 
 | Data | Location | Reason |
 | --- | --- | --- |
-| PostgreSQL database | Bundled named volume or the external operator's backup system | Map data, spatial indexes, and schema; sample ETL control records with a local database; the `semantic` catalog schema holding generated and curated profiles, proposals, event receipts, history, and archive tombstones; the `control` schema holding the administrator credential, dashboard sessions, CLI token records, device authorizations and the MCP authorization component's OAuth records |
+| Packaged PostgreSQL database | Bundled named volume (federated source databases remain backed up separately by their source owners) | Derived layers, federation registry, spatial indexes, and schemas; the `semantic` catalog schema holding generated and curated profiles, proposals, event receipts, history, and archive tombstones; the `control` schema holding the administrator credential, dashboard sessions, CLI token records, device authorizations and the MCP authorization component's OAuth records |
 | Live workspace | `var/workspace` | Current configuration and previous atomic save |
 | Control file state | `var/control` | Audit log, proposals, durable operations, artifacts. Authentication, session, token and device-authorization records are **not** here any more; they are in the database's `control` schema, and the audit log is the deliberate exception that stayed a file |
 | Reload state | `var/reload` | Useful for consistent recovery diagnostics; can be regenerated cautiously |
