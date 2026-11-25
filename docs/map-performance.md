@@ -5,28 +5,96 @@ No deployment, merge, framework patch, pool-budget change or pin update.
 
 ## Viewport counts (OMA-75)
 
-Each plugin instance now retains one active request and one pending refresh.
-Movement immediately invalidates old display results, then debounces the pending
-refresh. The next request reads the current layer through the unchanged XYZ
-`locationCount` helper, preserving its filter construction. Hiding clears both
-the timer and pending work and invalidates the active result. Cancellation is not
-claimed to reach XYZ. Existing active work finishes before another request starts.
+`instance/public/plugins/viewport-layer-count/index.mjs` enforces single-flight
+coalescing with debounced scheduling per layer:
 
-Reproduce the deterministic regression:
+- **Single-flight and coalesced debounce**: Each plugin instance keeps at most
+  one active `mapp.ui.utils.locationCount(layer)` request and at most one
+  pending follow-up refresh. Movement invalidates in-flight display results
+  (`state.request++`) and resets the `viewport_layer_count.debounce` timer
+  (clamped `>= 0`, default `250 ms`). Cancellation is not claimed to abort an
+  already-dispatched XYZ request; existing active work finishes before another
+  request starts.
+- **Effective filter preservation**: Each refresh passes the live `layer`
+  through the unchanged XYZ `locationCount` helper, preserving
+  `layer.filter.default`, `layer.filter.current`, and `layer.filter.viewport = true`.
+- **Hide/show and out-of-scale lifecycle**: Hiding cancels the debounce timer,
+  drops pending work, invalidates any active result, and sets
+  `badge.hidden = true`. Showing again while an earlier request is still in
+  flight immediately restores the visible loading badge `(…)` and its
+  accessible `aria-label` when countable while keeping at most one request in
+  flight, suppressing the stale pre-hide response, and queuing the latest
+  viewport refresh. Going out of scale (`tableCurrent?.() === false`) or
+  invisible (`L?.getVisible?.() === false`) hides the badge immediately without
+  queuing follow-up work and suppresses stale settled results.
+- **Error recovery and accessibility**: Both synchronous throws and async
+  rejections release the active-request lock in `finally` (allowing pending and
+  subsequent refreshes to recover), suppress superseded errors, render `(–)`
+  with `${layer.name}: viewport count unavailable` for current errors, and
+  consistently reset `(…)` and `${layer.name}: counting features in viewport` on
+  every loading transition.
+
+Both test suites are wired into `.github/workflows/ci.yml` (`Check browser
+runner`) and `./bin/mapp test` (Node container check).
+
+Repeatable verification commands:
 
 ```sh
-node --test browser-runner/tests/viewport-count.test.mjs
-git show 47d373770b92dd929b82fe3bbc26b18ce07abc22:instance/public/plugins/viewport-layer-count/index.mjs > /tmp/oma64-baseline-count.mjs
-VIEWPORT_COUNT_MODULE=file:///tmp/oma64-baseline-count.mjs node --test browser-runner/tests/viewport-count.test.mjs
+# Deterministic unit suite (7 tests) + loopback HTTP rapid-pan benchmark (auto-compares against git commit 47d37377 when available)
+node --test browser-runner/tests/viewport-count.test.mjs browser-runner/tests/viewport-count-perf.test.mjs
+
+# Strict baseline-comparison HTTP benchmark (fails if baseline commit 47d37377 cannot be extracted)
+REQUIRE_BASELINE=1 node --test browser-runner/tests/viewport-count-perf.test.mjs
+
+# Baseline unit regression check (expected failure: 6 of 7 tests fail on 47d37377, including 8 vs 2 calls in rapid-pan coalescing)
+tmp=$(mktemp /tmp/oma64-baseline-count-XXXXXX.mjs)
+git show 47d373770b92dd929b82fe3bbc26b18ce07abc22:instance/public/plugins/viewport-layer-count/index.mjs > "$tmp"
+VIEWPORT_COUNT_MODULE="file://$tmp" node --test browser-runner/tests/viewport-count.test.mjs
+rm -f "$tmp"
 ```
 
-The baseline fails with eight unresolved calls where two are expected after
-initial scheduling and three pans across two layers. Current source passes;
-settling a request starts only its latest pending viewport. The test also checks
-stale-display suppression, hide/show and preservation of the default filter.
-These are stubbed count calls, not network or database timings. Tile latency,
-real effective-filter integration and isolated candidate-preview evidence remain
-outstanding; OMA-75 is not acceptance-complete.
+When run inside gitless containers (`./bin/mapp test`) or shallow CI checkouts,
+`browser-runner/tests/viewport-count-perf.test.mjs` runs all current-plugin HTTP
+invariants (`maxInFlightPerLayer <= 1`, bounded count traffic, effective filter
+parameters, final badges, hidden-layer suppression, and bounded tile latency)
+with zero skipped tests; pass `REQUIRE_BASELINE=1` (or
+`BASELINE_VIEWPORT_COUNT_MODULE`) to require the baseline delta check.
+
+### Measured baseline vs current loopback HTTP benchmark
+
+Workload (`REQUIRE_BASELINE=1 node --test browser-runner/tests/viewport-count-perf.test.mjs`):
+real loopback `node:http` server (`127.0.0.1`) with a shared FIFO worker pool
+(`concurrency: 2`, `/count` = `70 ms`, `/tile` = `15 ms`), 4 layers (`roads`,
+`stops`, `buildings`, `parcels`) carrying distinct `filter.default` and
+`filter.current`, `debounce: 20 ms`, 6 rapid pans spaced `45 ms` apart, 4
+concurrent `/tile` requests per pan (`24` tiles total), hiding `parcels` at pan
+3 and mutating `roads.filter.current` at pan 4. Request counts and
+`maxInFlightPerLayer` are deterministic; wall-clock latencies reflect a clean
+isolated run and vary slightly with host scheduling.
+
+| Metric | Baseline (`47d37377`) | Current (OMA-75) | Delta |
+| --- | ---: | ---: | ---: |
+| Total `/count` requests | 24 | 10 | -58.3% |
+| Max in-flight `/count` per layer | 6 | 1 | `<= 1` enforced |
+| Max total in-flight `/count` | 18 | 4 | -77.8% |
+| Max backend worker queue depth | 36 | 17 | -52.8% |
+| `/tile` latency mean (`n=24`) | 523.4 ms | 225.8 ms | -56.9% |
+| `/tile` latency p50 (`n=24`) | 566.0 ms | 219.1 ms | -61.3% |
+| `/tile` latency p95 (`n=24`) | 800.2 ms | 275.1 ms | -65.6% |
+| `/tile` latency max (`n=24`) | 815.4 ms | 294.1 ms | -63.9% |
+| `/count` latency mean | 515.4 ms | 190.1 ms | -63.1% |
+| `/count` latency p95 | 846.4 ms | 288.8 ms | -65.9% |
+| Total workload duration | 1437.4 ms | 751.2 ms | -47.7% |
+
+All effective filter query parameters (`default`, `current`, `viewport`) were
+validated on every `/count` request (`0` mismatches) and `parcels` recorded `0`
+post-hide stale badge updates (`hidden === true`).
+
+This benchmark exercises a constrained loopback `node:http` server rather than a
+live XYZ + PostGIS stack or a headless Chromium browser. Live PostgreSQL/XYZ
+tile timings and isolated candidate-preview browser evidence remain separate
+deployment verification steps; OMA-75 is not live-stack acceptance-complete
+without candidate-preview verification.
 
 ## Upstream dependencies (OMA-73 and OMA-74)
 
@@ -65,10 +133,16 @@ commit after those checks; no local framework patch is proposed.
 
 ## Checks and limitations
 
-Ran the focused Node regression (pass), baseline variant (expected failure),
-upstream source inspection, `docker info` (daemon available), and
-`git diff --check`. No database fixture, Caddy client-isolation experiment,
-representative tile timing, full image build or end-to-end verifier was run.
-No fixture servers or browsers were started. Self-review covered request lifecycle,
-debounce invalidation, hide/show, filter preservation and framework boundaries.
-Parent and children remain incomplete pending the evidence and dependencies above.
+Ran the focused Node unit suite (7/7 pass), the baseline unit regression check
+(expected failure: 6/7 fail on `47d37377`), the loopback HTTP rapid-pan
+benchmark (`REQUIRE_BASELINE=1`, pass against `47d37377`), gitless invocation
+matching `./bin/mapp test`'s Node container (8/8 pass, 0 skipped), `bash -n
+bin/mapp`, upstream source inspection, and `git diff --check`.
+
+Limitations remain explicit: the HTTP benchmark uses an ephemeral loopback
+`node:http` server with a synthetic bounded worker pool rather than a live XYZ
++ PostGIS stack. No live PostgreSQL fixture, Caddy independent-client isolation
+experiment, live candidate-preview browser capture, full image build, or
+end-to-end verifier was run; OMA-73 and OMA-74 upstream XYZ blockers remain
+unchanged. Parent and children remain incomplete pending live candidate-preview
+verification and those upstream dependencies.

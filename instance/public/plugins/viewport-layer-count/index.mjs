@@ -5,6 +5,16 @@ function formatCount(value) {
   return Number.isFinite(parsed) ? parsed.toLocaleString() : null;
 }
 
+function isCountable(layer) {
+  return Boolean(layer.tableCurrent?.() && layer.L?.getVisible?.());
+}
+
+function setLoading(layer, badge) {
+  badge.hidden = false;
+  badge.textContent = '(…)';
+  badge.setAttribute('aria-label', `${layer.name}: counting features in viewport`);
+}
+
 function makeBadge(layer) {
   const badge = document.createElement('span');
   badge.className = BADGE_CLASS;
@@ -20,29 +30,33 @@ function makeBadge(layer) {
     'opacity:.72',
     'white-space:nowrap',
   ].join(';');
-  badge.textContent = '(…)';
-  badge.setAttribute('aria-label', `${layer.name}: counting features in viewport`);
+  setLoading(layer, badge);
   return badge;
 }
 
 async function refresh(layer, badge, state) {
-  if (state.active) {
-    state.pending = true;
-    return;
-  }
-  if (!layer.tableCurrent?.() || !layer.L?.getVisible?.()) {
+  if (!isCountable(layer)) {
+    state.pending = false;
     badge.hidden = true;
     return;
   }
+  if (state.active) {
+    state.pending = true;
+    setLoading(layer, badge);
+    return;
+  }
 
-  badge.hidden = false;
   const request = state.request;
   state.active = true;
-  badge.textContent = '(…)';
+  setLoading(layer, badge);
 
   try {
     const count = formatCount(await mapp.ui.utils.locationCount(layer));
     if (request !== state.request) return;
+    if (!isCountable(layer)) {
+      badge.hidden = true;
+      return;
+    }
     badge.textContent = count === null ? '(–)' : `(${count})`;
     badge.setAttribute(
       'aria-label',
@@ -50,6 +64,10 @@ async function refresh(layer, badge, state) {
     );
   } catch (error) {
     if (request !== state.request) return;
+    if (!isCountable(layer)) {
+      badge.hidden = true;
+      return;
+    }
     badge.textContent = '(–)';
     badge.setAttribute('aria-label', `${layer.name}: viewport count unavailable`);
     console.warn(`Viewport count failed for layer [${layer.key}].`, error);
@@ -84,7 +102,11 @@ function viewportLayerCount(layer) {
   layer.viewConfig.headerBtn ??= [];
   layer.viewConfig.headerBtn.unshift(badge);
   layer.changeEndCallbacks.push(schedule);
-  layer.showCallbacks.push(schedule);
+  layer.showCallbacks.push(() => {
+    if (isCountable(layer)) setLoading(layer, badge);
+    else badge.hidden = true;
+    schedule();
+  });
   layer.hideCallbacks.push(() => {
     state.request++;
     state.pending = false;

@@ -180,6 +180,7 @@ jobs:
         run: |
           npm ci --ignore-scripts
           node --check server.mjs
+          node --test tests/viewport-count.test.mjs tests/viewport-count-perf.test.mjs
           npm audit --omit=dev
 
       - name: Check XYZ supervisor wrapper

@@ -1142,6 +1142,7 @@ case "${1:-}" in
         npm audit --omit=dev
         node --check /source/docker/xyz/supervisor.mjs
         node --check /source/browser-runner/server.mjs
+        node --test /source/browser-runner/tests/viewport-count.test.mjs /source/browser-runner/tests/viewport-count-perf.test.mjs
       '
     run_with_buildkit_lease_retry "${compose[@]}" build egress-proxy
     PYTHONDONTWRITEBYTECODE=1 python3 "${ROOT_DIR}/scripts/test_egress_proxy.py"
