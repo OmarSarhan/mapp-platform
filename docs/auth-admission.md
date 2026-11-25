@@ -1,5 +1,13 @@
 # OMA-76 implementation and isolated evidence
 
+**Not ready — independent review on 2026-11-20 supersedes the readiness
+assessment below.** Connection savings reproduced through real MCP transport,
+but origin cancellation, post-wait mutation deadlines, overload response
+mapping and the normal database-backed regression gate failed. The full
+Leeds/XYZ demo remains unverified. Passing subsets below are historical
+evidence, not acceptance of OMA-76. See the OMA-76 review findings in Linear;
+the local reproduction ledger is `/tmp/oma76-independent/REVIEW.md`.
+
 Baseline source: `47d373770b92dd929b82fe3bbc26b18ce07abc22`.
 No deployment, production database, source data, or live workspace was changed.
 
